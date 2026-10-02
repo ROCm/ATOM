@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790950252931,
+  "lastUpdate": 1790960423525,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "0b4f1ddba3767d59ac87d881525fabb26081a15b",
-          "message": "Settle a step's shape once, and fix the three defects that exposed (#2088)\n\n* refactor(engine): settle a step's shape once, in the two units it has\n\nEvery consumer used to re-derive its own width. `bs * max_seqlen_q` was\ncomputed in nine places, the flat replay bucket was searched twice with\ndifferent operands, and the two searches came to disagree -- a step could\nreport a captured graph at a width nothing had recorded. `ForwardMode.decide`\nis now the only thing that answers the question, and it answers it in the only\ntwo units the engine has: `running_bs` for everything per-sequence,\n`running_tokens` for everything per-row. `scheduled_*` stays this rank's own\ncount, and is what a result slices back to.\n\nThe batch is one rule on every kind of step: the DP reduction, rounded onto\nthe capture ladder. It used to branch four ways on how the step dispatched,\nand two of those arms handed back a per-rank count -- so a graph key, a draft\npass and an attention plan could each be holding a different width, and every\nconsumer had to know which kind it had. Dispatch is now asked separately:\n`use_cudagraph` says whether the target replays and sizes nothing.\n\nThe two units are agreed across DP to different extents, deliberately.\n`running_bs` always is. `running_tokens` is agreed exactly when\n`running_tokens_are_unified`, because off it MoE takes the variable-length\ngather, whose contract is that the rows it was handed are the rows this rank\nscheduled -- an over-wide per-sequence array costs a few sentinel rows, an\nover-wide height is a contract break.\n\n`_running_tokens` searches the ladder with `searchsorted` over an ascending\nint32 array built where the ladder is finalised. The list it used to scan is\nsorted descending for the length of `capture_cudagraph`, so a first-match scan\nread the largest size for that whole window and said nothing about it.\n\nAlso here:\n\n- The draft pass reports the rows it RAN, not the rows that were real. It\n  pads its own inputs and computes every one of them, so reporting\n  `scheduled_bs * num_draft` against a `running_bs * num_draft` tensor was a\n  contract break, not a conservative choice; `dp_gather_hidden_and_router`\n  asserts the two agree and aborted 8/8 ranks on the first decode step\n  whenever a batch had no recording to replay (`ATOM_DRAFT_CUDAGRAPH=0`).\n\n- `assert_shape_contract` covers the padded step, which is the only one that\n  can be wrong. It used to return early whenever `running_bs != scheduled_bs`,\n  exempting exactly that case; a mismatch then reached the model as lost\n  accuracy rather than as a failure here.\n\n- The prefill draft pass reaches a warmed shape: prefill rounds onto the same\n  ladder as a decode step, and its per-sequence tail is padded to match.\n\n- One name for this rank's sequence count. `real_bs` and `bs` were two\n  spellings of `Context.scheduled_bs` across the drafters; 47 sites.\n\n- `ScheduledBatch` no longer carries `max_seqlen_q`, `dspark_dp_bs` or\n  `dynamic_num_tokens_pad`. A scheduler object was holding numbers the DP\n  group settled after it was built.\n\nV4-Flash-DSpark tp8 + DPA, k=7, fp8 KV, GSM8K 1319 x3: 0.9492 / 0.9515 /\n0.9477. Unit suite 4712 passed.\n\n* fix(spec-decode): stop the draft pass handing out storage it does not own\n\nA rank idling behind someone else's long chunked prefill faulted all eight\nranks on V4-Flash-DSpark at 100k/c50: the target's embedding gather took an\nindex outside the vocab. Three defects on the draft path, in the order found.\n\n1. `DraftGraph.run` returned the recording's own tensors.\n\nA replay hands back the tensors the capture allocated. Those live in the pool\nevery captured size shares, and the pool packs a later size's capture into\nmemory the earlier ones released -- so replaying an earlier size rewrites\naddresses a later one's live output now holds. Holding a Python reference does\nnot stop that, which is the whole difference from the eager allocator.\n\nDSpark's draft ids are the only value in the engine that outlives the step\nthat made it: deferred output feeds them back as the next decode step's\n`input_ids` without a D2H. Read a step later they were another size's\nactivations, float bit patterns arriving as vocab indices.\n\nShown without the fault: stamp a sentinel into the bs=2 recording's output,\nreplay the bs=1 graph, and bs=1's activations come back -- while the\nfirst-captured size is never dirtied. `run` now copies a replay's result out\nof the pool; the eager path allocates normally and is untouched.\n\n2. A DP-sync dummy passed for a carried-over request.\n\n`dummy_execution` fabricates its sequence with a fixed id, so a second dummy\nmatched the first in `get_token_locations` and read that \"request's\" anchor\nand drafts out of `prev_token_ids` / `draft_token_ids`. Measured: `src=[0]` on\na dummy batch, whose seven draft slots then held 968440611 and similar. A\nfabricated batch carries nothing over, and the early return also skips the\nper-request loop -- most of the steps under DP attention are dummies.\n\nIt still becomes `prev_batch` on purpose: reporting lags a step, so the dummy\nis what flushes the last real step's output to the host, and its own token\nlands on the key the deferred flag overwrites.\n\n3. The draft pass reported the target's counts as its own.\n\n`_publish_draft_shape` now states both units honestly, declares the pass\nuniform across DP and not a prefill whatever the target just did, and fills\nthe DP table locally rather than all_reducing it: `running_bs` came out of\n`decide`'s one collective and the width is config, so there is nothing to ask.\n`DPMetadata.make`'s assert cannot catch a wrong table -- it checks this rank's\nown entry, which a uniform fill satisfies -- so a probe compared it against\nthe all_reduced one on every pass and found no disagreement across 8 ranks,\nover a 100k/c50 benchmark and a full GSM8K.\n\nVerified on V4-Flash-DSpark, tp8 + dp-attention, fp8 KV / fp4 indexer,\n--num-speculative-tokens 7:\n\n  100k/10/c50   drains clean, 106,043 tok/s (was an 8-rank abort)\n  GSM8K 1319    0.9522 flexible / 0.9522 strict, fewshot 3\n  acceptance    48.6%, 4.40 tokens per forward\n  unit tests    4719 passed, 0 failed\n\nThe local DP table was suspected of costing 0.9pp and does not: n=3 each way,\nfully interleaved (0.9477/0.9515/0.9522 local, 0.9454/0.9522/0.9522\nall_reduced). Single GSM8K runs on this model span 1.5pp.\n\n* fix(spec-decode): let the caller say whether its draft pass is uniform\n\n`_publish_draft_shape` asserted two things on behalf of every drafter that\ncalled it: that the pass was not a prefill, and that every DP rank was\nrunning the same height. Both hold for the DSpark block pass, which is\n`running_bs * num_draft` -- `decide`'s reduction times a config width. Only\none of the three call sites is that pass.\n\nEagle's first draft step runs the target's own token stream against the\ntarget's still-prefill metadata. Clearing `is_prefill` there sends the MLA\nlayers, the indexer and PCP down their decode branches on a pass that is a\nprefill, and declaring that height uniform states an equality no reduction\nchecked -- `input_ids.shape[0]` is this rank's `total_tokens_num`. Its\nmid-steps are uniform only when a recording exists to widen to; without one\n`running_bs` falls back to `scheduled_bs`. Kimi-K3's separate-draft path\npublishes `scheduled_bs * T`, also rank-local, and nothing rules it out\nunder DP: `--enable-dp-attention` folds TP into the DP size.\n\n`make` asserts only THIS rank's entry, which a uniform fill satisfies by\nconstruction, so a wrong claim survives to the fixed-size gather in\n`dp_gather_hidden_and_router` and lands as a mismatched collective.\n\nSo the seam states neither on anyone's behalf:\n\n  - `running_tokens_are_unified` is a required keyword. DSpark's block pass\n    passes True, Kimi-K3 False, Eagle `i > 0 and self.step is not None`.\n  - `is_prefill` goes back to being the caller's write. Two of the three\n    already had one; the block pass never did, and needs one now that it\n    reports `scheduled_bs * num_draft` -- `pad_for_all_gather` checks rows\n    against the scheduled count when the flag is True and would assert on\n    the first widened batch.\n  - `DPMetadata.make` takes `unified` and owns both ways to a table, so the\n    answer travels instead of the tensor it implies. Supplying a table and\n    claiming uniformity is now rejected rather than silently ordered.\n  - `warmup_draft_graphs` states the pair it bakes rather than inheriting\n    two defaults that happen to agree.\n\nEagle and Kimi-K3 are restored to their pre-9a3313953 behaviour; the DSpark\nblock pass is unchanged, only its writer moved.\n\nVerified on V4-Flash-DSpark, tp8 + dp-attention, fp8 KV / fp4 indexer,\n--num-speculative-tokens 7 -- the one configuration here that reaches the DP\nbranch. GSM8K 1319, fewshot 3, server restarted between runs:\n\n  0.9469 / 0.9469 / 0.9538   mean 0.9492, acceptance 47.6%, 4.37 tok/fwd\n\nagainst 0.9505 (local table) and 0.9499 (all_reduced) on 9a3313953, whose\nsample ranges this one overlaps in both directions. Single runs on this model\nspan 1.5pp. Eagle and Kimi-K3 have no recipe on this box and were not run.\n\n`DPMetadata.make` needs no aiter, so tests/test_dp_metadata.py runs in CI --\nthe drafter-level tests cannot, since spec_decode/drafter.py imports aiter at\nmodule load.\n\n  unit tests   4725 passed, 0 failed\n\n* fix(engine): cut a prefill's logits to the requests before sampling them\n\nRounding every step onto the capture ladder gave prefill a `running_bs`\nabove its own batch, and `prepare_prefill` pads `cu_seqlens_q` out to it so\na following draft pass reaches a warmed shape. The LM head slices prefill\nrows by that array, so `compute_logits` returns `running_bs` rows -- while\n`prepare_sample` sizes `temperatures` / `top_ks` / `top_ps` at\n`batch.total_seqs_num`, because those describe requests.\n\n`postprocess` cut the SAMPLED IDS back to the scheduled batch, one step too\nlate. Three prefill sequences on the default ladder run four rows, so any\nrequest setting `top_p < 1` or `top_k != -1` on a non-greedy batch reached\n`scaled_logits = logits / temperatures.unsqueeze(-1)` as `[4, V] / [3, 1]`\nand raised. The logprob path was already broken the same way and stayed\nbroken after that cut: `log_probs.gather(-1, sampled_tokens.unsqueeze(-1))`\ngathered `[running_bs, V]` by `[scheduled_bs, 1]`.\n\nBoth come from one uncut tensor, so the fix is to cut it: `logits[:bs]`\nbefore the sampler rather than `sampled_tokens[:bs]` after it. Greedy\nbatches took `argmax` and temperature-only ones over-read the parameter\nbuffer silently, which is why GSM8K and the benchmarks never saw it.\n\nAlso here, from the same review pass:\n\n- `_stage` grows `pad_to`. Both V4 state-slot publishers had hand-inlined\n  its body to get a padded width, dropping its buffer-capacity and dtype\n  assertions along the way.\n\n- The packed DP wire loses `any_dummy`. Nothing has read it since it was\n  added, its own comment describes an AND-reduce over an `.any()`, and the\n  layout was being renumbered anyway -- a block drafter now appends one\n  int32 instead of two.\n\n- `_running_tokens` drops a `batch` parameter it never read (and a `cls`),\n  `_local_tbo_eligibility` an argument with one caller and one value, whose\n  `np.asarray` now runs below the `enable_tbo` early return rather than on\n  every step. `capture_sizes_np` stops sorting an already-sorted list.\n\n- `_dspark_decode_replay` is deleted: its only reader,\n  `_piecewise_replay_shape`, went with the shape refactor and the per-step\n  write survived it.\n\n- Dangling names: two comments cited `ScheduledBatch.max_seqlen_q`, which\n  that refactor deleted; three cited `_refresh_dp_metadata`, renamed before\n  this branch began -- one of them a `raising=False` monkeypatch that\n  therefore neutralised nothing. `is_captured` credited `warmup` with an\n  assert it does not contain, a state-slot comment cited\n  `_populate_state_slot_mappings` as evidence for the opposite of what that\n  function documents, and the call site of `assert_shape_contract` still\n  said it skips cudagraph steps -- covering those is what the refactor\n  changed it to do. `docs/environment_variables.md` still documented the\n  EPLB capture opt-out that went away with `DraftGraph.pads`.\n\n- Comment volume, where the same fact was written more than once: the draft\n  loop's eight-line publish carried 27 lines with one sentence in it three\n  times; `assert_shape_contract` closed with eight lines about two\n  assertions deliberately not written; the ladder's sortedness was\n  explained three times, two of them disagreeing. Net 55 lines.\n\n  unit tests   4729 passed, 0 failed\n\n* fix(tests): guard on the module a test needs, not on the name aiter\n\n`tests/test_postprocess_width.py` aborted collection on the non-GPU runner,\nwhich is not one failed test -- pytest exits 2 and the other 4700 never run.\n\n`pytest.importorskip(\"aiter\")` only skips on ModuleNotFoundError, and on that\nrunner `aiter` is importable by the time this file is reached:\n`tests/test_pd_pp.py` does `sys.modules.setdefault(\"aiter\", ModuleType(\"aiter\"))`\nat module scope and never restores it, so every module collected after it\n(pd < po) sees the name resolve and dies reading a symbol off it --\n`cannot import name 'destroy_dist_env' from 'aiter' (unknown location)`.\n`tests/import_guard.py` already documents this shape as how the non-GPU job\nactually fails.\n\nNaming the module the test actually needs catches both shapes, and `exc_type`\nis what makes the second one a skip:\n\n    mod = pytest.importorskip(\n        \"atom.model_engine.model_runner\", exc_type=ImportError, reason=...\n    )\n\n`test_dspark.py` and `test_mtp_deferred_status_queue.py` carry the same\nname-only guard and survive today only by sorting before `test_pd_pp.py`.\nAlphabetical order is not a guard, so they move to the same idiom.\n\nThe probe that was supposed to catch this modelled `aiter` ABSENT, where a\nname-only guard skips correctly -- so it passed the file that broke CI.\n`/app/logs_claude/check_tests_import_without_aiter.py` now runs an ABSENT and\na HOLLOW pass; HOLLOW reproduces the runner's error verbatim, and the whole\ntests/ tree is clean in both.\n\nThe stub leak in `test_pd_pp.py` is left alone: restoring `sys.modules` there\nis a change to a PD test whose fixtures are not examined here, and no file\ndepends on the leak.\n\n  unit tests   4731 passed, 0 failed\n\n* perf(spec-decode): record the MTP draft head with the backbone that feeds it\n\nEagleProposer declared a DraftGraph with no epilogue, so a mid-step replayed\nthe backbone and then ran `compute_draft_ids` eager -- an LM head, a TP\nall_gather and an argmax, once per draft step, outside the recording.\n\nTwo things had to change, and the first is why this was never done:\n\n`compute_argmax_token` reached `all_gather` without `use_custom`, whose\ndefault is False, so it took RCCL. `graph_capture()` arms the custom\nimplementation and only that one, which is what `logits_in_graph =\nworld_size == 1` has meant since `0cad4aabe` (\"NCCL all_gather which is not\ngraph-capturable on HIP when TP > 1\"). The logits path two functions up\nalready passes `envs.ATOM_USE_CUSTOM_ALL_GATHER`; the argmax path did not.\nWith it, capture succeeds at tp8 -- that rationale was stale, not wrong.\n\nThe epilogue then returns `(hidden_states, ids)`, both: the next mid-step\nreads the hidden states and they exist only inside the recording. It runs the\nhead over every row rather than `[:scheduled_bs]`, since a capture bakes the\nlength it was made at; the caller slices on the way out.\n\nMeasured on V4-Pro MTP3, tp8, same 100k/10/c50 shape both ways, rank_0\n`propose_eagle` spans -- host kernel launches left outside the graph:\n\n  mid-step 1   18.29 -> 9.53   (the rest is prepare_mtp_decode at the i==1\n                                metadata boundary, not the head)\n  mid-step 2   10.31 -> 1.51\n\n  GSM8K 1319   0.9515 flexible, was 0.9545\n  acceptance   64.47% / 66.11%, was 64.27% / 66.24%; 2.93 / 2.98 tok/fwd,\n               unchanged -- the probe that would see a token differ\n\nThroughput is NOT measured. Both arms are single-shot and profiled, and step\n0's span moved 19.1 -> 9.6 ms between the two runs while nothing touched it\n(step 0 never enters a graph), so this shape cannot size a sub-percent\neffect. A decode-dominated shape with alternating arms would.\n\n`_owned` clones both tuple elements on replay. Neither outlives a replay here\n-- `stage()` copies the hidden states before the next one, and the ids land in\n`draft_token_ids` immediately -- so the hidden-state clone is waste, ~688 KB\nper mid-step at bs=48. Left alone: teaching the seam which output to skip is a\nknob on the seam that returned pool storage three commits ago, and the cost is\nalready inside the launch counts above.\n\nNo unit test: `EagleProposer.propose` has no harness, and asserting on the\none-line `_step_head` would not reach the property (the graph returns both,\nthe loop slices the ids). GPU evidence only.\n\n  unit tests   4731 passed, 0 failed\n\n* fix(attention): cut the padded prefill arrays back to the requests they describe\n\n`CommonAttentionBuilder.prepare_prefill` pads `cu_seqlens_q`, `cu_seqlens_k`\nand `context_lens` out to `running_bs` and uploads them at that width, so a\ndraft pass that follows the prefill sees clean tail rows. Every consumer that\nstill counted requests off one of them broke the moment a batch's sequence\ncount fell off the capture ladder -- which is most of them:\n\n    RuntimeError: The expanded size of the tensor (21) must match the existing\n    size (32) at non-singleton dimension 0\n\nSix accuracy jobs failed that way. The heavy matrix had been SKIPPED on this\nbranch's earlier pushes, so this is the first run that exercised it; the green\n\"ATOM Test\" on 7ef28c3a3 and 64f088dbf says nothing about accuracy. DeepSeek-V4\npassed throughout because it has its own backend and never reaches the common\nbuilder -- which is also why local V4 testing never saw it.\n\nEach site cuts to the count already in scope. Nothing gains a parameter or a\nfield, and every cut restores the width the same line had before 8234bf468:\n\n    aiter_mla.py          context_lens[:bs] under the kv_indptr cumsum\n    aiter_attention.py    both per-seq args of make_sparse_prefill_metadata,\n                          sliced like the block tables directly above them\n    attention_mla.py      the two chunked-prefill varlen calls take as many\n                          q-cums as the chunk built k-cums; the paged call\n                          takes kv_last_page_lens' width\n    attention_mha.py      unified_attention's two per-seq args, cut to the\n                          block table it indexes with them\n    triton_mha.py         the fake block table's row count, from the batch\n                          rather than from the padded array's length\n    gdn_attn.py           query_start_loc, PREFILL ONLY -- that function also\n                          serves decode, whose padding predates this and whose\n                          consumers are written for it\n\n`minimax_m3/sparse_attn.py` and `index_topk.py` need no edit: their widths come\nfrom the aiter_attention call above, and clamping them locally would hide a\nreal disagreement instead of fixing one.\n\nVerified by reproducing first. GLM-5.2-MXFP4 MTP tp4 died on its first prefill\nbatch with the error above on four ranks and zero completions; after the fix:\n\n  GLM-5.2-MXFP4 MTP   0.9249 flexible / 0.9280 strict, acceptance 75.3%\n                      (threshold 0.92, accept threshold 0.595), 0 tracebacks\n  MiniMax-M3-MXFP4    0.9393 flexible / 0.9401 strict (baseline 0.9363,\n                      threshold 0.93), tp8 5-shot chat, 0 tracebacks\n  unit tests          4731 passed, 0 failed\n\nBetween them those two cover four of the sites: MiniMax reaches the\naiter_attention pair and the two minimax_m3 consumers downstream of it, GLM the\naiter_mla one. The other four models that failed -- Qwen3-Next-80B,\nQwen3.5-397B, DeepSeek-R1-0528-FP4 MTP, Kimi-K2.7 -- have no recipe on this\nbox and were NOT run; their sites were checked statically against 8234bf468^\ninstead. The gdn_attn edit landed after both e2e runs and neither model uses\nthat backend, so it carries static evidence only.\n\nKnown cost of fixing it this way: six sites now spell \"the requests this rank\nscheduled\" six different ways, two of them by reading a length off another\narray that happens to be unpadded. The invariant that keeps those two correct\nis not stated anywhere.",
-          "timestamp": "2026-08-30T17:20:01Z",
-          "url": "https://github.com/ROCm/ATOM/commit/0b4f1ddba3767d59ac87d881525fabb26081a15b"
-        },
-        "date": 1788120153117,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33262015807 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260829 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8939 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8332,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33262015807 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260829 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8188 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8499,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33262015807 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260829 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8408 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33262015807 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260829 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8643 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8719,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33262015807 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260829 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8552 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -293874,6 +293822,388 @@ window.BENCHMARK_DATA = {
             "value": 287.3575,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37002953488 | docker_image=rocm/atom-dev:nightly_202609301507 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9211%2C%22cache_hit_tokens%22%3A943463856%2C%22cache_total_tokens%22%3A1024317449%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A9151%2C%22concurrency%22%3A96%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3629.3276%2C%22e2el_ms%22%3A34478.8995%2C%22e2el_p90%22%3A71838.5393%2C%22e2el_p99%22%3A183034.7573%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609301507%22%2C%22input_tput%22%3A260640.4342%2C%22input_tput_per_gpu%22%3A32580.0543%2C%22interactivity%22%3A6.0471%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A9147%2C%22interactivity_p90_itl%22%3A42.7453%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A18.7758%2C%22itl_p90%22%3A23.3944%2C%22median_e2el_ms%22%3A24578.4443%2C%22median_itl_ms%22%3A18.7255%2C%22median_tpot_ms%22%3A18.7255%2C%22median_ttft_ms%22%3A9306.7309%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2298.8601%2C%22output_tput_per_gpu%22%3A287.3575%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.3285%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc96-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37002953488%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A262939.2943%2C%22tpot_ms%22%3A18.7758%2C%22tpot_p90%22%3A23.3944%2C%22tpot_p99%22%3A28.3963%2C%22tput_per_gpu%22%3A32867.4118%2C%22ttft_ms%22%3A16154.8324%2C%22ttft_p90%22%3A40873.1425%2C%22ttft_p99%22%3A76324.2569%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "github-actions[bot]",
+            "username": "github-actions[bot]",
+            "email": "41898282+github-actions[bot]@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "922b3519628a002ae9dbdd4d30683e17d372ff00",
+          "message": "build(docker): pin LMCache 0.5.6.dev139+gf22dec28.rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1 wheel (#2438)\n\nBuilt from LMCache/LMCache@f22dec2832124ea4ffeb464553b819a6369d4a30 by https://github.com/ROCm/ATOM/actions/runs/36677914131.\n\nCo-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>",
+          "timestamp": "2026-09-30T08:50:03Z",
+          "url": "https://github.com/ROCm/ATOM/commit/922b3519628a002ae9dbdd4d30683e17d372ff00"
+        },
+        "date": 1790960422950,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9431,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
+            "value": 0.9439,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
+            "value": 67.43,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.02,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP Online-Quant accuracy (GSM8K)",
+            "value": 0.9393,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Online quantization on top of DeepSeek-R1-0528 MTP (FP8 native): global ptpc_fp8 + expert layers mxfp4, excluding lm_head and *.gate.*. Threshold set to 0.93 (same headroom as DeepSeek-R1-0528-FP4 MTP) as a conservative placeholder for the MoE-MXFP4 accuracy drop. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.934 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP Online-Quant MTP acceptance (%)",
+            "value": 64.39,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Online quantization on top of DeepSeek-R1-0528 MTP (FP8 native): global ptpc_fp8 + expert layers mxfp4, excluding lm_head and *.gate.*. Threshold set to 0.93 (same headroom as DeepSeek-R1-0528-FP4 MTP) as a conservative placeholder for the MoE-MXFP4 accuracy drop. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.934 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP Online-Quant avg toks/fwd (tok/fwd)",
+            "value": 2.93,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP Streaming Online-Quant accuracy (GSM8K)",
+            "value": 0.9393,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Nightly streaming variant of DeepSeek-R1-0528 MTP online quantization. Covers streaming load with its default settings, mixed FP8/MXFP4 quantization, inference accuracy, and MTP acceptance. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9386 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP Streaming Online-Quant MTP acceptance (%)",
+            "value": 64.04,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Nightly streaming variant of DeepSeek-R1-0528 MTP online quantization. Covers streaming load with its default settings, mixed FP8/MXFP4 quantization, inference accuracy, and MTP acceptance. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9386 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP Streaming Online-Quant avg toks/fwd (tok/fwd)",
+            "value": 2.92,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
+            "value": 0.9447,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9386 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
+            "value": 0.9439,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
+            "value": 64.56,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro accuracy (GSM8K)",
+            "value": 0.9507,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DEP RCCL accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DSpark accuracy (GSM8K)",
+            "value": 0.9515,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DSpark MTP acceptance (%)",
+            "value": 44.95,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DSpark avg toks/fwd (tok/fwd)",
+            "value": 4.15,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.956 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: EP+DPA, EPLB pure rearrangement (num_redundant_experts=0, no extra memory), rebalance_interval=200. g64 8xMI355X measured GSM8K 5-shot flexible/strict = 0.9560/0.9568 (2026-07-20), 4 rebalances during the eval, 0 crashes. Guards the num_redundant>0 startup-OOM/migration-deadlock fixes (redundant=0 doesn't hit them, but shares the rebalance/migration code path). | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r64 biased accuracy (GSM8K)",
+            "value": 0.9515,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.955 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: EP+DPA, EPLB biased placement (64 redundant physical experts = top-8 hottest fully replicated to all 8 GPUs), rebalance_interval=200. Exercises fill_redundant init + runtime rebalance/migration end-to-end, guarding the num_redundant>0 startup-OOM/migration-deadlock fixes. g64 8xMI355X measured GSM8K 5-shot flexible/strict = 0.9553/0.9560 (2026-07-20), 4 rebalances including migration during the eval, 0 crashes. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r64 naive accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.956 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: EP+DPA, EPLB naive placement (64 redundant physical experts spread thinly via balanced_packing), rebalance_interval=200. Exercises fill_redundant init + runtime rebalance/migration end-to-end, guarding the num_redundant>0 startup-OOM/migration-deadlock fixes. g64 8xMI355X measured GSM8K 5-shot = 0.956 (2026-07-20), 4 rebalances including migration during the eval, 0 crashes. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9507,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.02,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO+DPA conc1000 accuracy (GSM8K)",
+            "value": 0.956,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.95 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance). | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.956 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4.1-Flash DSpark accuracy (GSM8K)",
+            "value": 0.9098,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.91 | Baseline: 0.9224 | BaselineModel: deepseek-ai/DeepSeek-V4.1-Flash | BaselineNote: Every argument here is forced rather than chosen: the V4.1 runtime rejects a KV cache other than bf16/fp4, an index plane other than fp8, and any DSpark that is not 5 tokens at TP4 on a bf16 cache (atom/models/deepseek_v41/config.py). Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9098 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4.1-Flash"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4.1-Flash DSpark MTP acceptance (%)",
+            "value": 49.87,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.91 | Baseline: 0.9224 | BaselineModel: deepseek-ai/DeepSeek-V4.1-Flash | BaselineNote: Every argument here is forced rather than chosen: the V4.1 runtime rejects a KV cache other than bf16/fp4, an index plane other than fp8, and any DSpark that is not 5 tokens at TP4 on a bf16 cache (atom/models/deepseek_v41/config.py). Nothing pins the compilation level or max-num-seqs, so this runs at the server's own defaults, level 3 and 512 sequences. The baseline below was measured at 512 but at level 0, because the development box resolves torch's Triton specialization hook to neither name it has been given: Inductor then drops a hand-written Triton kernel silently and the model emits repeated tokens out of whatever the allocator last held, which tests/test_triton_inductor_pairing.py states at the kernel level and is red there. That is a property of one torch/Triton pair, not of this model, so the first CI runs are what confirm the number at level 3 — until then read the baseline as level 0's. Baseline is the mean of three full 1319-question 3-shot runs on this branch, each on a fresh server: 0.9189 / 0.9212 / 0.9272 flexible-extract (strict within 0.0015 of flexible every time), mean 0.9224. Treat the 0.83pp they span as a lower bound on the noise, not the noise itself — an earlier build of this same branch gave 0.9143 / 0.9143 / 0.9151, three runs inside 0.08pp, and reading that as a variance would have been wrong. This model is known to depend on memory layout, and DSpark verifies every draft token against the target, so draft quality moves which batch shapes run rather than what the answer is. The 0.91 bar leaves 1.24pp; a single red is noise until a rerun agrees with it, and a real regression shows up as two. mtp_accept_threshold intentionally omitted until a CI run reports this model's DSpark acceptance rate. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9098 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4.1-Flash"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4.1-Flash DSpark avg toks/fwd (tok/fwd)",
+            "value": 3.49,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::GLM-5-FP8 accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.93 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5 | BaselineNote: HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot) | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/zai-org/GLM-5-FP8"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 accuracy (GSM8K)",
+            "value": 0.9393,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: ATOM native FP8 gsm8k 3-shot flexible-extract=0.9447 (5-shot=0.9416); --gpu-memory-utilization 0.8 needed since the DSA index cache OOMs at default 0.9. Threshold 0.92 leaves ~2.5pp headroom. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9401 | fewshot: 3 | Model: /models/zai-org/GLM-5.2-FP8"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 accuracy (GSM8K)",
+            "value": 0.9249,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9265 | fewshot: 3 | Model: /models/amd/GLM-5.2-MXFP4"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP accuracy (GSM8K)",
+            "value": 0.934,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9333 | fewshot: 3 | Model: /models/amd/GLM-5.2-MXFP4"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP MTP acceptance (%)",
+            "value": 76.63,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9333 | fewshot: 3 | Model: /models/amd/GLM-5.2-MXFP4"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.3,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::GLM-5.3-FP8 accuracy (GSM8K)",
+            "value": 0.9727,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.96 | Baseline: 0.9719 | BaselineModel: zai-org/GLM-5.3 | BaselineNote: First accuracy gate for GLM-5.3 (glm_moe_dsa); the model ran on ATOM before this but was covered by no CI entry and no recipe. Measured 2026-09-02 on 8xMI355X, all 1319 questions, chat 5-shot, temperature 0: flexible-extract=0.9719, strict-match=0.9727. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9735 | fewshot: 5 | Model: /models/zai-org/GLM-5.3"
+          },
+          {
+            "name": "ATOM::GLM-5.3-Flash-kpool-16shot accuracy (GSM8K)",
+            "value": 0.9666,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.9613 | BaselineModel: zai-org/GLM-5.3-Flash | BaselineNote: Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. Threshold stays at 0.94. This entry is test_level pr, so every unrelated PR runs it on 8 GPUs; repeat runs of IDENTICAL code have landed at 0.9613/0.9629/0.9644/0.9659, so a 0.96 threshold is cleared by 0.0013 in the worst case and would fail roughly one PR in four on unchanged code -- a gate that flaky trains people to re-run until green and stops carrying information. Baseline is the 0.9613 measured on this tree; the 0.9659 it replaced came from an earlier branch and is optimistic here. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9674 | fewshot: 16 | Model: /models/zai-org/GLM-5.3-Flash"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.92 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.7-Code | BaselineNote: Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/amd/Kimi-K2.7-Code-MXFP4"
+          },
+          {
+            "name": "ATOM::Kimi-K3 accuracy (GSM8K)",
+            "value": 0.9545,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 | BaselineNote: Kimi-K3 (kimi_linear KDA+MLA, MXFP4 MoE) native ATOM FP8 kv-cache, TP8 (GSM8K 3-shot flexible-extract). Baseline 0.95; threshold 0.94 leaves ~1pp headroom. Refresh after the first CI run. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark MTP acceptance (%)",
+            "value": 51.09,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark avg toks/fwd (tok/fwd)",
+            "value": 4.58,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
+            "value": 0.903,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6141 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
+          },
+          {
+            "name": "ATOM::MiMo-V2-Flash accuracy (GSM8K)",
+            "value": 0.787,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.778 | Baseline: 0.79 | BaselineModel: XiaomiMiMo/MiMo-V2-Flash | BaselineNote: CI GSM8K 3-shot. First stable run base=0.8082 (run 26410931088, commit 24e4367b). Baseline 0.79 sits ~1.5pp below to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.1σ headroom. tp pinned to 4 to match the MTP entry. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7801 | fewshot: 3 | Model: /models/XiaomiMiMo/MiMo-V2-Flash"
+          },
+          {
+            "name": "ATOM::MiMo-V2-Flash MTP accuracy (GSM8K)",
+            "value": 0.8021,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.778 | Baseline: 0.79 | BaselineModel: XiaomiMiMo/MiMo-V2-Flash | BaselineNote: CI GSM8K 3-shot MTP1=0.7983 (run 26410931088). Baseline 0.79; threshold 0.778 (~1.1σ). tp MUST=4, num-speculative-tokens MUST=1: ATOM builds only MTP layer 0 (vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); more spec → layers 1/2 KV unpopulated, accept craters. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7961 | fewshot: 3 | Model: /models/XiaomiMiMo/MiMo-V2-Flash"
+          },
+          {
+            "name": "ATOM::MiMo-V2-Flash MTP MTP acceptance (%)",
+            "value": 93.62,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.778 | Baseline: 0.79 | BaselineModel: XiaomiMiMo/MiMo-V2-Flash | BaselineNote: CI GSM8K 3-shot MTP1=0.7983 (run 26410931088). Baseline 0.79; threshold 0.778 (~1.1σ). tp MUST=4, num-speculative-tokens MUST=1: ATOM builds only MTP layer 0 (vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); more spec → layers 1/2 KV unpopulated, accept craters. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7961 | fewshot: 3 | Model: /models/XiaomiMiMo/MiMo-V2-Flash"
+          },
+          {
+            "name": "ATOM::MiMo-V2-Flash MTP avg toks/fwd (tok/fwd)",
+            "value": 1.94,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::MiniMax-M2.7 accuracy (GSM8K)",
+            "value": 0.8908,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.8872 | Baseline: 0.9022 | BaselineModel: MiniMaxAI/MiniMax-M2.7 | BaselineNote: ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9318 | fewshot: 3 | Model: /models/MiniMaxAI/MiniMax-M2.7"
+          },
+          {
+            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
+            "value": 0.8992,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8825 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-MXFP4 accuracy (GSM8K)",
+            "value": 0.8802,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8681 | fewshot: 3 | Model: /models/amd/Qwen3-235B-A22B-Instruct-2507-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
+            "value": 0.6846,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7908 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
+          },
+          {
+            "name": "ATOM::Qwen3.5-35B-A3B TP2 accuracy (GSM8K)",
+            "value": 0.8597,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.83 | Baseline: 0.85 | BaselineModel: Qwen/Qwen3.5-35B-A3B | BaselineNote: Mean of first 4 valid CI runs (0.8226 / 0.8529 / 0.8620 / 0.8628). Threshold 0.83 from sglang nightly retained. | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8469 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 accuracy (GSM8K)",
+            "value": 0.8741,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8605 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
+            "value": 0.8704,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8544 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
+            "value": 84.67,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8544 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.54,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 accuracy (GSM8K)",
+            "value": 0.8484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8332 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP accuracy (GSM8K)",
+            "value": 0.8476,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8347 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP MTP acceptance (%)",
+            "value": 84.53,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8347 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 3.54,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.9014,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.185 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
+            "value": 0.8848,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37032752903 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1539 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
