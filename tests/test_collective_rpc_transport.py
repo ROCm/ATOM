@@ -533,6 +533,21 @@ def test_a_rank_that_died_is_named_even_after_the_deadline():
     assert "died" in results[1].error
 
 
+def test_a_reply_that_arrived_is_taken_even_after_the_deadline():
+    """Ranks are collected in turn against one deadline, so a silent rank can
+    spend all of it before the next rank's turn. That rank answered meanwhile,
+    and with no time left the poll still takes what is already queued."""
+    mgr = _mgr(2)
+    threading.Timer(
+        0.05, _reply, args=(mgr, 1, "r1"), kwargs={"value": "answered"}
+    ).start()
+
+    results = mgr.collective_rpc("m", RpcPayload("r1"), timeout=0.3)
+
+    assert "timed out" in results[0].error
+    assert results[1].value == "answered"
+
+
 def test_a_barrier_call_that_times_out_still_releases_the_survivors():
     """The deadline branch returned before the barrier check, so a rank found
     dead on the last poll left the others waiting after the call had given up
