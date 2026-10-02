@@ -14,6 +14,7 @@ that left most of it old.
 
 import contextlib
 import logging
+from unittest import mock
 
 import pytest
 import torch
@@ -444,7 +445,10 @@ def _legacy_reload(runner, path, checkpoint):
         with _shm_segment(flat) as shm_name:
             return runner.update_weights_from_shm(shm_name, meta)
     runner._ipc_buffer = flat  # as mapped from the sender's handle
-    return runner.update_weights_from_ipc(None, meta)
+    # Releasing the sender's mapping is not under test, and on a CPU-only torch
+    # it raises an AssertionError the updater does not catch.
+    with mock.patch.object(torch.cuda, "ipc_collect", lambda: None):
+        return runner.update_weights_from_ipc(None, meta)
 
 
 @pytest.mark.parametrize("path", ["shm", "ipc"])
