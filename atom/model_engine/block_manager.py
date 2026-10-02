@@ -215,6 +215,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
+            state_tier_cpu_bytes,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -370,6 +371,12 @@ class BlockManager:
             self.state_offload = StateOffloadIndex(
                 can_store=self.state_tier_capability.can_store_state,
                 can_load=self.state_tier_capability.can_load_state,
+                # The codec stores one `slot_bytes` image per entry.
+                max_cpu_entries=(
+                    state_tier_cpu_bytes() // checkpoint_spec.slot_bytes
+                    if checkpoint_spec is not None
+                    else None
+                ),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
