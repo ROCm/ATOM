@@ -148,7 +148,12 @@ class StateSlotAllocator:
             k = keys[i]
             slot = key_to_slot.get(k)
             if slot is None:
-                slot = self._acquire(active)
+                # Reserved-but-unclaimed slots are live too: one holds bytes a
+                # parked request's restore already wrote, and handing it to a
+                # batch member puts two requests on one ring. They are not in
+                # `active` because their request has no batch row yet -- which
+                # is the whole reason reservations exist.
+                slot = self._acquire(active | self._reserved)
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
                 reset.add(slot)

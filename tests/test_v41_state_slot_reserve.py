@@ -106,3 +106,27 @@ def test_a_released_slot_is_reset_for_its_next_tenant():
     allocator.release("r0")
     _, reset = allocator.assign(["r1"], [4096])
     assert reset == {0}
+
+
+def test_assign_does_not_evict_a_reserved_slot():
+    """A parked request's restored bytes must survive the next batch.
+
+    The reservation is not in `active` -- that is the point of it, the request
+    has no batch row yet -- so `assign` has to be told about it separately.
+    Without this the restore lands, the next batch takes the slot, and the two
+    requests run on one ring.
+    """
+    allocator = StateSlotAllocator(2)
+    parked = allocator.reserve("parked")
+    allocator.assign(["batch0"], [100])
+    assert allocator.slot_for("parked") == parked
+    assert allocator.slot_for("batch0") != parked
+
+
+def test_a_claimed_reservation_stops_protecting_its_slot():
+    """Otherwise every reservation shrinks the pool for good."""
+    allocator = StateSlotAllocator(2)
+    allocator.reserve("r0")
+    allocator.assign(["r0"], [4096])          # claimed: no longer a reservation
+    allocator.assign(["other"], [100])        # r0 gone from the batch
+    assert allocator.reserve("r1") is not None
