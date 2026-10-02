@@ -269,13 +269,13 @@ def _three_buckets():
     ]
 
 
-def _receive(monkeypatch, trainer, runner, synchronize=lambda *a, **k: None):
+def _receive(monkeypatch, trainer, runner, synchronize=lambda *a, **k: None, version=1):
     import torch
 
     monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
     monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
     return receiver.receive_weight_stream(
-        None, runner, device=torch.device("cpu"), expected_version=1
+        None, runner, device=torch.device("cpu"), expected_version=version
     )
 
 
@@ -312,17 +312,39 @@ def test_a_version_mismatch_drains_before_raising(monkeypatch):
     assert runner.events[:1] == ["begin"] and "apply1" not in runner.events
 
 
-def test_a_header_without_sizes_cannot_be_drained(monkeypatch):
-    """Nothing says what the sender broadcasts next, so there is no step to
-    keep; failing at once is the only option."""
+def test_a_header_whose_sizes_cannot_be_received_fails_at_once(monkeypatch):
+    """No buffer of a negative size can be posted, so there is no step left
+    to keep; failing at once is the only option."""
     import torch
 
-    bad = torch.tensor([7, 0, 0, 1], dtype=torch.int64)
+    bad = torch.tensor([_CMD_BUCKET, -1, 8, 1], dtype=torch.int64)
     trainer = _Trainer([bad, *_frames(_three_buckets())])
     runner = _Runner()
 
     with pytest.raises(RuntimeError, match="invalid RDMA weight header"):
         _receive(monkeypatch, trainer, runner)
+    assert runner.events[-1].startswith("abort")
+
+
+def test_an_unknown_command_is_received_before_it_is_refused(monkeypatch):
+    """Like any frame but the end marker, it carries the sizes of the two
+    broadcasts that follow it. Refused at the header, this rank left the
+    trainer and every other rank waiting in those."""
+    import torch
+
+    unknown = [
+        torch.tensor([9, 3, 5, 1], dtype=torch.int64),
+        torch.zeros(3, dtype=torch.uint8),
+        torch.zeros(5, dtype=torch.uint8),
+    ]
+    trainer = _Trainer([*unknown, *_frames(_three_buckets())])
+    runner = _Runner()
+
+    with pytest.raises(RuntimeError, match="command=9"):
+        _receive(monkeypatch, trainer, runner)
+
+    assert trainer.frames == [], "every remaining broadcast must still be joined"
+    assert not [e for e in runner.events if e.startswith("apply")]
     assert runner.events[-1].startswith("abort")
 
 
@@ -337,8 +359,70 @@ def test_a_refused_begin_still_receives_the_stream(monkeypatch):
         _receive(monkeypatch, trainer, runner)
 
     assert trainer.frames == [], "every remaining broadcast must still be joined"
-    assert not [e for e in runner.events if e.startswith("apply")]
-    assert runner.events[-1].startswith("abort")
+    assert runner.events == ["begin"], "nothing applied, and nothing aborted"
+
+
+def _transacting_runner():
+    """The real transaction, over a model of one weight."""
+    import torch
+    from torch import nn
+
+    from atom.rollout.weight_updater import WeightUpdaterMixin
+
+    class _Real(WeightUpdaterMixin):
+        device = torch.device("cpu")
+        label = "test"
+        rank = 0
+        world_size = 1
+
+        def __init__(self):
+            self.model = nn.Module()
+            self.model.w = nn.Parameter(torch.zeros(1), requires_grad=False)
+
+        def clear_kv_cache(self):
+            pass
+
+        def _sync_target_model(self):
+            return self.model
+
+    return _Real()
+
+
+def test_a_refused_stream_leaves_a_reload_another_caller_has_open(monkeypatch):
+    """The abort on the way out ends whatever reload is open, and the one that
+    refused this stream was not this stream's."""
+    import torch
+
+    runner = _transacting_runner()
+    runner.begin_weight_update(1)
+    trainer = _Trainer(_frames(_three_buckets(), version=2))
+
+    with pytest.raises(RuntimeError, match="already in progress"):
+        _receive(monkeypatch, trainer, runner, version=2)
+
+    assert trainer.frames == []
+    assert runner.get_weight_update_status()["in_progress"] == 1
+    runner.apply_weight_bucket([("w", torch.ones(1))])
+    runner.commit_weight_update(1)
+    runner.assert_weight_update_ready()
+
+
+def test_a_replayed_stream_leaves_the_committed_weights_serving(monkeypatch):
+    """It wrote nothing, so there is nothing to fence; fenced anyway, serving
+    stopped until a reload the weights did not need."""
+    import torch
+
+    runner = _transacting_runner()
+    runner.begin_weight_update(1)
+    runner.apply_weight_bucket([("w", torch.ones(1))])
+    runner.commit_weight_update(1)
+    trainer = _Trainer(_frames(_three_buckets(), version=1))
+
+    with pytest.raises(RuntimeError, match="must increase"):
+        _receive(monkeypatch, trainer, runner, version=1)
+
+    runner.assert_weight_update_ready()
+    assert runner.get_weight_update_status()["last_committed"] == 1
 
 
 def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):

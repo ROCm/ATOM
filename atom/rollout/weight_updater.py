@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from collections.abc import Iterable
 
 import torch
 
@@ -927,13 +928,11 @@ class WeightUpdaterMixin:
         counts = self._apply_named_tensors(named_tensors)
         updated = counts["updated"]
 
-        self._finalize_expert_weight_sync()
+        self._relayout_rewritten_experts()
 
         if clear_kv_cache:
             self.clear_kv_cache()
 
-        # A fused parameter still waiting on shards was not rewritten.
-        incomplete = bool(getattr(self, "_packed_weight_accum", None))
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
 
@@ -943,25 +942,23 @@ class WeightUpdaterMixin:
             f"ignored_scales={counts['ignored_scales']}"
         )
         self._warn_if_nothing_matched(updated, counts["skipped"])
-        matched_nothing = updated == 0 and counts["skipped"] > 0
-        self._lift_partial_reload_fence(
-            "direct", complete=not incomplete and not matched_nothing
-        )
+        self._lift_partial_reload_fence("direct")
         return updated
 
     def _apply_named_tensors(
-        self, named_tensors: list[tuple[str, torch.Tensor]]
+        self, named_tensors: Iterable[tuple[str, torch.Tensor]]
     ) -> dict:
         """Apply one batch of named tensors, without finalising anything.
 
-        Extracted from ``update_weights`` so the bucketed RDMA path can reuse it
-        verbatim. Finalisation (expert relayout, KV clear, accumulator teardown)
+        One loop for every path -- direct, SHM, IPC and the bucketed RDMA
+        stream -- so they cannot drift apart in what they write or credit.
+        Finalisation (expert relayout, KV clear, accumulator teardown)
         deliberately stays with the caller: a bucketed stream must do it once at
         commit, not once per bucket, or a fused parameter whose shards span
         buckets would be finalised half-built.
 
-        Every write is credited to the open reload, if there is one, by the
-        parameter it landed in; see ``_credit_reload``.
+        Every write is credited by the parameter it landed in, whenever writes
+        are being counted; see ``_counting_writes``.
         """
         param_to_module = self._get_param_to_module_mapping()
 
@@ -993,9 +990,9 @@ class WeightUpdaterMixin:
             weight_loader = getattr(module, "weight_loader", None)
 
             if param_name in _EXPERT_BUFFER_SHARDS:
+                # Credited once its layout is back; see _relayout_rewritten_experts.
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
                 updated += 1
-                self._credit_reload(param)
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 if self._requantize_fp8_weight(module, param_name, param, tensor):
                     updated += 1
@@ -1060,15 +1057,24 @@ class WeightUpdaterMixin:
     # two names. What commit has to establish is that every parameter the
     # model serves from was rewritten, and that is a question about objects.
 
+    def _counting_writes(self) -> bool:
+        """Inside a reload, or while serving is fenced.
+
+        Fenced, the reload that lifts the fence -- by whichever path -- has to
+        show what a commit does: that every parameter was rewritten.
+        """
+        in_reload = getattr(self, "_weight_update_version", None) is not None
+        return in_reload or not getattr(self, "_weight_update_healthy", True)
+
     def _credit_reload(self, param: torch.nn.Parameter) -> None:
-        """Count *param* as rewritten in full by the open reload, if any."""
-        if getattr(self, "_weight_update_version", None) is not None:
+        """Count *param* as rewritten in full, if writes are being counted."""
+        if self._counting_writes():
             self._weight_update_written.add(id(param))
 
     def _credit_reload_part(self, param: torch.nn.Parameter, part, required) -> None:
         """Count one piece of a fused *param*, which is rewritten only once
         every piece in *required* has been."""
-        if getattr(self, "_weight_update_version", None) is None:
+        if not self._counting_writes():
             return
         entry = self._weight_update_parts.get(id(param))
         if entry is None:
@@ -1086,18 +1092,25 @@ class WeightUpdaterMixin:
         if isinstance(scale, torch.nn.Parameter):
             self._credit_reload(scale)
 
-    def _credit_rewritten_expert_buffers(self) -> None:
-        """Credit each fused expert buffer whose every slice this reload wrote.
+    def _relayout_rewritten_experts(self) -> None:
+        """Re-establish the expert layout, then credit the slices it covered.
 
-        Read off the relayout bookkeeping, before the relayout consumes it: it
+        Read off the relayout bookkeeping before the relayout consumes it: it
         records exactly which (expert, shard) slices were written, and begin
-        clears it, so a buffer counts only once all of its experts arrived.
+        clears it. Credited only once the relayout has returned, since a slice
+        is rewritten when its layout is back rather than when its bytes are;
+        and per expert, so a buffer whose experts arrive over several syncs
+        still adds up to the whole buffer.
         """
+        relaid = []
         for (module, param_name), arrived in self._pending_expert_relayout.items():
-            buffer = getattr(module, param_name)
-            required = _EXPERT_BUFFER_SHARDS[param_name]
-            if all(required <= arrived.get(e, set()) for e in range(buffer.shape[0])):
-                self._credit_reload(buffer)
+            whole = _EXPERT_BUFFER_SHARDS[param_name]
+            experts = [e for e, shards in arrived.items() if whole <= shards]
+            relaid.append((getattr(module, param_name), experts))
+        self._finalize_expert_weight_sync()
+        for buffer, experts in relaid:
+            for expert_id in experts:
+                self._credit_reload_part(buffer, expert_id, range(buffer.shape[0]))
 
     def _reload_coverage(self) -> set[int]:
         whole_by_parts = {
@@ -1106,6 +1119,10 @@ class WeightUpdaterMixin:
             if required <= got
         }
         return self._weight_update_written | whole_by_parts
+
+    def _reset_reload_coverage(self) -> None:
+        self._weight_update_written: set[int] = set()
+        self._weight_update_parts: dict[int, tuple[frozenset, set]] = {}
 
     def _discard_reload_scratch(self) -> None:
         """Forget cross-bucket state, so no reload inherits another's."""
@@ -1140,8 +1157,7 @@ class WeightUpdaterMixin:
 
         self._weight_update_version = version
         self._last_started_weight_version = version
-        self._weight_update_written: set[int] = set()
-        self._weight_update_parts: dict[int, tuple[frozenset, set]] = {}
+        self._reset_reload_coverage()
         self._weight_update_sources: set[str] = set()
         self._weight_update_skipped: set[str] = set()
         self._weight_update_buckets = 0
@@ -1204,11 +1220,10 @@ class WeightUpdaterMixin:
             raise error
 
         try:
-            self._credit_rewritten_expert_buffers()
             # Once, at the end: a fused parameter's shards may have spanned
             # buckets, so relayout before this point would work on a half-built
             # parameter.
-            self._finalize_expert_weight_sync()
+            self._relayout_rewritten_experts()
 
             leftover = sorted(getattr(self, "_packed_weight_accum", {}).keys())
             if leftover:
@@ -1266,6 +1281,9 @@ class WeightUpdaterMixin:
         self._weight_update_version = None
         self._weight_update_healthy = False
         self._weight_update_failure = str(error)
+        # Counted afresh from here: what lifts the fence is a reload that
+        # rewrites everything after it went up, not what this one wrote before.
+        self._reset_reload_coverage()
         # Includes the expert slices this reload registered for relayout. Kept,
         # the next reload would relayout them a second time or fail on their
         # missing shards; dropped, their bytes stay behind the fence until a
@@ -1294,31 +1312,39 @@ class WeightUpdaterMixin:
             f"{getattr(self, '_weight_update_failure', 'unknown')}"
         )
 
-    def _lift_partial_reload_fence(self, path: str, complete: bool) -> None:
-        """Serve again once a non-transactional reload has finished.
+    def _lift_partial_reload_fence(self, path: str) -> None:
+        """Serve again once non-transactional reloads have rewritten everything.
 
         The fence goes up when a transactional stream aborts, and only a commit
         took it down, so recovering through the direct, SHM or IPC path left
-        every later forward refused. Those paths verify no coverage, so their
-        finishing is taken on the trust they have always had -- unless this
-        one plainly did not complete.
+        every later forward refused. But those paths end on the caller's word,
+        with no manifest, so finishing one says nothing about what it covered:
+        an empty or partial reload would lift the fence over parameters the
+        failed stream left as they were. The test is therefore commit's -- every
+        parameter rewritten since the fence went up, by this reload or the ones
+        before it.
         """
         if getattr(self, "_weight_update_healthy", True):
             return
         if getattr(self, "_weight_update_version", None) is not None:
             return  # an open transaction's commit or abort decides
-        if not complete:
+        params = dict(self._sync_target_model().named_parameters())
+        covered = self._reload_coverage()
+        missing = sorted(name for name, p in params.items() if id(p) not in covered)
+        if missing:
             logger.warning(
-                f"{self.label}: {path} reload did not complete; serving stays fenced"
+                f"{self.label}: {path} reload finished, but {len(missing)}/"
+                f"{len(params)} parameters are not yet rewritten since the "
+                f"failed update ({missing[:5]}); serving stays fenced"
             )
             return
         logger.warning(
-            f"{self.label}: {path} reload finished, lifting the fence left by "
-            f"{getattr(self, '_weight_update_failure', None)!r}; this path does "
-            f"not verify coverage"
+            f"{self.label}: {path} reload has rewritten every parameter, lifting "
+            f"the fence left by {getattr(self, '_weight_update_failure', None)!r}"
         )
         self._weight_update_healthy = True
         self._weight_update_failure = None
+        self._reset_reload_coverage()
 
     def get_weight_update_status(self) -> dict:
         """Reportable state, so an orchestrator can see the fence over RPC."""
@@ -1365,88 +1391,26 @@ class WeightUpdaterMixin:
 
         try:
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
-            param_to_module = self._get_param_to_module_mapping()
 
-            updated = 0
-            skipped = 0
-            ignored_scales = 0
-
-            for name, meta in bucket_meta.items():
-                # Reconstruct a CPU tensor view from shared memory
-                dtype_str = meta["dtype"].replace("torch.", "")
-                dtype = getattr(torch, dtype_str)
-                offset = meta["offset"]
-                nbytes = meta["nbytes"]
-                tensor = (
-                    buffer[offset : offset + nbytes]
-                    .view(dtype=dtype)
-                    .view(meta["shape"])
-                )
-
-                if name not in param_to_module:
-                    result = self._apply_unmatched_weight(name, tensor, param_to_module)
-                    if result == "updated":
-                        updated += 1
-                    elif result == "accumulated":
-                        pass
-                    elif "weight_scale" in name or "input_scale" in name:
-                        ignored_scales += 1
-                    else:
-                        logger.debug(f"{self.label}: Unmatched parameter: {name}")
-                        skipped += 1
-                    continue
-
-                module, param_name, param = param_to_module[name]
-                weight_loader = getattr(module, "weight_loader", None)
-
-                if param_name in _EXPERT_BUFFER_SHARDS:
-                    self._apply_named_expert_buffer(
-                        name, param_name, module, param, tensor
+            def views():
+                for name, meta in bucket_meta.items():
+                    # Reconstruct a CPU tensor view from shared memory
+                    dtype_str = meta["dtype"].replace("torch.", "")
+                    dtype = getattr(torch, dtype_str)
+                    offset = meta["offset"]
+                    nbytes = meta["nbytes"]
+                    yield name, (
+                        buffer[offset : offset + nbytes]
+                        .view(dtype=dtype)
+                        .view(meta["shape"])
                     )
-                    updated += 1
-                elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                    if self._requantize_fp8_weight(module, param_name, param, tensor):
-                        updated += 1
-                    else:
-                        # Logged by the requantiser; the old weight is still there.
-                        skipped += 1
-                elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
-                    tensor = tensor.to(device=self.device)
-                    self._copy_into_param(param, tensor)
-                    self._post_process_fp8_weight(module, param)
-                    updated += 1
-                elif tensor.shape == param.shape:
-                    tensor = tensor.to(device=self.device, dtype=param.dtype)
-                    self._copy_into_param(param, tensor)
-                    updated += 1
-                elif weight_loader is not None and callable(weight_loader):
-                    try:
-                        tensor = tensor.to(device=self.device)
-                        self._load_into_param(param, weight_loader, tensor)
-                        updated += 1
-                    except Exception as e:  # noqa: BLE001 - a loader raises anything
-                        logger.warning(
-                            f"{self.label}: weight_loader failed for {name}: {e}"
-                        )
-                        skipped += 1
-                else:
-                    tp_size = self.world_size
-                    tp_rank = self.rank
-                    if tp_size > 1 and self._try_shard_weight(
-                        param, tensor, tp_rank, tp_size
-                    ):
-                        updated += 1
-                    else:
-                        logger.warning(
-                            f"{self.label}: Shape mismatch for {name}: "
-                            f"expected {param.shape}, got {tensor.shape}"
-                        )
-                        skipped += 1
+
+            counts = self._apply_named_tensors(views())
+            updated, skipped = counts["updated"], counts["skipped"]
 
             if is_last:
-                self._finalize_expert_weight_sync()
+                self._relayout_rewritten_experts()
                 self.clear_kv_cache()
-                incomplete = bool(getattr(self, "_packed_weight_accum", None))
                 if hasattr(self, "_packed_weight_accum"):
                     if self._packed_weight_accum:
                         logger.warning(
@@ -1454,14 +1418,11 @@ class WeightUpdaterMixin:
                             f"{list(self._packed_weight_accum.keys())}"
                         )
                     self._packed_weight_accum.clear()
-                matched_nothing = updated == 0 and skipped > 0
-                self._lift_partial_reload_fence(
-                    "SHM", complete=not incomplete and not matched_nothing
-                )
+                self._lift_partial_reload_fence("SHM")
             logger.info(
                 f"{self.label}: SHM weight update bucket done - "
                 f"updated={updated}, skipped={skipped}, "
-                f"ignored_scales={ignored_scales}, is_last={is_last}"
+                f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
             )
             self._warn_if_nothing_matched(updated, skipped)
             return updated
@@ -1533,88 +1494,35 @@ class WeightUpdaterMixin:
                 )
         buffer = self._ipc_buffer
 
-        param_to_module = self._get_param_to_module_mapping()
+        def copies():
+            for name, meta in bucket_meta.items():
+                dtype_str = meta["dtype"].replace("torch.", "")
+                dtype = getattr(torch, dtype_str)
+                offset = meta["offset"]
+                nbytes = meta["nbytes"]
 
-        updated = 0
-        skipped = 0
-        ignored_scales = 0
-
-        for name, meta in bucket_meta.items():
-            dtype_str = meta["dtype"].replace("torch.", "")
-            dtype = getattr(torch, dtype_str)
-            offset = meta["offset"]
-            nbytes = meta["nbytes"]
-
-            # View into the IPC buffer (on sender's GPU), then copy to
-            # this runner's device.  .to() always returns a new tensor
-            # when the device differs; for same-device case we need an
-            # explicit copy so the sender can safely overwrite the buffer.
-            src = buffer[offset : offset + nbytes].view(dtype=dtype).view(meta["shape"])
-            if src.device == self.device:
-                tensor = src.clone()
-            else:
-                tensor = src.to(device=self.device)
-
-            if name not in param_to_module:
-                result = self._apply_unmatched_weight(name, tensor, param_to_module)
-                if result == "updated":
-                    updated += 1
-                elif result == "accumulated":
-                    pass
-                elif "weight_scale" in name or "input_scale" in name:
-                    ignored_scales += 1
+                # View into the IPC buffer (on sender's GPU), then copy to
+                # this runner's device.  .to() always returns a new tensor
+                # when the device differs; for same-device case we need an
+                # explicit copy so the sender can safely overwrite the buffer.
+                src = (
+                    buffer[offset : offset + nbytes]
+                    .view(dtype=dtype)
+                    .view(meta["shape"])
+                )
+                if src.device == self.device:
+                    yield name, src.clone()
                 else:
-                    logger.debug(f"{self.label}: Unmatched parameter: {name}")
-                    skipped += 1
-                continue
+                    yield name, src.to(device=self.device)
 
-            module, param_name, param = param_to_module[name]
-            weight_loader = getattr(module, "weight_loader", None)
-
-            if param_name in _EXPERT_BUFFER_SHARDS:
-                self._apply_named_expert_buffer(name, param_name, module, param, tensor)
-                updated += 1
-            elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
-                if self._requantize_fp8_weight(module, param_name, param, tensor):
-                    updated += 1
-                else:
-                    # Logged by the requantiser; the old weight is still there.
-                    skipped += 1
-            elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
-                self._copy_into_param(param, tensor)
-                self._post_process_fp8_weight(module, param)
-                updated += 1
-            elif tensor.shape == param.shape:
-                if tensor.dtype != param.dtype:
-                    tensor = tensor.to(dtype=param.dtype)
-                self._copy_into_param(param, tensor)
-                updated += 1
-            elif weight_loader is not None and callable(weight_loader):
-                try:
-                    self._load_into_param(param, weight_loader, tensor)
-                    updated += 1
-                except Exception as e:  # noqa: BLE001 - a loader raises anything
-                    logger.warning(
-                        f"{self.label}: weight_loader failed for {name}: {e}"
-                    )
-                    skipped += 1
-            else:
-                tp_size = self.world_size
-                tp_rank = self.rank
-                if tp_size > 1 and self._try_shard_weight(
-                    param, tensor, tp_rank, tp_size
-                ):
-                    updated += 1
-                else:
-                    logger.warning(
-                        f"{self.label}: Shape mismatch for {name}: "
-                        f"expected {param.shape}, got {tensor.shape}"
-                    )
-                    skipped += 1
+        # A generator, not a list: a list would hold a copy of the whole
+        # bucket at once.
+        counts = self._apply_named_tensors(copies())
+        updated, skipped = counts["updated"], counts["skipped"]
 
         # Only release the IPC buffer mapping on the last bucket
         if is_last:
-            self._finalize_expert_weight_sync()
+            self._relayout_rewritten_experts()
             self._ipc_buffer = None
             try:
                 torch.cuda.ipc_collect()
@@ -1623,7 +1531,6 @@ class WeightUpdaterMixin:
                 logger.debug("torch.cuda.ipc_collect skipped: %s", e)
 
             self.clear_kv_cache()
-            incomplete = bool(getattr(self, "_packed_weight_accum", None))
             if hasattr(self, "_packed_weight_accum"):
                 if self._packed_weight_accum:
                     logger.warning(
@@ -1631,14 +1538,11 @@ class WeightUpdaterMixin:
                         f"{list(self._packed_weight_accum.keys())}"
                     )
                 self._packed_weight_accum.clear()
-            matched_nothing = updated == 0 and skipped > 0
-            self._lift_partial_reload_fence(
-                "IPC", complete=not incomplete and not matched_nothing
-            )
+            self._lift_partial_reload_fence("IPC")
         logger.info(
             f"{self.label}: IPC weight update bucket done - "
             f"updated={updated}, skipped={skipped}, "
-            f"ignored_scales={ignored_scales}, is_last={is_last}"
+            f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
         )
         self._warn_if_nothing_matched(updated, skipped)
         return updated

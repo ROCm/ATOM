@@ -346,6 +346,53 @@ def test_a_direct_full_reload_lifts_the_fence_an_aborted_stream_left():
     assert runner.get_weight_update_status()["healthy"] is True
 
 
+def test_an_empty_reload_does_not_lift_it():
+    """Those paths end on the caller's word, so finishing one was enough: a
+    reload that sent nothing lifted the fence over all the failed stream left."""
+    runner = _fenced(_Runner(_dense_model()))
+    runner.update_weights([])
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+
+def test_a_partial_reload_lifts_it_only_once_the_rest_arrives():
+    runner = _fenced(_Runner(_dense_model()))
+    ckpt = _dense_checkpoint()
+    runner.update_weights([("attn.o_proj.weight", ckpt.pop("attn.o_proj.weight"))])
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+    runner.update_weights(list(ckpt.items()))
+    runner.assert_weight_update_ready()
+
+
+def test_what_the_failed_stream_wrote_is_no_part_of_the_recovery():
+    """It rewrote o_proj before failing; a recovery that sends everything else
+    has still not rewritten the model."""
+    runner = _Runner(_dense_model())
+    ckpt = _dense_checkpoint()
+    runner.begin_weight_update(1)
+    runner.apply_weight_bucket([("attn.o_proj.weight", ckpt.pop("attn.o_proj.weight"))])
+    runner.abort_weight_update(1, RuntimeError("stream failed"))
+
+    runner.update_weights(list(ckpt.items()))
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+
+def test_experts_rewritten_over_several_reloads_add_up():
+    """Each reload relays out what it sent, so a buffer is credited expert by
+    expert; counted whole, one whose experts came in two reloads never was."""
+    runner = _fenced(_Runner(_moe_model()))
+    runner.update_weights(list(_expert_checkpoint(experts=[0]).items()))
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+    runner.update_weights(list(_expert_checkpoint(experts=[1]).items()))
+    runner.assert_weight_update_ready()
+
+
 def _staged(checkpoint):
     """Laid out as the SHM and IPC senders lay it out: one flat byte buffer,
     and where each tensor sits in it."""
@@ -390,6 +437,33 @@ def test_the_shm_path_lifts_it_on_its_last_bucket_only():
     runner.assert_weight_update_ready()
 
 
+def _legacy_reload(runner, path, checkpoint):
+    """One SHM or IPC reload of *checkpoint*, sent as its last bucket."""
+    flat, meta = _staged(checkpoint)
+    if path == "shm":
+        with _shm_segment(flat) as shm_name:
+            return runner.update_weights_from_shm(shm_name, meta)
+    runner._ipc_buffer = flat  # as mapped from the sender's handle
+    return runner.update_weights_from_ipc(None, meta)
+
+
+@pytest.mark.parametrize("path", ["shm", "ipc"])
+def test_a_full_shm_or_ipc_reload_lifts_it(path):
+    runner = _fenced(_Runner(_dense_model()))
+    _legacy_reload(runner, path, _dense_checkpoint())
+    runner.assert_weight_update_ready()
+
+
+@pytest.mark.parametrize("path", ["shm", "ipc"])
+def test_a_partial_shm_or_ipc_reload_keeps_it(path):
+    """Its last bucket was all it took, however little the reload held."""
+    runner = _fenced(_Runner(_dense_model()))
+    ckpt = _dense_checkpoint()
+    _legacy_reload(runner, path, {"attn.o_proj.weight": ckpt["attn.o_proj.weight"]})
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+
 @pytest.mark.parametrize("path", ["shm", "ipc"])
 def test_a_requantisation_that_did_not_write_is_not_counted(monkeypatch, path):
     """Counted as updated regardless, a reload that wrote nothing reported
@@ -398,16 +472,9 @@ def test_a_requantisation_that_did_not_write_is_not_counted(monkeypatch, path):
         WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: False
     )
     runner = _fenced(_Runner(_fp8_model()))
-    flat, meta = _staged({"layer.weight": torch.ones(4, HIDDEN, dtype=torch.bfloat16)})
+    incoming = {"layer.weight": torch.ones(4, HIDDEN, dtype=torch.bfloat16)}
 
-    if path == "shm":
-        with _shm_segment(flat) as shm_name:
-            updated = runner.update_weights_from_shm(shm_name, meta)
-    else:
-        runner._ipc_buffer = flat  # as mapped from the sender's handle
-        updated = runner.update_weights_from_ipc(None, meta)
-
-    assert updated == 0
+    assert _legacy_reload(runner, path, incoming) == 0
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
