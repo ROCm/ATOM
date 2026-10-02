@@ -1110,8 +1110,26 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def _stash_kda_stores(self, metadata) -> None:
         stores = getattr(metadata, "kda_stores", None) or ()
-        if stores:
-            self._pending_kda_stores.extend(stores)
+        if not stores:
+            return
+        if self._is_deepseek_v41:
+            # Snapshot now, not at the flush. This runs inside `start_load_kv`,
+            # which vLLM calls before the forward; `_flush_kda_stores` runs
+            # from `wait_for_save`, after it. By then `advance_cursor` has
+            # moved the slot's cursor to the END of this step's tokens, so the
+            # image no longer reads the frontier it would be keyed by -- which
+            # is precisely what the cursor guard refuses. K3 can flush late
+            # because its source is a block vLLM copied aside; V4.1's source is
+            # the live slot, and the live slot has a tense.
+            refused = self._v41_leg.snapshot_and_submit(stores)
+            if refused:
+                self._v41_refusals.extend(
+                    (reason, op_id)
+                    for reason, op_ids in refused.items()
+                    for op_id in op_ids
+                )
+            return
+        self._pending_kda_stores.extend(stores)
 
     def _flush_kda_stores(self) -> None:
         """D2H the stashed boundary pages, fenced to the compute stream now.
@@ -1126,18 +1144,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         stores = self._pending_kda_stores
         self._pending_kda_stores = []
         if tier is None or not stores:
-            return
-        if self._is_deepseek_v41:
-            # The snapshot has to happen here rather than in the tier: it reads
-            # the live slot, so it must be ordered on the compute stream
-            # between the forward that wrote it and the one that overwrites it.
-            refused = self._v41_leg.snapshot_and_submit(stores)
-            if refused:
-                self._v41_refusals.extend(
-                    (reason, op_id)
-                    for reason, op_ids in refused.items()
-                    for op_id in op_ids
-                )
             return
         ready_event = None
         if torch.cuda.is_available():
