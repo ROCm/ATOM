@@ -15,6 +15,28 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
+def build_aux_capture_spec(config) -> AuxCaptureSpec | None:
+    """Default DSpark aux-capture spec, derived from config alone (None if no DSpark).
+
+    Lets drafterless PP stages arm capture (`PPAuxRelay`); `DSparkProposer` uses
+    it too so the two cannot drift.
+    """
+    spec_cfg = getattr(config, "speculative_config", None)
+    if spec_cfg is None or not spec_cfg.use_dspark():
+        return None
+    draft_cfg = spec_cfg.draft_model_hf_config
+    layer_ids = tuple(
+        int(i) for i in (getattr(draft_cfg, "dspark_target_layer_ids", None) or ())
+    )
+    if not layer_ids:
+        raise ValueError("DSpark requires dspark_target_layer_ids on the draft config.")
+    return AuxCaptureSpec(
+        layer_ids=layer_ids,
+        hidden_size=config.hf_config.hidden_size,
+        extract=DSparkProposer._extract_layer_hidden,
+    )
+
+
 class DSparkProposer(Drafter):
     """DSpark block-parallel drafter (sibling of ``EagleProposer``).
 
@@ -463,6 +485,17 @@ class DSparkProposer(Drafter):
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
         """Resolve the draft's feature contract; the base owns capture buffers."""
+        own = getattr(self.model, "target_aux_capture_spec", None)
+        if own is None:
+            return build_aux_capture_spec(self.config)
+        if int(getattr(self.config, "pipeline_parallel_size", 1) or 1) > 1:
+            # Drafterless PP stages can only rebuild the default spec; relaying
+            # it to a draft with its own contract would be silently wrong.
+            raise NotImplementedError(
+                f"{type(self.model).__name__} declares its own "
+                "target_aux_capture_spec, which pipeline parallelism cannot "
+                "reconstruct on a drafterless stage."
+            )
         draft_cfg = self.speculative_config.draft_model_hf_config
         layer_ids = tuple(
             int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
@@ -471,14 +504,7 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
-        own = getattr(self.model, "target_aux_capture_spec", None)
-        if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
-        return AuxCaptureSpec(
-            layer_ids=layer_ids,
-            hidden_size=self.config.hf_config.hidden_size,
-            extract=self._extract_layer_hidden,
-        )
+        return own(layer_ids, self.config.hf_config.hidden_size)
 
     @staticmethod
     def _extract_layer_hidden(output, block: nn.Module):

@@ -2632,22 +2632,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # on the batch (= num_spec_step+1 for plain MTP, or the DSpark q-bucket
         # when shrunk). positions/attn use this so the (running_bs, q) graph is
         # selected. See `ForwardMode.max_seqlen_q`.
-        # MTP: roll back ctx by `num_rejected` so this fwd's positions overwrite
-        # last fwd's rejected-draft slots (matches aiter_mla.py:701 /
-        # aiter_attention.py:542). `batch.context_lens` = `seq.num_tokens`
-        # which the scheduler advances by `mtp_k - num_rejected` placeholders
-        # per fwd (scheduler.py:789); without this rollback, MTP-k positions
-        # would skip ahead by `num_rejected` and the rejected slots would
-        # never be overwritten with the corrected K/V. `num_rejected` is None
-        # on dummy runs and on the first fwd before any sampler output.
+        # MTP: `seq.num_tokens` runs past this fwd's window by
+        # `verify_context_shift()` (`num_rejected` deferred, 1 undeferred/PP);
+        # roll ctx back so positions overwrite last fwd's rejected-draft slots.
+        # None on dummy runs and before the first sampler output.
         # The rolled-back ctx is also what anchors `positions` (at `ctx -
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens_np = context_lens_np - num_rejected.astype(np.int32)
+            shift = self.model_runner.tokenID_processor.verify_context_shift()
+            if shift is not None:
+                context_lens_np = context_lens_np - shift.astype(np.int32)
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never
         # OOB); dropped tail slots are re-drafted next step (lossless). No-op when

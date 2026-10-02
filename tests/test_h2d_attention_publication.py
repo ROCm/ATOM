@@ -78,7 +78,9 @@ def make_runner(
             eos_token_id=2,
         ),
     )
-    runner.tokenID_processor = SimpleNamespace(num_rejected=None)
+    runner.tokenID_processor = SimpleNamespace(
+        num_rejected=None, verify_context_shift=lambda: None
+    )
     runner.forward_vars = {
         name: CpuGpuBuffer(64, dtype=torch.int32, device=runner.device)
         for name in ("input_ids", "decode_src")
