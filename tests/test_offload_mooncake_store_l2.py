@@ -14,6 +14,7 @@ import asyncio
 import ctypes
 import errno
 import functools
+import json
 import logging
 import sys
 import threading
@@ -67,6 +68,7 @@ def store_env(monkeypatch):
     monkeypatch.delenv("MOONCAKE_CONFIG_PATH", raising=False)
     monkeypatch.delenv("ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES", raising=False)
     monkeypatch.delenv("ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES", raising=False)
+    monkeypatch.delenv("ATOM_LMCACHE_MOONCAKE_POOLS", raising=False)
 
 
 def _root_complex(bus: str) -> str:
@@ -186,6 +188,75 @@ def test_prepare_pins_one_nic_and_installs_every_patch(store_env, monkeypatch):
     assert calls == ["prctl", "thp", "lookup", "get"]
 
 
+POOLS = {
+    "rdma2": {"master": "10.0.0.1:50251", "metadata": "http://10.0.0.1:50280/metadata"},
+    "rdma3": {"master": "10.0.0.1:50351", "metadata": "http://10.0.0.1:50380/metadata"},
+}
+
+
+def _prepare_on(monkeypatch, device):
+    """prepare_mooncake_store_l2 for a worker whose NIC is ``device``."""
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(current_device=lambda: 0)),
+    )
+    monkeypatch.setattr(l2, "requester_rdma_device", lambda index: device)
+    for patch in (
+        "install_thp_pinned_allocator",
+        "install_batch_is_exist_lookup",
+        "install_non_blocking_l2_get_allocation",
+        "_require_thp_allowed",
+    ):
+        monkeypatch.setattr(l2, patch, lambda: None)
+    cfg = _cfg()
+    l2.prepare_mooncake_store_l2(cfg)
+    return cfg
+
+
+def test_parse_store_pools():
+    assert l2.parse_store_pools(" ") == {}
+    assert l2.parse_store_pools(json.dumps(POOLS)) == {
+        "rdma2": l2.StorePool("10.0.0.1:50251", "http://10.0.0.1:50280/metadata"),
+        "rdma3": l2.StorePool("10.0.0.1:50351", "http://10.0.0.1:50380/metadata"),
+    }
+    for bad, match in (
+        ("rdma0=10.0.0.1:50051", "not JSON"),
+        ("{}", "non-empty JSON object"),
+        ('["rdma0"]', "non-empty JSON object"),
+        ('{"rdma0": {"metadata": "http://h/metadata"}}', "'rdma0'"),
+        ('{"rdma0": "10.0.0.1:50051"}', "'rdma0'"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            l2.parse_store_pools(bad)
+
+
+def test_prepare_points_each_rank_at_the_pool_of_its_nic(store_env, monkeypatch):
+    monkeypatch.setenv("ATOM_LMCACHE_MOONCAKE_POOLS", json.dumps(POOLS))
+    cfg = _prepare_on(monkeypatch, "rdma3")
+    assert cfg.extra_config["mooncake_rdma_devices"] == "rdma3"
+    assert cfg.extra_config["mooncake_master_server_addr"] == "10.0.0.1:50351"
+    assert (
+        cfg.extra_config["mooncake_metadata_server"] == "http://10.0.0.1:50380/metadata"
+    )
+    assert cfg.remote_url == "mooncakestore://10.0.0.1:50351/"
+    with pytest.raises(ValueError, match="no pool for RDMA device 'rdma0'"):
+        _prepare_on(monkeypatch, "rdma0")
+
+
+def test_prepare_without_pools_keeps_the_configured_master(store_env, monkeypatch):
+    cfg = _prepare_on(monkeypatch, "rdma3")
+    assert cfg.extra_config["mooncake_master_server_addr"] == "10.0.0.1:50051"
+    assert cfg.remote_url == "mooncakestore://10.0.0.1:50051/"
+
+
+def test_store_pool_of_needs_an_rdma_device(store_env, monkeypatch):
+    assert l2.store_pool_of(None) is None
+    monkeypatch.setenv("ATOM_LMCACHE_MOONCAKE_POOLS", json.dumps(POOLS))
+    with pytest.raises(ValueError, match="tcp"):
+        l2.store_pool_of(None)
+
+
 def test_prepare_validates_before_it_patches(store_env, monkeypatch):
     monkeypatch.setenv("MC_NUM_QP_PER_EP", "2")
     monkeypatch.setattr(l2, "install_thp_pinned_allocator", pytest.fail)
@@ -271,6 +342,14 @@ def test_requester_device_never_shares_an_owner_nic(node, monkeypatch):
     assert l2.requester_rdma_device(0) == "rdma3"
     with pytest.raises(ValueError, match="'rdma7'.*Store owner"):
         l2.requester_rdma_device(4)
+
+
+def test_requester_device_shares_the_owner_nic_of_its_own_pool(node, monkeypatch):
+    monkeypatch.setenv(
+        "ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES", "rdma0,rdma1,rdma2,rdma3"
+    )
+    monkeypatch.setenv("ATOM_LMCACHE_MOONCAKE_POOLS", json.dumps(POOLS))
+    assert l2.requester_rdma_device(0) == "rdma3"
 
 
 # --- THP pinned L1 -----------------------------------------------------------

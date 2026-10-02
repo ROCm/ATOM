@@ -57,6 +57,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import functools
+import json
 import logging
 import os
 import platform
@@ -158,14 +159,21 @@ def prepare_mooncake_store_l2(cfg: Any) -> None:
 
         device = requester_rdma_device(torch.cuda.current_device())
         extra["mooncake_rdma_devices"] = device
+    pool = store_pool_of(device)
+    if pool is not None:
+        extra["mooncake_master_server_addr"] = pool.master
+        extra["mooncake_metadata_server"] = pool.metadata
+        cfg.remote_url = f"{MOONCAKE_STORE_URL_SCHEME}{pool.master}/"
     install_thp_pinned_allocator()
     install_batch_is_exist_lookup()
     install_non_blocking_l2_get_allocation()
     logger.info(
-        "LMCache Mooncake Store L2: protocol=%s rdma_devices=%s, THP pinned L1, "
-        "one batch_is_exist RPC per lookup, L2 gets without waiting for L1 room",
+        "LMCache Mooncake Store L2: protocol=%s rdma_devices=%s master=%s, THP "
+        "pinned L1, one batch_is_exist RPC per lookup, L2 gets without waiting "
+        "for L1 room",
         protocol,
         device or "-",
+        extra.get("mooncake_master_server_addr", "-"),
     )
 
 
@@ -297,7 +305,9 @@ def requester_rdma_device(device_index: int) -> str:
     if not (_IB_SYSFS_ROOT / device).exists():
         raise ValueError(f"RDMA device {device!r} from {origin} does not exist")
     owner_devices = parse_device_list(envs.ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES)
-    if device in owner_devices:
+    # With per-NIC pools the owners on this device are its own pool's, the
+    # only ones this worker reads; store_pool_of checks the device has one.
+    if device in owner_devices and not envs.ATOM_LMCACHE_MOONCAKE_POOLS.strip():
         raise ValueError(
             f"RDMA device {device!r} from {origin} is also a Store owner's "
             f"(ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES={','.join(owner_devices)}); "
@@ -310,6 +320,73 @@ def requester_rdma_device(device_index: int) -> str:
         origin,
     )
     return device
+
+
+class StorePool(NamedTuple):
+    """The master of one per-NIC Store pool."""
+
+    master: str
+    metadata: str
+
+
+def parse_store_pools(value: str) -> dict[str, StorePool]:
+    """Parse ``ATOM_LMCACHE_MOONCAKE_POOLS``; blank means one shared pool.
+
+    Raises:
+        ValueError: Not a non-empty JSON object mapping each RDMA device to
+            ``{"master": "host:port", "metadata": "<url>"}``.
+    """
+    if not value.strip():
+        return {}
+    try:
+        table = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ATOM_LMCACHE_MOONCAKE_POOLS is not JSON: {exc}") from exc
+    if not isinstance(table, dict) or not table:
+        raise ValueError(
+            "ATOM_LMCACHE_MOONCAKE_POOLS must be a non-empty JSON object keyed "
+            "by RDMA device"
+        )
+    pools = {}
+    for device, pool in table.items():
+        fields = pool if isinstance(pool, dict) else {}
+        master, metadata = fields.get("master"), fields.get("metadata")
+        if not (isinstance(master, str) and master and isinstance(metadata, str)):
+            raise ValueError(
+                f"ATOM_LMCACHE_MOONCAKE_POOLS[{device!r}] must be "
+                '{"master": "host:port", "metadata": "<url>"}'
+            )
+        pools[device] = StorePool(master, metadata)
+    return pools
+
+
+def store_pool_of(device: str | None) -> StorePool | None:
+    """Return the per-NIC pool of a worker's RDMA device, None without pools.
+
+    Where owners must share the requesters' NICs (a node with only its own
+    GPUs' NICs), each NIC gets a master of its own: the worker on a NIC reads
+    only that pool's owners, and a NIC carries one requester and its own
+    pool's owners instead of every owner's reads.
+
+    Raises:
+        ValueError: Pools are set, but the worker has no RDMA device (tcp)
+            or no pool for its device.
+    """
+    pools = parse_store_pools(envs.ATOM_LMCACHE_MOONCAKE_POOLS)
+    if not pools:
+        return None
+    if device is None:
+        raise ValueError(
+            "ATOM_LMCACHE_MOONCAKE_POOLS keys the Store pools by RDMA device; "
+            "a tcp Store client has none"
+        )
+    pool = pools.get(device)
+    if pool is None:
+        raise ValueError(
+            f"ATOM_LMCACHE_MOONCAKE_POOLS has no pool for RDMA device "
+            f"{device!r} (pools: {', '.join(sorted(pools))})"
+        )
+    return pool
 
 
 def gpu_pci_bdf(device_index: int) -> str:

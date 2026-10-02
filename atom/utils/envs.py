@@ -1041,6 +1041,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES": lambda: os.getenv(
         "ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES", ""
     ),
+    # Per-NIC Store pools, a JSON object keyed by RDMA device:
+    # {"rdma0": {"master": "host:port", "metadata": "http://host:port/metadata"}}.
+    # A worker uses the pool of its own device, whose owners serve on that
+    # device too. Unset: the master in LMCACHE_EXTRA_CONFIG.
+    "ATOM_LMCACHE_MOONCAKE_POOLS": lambda: os.getenv("ATOM_LMCACHE_MOONCAKE_POOLS", ""),
 }
 
 
