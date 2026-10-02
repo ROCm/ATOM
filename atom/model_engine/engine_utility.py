@@ -325,8 +325,13 @@ class EngineUtilityHandler:
         """
         delay = args.get("delay_iters")
         max_iters = args.get("max_iters")
-        delay = self.profiler_delay_iters if delay is None else int(delay)
-        max_iters = self.profiler_max_iters if max_iters is None else int(max_iters)
+        try:
+            delay = self.profiler_delay_iters if delay is None else int(delay)
+            max_iters = self.profiler_max_iters if max_iters is None else int(max_iters)
+        except (TypeError, ValueError, OverflowError) as e:
+            # Nothing above this catches, so an unconverted value would end
+            # the engine process over a mistyped argument.
+            return f"A profiling window must be a number of steps: {e}"
         if delay < 0 or max_iters < 0:
             # The HTTP body is validated, but this is also reachable from
             # `LLMEngine.start_profile`, and a negative delay counts away
@@ -477,6 +482,8 @@ class EngineUtilityHandler:
             self._profiler_recorded = 0
             self._profiler_pending = 0
             self._profiler_reservation = None
+            if self.scheduler is not None:
+                self.scheduler.profile_active = False
             self._profiler_last_error = f"profiler auto-{action} failed: {e}"
             logger.exception(f"{self.label}: profiler auto-{action} failed")
 

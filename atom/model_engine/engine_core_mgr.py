@@ -1339,15 +1339,24 @@ class CoreManager:
         # Collect one response per routable engine (must match the broadcast count
         # len(self.control_sockets), which is the global engine count on a coordinator).
         responses = []
-        for _ in range(len(self.control_sockets)):
+        while len(responses) < len(self.control_sockets):
             try:
                 resp = self.utility_response_queue.get(timeout=timeout)
-                responses.append(resp)
             except queue.Empty:
                 raise TimeoutError(
                     f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
                     f"for command '{cmd}' (timeout={timeout}s)"
                 )
+            if resp.get("cmd") not in (cmd, None):
+                # A command sent without waiting is answered on each engine's
+                # own schedule, so its replies can arrive after the drain
+                # above and would otherwise be counted as this command's.
+                logger.warning(
+                    f"{self.label}: dropping late '{resp.get('cmd')}' response "
+                    f"while waiting for '{cmd}'"
+                )
+                continue
+            responses.append(resp)
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):

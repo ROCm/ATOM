@@ -29,6 +29,7 @@ from atom.model_engine.engine_utility import EngineUtilityHandler
 
 with stubbed_aiter():
     from atom.model_engine.async_proc import AsyncIOProcManager
+    from atom.model_engine.engine_core_mgr import CoreManager
     from atom.model_engine.llm_engine import LLMEngine
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -283,14 +284,24 @@ def test_a_new_run_does_not_inherit_the_last_failure():
     assert "error" not in broadcast(one, "stop_profile")[0]
 
 
-def test_a_negative_window_is_refused():
+@pytest.mark.parametrize(
+    "window",
+    [
+        # Counts away from zero, so the window never opens.
+        {"delay_iters": -1},
+        {"max_iters": "soon"},
+        {"delay_iters": float("inf")},
+    ],
+)
+def test_a_window_that_cannot_be_counted_down_is_refused(window):
     """The request body is validated, but `LLMEngine.start_profile` is a
-    public method: a negative delay counts away from zero and never opens.
+    public method, and nothing above this handler catches: an unconverted
+    value would end the engine process instead of the request.
     """
     handler, mgr = make_handler(max_iters=5)
     one = [(handler, mgr)]
 
-    assert "error" in start_window(one, body={"delay_iters": -1})[0]
+    assert "error" in start_window(one, body=window)[0]
     assert not mgr.calls, "a refused window reached the workers"
 
     # Refusing must not disturb the window the flags describe.
@@ -566,6 +577,26 @@ def test_a_commit_timeout_stops_the_engines_that_did_commit():
         "commit_profile",
     ]
     assert [cmd for cmd, _ in core_mgr.sent] == ["stop_profile"]
+
+
+def test_a_late_reply_is_not_counted_as_another_commands_answer():
+    """Those cleanup rounds are sent without waiting, and each engine
+    answers on its own schedule -- after the drain the next round does.
+    """
+    late = {"cmd": "release_profile", "result": {"released": False}}
+    mine = {"cmd": "reserve_profile", "result": {"reserved": True}}
+
+    core_mgr = CoreManager.__new__(CoreManager)
+    core_mgr.label = "test"
+    core_mgr.control_sockets = [None]
+    core_mgr.utility_response_queue = queue.Queue()
+    core_mgr.broadcast_utility_command = lambda cmd, **kwargs: [
+        core_mgr.utility_response_queue.put(reply) for reply in (late, mine)
+    ]
+
+    collected = core_mgr.broadcast_utility_command_sync("reserve_profile", timeout=1)
+
+    assert collected == [mine], "an abandoned round answered for this one"
 
 
 def test_call_func_ticks_only_on_completed_forwards():
