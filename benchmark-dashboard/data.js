@@ -1,29 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790906108290,
+  "lastUpdate": 1790927161751,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "wanzhenchn",
-            "username": "wanzhenchn",
-            "email": "wanzhenchn@gmail.com"
-          },
-          "committer": {
-            "name": "wanzhenchn",
-            "username": "wanzhenchn",
-            "email": "wanzhenchn@gmail.com"
-          },
-          "id": "b1afd5174ebbaaf9b72e9f9ae88fc46351b18c9a",
-          "message": "fix(k3-disagg): align P/D decode shapes with scheduled batches\n\n- derive MLA query width from per-forward batch metadata\n- fall back to eager execution when an exact CUDA graph shape is unavailable\n- return the actual staged decode token range\n- initialize remote first-decode MTP windows without prompt-token leakage\n- preserve first-decode metadata without an extra scheduler scan\n- add P/D handoff and shape regression coverage",
-          "timestamp": "2026-08-29T04:09:18Z",
-          "url": "https://github.com/ROCm/ATOM/commit/b1afd5174ebbaaf9b72e9f9ae88fc46351b18c9a"
-        },
-        "date": 1788028058797,
-        "tool": "customBiggerIsBetter",
-        "benches": []
-      },
       {
         "commit": {
           "author": {
@@ -307044,6 +307023,34 @@ window.BENCHMARK_DATA = {
             "value": 0.978,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36741911049 | Threshold: 0.96 | Baseline: 0.9757 | BaselineModel: Qwen/Qwen3.8-Flash-Next-FP8 | BaselineNote: MI308 SGLang-ATOM Qwen3.8-Flash-Next TP2+EP on gfx942 192 GiB. Same 5-shot chat GSM8K bar as the MI355 Flash entry; BF16 KV and page-size 64 are required. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20260930 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.9727 | fewshot: 5 | Model: /models/Qwen/Qwen3.8-Flash-Next-FP8"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "id": "64a6a9399b99eab6a64b0229fee572d7488fb0bd",
+          "message": "fix(mooncake): bind the consumer notify listener when its port is chosen\n\nThe consumer picked its write-done port with get_open_port() in __init__\nbut bound it only when the listener thread started, after model load and\nKV registration -- about 10 minutes later. Services run with --network\nhost, so in that window any outgoing connection on the node (router,\naiperf, metrics scrapes) could take the port as its ephemeral source\nport. The bind then failed with EADDRINUSE, the listener thread died,\nthe rank never heard a write-done, and warmup stalled at 0 requests.\nSeen on 4 GLM-5.2 1P1D runs on pit2-p03-g19/g23 (ports 37563-37577,\nwhere the ephemeral connects to 8000/8010/8020 cluster).\n\nBind the ROUTER socket in __init__ right after picking the port, retry\non EADDRINUSE, and hand the bound socket to the listener thread.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-09-29T14:25:11Z",
+          "url": "https://github.com/ROCm/ATOM/commit/64a6a9399b99eab6a64b0229fee572d7488fb0bd"
+        },
+        "date": 1790927160832,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4 1048576/1024 c=96 perf point",
+            "value": 263.7268,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36969099523 | docker_image=rocm/atom-dev:nightly_202609301507 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9216%2C%22cache_hit_tokens%22%3A842493424%2C%22cache_total_tokens%22%3A914180026%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A8425%2C%22concurrency%22%3A96%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3629.6655%2C%22e2el_ms%22%3A40701.732%2C%22e2el_p90%22%3A80713.9208%2C%22e2el_p99%22%3A183190.0531%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609301507%22%2C%22input_tput%22%3A232615.6351%2C%22input_tput_per_gpu%22%3A29076.9544%2C%22interactivity%22%3A4.4634%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A8425%2C%22interactivity_p90_itl%22%3A46.6814%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A17.8824%2C%22itl_p90%22%3A21.4218%2C%22median_e2el_ms%22%3A30331.9823%2C%22median_itl_ms%22%3A17.9007%2C%22median_tpot_ms%22%3A17.9007%2C%22median_ttft_ms%22%3A16379.9925%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2109.8147%2C%22output_tput_per_gpu%22%3A263.7268%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.1438%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc96-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F36969099523%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A234725.4498%2C%22tpot_ms%22%3A17.8824%2C%22tpot_p90%22%3A21.4218%2C%22tpot_p99%22%3A32.8137%2C%22tput_per_gpu%22%3A29340.6812%2C%22ttft_ms%22%3A23176.1528%2C%22ttft_p90%22%3A54163.0649%2C%22ttft_p99%22%3A97180.7851%7D"
           }
         ]
       }
