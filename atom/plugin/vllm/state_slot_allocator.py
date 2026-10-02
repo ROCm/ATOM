@@ -49,6 +49,53 @@ class StateSlotAllocator:
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
 
+    def slot_for(self, key):
+        """This key's slot, or None if it has none.
+
+        A reader that needs the slot outside a forward -- the offload leg
+        snapshotting a request's state -- must not create one by asking.
+        """
+        return self._key_to_slot.get(key)
+
+    def reserve(self, key) -> int:
+        """Bind *key* to a slot now, outside any batch. Idempotent.
+
+        A connector that restores per-request state has to write it before the
+        request is ever scheduled, and ``assign`` only runs from inside a
+        forward. Reserving is also what keeps the following ``assign`` from
+        reporting the slot as freshly allocated: that report means "reset me",
+        and resetting would zero the bytes the restore just wrote.
+
+        The reservation counts as a sighting, so a slot reserved this step is
+        not the eviction victim chosen by the next one.
+        """
+        self._step += 1
+        slot = self._key_to_slot.get(key)
+        if slot is None:
+            # `active` is every key currently bound: a reservation has no batch
+            # to compare against, and evicting a live tenant to make room for
+            # one would corrupt the request that still holds it.
+            slot = self._acquire(set(self._key_to_slot))
+            self._key_to_slot[key] = slot
+            self._slot_to_key[slot] = key
+        self._last_seen[slot] = self._step
+        return slot
+
+    def release(self, key) -> None:
+        """Give a reserved slot back, for a request that will never arrive.
+
+        Reservations are not otherwise reclaimed until the slot is the
+        least-recently-seen eviction victim, so a request that is cancelled
+        between its load and its first forward would hold one indefinitely.
+        """
+        slot = self._key_to_slot.pop(key, None)
+        if slot is None:
+            return
+        self._slot_to_key[slot] = None
+        self._last_seen[slot] = -1
+        if slot not in self._free:
+            self._free.append(slot)
+
     def assign(self, req_keys, num_computed):
         """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``.
 
