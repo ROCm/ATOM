@@ -42,12 +42,16 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
-from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.model_engine.scheduler import (
+    ScheduledBatch,
+    ScheduledBatchOutput,
+    uses_deferred_output,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -165,6 +169,11 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
+# Re-exported under the old private name: this module is where the predicate
+# used to live and where callers (and tests) still import it from.
+_kv_config_has_producer = kv_config_has_producer
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -194,7 +203,20 @@ class tokenIDProcessor:
         spec_enabled: bool | None = None,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
+        self.is_pipeline_parallel = (
+            getattr(runner.config, "pipeline_parallel_size", 1) > 1
+        )
+        # P/D hands off prompt-end state plus the first sampled token. Deferred
+        # output makes the producer decode once more to surface that token, so
+        # the consumer applies T0 to a state that already has it. Only a
+        # recurrent state notices -- a paged write lands at T0's own position,
+        # so repeating it is idempotent. The scheduler reads the same predicate
+        # to place the decode window this processor fills. The family is only
+        # asked of a producer; a runner sets it before building this, a bare
+        # test double need not.
+        self.is_deferred_out = uses_deferred_output(
+            runner.config, getattr(runner, "attn_family", None)
+        )
 
         self.runner = runner
         device = runner.device
@@ -505,7 +527,6 @@ class tokenIDProcessor:
         GPU need to be copied into the corresponding slots into input_ids.
         """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
@@ -532,10 +553,14 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
-            if self.spec_enabled:
-                # PP: the host already holds each row's anchor, so fill only
-                # the draft columns. Gated on `spec_enabled` because the
-                # embedding runs on the first stage, not the (use_spec) last.
+            # Undeferred: pipeline parallel, or a P/D producer whose model
+            # keeps recurrent state. The host already holds each row's anchor,
+            # so fill only the draft columns, ragged or uniform alike. Gated on
+            # `spec_enabled` because the embedding runs on the first stage, not
+            # the (use_spec) last; and on `num_spec_step` because a P/D
+            # producer keeps its drafter loaded while its scheduler schedules
+            # it target-only, and such a batch carries no draft rows.
+            if self.spec_enabled and batch.num_spec_step > 0:
                 _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
                 spec = batch.scheduled_spec_decode_tokens
                 for i in range(len(lens)):
@@ -647,7 +672,11 @@ class tokenIDProcessor:
             width=fill_to,
         )
 
-        input_ids = self.input_ids.gpu[:total_tokens]
+        # Slice by the width this path actually staged. Prefill returned above,
+        # so the decode total is the whole batch; a worker-side speculative q
+        # shrink rewrites it, and reading any other total here would leave the
+        # attention metadata wider than input_ids.
+        input_ids = self.input_ids.gpu[:total_tokens_decode]
         return input_ids
 
     def prepare_draft_ids(
@@ -1345,6 +1374,125 @@ class ModelRunner:
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
+        self._warmup_prefill_token_sweep(min(warmup_max_tokens, max_model_len))
+
+    def _warmup_prefill_token_sweep(self, max_tokens: int):
+        """Compile the M-bucketed prefill kernels at startup.
+
+        AITER/FlyDSL pick a GEMM kernel per M bucket and JIT-compile it on
+        first use, so the first serving step in each new bucket stalls every
+        rank for 10-30 s with the waiting queue growing behind it. Two passes:
+        dummy prefills through the whole model (MoE, dense MLP, the GEMMs ahead
+        of attention), then each distinct linear shape called directly, which
+        reaches the attention projections a dummy run returns before.
+        """
+        stride = envs.ATOM_WARMUP_PREFILL_TOKEN_STRIDE
+        if stride <= 0:
+            return
+        start_time = time.time()
+        # Powers of two from 16 (a DCP rank never sees an empty shard) up to
+        # the stride, every stride tokens after that, and one count that is
+        # not a multiple of 16 for Triton's divisibility specialization.
+        sizes = [1 << i for i in range(4, stride.bit_length()) if (1 << i) < stride]
+        sizes += list(range(stride, max_tokens + 1, stride))
+        sizes = sorted(
+            {s for s in sizes + [max_tokens - 1, max_tokens] if 16 <= s <= max_tokens}
+        )
+        for num_tokens in sizes:
+            seq = Sequence([0] * num_tokens, block_size=self.block_size)
+            self.forward(
+                ScheduledBatch(
+                    seqs={seq.id: seq},
+                    num_scheduled_tokens=np.array([num_tokens], dtype=np.int32),
+                    total_tokens_num=num_tokens,
+                    total_tokens_num_prefill=num_tokens,
+                    total_seqs_num=1,
+                    total_seqs_num_prefill=1,
+                    is_dummy_run=True,
+                )
+            )
+            self.tokenID_processor.clean()
+        model_elapsed = time.time() - start_time
+
+        # Tuned GEMM tables also key exact M at 1, 2, 4 and multiples of 8 and
+        # pad to 16 below 256, finer than the stride.
+        linear_sizes = sorted(
+            set(sizes) | {1, 2, 4} | set(range(8, min(512, max_tokens) + 1, 8))
+        )
+        linears = self._distinct_prefill_linears()
+        with torch.inference_mode():
+            for prefix, linear in linears:
+                reduce_results = linear.reduce_results
+                linear.reduce_results = False
+                try:
+                    for num_tokens in linear_sizes:
+                        linear(
+                            torch.zeros(
+                                num_tokens,
+                                linear.input_size,
+                                dtype=self.config.torch_dtype,
+                                device=self.device,
+                            )
+                        )
+                except (
+                    AssertionError,
+                    IndexError,
+                    KeyError,
+                    NotImplementedError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as e:
+                    # A layer whose forward needs inputs this cannot fake (a
+                    # pre-quantized x, a fused caller) is left to compile on
+                    # first use rather than failing startup.
+                    logger.warning(
+                        f"{self.label}: prefill token sweep skipped {prefix}: {e}"
+                    )
+                finally:
+                    linear.reduce_results = reduce_results
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: prefill token sweep {time.time() - start_time:.2f} seconds: "
+            f"model {len(sizes)} sizes in {model_elapsed:.2f}s (stride {stride}, "
+            f"max {max_tokens}), {len(linears)} distinct linears x "
+            f"{len(linear_sizes)} sizes"
+        )
+
+    def _distinct_prefill_linears(self):
+        """One (prefix, layer) per distinct linear GEMM shape in the model,
+        plus the prefill-only q_proj row views that MLA builds under DCP
+        query replication."""
+        from atom.model_ops.linear import LinearBase
+
+        candidates = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, LinearBase):
+                candidates.append((name, module))
+            if getattr(module, "qrep_enabled", False) and hasattr(
+                module, "_local_q_proj"
+            ):
+                candidates.append((f"{name}._local_q_proj", module._local_q_proj()))
+        distinct = {}
+        for name, linear in candidates:
+            weight = getattr(linear, "weight", None)
+            # Fused-away shells (e.g. KDA b_proj / f_a_proj) keep a 0-element
+            # weight and never run; a conv kept as a LinearBase (q_conv1d) has
+            # a 3-D weight and is no GEMM.
+            if weight is None or weight.numel() == 0 or weight.dim() != 2:
+                continue
+            key = (
+                type(linear).__name__,
+                linear.quant_type.value,
+                str(linear.params_dtype),
+                tuple(weight.shape),
+                str(weight.dtype),
+                linear.input_size,
+                linear.bias is not None,
+                linear.native_a8_group_rows,
+            )
+            distinct.setdefault(key, (name, linear))
+        return list(distinct.values())
 
     def allocate_forward_vars(self):
         config = self.config
@@ -2323,6 +2471,12 @@ class ModelRunner:
         scheduled_bs = batch.total_seqs_num_decode
         if scheduled_bs <= 0:
             return
+        # A batch with no draft slots was scheduled target-only (a P/D producer
+        # reserves one token per request). The drafter still carries `mtp_k`,
+        # so quantizing ell+1 up into a bucket would widen past the tokens and
+        # the KV this step reserved.
+        if int(getattr(batch, "num_spec_step", 0) or 0) <= 0:
+            return None
         full_q = self.drafter.mtp_k + 1
 
         # {req_id: ell} from an EARLIER step's propose() (verify_scheduler, same
@@ -2391,6 +2545,11 @@ class ModelRunner:
         # segment: token[0] is the anchor; the rest are placeholders overwritten
         # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
         old_nst = batch.num_scheduled_tokens
+        # Rounding a bucket up must not outgrow what the scheduler reserved.
+        # The producer case returns above; this stops a stale ell from doing
+        # the same to any other target-narrow batch.
+        if int(np.min(old_nst[:scheduled_bs])) < q:
+            return None
         sched = np.asarray(batch.scheduled_tokens)
         old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
         np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
@@ -2704,6 +2863,15 @@ class ModelRunner:
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+            graph_shapes=(
+                None
+                if (
+                    self.enforce_eager
+                    or self._piecewise_cg_active()
+                    or not hasattr(self, "graphs")
+                )
+                else self.graphs.keys()
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3448,7 +3616,7 @@ class ModelRunner:
             else:
                 prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
                 prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages (is_deferred_out=False) still run the drafter.
+            # PP stages and P/D producers still run the drafter.
             if hasattr(self, "drafter"):
                 # Mid-prompt sequences get their anchor corrected inside
                 # propose_draft_token_ids, from `batch.next_token_ids`.
@@ -3613,12 +3781,15 @@ class ModelRunner:
 
         Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
-        drafts nothing. PP is excluded via `is_deferred_out`.
+        drafts nothing. PP is excluded, and asked about directly:
+        `is_deferred_out` is also off on a P/D producer, a rank that keeps its
+        drafter loaded and still owes its peers the collectives propose()
+        carries.
         """
         return (
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
-            and self.tokenID_processor.is_deferred_out
+            and not self.tokenID_processor.is_pipeline_parallel
         )
 
     @torch.inference_mode()

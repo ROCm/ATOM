@@ -625,10 +625,15 @@ models:
         AITER_SITUV2_A4W4: "1"
         AITER_QUICK_REDUCE_QUANTIZATION: INT4
         AITER_FLYDSL_STAGE2_FP8: "1"
-        # AgentX enables comm-group reuse only on C56/C64.
+        # AgentX enables comm-group reuse from CONC 56 up (C56/C64/C72).
         AITER_REUSE_IDENTICAL_COMM_GROUPS: "0"
-        ATOM_MLA_MAX_SPLIT_PER_BATCH: "256"
+        ATOM_GDN_SSM_DTYPE: "fp16"
+        # Already the ATOM default; pinned so a default flip cannot silently
+        # move the published numbers.
+        ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "1"
         ATOM_STATE_CHECKPOINT_DEMAND: "0"
+        # AgentX runs FlyDSL FP8 prefill attention on every band.
+        ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: "1"
         # AgentX band default: ReplaySSM off on CONC 1/2/4, on for the mid band
         # (CONC 8-16), off again from CONC 32. Cases that declare their own env
         # block must restate the key, because a YAML merge key loses to an
@@ -644,6 +649,11 @@ models:
         enable_prefix_caching: true
         max_model_len: ""
         state_checkpoint_interval_tokens: -1
+        # ATOM resolves the tool-call format from the chat template at startup.
+        # Naming it fails closed: should the template ever stop rendering a tools
+        # payload, the auto path degrades to plain-text tool calls, which the
+        # vendor verifier reads as a model that cannot call tools at all.
+        extra_args: "--tool-call-parser kimi_k3"
         online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
     suites:
       nightly:
@@ -657,7 +667,7 @@ models:
             osl: 1024
             server:
               common_args: &kimi_k3_agentic_dspark7_args
-                gpu_memory_utilization: 0.88
+                gpu_memory_utilization: 0.90
                 max_num_seqs: 32
                 max_num_batched_tokens: 8192
                 method: dspark
@@ -671,7 +681,7 @@ models:
               workers: 1
               tp: 8
               # AgentX pins the compile path and captures the dense query-token
-              # range 2..2*CONC*(1+spec) that `auto` derives per concurrency.
+              # range 1..2*CONC*(1+spec) that `auto` derives per concurrency.
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
@@ -698,10 +708,10 @@ models:
           display_topology: 1P1D-TP8-DCP8-DSPARK3
           concurrency: [8]
           server:
-            common_args: &kimi_k3_agentic_dspark3_args
-              gpu_memory_utilization: 0.88
+            common_args:
+              gpu_memory_utilization: 0.90
               max_num_seqs: 32
-              max_num_batched_tokens: 4096
+              max_num_batched_tokens: 8192
               method: dspark
               draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
               num_speculative_tokens: 3
@@ -725,53 +735,18 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "128"
               LMCACHE_CHUNK_SIZE: "1024"
               LMCACHE_NUMA_MODE: auto
-              LMCACHE_ENABLE_OUTPUT_PATH_MODE: "1"
-              LMCACHE_ENABLE_LAYOUT_FILE_MODE: "1"
               ATOM_NUMA_BIND: "1"
               ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
               # Auto-binding off so the explicit ATOM_NUMA_NODE map is what takes effect.
               ATOM_AUTO_NUMA_BIND: "0"
-              OFFLOAD_KV_FOR_HYBRID: "1"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
 
         - <<: *kimi_k3_agentic_dcp8_lmcache
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12
-          concurrency: [12]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_dspark3_args
-              max_num_seqs: 24
-
-        # C14 runs the C16 server verbatim and only moves the client, so it also
-        # keeps C16's CUDA-graph width: deriving it from 2*CONC gives 28 and the
-        # server dies during graph warmup. cudagraph_max_num_seqs pins the window
-        # back to 32, which lands the same graph_max 128 as C16.
-        - <<: *kimi_k3_agentic_dcp8_lmcache
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14
-          concurrency: [14]
-          server:
-            common_args: &kimi_k3_agentic_dspark3_8192_args
-              <<: *kimi_k3_agentic_dspark3_args
-              max_num_seqs: 32
-              max_num_batched_tokens: 8192
-              gpu_memory_utilization: 0.86
-          decode:
-            workers: 1
-            tp: 8
-            dcp: 8
-            cudagraph: auto
-            cudagraph_max_num_seqs: 32
-            cudagraph_mode: FULL
-            compilation_level: 3
-
-        - <<: *kimi_k3_agentic_dcp8_lmcache
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16
           concurrency: [16]
-          server:
-            common_args: *kimi_k3_agentic_dspark3_8192_args
 
         - &kimi_k3_agentic_no_dspark
           <<: *kimi_k3_agentic_dcp8_lmcache
@@ -780,7 +755,7 @@ models:
           concurrency: [32]
           server:
             common_args: &kimi_k3_agentic_no_dspark_args
-              gpu_memory_utilization: 0.86
+              gpu_memory_utilization: 0.90
               max_num_seqs: 64
               max_num_batched_tokens: 8192
           env:
@@ -800,13 +775,23 @@ models:
               max_num_seqs: 80
 
         - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48
+          concurrency: [48]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 96
+
+        # From CONC 56 up the CPU tier grows to 192 GiB and AITER reuses
+        # identical comm groups; everything else still tracks 2 * CONC.
+        - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56
           concurrency: [56]
           server:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 112
-          env:
+          env: &kimi_k3_agentic_lmcache192_env
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
@@ -821,13 +806,258 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 128
-          env:
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_lmcache192_env
+
+        # At C72 the single prefill node is the bottleneck. The decode node
+        # peaked at 42.5% KV and max Waiting 4. Prefill queueing was 81% of
+        # TTFT, for two reasons:
+        # (1) 27 engine stalls of 10-30 s, each on the first prefill step in a
+        #     new GEMM M bucket (online FlyDSL JIT). They cost 472 s, mostly in
+        #     the first 20 min.
+        # (2) Steady state at about 78% utilization, where Phase 1 gives a
+        #     >64k-token cold prefill the whole 8192-token budget and the short
+        #     requests behind it wait.
+        # The prefill token sweep fixes (1). Capping each prefill at 4096
+        # tokens per step lets short requests share the step, which fixes (2).
+        # The jitwarm cell turns on only the first fix, to measure it alone.
+        - &kimi_k3_agentic_jitwarm
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env: &kimi_k3_agentic_jitwarm_env
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
+        - <<: *kimi_k3_agentic_jitwarm
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
+        # Capping long prefills at 4096 tokens per step did not pay. At C72
+        # against jitwarm-c72 it measured:
+        #   TTFT p90         17.9 s vs 14.2 s
+        #   interactivity    10.65 vs 10.59
+        #   output tok/s     unchanged
+        # It also added 5 prefill stalls of 12-52 s, each after a multi-request
+        # batch of 4096-token chunks. pfx-statecap-c72 hung its prefill engine
+        # on such a batch. Kept for reference; do not promote.
+        - &kimi_k3_agentic_prefill_tuned
+          <<: *kimi_k3_agentic_jitwarm
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-c72
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--long-prefill-token-threshold 4096"
+
+        - <<: *kimi_k3_agentic_prefill_tuned
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
+        # At C72 the KV in LMCache never filled: 92 of 192 GiB written per
+        # rank, no KV eviction. What did fill was the 32 GiB state sub-cap
+        # (OFFLOAD_STATE_CPU_SIZE), which holds 1183 KDA state images. It turns
+        # over every ~16 min. Each image it dropped was still in the engine's
+        # index, so a later turn over that prefix failed its load and
+        # recomputed from token 0: 33 times at C72, ~4M tokens, and ~20% of the
+        # C56 -> C72 rise in uncached prefill.
+        # The index now mirrors the cap (code). These cells also give the state
+        # tier 96 GiB (~3500 images, which covers the oldest image a failed
+        # load wanted, 3686 stores back) inside a 224 GiB pool. That is
+        # 92 + 96 GiB at C72; 8 x 224 GiB fits in the node's ~3 TB.
+        - &kimi_k3_agentic_statecap
+          <<: *kimi_k3_agentic_prefill_tuned
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c72
+          env: &kimi_k3_agentic_statecap_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
+        # The state-tier fix without the long-prefill cap, to tell the two
+        # apart: pfx-statecap-c72 hung its prefill engine 39 min into
+        # profiling. The hung step mixed a 4096-token chunk at 471k context
+        # with five other requests, a mix the cap makes common.
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c72
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c88
+          concurrency: [88]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
+        # Upper edge of one prefill node. Extrapolated from statecap-c72
+        # (rho 0.66, decode bs p90 76): rho ~0.88 and decode bs ~100 here.
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c96
+          concurrency: [96]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 192
+
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
+        # With only the prompt-end anchor, a sub-agent that forks a parent's
+        # context can reuse KV but not KDA state past the parent's last anchor.
+        # About 1M (state truncation) plus 3.6M (cross-session prefix) tokens
+        # at C72 were cache-eligible per aiperf but recomputed. The demand rung
+        # adds a checkpoint where a later request is expected to resume. It also
+        # adds state writes, so it runs on top of the larger state tier.
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-demand-c72
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
+        # Non-disaggregated counterpart to the C64 cell above: one server does
+        # prefill and decode on a single node, same workload and same server
+        # knobs, so the pair isolates what the P/D split itself is worth.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c64
+          topology: agg
+          display_topology: AGG-TP8-DCP8
+          # Placement only; `topology: agg` above is what says there is no
+          # prefill/decode split to place. The other single_node cells halve the
+          # node between two services, so this one keeps all 8 GPUs at TP8.
+          pd_worker_layout: single_node
+          concurrency: [64]
+          # Unused here; the aggregated server is configured by the decode block.
+          prefill: {}
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 128
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            # The aggregated server reads env.decode. These are the C64 prefill's
+            # LMCache settings, spelled out rather than merged from its anchor:
+            # that anchor also carries the mooncake half of the `multi`
+            # connector, which has no peer to stream KV to here. What is left is
+            # the same 192 GiB CPU tier behind a standalone offload connector.
+            decode:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              LMCACHE_CHUNK_SIZE: "1024"
+              LMCACHE_NUMA_MODE: auto
+              ATOM_NUMA_BIND: "1"
+              ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
+              ATOM_AUTO_NUMA_BIND: "0"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        - &kimi_k3_agentic_2p1d
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c64
+          topology: 2p1d
+          display_topology: 2P1D-TP8-DCP8
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [64]
+          prefill:
+            workers: 2
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 128
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 256
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
+          concurrency: [256]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 512
+
+        # Past one prefill node (~14k uncached tok/s, rho ~0.88 by C96): two
+        # prefill nodes with JIT warmup and the state-tier fix on both.
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 256
+          env: *kimi_k3_agentic_statecap_env
 
     accuracy:
       task: gsm8k

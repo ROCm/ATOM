@@ -46,6 +46,11 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
         "public_dataset": env.get("AIPERF_PUBLIC_DATASET"),
         "topology": env.get("TOPOLOGY") or data.get("topology"),
         "display_topology": env.get("DISPLAY_TOPOLOGY") or data.get("display_topology"),
+        # ATOMesh only: whether a prefill/decode split produced these numbers.
+        # The launcher knows it for certain, and the dashboard needs it to size
+        # the cell: an aggregated run puts both phases on one server's GPUs, so
+        # its GPU count is that server's, not a prefill plus decode sum.
+        "disaggregated": None if single_node else env.get("AGGREGATED") != "1",
         "precision": env.get("PRECISION") or data.get("precision"),
         "random_input_len": int(
             data.get("max_context_length") or env.get("AIPERF_MAX_CONTEXT_LENGTH") or 0

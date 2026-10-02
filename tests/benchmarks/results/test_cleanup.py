@@ -50,6 +50,20 @@ def test_single_node_export_preserves_counts_and_invalidity(arguments):
     assert result["p90_itl_ms"] == fixture["expected"]["p90_itl_ms"]
     assert result["successful_requests"] == 40
     assert result["dashboard_publish_allowed"] is False
+    # Only the ATOMesh launcher knows whether the run was split.
+    assert "disaggregated" not in result
+
+
+@pytest.mark.parametrize(("aggregated", "expected"), [("1", False), ("0", True)])
+def test_pd_export_states_whether_the_run_was_split(aggregated, expected):
+    fixture = read_json(FIXTURES / "aiperf-dashboard.json")
+    result = dashboard_module().dashboard_summary(
+        fixture["source"],
+        Path("aiperf/profile_export_aiperf.json"),
+        fixture["concurrency"],
+        {**fixture["environment"], "AGGREGATED": aggregated},
+    )
+    assert result["disaggregated"] is expected
 
 
 def test_buffered_records_flush_on_close_and_periodic_write(tmp_path, monkeypatch):

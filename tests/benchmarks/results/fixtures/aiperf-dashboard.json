@@ -95,6 +95,7 @@
     "public_dataset": "fixture-dataset",
     "topology": "1p2d",
     "display_topology": "CPP4+DCP4",
+    "disaggregated": true,
     "precision": "fp8",
     "random_input_len": 262144,
     "random_output_len": 1024,
