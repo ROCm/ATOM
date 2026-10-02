@@ -708,6 +708,54 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c128
           concurrency: [128]
 
+        # The same cells on two nodes that each give the job only GPUs 0-3
+        # with their NUMA node's memory and NICs (rdma0-3): the other half of
+        # each node belongs to another job. Prefill on the first node, decode
+        # on the second, both on GPUs 0-3. "lmcache-2n" keeps the single-node
+        # cells' in-process CPU tier (4 x 256 GiB on the prefill node), so the
+        # decode node's memory stays unused. "lmcachemc-2n" gives each PP
+        # stage a 48 GiB-base L1 over Mooncake Store pools of both nodes'
+        # NUMA0 memory: 4 x 192 GiB on the prefill node, 4 x 240 GiB on the
+        # decode node. Those owners must share the stages' NICs, so each NIC
+        # is a pool of its own (LMCACHE_MOONCAKE_POOLS=per_nic): one master
+        # for all eight owners stalled reads across two such nodes for good,
+        # one per NIC read 4 x 37 GB/s.
+        - &glm52_agentic_lmcache_2n_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-2n-1m-c96
+          pd_worker_layout: multi_node
+          concurrency: [96]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+            decode: &glm52_cpp4_dcp4_2n_decode_env
+              <<: *glm52_cpp4_dcp4_decode_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+
+        - <<: *glm52_agentic_lmcache_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-2n-1m-c112
+          concurrency: [112]
+
+        - &glm52_agentic_lmcachemc_2n_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-2n-1m-c96
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "48"
+              LMCACHE_MOONCAKE_L2: "1"
+              LMCACHE_MOONCAKE_POOLS: "per_nic"
+              LMCACHE_MOONCAKE_MASTER_NUMA: "0"
+              LMCACHE_MOONCAKE_OWNERS: "0:192:rdma0;0:192:rdma1;0:192:rdma2;0:192:rdma3"
+              LMCACHE_MOONCAKE_DECODE_OWNERS: "0:240:rdma0;0:240:rdma1;0:240:rdma2;0:240:rdma3"
+              LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+            decode: *glm52_cpp4_dcp4_2n_decode_env
+
+        - <<: *glm52_agentic_lmcachemc_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-2n-1m-c112
+          concurrency: [112]
+
     accuracy:
       task: gsm8k
       fewshot: 20
