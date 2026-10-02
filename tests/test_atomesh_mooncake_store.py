@@ -318,7 +318,7 @@ stop_mooncake_store
         self.assertEqual(env["MC_TCP_BIND_ADDRESS"], HOST)
         self.assertEqual(env["LMCACHE_BLOCKING_TIMEOUT_SECS"], "60")
         self.assertEqual(env["LMCACHE_MAX_LOCAL_CPU_SIZE"], "48")
-        self.assertEqual(env["OFFLOAD_LOAD_WORKERS"], "4")
+        self.assertEqual(env["OFFLOAD_LOAD_WORKERS"], "1")
         self.assertEqual(
             env["ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES"], "rdma4,rdma5,rdma6,rdma7"
         )

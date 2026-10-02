@@ -1198,7 +1198,7 @@ The worker environment (the atomesh launcher sets all of it, below):
 ```bash
 export LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto LMCACHE_MAX_LOCAL_CPU_SIZE=48
 export LMCACHE_REMOTE_URL="mooncakestore://${IP}:50051/" LMCACHE_REMOTE_SERDE=naive
-export LMCACHE_BLOCKING_TIMEOUT_SECS=60 OFFLOAD_LOAD_WORKERS=4
+export LMCACHE_BLOCKING_TIMEOUT_SECS=60 OFFLOAD_LOAD_WORKERS=1
 export MC_NUM_QP_PER_EP=1 MC_MAX_MR_SIZE=1073741824 MC_TCP_BIND_ADDRESS="${IP}"
 export LMCACHE_EXTRA_CONFIG='{"save_chunk_meta":false,"transfer_timeout":60,
   "use_exists_sync":true,"remote_enable_mla_worker_id_as0":false,
@@ -1210,6 +1210,12 @@ export LMCACHE_EXTRA_CONFIG='{"save_chunk_meta":false,"transfer_timeout":60,
 
 The decode side needs `MC_NUM_QP_PER_EP=1` too: its P->D transfer engine reads
 the same variable, and endpoints with different QP counts cannot connect.
+One load worker: with four (`OFFLOAD_LOAD_WORKERS=4`), GLM-5.2 cpp4/dcp4 at c96
+hung the prefill pipeline in all three runs, single node and two nodes. One
+stage's GPU ran nothing, with its HSA queues stopped at barriers and every
+offload and compute thread waiting on them. With one load worker, as the
+in-process baseline runs, the 30-minute window completed.
+
 Start the master and owners first, and restart the Store whenever the model,
 the PP layer split or the chunk size changes: the key namespace does not cover
 the PP split, and the Store keeps objects across ATOM restarts. Only the dense
