@@ -641,7 +641,9 @@ process_is_running() {
   if [[ -r "/proc/${pid}/stat" ]]; then
     state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
     [[ -n "${state}" && "${state}" != "Z" ]]
-    return
+    # Not a bare return: in a function the EXIT trap runs, that returns the
+    # trap's $? (the exit status), and cleanup would then wait on live servers.
+    return $?
   fi
 
   kill -0 "${pid}" 2>/dev/null
@@ -661,6 +663,16 @@ terminate_process_group() {
   done
   if process_is_running "${pid}"; then
     kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    # A process in uninterruptible sleep (a GPU or RDMA teardown) outlives
+    # SIGKILL, and `wait` would block on it until the job's time limit.
+    deadline=$(( $(date +%s) + 30 ))
+    while process_is_running "${pid}" && [[ "$(date +%s)" -lt "${deadline}" ]]; do
+      sleep 1
+    done
+    if process_is_running "${pid}"; then
+      echo "[cleanup] WARNING: pid ${pid} is still running 30s after SIGKILL (state $(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || echo '?')); not waiting for it" >&2
+      return 0
+    fi
   fi
   wait "${pid}" 2>/dev/null || true
 }
