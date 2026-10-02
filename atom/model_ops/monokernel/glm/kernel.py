@@ -3556,7 +3556,7 @@ def build_glm5_monokernel(
             DN_TILE + 15
         ) // 16  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
         DN_WPR = WAVES // DN_R
-        DN_BATCH = 4 if S > 4 else 9
+        DN_BATCH = 8 if S > 4 else 9
         DN_W_BYTES = HIDDEN * expert_inter // (2 if expert_mxfp4 else 1)
         DN_S_BYTES = (
             HIDDEN * (expert_inter // 32)
