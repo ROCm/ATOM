@@ -103,6 +103,8 @@ Four rules carry the module:
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
+| `mooncake_store_l2.py` | Mooncake Store as the in-process L2: recipe checks, one RDMA device per worker from the PCI topology, the THP pinned L1 allocator, one-RPC lookups ([Mooncake Store as L2](#mooncake-store-as-l2)). |
+| `remote_check.py` | Startup check of any remote tier: backend connected, L1 registered, one chunk round trip. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
 | `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
@@ -1165,6 +1167,56 @@ AOS1 follows the engine's location policy exactly. Submission passes
 `retrieve_locations`, and reads target the backend location returned by that
 search. The local-CPU allocator is therefore not an implicit readable cache tier
 when, for example, policy allows only `LocalDiskBackend`.
+
+### Mooncake Store as L2
+
+With `LMCACHE_REMOTE_URL` set, each worker's LMCache engine writes every chunk
+it keeps in its CPU pool (L1) through to the remote store as well, and reads an
+L1 miss back from it. With `mooncakestore://` that L2 is DRAM owned by separate
+`mooncake_client` processes and read over RDMA, so a small L1 per PP stage sits
+in front of a pool of several hundred GiB per NUMA node. The L2 includes the
+L1, so the distinct capacity is about the Store's.
+
+LMCache's Mooncake connector needs no change, but the worker does. Before the
+engine is built, `mooncake_store_l2.py`:
+
+| Does | Because |
+|------|---------|
+| Allocates the L1 itself: mmap, mbind to the GPU's NUMA node (any other node is refused), `MADV_HUGEPAGE`, one touch per 2 MiB, `hipHostRegister`. Startup fails unless all of it is transparent huge pages and, once the engine is built, unless LMCache's L1 is that region. | An ionic NIC registers about 3 GiB of 4 KiB pages in all, and one 4 KiB page counts its whole MR against that budget, so LMCache's own NUMA L1 (4 KiB pages) cannot register; LMCache only warns, and every put then fails without an error. With 1 GiB MRs a few 4 KiB pages would still register: requiring all huge pages is a policy that keeps the L1 off the budget. LMCache takes other allocators when it has no NUMA mapping for the GPU, and for hugetlb, shm or P2P pools. |
+| Gives each worker one RDMA device, the GPU's: the ACTIVE device sharing the deepest PCI path with it (`ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES` overrides), and refuses one the owners use (`ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES`). | Several NICs per requester, or NICs shared with the owners, stalled concurrent reads for 30-60 s before they failed. One NIC per stage, disjoint from the owners', ran 4 x 33 GB/s. |
+| Answers `batched_contains` with one `batch_is_exist` RPC. | The connector asked the master once per chunk on the scheduler's synchronous lookup path: 25-58 ms per lookup, against 0.4-1 ms. |
+| Refuses `MC_NUM_QP_PER_EP` other than 1, a set `MOONCAKE_CONFIG_PATH`, `LMCACHE_NUMA_MODE` other than `auto`/`manual`, `LMCACHE_LOCAL_CPU_USE_HUGEPAGES`, `LMCACHE_BLOCKING_TIMEOUT_SECS` < 30, and in `LMCACHE_EXTRA_CONFIG`: `save_chunk_meta` other than `false`, `transfer_timeout` < 30, `mooncake_global_segment_size` other than `"0"`, no `mooncake_protocol`, and keys Mooncake never sees (`master_server_address`, `device_name`, `mooncake_rdma_devices`, `mooncake_transfer_timeout`). | Each of them fails silently, hangs, or corrupts or leaks objects under load. |
+
+After the engine is built, `remote_check.py` fails startup unless the remote
+tier -- any remote URL -- has a connected `RemoteBackend`, a registered L1 where
+the connector registers one, and stores and returns one probe chunk byte for
+byte. LMCache retries neither a failed connection nor a failed registration.
+
+The worker environment:
+
+```bash
+export LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto LMCACHE_MAX_LOCAL_CPU_SIZE=48
+export LMCACHE_REMOTE_URL="mooncakestore://${IP}:50051/" LMCACHE_REMOTE_SERDE=naive
+export LMCACHE_BLOCKING_TIMEOUT_SECS=60 OFFLOAD_LOAD_WORKERS=4
+export MC_NUM_QP_PER_EP=1 MC_MAX_MR_SIZE=1073741824 MC_TCP_BIND_ADDRESS="${IP}"
+export LMCACHE_EXTRA_CONFIG='{"save_chunk_meta":false,"transfer_timeout":60,
+  "use_exists_sync":true,"remote_enable_mla_worker_id_as0":false,
+  "mooncake_local_hostname":"'"${IP}"'",
+  "mooncake_metadata_server":"http://'"${IP}"':50080/metadata",
+  "mooncake_master_server_addr":"'"${IP}"':50051","mooncake_protocol":"rdma",
+  "mooncake_global_segment_size":"0","mooncake_local_buffer_size":"67108864"}'
+```
+
+The decode side needs `MC_NUM_QP_PER_EP=1` too: its P->D transfer engine reads
+the same variable, and endpoints with different QP counts cannot connect.
+Start the master and owners first, and restart the Store whenever the model,
+the PP layer split or the chunk size changes: the key namespace does not cover
+the PP split, and the Store keeps objects across ATOM restarts. Only the dense
+layout is validated; DSV4's SLOT sidecar reads single keys, which the Mooncake
+connector does not serve, so those reads miss.
+
+The Store needs an image built with Mooncake `WITH_STORE=ON` (`mooncake_master`,
+`mooncake_client`, `mooncake.store`); the CI image builds `WITH_STORE=OFF`.
 
 ## How to Run
 

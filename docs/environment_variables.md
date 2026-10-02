@@ -327,6 +327,15 @@ derive a bound.
 | **OFFLOAD_PUBLICATION_POLL_INTERVAL_S** | float | 0.01 | Poll period of that wait (finite, > 0). |
 | **LMCACHE_MP_TRANSFER_MODE** | str | auto | `lmcache_mp` transfer mode: `auto` or `lmcache_driven` (`engine_driven` is rejected). Overridden by `lmcache.mp.mp_transfer_mode`. |
 | **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered: a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own and, when unset, assumes LMCache's. |
+| **ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES** | csv str | "" (PCI topology) | With a Mooncake Store L2 (`LMCACHE_REMOTE_URL=mooncakestore://...`): the RDMA device each offload worker's Store client uses, one per GPU ordinal (`cuda:i`), or a single device for all. Unset, a worker takes the ACTIVE device that shares the deepest PCI path with its GPU; HIP numbers MI355X GPUs in KFD order, not PCI order, so that is not `rdma<i>` (on pit2-p03 nodes GPU 0 is behind `rdma3`). A device that does not exist, or that the Store owners use, fails startup. |
+| **ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES** | csv str | "" | The RDMA devices the Mooncake Store owners on this node serve on. A worker whose own device is listed fails startup: owners and requesters sharing a NIC stall concurrent L2 reads, then fail them. |
+
+With a `mooncakestore://` remote the offload worker also refuses, at startup,
+`MC_NUM_QP_PER_EP` other than `1` (a Mooncake variable every Store process and
+the decode's P->D transfer engine must share), a set `MOONCAKE_CONFIG_PATH`,
+`LMCACHE_NUMA_MODE` other than `auto`/`manual`, and the `LMCACHE_EXTRA_CONFIG`
+settings listed in the offload README's
+[Mooncake Store L2 section](../atom/kv_transfer/offload/README.md#mooncake-store-as-l2).
 
 ## KV cache events
 
