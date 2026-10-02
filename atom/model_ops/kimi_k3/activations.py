@@ -204,10 +204,19 @@ def situ_and_mul_quant(
     m = x2.shape[0]
     out = torch.empty((m, d), dtype=dtypes.fp8, device=x.device)
     scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
-    if m > 0:
-        _aiter_situ_quant(
-            out, x2.contiguous(), scale, d, float(beta), float(linear_beta)
-        )
+    if m == 0:
+        return out, scale
+    # AITER's gfx1250 HIP kernel hard-requires `d` to be 8-aligned and no
+    # larger than 16376.  Kimi-K3's dense layer uses d=33792 while its shared
+    # experts use d=6144, so keep the fused fast path for the latter and fall
+    # back to the two-kernel implementation for unsupported shapes.
+    if d % 8 != 0 or d > 16376:
+        activation = situ_and_mul(x2, beta, linear_beta)
+        quant = get_hip_quant(QuantType.per_Token)
+        return quant(activation, quant_dtype=dtypes.fp8)
+    _aiter_situ_quant(
+        out, x2.contiguous(), scale, d, float(beta), float(linear_beta)
+    )
     return out, scale
 
 
