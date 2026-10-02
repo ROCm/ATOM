@@ -1093,6 +1093,12 @@ def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
     )
     assert seen == [(samples, 6)]
 
+    context.scheduled_bs = 16
+    with pytest.raises(module.MonoUnsupported, match="concurrency C=16"):
+        runner.supports(
+            torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
+        )
+
 
 def test_glm_fp8_fused_576_cache_has_explicit_device_io():
     kernel = (
