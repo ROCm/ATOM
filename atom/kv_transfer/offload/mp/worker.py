@@ -281,9 +281,14 @@ class LMCacheMPConnector(KVConnectorBase):
                 f"TP size={tp_size})"
             )
         self._is_kv_writer = rank % requested_replication == 0
+        # Only engine_driven needs the token axis made explicit; see
+        # `_token_major_view`.  lmcache_driven's kernels address pages by this
+        # shape and hang if it is split.
         views = _build_cache_views(
             transfer_tensors,
             num_blocks=normalized_num_blocks,
+            tokens_per_block=self.block_size,
+            expose_token_axis=_transfer_mode(self._config) == "engine_driven",
         )
         block_regions = getattr(transfer_tensors, "block_regions", None) or []
         expected = sum(int(region.unit_bytes) for region in block_regions)

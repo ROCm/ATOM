@@ -569,7 +569,11 @@ def _transfer_tensors(*, tp_replication_factor: int = 1) -> KVTransferTensors:
 
 def test_build_cache_views_groups_opaque_layouts():
     transfer_tensors = _transfer_tensors()
-    views = page_views._build_cache_views(transfer_tensors, num_blocks=2)
+    views = page_views._build_cache_views(
+        transfer_tensors,
+        num_blocks=2,
+        tokens_per_block=1,
+    )
 
     assert list(views.tensors) == [
         "page.0.primary.0",
@@ -605,7 +609,7 @@ def test_build_cache_views_publishes_float8_pages_as_raw_bytes():
     transfer = KVTransferTensors(pages=[PageRegion(region, page)])
     transfer.set_block_count(2)
 
-    views = page_views._build_cache_views(transfer, num_blocks=2)
+    views = page_views._build_cache_views(transfer, num_blocks=2, tokens_per_block=1)
     published = views.tensors["page.0.latent"]
 
     assert published.dtype == torch.uint8
@@ -614,16 +618,95 @@ def test_build_cache_views_publishes_float8_pages_as_raw_bytes():
     assert torch.equal(published, page.view(torch.uint8))
 
 
+def test_build_cache_views_splits_opaque_block_into_token_axis():
+    """An opaque ``[N, 1, unit_bytes]`` PAGE view is republished with the token
+    axis made explicit, so LMCache detects ``block_size == tokens_per_block``.
+
+    Without this, LMCache's client formula
+    (``blocks_in_chunk * detected_block_size``) and its engine-driven server
+    formula (``ctx.chunk_size``) disagree by exactly ``tokens_per_block``, and
+    the server sizes every stored object that many times too large.
+    """
+
+    page = torch.arange(2 * 1 * 128, dtype=torch.uint8).reshape(2, 1, 128)
+    region = KVTransferRegion(
+        base_addr=page.data_ptr(),
+        total_bytes=page.numel(),
+        unit_bytes=page[0].numel(),
+        semantic_role="latent",
+    )
+    transfer = KVTransferTensors(pages=[PageRegion(region, page)])
+    transfer.set_block_count(2)
+
+    views = page_views._build_cache_views(
+        transfer, num_blocks=2, tokens_per_block=4, expose_token_axis=True
+    )
+    published = views.tensors["page.0.latent"]
+
+    assert tuple(published.shape) == (2, 4, 32)
+    assert published.data_ptr() == page.data_ptr()
+    assert torch.equal(published.reshape(2, 1, 128), page)
+    # The chunk's byte count is what must not move.
+    assert views.bytes_per_block == 128
+
+
+def test_build_cache_views_keeps_opaque_block_when_tokens_do_not_divide():
+    """A block whose byte count is not a multiple of its token count cannot
+    carry an explicit token axis; publish it unchanged rather than
+    reinterpreting bytes across token boundaries."""
+
+    page = torch.arange(2 * 1 * 30, dtype=torch.uint8).reshape(2, 1, 30)
+    region = KVTransferRegion(
+        base_addr=page.data_ptr(),
+        total_bytes=page.numel(),
+        unit_bytes=page[0].numel(),
+        semantic_role="latent",
+    )
+    transfer = KVTransferTensors(pages=[PageRegion(region, page)])
+    transfer.set_block_count(2)
+
+    views = page_views._build_cache_views(
+        transfer, num_blocks=2, tokens_per_block=4, expose_token_axis=True
+    )
+
+    assert tuple(views.tensors["page.0.latent"].shape) == (2, 1, 30)
+
+
+def test_build_cache_views_keeps_opaque_view_unless_token_axis_requested():
+    """lmcache_driven addresses pages by the registered shape, so the split is
+    opt-in.  Applying it there made every arm hang on the GPU with
+    "RPC call to sample_tokens timed out" (measured 2026-10-01, 2 of 2 arms,
+    both orderings)."""
+
+    page = torch.arange(2 * 1 * 128, dtype=torch.uint8).reshape(2, 1, 128)
+    region = KVTransferRegion(
+        base_addr=page.data_ptr(),
+        total_bytes=page.numel(),
+        unit_bytes=page[0].numel(),
+        semantic_role="latent",
+    )
+    transfer = KVTransferTensors(pages=[PageRegion(region, page)])
+    transfer.set_block_count(2)
+
+    views = page_views._build_cache_views(
+        transfer,
+        num_blocks=2,
+        tokens_per_block=4,
+    )
+
+    assert tuple(views.tensors["page.0.latent"].shape) == (2, 1, 128)
+
+
 def test_build_cache_views_rejects_missing_or_bad_geometry():
     missing_view = _transfer_tensors()
     missing_view.pages[-1] = PageRegion(missing_view.pages[-1].region)
     with pytest.raises(ValueError, match="one block_tensor_view per block region"):
-        page_views._build_cache_views(missing_view, num_blocks=2)
+        page_views._build_cache_views(missing_view, num_blocks=2, tokens_per_block=1)
 
     bad_geometry = _transfer_tensors()
     bad_geometry.block_regions[0].unit_bytes += 1
     with pytest.raises(ValueError, match="byte geometry mismatch"):
-        page_views._build_cache_views(bad_geometry, num_blocks=2)
+        page_views._build_cache_views(bad_geometry, num_blocks=2, tokens_per_block=1)
 
     noncontiguous = _transfer_tensors()
     noncontiguous.pages[0] = replace(
@@ -631,14 +714,18 @@ def test_build_cache_views_rejects_missing_or_bad_geometry():
     )
     assert not noncontiguous.block_tensor_views[0].is_contiguous()
     with pytest.raises(ValueError, match="non-empty and contiguous"):
-        page_views._build_cache_views(noncontiguous, num_blocks=2)
+        page_views._build_cache_views(noncontiguous, num_blocks=2, tokens_per_block=1)
 
     unsupported_rank = _transfer_tensors()
     unsupported_rank.pages[0] = replace(
         unsupported_rank.pages[0], view=torch.zeros(2, 4, 4, 8, dtype=torch.float16)
     )
     with pytest.raises(ValueError, match="physical_slots, opaque_width"):
-        page_views._build_cache_views(unsupported_rank, num_blocks=2)
+        page_views._build_cache_views(
+            unsupported_rank,
+            num_blocks=2,
+            tokens_per_block=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -670,7 +757,11 @@ def test_build_cache_views_rejects_stateful_slot_layouts(field, value):
         NotImplementedError,
         match=rf"PAGE-only layouts.*{field}",
     ):
-        page_views._build_cache_views(transfer_tensors, num_blocks=2)
+        page_views._build_cache_views(
+            transfer_tensors,
+            num_blocks=2,
+            tokens_per_block=1,
+        )
 
 
 class _LookupAdapter:
@@ -2131,7 +2222,11 @@ def test_page_region_is_a_region_and_its_byte_view_built_together():
     transfer.block_tensor_views[1][2].fill_(1)
     assert torch.all(fp16[2].view(torch.uint8) == 1)
     transfer.set_block_count(3)
-    assert page_views._build_cache_views(transfer, num_blocks=3).bytes_per_block == 32
+    assert page_views._build_cache_views(
+        transfer,
+        num_blocks=3,
+        tokens_per_block=1,
+    ).bytes_per_block == 32
 
 
 def test_page_region_rejects_what_it_cannot_alias():
@@ -2205,7 +2300,11 @@ def test_recurrent_groups_register_after_every_page_plane():
     Interleaving them would renumber the PAGE planes, and every object already
     in the tier is addressed by those numbers.
     """
-    views = page_views._build_cache_views(_recurrent_transfer_tensors(), num_blocks=2)
+    views = page_views._build_cache_views(
+        _recurrent_transfer_tensors(),
+        num_blocks=2,
+        tokens_per_block=1,
+    )
     assert list(views.tensors)[:4] == [
         "page.0.primary.0",
         "page.1.primary.1",
@@ -2236,7 +2335,7 @@ def test_recurrent_group_geometry_is_checked_against_its_own_block_count():
         ),
     )
     with pytest.raises(ValueError, match=r"recurrent\[0\] view 4"):
-        page_views._build_cache_views(transfer, num_blocks=2)
+        page_views._build_cache_views(transfer, num_blocks=2, tokens_per_block=1)
 
 
 @pytest.mark.parametrize(("num_blocks", "tokens_per_block"), [(0, 8), (2, 0), (-1, 8)])
@@ -2250,7 +2349,7 @@ def test_recurrent_group_refuses_a_non_positive_geometry(num_blocks, tokens_per_
         ),
     )
     with pytest.raises(ValueError, match="must.*be positive"):
-        page_views._build_cache_views(transfer, num_blocks=2)
+        page_views._build_cache_views(transfer, num_blocks=2, tokens_per_block=1)
 
 
 def test_each_recurrent_ordinal_gets_its_own_engine_group(

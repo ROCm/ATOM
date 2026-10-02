@@ -435,6 +435,22 @@ LMCACHE_DISABLE_BANNER=1 lmcache server \
 * The server drops SHM silently if `/dev/shm` cannot hold `--l1-size-gb`.
   Grep `mpserver.log` for that warning rather than assuming.
 * `--l1-size-gb` is the whole tier, not a per-rank share.
+* **Clear a stale pool before starting.** The server creates
+  `/dev/shm/lmcache_l1_pool_<shm-name>` with `shm_open(O_CREAT)` and **no
+  `O_EXCL`**, so a server that was killed before it could unlink leaves the
+  segment behind and the next one with the same `--shm-name` silently reuses
+  it — then hangs pinning memory that is already registered. It never answers
+  `/healthcheck`, and the last line in its log is `Checking if shm capacity is
+  larger than L1 request`, which names neither the pool nor the cause.
+  Measured twice (2026-10-02): one 64 GiB orphan took down both a 192 GiB run
+  and a later 64 GiB one. `/dev/shm` is shared host-wide under `--ipc=host`,
+  so this crosses containers.
+
+  ```bash
+  # safe only when no lmcache server is live: a running one has the pool
+  # mmapped with its fd closed, so it looks unheld
+  pgrep -f "lmcache server .*--shm-name k3mp_5555" || rm -f /dev/shm/lmcache_l1_pool_k3mp_5555
+  ```
 
 **2. Keep the ATOM connector, add the backend key.**
 
@@ -454,7 +470,17 @@ LMCACHE_DISABLE_BANNER=1 lmcache server \
 **3. Transfer mode.** `lmcache.mp.mp_transfer_mode` picks which process owns
 the gather/scatter kernels: `lmcache_driven` (the default) runs them in the
 `lmcache server` process, `engine_driven` runs them in the TP worker. Both are
-correct; `lmcache_driven` is what the numbers below use.
+correct. **Use `engine_driven`** — it is what closes the gap to the in-process
+tier (see *Measured*), and at the same settings it also carries a higher tier
+share (71.9% vs 55.9% of prompt tokens at conc 16).
+
+```
+"lmcache.mp.mp_transfer_mode": "engine_driven"
+```
+
+The two modes use the registered tensor shape for different things, which is
+why ATOM publishes a different view for each: `engine_driven` sizes objects
+from it, `lmcache_driven` addresses pages with it.
 
 ### Verifying an ATOM MP run
 
@@ -585,32 +611,55 @@ the tier has to be shared across engines.
 
 #### ATOM MP backend
 
-Three arms taken in the same slot, one at a time, on image
+Arms taken one at a time on image
 `rocm/atom-dev:vllm-v0.28.0-nightly_20260928-lmcache-v0.10`
 (vLLM `0.28.1.dev0+g2cf0a6915`, LMCache `0.5.5rc3+rocm7.2.4.torch2.10`), TP8 on
-eight gfx950 GPUs, **900 s** per arm, `--concurrency 16`, `SEED=1234`,
-`--max-model-len 65536`, `--gpu-memory-utilization 0.85`, `--block-size 128`,
+eight gfx950 GPUs, **900 s** per arm, `SEED=1234`, `--max-model-len 65536`,
+`--gpu-memory-utilization 0.85`, `--block-size 128`,
 `cudagraph_mode=FULL_AND_PIECEWISE`. Client: the controlled-prefix synthetic
 pool from *Client* — `PREFIX_LEN=27648`, `GEN_ISL=4608`, `GEN_OSL=512`,
 `PREFIX_POOL=16`, `ENTRIES=256`; measured ISL p50 32334, OSL 512. Tier: 90
 GiB/rank in-process (`LMCACHE_MAX_LOCAL_CPU_SIZE=90`), 192 GiB whole-tier for
 MP (`--l1-size-gb 192`) plus 24 GiB/rank for the recurrent state.
 
+`--concurrency 16`:
+
 | arm | tok/s/GPU | req/s | per-user tok/s p50 | TTFT p50 (ms) | ITL p50 (ms) | HBM hit | tier share | n |
 |---|---|---|---|---|---|---|---|---|
 | OFF (no connector) | 65.02 | 1.0159 | 35.46 | 627 | 28.20 | 78.88% | 0.00% | 923 |
-| ON in-process | **81.57** | 1.2745 | **48.12** | 670 | 20.78 | 23.04% | 67.43% | 1158 |
-| ON ATOM MP | 74.24 | 1.1600 | **42.76** | 848 | 23.38 | 22.45% | 67.79% | 1054 |
+| ON in-process | 81.57 | 1.2745 | **48.12** | 670 | 20.78 | 23.04% | 67.43% | 1158 |
+| ON MP, `lmcache_driven` | 60.80 | 0.9500 | 42.49 | 795 | 23.53 | 33.99% | 55.89% | 912 |
+| ON MP, `engine_driven` | 82.43 | 1.2880 | **48.97** | 763 | 20.42 | 18.84% | 71.86% | 1170 |
 
-The two ON arms reach the same cache coverage — tier share 67.4% vs 67.8% of
-prompt tokens, HBM hit 23.0% vs 22.5% — so the throughput difference is not a
-hit-rate difference. The MP backend recovers 58% of the in-process arm's gain
-over OFF; its residual cost shows up as +180 ms TTFT and +2.6 ms ITL, both of
-which are the cross-process round trip the in-process tier does not pay.
+`engine_driven` was measured twice at this concurrency; the second arm read
+57.87 tok/s/GPU and 47.52 per-user tok/s p50. The p50 figures differ by 3%
+between the two, the aggregate by 42%: the lower arm took a burst of 79-103 s
+TTFT outliers (p99 78,953 ms against 8,753 ms, zero errors) which moves the
+aggregate without moving the p50. Read the per-user p50 as the stable number
+here and treat a single aggregate reading as provisional.
+
+Across concurrency — same client, same knobs, only `--concurrency` varies, and
+the in-process and MP arms alternate within one batch rather than running as
+two blocks:
+
+| conc | in-process per-user p50 | MP `engine_driven` per-user p50 | in-process tok/s/GPU | MP tok/s/GPU |
+|---|---|---|---|---|
+| 8 | 67.36 | 67.35 | 57.00 | 56.53 |
+| 16 | 48.12 | 47.52 - 48.97 | 81.57 | 57.87 - 82.43 |
+| 32 | 31.62 | 32.70 | 109.26 | 110.59 |
+
+MP with `engine_driven` matches the in-process tier at all three points: the
+deviations are -0.015%, bracketing, and +3.4%, i.e. they do not share a sign,
+which is what a difference below the arm-to-arm noise looks like. The same
+sweep with `lmcache_driven` read -9.6% / -11.1% / -7.5%.
 
 `HBM hit` and `tier share` are fractions of prompt tokens, computed from the
 server counters as end-minus-start deltas over the measured window;
-`tok/s/GPU` is `req/s x OSL / TP`.
+`tok/s/GPU` is `req/s x OSL / TP`. The conc-16 OFF and in-process rows come
+from an earlier batch than the two MP rows; the across-concurrency table is
+single-batch throughout, and its conc-32 in-process arm reads 31.62 against
+31.55 for the earlier batch, which is how the two batches were checked to be
+comparable.
 
 ### Accuracy
 
@@ -637,6 +686,37 @@ cannot hold the corpus, so pass 2 can only come back from the CPU tier.
 `m2_store`/`m3_load` ran in 7 chunks of 189 questions, one server boot per
 chunk, because a 64-block pool plus a 24 GiB tier cannot hold 1319 questions at
 once; the figures are the aggregate over all 1319.
+
+#### ATOM MP, `engine_driven`
+
+The table above was taken with the in-process tier. `engine_driven` is
+validated with the same two-pass idea on a smaller corpus, because the limit
+is the tier's capacity rather than the eval's:
+
+```bash
+ARM=atommp CLIENT=gsm8k CONC=32 ACC_CONC=32 ACC_SHOTS=64 ACC_LIMIT=120 \
+  NUM_GPU_BLOCKS_OVERRIDE=500 MAX_MODEL_LEN=16384 \
+  TP_RANK_COLLAPSE=true STATE_TRANSPORT=own-pool \
+  MP_L1_GIB=192 STATE_GIB=24 LMC_CPU_GIB=90 \
+  MP_TRANSFER_MODE=engine_driven SEED=530419
+```
+
+64-shot (~10,506 prompt tokens) so prompts clear both the 1536-token block and
+`OFFLOAD_MIN_LOAD_TOKENS=8192`; `ACC_LIMIT=120` so one pass (1,260,720 tok)
+fits the tier and pass 1 is not evicted before pass 2 reads it.
+
+| arm | pass 1 | pass 2 | delta |
+|---|---|---|---|
+| OFF (noise floor) | 0.9833 | 0.9917 | +1 question |
+| ON MP, `engine_driven` | 0.9917 | 0.9833 | -1 question |
+
+Pass 2 of the ON arm served 966,144 prompt tokens out of the tier against
+1,249,858 queried (77.3%), with `vllm:prefix_cache_hits_total` at **exactly
+0** — the 500-block HBM pool holds nothing, so the tier is the only place
+those tokens can have come from. The ON arm's -1 question is the same size as
+the OFF arm's own +1: at concurrency the engine is not bit-deterministic, and
+that is the noise floor. At 120 questions one question is 0.83%, so this
+rules out a structural byte error but not a sub-question bias.
 
 #### How this run measures LMCache
 
