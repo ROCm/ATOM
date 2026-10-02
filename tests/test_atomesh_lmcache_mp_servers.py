@@ -225,6 +225,44 @@ stop_lmcache_mp_servers
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
+    def test_stop_from_an_exit_trap_stops_live_servers(self):
+        # cleanup_processes runs from the EXIT trap after a failure. A bare
+        # `return` there hands process_is_running the exit status, so the reap
+        # waited forever on a live server instead of stopping it.
+        result = self.run_shell(
+            """
+trap 'stop_lmcache_mp_servers; echo "STOPPED rc=$?"' EXIT
+start_lmcache_mp_servers
+exit 3
+""",
+            expect_rc=3,
+            LMCACHE_MP_STAGE_SERVERS="0:0-1:10;1:2-3:10",
+            HIP_VISIBLE_DEVICES="0,1,2,3",
+        )
+        self.assertIn("STOPPED rc=0", result.stdout)
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_terminate_gives_up_on_a_process_that_outlives_sigkill(self):
+        # A process in uninterruptible sleep survives SIGKILL; waiting for it
+        # would hold the launcher, and so the container, until the job's time
+        # limit. Here kill is a no-op and the clock jumps, so the child stays
+        # alive and `wait` on it would block for its 600 s.
+        result = self.run_shell("""
+/bin/sleep 600 &
+child=$!
+trap 'command kill -9 "${child}" 2>/dev/null || true' EXIT
+clock="$(mktemp)"
+echo 0 > "${clock}"
+kill() { :; }
+sleep() { :; }
+date() { local now=$(( $(cat "${clock}") + 7 )); echo "${now}" > "${clock}"; echo "${now}"; }
+terminate_process_group "${child}"
+echo "RETURNED"
+""")
+        self.assertIn("RETURNED", result.stdout)
+        self.assertIn("still running 30s after SIGKILL", result.stderr)
+
     @staticmethod
     def alive(pid):
         try:
