@@ -1303,6 +1303,13 @@ class KimiKDAAttention(nn.Module):
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
+            decode_state_indices_in = state_indices_in[:num_actual_tokens]
+            if kda_metadata.has_state_fork:
+                # Under pp>1 the checkpoint can land after the prompt, so a fork
+                # can reach decode. The conv update reads the _in slot itself; the
+                # recurrence kernel updates in place with no _in index, so copy
+                # the source state onto the (zeroed) destination slot first.
+                ssm_state[decode_state_indices] = ssm_state[decode_state_indices_in]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1312,6 +1319,7 @@ class KimiKDAAttention(nn.Module):
                 None,
                 self.activation,
                 conv_state_indices=decode_state_indices,
+                conv_state_indices_in=decode_state_indices_in,
                 validate_data=False,
             )
             q = rearrange(q, "t (h d) -> 1 t h d", d=self.head_dim)

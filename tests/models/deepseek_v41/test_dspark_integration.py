@@ -220,7 +220,11 @@ def test_decode_positions_use_accepted_prefix_and_full_reservation():
     builder.cache = PagedAttentionCache(builder.geometry, 20, 5, "cpu")
     builder.block_size, builder.device = 16, "cpu"
     builder.model_runner = SimpleNamespace(
-        tokenID_processor=SimpleNamespace(num_rejected=np.array([0, 4])),
+        # Deferred output (pp == 1): the verify window's shift is num_rejected.
+        tokenID_processor=SimpleNamespace(
+            num_rejected=np.array([0, 4]),
+            verify_context_shift=lambda: np.array([0, 4]),
+        ),
         forward_vars=metadata_buffers(2, 4, 10, geometry=builder.geometry),
     )
     batch = SimpleNamespace(
