@@ -2389,6 +2389,16 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if self.kv_transfer_config:
+            # The offload namespace hashes the model's cache geometry. A worker
+            # normalises `hf_config` while it builds the model (Kimi-K3 derives
+            # `head_dim`, `ModelRunner.get_num_blocks` fills a missing one) and
+            # the scheduler never does, so hashing the live config gives each a
+            # different namespace and every scheduler lookup misses. Snapshot it
+            # here, before the config is shipped to either process.
+            from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+
+            self.offload_page_hf_geometry = snapshot_page_hf_geometry(self.hf_config)
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens

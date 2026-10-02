@@ -185,6 +185,26 @@ class LMCacheMPConnector(KVConnectorBase):
             self._do_load,
         )
 
+    def close(self) -> None:
+        """Unregister this rank's cache views from the MP server.
+
+        `ModelRunner.exit` calls this before the KV pool is freed. The server
+        maps the pool over GPU IPC, and without an unregister it keeps that
+        mapping -- and the memory -- until its worker reaper expires the
+        instance (`--worker-reap-timeout-seconds`, 120 s by default), so an
+        engine restarted on the same GPUs finds the memory still taken.
+        `AtomMPWorkerAdapter.shutdown` drains in-flight operations, stops the
+        heartbeat and unregisters.
+        """
+        adapter, self._adapter = self._adapter, None
+        if adapter is None:
+            return
+        try:
+            adapter.shutdown()
+        except Exception:
+            # Teardown continues; the server's reaper is the backstop.
+            logger.warning("LMCache MP worker shutdown failed", exc_info=True)
+
     def start_load_kv(self, metadata: Any) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return

@@ -155,6 +155,41 @@ def _register_custom_attention_to_sglang() -> None:
     install_upstream_glm52_graph_metadata_adapter()
 
 
+def _keep_atom_backend_for_qwen_qsa() -> None:
+    """Stop SGLang from replacing ATOM's full-attention backend on Qwen QSA models.
+
+    Since v0.5.20 SGLang's hybrid-GDN backend wrapper swaps the full-attention
+    child for its own ``QwenSparseAttnBackend`` whenever ``is_qwen_qsa`` holds.
+    ATOM's Qwen4Exp runs its own QSA kernels and fills their CUDA-graph page
+    tables from ``ATOMAttnBackendForSgl.init_forward_metadata_out_graph``; with
+    the swap that hook never runs and graph capture fails on the unallocated
+    buffers. Report "not QSA" to SGLang only for Qwen4Exp models ATOM serves.
+    """
+    try:
+        import sglang.srt.layers.attention.qsa.config as sglang_qsa_config
+    except ImportError:
+        return
+    if getattr(sglang_qsa_config, "_atom_keep_backend_patched", False):
+        return
+    if "atom.plugin.sglang" not in os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE", ""):
+        return
+
+    original_is_qwen_qsa = sglang_qsa_config.is_qwen_qsa
+
+    def is_qwen_qsa(config) -> bool:
+        arches = getattr(config, "architectures", None) or []
+        if any("Qwen4Exp" in str(arch) for arch in arches):
+            return False
+        return original_is_qwen_qsa(config)
+
+    sglang_qsa_config.is_qwen_qsa = is_qwen_qsa
+    sglang_qsa_config._atom_keep_backend_patched = True
+    logger.info(
+        "ATOM plugin: keep ATOMAttnBackendForSgl for Qwen4Exp QSA layers "
+        "(SGLang QwenSparseAttnBackend disabled)"
+    )
+
+
 def _patch_sglang_dsv4_draft_backends() -> None:
     """Route hard-coded speculative factories to ATOM-owned backends.
 
@@ -1065,6 +1100,7 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     )
 
     _register_custom_attention_to_sglang()
+    _keep_atom_backend_for_qwen_qsa()
     _patch_sglang_dsv4_draft_backends()
     patch_sglang_eagle3_runtime_compat()
     _patch_sglang_dsv4_spec_cuda_graph()

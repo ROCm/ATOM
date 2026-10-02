@@ -181,10 +181,13 @@ align to ATOM's PAGE/hash block size. A native prefix is loadable only where
 PAGE KV and a complete STATE checkpoint exist at the same boundary on every TP
 rank.
 
-`lmcache.mp.max_pinned_state_bytes` optionally limits native checkpoint sources
-and temporary restore images together. By default it is
-`OFFLOAD_MAX_PENDING_SAVES * units_per_checkpoint * page_unit_bytes` for each TP
-worker. Candidates consume no PAGE/image pin until admission. If a request has
+A native restore borrows `units_per_checkpoint` PAGE units for its STATE image
+while the transfer is in flight; on success those units are adopted in place as
+a READY checkpoint that later prefix hits reuse. There is no separate byte
+budget on these images: a request has at most one load, so the admitted batch
+bounds them, and a PAGE pool without room for an image refuses the load (which
+then recomputes). Saves remain bounded by the shared save limit below.
+Candidates consume no PAGE/image pin until admission. If a request has
 already finished, admission resolves its token/hash chain through the live
 prefix index and stores only the still-resident contiguous prefix.
 Native MP never stores a prefix shorter than `OFFLOAD_MIN_SAVE_TOKENS`: with
@@ -264,7 +267,8 @@ RESTORE
 - DSv4 declares PAGE and native STATE fully TP-replicated. In `auto` mode, one
   rank stores and every rank retrieves (`num_kv_readers=TP`). GLM-5.2 follows
   the same replicated sparse-MLA rule. MiniMax-M3 remains sharded and stores on
-  every rank.
+  every rank. Kimi-K3 also stores on every rank: its MLA PAGE is replicated,
+  but the KDA state packed into the same PAGE-unit image is sharded by head.
 - External native restore supports zero-HBM and incremental local-prefix cases;
   native lookup truncates the query to
   `floor((prompt_tokens - 1) / chunk_size) * chunk_size`, and PAGE and STATE
@@ -277,7 +281,7 @@ RESTORE
 
 ### MP validation
 
-CPU tests cover READY leases, generation replay, eviction/reset, byte budgets,
+CPU tests cover READY leases, generation replay, eviction/reset, save limits,
 fair admission, cancellation/failure, full-prompt boundaries, alias byte order,
 and strided-tail registration. LMCache tests cover null markers, serialization,
 sparse STATE lookup, and capability negotiation.

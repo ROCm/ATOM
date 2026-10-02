@@ -266,6 +266,54 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def reserve_checkpoint_descriptors(self, descriptor_slots):
         self.copies.staging.reserve(descriptor_slots)
 
+    def get_kv_transfer_tensors(self):
+        """PAGE units and the native checkpoint contract, for `lmcache_mp`.
+
+        A PAGE unit is its main page plus that page's rows in each index plane
+        (`PagedAttentionCache.unit_regions`). Each plane is published whole as
+        one region, in that order -- the order `StateCopies` cuts a checkpoint
+        image into, which `build_native_state_mp_layout` aliases unit by unit.
+        Nothing else is published: no SLOT and no P/D staging, since the only
+        transport admitted (`validate_runtime_config`) is the native-state MP
+        path, which moves STATE through `execute_paged_state_copies`.
+        """
+        runner = self.model_runner
+        if not getattr(runner.config, "kv_transfer_config", None):
+            return None
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+
+        if self.cache is None:
+            raise RuntimeError(
+                "DeepSeek-V4.1 publishes transfer regions after allocation"
+            )
+        planes = [("dsv41.page", self.cache.page_bytes)] + [
+            (f"dsv41.index_plane.{owner}", plane)
+            for owner, plane in self.cache.index_planes.items()
+        ]
+        pages = [page_region(plane, semantic_role=role) for role, plane in planes]
+        spec = runner.state_runtime.checkpoint_spec
+        published = [page.region.unit_bytes for page in pages]
+        if (
+            published != [size for _, size in self.cache.unit_regions()]
+            or sum(published) != spec.page_unit_bytes
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4.1 transfer regions do not match the checkpoint's "
+                f"PAGE unit: regions={published}, unit={spec.page_unit_bytes}"
+            )
+        # No cache dimension is split across TP: every rank holds the same PAGE
+        # and STATE bytes, as DeepSeek-V4's compressed cache does.
+        tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
+        return KVTransferTensors(
+            pages=pages,
+            tp_replication_factor=tp_size,
+            native_state_tp_replication_factor=tp_size,
+            paged_state_checkpoint_spec=spec,
+            execute_paged_state_copies=self.execute_paged_state_copies,
+            paged_state_region_count=len(pages),
+        )
+
     def warmup_per_req_cache(self):
         self.copies.warmup()
 

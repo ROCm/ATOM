@@ -52,7 +52,7 @@ The validated prefill and decode configurations are:
 | Batched-token budget | 8192 | 16384 (default) |
 | LMCache | 256 GiB CPU tier, 256-token chunks | Disabled |
 | Native prefix caching | Enabled | Enabled |
-| Speculative decoding | MTP3 | MTP3 |
+| Speculative decoding | MTP3, forced AL 2.99 | MTP3, forced AL 2.99 |
 
 Both nodes use MXFP4 weights, online PTPC FP8 quantization,
 `ATOM_MLA_PAGE_SIZE=1`, `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047`,
@@ -103,6 +103,7 @@ env \
   HIP_VISIBLE_DEVICES=0,1,2,3 \
   VLLM_PP_LAYER_PARTITION=20,20,20,18 \
   LMCACHE_LOCAL_CPU=True \
+  LMCACHE_NUMA_MODE=auto \
   LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
   LMCACHE_CHUNK_SIZE=256 \
   OFFLOAD_PROFILE=1 \
@@ -117,10 +118,11 @@ env \
     --max-num-seqs 512 \
     --enable_prefix_caching \
     --online_quant_config \
-      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
     --level 3 \
     --method mtp \
     --num-speculative-tokens 3 \
+    --spec-decode-acceptance-length 2.99 \
     --server-port 8010 \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 4 \
@@ -162,10 +164,11 @@ env \
     --max-num-seqs 512 \
     --enable_prefix_caching \
     --online_quant_config \
-      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","*expert*"]}' \
+      '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
     --level 3 \
     --method mtp \
     --num-speculative-tokens 3 \
+    --spec-decode-acceptance-length 2.99 \
     --server-port 8020 \
     --tensor-parallel-size 4 \
     --decode-context-parallel-size 4 \

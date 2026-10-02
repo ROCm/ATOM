@@ -100,6 +100,18 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._hit_save_floors[sid] = num_prompt
         return matched
 
+    def _new_load_operation(self, seq: Any) -> LoadOperationId:
+        operation = super()._new_load_operation(seq)
+        # The worker restores PAGE KV straight into allocated blocks, which
+        # never pass through `hash_blocks()`. Naming where the load starts lets
+        # `Scheduler._mark_offload_load_ready` publish the loaded prefix once
+        # the load succeeds; without it the suffix prefill finds its parent
+        # block unhashed and cannot register its own blocks either.
+        # `build_connector_meta` dispatches only chunk-aligned loads from the
+        # post-allocate HBM frontier, so this is always a hash-block boundary.
+        seq.offload_load_start_tokens = int(seq.num_cached_tokens)
+        return operation
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         metadata = super().build_connector_meta()
         for req in metadata.requests:
