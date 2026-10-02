@@ -46,7 +46,8 @@ PYTHON_STUB = textwrap.dedent("""\
           exit 5
         fi
         bytes="$(sed -n 's/.* --global_segment_size=\\([0-9]*\\) .*/\\1/p' <<< " $* ")"
-        echo "${bytes}" >> "${STUB_DIR}/segments"
+        master="$(sed -n 's/.* --master_server_address=[^ ]*:\\([0-9]*\\) .*/\\1/p' <<< " $* ")"
+        echo "${master} ${bytes}" >> "${STUB_DIR}/segments"
         exec sleep 60
         ;;
       *" --every "*) exec sleep 60 ;;
@@ -61,9 +62,14 @@ CURL_STUB = textwrap.dedent("""\
     case "${url}" in
       */metadata*) [[ -e "${STUB_DIR}/master-up" ]] ;;
       */metrics)
+        # A pool's metrics count the owners that joined its master.
+        port="$(sed -n 's#^http://[^/]*:\\([0-9]*\\)/metrics$#\\1#p' <<< "${url}")"
+        master=$(( ATOMESH_MOONCAKE_MASTER_PORT + port - ATOMESH_MOONCAKE_METRICS_PORT ))
         total=0
         if [[ -e "${STUB_DIR}/segments" ]]; then
-          while read -r bytes; do total=$(( total + bytes )); done < "${STUB_DIR}/segments"
+          while read -r owner_master bytes; do
+            if [[ "${owner_master}" == "${master}" ]]; then total=$(( total + bytes )); fi
+          done < "${STUB_DIR}/segments"
         fi
         echo "# HELP master_total_capacity_bytes"
         echo "master_total_capacity_bytes ${total}"
@@ -339,6 +345,210 @@ stop_mooncake_store
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
+    def pools(self, **env):
+        result = self.run_shell(
+            """
+plan_mooncake_store_pools
+for i in "${!mooncake_pool_devices[@]}"; do
+  echo "${mooncake_pool_devices[i]}|${mooncake_pool_capacity[i]}|$(mooncake_pool_port 50000 "${i}")$(mooncake_pool_suffix "${i}")"
+done
+""",
+            **env,
+        )
+        return [line.split("|") for line in result.stdout.splitlines()]
+
+    def test_one_shared_pool_counts_the_owners_of_every_node(self):
+        self.assertEqual(
+            self.pools(
+                LMCACHE_MOONCAKE_OWNERS="0:64;1:96",
+                LMCACHE_MOONCAKE_DECODE_OWNERS="0:32:rdma0",
+            ),
+            [["", str(192 * GIB), "50000"]],
+        )
+
+    def test_per_nic_pools_number_the_nics_of_both_nodes_alike(self):
+        # Each node lists its owners in its own order; a decode node reads the
+        # settings from their prefill-prefixed copies.
+        self.assertEqual(
+            self.pools(
+                LMCACHE_MOONCAKE_POOLS="per_nic",
+                LMCACHE_MOONCAKE_OWNERS="0:192:rdma1;0:192:rdma0;0:16:rdma10",
+                ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_DECODE_OWNERS=(
+                    "0:240:rdma0;0:240:rdma1"
+                ),
+            ),
+            [
+                ["rdma0", str(432 * GIB), "50000-pool0"],
+                ["rdma1", str(432 * GIB), "50100-pool1"],
+                ["rdma10", str(16 * GIB), "50200-pool2"],
+            ],
+        )
+
+    def test_invalid_pool_settings_are_refused(self):
+        per_nic = {"LMCACHE_MOONCAKE_POOLS": "per_nic"}
+        for env, message in (
+            (
+                {**per_nic, "LMCACHE_MOONCAKE_OWNERS": "0:64:rdma0,rdma1"},
+                "needs exactly one NIC; 0:64:rdma0,rdma1 names several",
+            ),
+            # Without a list of its own an owner takes rdma4-rdma7.
+            ({**per_nic, "LMCACHE_MOONCAKE_OWNERS": "0:64"}, "needs exactly one NIC"),
+            ({"LMCACHE_MOONCAKE_POOLS": "ring"}, "neither shared nor per_nic"),
+            (
+                {
+                    **per_nic,
+                    "LMCACHE_MOONCAKE_OWNERS": "0:8:rdma0;0:8:rdma1",
+                    "ATOMESH_MOONCAKE_METRICS_PORT": "65500",
+                },
+                "port ATOMESH_MOONCAKE_METRICS_PORT + 100 x 1 = 65600",
+            ),
+        ):
+            with self.subTest(env=env):
+                result = self.run_shell(
+                    "plan_mooncake_store_pools\n", expect_rc=2, **env
+                )
+                self.assertIn(message, result.stderr)
+
+    def test_decode_owners_need_their_own_nodes_and_one_prefill_node(self):
+        decode_owners = {"LMCACHE_MOONCAKE_DECODE_OWNERS": "0:8:rdma0"}
+        for env in (
+            {"ATOMESH_PD_WORKER_LAYOUT": "single_node", "xP": "1"},
+            {"ATOMESH_PD_WORKER_LAYOUT": "multi_node", "xP": "2"},
+        ):
+            with self.subTest(env=env):
+                result = self.run_shell(
+                    "check_mooncake_store_settings\n",
+                    expect_rc=2,
+                    **decode_owners,
+                    **env,
+                )
+                self.assertIn("needs the decode on nodes of its own", result.stderr)
+        self.run_shell(
+            "check_mooncake_store_settings\n",
+            **decode_owners,
+            ATOMESH_PD_WORKER_LAYOUT="multi_node",
+            xP="1",
+        )
+
+    def test_per_nic_store_gives_each_nic_a_master_and_each_stage_its_pool(self):
+        port = self.master_port
+        result = self.run_shell(
+            """
+start_mooncake_store
+printf 'ENV %s\\n' "${mooncake_l2_prefill_env[@]}"
+# As cleanup_processes runs them.
+save_mooncake_store_metrics
+stop_mooncake_store
+""",
+            LMCACHE_MOONCAKE_POOLS="per_nic",
+            LMCACHE_MOONCAKE_MASTER_NUMA="0",
+            LMCACHE_MOONCAKE_OWNERS="0:64:rdma1;0:32:rdma0",
+        )
+        masters = sorted(self.store_calls("mooncake_master"))
+        self.assertEqual(len(masters), 2)
+        for pool, master in enumerate(
+            sorted(masters, key=lambda c: f"--rpc_port={port + 100}" in c)
+        ):
+            self.assertIn("/scripts/numa_exec.py 0 mooncake_master", master)
+            for flag in (
+                f"--rpc_port={port + 100 * pool}",
+                f"--http_metadata_server_port={50180 + 100 * pool}",
+                f"--metrics_port={50190 + 100 * pool}",
+            ):
+                self.assertIn(f" {flag} ", f"{master} ")
+        owners = self.store_calls("mooncake_client")
+        for device, pool, size in (("rdma1", 1, 64 * GIB), ("rdma0", 0, 32 * GIB)):
+            (call,) = [c for c in owners if f"--device_names={device} " in f"{c} "]
+            for flag in (
+                f"--master_server_address={HOST}:{port + 100 * pool}",
+                f"--metadata_server=http://{HOST}:{50180 + 100 * pool}/metadata",
+                f"--global_segment_size={size}",
+            ):
+                self.assertIn(f" {flag} ", f"{call} ")
+        env = dict(
+            line.removeprefix("ENV ").split("=", 1)
+            for line in result.stdout.splitlines()
+            if line.startswith("ENV ")
+        )
+        self.assertEqual(
+            json.loads(env["ATOM_LMCACHE_MOONCAKE_POOLS"]),
+            {
+                "rdma0": {
+                    "master": f"{HOST}:{port}",
+                    "metadata": f"http://{HOST}:50180/metadata",
+                },
+                "rdma1": {
+                    "master": f"{HOST}:{port + 100}",
+                    "metadata": f"http://{HOST}:50280/metadata",
+                },
+            },
+        )
+        # Owners share the stages' NICs by design here.
+        self.assertNotIn("ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES", env)
+        for pool, size in ((0, 32 * GIB), (1, 64 * GIB)):
+            metrics = self.root / f"logs/mooncake-master-rank-0-pool{pool}.metrics"
+            self.assertIn(f"master_total_capacity_bytes {size}", metrics.read_text())
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_decode_node_owners_join_the_prefill_nodes_masters(self):
+        port = self.master_port
+        # The prefill node runs the masters and has mounted its own owners.
+        (self.root / "segments").write_text(
+            f"{port} {64 * GIB}\n{port + 100} {64 * GIB}\n"
+        )
+        result = self.run_shell(
+            f"""
+for p in {port} {port + 100}; do
+  setsid python3 /scripts/numa_exec.py 0 mooncake_master --rpc_port=$p \
+    >/dev/null 2>&1 &
+done
+start_mooncake_store_decode_owners
+mooncake_store_running
+echo "MASTERS=${{mooncake_store_master_count}}"
+# As cleanup_processes runs them.
+save_mooncake_store_metrics
+stop_mooncake_store
+""",
+            NODE_RANK="1",
+            NODE0_ADDR=HOST,
+            host_ip="127.0.0.2",
+            HIP_VISIBLE_DEVICES="0,1,2,3",
+            LMCACHE_MOONCAKE_L2="0",
+            ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_L2="1",
+            ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_POOLS="per_nic",
+            ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_OWNERS="0:64:rdma0;0:64:rdma1",
+            ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_DECODE_OWNERS=(
+                "0:96:rdma1;0:96:rdma0"
+            ),
+        )
+        self.assertIn("MASTERS=0", result.stdout)
+        # No L1 here: the budget counts the owners only.
+        (budget,) = [
+            line
+            for line in self.calls.read_text().splitlines()
+            if "numa_memory_budget.py" in line
+        ]
+        self.assertIn("--gpus  --per-gpu-gib 48 0:96 0:96", budget)
+        owners = self.store_calls("mooncake_client")
+        self.assertEqual(len(owners), 2)
+        for device, pool in (("rdma0", 0), ("rdma1", 1)):
+            (call,) = [c for c in owners if f"--device_names={device} " in f"{c} "]
+            self.assertIn("BIND=127.0.0.2 ", call)
+            self.assertIn("/scripts/numa_exec.py 0 mooncake_client ", call)
+            for flag in (
+                "--host=127.0.0.2",
+                f"--master_server_address={HOST}:{port + 100 * pool}",
+                f"--metadata_server=http://{HOST}:{50180 + 100 * pool}/metadata",
+                f"--global_segment_size={96 * GIB}",
+            ):
+                self.assertIn(f" {flag} ", f"{call} ")
+        # Its owners are stopped; the masters are the prefill node's to stop.
+        owner_pids = {int(c.split()[0]) for c in owners}
+        for pid in owner_pids:
+            self.assertFalse(self.alive(pid), pid)
+        self.assertFalse(list((self.root / "logs").glob("*.metrics")))
+
     def test_an_owner_dying_before_ready_stops_the_store(self):
         self.run_shell(
             "start_mooncake_store\n",
@@ -365,7 +575,7 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         )
         self.assertIn("STOP rc=1", result.stdout)
         self.assertIn(
-            f"counts {8 * GIB} of the owners' {16 * GIB} bytes", result.stderr
+            f"counts {8 * GIB} of its owners' {16 * GIB} bytes", result.stderr
         )
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)

@@ -1183,7 +1183,7 @@ engine is built, `mooncake_store_l2.py`:
 | Does | Because |
 |------|---------|
 | Allocates the L1 itself: mmap, mbind to the GPU's NUMA node (any other node is refused), `MADV_HUGEPAGE`, one touch per 2 MiB, `hipHostRegister`. Startup fails unless all of it is transparent huge pages and, once the engine is built, unless LMCache's L1 is that region. | An ionic NIC registers about 3 GiB of 4 KiB pages in all, and one 4 KiB page counts its whole MR against that budget, so LMCache's own NUMA L1 (4 KiB pages) cannot register; LMCache only warns, and every put then fails without an error. With 1 GiB MRs a few 4 KiB pages would still register: requiring all huge pages is a policy that keeps the L1 off the budget. LMCache takes other allocators when it has no NUMA mapping for the GPU, and for hugetlb, shm or P2P pools. |
-| Gives each worker one RDMA device, the GPU's: the ACTIVE device sharing the deepest PCI path with it (`ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES` overrides), and refuses one the owners use (`ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES`). | Several NICs per requester, or NICs shared with the owners, stalled concurrent reads for 30-60 s before they failed. One NIC per stage, disjoint from the owners', ran 4 x 33 GB/s. |
+| Gives each worker one RDMA device, the GPU's: the ACTIVE device sharing the deepest PCI path with it (`ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES` overrides), and refuses one the owners use (`ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES`). With per-NIC pools (`ATOM_LMCACHE_MOONCAKE_POOLS`) the owners share the stages' NICs instead, and the worker joins the pool of its own device. | Several NICs per requester, or NICs shared with the owners, stalled concurrent reads for 30-60 s before they failed. One NIC per stage, disjoint from the owners', ran 4 x 33 GB/s. Where a job may use only its own GPUs' NICs, one master per NIC keeps a NIC to one stage and its own pool's owners: across two nodes, 4 x 37 GB/s with no retransmission, where one master for the same 8 owners stalled a stage for good. |
 | Answers `batched_contains` with one `batch_is_exist` RPC. | The connector asked the master once per chunk on the scheduler's synchronous lookup path: 25-58 ms per lookup, against 0.4-1 ms. |
 | Makes the connector's gets allocate their L1 buffers without waiting: what eviction frees at once, and once one allocation fails, none for the rest of the batch (those chunks miss). | The get allocates on LMCache's storage event loop, which also finishes the write-through puts whose L1 references keep their chunks from eviction. Busy-waiting there for room spun forever once in-flight puts and pinned chunks filled the L1, and every later put and get of the worker hung (pit2-p03-g40, 8 GiB L1 per stage, agentic 1M traces at 16 sessions). LMCache keeps the retrieved prefix up to the first missing chunk; the rest is recomputed. |
 | Refuses `MC_NUM_QP_PER_EP` other than 1, a set `MOONCAKE_CONFIG_PATH`, `LMCACHE_NUMA_MODE` other than `auto`/`manual`, `LMCACHE_LOCAL_CPU_USE_HUGEPAGES`, `LMCACHE_BLOCKING_TIMEOUT_SECS` < 30, and in `LMCACHE_EXTRA_CONFIG`: `save_chunk_meta` other than `false`, `transfer_timeout` < 30, `mooncake_global_segment_size` other than `"0"`, no `mooncake_protocol`, and keys Mooncake never sees (`master_server_address`, `device_name`, `mooncake_rdma_devices`, `mooncake_transfer_timeout`). | Each of them fails silently, hangs, or corrupts or leaks objects under load. |
@@ -1233,18 +1233,30 @@ stops the owners and then the master after the workers. The defaults fit
 pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node, and NUMA1's NICs named
 `rdma4`-`rdma7`.
 
+With `LMCACHE_MOONCAKE_POOLS=per_nic` the launcher starts one master per owner
+NIC (pool *i* on the base ports + 100 x *i*) and gives the prefill workers
+`ATOM_LMCACHE_MOONCAKE_POOLS` instead of the owners' devices. With
+`LMCACHE_MOONCAKE_DECODE_OWNERS` each decode node (`pd_worker_layout`
+`multi_node`, one prefill node) starts owners on its own memory before its
+workers load; they join the prefill node's masters, and the prefill node
+waits until every pool counts the owners of all nodes. The master metrics are
+saved before anything stops, since a decode node stops its owners once the
+router closes.
+
 | Launcher knob | Default | Meaning |
 |---------------|---------|---------|
 | `LMCACHE_MOONCAKE_OWNERS` | `0:768:rdma4,rdma5;1:768:rdma6,rdma7` | One owner per `<numa>:<GiB>[:<rdma,...>]` entry. An ionic NIC registers at most 832-896 GiB for one process: a 960 GiB owner fails to mount, on one NIC or four, and so did 768 + 960 GiB owners sharing `rdma4`-`rdma7`; 768 + 768 GiB on separate NIC pairs mount in 12 s. |
 | `LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES` | `rdma4,rdma5,rdma6,rdma7` | Devices of an owner entry without its own; must not be a stage's. |
-| `LMCACHE_MOONCAKE_MASTER_NUMA` | 1 | NUMA node whose CPUs run the master. |
+| `LMCACHE_MOONCAKE_POOLS` | `shared` | `shared`: one master for every owner. `per_nic`: one master per owner NIC, every owner on exactly one NIC, each prefill worker on its own NIC's pool. |
+| `LMCACHE_MOONCAKE_DECODE_OWNERS` | unset | Owners each decode node starts, same format, joining the prefill node's masters (`multi_node`, one prefill node). |
+| `LMCACHE_MOONCAKE_MASTER_NUMA` | 1 | NUMA node whose CPUs run the masters. |
 | `LMCACHE_MOONCAKE_EVICTION_HIGH_WATERMARK`, `LMCACHE_MOONCAKE_EVICTION_RATIO` | 0.90, 0.05 | Master eviction trigger and step (approximately LRU). |
 | `LMCACHE_MOONCAKE_OWNER_THREADS`, `LMCACHE_MOONCAKE_OWNER_MAX_MR_SIZE` | 4, 64 GiB | Owner service threads; MR size the segment is split into. |
 | `LMCACHE_MOONCAKE_MASTER_WAIT_TIMEOUT`, `LMCACHE_MOONCAKE_WAIT_TIMEOUT` | 120 s, 1200 s | Readiness deadlines of the master and of the owners' capacity. |
 | `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS` | `MODEL_PATH` | Colon-separated directories whose clean page cache is dropped before the owners allocate (suite `lmcache_mooncake`: `${ATOMESH_MODEL_ROOT}`, every model on the node). |
 | `LMCACHE_MOONCAKE_NODE_RESERVE_GIB` | 128 | Memory each NUMA node keeps beyond the owners and the stages' L1s (`LMCACHE_MAX_LOCAL_CPU_SIZE` per prefill GPU); a plan that leaves less fails the start. |
 | `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_SECONDS` | 1800 | How long the model's page cache keeps being dropped while weights load. |
-| `ATOMESH_MOONCAKE_{MASTER,METADATA,METRICS,OWNER}_PORT` | 50051, 50080, 50090, 50052 | Ports, shifted by `ATOMESH_SERVICE_PORT_OFFSET`; owner *i* uses the base + *i*. |
+| `ATOMESH_MOONCAKE_{MASTER,METADATA,METRICS,OWNER}_PORT` | 50051, 50080, 50090, 50052 | Ports, shifted by `ATOMESH_SERVICE_PORT_OFFSET`; pool *i*'s master uses the base + 100 x *i*, owner *i* the base + *i*. |
 
 The Store needs an image built with Mooncake `WITH_STORE=ON` (`mooncake_master`,
 `mooncake_client`, `mooncake.store`); the CI image builds `WITH_STORE=OFF`.
