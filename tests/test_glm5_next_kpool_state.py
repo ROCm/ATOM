@@ -2,6 +2,7 @@
 
 """GLM-5.3 k-pool state contracts (CPU plus ROCm-only kernel cases)."""
 
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -236,3 +237,173 @@ def test_decode_tail_fork_reads_input_and_materializes_output_slot():
     assert out.shape == (1, 128)
     assert tail[9, 0, :, 0].cpu().tolist() == [1, 2, 3, 4]
     assert tail[9, 1, :, 0].cpu().tolist() == [11, 12, 13, 14]
+
+
+def test_cached_chunk_reads_the_tail_from_its_history_ring_rows(monkeypatch):
+    """Under MTP the tail is the history ring: position `p` lives at `p % 8`."""
+    seen = {}
+
+    def pool_and_rotate(pool_k, pool_gate, _ape):
+        seen["pool_k"] = pool_k.clone()
+        seen["pool_gate"] = pool_gate.clone()
+        return pool_k.sum(dim=1)
+
+    monkeypatch.setattr(KPOOL_INDEXER.kpool, "pool_and_rotate", pool_and_rotate)
+    monkeypatch.setattr(
+        KPOOL_INDEXER.kpool,
+        "pool_slot_mapping",
+        lambda _bt, pool_ids, _req_idx, _rows: pool_ids,
+    )
+    monkeypatch.setattr(
+        KPOOL_INDEXER, "indexer_k_quant_and_cache", lambda *_args, **_kwargs: None
+    )
+
+    tail = torch.full((12, 2, 8, 2), -1, dtype=torch.bfloat16)
+    for position in range(100, 103):
+        tail[5, 0, position % 8] = position
+        tail[5, 1, position % 8] = position + 100
+
+    KPOOL_INDEXER._kpool_write_completed_pools(
+        kv_cache=torch.empty(1),
+        k=torch.full((1, 2), 103, dtype=torch.bfloat16),
+        gate_score=torch.full((1, 2), 203, dtype=torch.bfloat16),
+        positions=torch.tensor([103]),
+        pool_bt=torch.empty((1, 1), dtype=torch.int32),
+        req_idx=torch.tensor([0]),
+        compress_ape=torch.zeros((4, 2)),
+        index_kpool=4,
+        head_dim=2,
+        scale_fmt="ue8m0",
+        pool_rows=16,
+        chunk_start=torch.tensor([103]),
+        tail_cache=tail,
+        state_slot_idx_in=torch.tensor([5]),
+        state_slot_idx=torch.tensor([9]),
+    )
+
+    assert seen["pool_k"][:, :, 0].tolist() == [[100, 101, 102, 103]]
+    assert seen["pool_gate"][:, :, 0].tolist() == [[200, 201, 202, 203]]
+
+
+def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch):
+    """MLA verify always reads sparse_kv_indices, so the indexer must write them.
+
+    `max_seqlen_k == 0` is what CUDAGraph capture metadata carries; skipping on
+    it would record the skip into every replay. The scoring scratch is sized
+    from the model limit for the same reason.
+    """
+    from atom.model_ops.glm5_next import speculative as SPEC
+
+    # The op imports these at call time; patch the defining modules. A dotted
+    # string would resolve `pa_mqa_logits` to the package's re-exported name.
+    aiter_cache = importlib.import_module("aiter.ops.cache")
+    aiter_topk = importlib.import_module("aiter.ops.topk")
+    aiter_logits = importlib.import_module("aiter.ops.triton.attention.pa_mqa_logits")
+    seen = {}
+    monkeypatch.setattr(
+        SPEC,
+        "build_speculative_pool_candidates",
+        lambda _h, keys, *_args: (
+            torch.zeros_like(keys),
+            torch.zeros(keys.shape[0], dtype=torch.int64),
+        ),
+    )
+    monkeypatch.setattr(
+        SPEC.kpool,
+        "pool_slot_mapping",
+        lambda _bt, pool_ids, _req_idx, _rows: pool_ids,
+    )
+    monkeypatch.setattr(SPEC, "update_speculative_kpool_history", lambda *_a: None)
+    monkeypatch.setattr(
+        aiter_cache, "indexer_k_quant_and_cache", lambda *_a, **_k: None
+    )
+
+    def paged_logits(_q, _kv, _w, logits, _lens, _bt, max_pools, **_kwargs):
+        seen["logits_width"] = logits.shape[1]
+        seen["max_pools"] = max_pools
+
+    monkeypatch.setattr(aiter_logits, "deepgemm_fp8_paged_mqa_logits", paged_logits)
+    monkeypatch.setattr(aiter_topk, "top_k_per_row_decode", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        SPEC.kpool, "expand_pools_and_append_tail", lambda *_a, **_k: None
+    )
+
+    def map_to_slots(*_args):
+        seen["mapped"] = True
+
+    monkeypatch.setattr(SPEC, "map_token_indices_to_slots", map_to_slots)
+
+    SPEC.run_speculative_kpool_indexer(
+        SimpleNamespace(
+            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+            max_seqlen_k=0,
+            block_tables=torch.zeros((1, 4), dtype=torch.int32),
+            sparse_kv_indptr=torch.tensor([0, 6, 13], dtype=torch.int32),
+        ),
+        kv_cache=torch.zeros((16, 1, 132), dtype=torch.uint8),
+        queries=torch.zeros((2, 2, 128)),
+        keys=torch.zeros((2, 128), dtype=torch.bfloat16),
+        gates=torch.zeros((2, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((2, 2)),
+        pool_bias=torch.zeros((4, 128)),
+        history=torch.zeros((1, 2, 8, 128), dtype=torch.bfloat16),
+        source_slots=torch.tensor([0], dtype=torch.int32),
+        destination_slots=torch.tensor([0], dtype=torch.int32),
+        positions=torch.tensor([5, 6]),
+        sparse_kv_indices=torch.zeros(16, dtype=torch.int32),
+        pool_size=4,
+        topk_tokens=2048,
+        output_width=2176,
+        block_size=16,
+        max_model_len=8192,
+        scale_fmt="ue8m0",
+        stable_topk=False,
+    )
+
+    assert seen.get("mapped") is True
+    assert seen["logits_width"] == seen["max_pools"] == 8192 // 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises Triton tail copy")
+def test_prefill_tail_seed_writes_history_ring_rows():
+    """Under MTP the tail has 8 rows per slot, not the pool's 4."""
+    device = torch.device("cuda")
+    tail = torch.zeros((12, 2, 8, 128), dtype=torch.bfloat16, device=device)
+
+    KPOOL_INDEXER.kpool.kpool_seed_tail(
+        tail,
+        torch.arange(100, 103, device=device)[:, None].expand(-1, 128).bfloat16(),
+        torch.arange(200, 203, device=device)[:, None].expand(-1, 128).bfloat16(),
+        torch.arange(100, 103, dtype=torch.int64, device=device),
+        torch.tensor([0, 3], dtype=torch.int32, device=device),
+        torch.tensor([9], dtype=torch.int32, device=device),
+        4,
+    )
+
+    assert tail[9, 0, :, 0].cpu().tolist() == [0, 0, 0, 0, 100, 101, 102, 0]
+    assert tail[9, 1, :, 0].cpu().tolist() == [0, 0, 0, 0, 200, 201, 202, 0]
+    tail[9] = 0
+    assert not tail.any(), "the seed wrote outside its own slot"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises Triton tail copy")
+def test_decode_tail_stash_addresses_history_ring_rows():
+    device = torch.device("cuda")
+    tail = torch.zeros((12, 2, 8, 128), dtype=torch.bfloat16, device=device)
+    for position in range(4, 7):
+        tail[5, 0, position] = position
+        tail[5, 1, position] = position + 10
+
+    KPOOL_INDEXER.kpool.kpool_decode_stash_and_pool(
+        tail,
+        torch.full((1, 128), 7, dtype=torch.bfloat16, device=device),
+        torch.full((1, 128), 17, dtype=torch.bfloat16, device=device),
+        torch.tensor([7], dtype=torch.int64, device=device),
+        torch.tensor([9], dtype=torch.int32, device=device),
+        torch.zeros((4, 128), dtype=torch.float32, device=device),
+        4,
+        slot_idx_in=torch.tensor([5], dtype=torch.int32, device=device),
+    )
+
+    assert tail[9, 0, :, 0].cpu().tolist() == [0, 0, 0, 0, 4, 5, 6, 7]
+    assert tail[9, 1, :, 0].cpu().tolist() == [0, 0, 0, 0, 14, 15, 16, 17]

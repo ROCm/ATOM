@@ -220,6 +220,7 @@ def run_speculative_kpool_indexer(
     topk_tokens: int,
     output_width: int,
     block_size: int,
+    max_model_len: int,
     scale_fmt: str,
     stable_topk: bool,
 ) -> None:
@@ -277,17 +278,19 @@ def run_speculative_kpool_indexer(
         source_slots,
         destination_slots,
     )
-    if metadata.max_seqlen_k <= topk_tokens:
-        return
-    # A per-token paged scoring path also handles ragged verification. Size its
-    # reusable scratch from this batch's live KV span, not the model limit.
+    # Always select, even below index_topk: MLA verification reads
+    # sparse_kv_indices whatever the length, so skipping the write leaves it the
+    # previous batch's selection. Pooled top-k then selects every pool, as in
+    # plain decode. Never branch on max_seqlen_k here either: CUDAGraph capture
+    # leaves it 0 and would record the skip for every replay. For the same
+    # reason the scratch is sized from the model limit, not this batch.
     selected = torch.full(
         (num_query_tokens, output_width),
         -1,
         device=keys.device,
         dtype=torch.int32,
     )
-    max_pools = speculative_pool_scratch_width(metadata.max_seqlen_k, pool_size)
+    max_pools = speculative_pool_scratch_width(max_model_len, pool_size)
     chunk_size = min(num_query_tokens, 128)
     logits_scratch = torch.empty(
         (chunk_size, max_pools),
