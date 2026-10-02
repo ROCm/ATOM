@@ -203,6 +203,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     without this base K3 does not mis-save, it does not boot.
     """
 
+    # Class-level so an instance built with `object.__new__` -- the idiom the
+    # tests in `tests/plugin` use to exercise one method without a vLLM config
+    # -- takes the non-V4.1 path rather than raising AttributeError from a
+    # branch that has nothing to do with what is under test.
+    _is_deepseek_v41 = False
+    _v41_cache = None
+    _v41_slots = None
+
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
         # kv_cache_config is required of out-of-tree v1 connectors: the factory
         # rejects the 2-argument signature outright, and the base class stores
@@ -268,9 +276,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
 
         self._is_deepseek_v41 = is_deepseek_v41_vllm_config(vllm_config)
-        # The carved pool and its state-slot allocator, bound at registration.
-        self._v41_cache = None
-        self._v41_slots = None
         # Worker half of the recurrent leg.
         self._kda_tier = None
         # Set only when the state rides the PAGE object; the own-pool codec
