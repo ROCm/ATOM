@@ -652,6 +652,54 @@ models:
           concurrency: [128]
 
         # Experiment: decode memory bundle (+~28% decode KV blocks on rocm10).
+        # Experiment: full GSM8K for the two-server MP layout, without and with
+        # the decode memory bundle.
+        - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-lmcachemp-gsm8k
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+              # No forced MTP acceptance: GSM8K must see real speculative decoding.
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+            eval_concurrency: [64]
+            model_type: local-completions
+            endpoint: completions
+
+        - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-lmcachemp-dbundle-gsm8k
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: >-
+              [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
+            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL --gpu-memory-utilization 0.94 --max-num-batched-tokens 2048 --timeout-keep-alive 900"
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill: *glm52_lmcachemp_cpp4_dcp4_env_prefill
+            decode:
+              <<: *glm52_cpp4_dcp4_decode_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+              # No forced MTP acceptance: GSM8K must see real speculative decoding.
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 3"
+          run_eval: true
+          eval_only: true
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+            eval_concurrency: [64]
+            model_type: local-completions
+            endpoint: completions
+
         - <<: *glm52_agentic_lmcachemp_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c112-dbundle
           concurrency: [112]
