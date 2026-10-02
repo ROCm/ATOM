@@ -2031,11 +2031,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             rid = str(req_id)
             self._promised_loads.pop(rid, None)
             state_failed = self._state_load_failure_reports.pop(rid, 0) > 0
-            if self._kda_planner is not None:
-                # Retract the index's claim on a boundary whose bytes are gone,
-                # so the next lookup caps at a boundary that is really there
-                # instead of failing the same load again.
-                self._kda_planner.on_load_result(rid, not state_failed)
+            for planner in (self._kda_planner, self._v41_planner):
+                if planner is not None:
+                    # Retract the index's claim on a boundary whose bytes are
+                    # gone, so the next lookup caps at a boundary that is
+                    # really there instead of failing the same load again.
+                    # Also discharges the pending-load entry: without it the
+                    # index keeps a claim per request for the life of the
+                    # process and reports every load as still in flight.
+                    planner.on_load_result(rid, not state_failed)
             if state_failed or self._load_failure_reports.pop(rid, 0) > 0:
                 # One rank that could not fill its shard makes the whole load a
                 # failure. Routing it through `load_finished` instead would pop
