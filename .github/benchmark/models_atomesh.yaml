@@ -340,10 +340,12 @@ models:
             tp: 4
             cudagraph: >-
               [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
-            # Decode alone raises the memory budget: at 0.85 about 48 GiB per
-            # GPU stays unused, and the retained prefix pool is what keeps
-            # P->D re-pulls down at high concurrency.
-            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL --gpu-memory-utilization 0.90 --timeout-keep-alive 900"
+            # Decode memory bundle (with AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+            # below): about 28% more decode KV blocks. The retained prefix pool
+            # keeps P->D re-pulls down, and decode KV caps the request rate
+            # once prefill keeps up. MTP decode batches stay far below 2048
+            # tokens.
+            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL --gpu-memory-utilization 0.94 --max-num-batched-tokens 2048 --timeout-keep-alive 900"
           env:
             common: &glm52_agentic_lmcache_cpp4_dcp4_env_common
               MC_DISABLE_HIP: "1"
@@ -371,6 +373,9 @@ models:
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              # Ranks share identical communicator groups instead of creating
+              # duplicates, freeing decode memory for KV.
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
 
