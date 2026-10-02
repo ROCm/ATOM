@@ -1157,6 +1157,11 @@ class WeightUpdaterMixin:
 
         self._weight_update_version = version
         self._last_started_weight_version = version
+        # Over a fence, nothing committed stands behind what this reload does
+        # not resend; see commit_weight_update.
+        self._weight_update_recovering = not getattr(
+            self, "_weight_update_healthy", True
+        )
         self._reset_reload_coverage()
         self._weight_update_sources: set[str] = set()
         self._weight_update_skipped: set[str] = set()
@@ -1232,18 +1237,37 @@ class WeightUpdaterMixin:
                 )
 
             covered = self._reload_coverage()
-            if verify_full_load:
-                params = dict(self._sync_target_model().named_parameters())
-                missing = sorted(
-                    name for name, param in params.items() if id(param) not in covered
-                )
-                if missing or self._weight_update_skipped:
-                    raise RuntimeError(
-                        "incomplete weight reload: wrote "
-                        f"{len(params) - len(missing)}/{len(params)} "
-                        f"parameters; missing={missing[:20]} "
-                        f"skipped={sorted(self._weight_update_skipped)[:20]}"
+            params = dict(self._sync_target_model().named_parameters())
+            missing = sorted(
+                name for name, param in params.items() if id(param) not in covered
+            )
+            incomplete = bool(missing or self._weight_update_skipped)
+            # The check can be waived for an update that resends only part of
+            # the model, since what it leaves out keeps serving the committed
+            # version it was loaded with. Over a fence there is none -- those
+            # parameters are whatever the failed reload left -- so there the
+            # check stands, whatever was asked.
+            over_fence = getattr(self, "_weight_update_recovering", False)
+            if incomplete and (verify_full_load or over_fence):
+                raise RuntimeError(
+                    "incomplete weight reload: wrote "
+                    f"{len(params) - len(missing)}/{len(params)} "
+                    f"parameters; missing={missing[:20]} "
+                    f"skipped={sorted(self._weight_update_skipped)[:20]}"
+                    + (
+                        "; verify_full_load=False cannot lift the fence a "
+                        "failed reload left"
+                        if over_fence and not verify_full_load
+                        else ""
                     )
+                )
+            if incomplete:
+                logger.warning(
+                    f"{self.label}: v{version} committed without the full-load "
+                    f"check, as asked: {len(missing)}/{len(params)} parameters "
+                    f"not rewritten {missing[:5]}, "
+                    f"skipped={sorted(self._weight_update_skipped)[:5]}"
+                )
 
             self.clear_kv_cache()
         except Exception as exc:
@@ -1255,6 +1279,7 @@ class WeightUpdaterMixin:
             "buckets": self._weight_update_buckets,
             "bytes": self._weight_update_bytes,
             "loaded_internal": len(covered),
+            "missing": len(missing),
             "skipped": sorted(self._weight_update_skipped),
         }
         self._weight_update_version = None

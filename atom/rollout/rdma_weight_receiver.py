@@ -33,6 +33,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import traceback
+from collections import Counter
 from datetime import timedelta
 from itertools import pairwise
 
@@ -103,7 +105,7 @@ def _decode_bucket(
     # tensor per name, back to back, so neither is ever legitimate.
     names = [name for _, _, name in spans]
     if len(set(names)) != len(names):
-        repeated = sorted({n for n in names if names.count(n) > 1})
+        repeated = sorted(n for n, seen in Counter(names).items() if seen > 1)
         raise RuntimeError(f"RDMA bucket repeats weight names: {repeated[:20]}")
     spans.sort()
     for (_, prev_end, prev_name), (start, _, name) in pairwise(spans):
@@ -164,6 +166,11 @@ def receive_weight_stream(
                 exc,
             )
         while True:
+            # The last bucket goes before anything else is allocated. Held
+            # until its names were reassigned, it was still resident while the
+            # next one was allocated -- two buckets at the peak -- and the
+            # final one stayed resident through commit.
+            metadata_tensor = payload = weights = None
             command, metadata_bytes, payload_bytes, version = _recv_header(
                 group, device=device
             )
@@ -216,6 +223,10 @@ def receive_weight_stream(
                 weights = _decode_bucket(metadata_tensor, payload)
                 runner.apply_weight_bucket(weights, payload_bytes=payload_bytes)
             except Exception as exc:  # noqa: BLE001 - raised at the end marker
+                # Kept until the end marker, so the frames it was raised
+                # through must not keep this bucket alive while the rest of
+                # the stream is drained.
+                traceback.clear_frames(exc.__traceback__)
                 failure = exc
                 logger.error(
                     "RDMA weight bucket %d failed on this rank, receiving the "
@@ -262,6 +273,7 @@ def receive_weight_stream(
         "seconds": elapsed,
         "gbps": (total_bytes * 8 / 1e9 / elapsed) if elapsed > 0 else 0.0,
         "loaded_internal": float(manifest["loaded_internal"]),
+        "missing": float(manifest["missing"]),
     }
 
 
@@ -352,7 +364,13 @@ class RDMAWeightReceiverMixin:
         version: int,
         verify_full_load: bool = True,
     ) -> dict[str, float]:
-        """Receive one version of the weights into resident memory."""
+        """Receive one version of the weights into resident memory.
+
+        ``verify_full_load=False`` waives the check that the stream rewrote
+        every parameter, for an update that resends only part of the model;
+        the parameters it did not rewrite are counted in ``missing``. Over a
+        fence it waives nothing -- see ``commit_weight_update``.
+        """
         groups = getattr(self, "_rdma_weight_groups", {})
         if group_name not in groups:
             raise RuntimeError(
@@ -367,7 +385,7 @@ class RDMAWeightReceiverMixin:
             verify_full_load=bool(verify_full_load),
         )
         logger.info(
-            "%s: RDMA weight reload v%d verified: %s",
+            "%s: RDMA weight reload v%d committed: %s",
             getattr(self, "label", "runner"),
             int(version),
             stats,

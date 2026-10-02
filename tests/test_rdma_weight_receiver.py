@@ -254,7 +254,7 @@ class _Runner:
 
     def commit_weight_update(self, version, verify_full_load=True):
         self.events.append("commit")
-        return {"loaded_internal": 1}
+        return {"loaded_internal": 1, "missing": 0}
 
     def abort_weight_update(self, version, error):
         self.events.append(f"abort: {error}")
@@ -286,6 +286,43 @@ def test_a_clean_stream_commits(monkeypatch):
     assert runner.events == ["begin", "apply1", "apply2", "apply3", "commit"]
     assert stats["buckets"] == 3.0
     assert trainer.frames == [], "the end marker was never read"
+
+
+@pytest.mark.parametrize("fail_on_bucket", [None, 1], ids=["clean", "draining"])
+def test_a_bucket_is_released_before_the_next_is_allocated(monkeypatch, fail_on_bucket):
+    """Held until its names were reassigned, the last bucket was still
+    resident while the next was allocated: two buckets at the peak. Draining
+    after a failure held the failed one the same way, through the traceback
+    of the error kept for the end marker."""
+    import torch
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner(fail_on_bucket=fail_on_bucket)
+    buffers = []
+    empty = torch.empty
+
+    def tracking_empty(*args, **kwargs):
+        if kwargs.get("dtype") is torch.uint8:
+            # A bucket's payload is allocated just after its own metadata,
+            # which may still be alive; nothing older may be. By storage, not
+            # by tensor: the decoded views keep the bytes alive without
+            # keeping the tensor they were sliced from.
+            older = buffers[: len(buffers) - len(buffers) % 2]
+            alive = sum(not ref.expired() for ref in older)
+            assert not alive, f"{alive} buffer(s) of an earlier bucket still alive"
+        tensor = empty(*args, **kwargs)
+        if kwargs.get("dtype") is torch.uint8:
+            buffers.append(StorageWeakRef(tensor.untyped_storage()))
+        return tensor
+
+    monkeypatch.setattr(torch, "empty", tracking_empty)
+    if fail_on_bucket is None:
+        _receive(monkeypatch, trainer, runner)
+    else:
+        with pytest.raises(RuntimeError, match="bucket 1 rejected"):
+            _receive(monkeypatch, trainer, runner)
+    assert len(buffers) == 6, "every bucket's two buffers were allocated"
 
 
 def test_a_failed_bucket_is_raised_only_after_the_stream_ends(monkeypatch):
@@ -542,45 +579,64 @@ def test_the_lifecycle_the_real_mixins_define_is_advertised():
 
 
 # ── against the sender's own source ────────────────────────────────────────
+#
+# Read, not imported: LumenRL is a separate repo, and an import would couple
+# the two. CI reads a snapshot -- everything above receive_weight_stream in
+# lumenrl/engine/inference/rdma_weight_transfer.py, copied verbatim -- and with
+# LUMENRL_ROOT naming a checkout, the snapshot is held to the sender itself.
+
+_SENDER_SNAPSHOT = Path(__file__).parent / "fixtures" / "lumenrl_rdma_sender.txt"
+_HEADER_ORDER = r"\[\s*command,\s*metadata_bytes,\s*payload_bytes,\s*version\s*,?\s*\]"
 
 
-def _lumenrl_sender() -> str:
-    """LumenRL's sender, read from the checkout ``LUMENRL_ROOT`` names.
-
-    Opt-in: ATOM's CI has no LumenRL checkout, and a check that skips wherever
-    one path is missing reads as coverage it never gives. The frozen constants
-    are pinned above either way. Named but missing fails rather than skips --
-    the check was asked for.
-    """
-    root = os.environ.get("LUMENRL_ROOT")
-    if not root:
-        pytest.skip("set LUMENRL_ROOT to a LumenRL checkout to check its sender")
-    sender = Path(root, "lumenrl", "engine", "inference", "rdma_weight_transfer.py")
-    assert sender.is_file(), f"LUMENRL_ROOT={root} has no {sender}"
-    return sender.read_text()
+def _protocol(src: str) -> dict:
+    """What the receiver depends on, as the sender's source states it."""
+    facts = {}
+    for const in ("_CMD_END", "_CMD_BUCKET", "_HEADER_WORDS"):
+        m = re.search(rf"^{const}\s*=\s*(\d+)", src, re.MULTILINE)
+        facts[const] = int(m[1]) if m else None
+    facts["header order"] = re.search(_HEADER_ORDER, src) is not None
+    entry = re.search(r"entries\.append\(\s*\{(.*?)\}\s*\)", src, re.DOTALL)
+    facts["entry keys"] = sorted(re.findall(r'"(\w+)":', entry[1])) if entry else None
+    return facts
 
 
 def test_the_sender_and_receiver_agree_on_the_constants():
-    """Read LumenRL's sender from source. It is a separate repo, so an import
-    would couple the two -- but the numbers still have to match."""
-    src = _lumenrl_sender()
+    facts = _protocol(_SENDER_SNAPSHOT.read_text())
     for const, value in (
         ("_CMD_END", _CMD_END),
         ("_CMD_BUCKET", _CMD_BUCKET),
         ("_HEADER_WORDS", _HEADER_WORDS),
     ):
-        m = re.search(rf"^{const}\s*=\s*(\d+)", src, re.MULTILINE)
-        assert m, f"{const} not found in the sender"
         assert (
-            int(m.group(1)) == value
-        ), f"{const}: sender says {m.group(1)}, receiver says {value}"
+            facts[const] == value
+        ), f"{const}: sender says {facts[const]}, receiver says {value}"
 
 
 def test_the_sender_packs_the_header_in_the_order_it_is_read():
     """The part of the contract no bounds check can see: swapped sizes make the
     two sides post broadcasts of different lengths, which RCCL does not check."""
-    order = r"\[\s*command,\s*metadata_bytes,\s*payload_bytes,\s*version\s*,?\s*\]"
-    assert re.search(order, _lumenrl_sender()), (
+    assert _protocol(_SENDER_SNAPSHOT.read_text())["header order"], (
         "the sender no longer builds its header as "
         "[command, metadata_bytes, payload_bytes, version]"
+    )
+
+
+def test_the_sender_describes_each_tensor_by_what_the_decoder_reads():
+    keys = _protocol(_SENDER_SNAPSHOT.read_text())["entry keys"]
+    assert keys == ["dtype", "name", "nbytes", "offset", "shape"]
+
+
+def test_the_snapshot_still_states_the_senders_protocol():
+    """The snapshot stands in for the sender only while it says what the
+    sender says. Opt-in, since ATOM's CI has no LumenRL checkout; named but
+    missing fails rather than skips, as the check was asked for."""
+    root = os.environ.get("LUMENRL_ROOT")
+    if not root:
+        pytest.skip("set LUMENRL_ROOT to a LumenRL checkout to check the snapshot")
+    sender = Path(root, "lumenrl", "engine", "inference", "rdma_weight_transfer.py")
+    assert sender.is_file(), f"LUMENRL_ROOT={root} has no {sender}"
+    assert _protocol(sender.read_text()) == _protocol(_SENDER_SNAPSHOT.read_text()), (
+        f"the sender's protocol changed: refresh {_SENDER_SNAPSHOT.name} from "
+        f"{sender} and check the receiver against it"
     )
