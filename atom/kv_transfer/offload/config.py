@@ -33,6 +33,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "dense": "dense",
     "kimi_k3": "kimi_k3",
     "m3": "m3",
+    "dsv41": "dsv41",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -52,6 +53,11 @@ _HF_PAGE_FIELDS = (
     "compress_ratios",
     "indexer_dtype",
     "indexer_types",
+    # DeepSeek-V4.1: `sliding_window` sizes the per-request window ring and
+    # `candidate_block_size` pages the index plane, so either one moves the
+    # bytes a stored object holds while every field above stays put.
+    "sliding_window",
+    "candidate_block_size",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
@@ -77,14 +83,16 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )
 
-# Layouts that own a tier for a model's per-request *recurrent* state. Today only
-# `kimi_k3` (the kimi_linear KDA state); `hybrid` (DSV4 sparse-attention
-# checkpoints) is not recurrent-state and dense<->hybrid is a legitimate operator
-# override for namespace separation. An explicit `offload_layout` override may not
-# downgrade a recurrent-state model to a layout that owns no tier for it (silent
-# wrong output) -- see `select_offload_layout`. GDN/linear model types are refused
-# outright in `_layout_from_model`, so no override can resurrect them.
-_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3"})
+# Layouts that own a tier for a model's per-request *recurrent* state:
+# `kimi_k3` (the kimi_linear KDA state) and `dsv41` (DeepSeek-V4.1's CSA2
+# window rings, compressor rings and Engram cursor). `hybrid` (DSV4
+# sparse-attention checkpoints) is not recurrent-state and dense<->hybrid is a
+# legitimate operator override for namespace separation. An explicit
+# `offload_layout` override may not downgrade a recurrent-state model to a
+# layout that owns no tier for it (silent wrong output) -- see
+# `select_offload_layout`. GDN/linear model types are refused outright in
+# `_layout_from_model`, so no override can resurrect them.
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "dsv41"})
 
 logger = logging.getLogger("atom")
 
@@ -206,6 +214,16 @@ def _layout_from_model(config) -> str:
     # KDA per-request state that a reusable prefix also needs.
     if model_type == "kimi_linear":
         return "kimi_k3"
+    # DeepSeek-V4.1 before the `compress_ratios` probe below, which it would
+    # otherwise answer: V4.1 declares compress ratios exactly as DSV4 does, but
+    # it also carries per-request CSA2 state (window ring per layer, the
+    # compressor's incomplete group, the Engram cursor) that the `hybrid`
+    # PAGE+SLOT codec owns no tier for. Resolving it to `hybrid` would both
+    # share DSV4's key space and leave it outside `_STATE_OWNING_LAYOUTS`, so
+    # an `offload_layout: dense` override would silently restore a KV prefix
+    # over a window ring that never existed.
+    if model_type == "deepseek_v41_text":
+        return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
     # GDN/linear models carry a per-request recurrent state no layout owns a
@@ -374,6 +392,7 @@ def build_page_namespace(
         "page_mode": {
             "hybrid": "dsv4-page-regions",
             "m3": "m3-page-regions",
+            "dsv41": "dsv41-page-state",
         }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
