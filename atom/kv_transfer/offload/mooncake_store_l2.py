@@ -479,6 +479,9 @@ class _ThpRegion(NamedTuple):
 
 _thp_regions: dict[int, _ThpRegion] = {}
 _thp_regions_lock = threading.Lock()
+# L1 regions faulted at worker start, before the weights load, by node; the
+# first L1 allocation on that node that fits takes its region.
+_reserved_l1: dict[int, tuple[int, _ThpRegion]] = {}
 _install_lock = threading.Lock()
 # LMCache's own free, for a buffer it allocated before the patch.
 _native_free_pinned_numa_ptr = None
@@ -715,28 +718,16 @@ def _thp_settings() -> str:
     return ", ".join(settings)
 
 
-def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
-    """Pinned host memory on ``numa_id``, every byte of it a transparent huge page.
+def _fault_thp_region(region_bytes: int, node: int) -> tuple[int, _ThpRegion]:
+    """Map ``region_bytes`` on ``node`` and fault it as transparent huge pages.
 
-    A drop-in for ``lmcache.device_ops.alloc_pinned_numa_ptr``: mmap,
-    mbind(MPOL_BIND), MADV_HUGEPAGE, one first touch per 2 MiB, MADV_COLLAPSE
-    when that left 4 KiB pages, then hipHostRegister. The region is ``size``
-    rounded up to 2 MiB. A node other than the current GPU's is refused before
-    anything is allocated.
+    mmap, mbind(MPOL_BIND), MADV_HUGEPAGE, one first touch per 2 MiB, and
+    MADV_COLLAPSE when that left 4 KiB pages. Not pinned, and not checked:
+    the caller pins it and then counts its huge pages.
 
-    Raises:
-        ValueError: ``numa_id`` is not the current GPU's node.
-        RuntimeError: Fewer than all bytes are huge pages (the message gives
-            the THP settings), or pinning failed.
-        OSError: A system call failed.
+    Returns:
+        (2 MiB-aligned address, region).
     """
-    size, node = int(size), int(numa_id)
-    if size <= 0:
-        raise ValueError(f"pinned allocation size must be positive, got {size}")
-    _require_thp_allowed()
-    _require_gpu_numa_node(node)
-    started = time.monotonic()
-    region_bytes = -(-size // HUGE_PAGE_BYTES) * HUGE_PAGE_BYTES
     _warn_if_node_is_short(node, region_bytes)
     # One spare huge page lets the region start on a 2 MiB boundary.
     mapping_bytes = region_bytes + HUGE_PAGE_BYTES
@@ -747,7 +738,6 @@ def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     if mapping in (None, _MAP_FAILED):
         raise _os_error(f"mmap of {mapping_bytes} bytes")
     address = (mapping + HUGE_PAGE_BYTES - 1) & ~(HUGE_PAGE_BYTES - 1)
-    registered = False
     try:
         _mbind(address, region_bytes, node)
         if libc.madvise(address, region_bytes, _MADV_HUGEPAGE) != 0:
@@ -764,6 +754,120 @@ def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
                 region_bytes / 2**30,
                 node,
             )
+            _collapse_into_huge_pages(address, region_bytes)
+    except BaseException:
+        libc.munmap(mapping, mapping_bytes)
+        raise
+    return address, _ThpRegion(mapping, mapping_bytes, region_bytes, node)
+
+
+def reserve_thp_l1(size: int, numa_id: int) -> None:
+    """Fault an L1 of ``size`` bytes on ``numa_id`` now; the L1 allocation takes it.
+
+    For a worker before its weights load: a weight load pins its staging
+    buffers and fills the page cache, pinned pages never move, and the node
+    left behind can be too fragmented to compact into the L1's huge pages
+    (pit2-p03-g35, next to 768 GiB of Store owners: 1.2 GiB of a 48.6 GiB L1
+    stayed 4 KiB pages after MADV_COLLAPSE, with 642 GiB free). One reservation
+    per node; a second one replaces the first.
+    """
+    size, node = int(size), int(numa_id)
+    region_bytes = -(-size // HUGE_PAGE_BYTES) * HUGE_PAGE_BYTES
+    started = time.monotonic()
+    address, region = _fault_thp_region(region_bytes, node)
+    with _thp_regions_lock:
+        previous = _reserved_l1.pop(node, None)
+        _reserved_l1[node] = (address, region)
+    if previous is not None:
+        _libc().munmap(previous[1].mapping, previous[1].mapping_bytes)
+    huge = anon_huge_page_bytes(address, address + region_bytes)
+    logger.info(
+        "LMCache L1: reserved %.2f GiB on NUMA node %d before the weights load, "
+        "%.2f GiB of it transparent huge pages (%.1f s)",
+        region_bytes / 2**30,
+        node,
+        huge / 2**30,
+        time.monotonic() - started,
+    )
+
+
+def _take_reserved_l1(node: int, region_bytes: int) -> tuple[int, _ThpRegion] | None:
+    """The node's reserved region if it holds ``region_bytes``; else free it."""
+    with _thp_regions_lock:
+        reserved = _reserved_l1.pop(node, None)
+    if reserved is None:
+        return None
+    if reserved[1].region_bytes >= region_bytes:
+        return reserved
+    logger.warning(
+        "LMCache L1: the %.2f GiB reserved on NUMA node %d is smaller than the "
+        "%.2f GiB pool; allocating the pool anew",
+        reserved[1].region_bytes / 2**30,
+        node,
+        region_bytes / 2**30,
+    )
+    _libc().munmap(reserved[1].mapping, reserved[1].mapping_bytes)
+    return None
+
+
+def release_reserved_l1() -> None:
+    """Free the reservations no L1 allocation took."""
+    with _thp_regions_lock:
+        reserved = list(_reserved_l1.items())
+        _reserved_l1.clear()
+    for node, (_, region) in reserved:
+        logger.warning(
+            "LMCache L1: no pool took the %.2f GiB reserved on NUMA node %d; "
+            "freeing it",
+            region.region_bytes / 2**30,
+            node,
+        )
+        _libc().munmap(region.mapping, region.mapping_bytes)
+
+
+def current_gpu_numa_node() -> int | None:
+    """The NUMA node of the current GPU, None when the platform has none."""
+    return _current_gpu_numa_node()
+
+
+def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
+    """Pinned host memory on ``numa_id``, every byte of it a transparent huge page.
+
+    A drop-in for ``lmcache.device_ops.alloc_pinned_numa_ptr``: the region
+    :func:`reserve_thp_l1` faulted on the node when it is large enough, else
+    a new one (mmap, mbind(MPOL_BIND), MADV_HUGEPAGE, one first touch per
+    2 MiB, MADV_COLLAPSE when that left 4 KiB pages); then hipHostRegister.
+    The region is ``size`` rounded up to 2 MiB at least. A node other than the
+    current GPU's is refused before anything is allocated.
+
+    Raises:
+        ValueError: ``numa_id`` is not the current GPU's node.
+        RuntimeError: Fewer than all bytes are huge pages (the message gives
+            the THP settings), or pinning failed.
+        OSError: A system call failed.
+    """
+    size, node = int(size), int(numa_id)
+    if size <= 0:
+        raise ValueError(f"pinned allocation size must be positive, got {size}")
+    _require_thp_allowed()
+    _require_gpu_numa_node(node)
+    started = time.monotonic()
+    reserved = _take_reserved_l1(node, -(-size // HUGE_PAGE_BYTES) * HUGE_PAGE_BYTES)
+    if reserved is None:
+        address, region = _fault_thp_region(
+            -(-size // HUGE_PAGE_BYTES) * HUGE_PAGE_BYTES, node
+        )
+    else:
+        address, region = reserved
+    region_bytes = region.region_bytes
+    registered = False
+    try:
+        # A reserved region waited through the weight load; a fresh one was
+        # just collapsed.
+        if (
+            reserved is not None
+            and anon_huge_page_bytes(address, address + region_bytes) != region_bytes
+        ):
             _collapse_into_huge_pages(address, region_bytes)
         _host_register(address, region_bytes)
         registered = True
@@ -785,15 +889,16 @@ def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
                     "hipHostUnregister after a failed allocation failed",
                     exc_info=True,
                 )
-        libc.munmap(mapping, mapping_bytes)
+        _libc().munmap(region.mapping, region.mapping_bytes)
         raise
     with _thp_regions_lock:
-        _thp_regions[address] = _ThpRegion(mapping, mapping_bytes, region_bytes, node)
+        _thp_regions[address] = region
     logger.info(
         "LMCache L1: %.2f GiB pinned on NUMA node %d, all transparent huge pages "
-        "(%.1f s)",
+        "(%s, %.1f s)",
         region_bytes / 2**30,
         node,
+        "reserved before the weights load" if reserved is not None else "allocated",
         time.monotonic() - started,
     )
     return address

@@ -427,6 +427,7 @@ def pinned(monkeypatch):
     """Real mmap/madvise/munmap; mbind, pinning and the THP census faked."""
     events = []
     monkeypatch.setattr(l2, "_thp_regions", {})
+    monkeypatch.setattr(l2, "_reserved_l1", {})
     monkeypatch.setattr(l2, "_require_thp_allowed", lambda: None)
     monkeypatch.setattr(l2, "_current_gpu_numa_node", lambda: None)
     monkeypatch.setattr(l2, "numa_node_meminfo", lambda node: {})
@@ -457,6 +458,42 @@ def test_alloc_rounds_to_huge_pages_aligns_and_frees(pinned):
     l2.free_thp_pinned_numa_ptr(ptr, size)
     assert pinned[-1] == ("unreg", ptr)
     assert l2._thp_regions == {}
+
+
+def test_alloc_takes_the_region_reserved_before_the_weights_load(pinned):
+    mib = 1024 * 1024
+    l2.reserve_thp_l1(6 * mib, 1)
+    address, region = l2._reserved_l1[1]
+    assert region.region_bytes == 6 * mib
+    assert pinned == [("mbind", 1)]  # faulted, not pinned yet
+    # LMCache may ask for a little less (alignment): the reservation serves.
+    ptr = l2.alloc_thp_pinned_numa_ptr(5 * mib + 1, 1)
+    assert ptr == address
+    assert pinned == [("mbind", 1), ("register", ptr, 6 * mib)]
+    assert l2._reserved_l1 == {}
+    l2.free_thp_pinned_numa_ptr(ptr)
+    assert l2._thp_regions == {}
+
+
+def test_alloc_beyond_the_reservation_frees_it_and_maps_anew(pinned, caplog):
+    mib = 1024 * 1024
+    l2.reserve_thp_l1(2 * mib, 1)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        ptr = l2.alloc_thp_pinned_numa_ptr(4 * mib, 1)
+    assert "smaller than the" in caplog.text
+    assert l2._thp_regions[ptr].region_bytes == 4 * mib
+    assert pinned == [("mbind", 1), ("mbind", 1), ("register", ptr, 4 * mib)]
+    l2.free_thp_pinned_numa_ptr(ptr)
+
+
+def test_release_frees_a_reservation_no_pool_took(pinned, caplog):
+    l2.reserve_thp_l1(2 * 1024 * 1024, 0)
+    l2.reserve_thp_l1(4 * 1024 * 1024, 0)  # replaces the first
+    assert l2._reserved_l1[0][1].region_bytes == 4 * 1024 * 1024
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        l2.release_reserved_l1()
+    assert l2._reserved_l1 == {}
+    assert "no pool took the 0.00 GiB reserved on NUMA node 0" in caplog.text
 
 
 def test_alloc_refuses_a_node_other_than_the_gpus(pinned, monkeypatch):
@@ -851,7 +888,7 @@ def test_l2_get_on_a_full_l1_leaves_the_loop_to_the_put_that_frees_it(monkeypatc
         (
             "mooncakestore://10.0.0.1:50051/",
             None,
-            ["prepare", "engine", "post", "thp", "verify"],
+            ["prepare", "engine", "post", "thp", "release", "verify"],
         ),
         ("lm://10.0.0.1:65432", None, ["engine", "post", "verify"]),
         (None, None, ["engine", "post"]),
@@ -916,6 +953,11 @@ def test_build_offload_engine_prepares_before_and_verifies_after(
         common.mooncake_store_l2, "verify_thp_l1", lambda engine: check("thp")
     )
     monkeypatch.setattr(
+        common.mooncake_store_l2,
+        "release_reserved_l1",
+        lambda: events.append("release"),
+    )
+    monkeypatch.setattr(
         common, "verify_remote_backend", lambda engine, meta: check("verify")
     )
     build = functools.partial(
@@ -935,6 +977,77 @@ def test_build_offload_engine_prepares_before_and_verifies_after(
     else:
         build()
     assert events == expected
+
+
+def test_offload_transfer_config_finds_the_in_process_connector():
+    from atom.kv_transfer.offload import _offload_common as common
+
+    offload = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    assert common.offload_transfer_config(offload) is offload
+    multi = {
+        "kv_connector": "multi",
+        "connectors": [{"kv_connector": "mooncake", "kv_role": "kv_producer"}, offload],
+    }
+    assert common.offload_transfer_config(multi) is offload
+    for other in (
+        None,
+        {"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+        {"kv_connector": "multi", "connectors": [{"kv_connector": "mooncake"}]},
+    ):
+        assert common.offload_transfer_config(other) is None
+
+
+def test_reserve_l1_before_weights_load_sizes_it_as_the_engine_does(monkeypatch):
+    from atom.kv_transfer.offload import _offload_common as common
+
+    reserved = []
+    built = []
+
+    def build(sub):
+        built.append(sub)
+        return SimpleNamespace(remote_url=remote_url, max_local_cpu_size=48.0)
+
+    def scale(cfg, config):
+        cfg.max_local_cpu_size *= 1.5
+
+    monkeypatch.setattr(common.offcfg, "build_lmcache_config", build)
+    monkeypatch.setattr(common.offcfg, "scale_cpu_size_for_pp", scale)
+    monkeypatch.setattr(common.mooncake_store_l2, "current_gpu_numa_node", lambda: 0)
+    monkeypatch.setattr(
+        common.mooncake_store_l2,
+        "reserve_thp_l1",
+        lambda size, node: reserved.append((size, node)),
+    )
+    offload = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    config = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "multi", "connectors": [offload]}
+    )
+    remote_url = "mooncakestore://10.0.0.1:50051/"
+    common.reserve_l1_before_weights_load(config)
+    assert built == [offload]
+    assert reserved == [(72 * 1024**3, 0)]
+    # Any other L2 (or none) keeps the allocation at engine build.
+    remote_url = "lm://10.0.0.1:65432"
+    common.reserve_l1_before_weights_load(config)
+    assert reserved == [(72 * 1024**3, 0)]
+    common.reserve_l1_before_weights_load(SimpleNamespace(kv_transfer_config=None))
+    assert len(built) == 2
+
+
+def test_reserve_l1_before_weights_load_is_best_effort(monkeypatch, caplog):
+    from atom.kv_transfer.offload import _offload_common as common
+
+    def build(sub):
+        raise ValueError("bad LMCache env")
+
+    monkeypatch.setattr(common.offcfg, "build_lmcache_config", build)
+    config = SimpleNamespace(
+        kv_transfer_config={"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    )
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        common.reserve_l1_before_weights_load(config)
+    assert "no reservation before the weights load" in caplog.text
 
 
 def test_release_failed_engine_stops_an_orphaned_storage_loop(monkeypatch):

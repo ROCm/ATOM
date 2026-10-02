@@ -90,6 +90,50 @@ def pp_aware_rank_and_world(config, tp) -> tuple[int, int]:
     return pp_rank * tp.world_size + tp.rank_in_group, pp_size * tp.world_size
 
 
+def offload_transfer_config(kv_transfer_config) -> dict | None:
+    """The in-process offload connector's config: itself, or a "multi" member."""
+    if not isinstance(kv_transfer_config, dict):
+        return None
+    if kv_transfer_config.get("kv_connector") == "lmcache_offload":
+        return kv_transfer_config
+    if kv_transfer_config.get("kv_connector") == "multi":
+        for sub in kv_transfer_config.get("connectors") or ():
+            if isinstance(sub, dict) and sub.get("kv_connector") == "lmcache_offload":
+                return sub
+    return None
+
+
+def reserve_l1_before_weights_load(config) -> None:
+    """With a Mooncake Store L2, fault this worker's L1 before its weights load.
+
+    The L1 must be all huge pages for the NICs to register it, and the node a
+    weight load leaves behind can be too fragmented for that
+    (:func:`mooncake_store_l2.reserve_thp_l1`); the engine build then takes the
+    region. Sized as the engine sizes it: the offload connector's LMCache
+    config, split across PP stages. Best effort: a worker that cannot reserve
+    allocates at engine build, which checks the pages itself.
+    """
+    sub = offload_transfer_config(getattr(config, "kv_transfer_config", None))
+    if sub is None:
+        return
+    try:
+        cfg = offcfg.build_lmcache_config(sub)
+        if not mooncake_store_l2.uses_mooncake_store(cfg):
+            return
+        offcfg.scale_cpu_size_for_pp(cfg, config)
+        size = int(float(cfg.max_local_cpu_size or 0) * 1024**3)
+        node = mooncake_store_l2.current_gpu_numa_node()
+        if size <= 0 or node is None:
+            return
+        mooncake_store_l2.reserve_thp_l1(size, node)
+    except Exception:
+        logger.warning(
+            "LMCache L1: no reservation before the weights load; the engine "
+            "build allocates it",
+            exc_info=True,
+        )
+
+
 def build_offload_engine(
     config,
     *,
@@ -137,6 +181,7 @@ def build_offload_engine(
         engine.post_init()
         if uses_mooncake_store:
             mooncake_store_l2.verify_thp_l1(engine)
+            mooncake_store_l2.release_reserved_l1()
         if getattr(cfg, "remote_url", None):
             verify_remote_backend(engine, meta)
     except BaseException:
