@@ -108,6 +108,8 @@ _PROT_READ_WRITE = 0x1 | 0x2
 _MAP_PRIVATE_ANONYMOUS = 0x02 | 0x20
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_HUGEPAGE = 14
+# Linux 6.1+: rebuild a range's 4 KiB pages as huge pages, compacting now.
+_MADV_COLLAPSE = 25
 _MPOL_BIND = 2
 _MPOL_MF_STRICT_MOVE = 0x1 | 0x2
 _PR_GET_THP_DISABLE = 42
@@ -549,6 +551,23 @@ def _touch_every_huge_page(address: int, length: int, node: int) -> None:
             )
 
 
+def _collapse_into_huge_pages(address: int, length: int) -> None:
+    """Ask the kernel to rebuild the range's 4 KiB stretches as huge pages.
+
+    A huge-page fault that finds no free 2 MiB block on the bound node falls
+    back to 4 KiB pages; MADV_COLLAPSE compacts synchronously whatever the THP
+    defrag setting, allocates under the range's mempolicy and skips what is
+    already huge. Best effort: the caller counts again. It must run before the
+    range is pinned, since pinned pages cannot move.
+    """
+    if _libc().madvise(address, length, _MADV_COLLAPSE) != 0:
+        logger.warning(
+            "LMCache L1: madvise(MADV_COLLAPSE) of %.2f GiB failed: %s",
+            length / 2**30,
+            os.strerror(ctypes.get_errno()),
+        )
+
+
 def _host_register(address: int, length: int) -> None:
     import torch
 
@@ -604,9 +623,10 @@ def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
     """Pinned host memory on ``numa_id``, every byte of it a transparent huge page.
 
     A drop-in for ``lmcache.device_ops.alloc_pinned_numa_ptr``: mmap,
-    mbind(MPOL_BIND), MADV_HUGEPAGE, one first touch per 2 MiB, then
-    hipHostRegister. The region is ``size`` rounded up to 2 MiB. A node other
-    than the current GPU's is refused before anything is allocated.
+    mbind(MPOL_BIND), MADV_HUGEPAGE, one first touch per 2 MiB, MADV_COLLAPSE
+    when that left 4 KiB pages, then hipHostRegister. The region is ``size``
+    rounded up to 2 MiB. A node other than the current GPU's is refused before
+    anything is allocated.
 
     Raises:
         ValueError: ``numa_id`` is not the current GPU's node.
@@ -637,6 +657,18 @@ def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
         if libc.madvise(address, region_bytes, _MADV_HUGEPAGE) != 0:
             raise _os_error("madvise(MADV_HUGEPAGE)")
         _touch_every_huge_page(address, region_bytes, node)
+        huge = anon_huge_page_bytes(address, address + region_bytes)
+        if huge != region_bytes:
+            # pit2-p03-g40, 48.6 GiB per stage next to a 768 GiB Store owner:
+            # 2-27 MiB of each pool came back as 4 KiB pages.
+            logger.info(
+                "LMCache L1: %d bytes of the %.2f GiB pool on NUMA node %d are "
+                "4 KiB pages after the first touch; collapsing them",
+                region_bytes - huge,
+                region_bytes / 2**30,
+                node,
+            )
+            _collapse_into_huge_pages(address, region_bytes)
         _host_register(address, region_bytes)
         registered = True
         huge = anon_huge_page_bytes(address, address + region_bytes)
@@ -644,8 +676,9 @@ def alloc_thp_pinned_numa_ptr(size: int, numa_id: int = 0) -> int:
             raise RuntimeError(
                 f"the {region_bytes / 2**30:.2f} GiB LMCache L1 on NUMA node {node} "
                 f"has {region_bytes - huge} bytes outside transparent huge pages "
-                f"({_thp_settings()}); drop the node's page cache or free memory "
-                "before starting: the Mooncake Store L2 needs an L1 of huge pages"
+                f"even after MADV_COLLAPSE ({_thp_settings()}); drop the node's "
+                "page cache or free memory before starting: the Mooncake Store "
+                "L2 needs an L1 of huge pages"
             )
     except BaseException:
         if registered:

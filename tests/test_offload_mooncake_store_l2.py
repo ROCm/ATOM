@@ -356,6 +356,9 @@ def pinned(monkeypatch):
     )
     monkeypatch.setattr(l2, "_host_unregister", lambda a: events.append(("unreg", a)))
     monkeypatch.setattr(l2, "anon_huge_page_bytes", lambda start, end: end - start)
+    monkeypatch.setattr(
+        l2, "_collapse_into_huge_pages", lambda a, n: events.append(("collapse", n))
+    )
     return events
 
 
@@ -409,8 +412,37 @@ def test_alloc_fails_and_unwinds_when_not_all_thp(pinned, monkeypatch):
     )
     with pytest.raises(RuntimeError, match="has 4096 bytes outside transparent huge"):
         l2.alloc_thp_pinned_numa_ptr(8 * 1024 * 1024, 0)
-    assert [event[0] for event in pinned] == ["mbind", "register", "unreg"]
+    assert [event[0] for event in pinned] == ["mbind", "collapse", "register", "unreg"]
     assert l2._thp_regions == {}
+
+
+def test_alloc_collapses_4k_stretches_before_pinning(pinned, monkeypatch, caplog):
+    census = iter([-6 * 1024 * 1024, 0])
+    monkeypatch.setattr(
+        l2, "anon_huge_page_bytes", lambda start, end: end - start + next(census)
+    )
+    with caplog.at_level(logging.INFO, logger="atom"):
+        ptr = l2.alloc_thp_pinned_numa_ptr(8 * 1024 * 1024, 0)
+    region = 8 * 1024 * 1024
+    # Pinned pages cannot move, so the collapse comes before hipHostRegister.
+    assert pinned == [("mbind", 0), ("collapse", region), ("register", ptr, region)]
+    assert any("6291456 bytes" in r.getMessage() for r in caplog.records)
+    l2.free_thp_pinned_numa_ptr(ptr)
+
+
+def test_collapse_into_huge_pages_reports_a_refusal(monkeypatch, caplog):
+    calls = []
+
+    def madvise(address, length, advice):
+        calls.append((address, length, advice))
+        ctypes.set_errno(11)
+        return -1
+
+    monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
+    assert calls == [(4096, 2 * 1024 * 1024, 25)]
+    assert "MADV_COLLAPSE" in caplog.records[0].getMessage()
 
 
 def test_alloc_refuses_when_thp_is_disabled_for_the_process(monkeypatch):
