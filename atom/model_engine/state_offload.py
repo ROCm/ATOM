@@ -12,6 +12,7 @@ lifetime.
 """
 
 import logging
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 
@@ -28,7 +29,13 @@ class StateOffloadIndex:
     (`fail_load` -> `forget`).
     """
 
-    def __init__(self, *, can_store: bool = True, can_load: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        can_store: bool = True,
+        can_load: bool = True,
+        max_cpu_entries: int | None = None,
+    ) -> None:
         # The two legs are separately granted. A `kv_producer` role saves and
         # never loads, a `kv_consumer` loads and never saves, and offering a
         # load the worker will not serve parks the request that took it.
@@ -47,10 +54,23 @@ class StateOffloadIndex:
         # only costs one recompute, never wrong output.
         self.hashes: set[int] = set()
         self._hash_lru: OrderedDict[int, None] = OrderedDict()
-        # ~1M hashes -> a few tens of MB. Well above any working set that a
-        # tier of realistic capacity actually holds, so it bounds a leak
-        # without evicting live entries in normal operation.
+        # ~1M hashes -> a few tens of MB: the leak bound when no codec bound
+        # is known.
         self._hash_cap = 1 << 20
+        # The worker's `StateByteCodec` keeps at most `max_cpu_entries` images
+        # and drops the least recently stored-or-loaded first, telling no one.
+        # Left at 1 << 20, this index kept advertising every dropped image:
+        # each later request over that prefix parked on a load that had to
+        # miss, then recomputed from token 0 -- 33 such recomputes at Kimi-K3
+        # agentic C72, ~4M tokens. Keeping the same LRU bound (`note_stored`
+        # and `complete_load` refresh, as `put` and `get` do there) makes the
+        # index forget what the codec dropped, so the boundary falls to a lower
+        # rung or the HBM prefix instead. The margin absorbs stores in flight
+        # and per-rank outcomes the engine never indexes; forgetting a few
+        # still-resident images early costs only those reuses.
+        if max_cpu_entries is not None and max_cpu_entries > 0:
+            margin = max(16, max_cpu_entries // 32)
+            self._hash_cap = max(1, min(self._hash_cap, max_cpu_entries - margin))
         self.hashes_evicted = 0
         # req_id -> hash, for loads offered and not yet settled. Keyed by
         # request because that is what comes back, on the same
@@ -153,8 +173,13 @@ class StateOffloadIndex:
         The hash stays indexed: a load reads LMCache, it does not consume it,
         and the next request over the same prefix must still find it.
         """
-        if self.pending_loads.pop(req_id, None) is not None:
+        h = self.pending_loads.pop(req_id, None)
+        if h is not None:
             self.loads_completed += 1
+            # The codec's `get` made this image its youngest; keep the same
+            # order so the cap trims what the codec will trim.
+            if h in self._hash_lru:
+                self._hash_lru.move_to_end(h)
 
     def fail_load(self, req_id) -> None:
         """No bytes came back. Retract the claim as well as counting it.
@@ -200,10 +225,11 @@ class StateOffloadIndex:
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
             "indexed": len(self.hashes),
-            # Non-zero means the index hit its `_hash_cap` and is dropping the
-            # coldest hashes. Harmless (a dropped hash just misses one reuse),
-            # but a climbing value means the cap is smaller than the live prefix
-            # working set and reuse is being left on the table.
+            # Hashes dropped at `_hash_cap`, which tracks the worker codec's
+            # LRU state-entry bound (`OFFLOAD_STATE_CPU_SIZE`). Each one is an
+            # image the CPU tier has most likely dropped too; a value climbing
+            # far past `indexed` means the state budget is smaller than the
+            # reusable working set.
             "hashes_evicted": self.hashes_evicted,
         }
 
@@ -368,6 +394,16 @@ def state_tier_capability(config) -> StateTierCapability:
     if not (can_store or can_load):
         return replace(none, reason=f"kv_role {role!r} neither saves nor loads")
     return StateTierCapability(can_store, can_load)
+
+
+def state_tier_cpu_bytes() -> int:
+    """CPU bytes the state tier may keep per worker (`OFFLOAD_STATE_CPU_SIZE`,
+    GiB, default 32), carved from the paged-KV LMCache pool it shares.
+
+    One reader for both halves: the worker's `StateByteCodec` evicts against
+    it and the engine's `StateOffloadIndex` mirrors the resulting entry bound.
+    """
+    return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
 
 def state_tier_chunk_tokens(config) -> int:

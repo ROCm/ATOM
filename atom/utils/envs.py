@@ -384,6 +384,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # >0: after warmup_model, compile the M-bucketed prefill GEMMs at startup
+    # instead of freezing the engine mid-serving: dummy prefills at 16, 32, ...
+    # below the stride and every stride tokens after, then each distinct linear
+    # shape called directly. 0 (default) skips it.
+    # See ModelRunner._warmup_prefill_token_sweep.
+    "ATOM_WARMUP_PREFILL_TOKEN_STRIDE": lambda: int(
+        os.getenv("ATOM_WARMUP_PREFILL_TOKEN_STRIDE", "0")
+    ),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.
