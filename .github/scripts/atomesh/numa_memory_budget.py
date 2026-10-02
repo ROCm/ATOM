@@ -9,17 +9,23 @@ time a start out (rocm7: over an hour).
 
 Usage:
   numa_memory_budget.py [--reserve-gib R] [--gpus 0,1,... --per-gpu-gib G]
-                        [<node>:<GiB> ...]
+                        [--compact] [<node>:<GiB> ...]
 
 ``<node>:<GiB>`` pins that much on a node; each GPU of ``--gpus`` (HIP
 ordinals) pins ``--per-gpu-gib`` on its own node. Exits 2 when a node's pins
 plus ``--reserve-gib`` exceed its MemTotal, and warns when they exceed its
 MemFree.
+
+With ``--compact``, once the pins fit, each node with pins is compacted for them:
+compact_huge_pages.py, bound to the node, faults that much as transparent huge
+pages from one thread and frees it, so the many-threaded faults of the owners
+that pin it next find free huge pages instead of racing direct compaction.
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -155,10 +161,51 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="memory each node keeps for everything that is not pinned here",
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="once the pins fit, fault and free each node's pins as huge pages",
+    )
     parser.add_argument("--sysfs", type=Path, default=Path("/sys"))
     args = parser.parse_args(argv)
     planned = plan_pins(args.pins, args.gpus, args.per_gpu_gib, args.sysfs)
-    return check_budget(planned, args.reserve_gib, args.sysfs)
+    status = check_budget(planned, args.reserve_gib, args.sysfs)
+    if status == 0 and args.compact:
+        compact_nodes(planned)
+    return status
+
+
+def compact_nodes(planned: dict[int, float]) -> None:
+    """Compact each node for its pins: compact_huge_pages.py bound to the node.
+
+    One node at a time; a failure only warns, since the pins' owners check
+    their own pages.
+    """
+    here = Path(__file__).resolve().parent
+    for node in sorted(planned):
+        if planned[node] <= 0:
+            continue
+        print(
+            f"[numa-budget] compacting NUMA node {node} for {planned[node]:.0f} GiB",
+            flush=True,
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(here / "numa_exec.py"),
+                str(node),
+                sys.executable,
+                str(here / "compact_huge_pages.py"),
+                f"{planned[node]:g}",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            print(
+                f"[numa-budget][WARN] compacting NUMA node {node} failed "
+                f"rc={result.returncode}",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":

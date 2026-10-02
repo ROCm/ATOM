@@ -1308,8 +1308,10 @@ check_mooncake_owner_devices() {
 # prepare_mooncake_store_memory [l1 GPUs]: drops the clean page cache that the
 # owners' and the L1s' huge-page faults would otherwise reclaim through
 # compaction, then refuses pins that do not fit a NUMA node
-# (numa_memory_budget.py warns when they exceed its free memory). The L1s are
-# the prefill GPUs' (default HIP_VISIBLE_DEVICES); a decode node has none.
+# (numa_memory_budget.py warns when they exceed its free memory), and compacts
+# each node for its pins: owners that fault a fragmented node from many threads
+# get 4 KiB pages, which the NICs refuse. The L1s are the prefill GPUs'
+# (default HIP_VISIBLE_DEVICES); a decode node has none.
 prepare_mooncake_store_memory() {
   local l1_gpus="${1-${HIP_VISIBLE_DEVICES:-}}"
   local -a drop_dirs=()
@@ -1327,6 +1329,7 @@ prepare_mooncake_store_memory() {
     --reserve-gib "$(mooncake_setting LMCACHE_MOONCAKE_NODE_RESERVE_GIB 128)" \
     --gpus "${l1_gpus}" \
     --per-gpu-gib "${LMCACHE_MAX_LOCAL_CPU_SIZE:-48}" \
+    --compact \
     ${pins[@]+"${pins[@]}"}; then
     echo "[mooncake-store][FAIL] the Store owners (LMCACHE_MOONCAKE_OWNERS) and the stages' L1s (LMCACHE_MAX_LOCAL_CPU_SIZE per prefill GPU) must fit their NUMA nodes, see numa-budget above" >&2
     exit 2

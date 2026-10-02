@@ -113,6 +113,87 @@ class NumaMemoryBudgetTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot read NUMA node 2", result.stderr)
 
+    def compact(self, *args):
+        calls = []
+
+        def run(cmd, check):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        real_run = BUDGET.subprocess.run
+        BUDGET.subprocess.run = run
+        try:
+            status = BUDGET.main(["--sysfs", str(self.sysfs), "--compact", *args])
+        finally:
+            BUDGET.subprocess.run = real_run
+        return status, calls
+
+    def test_compact_faults_each_nodes_pins_bound_to_that_node(self):
+        status, calls = self.compact(
+            "--gpus", "0,1,2,3", "--per-gpu-gib", "48", "0:768", "1:960"
+        )
+        self.assertEqual(status, 0)
+        here = SCRIPT.parent
+        self.assertEqual(
+            calls,
+            [
+                [
+                    sys.executable,
+                    str(here / "numa_exec.py"),
+                    str(node),
+                    sys.executable,
+                    str(here / "compact_huge_pages.py"),
+                    gib,
+                ]
+                for node, gib in ((0, "960"), (1, "960"))
+            ],
+        )
+
+    def test_compact_waits_for_a_plan_that_fits(self):
+        status, calls = self.compact("--reserve-gib", "128", "0:1500")
+        self.assertEqual(status, 2)
+        self.assertEqual(calls, [])
+
+
+class CompactHugePagesTest(unittest.TestCase):
+    def setUp(self):
+        path = SCRIPT.parent / "compact_huge_pages.py"
+        spec = importlib.util.spec_from_file_location("compact_huge_pages", path)
+        self.compact = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.compact)
+        self.script = path
+
+    def test_anon_huge_page_bytes_counts_the_overlapping_mappings(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".smaps") as smaps:
+            smaps.write(
+                "7f0000000000-7f0000400000 rw-p 00000000 00:00 0\n"
+                "AnonHugePages:      4096 kB\n"
+                "7f0000400000-7f0000800000 rw-p 00000000 00:00 0\n"
+                "AnonHugePages:      2048 kB\n"
+                "7f0000800000-7f0000a00000 rw-p 00000000 00:00 0 [heap]\n"
+                "AnonHugePages:      2048 kB\n"
+            )
+            smaps.flush()
+            start, end = 0x7F0000200000, 0x7F0000600000
+            self.assertEqual(
+                self.compact.anon_huge_page_bytes(start, end, smaps.name),
+                6144 * 1024,
+            )
+
+    def test_faults_and_frees_on_this_kernel(self):
+        result = subprocess.run(
+            [sys.executable, str(self.script), "0.0625"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(
+            result.stdout,
+            r"^\[thp-compact\](\[WARN\])? \d+ of 0 GiB came as huge pages "
+            r"\(\d+\.\d%\) in \d+ s\n$",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
