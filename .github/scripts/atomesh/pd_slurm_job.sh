@@ -180,11 +180,18 @@ peer_state() {
 
 pre_cleanup_local() {
   [[ "${ATOMESH_ENV_ATOMESH_PRE_CLEAN_GPU:-0}" == "1" ]] || return 0
+  local -a stale_cell_args=() stale_cell_ids=()
+  local stale_cell_id
+  IFS=',' read -r -a stale_cell_ids <<< "${ATOMESH_ENV_ATOMESH_STALE_CELL_IDS:-}"
+  for stale_cell_id in "${stale_cell_ids[@]}"; do
+    [[ -n "${stale_cell_id}" ]] && stale_cell_args+=(--stale-cell-id "${stale_cell_id}")
+  done
   timeout --kill-after=2s 120s python3 \
     "${REPO_ROOT}/.github/scripts/atomesh/pd_gpu_cleanup.py" \
     --job-id "${JOB_ID}" --run-token "${ATOMESH_RUN_TOKEN}" \
     --node "${SELECTED_NODES[$node_rank]}" --rank "${node_rank}" \
     --cell-id "${ATOMESH_CELL_ID}" \
+    "${stale_cell_args[@]}" \
     --out "${RUN_DIR}/gpu-preflight-${node_rank}.json" || return $?
   local deadline=$((SECONDS + 180)) state_rc
   while true; do

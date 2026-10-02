@@ -77,6 +77,7 @@ class Cleanup:
             "node": args.node,
             "rank": args.rank,
             "cell_id": args.cell_id,
+            "stale_cell_ids": args.stale_cell_id,
             "required_free_ratio": 0.88,
             "docker_host": "unix:///var/run/docker.sock",
             "events": [],
@@ -113,8 +114,11 @@ class Cleanup:
         return set(rows)
 
     def stop_containers(self):
+        cell_ids = "|".join(
+            re.escape(cell) for cell in [self.args.cell_id, *self.args.stale_cell_id]
+        )
         pattern = re.compile(
-            rf"atomesh-{re.escape(self.args.cell_id)}-([0-9]+)-[0-9]+"
+            rf"atomesh-(?:{cell_ids})-([0-9]+)-[0-9]+"
             r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
         )
         user = f"{os.getuid()}:{os.getgid()}"
@@ -144,6 +148,14 @@ class Cleanup:
                     continue
                 raise
             match = pattern.fullmatch(name.removeprefix("/"))
+            self.event(
+                "container_seen",
+                container=cid,
+                name=name,
+                user=owner,
+                matches_case=match is not None,
+                matches_user=owner == user,
+            )
             if match is None or owner != user:
                 continue
             old_job = match[1]
@@ -163,6 +175,13 @@ class Cleanup:
             command(["docker", "rm", cid])
             self.event("removed_container", container=cid, name=name)
 
+    def snapshot_ports(self, stage):
+        try:
+            listeners = command(["ss", "-H", "-ltnp"], timeout=5)
+            self.event(stage, listeners=listeners)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            self.event(stage, error=str(error))
+
     def run(self):
         args = self.args
         if socket.gethostname().split(".")[0] != args.node:
@@ -176,10 +195,15 @@ class Cleanup:
             raise RuntimeError("Cleanup must be invoked by the exclusive CI submitter")
         if not re.fullmatch(r"[0-9a-f]{32}", args.run_token):
             raise RuntimeError("Missing cleanup run identity")
-        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", args.cell_id):
+        if any(
+            not re.fullmatch(r"[a-zA-Z0-9_.-]+", cell)
+            for cell in [args.cell_id, *args.stale_cell_id]
+        ):
             raise RuntimeError("Invalid case identity")
         self.snapshot("before")
+        self.snapshot_ports("listeners_before")
         self.stop_containers()
+        self.snapshot_ports("listeners_after")
         deadline = time.monotonic() + 60
         while True:
             current = self.snapshot("check")
@@ -203,6 +227,7 @@ def main():
     parser.add_argument("--node")
     parser.add_argument("--rank", type=int)
     parser.add_argument("--cell-id")
+    parser.add_argument("--stale-cell-id", action="append", default=[])
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     if None in (
