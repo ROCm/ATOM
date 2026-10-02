@@ -38,6 +38,7 @@ on:
           - weekly
           - agentic_multi_decode
           - lmcache_mp
+          - lmcache_mooncake
           - accuracy
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
@@ -94,6 +95,12 @@ on:
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c96,
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c112,
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c128
+
+          GLM lmcache_mooncake (suite=lmcache_mooncake; needs an atomesh_image with Mooncake Store; pit2-p03 (TW MI355X) nodes only):
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c72,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c96,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c112,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c128
 
           GLM agentic_multi_decode (1P3D):
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c12,

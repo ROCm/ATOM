@@ -1192,7 +1192,7 @@ tier -- any remote URL -- has a connected `RemoteBackend`, a registered L1 where
 the connector registers one, and stores and returns one probe chunk byte for
 byte. LMCache retries neither a failed connection nor a failed registration.
 
-The worker environment:
+The worker environment (the atomesh launcher sets all of it, below):
 
 ```bash
 export LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto LMCACHE_MAX_LOCAL_CPU_SIZE=48
@@ -1214,6 +1214,36 @@ the PP layer split or the chunk size changes: the key namespace does not cover
 the PP split, and the Store keeps objects across ATOM restarts. Only the dense
 layout is validated; DSV4's SLOT sidecar reads single keys, which the Mooncake
 connector does not serve, so those reads miss.
+
+The atomesh launcher (`.github/scripts/atomesh/pd_server_atom.sh`) runs the
+Store for the prefill role env `LMCACHE_MOONCAKE_L2=1` (CI suite
+`lmcache_mooncake`): a master on NUMA1's CPUs and one owner per NUMA node, each
+bound to its node, with THP segments (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`),
+no GPU, and the role IP (`eno1` is firewalled). Before the node starts anything
+it refuses conflicting settings of either role; before the owners allocate it
+drops the configured page cache and checks that the owners and the stages' L1s
+fit each NUMA node (`numa_memory_budget.py`: too much fails, more than the free
+memory warns), and that each owner's NICs are ACTIVE and on one node. It waits
+until the master's RPC port listens and the master counts every owner's
+capacity, sets the environment above on the prefill command line and
+`MC_NUM_QP_PER_EP=1` on the decode's, and at shutdown saves the master's
+metrics, fails the job if the master lost owner capacity during the run, and
+stops the owners and then the master after the workers. The defaults fit
+pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node, and NUMA1's NICs named
+`rdma4`-`rdma7`.
+
+| Launcher knob | Default | Meaning |
+|---------------|---------|---------|
+| `LMCACHE_MOONCAKE_OWNERS` | `0:768;1:960` | One owner per `<numa>:<GiB>[:<rdma,...>]` entry. |
+| `LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES` | `rdma4,rdma5,rdma6,rdma7` | Devices of an owner entry without its own; must not be a stage's. |
+| `LMCACHE_MOONCAKE_MASTER_NUMA` | 1 | NUMA node whose CPUs run the master. |
+| `LMCACHE_MOONCAKE_EVICTION_HIGH_WATERMARK`, `LMCACHE_MOONCAKE_EVICTION_RATIO` | 0.90, 0.05 | Master eviction trigger and step (approximately LRU). |
+| `LMCACHE_MOONCAKE_OWNER_THREADS`, `LMCACHE_MOONCAKE_OWNER_MAX_MR_SIZE` | 4, 64 GiB | Owner service threads; MR size the segment is split into. |
+| `LMCACHE_MOONCAKE_MASTER_WAIT_TIMEOUT`, `LMCACHE_MOONCAKE_WAIT_TIMEOUT` | 120 s, 1200 s | Readiness deadlines of the master and of the owners' capacity. |
+| `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS` | `MODEL_PATH` | Colon-separated directories whose clean page cache is dropped before the owners allocate (suite `lmcache_mooncake`: `${ATOMESH_MODEL_ROOT}`, every model on the node). |
+| `LMCACHE_MOONCAKE_NODE_RESERVE_GIB` | 128 | Memory each NUMA node keeps beyond the owners and the stages' L1s (`LMCACHE_MAX_LOCAL_CPU_SIZE` per prefill GPU); a plan that leaves less fails the start. |
+| `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_SECONDS` | 1800 | How long the model's page cache keeps being dropped while weights load. |
+| `ATOMESH_MOONCAKE_{MASTER,METADATA,METRICS,OWNER}_PORT` | 50051, 50080, 50090, 50052 | Ports, shifted by `ATOMESH_SERVICE_PORT_OFFSET`; owner *i* uses the base + *i*. |
 
 The Store needs an image built with Mooncake `WITH_STORE=ON` (`mooncake_master`,
 `mooncake_client`, `mooncake.store`); the CI image builds `WITH_STORE=OFF`.

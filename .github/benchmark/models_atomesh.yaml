@@ -656,6 +656,55 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c128
           concurrency: [128]
 
+      # The nightly lmcache-1m cells with a small CPU tier per PP stage
+      # (in-process LMCache, 48 GiB base) over a Mooncake Store L2 that the
+      # launcher starts on the prefill node (pd_server_atom.sh:
+      # LMCACHE_MOONCAKE_L2): every chunk is written through to the Store, so
+      # the distinct capacity is about the owners' 768 + 960 GiB. Dispatch-only,
+      # never scheduled: they need an image with Mooncake Store (mooncake_master,
+      # mooncake_client and mooncake.store; the CI image builds Mooncake with
+      # WITH_STORE=OFF), so dispatch with suite=lmcache_mooncake and an explicit
+      # atomesh_image. The owner sizes and NICs fit pit2-p03 (TW MI355X) nodes
+      # only: about 1.5 TiB per NUMA node, NUMA1's NICs named rdma4-7 (Spur
+      # MI350X hosts name theirs ionic_N).
+      lmcache_mooncake:
+        - &glm52_agentic_lmcachemc_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c72
+          concurrency: [72]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              # The L1 per stage scales from this base by its layer share
+              # (about 48.6 GiB for 20 of 79 layers); it must stay huge pages,
+              # which ATOM checks at startup.
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "48"
+              LMCACHE_MOONCAKE_L2: "1"
+              # <numa>:<GiB>[:<rdma,...>] per owner. Both serve on rdma4-7,
+              # disjoint from the stages' own NICs (their GPUs' rdma0-3).
+              # Resize by overriding ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_OWNERS.
+              LMCACHE_MOONCAKE_OWNERS: "0:768;1:960"
+              # Owners and L1s pin huge pages under MPOL_BIND, so the clean
+              # page cache of every model on the node goes first, not just this
+              # one's: other weights' cache would be reclaimed through
+              # compaction (pit2-p03-g40 held 520 GiB of another model's).
+              LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+            # The launcher adds MC_NUM_QP_PER_EP=1 for the P->D transfer engine.
+            decode: *glm52_cpp4_dcp4_decode_env
+
+        - <<: *glm52_agentic_lmcachemc_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_lmcachemc_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_lmcachemc_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c128
+          concurrency: [128]
+
     accuracy:
       task: gsm8k
       fewshot: 20
