@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790927161751,
+  "lastUpdate": 1790929504687,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Xin Huang",
-            "username": "gyohuangxin",
-            "email": "Xin.Huang@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "00760297ef69af7ab5d345af9c8fc6da00f5314d",
-          "message": "[CI] Prune stale Docker data on TW runners (#2084)\n\n* ci: prune stale Docker data on TW runners\n\n* Potential fix for pull request finding\n\nCo-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>\n\n* ci: prune stale Docker data on TW runners\n\n* Potential fix for pull request finding\n\nCo-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>\n\n---------\n\nCo-authored-by: Copilot Autofix powered by AI <175728472+Copilot@users.noreply.github.com>",
-          "timestamp": "2026-08-29T13:17:36Z",
-          "url": "https://github.com/ROCm/ATOM/commit/00760297ef69af7ab5d345af9c8fc6da00f5314d"
-        },
-        "date": 1788033631308,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33206233216 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8939 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8378,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33206233216 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8211 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8605,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33206233216 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8408 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8688,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33206233216 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8567 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8666,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33206233216 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260828 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8461 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -307051,6 +306999,34 @@ window.BENCHMARK_DATA = {
             "value": 263.7268,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36969099523 | docker_image=rocm/atom-dev:nightly_202609301507 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9216%2C%22cache_hit_tokens%22%3A842493424%2C%22cache_total_tokens%22%3A914180026%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A8425%2C%22concurrency%22%3A96%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3629.6655%2C%22e2el_ms%22%3A40701.732%2C%22e2el_p90%22%3A80713.9208%2C%22e2el_p99%22%3A183190.0531%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609301507%22%2C%22input_tput%22%3A232615.6351%2C%22input_tput_per_gpu%22%3A29076.9544%2C%22interactivity%22%3A4.4634%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A8425%2C%22interactivity_p90_itl%22%3A46.6814%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A17.8824%2C%22itl_p90%22%3A21.4218%2C%22median_e2el_ms%22%3A30331.9823%2C%22median_itl_ms%22%3A17.9007%2C%22median_tpot_ms%22%3A17.9007%2C%22median_ttft_ms%22%3A16379.9925%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2109.8147%2C%22output_tput_per_gpu%22%3A263.7268%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.1438%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc96-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F36969099523%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A234725.4498%2C%22tpot_ms%22%3A17.8824%2C%22tpot_p90%22%3A21.4218%2C%22tpot_p99%22%3A32.8137%2C%22tput_per_gpu%22%3A29340.6812%2C%22ttft_ms%22%3A23176.1528%2C%22ttft_p90%22%3A54163.0649%2C%22ttft_p99%22%3A97180.7851%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "id": "e991864c124046f04db56bbff8073a224f12d7a2",
+          "message": "fix(offload): trust retrieve's unpin only for LMCache #3884's exact loop\n\n7b6892755 decided whether LMCacheEngine.retrieve releases the lookup\npins by looking for `.unpin(` in its source. LMCache #5098 (bdb66b85,\nin the rocm7 0.5.6.dev139+gf22dec28 wheel since #2438) kept that call\nbut guarded it with `(self.async_loading or self._is_passive())`, so a\nsynchronous retrieve on an active rank -- the only way ATOM retrieves:\nasync loading is rejected and use_mla=False -- no longer unpins. The\nprobe still answered \"releases\", the worker released only the chunks\nretrieve did not return, and every retrieved chunk kept its lookup pin\nuntil the PinMonitor forced it out 300 s after its last pin. A hot\nprefix is pinned again before that, so its count only grows: the rocm7\nc72/c96 prefill logs show 0.67-1.0 M \"Pin timeout detected\" (pin counts\nup to 34) and up to 82,193 pinned objects (about 240 GiB, near a\nstage's whole L1) in one process, against 0 on the rocm10 (0.4.5) runs.\n\nAnswer \"releases\" only when one top-level statement of retrieve is\nexactly the cleanup loop that LMCache #3884 (495cc9a8) ends it with up\nto #5098 -- compared as ast.dump, so comments and positions do not\nmatter -- and the engine neither removes chunks after retrieve nor\nloads asynchronously. Anything else, an unreadable source included,\nreleases the whole lookup, so a future LMCache the rule misreads costs\na double unpin, not a leak. The answer depends on the engine's flags,\nso it is cached per engine. When the source cannot be read, the INFO\nline keeps its prefix and adds the reason and lmcache's version.\n\nOver LMCacheEngine.retrieve of 40 LMCache revisions from v0.4.5 to dev\n8d7d2c47 (decorators included, read back through inspect.getsource),\na synchronous engine gets \"keeps\" for v0.4.5-v0.5.1 and 495cc9a8~1,\n\"releases\" for 495cc9a8, v0.5.2rc1-v0.5.6rc2, 05fc77a0 and bdb66b85~1,\nand \"keeps\" for bdb66b85, f22dec28 and 8d7d2c47: what each revision's\nown cleanup loop does to a pinned chunk. Async, passive and\nremove-after-retrieve engines get the same answer or \"keeps\", never a\nwrong \"releases\".\n\nTests: the dense doubles open with LMCache's health check and end with\nthe 0.4.5, #3884 or #5098 cleanup copied from LMCache, plus a later\nshape that nests #3884's loop under #5098's guard. The probe test adds\n#3884 with remove_after_retrieve and with async loading (both \"keeps\"),\na per-engine cache test and the unreadable-source log line; the DSv4\nPAGE+SLOT doubles run the same three cleanups. A new CPU-only test on\na real LMCacheEngine (skipped without lmcache) pins three chunks with\ntwo lookups and runs the dense worker's real load path: the first load\nleaves [1, 1, 1] and the second [0, 0, 0] on f22dec28 (rocm7 image),\n0.4.5 (rocm10) and 0.5.5rc3 (latest). 7b6892755 fails 15 of these\ntests, the real-engine one included, and dropping any part of the rule\n(remove or async check, per-engine cache key, top-level match,\nunreadable fallback, log reason) fails at least one.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-02T04:38:15Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e991864c124046f04db56bbff8073a224f12d7a2"
+        },
+        "date": 1790929503834,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4 1048576/1024 c=72 perf point",
+            "value": 273.5373,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/36972153088 | docker_image=rocm/atom-dev:nightly_202609301507 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9612%2C%22cache_hit_tokens%22%3A1022211328%2C%22cache_total_tokens%22%3A1063515179%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A8781%2C%22concurrency%22%3A72%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3620.2226%2C%22e2el_ms%22%3A21099.4577%2C%22e2el_p90%22%3A43006.0978%2C%22e2el_p99%22%3A140217.7074%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609301507%22%2C%22input_tput%22%3A270614.3094%2C%22input_tput_per_gpu%22%3A33826.7887%2C%22interactivity%22%3A19.2889%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A8780%2C%22interactivity_p90_itl%22%3A49.6209%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A17.5701%2C%22itl_p90%22%3A20.1528%2C%22median_e2el_ms%22%3A11786.7333%2C%22median_itl_ms%22%3A17.6264%2C%22median_tpot_ms%22%3A17.6264%2C%22median_ttft_ms%22%3A2305.4259%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2188.2981%2C%22output_tput_per_gpu%22%3A273.5373%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.2343%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc72-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F36972153088%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A272802.6074%2C%22tpot_ms%22%3A17.5701%2C%22tpot_p90%22%3A20.1528%2C%22tpot_p99%22%3A29.6468%2C%22tput_per_gpu%22%3A34100.3259%2C%22ttft_ms%22%3A3629.7908%2C%22ttft_p90%22%3A7964.614%2C%22ttft_p99%22%3A21018.339%7D"
           }
         ]
       }
