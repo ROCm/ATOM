@@ -600,6 +600,15 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         the target's metadata, so a write here would reach the verify step.
         """
 
+    def _publish_dcp_token_block_tables(
+        self, attn_metadata, running_bs: int, max_seqlen_q: int
+    ) -> None:
+        """Nothing to publish: this backend has no DCP sparse indexer.
+
+        Answered for the same reason as `_publish_indexer_fp4_decode_schedule`:
+        `EagleProposer` calls it on whatever builder the target uses.
+        """
+
     def prepare_block_tables(self, batch: ScheduledBatch, running_bs=None):
         """Prepare the shared CPU snapshot, reusing unchanged page mappings."""
         return block_table_state(
