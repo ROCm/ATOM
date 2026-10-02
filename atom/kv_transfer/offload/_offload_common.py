@@ -11,9 +11,12 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import logging
 import os
+import sys
+import textwrap
 import threading
 import time
 import weakref
@@ -127,6 +130,24 @@ def build_offload_engine(
     engine.fmt = MemoryFormat.KV_2LTD
     engine.post_init()
     return engine, cfg, meta
+
+
+# The cleanup loop that ends ``LMCacheEngine.retrieve`` from LMCache #3884
+# (0.5.2) up to #5098: every returned chunk not removed after retrieve loses
+# one pin. Held as its ``ast.dump``, which ignores comments and positions, for
+# ``_retrieve_releases_lookup_pins`` to compare against.
+_LMCACHE_3884_RETRIEVE_CLEANUP = ast.dump(ast.parse(textwrap.dedent("""
+    for key, memory_obj, _, _ in reordered_chunks:
+        if self.remove_after_retrieve and not self._is_passive():
+            assert self.storage_manager is not None
+            self.storage_manager.remove(key, self.retrieve_locations)
+            if self._is_sync_pd_backend():
+                memory_obj.ref_count_down()
+        else:
+            if memory_obj.is_pinned:
+                memory_obj.unpin()
+            memory_obj.ref_count_down()
+    """)).body[0])
 
 
 class OffloadWorkerMixin:
@@ -323,33 +344,56 @@ class OffloadWorkerMixin:
             )
 
     def _retrieve_releases_lookup_pins(self, engine) -> bool:
-        """Whether this LMCache's ``retrieve`` unpins the chunks it returns.
+        """Whether this engine's ``retrieve`` unpins the chunks it returns.
 
-        LMCache 0.5.x's ``LMCacheEngine.retrieve`` unpins each returned chunk
-        (``if memory_obj.is_pinned: memory_obj.unpin()``); 0.4.5 (the rocm10
-        image) only drops the chunk's ref count, so the lookup pin stays until
-        ``lookup_unpin`` or the PinMonitor's 300 s forced unpin. Probed once
-        per ``retrieve`` implementation from its source; an unreadable source
-        counts as "does not unpin", whose worst case is a double unpin rather
-        than a pin leak on every retrieved chunk.
+        ATOM retrieves synchronously on an active (non-passive) rank, and there
+        LMCache's ``LMCacheEngine.retrieve`` has done three things:
+
+        - 0.4.5 (rocm10 image): drops each returned chunk's get reference only;
+        - #3884 up to #5098 (0.5.2 to 0.5.6rc2): also unpins each returned
+          chunk (``if memory_obj.is_pinned: memory_obj.unpin()``);
+        - #5098 onward (rocm7 0.5.6.dev139+gf22dec28 wheel): unpins only on an
+          async-loading or passive engine (``if (self.async_loading or
+          self._is_passive()) and memory_obj.is_pinned``); the lookup owner
+          releases its pins with ``lookup_unpin``.
+
+        So an ``.unpin(`` in the source proves nothing. ``retrieve`` counts as
+        releasing only when one of its top-level statements is exactly #3884's
+        cleanup loop (``_LMCACHE_3884_RETRIEVE_CLEANUP``) and the engine
+        neither removes chunks after retrieve nor loads asynchronously.
+        Anything else, an unreadable source included, counts as "keeps", whose
+        worst case is a double unpin. The opposite mistake leaves a pin on
+        every retrieved chunk until the PinMonitor forces it out
+        ``pin_timeout_sec`` after its last pin, which a hot prefix, pinned
+        again before then, never reaches. The answer depends on the engine's
+        flags, so it is cached per engine.
         """
 
         retrieve = getattr(type(engine), "retrieve", None) or getattr(
             engine, "retrieve", None
         )
         cached = getattr(self, "_retrieve_unpin_probe", None)
-        if cached is not None and cached[0] is retrieve:
-            return cached[1]
+        if cached is not None and cached[0] is retrieve and cached[1] is engine:
+            return cached[2]
+        unreadable = ""
         try:
-            releases = ".unpin(" in inspect.getsource(retrieve)
-        except (OSError, TypeError):
-            releases = False
-        self._retrieve_unpin_probe = (retrieve, releases)
+            body = ast.parse(textwrap.dedent(inspect.getsource(retrieve))).body[0].body
+        except Exception as exc:  # noqa: BLE001  # unreadable third-party source
+            body = []
+            version = getattr(sys.modules.get("lmcache"), "__version__", "unknown")
+            unreadable = f" (cannot read retrieve's source: {exc!r}; lmcache {version})"
+        releases = (
+            getattr(engine, "remove_after_retrieve", None) is False
+            and getattr(engine, "async_loading", None) is False
+            and any(ast.dump(node) == _LMCACHE_3884_RETRIEVE_CLEANUP for node in body)
+        )
+        self._retrieve_unpin_probe = (retrieve, engine, releases)
         logger.info(
             "LMCache offload: retrieve %s its lookup pins; post-retrieve unpin "
-            "releases %s",
+            "releases %s%s",
             "releases" if releases else "keeps",
             "only unretrieved chunks" if releases else "the whole lookup",
+            unreadable,
         )
         return releases
 
@@ -357,15 +401,16 @@ class OffloadWorkerMixin:
         """Release the lookup pins that ``retrieve`` did not already release.
 
         Where ``LMCacheEngine.retrieve`` unpins every chunk it returns (LMCache
-        0.5.x), a plain ``lookup_unpin`` afterwards drops those chunks' pin
-        count a second time. When another request pinned the same shared
-        prefix chunk, that second drop cancels its pin and the chunk can be
-        evicted before it is loaded. Only chunks whose first token ``ret_mask``
-        does not mark as retrieved still hold this request's pin: those below
-        the HBM prefix, and those the retrieve could not return.
+        #3884 up to #5098), a plain ``lookup_unpin`` afterwards drops those
+        chunks' pin count a second time. When another request pinned the same
+        shared prefix chunk, that second drop cancels its pin and the chunk can
+        be evicted before it is loaded. Only chunks whose first token
+        ``ret_mask`` does not mark as retrieved still hold this request's pin:
+        those below the HBM prefix, and those the retrieve could not return.
 
-        Where ``retrieve`` leaves the pins alone (LMCache 0.4.5), every pin of
-        the lookup is still held, so the whole lookup is released.
+        Where ``retrieve`` leaves the pins alone (LMCache 0.4.5, and #5098
+        onward), every pin of the lookup is still held, so the whole lookup is
+        released.
         """
 
         engine = getattr(self, "_engine", None)

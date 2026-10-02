@@ -2572,9 +2572,12 @@ def test_page_retrieve_failure_prevents_sidecar_fetch_and_unpins_once():
 
 class _PinningEngine(_FakeEngine):
     """Engine double whose lookup pins both 4-token chunks of the 8-token
-    request. Its retrieve returns ``retrieved`` chunks and also unpins them
-    the way LMCache 0.5.x does; the worker tells the two releases apart from
-    retrieve's source."""
+    request. Its retrieve returns ``retrieved`` chunks and ends with the
+    cleanup loop of LMCache #3884 up to #5098 (0.5.2 to 0.5.6rc2), which also
+    unpins them; the worker tells the releases apart from retrieve's source."""
+
+    async_loading = False
+    remove_after_retrieve = False
 
     def __init__(self, order, *, retrieved) -> None:
         super().__init__(order)
@@ -2583,6 +2586,9 @@ class _PinningEngine(_FakeEngine):
         self.lookup_pins = {"23": {"LocalCPUBackend": list(self.keys)}}
         self.retrieved = retrieved
         self.storage_manager = SimpleNamespace(batched_unpin=self._batched_unpin)
+
+    def _is_passive(self) -> bool:
+        return False
 
     def _batched_unpin(self, keys, locations) -> None:
         assert locations == ["LocalCPUBackend"]
@@ -2595,10 +2601,29 @@ class _PinningEngine(_FakeEngine):
             result[idx * 4 : (idx + 1) * 4] = True
         return result & mask
 
+    def _reordered_chunks(self):
+        """The ``(key, memory_obj, start, end)`` chunks retrieve returns."""
+
+        chunks = []
+        for idx in self.retrieved:
+            key = self.keys[idx]
+            chunk = _PinnedChunk(self.pin_count, key)
+            chunks.append((key, chunk, idx * 4, (idx + 1) * 4))
+        return chunks
+
     def retrieve(self, tokens, mask=None, **kwargs):
         self.order.append("retrieve")
-        for idx in self.retrieved:
-            _PinnedChunk(self.pin_count, self.keys[idx]).unpin()
+        reordered_chunks = self._reordered_chunks()
+        for key, memory_obj, _, _ in reordered_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                assert self.storage_manager is not None
+                self.storage_manager.remove(key, self.retrieve_locations)
+                if self._is_sync_pd_backend():
+                    memory_obj.ref_count_down()
+            else:
+                if memory_obj.is_pinned:
+                    memory_obj.unpin()
+                memory_obj.ref_count_down()
         return self._retrieved_mask(mask)
 
     def lookup_unpin(self, lookup_id) -> None:
@@ -2615,32 +2640,67 @@ class _PinKeepingEngine(_PinningEngine):
         return self._retrieved_mask(mask)
 
 
+class _SyncPinKeepingEngine(_PinningEngine):
+    """LMCache #5098 onward (rocm7 0.5.6.dev139+gf22dec28 wheel): the unpin is
+    still in retrieve's source, but only an async-loading or passive engine
+    reaches it, so a synchronous retrieve leaves the lookup pins held."""
+
+    def retrieve(self, tokens, mask=None, **kwargs):
+        self.order.append("retrieve")
+        reordered_chunks = self._reordered_chunks()
+        for key, memory_obj, _, _ in reordered_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                assert self.storage_manager is not None
+                self.storage_manager.remove(key, self.retrieve_locations)
+                if self._is_sync_pd_backend():
+                    memory_obj.ref_count_down()
+            else:
+                if (self.async_loading or self._is_passive()) and memory_obj.is_pinned:
+                    memory_obj.unpin()
+                memory_obj.ref_count_down()
+        return self._retrieved_mask(mask)
+
+
 class _PinnedChunk:
     def __init__(self, pin_count, key) -> None:
         self._pin_count = pin_count
         self._key = key
 
+    @property
+    def is_pinned(self) -> bool:
+        return self._pin_count[self._key] > 0
+
     def unpin(self) -> None:
         self._pin_count[self._key] -= 1
 
+    def ref_count_down(self) -> None:
+        pass
 
-@pytest.mark.parametrize("retrieve_unpins", [True, False], ids=["lmc056", "lmc045"])
+
+_LMCACHE_PAGE_RETRIEVES = {
+    "lmc045": _PinKeepingEngine,
+    "lmc3884": _PinningEngine,
+    "lmc5098": _SyncPinKeepingEngine,
+}
+
+
+@pytest.mark.parametrize("lmcache", sorted(_LMCACHE_PAGE_RETRIEVES))
 @pytest.mark.parametrize(
     "retrieved, sidecar, loaded",
     [([1], True, True), ([1], False, False), ([], True, False)],
     ids=["loaded", "sidecar_missing", "page_missing"],
 )
 def test_page_slot_load_releases_each_lookup_pin_exactly_once(
-    retrieved, sidecar, loaded, retrieve_unpins
+    retrieved, sidecar, loaded, lmcache
 ):
-    """Each PAGE lookup pin is released exactly once whether or not LMCache's
-    retrieve already dropped the pins of the chunks it returned, and whether
-    the composite load succeeds or fails after the PAGE retrieve."""
+    """Each PAGE lookup pin is released exactly once whichever LMCache retrieve
+    ran (one that already dropped the pins of the chunks it returned, or one
+    that left them held), and whether the composite load succeeds or fails
+    after the PAGE retrieve."""
 
     order = []
     connector = _worker(order)
-    engine_cls = _PinningEngine if retrieve_unpins else _PinKeepingEngine
-    connector._engine = engine_cls(order, retrieved=retrieved)
+    connector._engine = _LMCACHE_PAGE_RETRIEVES[lmcache](order, retrieved=retrieved)
     if sidecar:
         connector._slot_store.get_result = _sidecar_blob()
 

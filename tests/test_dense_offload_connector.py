@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -655,77 +656,187 @@ def test_dense_lookup_unpin_passes_one_string_id():
 
 
 class _PinnedChunk:
+    """One chunk as LMCache's retrieve cleanup sees it: a shared pin count."""
+
     def __init__(self, pin_count, key):
         self._pin_count = pin_count
         self._key = key
 
+    @property
+    def is_pinned(self):
+        return self._pin_count[self._key] > 0
+
     def unpin(self):
         self._pin_count[self._key] -= 1
 
+    def ref_count_down(self):
+        pass
 
-def _pinning_engine(retrieved_chunks, *, retrieve_unpins, chunk_size=8, num_chunks=4):
-    """LMCache engine double: lookup pins every chunk. With ``retrieve_unpins``
-    retrieve unpins the chunks it returns (LMCache 0.5.x); without it retrieve
-    leaves every lookup pin held (LMCache 0.4.5). The worker tells the two
-    apart from retrieve's source, as it does for the real engine."""
 
-    keys = [f"k{i}" for i in range(num_chunks)]
-    pin_count = {key: 1 for key in keys}
+class _LookupPinnedEngine:
+    """LMCache engine double whose lookup pinned every chunk of the request.
 
-    def _mark(tokens, mask):
-        ret = torch.zeros(len(tokens), dtype=torch.bool)
-        for idx in retrieved_chunks:
-            ret[idx * chunk_size : (idx + 1) * chunk_size] = True
-        return ret & mask
+    Each subclass's ``retrieve`` opens with LMCache's health check and ends
+    with one LMCache release's cleanup loop, copied from LMCache with comments
+    and logging dropped. The worker tells them apart by reading that source,
+    as it does for the real engine; ATOM retrieves synchronously on an active
+    rank.
+    """
 
-    def unpinning_retrieve(tokens, *, mask, **_kwargs):
-        for idx in retrieved_chunks:
-            _PinnedChunk(pin_count, keys[idx]).unpin()
-        return _mark(tokens, mask)
+    async_loading = False
+    remove_after_retrieve = False
 
-    def pin_keeping_retrieve(tokens, *, mask, **_kwargs):
-        return _mark(tokens, mask)
+    def __init__(self, retrieved_chunks, *, chunk_size=8, num_chunks=4):
+        self.keys = [f"k{i}" for i in range(num_chunks)]
+        self.pin_count = {key: 1 for key in self.keys}
+        self.lookup_pins = {}
+        self.retrieve_locations = ["LocalCPUBackend"]
+        self.storage_manager = SimpleNamespace(batched_unpin=self._batched_unpin)
+        self._retrieved_chunks = retrieved_chunks
+        self._chunk_size = chunk_size
 
-    def batched_unpin(unpin_keys, locations):
+    def is_healthy(self):
+        return True
+
+    def _is_passive(self):
+        return False
+
+    def _is_sync_pd_backend(self):
+        return False
+
+    def _returned(self, tokens, mask):
+        """``ret_mask`` and the ``reordered_chunks`` the cleanup loop walks."""
+
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool)
+        reordered_chunks = []
+        for idx in self._retrieved_chunks:
+            start, end = idx * self._chunk_size, (idx + 1) * self._chunk_size
+            ret_mask[start:end] = True
+            chunk = _PinnedChunk(self.pin_count, self.keys[idx])
+            reordered_chunks.append((self.keys[idx], chunk, start, end))
+        return ret_mask & mask, reordered_chunks
+
+    def _batched_unpin(self, keys, locations):
         assert locations == ["LocalCPUBackend"]
-        for key in unpin_keys:
-            pin_count[key] -= 1
+        for key in keys:
+            self.pin_count[key] -= 1
 
-    storage_manager = SimpleNamespace(batched_unpin=batched_unpin)
-    lookup_pins = {}
-
-    def lookup_unpin(lookup_id):
-        for location, pinned in lookup_pins.pop(lookup_id, {}).items():
-            storage_manager.batched_unpin(pinned, [location])
-
-    engine = SimpleNamespace(
-        retrieve=unpinning_retrieve if retrieve_unpins else pin_keeping_retrieve,
-        lookup_pins=lookup_pins,
-        lookup_unpin=lookup_unpin,
-        storage_manager=storage_manager,
-    )
-    return engine, keys, pin_count
+    def lookup_unpin(self, lookup_id):
+        for location, keys in self.lookup_pins.pop(lookup_id, {}).items():
+            self._batched_unpin(keys, [location])
 
 
-@pytest.mark.parametrize("retrieve_unpins", [True, False], ids=["lmc056", "lmc045"])
+class _Lmc045Engine(_LookupPinnedEngine):
+    """LMCache 0.4.5 (rocm10 image): retrieve drops the get reference only."""
+
+    def retrieve(self, tokens, mask=None, **kwargs):
+        if not self.is_healthy():
+            return torch.zeros(len(tokens), dtype=torch.bool)
+        ret_mask, reordered_chunks = self._returned(tokens, mask)
+        for key, memory_obj, _, _ in reordered_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                assert self.storage_manager is not None
+                self.storage_manager.remove(key, self.retrieve_locations)
+                if self._is_sync_pd_backend():
+                    memory_obj.ref_count_down()
+            elif not self.async_loading:
+                memory_obj.ref_count_down()
+        return ret_mask
+
+
+class _Lmc3884Engine(_LookupPinnedEngine):
+    """LMCache #3884 up to #5098 (0.5.2 to 0.5.6rc2): retrieve also unpins
+    every chunk it returns."""
+
+    def retrieve(self, tokens, mask=None, **kwargs):
+        if not self.is_healthy():
+            return torch.zeros(len(tokens), dtype=torch.bool)
+        ret_mask, reordered_chunks = self._returned(tokens, mask)
+        for key, memory_obj, _, _ in reordered_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                assert self.storage_manager is not None
+                self.storage_manager.remove(key, self.retrieve_locations)
+                if self._is_sync_pd_backend():
+                    memory_obj.ref_count_down()
+            else:
+                if memory_obj.is_pinned:
+                    memory_obj.unpin()
+                memory_obj.ref_count_down()
+        return ret_mask
+
+
+class _Lmc5098Engine(_LookupPinnedEngine):
+    """LMCache #5098 onward (rocm7 0.5.6.dev139+gf22dec28 wheel): the unpin is
+    still in retrieve's source, but only an async-loading or passive engine
+    reaches it; a synchronous load's pins belong to ``lookup_unpin``."""
+
+    def retrieve(self, tokens, mask=None, **kwargs):
+        if not self.is_healthy():
+            return torch.zeros(len(tokens), dtype=torch.bool)
+        ret_mask, reordered_chunks = self._returned(tokens, mask)
+        for key, memory_obj, _, _ in reordered_chunks:
+            if self.remove_after_retrieve and not self._is_passive():
+                assert self.storage_manager is not None
+                self.storage_manager.remove(key, self.retrieve_locations)
+                if self._is_sync_pd_backend():
+                    memory_obj.ref_count_down()
+            else:
+                if (self.async_loading or self._is_passive()) and memory_obj.is_pinned:
+                    memory_obj.unpin()
+                memory_obj.ref_count_down()
+        return ret_mask
+
+
+class _OwnerGuardedLmc3884Engine(_LookupPinnedEngine):
+    """A plausible later shape of #5098: #3884's loop kept verbatim, but run
+    only where retrieve owns the lookup pins (async loading or passive). A
+    synchronous load keeps its pins."""
+
+    def retrieve(self, tokens, mask=None, **kwargs):
+        if not self.is_healthy():
+            return torch.zeros(len(tokens), dtype=torch.bool)
+        ret_mask, reordered_chunks = self._returned(tokens, mask)
+        if self.async_loading or self._is_passive():
+            for key, memory_obj, _, _ in reordered_chunks:
+                if self.remove_after_retrieve and not self._is_passive():
+                    assert self.storage_manager is not None
+                    self.storage_manager.remove(key, self.retrieve_locations)
+                    if self._is_sync_pd_backend():
+                        memory_obj.ref_count_down()
+                else:
+                    if memory_obj.is_pinned:
+                        memory_obj.unpin()
+                    memory_obj.ref_count_down()
+        else:
+            for _key, memory_obj, _, _ in reordered_chunks:
+                memory_obj.ref_count_down()
+        return ret_mask
+
+
+_LMCACHE_RETRIEVES = {
+    "lmc045": _Lmc045Engine,
+    "lmc3884": _Lmc3884Engine,
+    "lmc5098": _Lmc5098Engine,
+    "owner_guarded_3884": _OwnerGuardedLmc3884Engine,
+}
+
+
+@pytest.mark.parametrize("lmcache", sorted(_LMCACHE_RETRIEVES))
 @pytest.mark.parametrize(
     "hbm, retrieved, loaded",
     [(8, [1, 2, 3], True), (0, [0, 1, 2, 3], True), (8, [1], False)],
 )
-def test_load_releases_each_lookup_pin_exactly_once(
-    hbm, retrieved, loaded, retrieve_unpins
-):
-    """Each lookup pin is released exactly once, whether or not retrieve()
-    already dropped the pins of the chunks it returned: unpinning them again
-    cancels another request's pin on a shared prefix chunk (0.5.x), and not
-    unpinning them leaks them until the PinMonitor forces them out (0.4.5)."""
+def test_load_releases_each_lookup_pin_exactly_once(hbm, retrieved, loaded, lmcache):
+    """Each lookup pin is released exactly once, whichever LMCache retrieve ran.
+    Unpinning a chunk that retrieve already unpinned (lmc3884) cancels another
+    request's pin on a shared prefix chunk; skipping a pin that retrieve left
+    held (the others) keeps the chunk pinned until the PinMonitor forces it
+    out."""
 
     worker = DenseOffloadConnector(_config("kv_consumer"))
     worker.chunk_size = 8
-    engine, keys, pin_count = _pinning_engine(
-        retrieved, retrieve_unpins=retrieve_unpins
-    )
-    engine.lookup_pins["71"] = {"LocalCPUBackend": list(keys)}
+    engine = _LMCACHE_RETRIEVES[lmcache](retrieved)
+    engine.lookup_pins["71"] = {"LocalCPUBackend": list(engine.keys)}
     worker._engine = engine
     request = LMCacheReqMeta(
         req_id=71,
@@ -740,7 +851,7 @@ def test_load_releases_each_lookup_pin_exactly_once(
     try:
         worker._do_load_req(request)
 
-        assert pin_count == {key: 0 for key in keys}
+        assert engine.pin_count == {key: 0 for key in engine.keys}
         assert engine.lookup_pins == {}
         finished = worker.get_finished()
         done = finished.finished_loading if loaded else finished.failed_loading
@@ -749,31 +860,73 @@ def test_load_releases_each_lookup_pin_exactly_once(
         worker.close()
 
 
-def test_retrieve_unpin_probe_matches_each_lmcache_release():
-    """The probe reads the real LMCache retrieve shapes: 0.5.x unpins what it
-    returns, 0.4.5 only drops the ref count; unreadable source is treated as
-    keeping the pins."""
+class _RemovingLmc3884Engine(_Lmc3884Engine):
+    remove_after_retrieve = True
+
+
+class _AsyncLmc3884Engine(_Lmc3884Engine):
+    async_loading = True
+
+
+@pytest.mark.parametrize(
+    "engine_cls, releases",
+    [
+        (_Lmc045Engine, False),
+        (_Lmc3884Engine, True),
+        # The rocm7 leak: `.unpin(` is in this source, yet a sync load skips it.
+        (_Lmc5098Engine, False),
+        # #3884's loop, but nested under a guard a sync load does not pass.
+        (_OwnerGuardedLmc3884Engine, False),
+        # #3884's loop removes these chunks instead of unpinning them.
+        (_RemovingLmc3884Engine, False),
+        # ATOM rejects async loading, so "releases" is never claimed for it.
+        (_AsyncLmc3884Engine, False),
+    ],
+)
+def test_retrieve_releases_pins_only_with_3884_cleanup_on_sync_engine(
+    engine_cls, releases
+):
+    """Only #3884's exact cleanup loop, on an engine that neither removes
+    chunks after retrieve nor loads asynchronously, counts as releasing the
+    pins; every other shape keeps them, whose worst case is a double unpin."""
 
     worker = DenseOffloadConnector(_config("kv_consumer"))
-
-    class _Engine056:
-        def retrieve(self, tokens, mask=None, **kwargs):
-            for _key, memory_obj in self.chunks:
-                if memory_obj.is_pinned:
-                    memory_obj.unpin()
-                memory_obj.ref_count_down()
-
-    class _Engine045:
-        def retrieve(self, tokens, mask=None, **kwargs):
-            for _key, memory_obj in self.chunks:
-                memory_obj.ref_count_down()
-
     try:
-        assert worker._retrieve_releases_lookup_pins(_Engine056()) is True
-        assert worker._retrieve_releases_lookup_pins(_Engine045()) is False
-        assert worker._retrieve_releases_lookup_pins(SimpleNamespace(retrieve=len)) is (
-            False
-        )
+        assert worker._retrieve_releases_lookup_pins(engine_cls([])) is releases
+    finally:
+        worker.close()
+
+
+def test_retrieve_unpin_probe_is_cached_per_engine():
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    releasing, removing = _Lmc3884Engine([]), _Lmc3884Engine([])
+    removing.remove_after_retrieve = True
+    try:
+        assert worker._retrieve_releases_lookup_pins(releasing) is True
+        assert worker._retrieve_releases_lookup_pins(removing) is False
+        assert worker._retrieve_releases_lookup_pins(releasing) is True
+    finally:
+        worker.close()
+
+
+def test_retrieve_unpin_probe_treats_unreadable_source_as_keeping_pins(caplog):
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    try:
+        with caplog.at_level(logging.INFO, logger="atom"):
+            releases = worker._retrieve_releases_lookup_pins(
+                SimpleNamespace(retrieve=len)
+            )
+
+        assert releases is False
+        # Log scans match the prefix; the reason and version follow it.
+        (message,) = [
+            record.getMessage()
+            for record in caplog.records
+            if "its lookup pins" in record.getMessage()
+        ]
+        assert message.startswith("LMCache offload: retrieve keeps its lookup pins")
+        assert "cannot read retrieve's source: TypeError(" in message
+        assert "; lmcache " in message
     finally:
         worker.close()
 

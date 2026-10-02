@@ -1426,7 +1426,8 @@ class DSV4OffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             # A worker owns one lookup pin for the emitted composite load. It is
             # released after PAGE and SLOT reach a terminal state, exactly once.
             # Once PAGE retrieve ran, it may already have released the pins of
-            # the chunks it returned (LMCache 0.5.x), so only the rest remain.
+            # the chunks it returned (LMCache #3884 up to #5098), so only the
+            # rest remain.
             if retrieve_masks:
                 self._lookup_unpin_after_retrieve(req.req_id, retrieve_masks[0])
             else:
