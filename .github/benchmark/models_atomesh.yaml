@@ -904,10 +904,10 @@ models:
             wait_server_timeout: 10800
           run_eval: true
         - <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-main-grouping-with-59164-dspark3-tp8-dcp8-eager
+          name: kimi-k3-gsm8k-main-grouping-zeroing-range-dspark3-tp8-dcp8-eager
           vllm:
             source:
-              sha: f383aa4ce837544fdf6d4a0b58a50a06ddfb1cf4
+              sha: 87dbc320f705ebb1bd1630048ee6e20a3852e551
     accuracy:
       task: gsm8k
       fewshot: 5
