@@ -126,8 +126,10 @@ def receive_weight_stream(
 ) -> dict[str, float]:
     """Consume one weight stream and apply it as a single transaction.
 
-    Returns throughput and coverage statistics. On any failure the runner is
-    fenced rather than left half-updated -- see ``abort_weight_update``.
+    Returns throughput and coverage statistics. Once this stream's reload has
+    begun, any failure fences the runner rather than leaving it half-updated --
+    see ``abort_weight_update``. A stream refused at begin wrote nothing, and
+    leaves the runner as it was, a reload another caller has open included.
 
     A failure on this rank does not end its part in the stream. The trainer and
     every other rank are still in the broadcasts, and one rank leaving early
@@ -142,16 +144,18 @@ def receive_weight_stream(
     started = time.perf_counter()
     failure: Exception | None = None
     drained = 0
+    began = False
 
     try:
         try:
             runner.begin_weight_update(expected_version)
+            began = True
         except Exception as exc:  # noqa: BLE001 - raised at the end marker
             # Refused before anything was written -- a replayed or older
             # version, or a reload already open. Received all the same, or the
-            # trainer and every other rank wait in the next broadcast; and
-            # fenced like any failure, since this rank cannot tell whether its
-            # peers took the stream.
+            # trainer and every other rank wait in the next broadcast. Not
+            # aborted on the way out: a reload already open is its caller's to
+            # finish, and the weights are as the refusal found them.
             failure = exc
             logger.error(
                 "RDMA weight stream v%d refused on this rank, receiving it "
@@ -180,20 +184,30 @@ def receive_weight_stream(
                         f"payload_bytes={payload_bytes}, both must be 0"
                     )
                 break
-            if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
-                # Unlike a bad bucket, this cannot be drained: without sizes
-                # there is no telling what the sender broadcasts next.
+            if metadata_bytes < 0 or payload_bytes < 0:
+                # The one frame that cannot be drained: there is no buffer of a
+                # negative size to post, so no staying in step with the sender.
                 raise RuntimeError(
                     f"invalid RDMA weight header: command={command} "
                     f"metadata_bytes={metadata_bytes} payload_bytes={payload_bytes}"
                 )
 
+            # Every frame but the end marker is followed by these two
+            # broadcasts, so they are received before the frame is judged: one
+            # this rank cannot use still has to keep it in step.
             metadata_tensor = torch.empty(
                 metadata_bytes, dtype=torch.uint8, device=device
             )
             payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
             dist.broadcast(metadata_tensor, src=0, group=group)
             dist.broadcast(payload, src=0, group=group)
+            if failure is None and (
+                command != _CMD_BUCKET or metadata_bytes == 0 or payload_bytes == 0
+            ):
+                failure = RuntimeError(
+                    f"invalid RDMA weight header: command={command} "
+                    f"metadata_bytes={metadata_bytes} payload_bytes={payload_bytes}"
+                )
             if failure is not None:
                 drained += 1
                 continue
@@ -233,9 +247,10 @@ def receive_weight_stream(
         # commit has declared the version good.
         torch.cuda.synchronize(device)
     except Exception as exc:
-        # Fence before re-raising: the parameters are now a mix of versions, so
-        # serving must stop until a later full reload succeeds.
-        runner.abort_weight_update(expected_version, exc)
+        if began:
+            # Fence before re-raising: the parameters are now a mix of
+            # versions, so serving must stop until a later full reload succeeds.
+            runner.abort_weight_update(expected_version, exc)
         raise
 
     elapsed = time.perf_counter() - started
