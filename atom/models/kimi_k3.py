@@ -55,6 +55,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
+from atom.models.kimi_k3_mono import KimiMonoDecode
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -1819,6 +1820,11 @@ class KimiLinearForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._mono = KimiMonoDecode(
+            self,
+            atom_config,
+            envs.ATOM_NATIVE_DECODE_MONOKERNEL,
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -1830,6 +1836,14 @@ class KimiLinearForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        self._mono.prepare()
+        if self._mono.supports(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
