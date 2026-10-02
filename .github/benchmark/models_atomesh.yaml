@@ -910,10 +910,10 @@ models:
             source:
               sha: 0d914cea5eead4425a8f2b71dfc51a4ddecbe7c6
         - <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-main-grouping-range-tcp0-dspark3-tp8-dcp8-eager
+          name: kimi-k3-gsm8k-main-grouping-range-heartbeat-dspark3-tp8-dcp8-eager
           vllm:
             source:
-              sha: e94ba66fca8f4a3ad74c366c31596ce43a2b8072
+              sha: 87c4e9a53ad3b45466f48e120e4b5692e5f60ca9
     accuracy:
       task: gsm8k
       fewshot: 5
