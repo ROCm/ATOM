@@ -45,13 +45,45 @@ def test_a_resumed_request_resets_even_if_it_was_reserved():
     assert slot in reset
 
 
-def test_a_reservation_never_evicts_a_live_tenant():
+def test_a_reservation_never_evicts_a_request_in_the_current_batch():
+    """Two tenants in one slot is the failure this prevents.
+
+    Observed on hardware as `_report_stale_state` refusing two requests whose
+    positions straddled one cursor by a token each -- they were sharing a slot.
+    """
     allocator = StateSlotAllocator(2)
-    held = {key: allocator.reserve(key) for key in ("a", "b")}
-    # The pool is full of reservations; a third must not quietly take one of
-    # their slots and leave two requests pointing at the same bytes.
-    allocator.reserve("c")
-    assert allocator.reserve("a") == held["a"] or allocator.reserve("b") == held["b"]
+    allocator.assign(["live0", "live1"], [100, 100])
+    live = {k: allocator.slot_for(k) for k in ("live0", "live1")}
+    # No room: both slots belong to the batch. Refusing is the only safe
+    # answer -- taking one anyway puts two requests on one ring.
+    assert allocator.reserve("newcomer") is None
+    assert allocator.slot_for("live0") == live["live0"]
+    assert allocator.slot_for("live1") == live["live1"]
+
+
+def test_a_reservation_recycles_a_finished_request_s_slot():
+    """The pool must not look full just because it remembers old requests.
+
+    A finished request's entry survives in the key table until its slot is
+    recycled. Counting those as live is what made `_acquire` find no victim
+    after `num_slots` requests and fall back to slot 0 -- handing a live
+    request's slot to a second tenant.
+    """
+    allocator = StateSlotAllocator(2)
+    allocator.assign(["done0", "done1"], [100, 100])
+    allocator.assign(["live"], [100])  # done0/done1 are gone from the batch
+    live_slot = allocator.slot_for("live")
+    # One finished request's slot is recyclable; the other slot is the batch's.
+    first = allocator.reserve("new0")
+    assert first is not None and first != live_slot
+    assert allocator.reserve("new1") is None, "a reservation evicted the batch"
+
+
+def test_reservations_do_not_evict_each_other():
+    allocator = StateSlotAllocator(4)
+    slots = [allocator.reserve(f"r{i}") for i in range(4)]
+    assert len(set(slots)) == 4
+    assert allocator.reserve("one-too-many") is None
 
 
 def test_releasing_returns_the_slot_to_the_pool():

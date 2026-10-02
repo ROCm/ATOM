@@ -1104,7 +1104,20 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # reporting it as freshly allocated: that report means "reset
                 # me", which would zero the bytes this load is about to write.
                 slot = self._v41_slots.reserve(load.req_id)
-                load = replace(load, block_ids=(int(slot),))
+                if slot is None:
+                    # Every slot belongs to the batch or to another parked
+                    # request. Submit the load with no destination: the tier
+                    # fails it without touching the device, `_join_kda`
+                    # invalidates the blocks the dense half filled, and the
+                    # request recomputes. The alternative -- restoring into
+                    # someone else's slot -- is two requests on one ring.
+                    logger.warning(
+                        "ATOM LMCache offload: no free V4.1 state slot for %s; "
+                        "declining the restore so it recomputes",
+                        load.req_id,
+                    )
+                else:
+                    load = replace(load, block_ids=(int(slot),))
             self._kda_expect.add(load.req_id)
             tier.submit_load(load)
 
