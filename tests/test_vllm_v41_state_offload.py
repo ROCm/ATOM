@@ -204,18 +204,17 @@ def test_a_boundary_past_the_hashed_prefix_is_skipped():
     assert planner.stats()["sweep_no_hash"] == 1
 
 
-def test_worker_refusals_land_in_the_planner_s_stats():
-    """The cursor guard and the ring live in the worker; the counters do not.
+def test_a_refused_snapshot_closes_the_quorum_as_a_failure():
+    """A store the worker refused will never report, so it rides back failed.
 
-    A reader asking why this leg stored nothing has one place to look, and a
-    refused op leaves the pending set -- no rank will report on it, so a
-    quorum waiting for one would never close.
+    Anything else leaves the boundary pending for the life of the process --
+    and, worse, leaves it unclaimed-but-not-disowned.
     """
-    planner, views = make_planner(), FakeViews()
+    planner, views = make_planner(world_size=1), FakeViews()
     store, = sweep(planner, views, INTERVAL)
-    planner.note_worker_refusals({"cursor_mismatch": [store.op_id]})
-    assert planner.stats()["cursor_mismatch"] == 1
+    planner.absorb_reports({}, {store.op_id: 1})
     assert store.op_id not in planner._pending_stores
+    assert not planner._index.could_serve(store.prefix_hash)
 
 
 def test_two_requests_over_one_prefix_store_it_once():

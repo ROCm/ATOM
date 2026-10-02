@@ -34,6 +34,7 @@ reports a load finished once both halves have landed.
 
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -210,6 +211,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     _is_deepseek_v41 = False
     _v41_cache = None
     _v41_slots = None
+    _v41_planner = None
+    _v41_views = None
+    _v41_leg = None
+    # Immutable on the class so a borrowed instance reads an empty one rather
+    # than sharing a list; the V4.1 path always has `__init__`'s own.
+    _v41_refusals = ()
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
         # kv_cache_config is required of out-of-tree v1 connectors: the factory
@@ -307,11 +314,21 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # into the boundary page. Recording the fence in `start_load_kv`
         # copies the page before that write.
         self._pending_kda_stores: list = []
+        # `(reason, op_id)` the worker refused to snapshot, echoed back so the
+        # scheduler's counters -- the one place a reader looks -- say why.
+        self._v41_refusals: list = []
+        self._v41_refusal_counts: dict = {}
         # No-forward steps never call `wait_for_save`. Nothing writes the
         # boundary page on those steps, so `get_finished` may flush instead.
         self._kda_flush_stores_in_get_finished = False
         # Scheduler half of the recurrent leg.
         self._kda_planner = None
+        # DeepSeek-V4.1's per-request CSA2 state. Scheduler half decides the
+        # boundaries; worker half owns the bytes. Both stay None on every
+        # other model.
+        self._v41_planner = None
+        self._v41_views = None
+        self._v41_leg = None
         self._state_load_failure_reports: dict[str, int] = {}
         # vLLM Request objects for the requests this connector has seen. The
         # recurrent key is derived from `request.block_hashes`, and a boundary
@@ -361,6 +378,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
                 self._scheduler = DenseOffloadScheduler(self._config)
             self._init_kda_planner(vllm_config, kv_cache_config)
+            self._init_v41_planner(vllm_config, kv_cache_config)
 
             # This process is the one that runs vLLM's scheduler, and the
             # recompute path it takes when this connector reports a failed
@@ -541,6 +559,38 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return others[0]
 
+    def _init_v41_planner(self, vllm_config, kv_cache_config) -> None:
+        """Stand up the scheduler half of V4.1's STATE leg."""
+        if not self._is_deepseek_v41:
+            return
+        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+        from .v41_state import DEFAULT_STATE_INTERVAL, V41BoundaryPlanner
+
+        _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+        extra = self._config.kv_transfer_config.get("kv_connector_extra_config") or {}
+        interval = int(
+            extra.get("atom.offload.v41.state_interval", DEFAULT_STATE_INTERVAL)
+        )
+        self._v41_planner = V41BoundaryPlanner(
+            hash_block_size=int(hash_block_size),
+            chunk_size=int(self._scheduler.chunk_size),
+            state_interval=interval,
+            max_num_batched_tokens=int(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            ),
+            world_size=self._world_size,
+        )
+        self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
+        logger.info(
+            "ATOM LMCache offload: V4.1 state leg on (interval=%d, "
+            "hash_block=%d, chunk=%d, world=%d)",
+            interval,
+            int(hash_block_size),
+            int(self._scheduler.chunk_size),
+            self._world_size,
+        )
+
     def _init_kda_planner(self, vllm_config, kv_cache_config) -> None:
         """Stand up the scheduler half of the recurrent leg, if there is one."""
         if not self._mamba_groups:
@@ -691,7 +741,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # those exist until the call above has run. Skipped entirely when the
         # state rides the PAGE object -- there is then no second engine, no
         # second pool and no leg of its own to drive.
-        if not self._state_rides_mp:
+        if self._is_deepseek_v41:
+            self._init_v41_state_tier()
+        elif not self._state_rides_mp:
             self._init_kda_tier(per_group, list(groups))
         logger.info(
             "ATOM LMCache offload: registered %d layers, num_blocks=%d "
@@ -926,6 +978,54 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return tensors, num_blocks, int(planes[0][1].shape[0])
 
+    def _init_v41_state_tier(self) -> None:
+        """Stand up the worker half of V4.1's STATE leg.
+
+        Built like the recurrent tier beside it and for the same reason: the
+        image is one whole entry, so it needs staging sized to that rather
+        than the KV path's chunk-sized buffer, which would fail every transfer
+        at `ensure_buffer`.
+        """
+        if not self._is_deepseek_v41 or self._v41_cache is None:
+            return
+        from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
+        from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+
+        from .kda_state import KdaStateTier
+        from .v41_state import V41StateViews, V41StateWorkerLeg
+
+        extra = self._config.kv_transfer_config.get("kv_connector_extra_config") or {}
+        depth = int(extra.get("atom.offload.v41.state_stage_depth", 8))
+        views = V41StateViews(self._v41_cache, stage_depth=depth)
+        gpu_connector = self._worker._engine.gpu_connector
+        meta = self._worker._lmcache_metadata
+        staged = StagedTransfer(
+            gpu_connector.device,
+            staging_buffer_bytes=views.entry_bytes,
+            release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
+        )
+        codec = StateByteCodec(
+            views,
+            staged,
+            views.entry_bytes,
+            model_name=meta.model_name,
+            world_size=int(meta.world_size),
+            worker_id=int(meta.worker_id),
+            layout_id=views.layout_id,
+        )
+        codec.bind_storage_manager(self._worker._engine.storage_manager)
+        self._v41_views = views
+        self._kda_tier = KdaStateTier(codec, thread_name_prefix="atom-v41")
+        self._v41_leg = V41StateWorkerLeg(views, self._kda_tier, self._v41_slots)
+        logger.info(
+            "ATOM LMCache offload: V4.1 state tier up, entry=%d B, slots=%d, "
+            "staging depth=%d (%.1f MiB)",
+            views.entry_bytes,
+            views.num_slots,
+            views.stage_depth,
+            views.entry_bytes * views.stage_depth / (1 << 20),
+        )
+
     def _init_kda_tier(
         self, per_group: list[dict[str, "torch.Tensor"]], groups: list[Any]
     ) -> None:
@@ -997,6 +1097,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if tier is None:
             return
         for load in getattr(metadata, "kda_loads", None) or ():
+            if self._is_deepseek_v41:
+                # The destination is a state slot, and a parked request has no
+                # batch row yet -- `assign` has never seen it. Reserving binds
+                # one now and, critically, keeps the following `assign` from
+                # reporting it as freshly allocated: that report means "reset
+                # me", which would zero the bytes this load is about to write.
+                slot = self._v41_slots.reserve(load.req_id)
+                load = replace(load, block_ids=(int(slot),))
             self._kda_expect.add(load.req_id)
             tier.submit_load(load)
 
@@ -1019,6 +1127,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._pending_kda_stores = []
         if tier is None or not stores:
             return
+        if self._is_deepseek_v41:
+            # The snapshot has to happen here rather than in the tier: it reads
+            # the live slot, so it must be ordered on the compute stream
+            # between the forward that wrote it and the one that overwrites it.
+            refused = self._v41_leg.snapshot_and_submit(stores)
+            if refused:
+                self._v41_refusals.extend(
+                    (reason, op_id)
+                    for reason, op_ids in refused.items()
+                    for op_id in op_ids
+                )
+            return
         ready_event = None
         if torch.cuda.is_available():
             ready_event = torch.cuda.Event()
@@ -1037,6 +1157,25 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         tier = self._kda_tier
         stored, store_failed = tier.take_store_reports()
+        if self._v41_refusals:
+            # A store this rank refused to snapshot is a store that will never
+            # report, so it rides back as this rank's failure. Without it the
+            # quorum waits for a report that cannot come and the boundary stays
+            # pending for the life of the process. The reason stays in the
+            # worker's own counters; what the scheduler needs here is only that
+            # the boundary must not be claimed.
+            refusals, self._v41_refusals = self._v41_refusals, []
+            for reason, op_id in refusals:
+                store_failed[op_id] = store_failed.get(op_id, 0) + 1
+                self._v41_refusal_counts[reason] = (
+                    self._v41_refusal_counts.get(reason, 0) + 1
+                )
+            logger.info(
+                "ATOM LMCache offload: V4.1 state leg refused %d snapshot(s) "
+                "this step; totals %s",
+                len(refusals),
+                dict(sorted(self._v41_refusal_counts.items())),
+            )
         for op_id, count in stored.items():
             self._worker_state_stored[op_id] = (
                 self._worker_state_stored.get(op_id, 0) + count
@@ -1044,6 +1183,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for op_id, count in store_failed.items():
             self._worker_state_store_failed[op_id] = (
                 self._worker_state_store_failed.get(op_id, 0) + count
+            )
+        if self._v41_leg is not None:
+            # Both outcomes free the slab: a failed store has stopped reading
+            # it just as surely as a successful one.
+            self._v41_leg.release_reported(
+                list(stored.keys()) + list(store_failed.keys())
             )
         self._kda_results.update(tier.take_load_results())
 
@@ -1379,11 +1524,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # lookup is running. Armed per lookup and cleared unconditionally,
             # so a hook firing outside one has nothing stale to read.
             self._kda_planner.begin_lookup(request)
+        if self._v41_planner is not None:
+            self._v41_planner.begin_lookup(request)
         try:
             need, _ = self._scheduler.get_num_new_matched_tokens(seq)
         finally:
             if self._kda_planner is not None:
                 self._kda_planner.end_lookup()
+            if self._v41_planner is not None:
+                self._v41_planner.end_lookup()
         if need <= 0:
             return 0, False
         if not self._scheduler.should_park_for_load_after_alloc(seq):
@@ -1424,6 +1573,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 self._attn_group_id,
                 int(num_external_tokens),
                 int(self._config.kv_cache_block_size),
+            )
+        if self._v41_planner is not None and num_external_tokens > 0:
+            # The attention blocks the dense load is filling: if the state
+            # half misses, they are what has to be invalidated, or vLLM caches
+            # a prefix whose window ring never existed.
+            self._v41_planner.resolve_load(
+                request, num_total_computed, tuple(attention_blocks)
             )
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
@@ -1506,6 +1662,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         kda_loads = (
             self._kda_planner.take_loads() if self._kda_planner is not None else []
         )
+        if self._v41_planner is not None:
+            skip = set(preempted)
+            skip.update(
+                str(r)
+                for r in getattr(scheduler_output, "finished_req_ids", None) or ()
+            )
+            for req_id in skip:
+                self._v41_planner.forget_request(req_id)
+            kda_stores = list(kda_stores) + self._v41_planner.collect_frontier_stores(
+                frontiers, self._requests, skip
+            )
+            kda_loads = list(kda_loads) + self._v41_planner.take_loads()
+            self._v41_planner.log_stats()
         return AtomOffloadMetadata(
             inner,
             preempted,
@@ -1894,6 +2063,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if meta is None:
             return
         self._apply_completions(getattr(meta, "completions", None) or ())
+        if self._v41_planner is not None:
+            self._v41_planner.absorb_reports(
+                getattr(meta, "state_stored", None),
+                getattr(meta, "state_store_failed", None),
+            )
         if self._kda_planner is not None:
             # Before the loops below: a store quorum releases a pinned block and
             # publishes the boundary, and both want to be true by the time this

@@ -460,19 +460,6 @@ class V41BoundaryPlanner:
             accepted.append(V41Store(op_id, prefix_hash, req_id, frontier))
         return accepted
 
-    def note_worker_refusals(self, counts) -> None:
-        """Fold the worker's reasons for not snapshotting back into the stats.
-
-        The cursor guard and the staging ring both live in the worker, but a
-        reader looking for why this leg stored nothing looks at one place.
-        Refused ops are dropped from the pending set here: no rank will ever
-        report on them, so a quorum that waited for one would never close.
-        """
-        for reason, op_ids in (counts or {}).items():
-            for op_id in op_ids:
-                self._pending_stores.pop(int(op_id), None)
-                self._counters[reason] = self._counters.get(reason, 0) + 1
-
     def absorb_reports(self, stored, failed) -> None:
         """Fold the worker's per-rank store reports into the index.
 
