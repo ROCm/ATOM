@@ -63,6 +63,43 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             return (MLA_ROWS,)
         return ()
 
+    def get_kv_transfer_tensors(self):
+        """MLA PAGE regions plus the native checkpoint contract, for `lmcache_mp`.
+
+        K3 keeps its KDA checkpoint images in ordinary MLA PAGE units, laid out
+        by `_page_unit_regions` -- one region per MLA row, then each index
+        layer. Those are exactly the leading regions the MLA builder publishes,
+        in the same order and per-unit size, so publishing the checkpoint spec
+        and copy callback over them lets `lmcache_mp` store and restore the KDA
+        state with the KV. Without them the MP worker refuses K3 rather than
+        restoring KV under stale recurrent state.
+
+        KDA heads are TP-sharded, so every rank's image differs: STATE is never
+        TP-replicated even though the MLA KV beside it is.
+        """
+        transfer = super().get_kv_transfer_tensors()
+        if transfer is None or not self._uses_paged_checkpoints():
+            return transfer
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return transfer
+        bases, sizes = self._page_unit_regions()
+        count = len(bases)
+        published = [
+            (page.region.base_addr, page.region.unit_bytes)
+            for page in transfer.pages[:count]
+        ]
+        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+            raise RuntimeError(
+                "Kimi-K3 transfer regions do not match its checkpoint PAGE unit: "
+                f"{len(transfer.pages)} published, {count} in a unit"
+            )
+        transfer.paged_state_checkpoint_spec = spec
+        transfer.execute_paged_state_copies = self.execute_paged_state_copies
+        transfer.paged_state_region_count = count
+        transfer.native_state_tp_replication_factor = 1
+        return transfer
+
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
 

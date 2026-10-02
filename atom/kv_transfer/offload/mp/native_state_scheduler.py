@@ -6,9 +6,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -17,13 +16,12 @@ from atom.kv_transfer.disaggregation.types import (
     SaveSourceGroupId,
     StateStoreOperationId,
 )
-from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import NativeStateTransfer
-from atom.kv_transfer.offload.mp.deployment import _extra_config, _validate_mp_config
+from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     require_native_state_server,
@@ -35,8 +33,6 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 _MAX_SAVE_ATTEMPTS = 3
-
-_T = TypeVar("_T")
 
 
 @dataclass
@@ -108,18 +104,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 getattr(self._config, "kv_transfer_config", {}) or {},
                 envs.OFFLOAD_COPY_WORKERS,
             )
-            self._image_reservation_bytes = (
-                coordinator.store.spec.units_per_checkpoint
-                * coordinator.store.spec.page_unit_bytes
-            )
-            self._max_pinned_state_bytes = offcfg._strict_integer(
-                "lmcache.mp.max_pinned_state_bytes",
-                _extra_config(self._config).get(
-                    "lmcache.mp.max_pinned_state_bytes",
-                    self._max_pending_saves * self._image_reservation_bytes,
-                ),
-                minimum=self._image_reservation_bytes,
-            )
         except Exception:
             shutdown = getattr(self._mp_adapter, "shutdown", None)
             if callable(shutdown):
@@ -127,7 +111,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             raise
         self._block_manager = block_manager
         self._checkpoints = coordinator
-        self._pinned_state_bytes = 0
         self._native_saves: dict[SaveOperationId, _NativeSave] = {}
         self._native_loads: dict[LoadOperationId, _NativeLoad] = {}
         self._native_load_operations: dict[str, LoadOperationId] = {}
@@ -184,32 +167,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if previous is not None:
             return 0, False
         return super().get_num_new_matched_tokens(seq)
-
-    def _has_state_budget(self) -> bool:
-        return (
-            self._pinned_state_bytes + self._image_reservation_bytes
-            <= self._max_pinned_state_bytes
-        )
-
-    def _charge_state_image(self, acquire: Callable[[], _T | None]) -> _T | None:
-        """Charge one image to the pinned-state budget around ``acquire()``.
-
-        The charge lands before ``acquire`` takes any pin and is refunded when
-        it returns None or raises, so a refused source or reservation leaves the
-        budget as it found it. All callers run on the scheduler thread.
-        """
-        self._pinned_state_bytes += self._image_reservation_bytes
-        try:
-            result = acquire()
-        except BaseException:
-            self._refund_state_image()
-            raise
-        if result is None:
-            self._refund_state_image()
-        return result
-
-    def _refund_state_image(self) -> None:
-        self._pinned_state_bytes -= self._image_reservation_bytes
 
     def _save_frontier(self, seq: Any) -> int:
         if not getattr(seq, "has_per_req_cache", False):
@@ -269,10 +226,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         return saved
 
     def _may_emit_save(self) -> bool:
-        return (
-            len(self._save_inflight) < self._max_pending_saves
-            and self._has_state_budget()
-        )
+        return len(self._save_inflight) < self._max_pending_saves
 
     def _build_save_request(
         self, seq, saved, aligned, operation, block_ids, is_last_prefill
@@ -280,10 +234,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if not self._may_emit_save():
             return None
         prefix_hash = self._boundary_hash(seq, aligned)
-        source = self._charge_state_image(
-            lambda: self._checkpoints.acquire_checkpoint_source(
-                prefix_hash, max_inflight=self._max_pending_saves
-            )
+        source = self._checkpoints.acquire_checkpoint_source(
+            prefix_hash, max_inflight=self._max_pending_saves
         )
         if source is None:
             return None
@@ -297,12 +249,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 seq, state_operation, saved, aligned
             )
         except BaseException:
-            # Nothing was dispatched: return the lease and the budget charge
-            # the same way a settled save does, or they leak for the process
-            # lifetime (the pin is never timeout-reclaimable).
+            # Nothing was dispatched: return the lease the same way a settled
+            # save does, or it leaks for the process lifetime (the pin is never
+            # timeout-reclaimable).
             self._checkpoints.release_offload_store_source(state_operation)
             self._checkpoints.settle_offload_store(state_operation)
-            self._refund_state_image()
             raise
         return request
 
@@ -322,7 +273,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # milestone proves the server has finished reading the STATE groups.
         self._checkpoints.release_offload_store_source(lease.source)
         self._checkpoints.settle_offload_store(lease.source)
-        self._refund_state_image()
         sid = str(operation.req_id)
         if succeeded:
             self._save_failures.pop(sid, None)
@@ -369,14 +319,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if lease.seq is seq:
                 return decision
             return False, "native_load_id_busy", hbm, lmc, need, chunk
-        if not self._has_state_budget():
-            return False, "native_state_budget", hbm, lmc, need, chunk
         prefix_hash = self._boundary_hash(seq, lmc)
         operation = LoadOperationId(seq.id, self._load_nonce)
         self._load_nonce += 1
-        units = self._charge_state_image(
-            lambda: self._checkpoints.reserve_transfer_units(operation)
-        )
+        # No byte budget on top of the PAGE pool: one load per request bounds
+        # these by the admitted batch, and a pool without room for an image
+        # refuses here. A refusal recomputes the prefix, which costs far more
+        # than the image's few PAGE units, and a completed image is adopted as
+        # a READY checkpoint that later hits reuse.
+        units = self._checkpoints.reserve_transfer_units(operation)
         if units is None:
             return False, "native_state_units", hbm, lmc, need, chunk
         local_restore = None
@@ -399,7 +350,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
             if local_restore is not None:
                 self._checkpoints.resume_suspended_restore(local_restore)
             self._checkpoints.release_transfer_units(operation)
-            self._refund_state_image()
             raise
         self._native_load_operations[sid] = operation
         self._active_load_operations[sid] = (seq, operation)
@@ -430,7 +380,6 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if lease is not None:
             if release_units:
                 self._checkpoints.release_transfer_units(operation)
-            self._refund_state_image()
             sid = str(operation.req_id)
             if self._native_load_operations.get(sid) == operation:
                 del self._native_load_operations[sid]

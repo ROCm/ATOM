@@ -612,8 +612,8 @@ class PageUnitCheckpointStore:
     ) -> tuple[StateStoreOperationId, tuple[int, ...]] | None:
         """Lease the existing READY image for an admitted external transfer.
 
-        The caller must finish scheduler admission and reserve its transfer
-        byte budget before acquiring this source. A lease pins the image's
+        The caller must finish scheduler admission before acquiring this
+        source. A lease pins the image's
         existing PAGE units; it neither copies an Active Slot nor queues a
         checkpoint. Missing, COPYING, or already dispatched hashes return
         None, as does a full optional operation limit. The limit includes
@@ -1075,9 +1075,8 @@ class PagedStateCheckpointCoordinator:
 
         `owner` must uniquely identify this transfer attempt, including its
         generation. Duplicate active owners and insufficient available units
-        are refused. The caller reserves its byte budget before this call and
-        releases these units only after both the transfer and restore stop
-        using them. No checkpoint is published and no Active Slot is touched.
+        are refused. The caller releases these units only after both the
+        transfer and restore stop using them. No checkpoint is published and no Active Slot is touched.
         """
         if owner is None:
             raise ValueError("a transfer reservation needs an owner")

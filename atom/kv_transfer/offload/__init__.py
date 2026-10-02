@@ -40,4 +40,7 @@ KVConnectorFactory.register(
     scheduler_class="LMCacheMPConnectorScheduler",
     aliases=("LMCacheMPConnector",),
     requires_pd_staging=False,
+    # Groups regions by per-block shape and copies whole blocks, so a layer may
+    # publish extra planes (the FP4 indexer's e8m0 scale) as more regions.
+    copies_whole_block_regions=True,
 )

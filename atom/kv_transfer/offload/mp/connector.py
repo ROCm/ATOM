@@ -98,6 +98,12 @@ class LMCacheMPConnector(KVConnectorBase):
         impl.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
         self._impl = impl
 
+    def close(self) -> None:
+        # Explicit rather than through `__getattr__`, which cannot answer
+        # before registration: `ModelRunner.exit` asks every connector.
+        if self._impl is not None:
+            self._impl.close()
+
     def start_load_kv(self, metadata: Any) -> None:
         self._require_impl().start_load_kv(metadata)
 
