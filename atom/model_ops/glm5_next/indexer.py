@@ -77,8 +77,17 @@ def _kpool_write_completed_pools(
         read_slots = state_slot_idx if state_slot_idx_in is None else state_slot_idx_in
         safe_slots = read_slots[req_idx].clamp_min(0)
         stash = tail_cache[safe_slots]
-        pool_k = torch.where(from_tail[..., None], stash[:, 0], pool_k)
-        pool_gate = torch.where(from_tail[..., None], stash[:, 1], pool_gate)
+        # The tail holds position `p` at row `p % ROWS`; ROWS exceeds the pool
+        # size when it doubles as the speculative history ring.
+        stash_rows = (abs_slot.clamp_min(0) % stash.shape[-2])[..., None].expand(
+            -1, -1, stash.shape[-1]
+        )
+        pool_k = torch.where(
+            from_tail[..., None], stash[:, 0].gather(1, stash_rows), pool_k
+        )
+        pool_gate = torch.where(
+            from_tail[..., None], stash[:, 1].gather(1, stash_rows), pool_gate
+        )
 
     pooled = kpool.pool_and_rotate(pool_k, pool_gate, compress_ape)
     abs_pos = positions.to(torch.int64)
@@ -171,6 +180,7 @@ def _sparse_attn_indexer_kpool(
             topk_tokens,
             topk_out_width,
             get_current_atom_config().kv_cache_block_size,
+            max_model_len,
             scale_fmt,
             stable_topk,
         )
