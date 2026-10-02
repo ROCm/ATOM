@@ -16,6 +16,7 @@ import functools
 import logging
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -157,7 +158,7 @@ def test_validate_refuses_keys_mooncake_never_sees(store_env, key):
         l2.validate_mooncake_store_config(_cfg(extra_config=_valid_extra(**{key: "v"})))
 
 
-def test_prepare_pins_one_nic_and_installs_both_patches(store_env, monkeypatch):
+def test_prepare_pins_one_nic_and_installs_every_patch(store_env, monkeypatch):
     calls = []
     fake_torch = SimpleNamespace(cuda=SimpleNamespace(current_device=lambda: 2))
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -168,17 +169,20 @@ def test_prepare_pins_one_nic_and_installs_both_patches(store_env, monkeypatch):
     monkeypatch.setattr(
         l2, "install_batch_is_exist_lookup", lambda: calls.append("lookup")
     )
+    monkeypatch.setattr(
+        l2, "install_non_blocking_l2_get_allocation", lambda: calls.append("get")
+    )
     monkeypatch.setattr(l2, "_require_thp_allowed", lambda: calls.append("prctl"))
     cfg = _cfg()
     l2.prepare_mooncake_store_l2(cfg)
     assert cfg.extra_config["mooncake_rdma_devices"] == "rdma2"
-    assert calls == ["prctl", 2, "thp", "lookup"]
+    assert calls == ["prctl", 2, "thp", "lookup", "get"]
 
     calls.clear()
     tcp = _cfg(extra_config=_valid_extra(mooncake_protocol="tcp"))
     l2.prepare_mooncake_store_l2(tcp)
     assert "mooncake_rdma_devices" not in tcp.extra_config
-    assert calls == ["prctl", "thp", "lookup"]
+    assert calls == ["prctl", "thp", "lookup", "get"]
 
 
 def test_prepare_validates_before_it_patches(store_env, monkeypatch):
@@ -543,8 +547,18 @@ def _fake_connector_modules(monkeypatch, upstream_batched=False):
             raise NotImplementedError
 
     class MooncakestoreConnector(RemoteConnector):
-        def __init__(self, store):
+        """The f22dec28 zero-copy get: one CPU-pool buffer per key, then a read."""
+
+        def __init__(self, store, local_cpu_backend=None):
             self.store = store
+            self.local_cpu_backend = local_cpu_backend
+
+        async def batched_get(self, keys):
+            memory_objs = [
+                self.local_cpu_backend.allocate("shapes", "dtypes", "fmt") for _ in keys
+            ]
+            await asyncio.sleep(0)  # batch_get_into runs in a worker thread
+            return memory_objs
 
     if upstream_batched:
         MooncakestoreConnector.support_batched_contains = lambda self: True
@@ -592,6 +606,97 @@ def test_install_batch_is_exist_lookup_keeps_an_upstream_implementation(monkeypa
 def test_parse_device_list():
     assert l2.parse_device_list(" rdma0, ,rdma1,") == ["rdma0", "rdma1"]
     assert l2.parse_device_list("") == []
+
+
+# --- L2 gets without waiting for L1 room -------------------------------------
+
+
+class _CpuPool:
+    """LMCache's LocalCPUBackend.allocate: busy-waits for room unless told not to."""
+
+    def __init__(self, free, give_up_after_s=2.0):
+        self.free = free
+        self.calls = []
+        self.memory_allocator = object()
+        self._give_up_after_s = give_up_after_s
+
+    def allocate(self, shapes, dtypes, fmt=None, eviction=True, busy_loop=True):
+        self.calls.append((eviction, busy_loop))
+        deadline = time.monotonic() + self._give_up_after_s
+        while self.free == 0:
+            # LMCache sleeps without yielding the event loop it runs on; the
+            # deadline only keeps a regression from hanging the test session.
+            if not busy_loop or time.monotonic() > deadline:
+                return None
+            time.sleep(0.01)
+        self.free -= 1
+        return object()
+
+
+def test_allocate_without_waiting_ends_the_batch_at_the_first_failure():
+    pool = _CpuPool(free=2)
+    view = l2._AllocateWithoutWaiting(pool)
+    view.start_batch()
+    allocated = [view.allocate("s", "d", "f") for _ in range(4)]
+    assert [obj is not None for obj in allocated] == [True, True, False, False]
+    # Eviction stays on; the third allocation found no room and ended the batch.
+    assert pool.calls == [(True, False)] * 3
+    pool.free = 1
+    view.start_batch()
+    assert view.allocate("s", "d", "f", busy_loop=True) is not None
+    assert pool.calls[-1] == (True, False)
+    assert view.memory_allocator is pool.memory_allocator
+
+
+def test_install_non_blocking_l2_get_allocation(monkeypatch):
+    connector_cls = _fake_connector_modules(monkeypatch)
+    l2.install_non_blocking_l2_get_allocation()
+    patched = connector_cls.batched_get
+    l2.install_non_blocking_l2_get_allocation()
+    assert connector_cls.batched_get is patched
+
+    pool = _CpuPool(free=2)
+    connector = connector_cls(store=None, local_cpu_backend=pool)
+    got = asyncio.run(connector.batched_get([_Key(f"k{i}") for i in range(4)]))
+    assert [obj is not None for obj in got] == [True, True, False, False]
+    assert pool.calls == [(True, False)] * 3
+    view = connector.local_cpu_backend
+    assert isinstance(view, l2._AllocateWithoutWaiting)
+
+    # The next get is a new batch, and the connector keeps one view.
+    pool.free = 1
+    got = asyncio.run(connector.batched_get([_Key("k0")]))
+    assert got[0] is not None
+    assert connector.local_cpu_backend is view
+
+
+def test_l2_get_on_a_full_l1_leaves_the_loop_to_the_put_that_frees_it(monkeypatch):
+    """The pit2-p03-g40 hang: the get waited on the loop the freeing put needs."""
+    connector_cls = _fake_connector_modules(monkeypatch)
+    l2.install_non_blocking_l2_get_allocation()
+    pool = _CpuPool(free=0, give_up_after_s=10.0)
+    connector = connector_cls(store=None, local_cpu_backend=pool)
+
+    async def finish_put():
+        pool.free += 1  # the put's on_complete drops its L1 reference
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        get = asyncio.run_coroutine_threadsafe(
+            connector.batched_get([_Key("k0")]), loop
+        )
+        put = asyncio.run_coroutine_threadsafe(finish_put(), loop)
+        started = time.monotonic()
+        assert get.result(timeout=5) == [None]
+        put.result(timeout=5)
+        assert time.monotonic() - started < 1.0
+        assert pool.free == 1
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
 
 
 # --- wiring into the engine build ------------------------------------------

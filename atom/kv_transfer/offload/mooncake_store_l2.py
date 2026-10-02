@@ -34,6 +34,15 @@ because each of the following fails silently or hangs otherwise:
   ``contains``, so a lookup asked the master once per chunk on the
   scheduler's synchronous path: 25-58 ms for 640-1280 chunks, against
   0.4-1 ms for one ``batch_is_exist``.
+* **L2 gets never wait for room in the L1.** The connector's batched get
+  allocates its L1 buffers on LMCache's storage event loop, busy-waiting until
+  eviction makes room; that loop is also the thread that finishes the
+  write-through puts whose L1 references block the eviction. On
+  pit2-p03-g40 (8 GiB L1 per stage, agentic 1M traces at 16 sessions) three
+  of four stages' loops spun there for good within 3 minutes, and every later
+  L2 put and get of those workers hung. A get now takes what eviction frees at
+  once and treats the rest of the batch as missing; LMCache keeps the prefix
+  up to the first missing chunk, and the scheduler recomputes the rest.
 * **Recipe checks.** Settings that LMCache or Mooncake ignore without a word,
   or whose wrong value only shows up as a corrupt or leaked object under load,
   are refused at startup.
@@ -122,7 +131,7 @@ def uses_mooncake_store(cfg: Any) -> bool:
 
 
 def prepare_mooncake_store_l2(cfg: Any) -> None:
-    """Validate the recipe, give this rank its NIC, patch LMCache's L1 and lookup.
+    """Validate the recipe, give this rank its NIC, patch LMCache's L1, lookup and get.
 
     Runs in each worker before its LMCache engine is built, since building it
     allocates the L1 pool and registers it with Mooncake.
@@ -145,9 +154,10 @@ def prepare_mooncake_store_l2(cfg: Any) -> None:
         extra["mooncake_rdma_devices"] = device
     install_thp_pinned_allocator()
     install_batch_is_exist_lookup()
+    install_non_blocking_l2_get_allocation()
     logger.info(
         "LMCache Mooncake Store L2: protocol=%s rdma_devices=%s, THP pinned L1, "
-        "one batch_is_exist RPC per lookup",
+        "one batch_is_exist RPC per lookup, L2 gets without waiting for L1 room",
         protocol,
         device or "-",
     )
@@ -796,3 +806,77 @@ def install_batch_is_exist_lookup() -> None:
             return
         MooncakestoreConnector.support_batched_contains = _supports_batched_contains
         MooncakestoreConnector.batched_contains = _batched_contains_by_batch_is_exist
+
+
+# ---------------------------------------------------------------------------
+# L2 gets that never wait for room in the L1
+# ---------------------------------------------------------------------------
+
+
+class _AllocateWithoutWaiting:
+    """LMCache's CPU backend as the Mooncake connector's gets see it.
+
+    ``LocalCPUBackend.allocate`` busy-waits by default until eviction frees
+    enough of the L1. The connector's batched get allocates on LMCache's
+    storage event loop, which is also where the write-through puts finish and
+    drop the L1 references that keep their chunks from being evicted: once the
+    in-flight puts and the pinned chunks fill the L1, the loop waits for itself
+    forever, and every later put and get of the worker hangs behind it.
+
+    Here an allocation evicts what it can and otherwise returns None, and after
+    one fails the rest of the batch is not allocated at all: LMCache keeps a
+    retrieved prefix only up to the first missing chunk, so a later buffer
+    would only evict L1 chunks to read data that is thrown away.
+    """
+
+    def __init__(self, backend: Any) -> None:
+        self._backend = backend
+        self._batch_failed = False
+
+    def start_batch(self) -> None:
+        self._batch_failed = False
+
+    def allocate(self, shapes, dtypes, fmt=None, eviction=True, busy_loop=True):
+        del busy_loop  # never: the caller is LMCache's storage event loop
+        if self._batch_failed:
+            return None
+        memory_obj = self._backend.allocate(
+            shapes, dtypes, fmt, eviction=eviction, busy_loop=False
+        )
+        if memory_obj is None:
+            self._batch_failed = True
+        return memory_obj
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._backend, name)
+
+
+def install_non_blocking_l2_get_allocation() -> None:
+    """Make the Mooncake connector's gets give up on a full L1 instead of waiting.
+
+    Wraps ``MooncakestoreConnector.batched_get``, its only get entry point:
+    each call starts a new batch for the connector's
+    :class:`_AllocateWithoutWaiting` view of the CPU backend, created on first
+    use. The allocations of a batch run before its first ``await``, so no other
+    coroutine on the loop interleaves with them. Process-wide and idempotent.
+    """
+    from lmcache.v1.storage_backend.connector.mooncakestore_connector import (
+        MooncakestoreConnector,
+    )
+
+    with _install_lock:
+        upstream = MooncakestoreConnector.batched_get
+        if getattr(upstream, "_atom_without_waiting", False):
+            return
+
+        @functools.wraps(upstream)
+        async def batched_get(self, keys):
+            backend = self.local_cpu_backend
+            if not isinstance(backend, _AllocateWithoutWaiting):
+                backend = _AllocateWithoutWaiting(backend)
+                self.local_cpu_backend = backend
+            backend.start_batch()
+            return await upstream(self, keys)
+
+        batched_get._atom_without_waiting = True
+        MooncakestoreConnector.batched_get = batched_get
