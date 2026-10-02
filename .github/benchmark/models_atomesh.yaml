@@ -773,6 +773,20 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 176
 
+        # Upper edge of one prefill node. Extrapolated from statecap-c72
+        # (rho 0.66, decode bs p90 76): rho ~0.88 and decode bs ~100 here.
+        - <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c96
+          concurrency: [96]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 192
+
         - <<: *kimi_k3_agentic_statecap
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c88
           concurrency: [88]
@@ -880,6 +894,17 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 512
+
+        # Past one prefill node (~14k uncached tok/s, rho ~0.88 by C96): two
+        # prefill nodes with JIT warmup and the state-tier fix on both.
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 256
+          env: *kimi_k3_agentic_statecap_env
 
     accuracy:
       task: gsm8k
