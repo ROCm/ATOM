@@ -353,3 +353,32 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     assert scheduler.model_name == worker.model_name
     assert scheduler.worker_id == 0
     assert worker.worker_id == 3
+
+
+def test_page_namespace_survives_a_worker_normalising_hf_config():
+    """Scheduler and worker must hash the same geometry.
+
+    A worker normalises `hf_config` while it builds the model (Kimi-K3 derives
+    `head_dim`); the scheduler never builds it. Hashing the live config gave
+    them different namespaces, and every `lmcache_mp` lookup missed. `Config`
+    snapshots the geometry before the config reaches either process.
+    """
+    import copy
+
+    shipped = _config()
+    shipped.hf_config.head_dim = None
+    shipped.offload_page_hf_geometry = offcfg.snapshot_page_hf_geometry(
+        shipped.hf_config
+    )
+    scheduler, worker = copy.deepcopy(shipped), copy.deepcopy(shipped)
+    worker.hf_config.head_dim = 192  # what `_normalize_kimi_config` writes
+
+    assert offcfg.build_page_namespace(
+        scheduler, _lmcache_config(), 4
+    ) == offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+    # Without the snapshot the two diverge -- the bug this guards against.
+    del scheduler.offload_page_hf_geometry, worker.offload_page_hf_geometry
+    assert offcfg.build_page_namespace(
+        scheduler, _lmcache_config(), 4
+    ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)

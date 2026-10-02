@@ -93,9 +93,7 @@ class DraftAttention(Attention):
             step,
             self.softmax_scale,
         )
-        return self._project_out(
-            rotate_rows(rope, output, step.positions, inverse=True)
-        )
+        return self._project_out(output, rope, step.positions)
 
 
 class DraftBlock(Block):
@@ -272,9 +270,13 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 )
                 cache.write_window(attention.spec.layer_id, keys, step)
             return
-        weight, weight_scale, group_rows, width = fused
+        weight, weight_scale, group_rows, width, preshuffled = fused
         kv = native_quant_linear(
-            hidden, weight, weight_scale, weight_group_rows=group_rows
+            hidden,
+            weight,
+            weight_scale,
+            weight_group_rows=group_rows,
+            weight_preshuffled=preshuffled,
         ).unflatten(-1, (len(layers), width))
         tail = self._draft_kv_tail_fusion()
         if tail is None:
@@ -354,20 +356,28 @@ class DeepseekV41DSpark(DSparkDraftModel):
             self._context_kv_fused = None
             return None
         shards = [a.wkv_shard for a in layers]
-        first = shards[0]
-        shape = {(s.native_a8_group_rows, s.input_size, s.output_size) for s in shards}
-        if (
-            len(shape) != 1
-            or first.native_a8_group_rows is None
-            or any(s.bias is not None for s in shards)
-        ):
+        # One GEMM needs one layout. A (16, 16)-preshuffled weight permutes
+        # only within 16-row groups, so stages that share it concatenate into
+        # one in that layout.
+        layouts = {
+            (
+                s.native_a8_group_rows,
+                s.input_size,
+                s.output_size,
+                getattr(s.weight, "is_shuffled", False),
+            )
+            for s in shards
+        }
+        (group_rows, _, width, preshuffled), *others = layouts
+        if others or group_rows is None or any(s.bias is not None for s in shards):
             fused = None
         else:
             fused = (
                 torch.cat([s.weight for s in shards]),
                 torch.cat([s.weight_scale for s in shards]),
-                first.native_a8_group_rows,
-                first.output_size,
+                group_rows,
+                width,
+                preshuffled,
             )
         self._context_kv_fused = fused
         return fused

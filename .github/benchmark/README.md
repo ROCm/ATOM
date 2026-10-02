@@ -166,7 +166,9 @@ The flat accuracy catalogs — `models_accuracy.json`, `oot_models_accuracy.json
   `accuracy_threshold` / `accuracy_test_threshold`.
 - **Accuracy timeout**: set optional `accuracy_timeout_minutes` on a
   `models_accuracy.json` entry to override the native ATOM/atomesh accuracy
-  step timeout. If omitted, the timeout is 30 minutes.
+  eval budget. If omitted, the eval budget is 30 minutes. The native ATOM step
+  also launches the server, so its timeout is the larger of this value and 60
+  minutes; the atomesh step times out at this value alone.
 - **Known drift (tolerated for now)**: `extraArgs` vs `extra_args` and
   `accuracy_threshold` vs `accuracy_test_threshold` are both accepted; the schema
   documents the current reality. Normalizing these (and their consumers) is a

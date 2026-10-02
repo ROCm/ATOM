@@ -345,6 +345,7 @@ def validate_speculative_config(config):
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
@@ -376,7 +377,15 @@ def validate_runtime_config(config):
             or config.enable_dp_attention,
         ),
         ("TBO", config.enable_tbo or config.enable_tbo_decode),
-        ("KV transfer", bool(config.kv_transfer_config) or config.enable_rapidserve),
+        (
+            # `lmcache_mp` is the one transport admitted: it checkpoints STATE
+            # through the backend's PAGE-backed copies. P/D and in-process
+            # offload read SLOT regions and codecs this runtime does not publish.
+            "KV transfer other than lmcache_mp",
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
+            not in (None, "lmcache_mp"),
+        ),
+        ("RapidServe", config.enable_rapidserve),
         ("plugin mode", config.plugin_config is not None),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),

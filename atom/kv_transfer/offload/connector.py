@@ -177,6 +177,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def __init__(self, config) -> None:
         self._impl = _build_scheduler(config)
 
+    def bind_block_manager(self, block_manager) -> None:
+        callback = getattr(self._impl, "bind_block_manager", None)
+        if callable(callback):
+            callback(block_manager)
+
     @property
     def has_state_tier(self) -> bool:
         """True when the selected impl actually hosts the KDA state tier.
@@ -222,6 +227,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def protected_block_ids(self, seq):
         callback = getattr(self._impl, "protected_block_ids", None)
         return callback(seq) if callback is not None else None
+
+    def can_partially_deallocate_state(self, seq) -> bool:
+        callback = getattr(self._impl, "can_partially_deallocate_state", None)
+        return callable(callback) and callback(seq) is True
 
     def activate_block_leases(self, seq, block_ids) -> None:
         callback = getattr(self._impl, "activate_block_leases", None)
@@ -326,6 +335,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """
         callback = getattr(self._impl, "take_state_source_releases", None)
         return callback() if callback is not None else set()
+
+    def waits_for_transfer_report(self, seq) -> bool:
+        # In-process offload proves its copies finished, so the engine's
+        # clock-based reclaim applies unless the impl says otherwise.
+        callback = getattr(self._impl, "waits_for_transfer_report", None)
+        return bool(callback(seq)) if callback is not None else False
 
     def save_abandon_timeout_s(self) -> float:
         # Plain forward: the abstract lifecycle contract guarantees every _impl

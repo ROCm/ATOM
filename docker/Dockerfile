@@ -5,7 +5,7 @@ ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 # LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
 # LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:d3cfe74f42d78a188992cae98efbe23053610216e7b247632d6be772e9d465d6"
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
@@ -174,7 +174,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.17"
+ARG SGLANG_REF="v0.5.20"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -536,10 +536,12 @@ RUN pip install rocm-trace-lite && \
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
+# Optional Cargo features; ext-proc is excluded unless explicitly requested.
+ARG ATOM_MESH_FEATURES=""
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
@@ -560,7 +562,7 @@ RUN echo "========== Install atomesh binary ==========" && \
 # follows from the wheel name; the ABI suffix and wheel tag are the workflow's
 # ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
 # image's torch.
-ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
+ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
 RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
     echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
     set -- /tmp/lmcache-wheel/*.whl && \

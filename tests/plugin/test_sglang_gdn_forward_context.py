@@ -230,6 +230,50 @@ def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
     assert num_tokens == 2
 
 
+def test_build_context_draft_extend_uses_packed_positions(monkeypatch):
+    """DRAFT_EXTEND_V2 is not is_extend(); width is positions, not batch_size."""
+    monkeypatch.setattr(
+        attention_gdn,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(enable_dp_attention=False),
+    )
+
+    class _DraftExtend:
+        @staticmethod
+        def is_target_verify():
+            return False
+
+        @staticmethod
+        def is_draft_extend_v2():
+            return True
+
+        @staticmethod
+        def is_extend():
+            return False
+
+        @staticmethod
+        def is_prefill():
+            return False
+
+        @staticmethod
+        def is_idle():
+            return False
+
+        @staticmethod
+        def is_decode_or_idle():
+            return False
+
+    forward_batch = SimpleNamespace(
+        forward_mode=_DraftExtend(),
+        positions=torch.arange(6),
+        batch_size=2,
+    )
+    context, num_tokens = SGLangGDNForwardContext._build_context(forward_batch)
+    assert num_tokens == 6
+    assert context.is_prefill is False
+    assert context.scheduled_tokens == 6
+
+
 def test_bind_preserves_outer_attention_metadata(monkeypatch):
     slot_mapping = object()
     outer_metadata = SimpleNamespace(max_seqlen_k=128, slot_mapping=slot_mapping)
@@ -311,6 +355,7 @@ class _TemporalPool:
 def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
+    attention_gdn._PREFILL_SCHEDULES.clear()
     cfg, impl = _qwen4_flydsl_atom_config()
     impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
     monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
@@ -335,6 +380,55 @@ def test_extend_attaches_flydsl_prefill_metadata_for_qwen4(monkeypatch):
     assert metadata is not None
     assert metadata.flydsl_prefill_metadata is schedule
     assert impl.allow_aiter_flydsl
+
+
+def test_flydsl_prefill_schedule_reuses_host_lengths(monkeypatch):
+    """Same query lengths keep one schedule and do not reread the GPU offsets."""
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    attention_gdn._PREFILL_SCHEDULES.clear()
+    cfg, impl = _qwen4_flydsl_atom_config()
+    impl.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=True, decode=True)
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    calls = []
+
+    def _build(lengths, cu_seqlens):
+        calls.append(tuple(lengths))
+        return ("schedule", tuple(lengths))
+
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.build_prefill_metadata",
+        _build,
+    )
+    # GPU offsets disagree with the scheduler list. The schedule must follow
+    # the host list, so this step does not sync query_start_loc.
+    query_start_loc = torch.tensor([0, 99], dtype=torch.int32)
+    indices = torch.tensor([3], dtype=torch.int32)
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=1,
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+        extend_seq_lens_cpu=[8],
+    )
+    linear = SimpleNamespace(
+        forward_metadata=SimpleNamespace(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=indices,
+        ),
+        req_to_token_pool=_MambaPool(),
+    )
+    first = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+    second = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+    assert calls == [(8,)]
+    assert first.flydsl_prefill_metadata is second.flydsl_prefill_metadata
+    assert first.flydsl_prefill_metadata == ("schedule", (8,))
+
+    other_loc = torch.tensor([0, 8], dtype=torch.int32)
+    linear.forward_metadata.query_start_loc = other_loc
+    third = SGLangGDNForwardContext._build_gdn_metadata(forward_batch, linear)
+    assert calls == [(8,), (8,)]
+    assert third.flydsl_prefill_metadata is not first.flydsl_prefill_metadata
 
 
 def test_extend_skips_flydsl_metadata_when_prefill_disabled(monkeypatch):

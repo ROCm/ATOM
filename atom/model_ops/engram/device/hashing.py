@@ -123,8 +123,13 @@ def _engram_snapshot_kernel(
     tokens,
     padded_tokens,
     history_stride,
+    cursor_positions,
+    cursor_out,
+    cursor_slot_stride,
+    cursor_row_stride,
     NGRAM: tl.constexpr,
     BLOCK: tl.constexpr,
+    STAGE_CURSOR: tl.constexpr,
 ):
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = token < tokens
@@ -148,9 +153,29 @@ def _engram_snapshot_kernel(
             tl.where(live, source, -2),
             token < padded_tokens,
         )
+        if STAGE_CURSOR and shift < NGRAM - 1:
+            # Snapshot is newest-first; a cursor stores oldest-first history
+            # AFTER this token. Both use these same committed lookbacks.
+            tl.store(
+                cursor_out
+                + batch * cursor_slot_stride
+                + local * cursor_row_stride
+                + NGRAM
+                - 1
+                - shift,
+                source,
+                live,
+            )
+    if STAGE_CURSOR:
+        position = tl.load(cursor_positions + token - local, live, 0)
+        tl.store(
+            cursor_out + batch * cursor_slot_stride + local * cursor_row_stride,
+            position + local + 1,
+            live,
+        )
 
 
-def engram_snapshot(tables, batch, out):
+def engram_snapshot(tables, batch, out, *, cursor_positions=None, cursor_out=None):
     """Freeze lookbacks before the runner advances the committed cursor.
 
     The output has a stable address across graph buckets and replays. Only
@@ -162,6 +187,22 @@ def engram_snapshot(tables, batch, out):
         raise ValueError("Engram snapshot must cover all tokens and lookbacks")
     if not out.is_contiguous():
         raise ValueError("Engram snapshot must be contiguous")
+    stage_cursor = cursor_out is not None
+    if stage_cursor:
+        _check_plane(batch.history, tables, cursor_out)
+        if (
+            cursor_out.ndim != 3
+            or cursor_out.shape[0] < batch.history_index.numel()
+            or cursor_out.shape[-1] != tables.ngram
+            or cursor_positions is None
+            or cursor_positions.numel() < tokens
+        ):
+            raise ValueError("Engram snapshot requires per-request cursor candidates")
+        if (
+            cursor_out.untyped_storage().data_ptr()
+            == batch.history.untyped_storage().data_ptr()
+        ):
+            raise ValueError("Engram snapshot cursor candidates must not alias history")
     if out.shape[0]:
         _engram_snapshot_kernel[(triton.cdiv(out.shape[0], 128),)](
             batch.compressed,
@@ -173,8 +214,13 @@ def engram_snapshot(tables, batch, out):
             tokens,
             out.shape[0],
             batch.history.stride(0),
+            cursor_positions,
+            cursor_out,
+            cursor_out.stride(0) if stage_cursor else 0,
+            cursor_out.stride(1) if stage_cursor else 0,
             NGRAM=tables.ngram,
             BLOCK=128,
+            STAGE_CURSOR=stage_cursor,
         )
     return out
 

@@ -192,6 +192,22 @@ running image ID. Unknown values stay unknown. GPU allocation uses TP/PP/DP and
 HIP-to-PCI discovery; ambiguous subsets are not guessed from DRM numbering.
 Physical GPU IDs are evidence, not curve-group dimensions.
 
+AITER identity is read from the installed `amd-aiter` distribution. A Git
+installation records its commit from `direct_url.json` or its local source
+directory. A wheel with a clean `+g<commit>` version suffix (for example,
+`0.1.1.dev1+ga75ba53de`) records that abbreviation as `software.aiter_sha` with
+`aiter_sha_source=package_version`; it is not expanded to a guessed full SHA.
+`aiter_version` retains the exact package version, and `aiter_wheel_sha256`
+retains pip's wheel archive SHA-256 when available. Index installs may not retain
+an archive hash. A separate checkout or requested wheel pin is never substituted
+for the installed package. Unknown commit identities still fail strict validation.
+
+A successful replay with missing bundle metadata has `status=partial` and its
+original client exit code remains zero in `validation.json`. With
+`ATOM_BUNDLE_REQUIRE_FULL=1`, packaging returns exit code 2 and fails the Actions
+step, while retaining the diagnostic bundle. Nonzero client exits remain failed
+measurements even when all package identities are available.
+
 ## Files and publication
 
 ```text

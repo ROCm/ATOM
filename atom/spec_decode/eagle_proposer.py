@@ -14,6 +14,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
     pcp_round_robin_split,
 )
+from atom.model_ops.attentions.backends import PAD_SLOT_ID
 from atom.model_ops.embed_head import empty_token_ids
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_kv import draft_kv_builder
@@ -394,6 +395,37 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
+    def warmup_draft_graphs(self, build_context, stream) -> None:
+        """Warm every size from the state the target's capture left behind.
+
+        `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
+        place, and nothing between two sizes resets them -- a page-size-1 MLA
+        capture builder leaves `kv_indptr` alone. Left to accumulate, a larger
+        size's first rows carry every earlier size's increments and its tail
+        does not, so the array runs backwards: negative KV lengths into the
+        MLA work-plan build (capture sizes 1, 2, 4 already give
+        `[0, 3, 4, 3, 4]`). Restore both before each size, and once after.
+        """
+        var = self.runner.forward_vars
+        pristine = {
+            name: var[name].gpu.clone()
+            for name in ("kv_indptr", "context_lens")
+            if name in var
+        }
+
+        def restore():
+            for name, saved in pristine.items():
+                var[name].gpu.copy_(saved)
+
+        def build_pristine_context(**kwargs):
+            restore()
+            return build_context(**kwargs)
+
+        try:
+            super().warmup_draft_graphs(build_pristine_context, stream)
+        finally:
+            restore()
+
     def _step_warmup_inputs(self, running_bs, **staged):
         """Put the warmup context into the shape a mid-step sees.
 
@@ -401,6 +433,10 @@ class EagleProposer(Drafter):
         steps 1+ run one row per sequence, and every kernel they compile is
         chosen from that shape. Replaying the same rewrite serving uses is the
         point -- a warmup that built its own would warm a shape nobody asks for.
+        That is both halves `propose` runs before a mid-step:
+        `_enter_decode_metadata`, then `_advance_decode_metadata`, whose
+        `prepare_mtp_decode` swaps the target's verify-width work plan for the
+        draft's.
 
         The same goes for state the model carries: `skip_topk` is read as a
         Python branch inside the draft's attention, and `propose` turns it on
@@ -416,9 +452,22 @@ class EagleProposer(Drafter):
         # never draws.
         staged["positions"].copy_(fc.attn_metadata.context_lens[:running_bs])
         zeros = torch.zeros(running_bs, dtype=torch.int32, device=self.device)
-        self._enter_decode_metadata(
+        i0_max_seqlen_q, _ = self._enter_decode_metadata(
             running_bs, running_bs, staged["positions"], zeros.to(torch.int64), zeros
         )
+        workinfos = self._advance_decode_metadata(
+            running_bs,
+            running_bs,
+            staged["positions"],
+            i0_max_seqlen_q,
+            num_reject_tokens=zeros,
+            from_prefill=False,
+        )
+        # Serving aims the draft's KV write at a real slot; capture blanked them
+        # so the warmup forward writes nowhere. A backend that recomputed the
+        # slots just undid that, so blank them again.
+        if "slot_mapping" in workinfos:
+            workinfos["slot_mapping"].fill_(PAD_SLOT_ID)
 
     def _enter_decode_metadata(
         self,
@@ -509,6 +558,65 @@ class EagleProposer(Drafter):
             )
         context.is_prefill = False
         return i0_max_seqlen_q, positions
+
+    def _advance_decode_metadata(
+        self,
+        scheduled_bs,
+        running_bs,
+        positions,
+        i0_max_seqlen_q,
+        *,
+        num_reject_tokens,
+        from_prefill,
+    ):
+        """Advance the one-row-per-sequence metadata by one drafted token.
+
+        Every mid-step runs this before its forward, and ``warmup_inputs``
+        runs it too: a warmup that stopped after ``_enter_decode_metadata``
+        left the target's verify-width persistent MLA work plan installed, and
+        the draft's one-row query walked it out of bounds (DPA). One body for
+        both callers, so the warmed state cannot drift from the served one.
+
+        Returns what ``prepare_mtp_decode`` returned, already installed.
+        """
+        attn_metadata = get_forward_context().attn_metadata
+        builder = self.runner.attn_metadata_builder
+        # TODO: FIX this condition after we support3 attention head numbers=32
+        only_update = not from_prefill and builder.num_attention_heads != 32
+        attn_metadata.max_seqlen_k += 1
+        fuse_mtp = positions.ndim == 1 and getattr(
+            builder, "fuse_mtp_decode_position_update", False
+        )
+        if fuse_mtp:
+            mtp_decode_kwargs = {
+                "update_context_lens": True,
+                "positions_out": positions,
+            }
+        else:
+            attn_metadata.context_lens[:running_bs] += 1
+            positions += 1
+            mtp_decode_kwargs = {}
+        # `scheduled_bs` stays the REAL sequence count; the builder reads the
+        # padded row count off `positions`, which is the pass's own buffer and
+        # therefore already `running_bs` long.
+        workinfos = builder.prepare_mtp_decode(
+            scheduled_bs,
+            i0_max_seqlen_q if only_update else attn_metadata.max_seqlen_q,
+            attn_metadata.max_seqlen_k,
+            positions,
+            only_update=only_update,
+            num_reject_tokens=num_reject_tokens,
+            **mtp_decode_kwargs,
+        )
+        for k, v in workinfos.items():
+            attn_metadata.__dict__[k] = v
+        # Every step, and only after `prepare_mtp_decode`: that call is what
+        # refreshes the DCP local lengths the schedule is built from, and a
+        # replay reads the buffer's contents. The publish in
+        # `_enter_decode_metadata` runs before the refresh, and steps 1+
+        # reached their forward with step 0's.
+        builder._publish_indexer_fp4_decode_schedule(attn_metadata, running_bs, 1)
+        return workinfos
 
     def propose(
         self,
@@ -702,11 +810,8 @@ class EagleProposer(Drafter):
                     )
 
                 if i < self.mtp_k - 1:
-                    do_attn_metadata_update = (
-                        not context.is_prefill
-                        # TODO: FIX this condition after we support3 attention head numbers=32
-                        and self.runner.attn_metadata_builder.num_attention_heads != 32
-                    )
+                    # Read before step 0's rewrite below flips it to decode.
+                    from_prefill = context.is_prefill
                     if i == 0:
                         i0_max_seqlen_q, positions = self._enter_decode_metadata(
                             scheduled_bs,
@@ -729,49 +834,15 @@ class EagleProposer(Drafter):
                                 running_bs, {"positions": positions}
                             )["positions"]
 
-                    # update metadata
-                    attn_metadata.max_seqlen_k += 1
-                    fuse_mtp = positions.ndim == 1 and getattr(
-                        self.runner.attn_metadata_builder,
-                        "fuse_mtp_decode_position_update",
-                        False,
-                    )
-                    if fuse_mtp:
-                        mtp_decode_kwargs = {
-                            "update_context_lens": True,
-                            "positions_out": positions,
-                        }
-                    else:
-                        attn_metadata.context_lens[:running_bs] += 1
-                        positions += 1
-                        mtp_decode_kwargs = {}
-                    # `scheduled_bs` stays the REAL sequence count; the builder
-                    # reads the padded row count off `positions`, which is the
-                    # pass's own buffer and therefore already `running_bs` long.
-                    workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
+                    workinfos = self._advance_decode_metadata(
                         scheduled_bs,
-                        (
-                            attn_metadata.max_seqlen_q
-                            if not do_attn_metadata_update
-                            else i0_max_seqlen_q
-                        ),
-                        attn_metadata.max_seqlen_k,
+                        running_bs,
                         positions,
-                        only_update=do_attn_metadata_update,
+                        i0_max_seqlen_q,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
-                        **mtp_decode_kwargs,
+                        from_prefill=from_prefill,
                     )
-                    for k, v in workinfos.items():
-                        attn_metadata.__dict__[k] = v
-                    # Every step, and only after `prepare_mtp_decode`: that call
-                    # is what refreshes the DCP local lengths the schedule is
-                    # built from, and a replay reads the buffer's contents. The
-                    # publish in `_enter_decode_metadata` runs before the
-                    # refresh, and steps 1+ reached their forward with step 0's.
                     builder = self.runner.attn_metadata_builder
-                    builder._publish_indexer_fp4_decode_schedule(
-                        attn_metadata, running_bs, 1
-                    )
                     if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices. Both,
                         # and the slot_mapping written below, are the ones

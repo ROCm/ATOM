@@ -697,6 +697,18 @@ def pack_rows(dst: np.ndarray, rows: Sequence) -> None:
 class CpuGpuBuffer:
     """Buffer to easily copy tensors between CPU and GPU."""
 
+    def __setattr__(self, name, value):
+        if (
+            name in ("cpu", "gpu", "np")
+            and self.__dict__.get("_publication") is not None
+        ):
+            from atom.utils.h2d import PublicationError
+
+            raise PublicationError(
+                "bound metadata storage is fixed; recreate the buffer and owner"
+            )
+        object.__setattr__(self, name, value)
+
     def __init__(
         self,
         *size: int | torch.SymInt,
@@ -704,7 +716,12 @@ class CpuGpuBuffer:
         device: torch.device,
         pin_memory: bool = True,
         with_numpy: bool = True,
+        publication_group: str | None = None,
+        publication_unit: str = "rows",
     ) -> None:
+        self._publication = None
+        self.publication_group = publication_group
+        self.publication_unit = publication_unit
         self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
         self.gpu = torch.zeros_like(self.cpu, device=device)
         self.np: np.ndarray
@@ -719,7 +736,11 @@ class CpuGpuBuffer:
                 )
             self.np = self.cpu.numpy()
 
-    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
+    def copy_to_gpu(
+        self, n: int | None = None, *, republish_reason: str | None = None
+    ) -> torch.Tensor:
+        if self._publication is not None:
+            return self._publication.copy_to_gpu(n, republish_reason=republish_reason)
         if n is None:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
@@ -742,6 +763,8 @@ class CpuGpuBuffer:
             device=self.gpu.device,
             pin_memory=self.cpu.is_pinned(),
             with_numpy=hasattr(self, "np"),
+            publication_group=self.publication_group,
+            publication_unit=self.publication_unit,
         )
         new.cpu.copy_(self.cpu)
         new.gpu.copy_(self.gpu)

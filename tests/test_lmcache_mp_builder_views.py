@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import types
@@ -15,8 +16,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.kv_transfer.offload.mp.backend import _build_cache_views
+from atom.kv_transfer.offload.mp.page_views import _build_cache_views
+from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
 
 _MISSING = object()
 _REPO_ROOT = Path(__file__).parents[1]
@@ -77,6 +80,31 @@ def _sub_pool_module():
         SubPoolSpec=type("SubPoolSpec", (), {}),
         page_pool=lambda size: size,
     )
+
+
+@pytest.fixture(scope="module")
+def mha_export_method():
+    # Execute only the shipped exporter: importing the full backend requires a
+    # GPU AITER build, while this PAGE-view contract is plain torch geometry.
+    source = _REPO_ROOT / "atom/model_ops/attentions/aiter_attention.py"
+    module = ast.parse(source.read_text())
+    builder = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "AiterAttentionMetadataBuilder"
+    )
+    method = next(
+        node
+        for node in builder.body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_kv_transfer_tensors"
+    )
+    namespace = {}
+    exec(  # noqa: S102 -- execute the local exporter under the CPU fixture
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    return namespace["get_kv_transfer_tensors"]
 
 
 @pytest.fixture(scope="module")
@@ -143,6 +171,9 @@ def mla_builder_cls():
             kv_indices_generate_triton=noop,
             mtp_prepare_decode_mla_kernel=noop,
         ),
+        "atom.utils.block_tables": _module(
+            "atom.utils.block_tables", block_table_state=noop
+        ),
         "atom.utils.forward_context": _module(
             "atom.utils.forward_context",
             AttentionMetaData=type("AttentionMetaData", (), {}),
@@ -169,6 +200,41 @@ def _assert_region_view_geometry(transfer):
         assert view.data_ptr() == region.base_addr
         assert view[0].numel() * view.element_size() == region.unit_bytes
         assert view.numel() * view.element_size() == region.total_bytes
+
+
+def test_minimax_m3_builder_publishes_gqa_and_index_views_without_tp_collapse(
+    mha_export_method,
+):
+    num_blocks = 3
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=1,
+        head_dim=128,
+        kv_dtype=torch.float8_e4m3fnuz,
+        extra_fields=(EntryField("index", 1, (128 * 128,), torch.uint8),),
+    )
+    pool.allocate(num_blocks, "cpu")
+    builder = SimpleNamespace(kv_pools={"gqa4": pool})
+
+    transfer = mha_export_method(builder)
+    transfer.set_block_count(num_blocks)
+
+    assert transfer.tp_replication_factor == 1
+    assert len(transfer.block_regions) == 4 * 2 + 1
+    assert all(
+        region.semantic_role.startswith("mha.gqa4.")
+        for region in transfer.block_regions
+    )
+    assert all(
+        view.shape[:2] == (num_blocks, 1) for view in transfer.block_tensor_views
+    )
+    _assert_region_view_geometry(transfer)
+    cache_views = _build_cache_views(transfer, num_blocks=num_blocks)
+    assert len(cache_views.tensors) == len(transfer.block_regions)
+
+    transfer.block_tensor_views[-1][1].fill_(7)
+    assert torch.all(pool.field_view("index", 0, torch.uint8, (num_blocks, -1))[1] == 7)
 
 
 @pytest.mark.parametrize("index_layers,index_rows", [(0, 0), (2, 2), (1, 1)])
@@ -200,10 +266,13 @@ def test_mla_builder_publishes_latent_and_index_views(
     assert transfer.num_blocks == 0
     transfer.set_block_count(2)
 
+    # Published as block-major bytes, like every other backend: one fp16
+    # [2 rows, 7] block is 28 bytes, one index block index_rows * 3.
+    assert all(view.dtype == torch.uint8 for view in transfer.block_tensor_views)
     assert [tuple(view.shape) for view in transfer.block_tensor_views] == [
-        (2, 2, 7),
-        (2, 2, 7),
-    ] + [(2, index_rows, 3)] * index_layers
+        (2, 1, 28),
+        (2, 1, 28),
+    ] + [(2, 1, index_rows * 3)] * index_layers
     # Main's DCP transfer contract intentionally collapses physical rows into
     # transport roles. MP still keeps them distinct through the plane index in
     # each tensor key (``page.<index>.<role>``).
@@ -219,4 +288,63 @@ def test_mla_builder_publishes_latent_and_index_views(
     assert cache_views.bytes_per_block == 2 * 2 * 7 * 2 + index_layers * index_rows * 3
     # Transfer writes must update the allocation used by attention kernels.
     transfer.block_tensor_views[0][1].fill_(7)
-    assert torch.all(pool.layer("kv", 0)[1] == 7)
+    assert torch.all(pool.layer("kv", 0)[1].view(torch.uint8) == 7)
+
+
+def test_mla_builder_publishes_fp4_index_scale_plane_to_lmcache_mp(mla_builder_cls):
+    # The FP4 sparse indexer keeps packed E2M1 and its e8m0 exponents as two
+    # planes. `lmcache_mp` groups regions by per-block shape and copies whole
+    # blocks, so the scale plane is published as one more region per layer and
+    # both planes round-trip. 64 rows is the block size FP4 requires.
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            tensor_parallel_size=8,
+            kv_transfer_config={"kv_connector": "lmcache_mp"},
+        ),
+    )
+    pool = MlaKvPool(
+        layers=2,
+        block_size=64,
+        entry_dim=7,
+        kv_dtype=torch.float16,
+        index_layers=2,
+        index_rows_per_block=64,
+        index_head_dim=128,
+        index_fp4=True,
+    )
+    pool.allocate(2, "cpu")
+    builder = mla_builder_cls.__new__(mla_builder_cls)
+    builder.model_runner = runner
+    builder.kv_pool = pool
+    builder._indexer_fp4 = True
+
+    transfer = builder.get_kv_transfer_tensors()
+    transfer.set_block_count(2)
+
+    # One 128-dim index block: 1 K-tile of 4 x 64 x 16 packed bytes, plus
+    # 4 x 64 e8m0 exponent bytes.
+    kv_bytes = 64 * 7 * 2
+    assert [tuple(view.shape) for view in transfer.block_tensor_views] == [
+        (2, 1, kv_bytes),
+        (2, 1, kv_bytes),
+        (2, 1, 4096),
+        (2, 1, 4096),
+        (2, 1, 256),
+        (2, 1, 256),
+    ]
+    assert [region.semantic_role for region in transfer.block_regions] == [
+        "mla.kv",
+        "mla.kv",
+        "dsa.index_cache",
+        "dsa.index_cache",
+        "mla.index_scale.layer_0",
+        "mla.index_scale.layer_1",
+    ]
+    assert transfer.tp_replication_factor == 8
+    _assert_region_view_geometry(transfer)
+    cache_views = _build_cache_views(transfer, num_blocks=2)
+    assert cache_views.bytes_per_block == 2 * kv_bytes + 2 * 4096 + 2 * 256
+    # A restore into the scale region lands in the plane the indexer reads.
+    transfer.block_tensor_views[5][1].fill_(3)
+    assert torch.all(pool.layer("index_scale", 1)[1] == 3)
+    assert torch.all(pool.layer("index_scale", 1)[0] == 0)

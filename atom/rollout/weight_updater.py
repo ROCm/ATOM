@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Optional
 
 import torch
 
@@ -877,6 +876,7 @@ class WeightUpdaterMixin:
             quant_type,
             getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
+            native_group_rows=getattr(module, "native_a8_group_rows", None),
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
@@ -1125,7 +1125,7 @@ class WeightUpdaterMixin:
         ipc_handle,
         bucket_meta: dict,
         is_last: bool = True,
-        ipc_handles: Optional[dict] = None,
+        ipc_handles: dict | None = None,
     ) -> int:
         """Update model weights by reading tensor data from a CUDA IPC shared buffer.
 
@@ -1267,8 +1267,9 @@ class WeightUpdaterMixin:
             self._ipc_buffer = None
             try:
                 torch.cuda.ipc_collect()
-            except Exception:
-                pass  # ipc_collect may not be available on all platforms
+            except (AttributeError, RuntimeError) as e:
+                # ipc_collect may not be available on all platforms
+                logger.debug("torch.cuda.ipc_collect skipped: %s", e)
 
             self.clear_kv_cache()
             if hasattr(self, "_packed_weight_accum"):
