@@ -46,7 +46,7 @@ pub async fn track_http_ttft(
         || request.method() != Method::POST
         || !matches!(
             request.uri().path(),
-            "/v1/chat/completions" | "/v1/completions"
+            "/v1/chat/completions" | "/v1/completions" | "/v1/messages" | "/v1/responses"
         )
     {
         return next.run(request).await;
@@ -224,14 +224,29 @@ impl FirstOutputSse {
             let Ok(payload) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
-            if payload.get("error").is_some() {
+            if payload.get("error").is_some()
+                || matches!(
+                    payload["type"].as_str(),
+                    Some(
+                        "message_stop"
+                            | "response.completed"
+                            | "response.failed"
+                            | "response.incomplete"
+                    )
+                )
+            {
                 self.finish();
                 return false;
             }
-            if let Some(model) = payload.get("model").and_then(Value::as_str) {
+            if let Some(model) = payload
+                .get("model")
+                .or_else(|| payload["message"].get("model"))
+                .or_else(|| payload["response"].get("model"))
+                .and_then(Value::as_str)
+            {
                 self.model = Some(model.to_owned());
             }
-            if has_generated_output(&payload) {
+            if Self::has_generated_output(&payload) {
                 self.finish();
                 return true;
             }
@@ -246,32 +261,55 @@ impl FirstOutputSse {
         self.done = true;
         self.frames = SseFrames::default();
     }
-}
 
-fn nonempty_string(value: &Value) -> bool {
-    value.as_str().is_some_and(|s| !s.is_empty())
-}
+    fn nonempty_string(value: &Value) -> bool {
+        value.as_str().is_some_and(|s| !s.is_empty())
+    }
 
-fn has_function_output(value: &Value) -> bool {
-    nonempty_string(&value["name"]) || nonempty_string(&value["arguments"])
-}
+    fn has_function_output(value: &Value) -> bool {
+        Self::nonempty_string(&value["name"]) || Self::nonempty_string(&value["arguments"])
+    }
 
-fn has_generated_output(payload: &Value) -> bool {
-    payload["choices"].as_array().is_some_and(|choices| {
-        choices.iter().any(|choice| {
-            let delta = &choice["delta"];
-            nonempty_string(&choice["text"])
-                || ["content", "reasoning_content", "reasoning"]
+    fn has_generated_output(payload: &Value) -> bool {
+        match payload["type"].as_str() {
+            Some("content_block_delta") => {
+                return ["text", "thinking", "partial_json"]
                     .iter()
-                    .any(|key| nonempty_string(&delta[key]))
-                || has_function_output(&delta["function_call"])
-                || delta["tool_calls"].as_array().is_some_and(|calls| {
-                    calls
+                    .any(|key| Self::nonempty_string(&payload["delta"][key]))
+            }
+            Some("content_block_start") => {
+                return Self::nonempty_string(&payload["content_block"]["text"])
+                    || Self::nonempty_string(&payload["content_block"]["thinking"])
+                    || payload["content_block"]["type"] == "tool_use"
+            }
+            Some(
+                "response.output_text.delta"
+                | "response.reasoning_text.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.function_call_arguments.delta",
+            ) => return Self::nonempty_string(&payload["delta"]),
+            Some("response.output_item.added") => {
+                return payload["item"]["type"] == "function_call"
+                    && Self::nonempty_string(&payload["item"]["name"])
+            }
+            _ => {}
+        }
+        payload["choices"].as_array().is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                let delta = &choice["delta"];
+                Self::nonempty_string(&choice["text"])
+                    || ["content", "reasoning_content", "reasoning"]
                         .iter()
-                        .any(|call| has_function_output(&call["function"]))
-                })
+                        .any(|key| Self::nonempty_string(&delta[key]))
+                    || Self::has_function_output(&delta["function_call"])
+                    || delta["tool_calls"].as_array().is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|call| Self::has_function_output(&call["function"]))
+                    })
+            })
         })
-    })
+    }
 }
 
 #[cfg(test)]
@@ -517,5 +555,41 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(sample(&handle.render(), "count"), 1.0);
+    }
+
+    #[test]
+    fn messages_and_responses_observe_text_reasoning_and_tools_once() {
+        for payload in [
+            serde_json::json!({"type":"content_block_delta","delta":{"text":"你好"}}),
+            serde_json::json!({"type":"content_block_delta","delta":{"thinking":"thinking"}}),
+            serde_json::json!({"type":"content_block_delta","delta":{"partial_json":"{"}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"你好"}),
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"thinking"}),
+            serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{"}),
+        ] {
+            let mut observer = FirstOutputSse::default();
+            assert!(!observer.feed(
+                b": heartbeat\n\nevent: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+            ));
+            let bytes = format!("data: {payload}\n\n");
+            let hits = bytes
+                .as_bytes()
+                .iter()
+                .filter(|b| observer.feed(&[**b]))
+                .count();
+            assert_eq!(hits, 1);
+            assert!(!observer.feed(bytes.as_bytes()));
+        }
+        for terminal in [
+            "message_stop",
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        ] {
+            let mut observer = FirstOutputSse::default();
+            assert!(!observer.feed(format!("data: {{\"type\":\"{terminal}\"}}\n\n").as_bytes()));
+            assert!(!observer
+                .feed(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n"));
+        }
     }
 }

@@ -61,6 +61,7 @@ pub(super) struct Session {
     parser: Arc<RequestParser>,
     request: Option<RequestEnvelope>,
     request_id: Option<String>,
+    request_path: String,
     request_id_headers: Vec<String>,
     admitted: Option<AdmissionLease>,
     request_end: Option<bool>,
@@ -94,6 +95,7 @@ impl Session {
             early_response: false,
             request: None,
             request_id: None,
+            request_path: String::new(),
             admitted: None,
             request_end: None,
             lifecycle: RequestLifecycle::new(),
@@ -119,7 +121,7 @@ impl Session {
                         Err(tonic::Status::failed_precondition(error.to_string()))
                     } else if self.lifecycle.response_started {
                         Err(tonic::Status::internal(error.to_string()))
-                    } else { Ok(error.response(self.request_id.as_deref())) };
+                    } else { Ok(error.response(self.request_id.as_deref(), &self.request_path)) };
                     let _ = timeout(Duration::from_secs(1), output.send(response)).await;
                 }
             }
@@ -190,6 +192,14 @@ impl Session {
             }
             if self.request_id.is_none() {
                 if let Some(Request::RequestHeaders(headers)) = &message.request {
+                    self.request_path = headers
+                        .headers
+                        .as_ref()
+                        .and_then(|h| h.headers.iter().find(|v| v.key == ":path"))
+                        .map(|h| {
+                            String::from_utf8_lossy(RequestEnvelope::header_bytes(h)).into_owned()
+                        })
+                        .unwrap_or_default();
                     self.request_id = Some(RequestEnvelope::request_id(
                         headers,
                         &self.request_id_headers,
@@ -481,15 +491,16 @@ impl Session {
             &request.headers,
             &decision.address.to_string(),
             &request.id,
-            decision.authorization.as_deref(),
+            decision.api_key.as_deref(),
             decision.target.execution_id(),
+            &request.path,
         );
         self.lifecycle.admit(admission);
         self.lifecycle.bind(decision);
         self.phase = Phase::Dispatching;
         let output = self.output.clone();
         Box::pin(async move {
-            output.send(headers).await?;
+            output.send(headers?).await?;
             output.send_body(&request.raw, !trailers, true).await?;
             if trailers {
                 output

@@ -14,17 +14,24 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Convert headers from reqwest Response to axum HeaderMap
-/// Filters out hop-by-hop headers that shouldn't be forwarded
+/// Preserve repeated response headers while removing hop-by-hop fields.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
-    for (name, value) in reqwest_headers.iter() {
-        // Skip hop-by-hop headers that shouldn't be forwarded
-        // Use eq_ignore_ascii_case to avoid string allocation
-        if should_forward_header_no_alloc(name.as_str()) {
-            // The original name and value are already valid, so we can just clone them
-            headers.insert(name.clone(), value.clone());
+    let nominated: Vec<_> = reqwest_headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+    for (name, value) in reqwest_headers {
+        if should_forward_header_no_alloc(name.as_str())
+            && !nominated
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(name.as_str()))
+        {
+            headers.append(name.clone(), value.clone());
         }
     }
 
@@ -33,17 +40,15 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 
 /// Determine if a header should be forwarded without allocating (case-insensitive)
 fn should_forward_header_no_alloc(name: &str) -> bool {
-    // List of headers that should NOT be forwarded (hop-by-hop headers)
-    // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
         || name.eq_ignore_ascii_case("proxy-authorization")
         || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("trailers")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
-        || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host"))
 }
 
@@ -52,6 +57,9 @@ pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
 
     name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("anthropic-version")
+        || name.eq_ignore_ascii_case("anthropic-beta")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("x-session-id")
@@ -70,6 +78,31 @@ pub fn extract_sticky_routing_key(headers: Option<&HeaderMap>) -> Option<&str> {
         .to_str()
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+/// Resolve client headers and worker credentials once for HTTP and Envoy mutation.
+pub fn inference_request_headers(
+    original: &HeaderMap,
+    path: &str,
+    api_key: Option<&str>,
+) -> Result<HeaderMap, http::header::InvalidHeaderValue> {
+    let mut result = HeaderMap::new();
+    for (name, value) in original {
+        if should_forward_request_header(name.as_str())
+            && !(api_key.is_some() && (name == "authorization" || name == "x-api-key"))
+        {
+            result.append(name.clone(), value.clone());
+        }
+    }
+    if let Some(key) = api_key {
+        let (name, value) = if path.split('?').next() == Some("/v1/messages") {
+            ("x-api-key", key.to_owned())
+        } else {
+            ("authorization", format!("Bearer {key}"))
+        };
+        result.insert(name, http::HeaderValue::from_str(&value)?);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -111,7 +144,7 @@ mod tests {
         assert!(!should_forward_request_header("user-agent"));
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
-        assert!(!should_forward_request_header("x-api-key"));
+        assert!(should_forward_request_header("x-api-key"));
     }
 
     #[test]
@@ -146,7 +179,6 @@ mod tests {
             "trailers",
             "transfer-encoding",
             "upgrade",
-            "content-encoding",
             "host",
         ];
         for h in hop_by_hop {

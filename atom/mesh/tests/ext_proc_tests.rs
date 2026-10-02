@@ -747,7 +747,7 @@ async fn prefix_hash_requires_tokens_and_accepts_generate_input_ids() {
 async fn protocol_modes_encoding_and_api_paths_are_explicitly_rejected() {
     let fixture = Fixture::new(RouterConfig::default()).await;
     for (path, method, encoding, status) in [
-        ("/v1/responses", "POST", "identity", 404),
+        ("/v1/not-an-api", "POST", "identity", 404),
         ("/v1/chat/completions", "GET", "identity", 405),
         ("/v1/chat/completions", "POST", "gzip", 415),
     ] {
@@ -2179,5 +2179,55 @@ async fn correlation_id_is_returned_when_admission_rejects_at_headers() {
         Some("rejected-id")
     );
     active.response_headers(true).await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn messages_and_responses_preserve_raw_input_and_use_api_errors() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    for (path, body) in [
+        (
+            "/v1/messages?beta=1",
+            r#"{ "model":"test-model", "messages":[{"role":"user","content":[{"type":"text","text":"你好","vendor":1}]}],"max_tokens":3,"vendor":{"keep":true} }"#,
+        ),
+        (
+            "/v1/responses?beta=1",
+            r#"{ "model":"test-model", "input":[{"type":"custom_input","vendor":1}],"max_output_tokens":3,"vendor":{"keep":true} }"#,
+        ),
+    ] {
+        let mut stream = fixture.open().await;
+        stream.request_headers(path).await;
+        for (index, bytes) in body.as_bytes().chunks(3).enumerate() {
+            stream.body(bytes, (index + 1) * 3 >= body.len()).await;
+        }
+        assert!(matches!(stream.recv().await, Response::RequestHeaders(_)));
+        let Response::RequestBody(reply) = stream.recv().await else {
+            panic!("expected raw body");
+        };
+        let Some(pb::body_mutation::Mutation::StreamedResponse(reply)) =
+            reply.response.unwrap().body_mutation.unwrap().mutation
+        else {
+            panic!("expected raw mutation");
+        };
+        assert_eq!(reply.body, body.as_bytes());
+        drop(stream);
+        fixture.unloaded().await;
+    }
+    let mut stream = fixture.open().await;
+    stream.request_headers("/v1/messages").await;
+    stream
+        .body(
+            br#"{"model":"test-model","messages":[],"max_tokens":3}"#,
+            true,
+        )
+        .await;
+    let Response::ImmediateResponse(reply) = stream.recv().await else {
+        panic!("expected error");
+    };
+    assert_eq!(reply.status.unwrap().code, 400);
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    drop(stream);
     fixture.runtime.shutdown().await.unwrap();
 }

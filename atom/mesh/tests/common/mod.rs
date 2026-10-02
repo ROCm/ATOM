@@ -3,6 +3,7 @@
 
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod multi_api;
 pub mod streaming_helpers;
 pub mod test_app;
 pub mod test_config;
