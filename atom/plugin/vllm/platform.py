@@ -127,9 +127,7 @@ def _select_hybrid_aware_scheduler(vllm_config) -> None:
     try:
         from atom.plugin.vllm.scheduler import select_scheduler_cls
 
-        chosen = select_scheduler_cls(
-            sc, deepseek_v41=_is_deepseek_v41(getattr(vllm_config, "model_config", None))
-        )
+        chosen = select_scheduler_cls(sc)
     except Exception:
         logger.warning(
             "ATOM: could not select a hybrid-aware scheduler; vLLM's own "

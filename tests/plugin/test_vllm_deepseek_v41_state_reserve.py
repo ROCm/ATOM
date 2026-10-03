@@ -207,3 +207,33 @@ class TestInstallSite:
             "register_model must install the V4.1 STATE-tail patch; the "
             "platform hook is not guaranteed to run"
         )
+
+
+class TestLocalHitCapInstallSite:
+    """The local-hit cap has to be installed where V4.1's other patch is.
+
+    The platform hook it would naturally live in is not always activated:
+    measured on a V4.1 serve, `ATOMPlatform.check_and_update_config` ran zero
+    times while the model wrapper's own hook ran four. A scheduler chosen
+    there is a scheduler never chosen, and the symptom is prefix caching
+    silently going uncapped -- which is a dead engine on the first deep local
+    hit, not a slow one.
+    """
+
+    def test_register_model_installs_the_local_hit_cap(self, monkeypatch):
+        import sys
+
+        register = importlib.import_module("atom.plugin.vllm.register")
+        installed = []
+        monkeypatch.setattr(
+            sys.modules["atom.plugin.vllm.scheduler"],
+            "apply_vllm_v41_local_hit_cap_patch",
+            lambda: installed.append(True),
+        )
+
+        register.register_model()
+
+        assert installed, (
+            "register_model must install the V4.1 local-hit cap; the platform "
+            "hook is not guaranteed to run"
+        )
