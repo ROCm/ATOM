@@ -17,10 +17,10 @@ pytest.importorskip("aiter")
 if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level=True)
 
-from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
+from aiter.jit.utils.chip_info import get_gfx
 
-from atom.model_ops.v4_kernels import hca_persist, paged_decode  # noqa: E402
-from atom.model_ops.v4_kernels.v4_quant import (  # noqa: E402
+from atom.model_ops.v4_kernels import hca_persist, paged_decode
+from atom.model_ops.v4_kernels.v4_quant import (
     mla_decode_fwd_v4_nm_ref,
     quantize_bf16_to_v4_2buff,
 )
@@ -68,15 +68,15 @@ def _inputs(kv_lens, seed, pool_extra=257):
     indptr = torch.zeros(n + 1, dtype=torch.int32, device=DEV)
     indptr[1:] = torch.tensor(kv_lens, device=DEV).cumsum(0)
     idx = torch.randint(0, pool, (tot,), device=DEV, generator=g)
-    return dict(
-        q_packed=qp,
-        q_rope=qr,
-        kv_packed=kp,
-        kv_rope=kr,
-        kv_indptr=indptr,
-        kv_page_indices=idx.to(torch.int32),
-        sink=(torch.randn(H, device=DEV, generator=g) * 2).float(),
-    )
+    return {
+        "q_packed": qp,
+        "q_rope": qr,
+        "kv_packed": kp,
+        "kv_rope": kr,
+        "kv_indptr": indptr,
+        "kv_page_indices": idx.to(torch.int32),
+        "sink": (torch.randn(H, device=DEV, generator=g) * 2).float(),
+    }
 
 
 def _reference(inp, n):
@@ -211,15 +211,15 @@ def test_cuda_graph_capture_replay_changing_csr(mode):
     hca_persist.prepare(DEV)  # model load does this, before capture
     first = _inputs(_q7_lens(100, 6) + [0] * 12, seed=6, pool_extra=t_pad * cap_k)
     pool_rows = first["kv_packed"].shape[0]
-    s = dict(
-        q_packed=first["q_packed"].clone(),
-        q_rope=first["q_rope"].clone(),
-        kv_packed=first["kv_packed"],
-        kv_rope=first["kv_rope"],
-        kv_indptr=torch.zeros(t_pad + 1, dtype=torch.int32, device=DEV),
-        kv_page_indices=torch.zeros(t_pad * cap_k, dtype=torch.int32, device=DEV),
-        sink=first["sink"],
-    )
+    s = {
+        "q_packed": first["q_packed"].clone(),
+        "q_rope": first["q_rope"].clone(),
+        "kv_packed": first["kv_packed"],
+        "kv_rope": first["kv_rope"],
+        "kv_indptr": torch.zeros(t_pad + 1, dtype=torch.int32, device=DEV),
+        "kv_page_indices": torch.zeros(t_pad * cap_k, dtype=torch.int32, device=DEV),
+        "sink": first["sink"],
+    }
 
     def stage(lens, seed):
         g = torch.Generator(device=DEV).manual_seed(seed)

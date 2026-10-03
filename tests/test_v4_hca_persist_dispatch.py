@@ -145,7 +145,7 @@ def test_persistent_gets_the_asm_path_tensors(monkeypatch, routes):
     _call(21)
     kind, args, _ = routes[-1]
     assert kind == "persist"
-    kv, kv_indices, kv_indptr, sink, kv_rope, q_packed, q_rope = args
+    kv, _kv_indices, kv_indptr, sink, kv_rope, q_packed, q_rope = args
     assert kv.shape == (8, 512) and kv_rope.shape == (8, 64)
     assert kv_indptr.numel() == 22 and q_packed.shape == (21, 128, 512)
     assert sink.numel() == 128 and q_rope.shape == (21, 128, 64)

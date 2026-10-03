@@ -104,7 +104,6 @@ from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
-from atom.model_ops.v4_kernels import hca_persist
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -113,6 +112,7 @@ from atom.model_ops.v4_kernels import (
     csa_translate_pack,
     fp4_indexer_enabled,
     fused_compress_attn,
+    hca_persist,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
     scale_indexer_weights,
