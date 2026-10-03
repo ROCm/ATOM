@@ -157,9 +157,38 @@ for want of a claimed boundary. The hits that do happen come from decode,
 where the frontier advances one token at a time and eventually lands exactly.
 
 Raising concurrency therefore does not reduce what the tier *can* do, it
-reduces how often a boundary is reachable. Aligning a prefill chunk to the
-interval is a scheduler-side change and is the next lever; `boundary_passed`
-is the number to watch.
+reduces how often a boundary is reachable.
+
+### Aligning the prefill chunk fixes it
+
+`apply_vllm_v41_prefill_alignment_patch` clips a prefill chunk so it ends on
+an interval boundary -- the same invariant vLLM already enforces for Mamba in
+`align` mode, with the interval in place of the block. Clipping cannot
+*extend* a chunk, so **the token budget has to exceed the interval**: with
+`max-num-batched-tokens 8192` against `state_interval 4096`, a chunk sharing
+the step with decodes still reaches 4,096 and stops there.
+
+Same workload and window as above, concurrency 8:
+
+| | `cap_kept` | `cap_declined` | `sweep_offered` |
+|---|---|---|---|
+| budget 4096, unaligned | 102 | 248 | 106 |
+| budget 8192, aligned | **613** | **2** | **656** |
+
+Hits kept go from 29 % to 99.7 %, and the tier supplies 75.1 % of prompt
+tokens. Throughput, with the budget's own effect separated out by running the
+OFF arm at both budgets:
+
+| arm | req/s | TTFT p50 |
+|---|---|---|
+| OFF, budget 4096 | 1.883 | 3502 ms |
+| OFF, budget 8192 | 2.034 | 2541 ms |
+| ON, budget 4096, unaligned | 2.206 | 2913 ms |
+| **ON, budget 8192, aligned** | **5.107** | **590 ms** |
+
+The budget alone is worth **+8.0 %** to the OFF arm. At the same budget the
+tier is worth **+151 %**. Quoting the 1.883 -> 5.107 pair as the tier's effect
+would be crediting it with a scheduling change it did not make.
 
 **The output length is load-bearing and is why it is stated first.** Offload
 removes prefill work and no decode work, so the ceiling is Amdahl's. The same
