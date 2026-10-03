@@ -138,14 +138,24 @@ class V41StateViews:
         """
         self._staging[int(stage)].copy_(self._cache.state_bytes[int(slot)])
 
-    def committed_position(self, slot: int) -> int:
-        """The token position this slot's cursor says its state is at.
+    def committed_positions(self, slots) -> list[int]:
+        """What each slot's cursor says its state is at, in one read.
 
         `PagedAttentionCache` will refuse any request whose cursor is not
-        exactly the frontier the scheduler claims, so this is the one value
-        that decides whether a snapshot is worth storing at all.
+        exactly the frontier the scheduler claims, so this is the value that
+        decides whether a snapshot is worth storing at all.
+
+        Gathered for the whole batch at once because the read is a blocking
+        device-to-host copy on the compute stream, inside `start_load_kv` --
+        one sync per candidate store put that stall on the critical path of
+        every step that stores anything, which is the path this leg is
+        supposed to stay off.
         """
-        return int(self._cache.cursor[int(slot), 0].item())
+        index = [int(s) for s in slots]
+        if not index:
+            return []
+        rows = torch.as_tensor(index, device=self._cache.cursor.device)
+        return torch.index_select(self._cache.cursor, 0, rows)[:, 0].tolist()
 
     # -- codec contract --------------------------------------------------
     def page_unit_views(self, unit_ids) -> list[torch.Tensor]:
@@ -212,12 +222,19 @@ class V41StateWorkerLeg:
             refused.setdefault(reason, []).append(int(op_id))
 
         submitted: list[tuple[int, int]] = []
-        for store in stores or ():
-            slot = self._slots.slot_for(store.req_id)
+        # One cursor read for the batch, before the per-store walk below.
+        candidates = [
+            (store, self._slots.slot_for(store.req_id)) for store in stores or ()
+        ]
+        positions = self._views.committed_positions(
+            [slot for _, slot in candidates if slot is not None]
+        )
+        cursors = iter(positions)
+        for store, slot in candidates:
             if slot is None:
                 refuse("worker_no_slot", store.op_id)
                 continue
-            committed = self._views.committed_position(int(slot))
+            committed = next(cursors)
             if committed != int(store.boundary):
                 # The one failure nothing downstream can detect: an image keyed
                 # to a position it is not at would be accepted by `cap_hit` and

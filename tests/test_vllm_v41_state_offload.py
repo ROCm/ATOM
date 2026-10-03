@@ -40,6 +40,9 @@ class FakeViews:
         # the scheduler says", so a test that cares about the guard sets it.
         self._committed = committed if committed is not None else {}
         self.default_committed = None
+        # How many device reads the worker leg made; one per batch, not one
+        # per candidate -- the read is a blocking D2H on the compute stream.
+        self.cursor_reads = 0
 
     def acquire_stage(self):
         return self._free.pop() if self._free else None
@@ -48,10 +51,9 @@ class FakeViews:
         self._free.append(int(stage))
         self.released.append(int(stage))
 
-    def committed_position(self, slot):
-        if slot in self._committed:
-            return self._committed[slot]
-        return self.default_committed
+    def committed_positions(self, slots):
+        self.cursor_reads += 1
+        return [self._committed.get(s, self.default_committed) for s in slots]
 
 
 def make_planner(**overrides):
@@ -437,3 +439,23 @@ def test_a_local_hit_needs_no_armed_lookup():
     planner = make_planner()
     assert planner._lookup_ctx is None
     assert planner.cap_local_hit(make_request(), INTERVAL) == 0
+
+
+def test_the_worker_reads_every_cursor_in_one_device_round_trip():
+    """The read is a blocking D2H on the compute stream inside start_load_kv.
+
+    One sync per candidate store puts that stall on the critical path of every
+    step that stores anything -- the path this leg exists to stay off. Each
+    store is then refused on its cursor, which keeps the assertion about the
+    read rather than about what follows it.
+    """
+    planner = make_planner()
+    views = FakeViews(depth=4, committed={0: 1, 1: 2, 2: 3})
+    decided = [
+        sweep(planner, views, INTERVAL, req_id=r)[0] for r in ("a", "b", "c")
+    ]
+    leg = worker_leg(views, {"a": 0, "b": 1, "c": 2})
+    views.cursor_reads = 0
+    refused = leg.snapshot_and_submit(decided)
+    assert views.cursor_reads == 1
+    assert len(refused["cursor_mismatch"]) == 3
