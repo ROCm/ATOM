@@ -79,7 +79,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # not order after. Named here rather than asserted because PP
             # offload has no supported configuration yet.
             logger.warning(
-                "LMCache offload scheduler: pipeline parallelism advances the "
+                "Offload scheduler: pipeline parallelism advances the "
                 "prefill frontier before the forward runs; dense saves may "
                 "include a chunk the producer fence does not cover"
             )
