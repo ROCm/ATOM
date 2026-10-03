@@ -1877,6 +1877,11 @@ start_prefill() {
       "ATOM_KV_OFFLOAD=lmcache_mp"
       "ATOM_KV_OFFLOAD_EXTRA_CONFIG=${lmcache_mp_offload_extra_config}"
     )
+    if mooncake_store_running; then
+      # The workers' P->D transfer engine still has to match the decode's
+      # one QP per endpoint (start_decode): a mismatch rejects every handshake.
+      prefill_offload_env+=("MC_NUM_QP_PER_EP=1")
+    fi
   elif mooncake_store_running; then
     prefill_offload_env+=("${mooncake_l2_prefill_env[@]}")
   fi
@@ -1940,8 +1945,9 @@ start_decode() {
   local -a decode_cache_env=()
   build_server_cache_env "decode" "${server_port}" decode_cache_env
   # The P->D transfer engine on both sides reads MC_NUM_QP_PER_EP, which the
-  # prefill's Mooncake L2 sets to 1 (validate_mooncake_l2_settings refused any
-  # other value); endpoints with other QP counts cannot connect.
+  # Mooncake L2 sets to 1 in every Mooncake process, the prefill workers'
+  # included (validate_mooncake_l2_settings refused any other value);
+  # endpoints with other QP counts cannot connect.
   local -a decode_mooncake_env=()
   if mooncake_l2_requested; then
     decode_mooncake_env=("MC_NUM_QP_PER_EP=1")

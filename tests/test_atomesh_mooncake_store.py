@@ -928,6 +928,16 @@ class LauncherWiringTest(unittest.TestCase):
         prefill = self.source.split("start_prefill() {")[1].split("\n}\n")[0]
         self.assertIn("start_mooncake_store", prefill)
         self.assertIn('prefill_offload_env+=("${mooncake_l2_prefill_env[@]}")', prefill)
+        # MP servers join their Store L2 as they start; their workers keep the
+        # decode's one QP for P->D, without the in-process Store env.
+        self.assertLess(
+            prefill.index("start_mooncake_store"),
+            prefill.index("start_lmcache_mp_servers"),
+        )
+        mp_env = prefill.split("if lmcache_mp_servers_running; then")[1]
+        mp_env = mp_env.split("elif mooncake_store_running; then")[0]
+        self.assertIn('prefill_offload_env+=("MC_NUM_QP_PER_EP=1")', mp_env)
+        self.assertNotIn("mooncake_l2_prefill_env", mp_env)
         decode = self.source.split("start_decode() {")[1].split("\n}\n")[0]
         self.assertIn('decode_mooncake_env=("MC_NUM_QP_PER_EP=1")', decode)
         self.assertIn('"${decode_mooncake_env[@]}" "${decode_cmd[@]}"', decode)

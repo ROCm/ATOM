@@ -65,6 +65,13 @@ class _MPLookupClient:
         self._max_pending = int(max_pending)
         self._nowait_grace = float(nowait_grace)
         self._lookups: dict[str, _LookupState] = {}
+        if self.nonblocking:
+            logger.info(
+                "LMCache MP lookups do not wait out L2 prefetches: at most %d "
+                "outstanding, %.0f ms for an answer before a request waits",
+                self._max_pending,
+                self._nowait_grace * 1000,
+            )
 
     def _submit(self, token_ids: list[int], lookup_id: str) -> _LookupState:
         state = _LookupState(token_ids=list(token_ids), submitted_at=time.monotonic())
