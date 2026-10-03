@@ -190,12 +190,22 @@ The budget alone is worth **+8.0 %** to the OFF arm. Quoting the
 1.883 -> 5.107 pair as the tier's effect would credit it with a scheduling
 change it did not make; at the same budget the pair is 2.034 -> 5.107.
 
-**That ratio is one seed, and the seed is the workload.** aiperf synthesises
-its prefix pool from it, so changing it changes the reuse structure rather
-than resampling the same one. A second seed read 3.876 req/s on the ON arm --
-24 % below the first, far outside the 1.5 % within-arm spread measured at
-concurrency 1. Both seeds are paired against their own OFF arm below; a
-single-seed ratio at this working point is not a result.
+**The seed is the workload, not a resample.** aiperf synthesises its prefix
+pool from it, so a different seed is a different reuse structure. Two seeds,
+each paired against its own OFF arm:
+
+| | OFF req/s | ON req/s | delta | OFF TTFT p50 | ON TTFT p50 |
+|---|---|---|---|---|---|
+| seed 7002 | 2.034 | 5.107 | **+151.0 %** | 2541 ms | 590 ms |
+| seed 7303 | 2.039 | 3.876 | **+90.1 %** | 2531 ms | 897 ms |
+
+So the tier is worth **+90 % to +151 %** here, depending on how much reuse the
+workload actually offers.
+
+The two OFF arms agree to **0.25 %**, which is the check that makes the spread
+readable: an arm with no reuse is indifferent to the prefix structure, so the
+61-point gap is the workload's reuse varying, not the measurement. Reporting
+either seed alone as "the" number would be reporting a draw.
 
 **The output length is load-bearing and is why it is stated first.** Offload
 removes prefill work and no decode work, so the ceiling is Amdahl's. The same
