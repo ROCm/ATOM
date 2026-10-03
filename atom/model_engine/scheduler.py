@@ -1698,6 +1698,12 @@ class Scheduler:
                 seq,
                 skip=remote_ready_for_decode or offload_resume,
             )
+            if needs_remote_load is None:
+                # Its lookup is still running. Like a prefix waiter it keeps its
+                # place in line, and the same bounded lookahead admits the
+                # requests behind it meanwhile.
+                prefix_waiters.append(seq)
+                continue
 
             if remote_ready_for_decode:
                 self._schedule_first_decode_after_remote_kv(seq)
@@ -2420,13 +2426,21 @@ class Scheduler:
             and len(seq.block_table) > 0
         )
 
-    def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
-        """Ask the connector whether this prefill should park for remote KV."""
+    def _query_connector_prefill_match(
+        self, seq: Sequence, *, skip: bool
+    ) -> bool | None:
+        """Ask the connector whether this prefill should park for remote KV.
+
+        None means the connector has not answered yet (a non-blocking LMCache
+        MP lookup still prefetching from L2): ask again on a later step.
+        """
         if skip or self.kv_connector is None:
             return False
         ext_tokens, needs_remote_load = self.kv_connector.get_num_new_matched_tokens(
             seq
         )
+        if ext_tokens is None:
+            return None
         # Keep the lookup's answer, not just the park flag: `can_allocate` runs
         # next and a hybrid's two legs have to be aimed at one boundary, for
         # which this is the KV leg's ceiling. In tokens, and absolute -- the

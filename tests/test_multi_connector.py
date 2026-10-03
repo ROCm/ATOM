@@ -83,8 +83,8 @@ class FakeSchedSub:
     def get_num_new_matched_tokens(self, seq):
         # Model the offload lookup's side effect: a matching prefix arms a load
         # (LMCache pin + _load_specs) that update_state_after_alloc would later
-        # turn into a real recv. A miss arms nothing.
-        if self._offload and self._match[0] > 0:
+        # turn into a real recv. A miss, or a lookup still pending, arms nothing.
+        if self._offload and (self._match[0] or 0) > 0:
             self.pending_load = True
         return self._match
 
@@ -323,6 +323,43 @@ def test_matched_tokens_earlier_connector_wins_over_later():
 def test_no_match_returns_zero():
     sched = _sched([FakeSchedSub(), FakeSchedSub()])
     assert sched.get_num_new_matched_tokens(object()) == (0, False)
+
+
+class _CountingSub(FakeSchedSub):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.asked = 0
+
+    def get_num_new_matched_tokens(self, seq):
+        self.asked += 1
+        return super().get_num_new_matched_tokens(seq)
+
+
+def test_pending_sub_holds_the_answer_and_later_subs_are_not_asked():
+    """A sub still looking up (None) may yet match, and first-hit-wins would
+    otherwise hand the load to a later sub. The later subs are not asked, so
+    none of them arms a load in the meantime."""
+    pending = _CountingSub(is_offload=True, offload_methods=True, match=(None, False))
+    later = _CountingSub(is_offload=True, offload_methods=True, match=(4, True))
+    seq = SimpleNamespace(id=7)
+    sched = _sched([FakeSchedSub(), pending, later])
+    sched._load_winner[7] = later
+
+    assert sched.get_num_new_matched_tokens(seq) == (None, False)
+    assert later.asked == 0
+    assert later.pending_load is False
+    assert 7 not in sched._load_winner
+
+
+def test_pending_sub_behind_a_winner_is_cancelled_like_any_loser():
+    winner = FakeSchedSub(is_producer=True, match=(5, True))
+    pending = FakeSchedSub(is_offload=True, offload_methods=True, match=(None, False))
+    seq = SimpleNamespace(id=7)
+    sched = _sched([winner, pending])
+
+    assert sched.get_num_new_matched_tokens(seq) == (5, True)
+    assert pending.cancelled == [seq]
+    assert sched._load_winner[7] is winner
 
 
 def test_losing_offload_sub_load_is_cancelled_when_another_sub_wins():

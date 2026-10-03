@@ -414,7 +414,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
 
     # -- base interface -----------------------------------------------------
 
-    def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, seq: Any) -> tuple[int | None, bool]:
         """First-hit-wins, and undo the losers' armed loads.
 
         A sub's lookup is not side-effect-free: an offload sub arms a KV load
@@ -435,15 +435,24 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         (`should_park_for_load_after_alloc` and siblings) belong to it, not to
         the tier sub (finding 1). Cleared by `request_finished` /
         `cancel_pending_load`.
+
+        A sub still looking the prompt up (``None`` tokens) holds the answer
+        until it replies, unless a sub before it already won: first-hit-wins
+        must not hand the load to a later sub while an earlier one may yet
+        match. The later subs are not asked meanwhile, so none of them arms a
+        load. Behind a winner, a pending sub is a loser like any other.
         """
         result = (0, False)
         winner = None
+        sid = getattr(seq, "id", None)
         for c in self._connectors:
             toks, needs_load = c.get_num_new_matched_tokens(seq)
+            if toks is None and winner is None:
+                self._load_winner.pop(sid, None)
+                return None, False
             if winner is None and toks > 0:
                 result = (toks, needs_load)
                 winner = c
-        sid = getattr(seq, "id", None)
         if winner is not None:
             self._load_winner[sid] = winner
             for c in self._connectors:

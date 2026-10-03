@@ -2341,6 +2341,71 @@ class TestChunkedPrefillFinality:
 # ── offload-resume admission ───────────────────────────────────────────────
 
 
+class TestPendingConnectorLookup:
+    """A request whose connector lookup is still running keeps its place.
+
+    A non-blocking LMCache MP lookup answers None while the server prefetches
+    the hit from its L2. The request is neither admitted nor counted as a
+    miss; the requests behind it are admitted meanwhile, and it is admitted
+    from its original place once the answer arrives.
+    """
+
+    def _sched(self, answers):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+                kv_cache_block_size=4,
+                max_model_len=256,
+            )
+        )
+        asked = []
+
+        def match(seq):
+            asked.append(seq.id)
+            return answers.get(seq.id, (0, False))
+
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+            get_num_new_matched_tokens=match,
+            update_state_after_alloc=lambda seq: None,
+        )
+        return sched, asked
+
+    def test_requests_behind_a_pending_lookup_are_admitted(self, seq_factory):
+        first = seq_factory(tuple(range(8)))
+        second = seq_factory(tuple(range(100, 108)))
+        third = seq_factory(tuple(range(200, 208)))
+        answers = {first.id: (None, False)}
+        sched, asked = self._sched(answers)
+        sched.waiting.extend([first, second, third])
+
+        _batch, scheduled = sched.schedule()
+
+        assert first.id not in scheduled
+        assert second.id in scheduled and third.id in scheduled
+        assert list(sched.waiting) == [first]
+
+        answers[first.id] = (0, False)
+        _batch, scheduled = sched.schedule()
+
+        assert first.id in scheduled
+        assert asked.count(first.id) == 2
+
+    def test_pending_requests_keep_their_order(self, seq_factory):
+        seqs = [seq_factory(tuple(range(i * 100, i * 100 + 8))) for i in range(3)]
+        answers = {seq.id: (None, False) for seq in seqs[:2]}
+        sched, _asked = self._sched(answers)
+        sched.waiting.extend(seqs)
+
+        _batch, scheduled = sched.schedule()
+
+        assert list(scheduled) == [seqs[2].id]
+        assert list(sched.waiting) == seqs[:2]
+
+
 class TestOffloadResumeAdmission:
     """An offload resume is sized by what it owes, not by its prompt.
 

@@ -28,6 +28,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
+    TIER_LOOKUP_PENDING,
     ChunkedOffloadSchedulerBase,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -911,6 +912,163 @@ def test_block_size_one_full_prompt_hit_stays_declined_when_asked_again(monkeypa
     assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
     assert "7" not in scheduler._load_specs
     assert len(lookup._adapter.submissions) == 1
+
+
+def _nonblocking_client(adapter, monkeypatch, *, timeout=10.0, **kwargs):
+    """A non-blocking client on a fake clock that each sleep advances."""
+    clock = [0.0]
+    monkeypatch.setattr(mp_lookup.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        mp_lookup.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    client = mp_lookup._MPLookupClient(
+        adapter,
+        config=_config(),
+        timeout=timeout,
+        poll_interval=0.01,
+        nonblocking=True,
+        **kwargs,
+    )
+    return client, clock
+
+
+def test_mp_lookup_nowait_is_pending_until_the_server_answers(monkeypatch):
+    # A new question waits out the grace (checks at 0, 0.01 and 0.02 s); an
+    # outstanding one is checked once and never submitted again.
+    adapter = _LookupAdapter([None, None, None, 8])
+    client, clock = _nonblocking_client(adapter, monkeypatch, nowait_grace=0.02)
+
+    assert client.lookup_nowait(list(range(8)), "req") is TIER_LOOKUP_PENDING
+    assert clock[0] == pytest.approx(0.02)
+    assert client.hit_tokens("req") is None
+
+    assert client.lookup_nowait(list(range(8)), "req") == 8
+    assert adapter.submissions == [("atom-offload-dp0:req", list(range(8)))]
+    assert client.hit_tokens("req") == 8
+
+
+def test_mp_lookup_nowait_answers_an_l1_hit_within_the_grace(monkeypatch):
+    adapter = _LookupAdapter([None, 8])
+    client, clock = _nonblocking_client(adapter, monkeypatch, nowait_grace=0.02)
+
+    assert client.lookup_nowait(list(range(8)), "req") == 8
+    assert clock[0] == pytest.approx(0.01)
+
+
+def test_mp_lookup_nowait_submits_at_most_max_pending_questions(monkeypatch):
+    # The third request is not asked while two questions are out, so the
+    # server's L1 holds prefetches for at most two unadmitted requests.
+    adapter = _LookupAdapter([])
+    client, _clock = _nonblocking_client(
+        adapter, monkeypatch, max_pending=2, nowait_grace=0.0
+    )
+
+    for lookup_id in ("a", "b", "c"):
+        assert client.lookup_nowait([1, 2], lookup_id) is TIER_LOOKUP_PENDING
+    assert [request for request, _ in adapter.submissions] == [
+        "atom-offload-dp0:a",
+        "atom-offload-dp0:b",
+    ]
+
+    adapter.results.append(4)
+    assert client.lookup_nowait([1, 2], "a") == 4
+    assert client.lookup_nowait([1, 2], "c") is TIER_LOOKUP_PENDING
+    assert [request for request, _ in adapter.submissions][-1] == "atom-offload-dp0:c"
+
+
+def test_mp_lookup_nowait_times_out_to_a_non_answer(monkeypatch):
+    # Past the lookup timeout the question is a non-answer, as from `lookup`,
+    # it stops counting against max_pending, and cleanup can still release
+    # the locks of a result that arrives late.
+    adapter = _LookupAdapter([])
+    client, clock = _nonblocking_client(
+        adapter, monkeypatch, timeout=1.0, max_pending=1, nowait_grace=0.0
+    )
+
+    assert client.lookup_nowait(list(range(8)), "late") is TIER_LOOKUP_PENDING
+    clock[0] = 1.5
+    assert client.lookup_nowait(list(range(8)), "late") is None
+    assert client.lookup_nowait(list(range(4)), "next") is TIER_LOOKUP_PENDING
+    assert [request for request, _ in adapter.submissions] == [
+        "atom-offload-dp0:late",
+        "atom-offload-dp0:next",
+    ]
+
+    adapter.results.append(8)
+    client.clear_lookup_status("late")
+    assert [(call["start"], call["end"]) for call in adapter.freed] == [(0, 8)]
+
+
+def test_pending_tier_lookup_is_neither_admitted_nor_remembered(monkeypatch):
+    # While the server prefetches, the request is not a miss and holds no
+    # pin: nothing is remembered, armed or listed for this step's release.
+    # The next step finds the answer without asking again.
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4, hit=12)
+    lookup.nonblocking = True
+    lookup._nowait_grace = 0.0
+    adapter = lookup._adapter
+    adapter.results.clear()
+    adapter.results.extend([None, 12])
+    seq = SimpleNamespace(
+        id=9,
+        num_prompt_tokens=16,
+        num_cached_tokens=0,
+        token_ids=list(range(16)),
+        block_table=[10, 11, 12, 13],
+    )
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (None, False)
+    assert scheduler._lookup_in_step == []
+    assert "9" not in scheduler._lookup_results
+    assert "9" not in scheduler._tier_hit_memo
+    assert "9" not in scheduler._load_specs
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (12, True)
+    assert len(adapter.submissions) == 1
+    assert scheduler._lookup_results["9"] == (seq, 12)
+
+
+def test_commit_time_lookup_waits_even_when_matching_does_not(monkeypatch):
+    # `_ensure_lookup_pin` runs after allocation, where a pending answer has
+    # nowhere to go, so it asks through the blocking `lookup`.
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4, hit=12)
+    lookup.nonblocking = True
+    calls = []
+    monkeypatch.setattr(
+        lookup, "lookup_nowait", lambda *a, **k: calls.append("nowait") or None
+    )
+    seq = SimpleNamespace(
+        id=9,
+        num_prompt_tokens=16,
+        num_cached_tokens=0,
+        token_ids=list(range(16)),
+        block_table=[10, 11, 12, 13],
+    )
+
+    assert scheduler._fresh_tier_lookup(seq, "9") == 12
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, False),
+        ({"lmcache.mp.l2": "none"}, False),
+        ({"lmcache.mp.l2": "auto"}, False),
+        ({"lmcache.mp.l2": "present"}, True),
+        ({"lmcache.mp.l2": "present", "lmcache.mp.nonblocking_lookup": False}, False),
+        ({"lmcache.mp.nonblocking_lookup": True}, True),
+    ],
+)
+def test_nonblocking_lookup_defaults_on_with_a_declared_l2(extra, expected):
+    assert mp_scheduler._nonblocking_lookup(extra) is expected
+
+
+def test_nonblocking_lookup_setting_must_be_a_bool():
+    with pytest.raises(TypeError, match="nonblocking_lookup must be true or false"):
+        mp_scheduler._nonblocking_lookup({"lmcache.mp.nonblocking_lookup": "yes"})
 
 
 def test_stale_load_failure_does_not_release_current_generation_locks():

@@ -796,7 +796,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         """How many extra prompt tokens the offload tier can supply.
 
         ``num_computed_tokens`` is vLLM's HBM-prefix-cache frontier; ATOM reads
@@ -843,6 +843,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         finally:
             if self._kda_planner is not None:
                 self._kda_planner.end_lookup()
+        if need is None:
+            # A non-blocking lookup is still running. vLLM reads None the same
+            # way: skip the request this step and ask again.
+            return None, False
         if need <= 0:
             return 0, False
         if not self._scheduler.should_park_for_load_after_alloc(seq):

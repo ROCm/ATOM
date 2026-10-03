@@ -36,6 +36,16 @@ DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
 DENSE_PAGE_STORE_CHANNEL = "dense.page.store"
 
 
+class _TierLookupPending:
+    def __repr__(self) -> str:
+        return "TIER_LOOKUP_PENDING"
+
+
+# A lookup client's ``lookup_nowait`` answers this while the tier has the
+# question but no answer yet. It is neither a hit nor a non-answer.
+TIER_LOOKUP_PENDING = _TierLookupPending()
+
+
 class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBase):
     """Transport- and layout-neutral policy for chunk-aligned KV offload."""
 
@@ -64,6 +74,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         documented way: the adapter's ``lookup`` also returns ``None``, meaning
         "the worker did not answer in time", which is not a hit of zero and must
         not be remembered as one.
+
+        A client whose ``nonblocking`` attribute is true also has
+        ``lookup_nowait``, which may answer ``TIER_LOOKUP_PENDING``. The match
+        step then asks through it, and answers ``(None, False)`` while the tier
+        is pending: the request is neither admitted nor counted as a miss.
         """
         self._init_offload_statistics()
         self._config = config
@@ -193,7 +208,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         self._hit_cap_hook = hook
 
-    def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, seq) -> tuple[int | None, bool]:
         """How many extra prompt tokens the external tier can supply.
 
         Called once per step for as long as the request stays unadmitted, so
@@ -202,6 +217,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         re-derived every call. A remembered hit carries no worker-side lookup
         pin; the pin is re-taken where the load is committed
         (`OffloadSchedulerMixin._ensure_lookup_pin`).
+
+        ``(None, False)`` means a non-blocking lookup is still pending: ask
+        again on a later step, and do not admit the request before then.
         """
 
         if not self._do_load or self._lookup_client is None:
@@ -222,21 +240,32 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         else:
             remembered, hit = self._remembered_tier_hit(seq, sid)
             if not remembered:
-                hit = self._fresh_tier_lookup(seq, sid)
+                hit = self._fresh_tier_lookup(seq, sid, wait=False)
+        if hit is TIER_LOOKUP_PENDING:
+            return None, False
         if hit is None:
             return 0, False
         return self._answer_from_tier_hit(seq, sid, hit)
 
-    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
-        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+    def _fresh_tier_lookup(self, seq, sid: str, *, wait: bool = True):
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer.
+
+        With ``wait`` false a non-blocking client may answer
+        ``TIER_LOOKUP_PENDING``, which is returned as is and remembered
+        nowhere: the client keeps the question, and no pin is held yet.
+        """
 
         num_prompt = seq.num_prompt_tokens
         token_ids = self._lookup_token_ids(seq)
-        if sid not in self._lookup_in_step:
+        listed = sid not in self._lookup_in_step
+        if listed:
             self._lookup_in_step.append(sid)
         self._lookup_results[sid] = (seq, 0)
         try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            if not wait and getattr(self._lookup_client, "nonblocking", False):
+                hit = self._lookup_client.lookup_nowait(token_ids, lookup_id=sid)
+            else:
+                hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
         except Exception:
             # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
             # a half-run lookup may have taken.
@@ -244,6 +273,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._lookup_results.pop(sid, None)
             self._remember_tier_hit(seq, sid, None)
             return None
+        if hit is TIER_LOOKUP_PENDING:
+            self._lookup_results.pop(sid, None)
+            if listed:
+                self._lookup_in_step.remove(sid)
+            return TIER_LOOKUP_PENDING
         if hit is None:
             self._lookup_results.pop(sid, None)
         else:

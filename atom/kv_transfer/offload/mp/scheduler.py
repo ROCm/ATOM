@@ -36,6 +36,21 @@ from atom.kv_transfer.offload.mp.transfer import (
 logger = logging.getLogger("atom")
 
 
+def _nonblocking_lookup(extra: dict[str, Any]) -> bool:
+    """``lmcache.mp.nonblocking_lookup``, by default on with a declared L2.
+
+    A server answers a lookup only after prefetching its L2 part into L1, so
+    with an L2 a blocking lookup holds the scheduler thread for an L2 read on
+    nearly every hit. An L1-only server answers within the no-wait grace.
+    """
+    configured = extra.get("lmcache.mp.nonblocking_lookup")
+    if configured is None:
+        return extra.get("lmcache.mp.l2") == "present"
+    if not isinstance(configured, bool):
+        raise TypeError("lmcache.mp.nonblocking_lookup must be true or false")
+    return configured
+
+
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
@@ -60,6 +75,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 config=config,
                 timeout=timeout,
                 poll_interval=poll_interval,
+                nonblocking=_nonblocking_lookup(extra),
+                max_pending=int(extra.get("lmcache.mp.max_pending_lookups", 8)),
+                nowait_grace=float(extra.get("lmcache.mp.lookup_nowait_grace", 0.02)),
             )
             self._mp_adapter = adapter
             self._scheduler_deadline_s = (
@@ -77,8 +95,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 shutdown()
             raise
 
-    def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, seq: Any) -> tuple[int | None, bool]:
         matched = super().get_num_new_matched_tokens(seq)
+        if matched[0] is None:
+            return matched
         sid = str(seq.id)
         num_prompt = int(seq.num_prompt_tokens)
         # The base's remembered hit, not `hit_tokens`: a step answered from the
