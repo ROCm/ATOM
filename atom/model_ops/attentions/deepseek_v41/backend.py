@@ -3,6 +3,8 @@
 
 from types import SimpleNamespace
 
+import os
+
 import numpy as np
 import torch
 
@@ -27,6 +29,28 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
+
+
+# `prepare_state`'s deferred probe ships the cursor rows asynchronously and
+# renders its stale-slot verdict on the next step, which takes one blocking
+# D2H (~58 us) off each decode step. Under a KV connector at concurrency it
+# reports positions one step out of register with the cursor it reads, and the
+# verdict is a hard refusal -- so it kills the engine on state that is fine.
+#
+# Measured, concurrency 8, chunked prefill, tier active: deferred probe dies
+# within seconds (`needs state at N, found N+1`, every time off by exactly the
+# one token a decode step advances); blocking probe runs full 120 s windows
+# with the tier storing and retrieving. Concurrency 1 is clean either way.
+#
+# So the default is the blocking path, and the deferred one is opt-in until
+# the register slip is understood. A check that fails closed on correct state
+# is worse than the microsecond it saves.
+_BLOCKING_STATE_PROBE = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE", "1") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
 
 
 def build_v41_pool_geometry(
@@ -586,7 +610,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=batch is None)
+            else cache.prepare_state(
+                step, histories=batch is None or _BLOCKING_STATE_PROBE
+            )
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
