@@ -780,8 +780,11 @@ purge_lmcache_disk() {
 #    MOONCAKE_STORE_HOST_POOL_GIB per prefill GPU (the connector's transfer
 #    pool when it sits in host memory; default 0, in GPU memory) must fit each
 #    node with MOONCAKE_STORE_NODE_RESERVE_GIB (default 128) to spare, and each
-#    node is compacted for its pins (numa_memory_budget.py --compact) before
-#    the owners fault them.
+#    node is compacted for its pins (numa_memory_budget.py --compact, stopped
+#    after MOONCAKE_STORE_COMPACT_TIMEOUT seconds, default 600) before the
+#    owners fault them. A node whose compaction runs out of time can leave an
+#    owner 4 KiB pages its NICs refuse to register (seen on pit2-p03-g27 right
+#    after a fresh image pull: NUMA1 held 145 GiB of page cache).
 # validate_mooncake_store_settings refuses a conflicting setting, or an image
 # without the Store, before the node starts anything. Master and owners start
 # before the workers, which connect (and round-trip a probe chunk) while they
@@ -1223,6 +1226,7 @@ prepare_mooncake_store_memory() {
     --gpus "${prefill_gpus}" \
     --per-gpu-gib "${MOONCAKE_STORE_HOST_POOL_GIB:-0}" \
     --compact \
+    --compact-timeout "$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
     ${pins[@]+"${pins[@]}"}; then
     echo "[mooncake-store][FAIL] this node's Store owners and the prefill GPUs' host transfer pools (MOONCAKE_STORE_HOST_POOL_GIB per GPU) must fit their NUMA nodes, see numa-budget above" >&2
     exit 2
