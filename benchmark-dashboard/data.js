@@ -1,64 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791032335995,
+  "lastUpdate": 1791035182975,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "JiaoliangYu",
-            "username": "JiaoliangYu",
-            "email": "Jiaoliang.Yu@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "9ac8da74cb4fe7f3d2a1133a3ebbb2dcb97c24ba",
-          "message": "Bench/dsv4 eplb mega c512 c4096 (#2094)\n\n* bench: add DeepSeek-V4-Pro EPLB + MegaMoE case at c=512/4096\n\nAdds a `deepseek-v4-pro-eplb` catalog entry running MegaMoE on top of\nEP + EPLB (r0, naive placement) at 8k1k, concurrency 512 and 4096. It\nis a distinct server configuration -- expert parallel with EPLB\nenabled and --moe-backend mega -- so it gets its own entry and\nworkflow toggle rather than a variant of the base model.\n\nc=4096 needs client-side sizing the runner cannot infer: the default\nconc*10 prompts is 40960 requests, roughly 90 minutes at the measured\nthroughput, well past the 80-minute benchmark step timeout. Scenarios\nmay now carry `num_prompts` / `num_warmups`, plumbed\ncatalog -> matrix config -> benchmark-tmpl -> atom_test.sh. Empty\nmeans unset, so every existing cell keeps the conc*10 / conc*2\ndefaults; `NUM_PROMPTS_OVERRIDE` already existed for the regression\npath and `NUM_WARMUPS_OVERRIDE` mirrors it.\n\nTwo scenarios can now share (isl, osl, ratio) and differ only in that\nsizing, so both the config grouping key and the\none-config-per-server-key test include it -- otherwise the two bands\nsilently merge and one override is dropped.\n\nVerified: the 317 pre-existing cells expand byte-identically, and the\ncatalog test suite passes.\n\n* bench: scale the EPLB rebalance interval with the request count\n\nThe two cells differ 4x in request count (5120 vs 20480), so a shared\nrebalance_interval would give them very different numbers of rebalance\nevents over a run and make the two points hard to read together. Scale\nit with the load instead: 200 at c=512, 800 at c=4096.\n\nServer args resolve per variant, not per scenario, so the eplb-config\nmoves out of the shared model config and the entry splits into two\nvariants, each pinned to its own concurrency. They keep the same\n`-mega` suffix; every uniqueness key that matters (result filename,\ncell identity, config grouping) already includes the concurrency.\n\n* bench: cap c=4096 client load via bench_args instead of new catalog keys\n\nUse the existing variant bench_args path for --num-prompts/--num-warmups\noverrides and drop the num_prompts/num_warmups scenario plumbing.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* bench: hoist EPLB scenarios to model level\n\nDeclare the 8k1k c=512/4096 grid once on the model entry and let each\nvariant's conc band select its cell, instead of duplicating scenarios.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* change interval size\n\n* bench: use catalog scenarios when dispatch param_lists is empty\n\nManual runs defaulted to 1024,1024,128,0.8 which overrides model.scenarios\nand drops EPLB cells (conc bands 512/4096). Empty param_lists now matches\nnightly behaviour so custom-grid models run without extra inputs.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* Revert \"bench: use catalog scenarios when dispatch param_lists is empty\"\n\nThis reverts commit 1bed2aa592289fbb394f363d9a80809ce4360a3c.\n\n---------\n\nCo-authored-by: JiaoliangYu <jiaolyu@amd.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
-          "timestamp": "2026-08-31T07:40:50Z",
-          "url": "https://github.com/ROCm/ATOM/commit/9ac8da74cb4fe7f3d2a1133a3ebbb2dcb97c24ba"
-        },
-        "date": 1788165755549,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 throughput (tok/s)",
-            "value": 4519.73,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33369475080 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202608301440"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 Total Tput (tok/s)",
-            "value": 40686.34,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33369475080 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202608301440"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 TTFT (ms)",
-            "value": 8052.16,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33369475080 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202608301440"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 TPOT (ms)",
-            "value": 101,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33369475080 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202608301440"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 _tp",
-            "value": 8,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -289207,6 +289151,34 @@ window.BENCHMARK_DATA = {
             "value": 65.8115,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37104322381 | docker_image=rocm/atom-dev:ubuntu24.04_py3.12_pytorch_release_2.10.0_kimi_k3_agentic_0924 | precision=MXFP4 | display_topology=1P1D-TP8-DCP8 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9456%2C%22cache_hit_tokens%22%3A468925440%2C%22cache_total_tokens%22%3A495916033%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A4481%2C%22concurrency%22%3A88%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_tp8_dcp8%22%2C%22decode_dcp%22%3A8%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3629.5602%2C%22e2el_ms%22%3A72632.2803%2C%22e2el_p90%22%3A225185.5202%2C%22e2el_p99%22%3A472408.7312%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Aubuntu24.04_py3.12_pytorch_release_2.10.0_kimi_k3_agentic_0924%22%2C%22input_tput%22%3A126187.2168%2C%22input_tput_per_gpu%22%3A7886.701%2C%22interactivity%22%3A3.9432%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A4481%2C%22interactivity_p90_itl%22%3A21.3778%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A41.8756%2C%22itl_p90%22%3A46.7774%2C%22median_e2el_ms%22%3A30801.9588%2C%22median_itl_ms%22%3A43.2204%2C%22median_tpot_ms%22%3A43.2204%2C%22median_ttft_ms%22%3A3362.2375%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22osl%22%3A1024%2C%22output_tput%22%3A1052.9839%2C%22output_tput_per_gpu%22%3A65.8115%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A8%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.1402%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p1d-isl1048576-osl1024-conc88-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37104322381%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A127240.2007%2C%22tpot_ms%22%3A41.8756%2C%22tpot_p90%22%3A46.7774%2C%22tpot_p99%22%3A49.2342%2C%22tput_per_gpu%22%3A7952.5125%2C%22ttft_ms%22%3A34764.7208%2C%22ttft_p90%22%3A104371.5259%2C%22ttft_p99%22%3A358959.2014%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "id": "e45eb0bb8c37522c2381ad1f913c34a103942ed4",
+          "message": "fix(atomesh): one offload load worker under the Mooncake Store L2; 96 GiB L1 on two half nodes\n\nThe launcher gave the prefill workers OFFLOAD_LOAD_WORKERS=4 under the\nMooncake Store L2. GLM-5.2 cpp4/dcp4 at c96 then hung the prefill PP\npipeline in all three runs (pit2-p03-g40 single node, and twice on g35+g19\ntwo half nodes), 19-38 min in, until the 600 s NCCL watchdog aborted it. In\nthe live capture one stage's GPU ran no dispatch while three of its HSA\nqueues held unprocessed packets behind barriers; its main thread, its save\nthread and two load threads all waited in memcpy_and_sync or a stream\nsynchronize, and the other stages spun in NCCL send/recv. With one load\nworker, as the in-process baseline runs, the 30-minute window completed.\n\nThe two-half-node cells get the sizing that ran: a 96 GiB-base L1 (about\n97 GiB per stage) and 4 x 144 GiB prefill owners, 1536 GiB of pools. A\n48 GiB-base L1 ran full for 27 minutes before a stage's 7.9 GB load never\nfinished.\n\nGLM-5.2 cpp4/dcp4 c96, two nodes with GPUs 0-3, NUMA0 and rdma0-3 each, same\nharness (1800 s window):\n  in-process L1 1 TiB:      2.419 req/s, 284.0K tok/s, TTFT mean 12.0 s,\n                            p99 57.9 s, 9361 uncached tokens per request\n  L1 384 GiB + 1536 GiB L2: 2.819 req/s, 323.4K tok/s, TTFT mean 4.6 s,\n                            p99 33.9 s, 5261 uncached tokens per request\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-02T22:50:42Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e45eb0bb8c37522c2381ad1f913c34a103942ed4"
+        },
+        "date": 1791035182201,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4 1048576/1024 c=96 perf point",
+            "value": 292.9012,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37091264003 | docker_image=rocm/atom-dev:mooncake-store-20261002 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9227%2C%22cache_hit_tokens%22%3A970096224%2C%22cache_total_tokens%22%3A1051315240%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A9333%2C%22concurrency%22%3A96%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3628.8855%2C%22e2el_ms%22%3A32924.9691%2C%22e2el_p90%22%3A68904.5071%2C%22e2el_p99%22%3A179797.821%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Amooncake-store-20261002%22%2C%22input_tput%22%3A267510.0022%2C%22input_tput_per_gpu%22%3A33438.7503%2C%22interactivity%22%3A6.8651%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A9329%2C%22interactivity_p90_itl%22%3A42.1959%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A19.0922%2C%22itl_p90%22%3A23.699%2C%22median_e2el_ms%22%3A22678.8478%2C%22median_itl_ms%22%3A19.2256%2C%22median_tpot_ms%22%3A19.2256%2C%22median_ttft_ms%22%3A7553.6474%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2343.2096%2C%22output_tput_per_gpu%22%3A292.9012%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.3748%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc96-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37091264003%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A269853.2119%2C%22tpot_ms%22%3A19.0922%2C%22tpot_p90%22%3A23.699%2C%22tpot_p99%22%3A26.6689%2C%22tput_per_gpu%22%3A33731.6515%2C%22ttft_ms%22%3A14297.5983%2C%22ttft_p90%22%3A36363.4794%2C%22ttft_p99%22%3A67582.9531%7D"
           }
         ]
       }
