@@ -787,6 +787,30 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 192
 
+        # The DCP prefill path walks each request's cached context in chunks of
+        # attn_prefill_chunk_size / (requests with context x dcp) local tokens
+        # (aiter_mla.py), one all-gather and one state merge per chunk and MLA
+        # layer. At the 16384 default a C72 step ran ~31 chunks per layer.
+        # 131072 cuts that to ~7. On a single-node prefill replay of this trace
+        # it measured +19% computed prefill tok/s (14.1k -> 16.8k on the same
+        # node), TTFT p50/p90 -14%/-13% on identical requests, +0.8 GB peak.
+        - &kimi_k3_agentic_statecap_apc
+          <<: *kimi_k3_agentic_statecap
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-apc131k-c72
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--attn-prefill-chunk-size 131072"
+
+        - <<: *kimi_k3_agentic_statecap_apc
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-apc131k-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+
         - <<: *kimi_k3_agentic_statecap
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-pfx-statecap-c88
           concurrency: [88]
