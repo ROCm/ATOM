@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from collections import deque
+from itertools import pairwise
 from typing import Any
 
 import torch
@@ -201,14 +202,30 @@ class TransferSlotPool:
                         f"{self._capacity[region]} ({quarantined} quarantined); "
                         f"{n} requested"
                     )
-                free = self._free[region]
-                if len(free) >= n:
-                    slots = [free.popleft() for _ in range(n)]
+                if len(self._free[region]) >= n:
+                    slots = self._take_locked(region, n)
                     for slot in slots:
                         slot.leased = True
                     return slots
                 # A release wakes this; so must a held slot coming back.
                 self._cond.wait(self._seconds_to_readmit_locked(region))
+
+    def contiguous_view(self, slots: list[Slot]) -> torch.Tensor | None:
+        """``slots`` as one chunk-major buffer, or None when they are not one.
+
+        Slots in index order whose bytes follow one another with no padding
+        between them -- a chunk size that is a page multiple, as every
+        GLM-5.2 stage's is -- are a buffer the codec packs or unpacks in one
+        call, with no staging copy.
+        """
+        if not slots or self.slot_stride != self.chunk_bytes:
+            return None
+        first = slots[0]
+        for previous, slot in pairwise(slots):
+            if slot.region != first.region or slot.index != previous.index + 1:
+                return None
+        offset = first.ptr - self.base_ptr
+        return self._buffer[offset : offset + len(slots) * self.chunk_bytes]
 
     def release(self, slots: list[Slot]) -> None:
         """Return slots no GPU or NIC access can still touch."""
@@ -307,6 +324,31 @@ class TransferSlotPool:
         if region not in REGIONS:
             raise ValueError(f"unknown transfer pool region {region!r}")
         return region
+
+    def _take_locked(self, region: str, n: int) -> list[Slot]:
+        """``n`` free slots of ``region`` in index order, one run if there is one.
+
+        The lowest run of ``n`` consecutive slots, so a window is one buffer
+        (``contiguous_view``); only a region that quarantine or other windows
+        have broken up hands out scattered slots, and those go through the
+        staging copy instead.
+        """
+        free = self._free[region]
+        ordered = sorted(free, key=lambda slot: slot.index)
+        chosen = ordered[:n]
+        run_start = 0
+        for position in range(1, len(ordered) + 1):
+            if (
+                position == len(ordered)
+                or ordered[position].index != ordered[position - 1].index + 1
+            ):
+                if position - run_start >= n:
+                    chosen = ordered[run_start : run_start + n]
+                    break
+                run_start = position
+        taken = {slot.index for slot in chosen}
+        self._free[region] = deque(slot for slot in free if slot.index not in taken)
+        return chosen
 
     def _quarantined_locked(self, region: str) -> int:
         return self._retired[region] + len(self._held[region])

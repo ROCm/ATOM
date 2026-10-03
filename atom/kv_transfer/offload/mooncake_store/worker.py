@@ -159,6 +159,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._world = 1
         self._chunk_bytes = 0
         self._stats_lock = threading.Lock()
+        # Per copy thread: the stream its in-place packs and unpacks run on.
+        self._in_place_tls = threading.local()
         self._next_stats_log_at = 0.0
         self._next_warning_at: dict[str, float] = {}
         self._suppressed_warnings: Counter = Counter()
@@ -399,8 +401,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         read_from = end
         failure = detail = None
         errors: Counter = Counter()
-        windows_run = stored_bytes = producer_fenced = 0
+        windows_run = stored_bytes = producer_fenced = in_place_windows = 0
         pack_ms = put_ms = 0.0
+        in_place = self._in_place_copy(pool)
         t_store0 = time.perf_counter()
         for window in windows:
             try:
@@ -420,30 +423,48 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             windows_run += 1
             starts = [index * chunk for index in window]
             ends = [(index + 1) * chunk for index in window]
+            run = pool.contiguous_view(slots) if in_place else None
             t_pack0 = time.perf_counter()
             try:
-                with (
-                    track_source(req.save_operation)
-                    if track_source is not None
-                    else nullcontext()
-                ):
-                    gpu_connector.batched_from_gpu(
-                        slots,
-                        starts,
-                        ends,
-                        block_ids=req.block_ids,
-                        producer_event=producer_event,
-                    )
+                if run is not None:
+                    self._pack_in_place(run, window, req.block_ids, producer_event)
+                else:
+                    with (
+                        track_source(req.save_operation)
+                        if track_source is not None
+                        else nullcontext()
+                    ):
+                        gpu_connector.batched_from_gpu(
+                            slots,
+                            starts,
+                            ends,
+                            block_ids=req.block_ids,
+                            producer_event=producer_event,
+                        )
             except BaseException:
                 self._settle_after_gpu_error(pool, slots)
                 raise
             pack_ms += (time.perf_counter() - t_pack0) * 1000
-            # Returned after its final stream sync: no GPU work of this window
-            # still reads the source or writes the slots.
+            # Both paths return after their final stream sync: no GPU work of
+            # this window still reads the source or writes the slots.
             read_from = window.start
-            producer_fenced |= int(
-                gpu_connector.last_transfer_stats().get("producer_fenced", 0)
-            )
+            if run is not None:
+                in_place_windows += 1
+                producer_fenced |= int(producer_event is not None)
+                if track_source is not None:
+                    # Highest first, as the block GPU connector reports them.
+                    for start_token, end_token in zip(
+                        reversed(starts), reversed(ends), strict=True
+                    ):
+                        self._source_group_safe(
+                            SaveSourceGroupId(
+                                req.save_operation, ((start_token, end_token),)
+                            )
+                        )
+            else:
+                producer_fenced |= int(
+                    gpu_connector.last_transfer_stats().get("producer_fenced", 0)
+                )
             keys = chunk_keys(
                 self._namespace,
                 self._rank,
@@ -493,14 +514,15 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d chunks=%d "
-                "windows=%d total_bytes=%d producer_fenced=%d pack_ms=%.2f "
-                "put_ms=%.2f store_ms=%.2f total_ms=%.2f errors=%s",
+                "windows=%d in_place_windows=%d total_bytes=%d producer_fenced=%d "
+                "pack_ms=%.2f put_ms=%.2f store_ms=%.2f total_ms=%.2f errors=%s",
                 self._rank,
                 req.req_id,
                 end * chunk,
                 start * chunk,
                 end - start,
                 windows_run,
+                in_place_windows,
                 stored_bytes,
                 producer_fenced,
                 pack_ms,
@@ -579,8 +601,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         )
         failure = detail = None
         errors: Counter = Counter()
-        windows_run = loaded_chunks = 0
+        windows_run = loaded_chunks = in_place_windows = 0
         get_ms = unpack_ms = 0.0
+        in_place = self._in_place_copy(pool)
         for window in windows:
             try:
                 slots = pool.acquire("load", len(window))
@@ -626,19 +649,24 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     else f"{bad[0]} bytes where {self._chunk_bytes} were expected"
                 )
                 break
+            run = pool.contiguous_view(slots) if in_place else None
             t_unpack0 = time.perf_counter()
             try:
-                gpu_connector.batched_to_gpu(
-                    slots,
-                    [index * chunk for index in window],
-                    [(index + 1) * chunk for index in window],
-                    block_ids=req.block_ids,
-                )
+                if run is not None:
+                    self._unpack_in_place(run, window, req.block_ids)
+                    in_place_windows += 1
+                else:
+                    gpu_connector.batched_to_gpu(
+                        slots,
+                        [index * chunk for index in window],
+                        [(index + 1) * chunk for index in window],
+                        block_ids=req.block_ids,
+                    )
             except BaseException:
                 self._settle_after_gpu_error(pool, slots)
                 raise
             unpack_ms += (time.perf_counter() - t_unpack0) * 1000
-            # batched_to_gpu synchronized before returning: the slots are idle.
+            # Both paths synchronized before returning: the slots are idle.
             pool.release(slots)
             loaded_chunks += len(window)
         if failure is not None:
@@ -657,7 +685,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             total_bytes = loaded_chunks * self._chunk_bytes
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d retrieved=%d "
-                "status=%s chunks=%d windows=%d total_bytes=%d get_ms=%.2f "
+                "status=%s chunks=%d windows=%d in_place_windows=%d total_bytes=%d "
+                "get_ms=%.2f "
                 "unpack_ms=%.2f retrieve_ms=%.2f total_ms=%.2f effective_gbps=%.2f "
                 "errors=%s",
                 self._rank,
@@ -668,6 +697,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 "ok" if failure is None else "miss",
                 end - first,
                 windows_run,
+                in_place_windows,
                 total_bytes,
                 get_ms,
                 unpack_ms,
@@ -685,7 +715,86 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 self._failed_load.add(self._load_completion_id(req))
                 self._record_load_error_blocks(req)
 
-    # -- slot settlement -----------------------------------------------
+    # -- in-place copies ---------------------------------------------------
+    def _in_place_copy(self, pool: TransferSlotPool) -> bool:
+        """Whether windows of ``pool`` can be packed and unpacked in their slots.
+
+        A window whose slots are one run of the GPU pool is a chunk-major buffer
+        the dense codec fills or drains with one kernel; the block GPU
+        connector instead stages it 48 MB at a time, with a copy per chunk and
+        a stream handshake per group, each a GIL round trip against the
+        forward thread.
+        """
+        codec = self._codec
+        return bool(
+            self._store_cfg.direct_copy
+            and pool.device.type == "cuda"
+            and codec is not None
+            and codec.has_fused_chunk_major_staging
+        )
+
+    def _in_place_stream(self) -> torch.cuda.Stream:
+        """This copy thread's stream for in-place packs and unpacks."""
+        stream = getattr(self._in_place_tls, "stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self._codec.device)
+            self._in_place_tls.stream = stream
+        return stream
+
+    def _window_block_ids(self, window: range, block_ids: list[int]) -> list[list[int]]:
+        """The scheduler blocks of each chunk of ``window``, in chunk order."""
+        per_chunk = self.chunk_size // self.virtual_block_size
+        groups = []
+        for index in window:
+            blocks = block_ids[index * per_chunk : (index + 1) * per_chunk]
+            if len(blocks) != per_chunk:
+                raise ValueError(
+                    f"chunk {index} needs blocks [{index * per_chunk}, "
+                    f"{(index + 1) * per_chunk}) of a {len(block_ids)}-block table"
+                )
+            groups.append([int(block) for block in blocks])
+        return groups
+
+    def _pack_in_place(
+        self,
+        run: torch.Tensor,
+        window: range,
+        block_ids: list[int],
+        producer_event: Any,
+    ) -> None:
+        """Pack ``window``'s KV blocks into ``run`` and wait until it is written.
+
+        Ordered after ``producer_event`` like the staged pack, so the kernels
+        that produced the KV finish first.
+        """
+        codec = self._codec
+        stream = self._in_place_stream()
+        if producer_event is not None:
+            stream.wait_event(producer_event)
+        owner = codec.prepare_block_id_groups(
+            [self._window_block_ids(window, block_ids)],
+            device=codec.device,
+            stream=stream,
+        )
+        codec.gpu_to_chunk_major_device_buffer_prepared(run, owner, 0, stream=stream)
+        stream.synchronize()
+
+    def _unpack_in_place(
+        self, run: torch.Tensor, window: range, block_ids: list[int]
+    ) -> None:
+        """Unpack ``run`` into ``window``'s KV blocks and wait until it is read."""
+        codec = self._codec
+        stream = self._in_place_stream()
+        owner = codec.prepare_block_id_groups(
+            [self._window_block_ids(window, block_ids)],
+            device=codec.device,
+            stream=stream,
+        )
+        codec.chunk_major_device_buffer_to_gpu_prepared(run, owner, 0, stream=stream)
+        stream.synchronize()
+
+        # -- slot settlement -----------------------------------------------
+
     @staticmethod
     def _settle(
         pool: TransferSlotPool,

@@ -449,6 +449,7 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source; must be > 0. |
 | `mooncake_store.publish_loaded_prefix` | true | Index a loaded prefix in the HBM prefix cache. |
 | `mooncake_store.startup_probe` | true | One-chunk round trip per worker at startup. |
+| `mooncake_store.direct_copy` | true | With the pool on the GPU, pack and unpack each window in place in its slots (one kernel per window) instead of through the block GPU connector's staging buffer. |
 | `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way). |
 
 `OFFLOAD_COPY_WORKERS`, `OFFLOAD_LOAD_WORKERS`, `OFFLOAD_MIN_LOAD_TOKENS`,

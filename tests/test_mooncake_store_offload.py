@@ -2027,3 +2027,234 @@ def test_kv_offload_mode_selects_the_store_connector():
             compose_kv_offload_config(
                 json.dumps(existing), kv_offload_connector_config("lmcache", "")
             )
+
+
+# --- in-place copies -----------------------------------------------------------
+
+# A chunk that fills its slot exactly, so a window of slots is one buffer.
+PAGE_BLOCK_BYTES = 2048
+PAGE_CHUNK_BYTES = PAGE_BLOCK_BYTES * CHUNK // BLOCK  # 4096: no padding
+
+
+def _page_pattern(block: int) -> bytes:
+    return bytes((block * 11 + i) % 253 for i in range(PAGE_BLOCK_BYTES))
+
+
+class FakeStream:
+    def __init__(self) -> None:
+        self.waited: list = []
+        self.synchronized = 0
+
+    def wait_event(self, event):
+        self.waited.append(event)
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+class FakeInPlaceCodec:
+    """The dense codec's prepared API over host bytes, block by block."""
+
+    has_fused_chunk_major_staging = True
+
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.kv: dict[int, bytes] = {}
+        self.calls: list[tuple] = []
+        self.fail = False
+
+    def prepare_block_id_groups(self, groups, *, device, stream):
+        self.calls.append(("prepare", [[list(chunk) for chunk in g] for g in groups]))
+        return SimpleNamespace(groups=groups, stream=stream)
+
+    def gpu_to_chunk_major_device_buffer_prepared(self, buf, owner, index, *, stream):
+        assert stream is owner.stream
+        if self.fail:
+            raise RuntimeError("pack failed")
+        blocks = [block for chunk in owner.groups[index] for block in chunk]
+        data = b"".join(self.kv.get(b, _page_pattern(b)) for b in blocks)
+        buf[: len(data)].copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+        self.calls.append(("pack", blocks))
+
+    def chunk_major_device_buffer_to_gpu_prepared(self, buf, owner, index, *, stream):
+        assert stream is owner.stream
+        blocks = [block for chunk in owner.groups[index] for block in chunk]
+        data = buf.numpy().tobytes()
+        for position, block in enumerate(blocks):
+            start = position * PAGE_BLOCK_BYTES
+            self.kv[block] = data[start : start + PAGE_BLOCK_BYTES]
+        self.calls.append(("unpack", blocks))
+
+
+@pytest.fixture
+def make_in_place_worker(cluster, monkeypatch):
+    """A worker whose windows take the in-place path over a host pool."""
+    built = []
+
+    def build(*, save_slots=8, load_slots=8):
+        worker = MooncakeStoreOffloadConnector(_config())
+        gpu = FakeGPUConnector(worker._source_group_safe)
+        gpu.gpu_staging_chunk_bytes = PAGE_CHUNK_BYTES
+        codec = FakeInPlaceCodec()
+        stream = FakeStream()
+        client = store_client.MooncakeStoreClient(
+            local_hostname="10.0.0.2",
+            metadata_server=METADATA,
+            master_server_addr=MASTER,
+            protocol="tcp",
+            rdma_devices="",
+        )
+        pool = TransferSlotPool(
+            device="cpu",
+            chunk_bytes=PAGE_CHUNK_BYTES,
+            save_bytes=save_slots * PAGE_CHUNK_BYTES,
+            load_bytes=load_slots * PAGE_CHUNK_BYTES,
+            client=client,
+        )
+        worker._gpu_connector, worker._client, worker._pool = gpu, client, pool
+        worker._codec = codec
+        worker._namespace = NAMESPACE
+        worker._rank, worker._world = 0, 1
+        worker._chunk_bytes = PAGE_CHUNK_BYTES
+        monkeypatch.setattr(worker, "_in_place_copy", lambda _pool: True)
+        monkeypatch.setattr(worker, "_in_place_stream", lambda: stream)
+        built.append(worker)
+        return worker, gpu, codec, stream
+
+    yield build
+    for worker in built:
+        worker.close()
+
+
+def test_pool_hands_out_a_window_as_one_run(cluster):
+    client = _client()
+    pool = TransferSlotPool(
+        device="cpu",
+        chunk_bytes=PAGE_CHUNK_BYTES,
+        save_bytes=6 * PAGE_CHUNK_BYTES,
+        load_bytes=PAGE_CHUNK_BYTES,
+        client=client,
+    )
+    first = pool.acquire("save", 2)
+    second = pool.acquire("save", 3)
+    assert [slot.index for slot in first] == [0, 1]
+    assert [slot.index for slot in second] == [2, 3, 4]
+    run = pool.contiguous_view(second)
+    assert run.numel() == 3 * PAGE_CHUNK_BYTES
+    assert run.data_ptr() == second[0].ptr
+    pool.release(first)
+    # Free slots 0, 1 and 5: the lowest run of two is 0-1.
+    assert [slot.index for slot in pool.acquire("save", 2)] == [0, 1]
+    # Only 5 is free now; 2-4 are taken, so no run of two exists yet.
+    pool.release(second)
+    pool.quarantine([pool.acquire("save", 1)[0]], reason="test", hold_s=60)
+    scattered = pool.acquire("save", 2)
+    assert [slot.index for slot in scattered] == [3, 4]
+    assert pool.contiguous_view(scattered) is not None
+    pool.close()
+
+
+def test_pool_contiguous_view_refuses_gaps_and_padding(cluster):
+    padded = TransferSlotPool(
+        device="cpu",
+        chunk_bytes=CHUNK_BYTES,
+        save_bytes=4 * SLOT,
+        load_bytes=SLOT,
+        client=_client(),
+    )
+    assert padded.contiguous_view(padded.acquire("save", 2)) is None
+    padded.close()
+    exact = TransferSlotPool(
+        device="cpu",
+        chunk_bytes=PAGE_CHUNK_BYTES,
+        save_bytes=4 * PAGE_CHUNK_BYTES,
+        load_bytes=2 * PAGE_CHUNK_BYTES,
+        client=_client(),
+    )
+    slots = exact.acquire("save", 4)
+    assert exact.contiguous_view([slots[0], slots[2]]) is None
+    load = exact.acquire("load", 1)
+    assert exact.contiguous_view([slots[3], load[0]]) is None
+    exact.close()
+
+
+def test_in_place_save_packs_each_window_once(cluster, make_in_place_worker):
+    worker, gpu, codec, stream = make_in_place_worker(save_slots=8)
+    request = _save_req(41, 40)
+    operation = request.save_operation
+    worker._do_save_req(request, producer_event="fence")
+
+    # Windows of two chunks (a quarter of 8 slots), highest first, one pack each;
+    # the staging path is never used.
+    assert gpu.calls == []
+    packs = [call[1] for call in codec.calls if call[0] == "pack"]
+    assert packs == [[6, 7, 8, 9], [2, 3, 4, 5], [0, 1]]
+    assert stream.waited == ["fence"] * 3 and stream.synchronized == 3
+    objects = cluster.objects[MASTER]
+    for index in range(5):
+        expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
+        assert objects[_key(request.chunk_hashes, index)] == expected
+    output = worker.get_finished()
+    assert output.finished_saving == {operation}
+    assert output.connector_completions == {
+        _store(operation),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(5)),
+    }
+
+
+def test_in_place_load_unpacks_each_window_once(cluster, make_in_place_worker):
+    worker, gpu, codec, _stream = make_in_place_worker(save_slots=8, load_slots=8)
+    worker._do_save_req(_save_req(42, 40))
+    codec.calls.clear()
+    destination = list(range(100, 110))
+    load = _load_req(42, hbm=8, lmc=40, block_ids=destination)
+    worker._do_load_req(load)
+
+    assert gpu.calls == []
+    unpacks = [call[1] for call in codec.calls if call[0] == "unpack"]
+    assert unpacks == [[102, 103, 104, 105], [106, 107, 108, 109]]
+    for chunk in range(1, 5):
+        for half in range(2):
+            source = 2 * chunk + half
+            assert codec.kv[destination[source]] == _page_pattern(source)
+    output = worker.get_finished()
+    assert output.finished_loading == {load.load_operation}
+    assert output.failed_loading == set()
+
+
+def test_scattered_slots_fall_back_to_the_staging_copy(cluster, make_in_place_worker):
+    worker, gpu, codec, _stream = make_in_place_worker(save_slots=16)
+    gpu.pattern = staticmethod(_page_pattern)
+    pool = worker._pool
+    # Hold every odd slot back: 8 usable slots give windows of two, and no two
+    # free slots are adjacent, so a window is two scattered slots.
+    slots = pool.acquire("save", 16)
+    pool.release([slot for slot in slots if slot.index % 2 == 0])
+    pool.quarantine(
+        [slot for slot in slots if slot.index % 2], reason="test", hold_s=60
+    )
+    request = _save_req(43, 32)
+    worker._do_save_req(request)
+
+    assert not [call for call in codec.calls if call[0] == "pack"]
+    assert gpu.calls == [("from", [16, 24]), ("from", [0, 8])]
+    objects = cluster.objects[MASTER]
+    for index in range(4):
+        expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
+        assert objects[_key(request.chunk_hashes, index)] == expected
+    assert _store(request.save_operation) in worker.get_finished().connector_completions
+
+
+def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
+    worker, _gpu, codec, _stream = make_in_place_worker()
+    codec.fail = True
+    request = _save_req(44, 16)
+    with pytest.raises(RuntimeError, match="pack failed"):
+        worker._do_save_req(request)
+    completions = worker.get_finished().connector_completions
+    assert not any(
+        completion.channel == DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL
+        for completion in completions
+    )
+    assert worker._pool.quarantined("save") == 0  # the fence held: released
