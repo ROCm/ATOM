@@ -472,7 +472,7 @@ def test_config_defaults_and_shared_master():
     assert cfg.chunk_tokens == 256 and cfg.lookup_batch_keys == 8192
     assert (cfg.load_pool_bytes, cfg.save_pool_bytes) == (1024 << 20, 256 << 20)
     assert cfg.save_abandon_timeout_s == 300.0
-    assert cfg.publish_loaded_prefix and cfg.startup_probe
+    assert cfg.publish_loaded_prefix and cfg.startup_probe and cfg.direct_copy
     assert cfg.owner_rdma_devices == cfg.rdma_devices == ()
     assert cfg.store_masters() == [nic.StorePool(MASTER, METADATA)]
 
@@ -557,6 +557,7 @@ def test_config_takes_the_launcher_worker_config(launcher_json):
         ({"save_abandon_timeout_s": "300"}, "number of seconds"),
         ({"publish_loaded_prefix": "true"}, "true or false"),
         ({"startup_probe": 1}, "true or false"),
+        ({"direct_copy": "false"}, "true or false"),
         ({"rdma_devices": ["rdma0"]}, "comma-separated string"),
     ],
 )
@@ -2258,3 +2259,74 @@ def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
         for completion in completions
     )
     assert worker._pool.quarantined("save") == 0  # the fence held: released
+
+
+@pytest.mark.parametrize(
+    ("direct_copy", "device", "fused", "expected"),
+    [
+        (True, "cuda", True, True),
+        (False, "cuda", True, False),
+        (True, "cpu", True, False),
+        (True, "cuda", False, False),
+    ],
+)
+def test_in_place_gate(cluster, direct_copy, device, fused, expected):
+    worker = MooncakeStoreOffloadConnector(
+        _config(extra=_extra(direct_copy=direct_copy))
+    )
+    worker._codec = SimpleNamespace(has_fused_chunk_major_staging=fused)
+    pool = SimpleNamespace(device=torch.device(device))
+    assert worker._in_place_copy(pool) is expected
+    worker._codec = None
+    assert worker._in_place_copy(pool) is False
+    worker.close()
+
+
+def test_in_place_save_failure_reports_each_chunk_once(cluster, make_in_place_worker):
+    worker, _gpu, _codec, _stream = make_in_place_worker(save_slots=8)
+    request = _save_req(45, 40)
+    operation = request.save_operation
+    store = cluster.store_of(MASTER)
+    # Windows [3,5), [1,3), [0,1): the second one's put fails.
+    store.put_codes[_key(request.chunk_hashes, 2)] = store_client.NO_AVAILABLE_HANDLE
+    worker._do_save_req(request)
+    completions = worker.get_finished().connector_completions
+    safe = [c for c in completions if c.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL]
+    assert sorted(safe, key=lambda c: c.operation_id.ranges) == [
+        _safe(operation, index) for index in range(5)
+    ]
+    assert _store(operation, False) in completions
+    assert _quiescent(operation) in completions
+
+
+def test_mixed_windows_report_the_same_chunks(
+    cluster, make_in_place_worker, monkeypatch
+):
+    worker, gpu, codec, _stream = make_in_place_worker(save_slots=8)
+    gpu.pattern = staticmethod(_page_pattern)
+    pool = worker._pool
+    # The first window [2,4) is one run; the second [0,2) is handed out as if
+    # scattered, so it takes the staging copy.
+    view = pool.contiguous_view
+    calls = []
+
+    def first_only(slots):
+        calls.append(len(slots))
+        return view(slots) if len(calls) == 1 else None
+
+    monkeypatch.setattr(pool, "contiguous_view", first_only)
+    request = _save_req(46, 32)
+    operation = request.save_operation
+    worker._do_save_req(request)
+    assert [call[1] for call in codec.calls if call[0] == "pack"] == [[4, 5, 6, 7]]
+    assert gpu.calls == [("from", [0, 8])]
+    completions = worker.get_finished().connector_completions
+    assert completions == {
+        _store(operation),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(4)),
+    }
+    objects = cluster.objects[MASTER]
+    for index in range(4):
+        expected = _page_pattern(2 * index) + _page_pattern(2 * index + 1)
+        assert objects[_key(request.chunk_hashes, index)] == expected
