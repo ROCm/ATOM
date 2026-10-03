@@ -186,9 +186,16 @@ OFF arm at both budgets:
 | ON, budget 4096, unaligned | 2.206 | 2913 ms |
 | **ON, budget 8192, aligned** | **5.107** | **590 ms** |
 
-The budget alone is worth **+8.0 %** to the OFF arm. At the same budget the
-tier is worth **+151 %**. Quoting the 1.883 -> 5.107 pair as the tier's effect
-would be crediting it with a scheduling change it did not make.
+The budget alone is worth **+8.0 %** to the OFF arm. Quoting the
+1.883 -> 5.107 pair as the tier's effect would credit it with a scheduling
+change it did not make; at the same budget the pair is 2.034 -> 5.107.
+
+**That ratio is one seed, and the seed is the workload.** aiperf synthesises
+its prefix pool from it, so changing it changes the reuse structure rather
+than resampling the same one. A second seed read 3.876 req/s on the ON arm --
+24 % below the first, far outside the 1.5 % within-arm spread measured at
+concurrency 1. Both seeds are paired against their own OFF arm below; a
+single-seed ratio at this working point is not a result.
 
 **The output length is load-bearing and is why it is stated first.** Offload
 removes prefill work and no decode work, so the ceiling is Amdahl's. The same
