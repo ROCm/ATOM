@@ -21,7 +21,10 @@ from atom.kv_transfer.offload._offload_common import (
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import NativeStateTransfer
-from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
+from atom.kv_transfer.offload.mp.deployment import (
+    _reject_native_state_pp,
+    _validate_mp_config,
+)
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     require_native_state_server,
@@ -67,6 +70,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # The layout is known only after BlockManager builds the native pool.
         # Defer connecting so scheduler and workers use the same namespace.
         _validate_mp_config(config)
+        _reject_native_state_pp(config)
         self._config = config
         self.kv_role = validated_kv_role(
             getattr(config, "kv_transfer_config", {}) or {}

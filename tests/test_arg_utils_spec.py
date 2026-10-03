@@ -316,6 +316,45 @@ class TestKVOffloadEnv:
             "lmcache_mp",
         ]
 
+    def test_mooncake_producer_and_lmcache_mp_become_multi(self, monkeypatch):
+        # Regression guard, not new code: the lmcache_mp PP prefill launch
+        # (pd_server_atom.sh) relies on this composition -- P->D over mooncake,
+        # prefix offload over the standalone LMCache MP server.
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
+        monkeypatch.setenv(
+            "ATOM_KV_OFFLOAD_EXTRA_CONFIG",
+            '{"lmcache.mp.port": 25555, "lmcache.mp.l2": "none"}',
+        )
+        pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+        cfg = self._kv(["--kv-transfer-config", json.dumps(pd)])
+        assert cfg == {
+            "kv_connector": "multi",
+            "connectors": [
+                pd,
+                {
+                    "kv_connector": "lmcache_mp",
+                    "kv_role": "offload",
+                    "kv_connector_extra_config": {
+                        "lmcache.mp.port": 25555,
+                        "lmcache.mp.l2": "none",
+                    },
+                },
+            ],
+        }
+
+    def test_lmcache_mp_is_refused_next_to_in_process_lmcache(self, monkeypatch):
+        # Regression guard: one prefix-offload tier per role.
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
+        multi = {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            ],
+        }
+        with pytest.raises(ValueError, match="conflicts with an offload connector"):
+            self._kv(["--kv-transfer-config", json.dumps(multi)])
+
     @pytest.mark.parametrize(
         "transfer",
         [

@@ -342,6 +342,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "waits_for_transfer_report", None)
         return bool(callback(seq)) if callback is not None else False
 
+    def keeps_save_reports_after_abandon(self, seq) -> bool:
+        # A connector that waits for its transfer reports (LMCache MP) also
+        # still needs its save reports after the engine abandons the save.
+        return self.waits_for_transfer_report(seq)
+
     def save_abandon_timeout_s(self) -> float:
         # Plain forward: the abstract lifecycle contract guarantees every _impl
         # defines this (concrete on OffloadSchedulerMixin). The scheduler sources
