@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import torch
 
 from atom.kv_transfer.offload.mooncake_store_l2 import StorePool
 from atom.kv_transfer.offload.mp import mooncake_l2_server as server
@@ -23,6 +24,7 @@ def ran(monkeypatch):
 
     monkeypatch.setattr(server.runpy, "run_module", run_module)
     monkeypatch.setattr(server, "requester_rdma_device", lambda gpu: f"rdma{3 - gpu}")
+    monkeypatch.setattr(server, "keep_l1_objects_page_aligned", lambda: None)
     return runs
 
 
@@ -101,3 +103,42 @@ def test_bad_command_lines_are_refused(argv, ran):
     with pytest.raises(SystemExit):
         server.main(argv)
     assert ran == []
+
+
+def _lazy_allocator_with(monkeypatch, *, pinned_whole):
+    """LMCache's LazyMemoryAllocator, built as its constructor builds it."""
+    lazy = pytest.importorskip("lmcache.v1.memory_allocators.lazy_memory_allocator")
+    from lmcache.v1.memory_allocators.tensor_memory_allocator import (
+        TensorMemoryAllocator,
+    )
+
+    size = 8 << 20
+    buffer = torch.zeros(size, dtype=torch.uint8)
+
+    def constructor(self, final_size, align_bytes):
+        self._final_size = final_size
+        self._curr_size = final_size if pinned_whole else final_size // 2
+        self._buffer = buffer
+        self._allocator = TensorMemoryAllocator(
+            tensor=buffer, align_bytes=align_bytes, init_address_space=self._curr_size
+        )
+        self._address_manager = self._allocator.address_manager
+
+    monkeypatch.setattr(lazy.LazyMemoryAllocator, "__init__", constructor)
+    server.keep_l1_objects_page_aligned()
+    server.keep_l1_objects_page_aligned()  # idempotent
+    return lazy.LazyMemoryAllocator(size, 2 << 20)
+
+
+def test_l1_pinned_whole_gets_page_aligned_objects(monkeypatch):
+    allocator = _lazy_allocator_with(monkeypatch, pinned_whole=True)
+
+    assert allocator._address_manager._align == server.L1_OBJECT_ALIGN_BYTES
+    assert allocator._allocator.address_manager is allocator._address_manager
+    assert allocator._allocator.buffer.data_ptr() == allocator._buffer.data_ptr()
+
+
+def test_lazily_growing_l1_keeps_its_allocator(monkeypatch):
+    allocator = _lazy_allocator_with(monkeypatch, pinned_whole=False)
+
+    assert allocator._address_manager._align == 2 << 20

@@ -18,6 +18,13 @@ owners share it; otherwise the pool of ``--master``/``--metadata``.
 
 This module appends the ``mooncake_store`` ``--l2-adapter`` for that NIC and
 pool, then runs LMCache's server in this process.
+
+The adapter registers the whole L1 with the NIC at startup, as one MR, which an
+ionic NIC refuses if a single 4 KiB page is in it. The launcher therefore
+starts the server with glibc's THP malloc and ``--l1-align-bytes 2097152``.
+LMCache aligns every L1 object to that value too, which puts each ~3 MB chunk
+in a 4 MiB slot and wastes a quarter of the L1, so this module keeps the base
+on 2 MiB and puts the objects back on 4 KiB (``keep_l1_objects_page_aligned``).
 """
 
 from __future__ import annotations
@@ -36,6 +43,50 @@ from atom.kv_transfer.offload.mooncake_store_l2 import (
 logger = logging.getLogger("atom")
 
 LMCACHE_SERVER_MODULE = "lmcache.v1.multiprocess.server"
+# LMCache's default L1 object alignment (``--l1-align-bytes``).
+L1_OBJECT_ALIGN_BYTES = 4096
+
+
+def keep_l1_objects_page_aligned() -> None:
+    """Align only the L1's base to ``--l1-align-bytes``, not each object in it.
+
+    LMCache's lazy L1 aligns the buffer base and every object to one value. An
+    L1 pinned whole at startup (``--l1-init-size-gb`` >= ``--l1-size-gb``) never
+    grows, so its object allocator can be rebuilt with page alignment once the
+    buffer exists. A lazily growing L1 is left alone: its expansion thread owns
+    the address space.
+    """
+    from lmcache.v1.memory_allocators import lazy_memory_allocator as lazy
+    from lmcache.v1.memory_allocators.tensor_memory_allocator import (
+        TensorMemoryAllocator,
+    )
+
+    allocator_init = lazy.LazyMemoryAllocator.__init__
+    if getattr(allocator_init, "_atom_page_aligned_objects", False):
+        return
+
+    def __init__(self, *args, **kwargs):
+        allocator_init(self, *args, **kwargs)
+        try:
+            pinned_whole = self._curr_size >= self._final_size
+            buffer = self._buffer
+        except AttributeError:
+            logger.warning(
+                "LMCache L1 objects keep the base alignment: this LMCache's "
+                "LazyMemoryAllocator has no _curr_size/_final_size/_buffer"
+            )
+            return
+        if not pinned_whole:
+            return
+        self._allocator = TensorMemoryAllocator(
+            tensor=buffer,
+            align_bytes=L1_OBJECT_ALIGN_BYTES,
+            init_address_space=self._curr_size,
+        )
+        self._address_manager = self._allocator.address_manager
+
+    __init__._atom_page_aligned_objects = True
+    lazy.LazyMemoryAllocator.__init__ = __init__
 
 
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -116,6 +167,7 @@ def main(argv: list[str] | None = None) -> None:
         device,
         master,
     )
+    keep_l1_objects_page_aligned()
     # The server parses sys.argv itself; JSON with no spaces survives any
     # later whitespace split of the logged command line.
     sys.argv = [
