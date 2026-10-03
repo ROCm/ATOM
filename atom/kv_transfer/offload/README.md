@@ -334,9 +334,15 @@ and no `import lmcache`.
 ### Data path
 
 ```text
-save: KV blocks --pack (Triton) + D2D copy--> slot of the worker's registered pool --batch_put_from--> owners
-load: owners --batch_get_into--> slot of the registered pool --D2D copy + unpack--> KV blocks
+save: KV blocks --pack (Triton), in place--> run of slots of the worker's registered pool --batch_put_from--> owners
+load: owners --batch_get_into--> run of slots of the registered pool --unpack (Triton), in place--> KV blocks
 ```
+
+A window whose slots are one run of the HBM pool is one chunk-major buffer, and
+the dense codec packs or unpacks it with one kernel and one stream sync
+(`direct_copy`). A window whose slots are scattered (held-back slots broke the
+region up) or a pool in host memory goes through the block GPU connector's
+staging buffer instead: pack, then a copy into each slot (and the reverse).
 
 - One Store object is one (PP/TP rank, 256-token chunk): the dense codec's
   opaque bytes of that rank's layers, 16 blocks in one contiguous range
