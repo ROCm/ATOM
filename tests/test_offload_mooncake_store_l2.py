@@ -672,7 +672,7 @@ def test_collapse_into_huge_pages_retries_when_no_huge_page_is_free(
     monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
     monkeypatch.setattr(l2.time, "sleep", sleeps.append)
     with caplog.at_level(logging.INFO, logger="atom"):
-        l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
+        assert l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024) is True
     assert calls == [(4096, 2 * 1024 * 1024, 25)] * 3
     assert sleeps == [1.0, 2.0]
     assert "succeeded on attempt 3" in caplog.records[-1].getMessage()
@@ -685,7 +685,7 @@ def test_collapse_into_huge_pages_gives_up(monkeypatch, caplog):
     madvise = _madvise_failing([errno.ENOMEM] * 10, calls)
     monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
     with caplog.at_level(logging.WARNING, logger="atom"):
-        l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
+        assert l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024) is False
     assert len(calls) == len(l2._COLLAPSE_RETRY_DELAYS_S) + 1
     assert sleeps == list(l2._COLLAPSE_RETRY_DELAYS_S)
     assert "MADV_COLLAPSE" in caplog.records[-1].getMessage()
@@ -693,7 +693,7 @@ def test_collapse_into_huge_pages_gives_up(monkeypatch, caplog):
     calls.clear()
     madvise = _madvise_failing([errno.EINVAL], calls)
     monkeypatch.setattr(l2, "_libc", lambda: SimpleNamespace(madvise=madvise))
-    l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024)
+    assert l2._collapse_into_huge_pages(4096, 2 * 1024 * 1024) is False
     assert len(calls) == 1
 
 

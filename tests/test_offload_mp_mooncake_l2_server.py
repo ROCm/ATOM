@@ -169,7 +169,7 @@ def test_lazily_growing_l1_keeps_its_allocator(monkeypatch):
     assert allocator._address_manager._align == 2 << 20
 
 
-def _pinning_allocator(monkeypatch, *, huge_fraction):
+def _pinning_allocator(monkeypatch, *, collapsed):
     """LMCache's LazyMemoryAllocator whose pin is wrapped by the THP check."""
     lazy = pytest.importorskip("lmcache.v1.memory_allocators.lazy_memory_allocator")
     calls = []
@@ -187,12 +187,7 @@ def _pinning_allocator(monkeypatch, *, huge_fraction):
     monkeypatch.setattr(
         server,
         "_collapse_into_huge_pages",
-        lambda address, size: calls.append(("collapse", size)),
-    )
-    monkeypatch.setattr(
-        server,
-        "anon_huge_page_bytes",
-        lambda start, end: int((end - start) * huge_fraction),
+        lambda address, size: calls.append(("collapse", size)) or collapsed,
     )
     server.make_l1_huge_before_pinning(1)
     server.make_l1_huge_before_pinning(1)  # idempotent
@@ -202,7 +197,7 @@ def _pinning_allocator(monkeypatch, *, huge_fraction):
 
 
 def test_l1_is_touched_and_collapsed_before_it_is_pinned(monkeypatch):
-    allocator, calls = _pinning_allocator(monkeypatch, huge_fraction=1.0)
+    allocator, calls = _pinning_allocator(monkeypatch, collapsed=True)
 
     allocator._pin_memory_chunk(0, 4 << 20)
 
@@ -210,8 +205,8 @@ def test_l1_is_touched_and_collapsed_before_it_is_pinned(monkeypatch):
 
 
 def test_l1_short_of_huge_pages_fails_before_it_is_pinned(monkeypatch):
-    allocator, calls = _pinning_allocator(monkeypatch, huge_fraction=0.5)
+    allocator, calls = _pinning_allocator(monkeypatch, collapsed=False)
 
-    with pytest.raises(RuntimeError, match="huge pages after MADV_COLLAPSE"):
+    with pytest.raises(RuntimeError, match="not all huge pages after MADV_COLLAPSE"):
         allocator._pin_memory_chunk(0, 4 << 20)
     assert ("pin", 0, 4 << 20) not in calls

@@ -38,7 +38,6 @@ import sys
 from atom.kv_transfer.offload.mooncake_store_l2 import (
     _collapse_into_huge_pages,
     _touch_every_huge_page,
-    anon_huge_page_bytes,
     requester_rdma_device,
     store_pool_of,
 )
@@ -99,9 +98,9 @@ def make_l1_huge_before_pinning(numa_node: int) -> None:
     fault of a 2 MiB stretch falls back to 4 KiB pages, and the adapter's one
     MR for the whole L1 then fails (two half nodes, pit2-p03-g52: compaction
     reached 99.6% and three of four 96 GiB L1s failed to register with
-    ENOMEM). Each chunk LMCache pins is touched once per 2 MiB, collapsed
-    (MADV_COLLAPSE compacts synchronously, retried on ENOMEM/EAGAIN) and
-    counted; a chunk that is not all huge pages fails the server's start here,
+    ENOMEM). Each chunk LMCache pins is touched once per 2 MiB and collapsed
+    (MADV_COLLAPSE compacts synchronously, retried on ENOMEM/EAGAIN); a chunk
+    the collapse cannot make all huge pages fails the server's start here,
     with the shortfall named, instead of in the adapter. Pinned pages cannot
     move, so this has to run before the pin.
     """
@@ -114,14 +113,15 @@ def make_l1_huge_before_pinning(numa_node: int) -> None:
     def _pin_memory_chunk(self, offset: int, size: int) -> None:
         address = self._buffer.data_ptr() + offset
         _touch_every_huge_page(address, size, numa_node)
-        _collapse_into_huge_pages(address, size)
-        huge = anon_huge_page_bytes(address, address + size)
-        if huge < size:
+        # LMCache's L1 is an aligned slice of a larger mapping, so smaps cannot
+        # count its huge pages; MADV_COLLAPSE succeeding over the aligned
+        # range is the check.
+        if not _collapse_into_huge_pages(address, size):
             raise RuntimeError(
-                f"LMCache MP L1 chunk at {address:#x} is {huge / 2**30:.2f} of "
-                f"{size / 2**30:.2f} GiB huge pages after MADV_COLLAPSE on NUMA "
-                f"node {numa_node}; the Store adapter cannot register it as one "
-                "MR. Free or compact the node's memory (the launcher's "
+                f"LMCache MP L1 chunk at {address:#x} ({size / 2**30:.2f} GiB) "
+                f"is not all huge pages after MADV_COLLAPSE on NUMA node "
+                f"{numa_node}; the Store adapter cannot register it as one MR. "
+                "Free or compact the node's memory (the launcher's "
                 "numa_memory_budget.py --compact) and restart"
             )
         return pin_chunk(self, offset, size)

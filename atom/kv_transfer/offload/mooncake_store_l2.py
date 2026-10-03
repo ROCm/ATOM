@@ -699,7 +699,7 @@ def _touch_every_huge_page(address: int, length: int, node: int) -> None:
             )
 
 
-def _collapse_into_huge_pages(address: int, length: int) -> None:
+def _collapse_into_huge_pages(address: int, length: int) -> bool:
     """Ask the kernel to rebuild the range's 4 KiB stretches as huge pages.
 
     A huge-page fault that finds no free 2 MiB block on the bound node falls
@@ -709,7 +709,9 @@ def _collapse_into_huge_pages(address: int, length: int) -> None:
     page, which on pit2-p03-g40 happened to one of four stages allocating at
     once and not to the others, so it is retried a few times with a growing
     pause. Best effort: the caller counts again. It must run before the range
-    is pinned, since pinned pages cannot move.
+    is pinned, since pinned pages cannot move. Returns whether the last
+    madvise succeeded, which over a 2 MiB-aligned range means every 2 MiB
+    of it is a huge page.
     """
     libc = _libc()
     for attempt, delay_s in enumerate((*_COLLAPSE_RETRY_DELAYS_S, None), start=1):
@@ -718,7 +720,7 @@ def _collapse_into_huge_pages(address: int, length: int) -> None:
                 logger.info(
                     "LMCache L1: MADV_COLLAPSE succeeded on attempt %d", attempt
                 )
-            return
+            return True
         error = ctypes.get_errno()
         logger.warning(
             "LMCache L1: madvise(MADV_COLLAPSE) of %.2f GiB failed on attempt %d: %s",
@@ -727,8 +729,9 @@ def _collapse_into_huge_pages(address: int, length: int) -> None:
             os.strerror(error),
         )
         if delay_s is None or error not in (errno.ENOMEM, errno.EAGAIN):
-            return
+            return False
         time.sleep(delay_s)
+    return False
 
 
 def _host_register(address: int, length: int) -> None:
