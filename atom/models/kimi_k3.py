@@ -182,15 +182,16 @@ class SituAndMul(nn.Module):
         self,
         beta: float = 1.0,
         linear_beta: float | None = None,
-        fused_quant: bool = False,
+        quant_type: QuantType | None = None,
+        quant_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
-        # Fuse per-token FP8 quant into the activation only when the consuming
-        # down_proj runs a8w8 per-token FP8 AND linear_beta is set (the aiter
-        # kernel always applies the linear-beta tanh to the up half).
-        self.fused_quant = fused_quant and linear_beta is not None
+        # Fusion requires linear_beta because both quantized kernels apply its
+        # tanh to the up half.
+        self.quant_type = quant_type if linear_beta is not None else None
+        self.quant_dtype = quant_dtype if linear_beta is not None else None
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         from atom.model_ops.kimi_k3 import situ_and_mul_maybe_quant
@@ -198,7 +199,11 @@ class SituAndMul(nn.Module):
         # Always (activation, scale): (fp8, scale) when fused, else (bf16, None),
         # so KimiMLP takes the same down_proj(x_scale=) call site.
         return situ_and_mul_maybe_quant(
-            x, self.beta, self.linear_beta, quant=self.fused_quant
+            x,
+            self.beta,
+            self.linear_beta,
+            quant_type=self.quant_type,
+            quant_dtype=self.quant_dtype,
         )
 
 
@@ -270,19 +275,20 @@ class KimiMLP(nn.Module):
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
-        # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
-        # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
-        # standalone quant. gate_up/down share a scheme, so probe down_proj.
+        # Fuse SiTUv2 with the down projection's activation quant. MXFP4 is
+        # selected here but gated to M<32 inside the op, where its consumer uses
+        # the non-shuffled scale layout; larger M returns bf16 and self-quantizes.
         down_type, down_dtype = _effective_layer_quant(
             quant_config, f"{prefix}.down_proj"
         )
         self._fuse_act_quant = (
             down_type == QuantType.per_Token and down_dtype == dtypes.fp8
-        )
+        ) or (down_type == QuantType.per_1x32 and down_dtype == dtypes.fp4x2)
         self.act_fn = SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
-            fused_quant=self._fuse_act_quant,
+            quant_type=down_type if self._fuse_act_quant else None,
+            quant_dtype=down_dtype if self._fuse_act_quant else None,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

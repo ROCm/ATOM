@@ -23,6 +23,51 @@ except ImportError:  # pragma: no cover
 if _HAS_TRITON:
 
     @triton.jit
+    def _round_fp32_to_bf16_fp32(x):
+        """Force the exact RNE BF16 round that a standalone store/reload performs."""
+        bits = x.to(tl.uint32, bitcast=True)
+        bits += 0x7FFF + ((bits >> 16) & 1)
+        return (bits & 0xFFFF0000).to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def _mxfp4_roundup_quant(x, BLOCK: tl.constexpr):
+        """Match AITER's default MXFP4 RoundUp/RCEIL scale and E2M1 packing."""
+        grouped = x.reshape(1, BLOCK // 32, 32)
+        amax = tl.max(tl.abs(grouped), axis=-1, keep_dims=True)
+        ratio = tl.maximum(amax, 6.0 * (2**-126)) * (1.0 / 6.0)
+        scale_u32 = (ratio.to(tl.uint32, bitcast=True) + 0x7FFFFF) >> 23
+        scale = scale_u32.to(tl.uint8)
+        inv_scale = ((254 - scale_u32) << 23).to(tl.float32, bitcast=True)
+        qx = (grouped * inv_scale).to(tl.uint32, bitcast=True)
+
+        sign = qx & 0x80000000
+        qx ^= sign
+        qx_f32 = qx.to(tl.float32, bitcast=True)
+        saturate = qx_f32 >= 6.0
+        denormal = (not saturate) & (qx_f32 < 1.0)
+        normal = not (saturate | denormal)
+
+        denorm_bias: tl.constexpr = 149 << 23
+        denorm = (qx_f32 + tl.cast(denorm_bias, tl.float32, bitcast=True)).to(
+            tl.uint32, bitcast=True
+        )
+        denorm = (denorm - denorm_bias).to(tl.uint8)
+
+        mant_odd = (qx >> 22) & 1
+        normal_q = (
+            qx.to(tl.int32) + ((1 - 127) << 23) + (1 << 21) - 1 + mant_odd.to(tl.int32)
+        )
+        normal_q = (normal_q >> 22).to(tl.uint8)
+        e2m1 = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
+        e2m1 = tl.where(normal, normal_q, e2m1)
+        e2m1 = tl.where(denormal, denorm, e2m1)
+        e2m1 |= (sign >> 28).to(tl.uint8)
+        e2m1 = e2m1.reshape(1, BLOCK // 32, 16, 2)
+        evens, odds = tl.split(e2m1)
+        packed = (evens | (odds << 4)).reshape(1, BLOCK // 2)
+        return packed, scale.reshape(1, BLOCK // 32)
+
+    @triton.jit
     def _situ_and_mul_kernel(
         x_ptr,
         y_ptr,
@@ -51,6 +96,41 @@ if _HAS_TRITON:
             u = linear_beta * (2.0 * tl.sigmoid(2.0 * u * inv_linear_beta) - 1.0)
         y = out * u
         tl.store(y_ptr + row * stride_ym + col, y.to(y_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _situ_and_mul_mxfp4_quant_kernel(
+        x_ptr,
+        y_ptr,
+        s_ptr,
+        D,
+        stride_xm,
+        beta,
+        inv_beta,
+        linear_beta,
+        inv_linear_beta,
+    ):
+        pid = tl.program_id(0)
+        groups = D // 32
+        row = pid // groups
+        group = pid % groups
+        local = tl.arange(0, 32)
+        cols = group * 32 + local
+        g = tl.load(x_ptr + row * stride_xm + cols).to(tl.float32)
+        u = tl.load(x_ptr + row * stride_xm + D + cols).to(tl.float32)
+        gate = beta * (2.0 * tl.sigmoid(2.0 * g * inv_beta) - 1.0) * tl.sigmoid(g)
+        up = linear_beta * (2.0 * tl.sigmoid(2.0 * u * inv_linear_beta) - 1.0)
+        # Match the unfused path exactly: SiTUv2 first stores BF16, then the
+        # standalone quant kernel reloads and widens that rounded value.
+        activation = _round_fp32_to_bf16_fp32(gate * up)
+        packed, scales = _mxfp4_roundup_quant(activation[None, :], 32)
+        tl.store(
+            y_ptr + row * (D // 2) + group * 16 + tl.arange(0, 16),
+            packed.reshape(16),
+        )
+        tl.store(
+            s_ptr + row * groups + group + tl.arange(0, 1),
+            scales.reshape(1),
+        )
 
     @triton.jit
     def _rmsnorm_gated_kernel(
@@ -211,29 +291,69 @@ def situ_and_mul_quant(
     return out, scale
 
 
+def _situ_and_mul_mxfp4_quant_fake(
+    x: torch.Tensor, beta: float, linear_beta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del beta, linear_beta
+    m = x.numel() // x.shape[-1]
+    d = x.shape[-1] // 2
+    return (
+        torch.empty((m, d // 2), dtype=dtypes.fp4x2, device=x.device),
+        torch.empty((m, d // 32), dtype=dtypes.fp8_e8m0, device=x.device),
+    )
+
+
+@torch_compile_guard(gen_fake=_situ_and_mul_mxfp4_quant_fake, mutates_args=[])
+def situ_and_mul_mxfp4_quant(
+    x: torch.Tensor, beta: float, linear_beta: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SiTUv2 fused with non-shuffled per-1x32 MXFP4 quant."""
+    assert linear_beta is not None, "MXFP4 SiTUv2 fusion requires linear_beta"
+    two_d = x.shape[-1]
+    d = two_d // 2
+    assert d % 32 == 0, f"MXFP4 SiTUv2 fusion requires D % 32 == 0, got {d}"
+    x2 = x.reshape(-1, two_d).contiguous()
+    m = x2.shape[0]
+    out = torch.empty((m, d // 2), dtype=torch.uint8, device=x.device)
+    scale = torch.empty((m, d // 32), dtype=torch.uint8, device=x.device)
+    if m > 0:
+        _situ_and_mul_mxfp4_quant_kernel[(m * (d // 32),)](
+            x2,
+            out,
+            scale,
+            d,
+            x2.stride(0),
+            float(beta),
+            1.0 / float(beta),
+            float(linear_beta),
+            1.0 / float(linear_beta),
+            num_warps=1,
+        )
+    return out.view(dtypes.fp4x2), scale.view(dtypes.fp8_e8m0)
+
+
 def situ_and_mul_maybe_quant(
     x: torch.Tensor,
     beta: float,
     linear_beta: float | None,
-    quant: bool = False,
+    quant_type: QuantType | None = None,
+    quant_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """SiTUv2 gated activation, optionally fused with per-token FP8 quant.
+    """SiTUv2 gated activation, optionally fused with its consumer's quant.
 
     Unifies the quant and non-quant paths behind one call site so the caller
     always does ``down_proj(x, x_scale=scale)``:
 
-    - ``quant=False``: return ``(bf16 [..., d], None)``. The ``None`` scale makes
-      ``down_proj(x, x_scale=None)`` fall back to its own standalone activation
-      quant.
-    - ``quant=True``: fuse SiTUv2 + per-token FP8 quant into one aiter kernel and
-      return ``(fp8 [m, d], scale [m, 1])`` for down_proj's ``x_scale=`` path
-      (dense-MLP / shared-expert under ptpc_fp8).
-
-    Unlike :func:`fused_sigmoid_mul_maybe_quant`, there is no scheme selector: the
-    aiter ``situv2_and_mul_quant`` kernel implements only the per-token scheme.
+    - per-token FP8 uses AITER's fused SiTUv2 quant kernel;
+    - per-1x32 MXFP4 fuses only for ``M < 32``, where the consuming GEMM expects
+      the non-shuffled scale layout;
+    - every other shape returns ``(bf16, None)`` and lets the Linear quantize.
     """
-    if quant:
+    if quant_type == QuantType.per_Token and quant_dtype == dtypes.fp8:
         return situ_and_mul_quant(x, beta, linear_beta)
+    m = x.numel() // x.shape[-1]
+    if quant_type == QuantType.per_1x32 and quant_dtype == dtypes.fp4x2 and m < 32:
+        return situ_and_mul_mxfp4_quant(x, beta, linear_beta)
     return situ_and_mul(x, beta, linear_beta), None
 
 
