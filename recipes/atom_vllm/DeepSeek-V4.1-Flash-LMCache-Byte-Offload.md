@@ -76,11 +76,37 @@ implemented.
 
 The cap is installed as a patch on `Scheduler._get_local_prefix_cache_hit`
 from `register_model`, not by selecting a scheduler subclass from the
-platform hook: measured on a V4.1 serve, `ATOMPlatform.check_and_update_config`
-ran **zero** times while the model wrapper's own hook ran four. A scheduler
-chosen there is a scheduler never chosen, and the symptom is prefix caching
-coming up uncapped -- the dead engine the cap exists to prevent, reintroduced
-by where it was installed.
+platform hook. Measured on a V4.1 serve,
+`ATOMPlatform.check_and_update_config` did not run:
+`enforce_deepseek_v41_constraints` is called from both it and the model
+wrapper, and its line appears four times, once per worker, with none from
+EngineCore; `_select_hybrid_aware_scheduler` logs on **both** of its
+branches and logged on neither. A scheduler chosen there is a scheduler never
+chosen, and the symptom is prefix caching coming up uncapped -- the dead
+engine the cap exists to prevent, reintroduced by where it was installed.
+
+### The same install site carries two other things
+
+`check_and_update_config` is also where `_enforce_deepseek_v4_constraints`
+and `_select_hybrid_aware_scheduler` are called from, and neither has a
+second home the way `enforce_deepseek_v41_constraints` does. **Unverified for
+the models they serve** -- the measurement above is V4.1 -- but the cause the
+state-reserve patch documents is about import timing rather than the model
+(`register_platform` can raise on a half-built `vllm` package and the loader
+swallows it), so it is not obviously specific to this one.
+
+If it does happen there, the two fail differently:
+
+* DeepSeek-V4 would come up with prefix caching enabled and **without** its
+  SWA-recompute patch, restoring compressed pages over a window ring that was
+  never repopulated. V4 has no cursor check, so that is silent wrong output,
+  not a crash.
+* A hybrid model (M3, GLM, Kimi-K3) would lose the KV-load-failure scheduler
+  and, per that function's own docstring, abort the engine on the first
+  failed load.
+
+Worth a `grep` for either function's log line on any serve that depends on
+them, rather than assuming the hook ran.
 
 ## Why caching is off by default here
 
