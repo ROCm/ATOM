@@ -1270,12 +1270,29 @@ its owners once the router closes.
 | `LMCACHE_MOONCAKE_OWNER_THREADS`, `LMCACHE_MOONCAKE_OWNER_MAX_MR_SIZE` | 4, 64 GiB | Owner service threads; MR size the segment is split into. |
 | `LMCACHE_MOONCAKE_MASTER_WAIT_TIMEOUT`, `LMCACHE_MOONCAKE_WAIT_TIMEOUT` | 120 s, 1200 s | Readiness deadlines of the master and of the owners' capacity. |
 | `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS` | `MODEL_PATH` | Colon-separated directories whose clean page cache is dropped before the owners allocate (suite `lmcache_mooncake`: `${ATOMESH_MODEL_ROOT}`, every model on the node). |
-| `LMCACHE_MOONCAKE_NODE_RESERVE_GIB` | 128 | Memory each NUMA node keeps beyond the owners and the stages' L1s (`LMCACHE_MAX_LOCAL_CPU_SIZE` per prefill GPU); a plan that leaves less fails the start. |
+| `LMCACHE_MOONCAKE_NODE_RESERVE_GIB` | 128 | Memory each NUMA node keeps beyond the owners and the L1s (`LMCACHE_MAX_LOCAL_CPU_SIZE` per prefill GPU, or the MP servers' `LMCACHE_MP_STAGE_SERVERS` sizes); a plan that leaves less fails the start. |
+| `LMCACHE_MP_STORE_MAX_MR_SIZE` | 1 TiB | `MC_MAX_MR_SIZE` of the MP servers' Store L2. LMCache can place an L1 object across two MRs, which the adapter refuses, so keep it at or above the L1 size. |
 | `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_SECONDS` | 1800 | How long the model's page cache keeps being dropped while weights load. |
 | `ATOMESH_MOONCAKE_{MASTER,METADATA,METRICS,OWNER}_PORT` | 26051, 26080, 26090, 26052 | Ports, shifted by `ATOMESH_SERVICE_PORT_OFFSET`; pool *i*'s master uses the base + 100 x *i*, owner *i* the base + *i*. Below Linux's ephemeral port range (32768-60999), where an outgoing connection could hold one. |
 
 The Store needs an image built with Mooncake `WITH_STORE=ON` (`mooncake_master`,
 `mooncake_client`, `mooncake.store`); the CI image builds `WITH_STORE=OFF`.
+
+### Mooncake Store as the MP servers' L2
+
+With `LMCACHE_MP_SERVER=1` and `LMCACHE_MOONCAKE_L2=1` together, the Store is
+the L2 of the LMCache MP servers instead of the in-process engines': the
+launcher starts the masters and owners as above, then one MP server per PP
+stage, each through `python -m atom.kv_transfer.offload.mp.mooncake_l2_server`,
+which gives LMCache's server a `mooncake_store` `--l2-adapter` and runs it.
+
+| Does | Because |
+|------|---------|
+| One server per PP stage (`LMCACHE_MP_STAGE_SERVERS` entries `<numa>:<s>-<s>:<GiB>`); the launcher refuses a multi-stage entry and a case-set `--l2-adapter`. | LMCache keeps one layout per (model, world size), so a server serving stages with different layer counts sizes its L2 prefetches wrongly (`lmcache.mp.server_per_rank_layouts`). |
+| Each server's adapter uses its stage GPU's NIC and, with per-NIC pools, that NIC's pool, chosen as the in-process L2 chooses a worker's. | Same NIC rules as the in-process L2. |
+| The server's L1 is glibc THP malloc (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`), `--l1-align-bytes 2097152` and `--l1-init-size-gb` equal to its size, registered as one MR (`MC_MAX_MR_SIZE` 1 TiB). | The adapter registers the whole L1 at startup. Without THP an ionic NIC refused the L1 after about 2 GiB (EINVAL); with THP but a 4 KiB-aligned base, the MR held 4 KiB pages at its ends and failed (ENOMEM). A shortfall now fails the server's start. |
+| Puts L1 objects back on 4 KiB on that 2 MiB base (`keep_l1_objects_page_aligned`). | LMCache aligns every object to `--l1-align-bytes` as well: each ~3 MB chunk would take a 4 MiB slot, a quarter of the L1. |
+| The scheduler asks the servers without waiting (`lmcache.mp.nonblocking_lookup`, on by default with `lmcache.mp.l2: present`): a request whose lookup is still prefetching keeps its place in line while the requests behind it are admitted; at most `lmcache.mp.max_pending_lookups` (8) are outstanding. | A server answers a lookup only once it has prefetched the hit's L2 part into L1, so a blocking lookup held the scheduler thread for an L2 read on nearly every hit. The bound keeps prefetches for unadmitted requests from filling the L1 under read locks. |
 
 ## How to Run
 
