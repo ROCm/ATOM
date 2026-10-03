@@ -942,7 +942,7 @@ start_lmcache_mp_servers() {
   done
   # Under LMCACHE_MOONCAKE_L2=1 the Store is every server's L2, on the NIC of
   # the one GPU its stage runs on (check_mooncake_mp_server_settings).
-  local -a store_l2_env=()
+  local -a store_l2_env=() store_l2_server_args=()
   if mooncake_store_running; then
     local -a stage_gpus=()
     IFS=',' read -r -a stage_gpus <<< "${HIP_VISIBLE_DEVICES:-}"
@@ -968,6 +968,14 @@ start_lmcache_mp_servers() {
     else
       store_l2_env+=("ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES=$(mooncake_owner_devices_csv)")
     fi
+    # A server answers a lookup only after it reserves L1 room for the whole
+    # L2 part of the hit, all or nothing. Write-through stores that stay in L1
+    # kept the 48 GiB L1s ~92% full, most reservations failed and the L2 hits
+    # were dropped (GLM-5.2 c96: cache read 39%, 0.45 req/s). Dropping each
+    # chunk from L1 once its L2 put lands leaves the L1 to in-flight stores
+    # and prefetches: 95% cache read, 2.67 req/s, on par with the in-process
+    # Store L2. Before the case's arguments, which may override it.
+    store_l2_server_args=(--l2-store-policy skip_l1)
     # The Store's own dropper already runs while the workers load.
     numa_bound=0
   fi
@@ -1005,6 +1013,7 @@ start_lmcache_mp_servers() {
       --max-gpu-workers "${LMCACHE_MP_GPU_WORKERS:-4}"
       --max-cpu-workers "${LMCACHE_MP_CPU_WORKERS:-4}"
       --prometheus-port "${prometheus_port}"
+      ${store_l2_server_args[@]+"${store_l2_server_args[@]}"}
       ${extra_args[@]+"${extra_args[@]}"}
     )
     if [[ "${#store_l2_env[@]}" -gt 0 ]]; then

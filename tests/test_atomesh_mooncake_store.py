@@ -938,6 +938,17 @@ class LauncherWiringTest(unittest.TestCase):
         mp_env = mp_env.split("elif mooncake_store_running; then")[0]
         self.assertIn('prefill_offload_env+=("MC_NUM_QP_PER_EP=1")', mp_env)
         self.assertNotIn("mooncake_l2_prefill_env", mp_env)
+        # The MP servers drop each chunk from L1 once its Store put lands, and
+        # a case's own LMCACHE_MP_EXTRA_ARGS come after, so they can override.
+        servers = self.source.split("start_lmcache_mp_servers() {")[1]
+        servers = servers.split("\n}\n")[0]
+        self.assertIn("store_l2_server_args=(--l2-store-policy skip_l1)", servers)
+        server_cmd = servers.split("python3 -m lmcache.v1.multiprocess.server")[1]
+        server_cmd = server_cmd.split("\n    )\n")[0]
+        self.assertLess(
+            server_cmd.index('${store_l2_server_args[@]+"${store_l2_server_args[@]}"}'),
+            server_cmd.index('${extra_args[@]+"${extra_args[@]}"}'),
+        )
         decode = self.source.split("start_decode() {")[1].split("\n}\n")[0]
         self.assertIn('decode_mooncake_env=("MC_NUM_QP_PER_EP=1")', decode)
         self.assertIn('"${decode_mooncake_env[@]}" "${decode_cmd[@]}"', decode)
