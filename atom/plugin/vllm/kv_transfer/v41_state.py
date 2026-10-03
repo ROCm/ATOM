@@ -409,17 +409,19 @@ class V41BoundaryPlanner:
         hit = int(hit)
         if hit <= 0:
             return hit
-        block_hashes = getattr(request, "block_hashes", None) or ()
-        boundary = (hit // self.state_interval) * self.state_interval
-        for _ in range(_MAX_CAP_DESCENT):
-            if boundary <= 0:
-                self._counters["local_cap_declined"] += 1
-                return 0
-            h = self.boundary_hash(block_hashes, boundary)
-            if h is not None and self._index.could_serve(h):
-                self._counters["local_cap_kept"] += 1
-                return min(hit, boundary)
-            boundary -= self.state_interval
+        # Refused outright, not shortened. Shortening a local hit to a
+        # boundary the index holds looks right and is not: nothing then
+        # *restores* that state. `resolve_load` runs only for tokens the
+        # connector supplied, so a locally served prefix arrives with its
+        # pages in HBM and a slot that was never written -- measured as
+        # `needs state at 8192, found 0`, the cap having picked 8192 and
+        # nobody having filled it.
+        #
+        # For this model PAGE reuse and STATE restore are one operation, and
+        # only the connector performs both. Declining here does not lose the
+        # reuse: the connector is asked about the whole prompt next and serves
+        # the same prefix from the tier, with its state. What it costs is the
+        # HBM-speed path, which for V4.1 was never admissible on its own.
         self._counters["local_cap_declined"] += 1
         return 0
 

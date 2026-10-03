@@ -375,18 +375,21 @@ def test_a_refused_store_holds_no_staging_slab():
 # ---- local prefix-cache hits -------------------------------------------
 
 
-def test_a_local_hit_is_capped_to_a_claimed_boundary():
-    """vLLM's own pool answers before the connector is ever consulted.
+def test_a_local_hit_is_refused_even_at_a_claimed_boundary():
+    """Shortening a local hit is not enough; nothing restores the state.
 
-    A local hit restores the compressed pages and nothing else, so it has to
-    pass the same rule as an external one -- against the same index.
+    `resolve_load` runs only for tokens the connector supplied, so a locally
+    served prefix arrives with its pages in HBM and a slot nobody wrote --
+    measured as `needs state at 8192, found 0`, the cap having picked 8192.
+    PAGE reuse and STATE restore are one operation here, and only the
+    connector performs both.
     """
     planner = make_planner()
     request = make_request()
     claimed = INTERVAL * 2
     planner._index.note_stored(planner.boundary_hash(request.block_hashes, claimed))
-    assert planner.cap_local_hit(request, INTERVAL * 3 + 50) == claimed
-    assert planner.stats()["local_cap_kept"] == 1
+    assert planner.cap_local_hit(request, INTERVAL * 3 + 50) == 0
+    assert planner.stats()["local_cap_declined"] == 1
 
 
 def test_a_local_hit_with_no_stored_boundary_is_declined():
@@ -397,7 +400,11 @@ def test_a_local_hit_with_no_stored_boundary_is_declined():
 
 
 def test_local_and_external_caps_are_counted_apart():
-    """They answer different questions and must not be summed by accident."""
+    """They answer different questions and must not be summed by accident.
+
+    The external one measures the tier. The local one measures how much reuse
+    prefix caching is being denied on this model -- which is all of it.
+    """
     planner = make_planner()
     request = make_request()
     planner._index.note_stored(planner.boundary_hash(request.block_hashes, INTERVAL))
@@ -405,13 +412,11 @@ def test_local_and_external_caps_are_counted_apart():
     planner.begin_lookup(request)
     planner.cap_hit(SimpleNamespace(id="r0"), INTERVAL * 2)
     stats = planner.stats()
-    assert stats["local_cap_kept"] == 1 and stats["cap_kept"] == 1
+    assert stats["local_cap_declined"] == 1 and stats["cap_kept"] == 1
 
 
 def test_a_local_hit_needs_no_armed_lookup():
     """Unlike the connector path there is no lookup in progress to read."""
     planner = make_planner()
-    request = make_request()
-    planner._index.note_stored(planner.boundary_hash(request.block_hashes, INTERVAL))
     assert planner._lookup_ctx is None
-    assert planner.cap_local_hit(request, INTERVAL) == INTERVAL
+    assert planner.cap_local_hit(make_request(), INTERVAL) == 0
