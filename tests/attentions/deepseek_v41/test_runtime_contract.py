@@ -416,3 +416,24 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+def test_prefix_caching_is_admitted_with_the_offload_connector():
+    """The connector is what makes reuse admissible, not a separate feature.
+
+    It stores the CSA2 state at the boundaries vLLM's hashes name and caps
+    every hit -- the block pool's own included -- to one it holds. Without it
+    there is nothing to cap against, so caching stays refused; with it the
+    refusal would be refusing the thing that makes it safe.
+    """
+    validate_runtime_config(
+        vllm_plugin_config(
+            enable_prefix_caching=True,
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"},
+        )
+    )
+
+
+def test_prefix_caching_without_the_connector_is_still_refused():
+    with pytest.raises(ValueError, match="prefix caching"):
+        validate_runtime_config(vllm_plugin_config(enable_prefix_caching=True))

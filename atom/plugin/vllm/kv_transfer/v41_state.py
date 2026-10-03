@@ -312,6 +312,13 @@ class V41BoundaryPlanner:
             "cursor_mismatch": 0,
             "cap_kept": 0,
             "cap_declined": 0,
+            # The same two, for hits vLLM served from its own pool without
+            # asking the connector. Kept apart because they answer different
+            # questions: the connector pair measures the tier, this pair
+            # measures what prefix caching costs on a model whose state the
+            # block pool does not carry.
+            "local_cap_kept": 0,
+            "local_cap_declined": 0,
         }
         self._last_stats_log = 0.0
         if self.state_interval % self.chunk_size:
@@ -383,6 +390,37 @@ class V41BoundaryPlanner:
                 return min(hit, boundary)
             boundary -= self.state_interval
         self._counters["cap_declined"] += 1
+        return 0
+
+    def cap_local_hit(self, request, hit: int) -> int:
+        """Shorten vLLM's *own* prefix-cache hit to a claimed boundary.
+
+        The connector-side `cap_hit` only sees hits vLLM asked it about. With
+        prefix caching on, vLLM's block pool answers first and keeps whatever
+        it can serve locally -- a path the connector is never consulted on. A
+        request admitted that way arrives with its PAGE prefix restored and a
+        state slot that was never written, which `_report_stale_state` turns
+        into a dead engine.
+
+        So the local hit is capped by the same rule and the same index. Unlike
+        the connector path there is no armed lookup to read, so the request is
+        the only context and is taken directly.
+        """
+        hit = int(hit)
+        if hit <= 0:
+            return hit
+        block_hashes = getattr(request, "block_hashes", None) or ()
+        boundary = (hit // self.state_interval) * self.state_interval
+        for _ in range(_MAX_CAP_DESCENT):
+            if boundary <= 0:
+                self._counters["local_cap_declined"] += 1
+                return 0
+            h = self.boundary_hash(block_hashes, boundary)
+            if h is not None and self._index.could_serve(h):
+                self._counters["local_cap_kept"] += 1
+                return min(hit, boundary)
+            boundary -= self.state_interval
+        self._counters["local_cap_declined"] += 1
         return 0
 
     def boundary_hash(self, block_hashes, boundary_tokens: int) -> int | None:

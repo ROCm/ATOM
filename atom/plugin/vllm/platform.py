@@ -127,7 +127,9 @@ def _select_hybrid_aware_scheduler(vllm_config) -> None:
     try:
         from atom.plugin.vllm.scheduler import select_scheduler_cls
 
-        chosen = select_scheduler_cls(sc)
+        chosen = select_scheduler_cls(
+            sc, deepseek_v41=_is_deepseek_v41(getattr(vllm_config, "model_config", None))
+        )
     except Exception:
         logger.warning(
             "ATOM: could not select a hybrid-aware scheduler; vLLM's own "
@@ -137,6 +139,17 @@ def _select_hybrid_aware_scheduler(vllm_config) -> None:
         return
     if chosen is not None:
         sc.scheduler_cls = chosen
+def _v41_state_tier_configured(vllm_config) -> bool:
+    """Whether this run has a connector that owns V4.1's per-request state."""
+    kv = getattr(vllm_config, "kv_transfer_config", None)
+    if kv is None:
+        return False
+    name = getattr(kv, "kv_connector", None)
+    if name is None and isinstance(kv, dict):
+        name = kv.get("kv_connector")
+    return name == "AtomLMCacheOffloadConnector"
+
+
 def enforce_deepseek_v41_constraints(vllm_config) -> None:
     """Apply V4.1-specific plugin constraints to one config. Idempotent.
 
@@ -168,14 +181,19 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         return
 
     cache_config = getattr(vllm_config, "cache_config", None)
-    if cache_config is not None and getattr(
-        cache_config, "enable_prefix_caching", False
+    if (
+        cache_config is not None
+        and getattr(cache_config, "enable_prefix_caching", False)
+        and not _v41_state_tier_configured(vllm_config)
     ):
         msg = (
-            "DeepSeek-V4.1 on the vLLM plugin does not support prefix caching: a "
-            "block-table hit restores the compressed pages but not the "
-            "per-request window ring, compressor rings or Engram cursor that "
-            "CSA2 attention reads alongside them. Pass --no-enable-prefix-caching."
+            "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "
+            "alongside AtomLMCacheOffloadConnector, which owns a tier for the "
+            "per-request window ring, compressor rings and Engram cursor that a "
+            "block-table hit does not replay -- and caps every hit, local or "
+            "external, to a boundary whose state was stored. Without it a hit "
+            "restores the compressed pages over state that never existed. Pass "
+            "--no-enable-prefix-caching, or configure the connector."
         )
         logger.error(msg)
         raise ValueError(msg)

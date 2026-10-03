@@ -176,6 +176,66 @@ class _HybridKVLoadFailureMixin:
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
 
+class _V41LocalHitCapMixin:
+    """Cap vLLM's own prefix-cache hit to a boundary whose CSA2 STATE exists.
+
+    DeepSeek-V4.1 keeps a per-request window ring, compressor rings and Engram
+    cursor that live in no block vLLM caches, and `PagedAttentionCache` refuses
+    any request whose cursor is not exactly the frontier the scheduler claims.
+    The connector caps the hits it is asked about; this caps the ones it never
+    sees, which is every hit the block pool can serve by itself.
+
+    Without it, turning prefix caching on is not a slower answer or a wrong
+    one -- it is `EngineDeadError` on the first local hit deep enough to
+    matter.
+
+    A capped hit costs a recompute. The counters that say how often are
+    `local_cap_kept` / `local_cap_declined` on the planner, reported with the
+    rest of the state leg.
+    """
+
+    def _get_local_prefix_cache_hit(self, request):
+        blocks, num_local, boundary, divergent = super()._get_local_prefix_cache_hit(
+            request
+        )
+        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        if planner is None or num_local <= 0:
+            return blocks, num_local, boundary, divergent
+        capped = int(planner.cap_local_hit(request, int(num_local)))
+        if capped >= num_local:
+            return blocks, num_local, boundary, divergent
+        block_size = int(self.cache_config.block_size)
+        # Whole blocks only: vLLM's hit is block-aligned and the pair
+        # (blocks, num_computed) has to stay consistent or the request reads
+        # KV from blocks it was not told it has.
+        drop = -(-(int(num_local) - capped) // block_size)
+        from atom.plugin.vllm.deepseek_v4_prefix_patch import _drop_swa_warmup_blocks
+
+        return (
+            *_drop_swa_warmup_blocks(
+                self.kv_cache_manager,
+                blocks,
+                int(num_local),
+                boundary,
+                warmup_blocks=drop,
+                block_size=block_size,
+            ),
+            divergent,
+        )
+
+
+class VllmAtomV41Scheduler(
+    _V41LocalHitCapMixin, _HybridKVLoadFailureMixin, Scheduler
+):
+    """V4.1: local hits capped to a stored STATE boundary."""
+
+
+class VllmAtomV41AsyncScheduler(
+    _V41LocalHitCapMixin, _HybridKVLoadFailureMixin, AsyncScheduler
+):
+    """V4.1, async."""
+
+
 class VllmAtomScheduler(_HybridKVLoadFailureMixin, Scheduler):
     """Synchronous scheduler with hybrid-aware KV-load-failure recovery."""
 
@@ -201,7 +261,7 @@ def vllm_needs_hybrid_kv_load_fix() -> bool:
         return True
 
 
-def select_scheduler_cls(scheduler_config) -> str | None:
+def select_scheduler_cls(scheduler_config, *, deepseek_v41: bool = False) -> str | None:
     """Return the qualified name of the scheduler to use, or None to leave vLLM's.
 
     Returns None whenever the caller already chose a scheduler, or vLLM no
@@ -213,6 +273,21 @@ def select_scheduler_cls(scheduler_config) -> str | None:
     """
     if getattr(scheduler_config, "scheduler_cls", None) is not None:
         return None
+    if deepseek_v41:
+        # Unconditional for this model: the local-hit cap is not a workaround
+        # for a vLLM shortcoming that may already be fixed, it is what makes
+        # prefix caching admissible at all here.
+        name = (
+            "VllmAtomV41AsyncScheduler"
+            if getattr(scheduler_config, "async_scheduling", False)
+            else "VllmAtomV41Scheduler"
+        )
+        logger.info(
+            "ATOM: selecting %s so DeepSeek-V4.1's local prefix-cache hits are "
+            "capped to a boundary whose CSA2 state was stored.",
+            name,
+        )
+        return f"atom.plugin.vllm.scheduler.{name}"
     if not vllm_needs_hybrid_kv_load_fix():
         logger.info(
             "ATOM: vLLM's KV-load-failure recovery already handles hybrid KV "

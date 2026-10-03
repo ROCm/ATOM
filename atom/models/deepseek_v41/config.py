@@ -349,6 +349,12 @@ def validate_speculative_config(config):
 _VLLM_PLUGIN_KV_CONNECTORS = ("AtomLMCacheOffloadConnector",)
 
 
+def _kv_connector_owns_v41_state(config) -> bool:
+    """Whether a connector with a tier for V4.1's per-request state is on."""
+    kv = config.kv_transfer_config or {}
+    return kv.get("kv_connector") in _VLLM_PLUGIN_KV_CONNECTORS
+
+
 def _kv_transfer_unsupported(config, on_vllm_plugin: bool) -> bool:
     """Whether this run's KV transport is one V4.1 does not implement."""
     kv_transfer_config = config.kv_transfer_config
@@ -429,12 +435,18 @@ def validate_runtime_config(config):
             "speculative decoding on the vLLM plugin",
             on_vllm_plugin and config.speculative_config is not None,
         ),
-        # TODO: CSA2 blocks are only reusable at whole-PAGE boundaries after
-        # the compressor has run; vLLM's hash-based reuse would hand back
-        # blocks whose STATE side was never replayed.
+        # CSA2 blocks are reusable only at whole-PAGE boundaries after the
+        # compressor has run, and the STATE side is not replayed by a
+        # block-table hit. The offload connector is what makes reuse
+        # admissible: it stores the STATE at those boundaries and caps every
+        # hit -- vLLM's own included, through the scheduler mixin -- to one it
+        # holds. Without it there is nothing to cap against.
         (
-            "prefix caching on the vLLM plugin",
-            on_vllm_plugin and config.enable_prefix_caching,
+            "prefix caching on the vLLM plugin without "
+            "AtomLMCacheOffloadConnector",
+            on_vllm_plugin
+            and config.enable_prefix_caching
+            and not _kv_connector_owns_v41_state(config),
         ),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
