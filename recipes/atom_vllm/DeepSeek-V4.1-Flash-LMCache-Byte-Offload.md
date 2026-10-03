@@ -92,6 +92,34 @@ Run-to-run variance, from a second window per arm: OFF 0.5 %, ON 1.5 % -- the
 effect is ~30x that. The ON window above starts on a cold tier, so it is the
 conservative one (a warm repeat read 1.452 req/s, +45.8 %).
 
+### The same tier at three working points
+
+| concurrency | output tokens | prefix share | req/s OFF -> ON | delta |
+|---|---|---|---|---|
+| 1 | 8 | 16,384 / 20,384 | 0.995 -> 1.431 | **+43.7 %** |
+| 8 | 8 | 16,384 / 20,384 | 1.880 -> 2.207 | **+17.1 %** |
+| 8 | 128 | 8,192 / 20,192 | 0.712 -> 0.689 | **−3.3 %** |
+
+One implementation, three answers. The third is Amdahl: with 128 output
+tokens decode is 92 % of request latency, the tier supplied 10.6 % of prompt
+tokens, and the ~3 % ITL cost is larger than what is left to win.
+
+The second is a scheduling effect worth naming, because it is the lever for
+raising it. A boundary only exists where the frontier *lands*, and vLLM
+spends one shared token budget across the step: with
+`max-num-batched-tokens 4096` and six decodes in the batch, the prefill
+request is scheduled 4,090 tokens, not 4,096, so the frontier lands at an
+arbitrary offset and steps over the 4,096-token grid. Measured over that
+window: `boundary_passed` 1,315 against `sweep_offered` 106, and
+`cap_declined` 248 against `cap_kept` 102 -- seven hits in ten are refused
+for want of a claimed boundary. The hits that do happen come from decode,
+where the frontier advances one token at a time and eventually lands exactly.
+
+Raising concurrency therefore does not reduce what the tier *can* do, it
+reduces how often a boundary is reachable. Aligning a prefill chunk to the
+interval is a scheduler-side change and is the next lever; `boundary_passed`
+is the number to watch.
+
 **The output length is load-bearing and is why it is stated first.** Offload
 removes prefill work and no decode work, so the ceiling is Amdahl's. The same
 tier on the same prompts with 128 output tokens is capped near **+6 %**,
