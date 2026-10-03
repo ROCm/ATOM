@@ -735,7 +735,18 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
 
     def test_conflicting_settings_are_refused_before_anything_starts(self):
         for env in (
+            # An MP server's Store L2 needs one server per PP stage, and the
+            # launcher owns its --l2-adapter.
             {"LMCACHE_MP_SERVER": "1"},
+            {
+                "LMCACHE_MP_SERVER": "1",
+                "LMCACHE_MP_STAGE_SERVERS": "0:0-1:96;0:2-3:96",
+            },
+            {
+                "LMCACHE_MP_SERVER": "1",
+                "LMCACHE_MP_STAGE_SERVERS": "0:0-0:96;0:1-1:96",
+                "LMCACHE_MP_EXTRA_ARGS": '--l2-adapter {"type":"mock"}',
+            },
             {"LMCACHE_EXTRA_CONFIG": "{}"},
             {"LMCACHE_REMOTE_URL": "mooncakestore://x:1/"},
             {"MC_NUM_QP_PER_EP": "2"},
@@ -759,7 +770,16 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         for env, message in (
             (
                 {"ATOMESH_PREFILL_ENV_LMCACHE_MP_SERVER": "1"},
-                "cannot be combined with LMCACHE_MP_SERVER",
+                "each MP server serves one PP stage",
+            ),
+            (
+                {
+                    "ATOMESH_PREFILL_ENV_LMCACHE_MP_SERVER": "1",
+                    "ATOMESH_PREFILL_ENV_LMCACHE_MP_STAGE_SERVERS": (
+                        "0:0-1:96;0:2-3:96"
+                    ),
+                },
+                "entry 1 serves stages 0-1",
             ),
             ({"ATOMESH_DECODE_ENV_MC_NUM_QP_PER_EP": "2"}, "MC_NUM_QP_PER_EP=2"),
             ({"ATOMESH_ENV_MC_NUM_QP_PER_EP": "4"}, "MC_NUM_QP_PER_EP=4"),
@@ -794,6 +814,13 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         )
         self.assertIn("LEAKED=none", result.stdout)
         self.assertEqual(self.calls.read_text(), "")
+        # One MP server per stage takes the Store as its L2.
+        self.run_shell(
+            "validate_mooncake_l2_settings\n",
+            **ok,
+            ATOMESH_PREFILL_ENV_LMCACHE_MP_SERVER="1",
+            ATOMESH_PREFILL_ENV_LMCACHE_MP_STAGE_SERVERS="0:0-0:96;0:1-1:96",
+        )
 
     def test_disabled_without_the_prefill_flag(self):
         self.run_shell(

@@ -940,6 +940,30 @@ start_lmcache_mp_servers() {
   for i in "${!lmcache_mp_plan_numa[@]}"; do
     [[ -n "${lmcache_mp_plan_numa[i]}" ]] && numa_bound=1
   done
+  # Under LMCACHE_MOONCAKE_L2=1 the Store is every server's L2, on the NIC of
+  # the one GPU its stage runs on (check_mooncake_mp_server_settings).
+  local -a store_l2_env=()
+  if mooncake_store_running; then
+    local -a stage_gpus=()
+    IFS=',' read -r -a stage_gpus <<< "${HIP_VISIBLE_DEVICES:-}"
+    if [[ "${#stage_gpus[@]}" -ne "${#lmcache_mp_plan_first_stage[@]}" ]]; then
+      echo "[lmcache-mp][FAIL] a server with a Store L2 serves one stage on one GPU: HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-} has ${#stage_gpus[@]} GPUs for ${#lmcache_mp_plan_first_stage[@]} stage servers" >&2
+      exit 2
+    fi
+    lmcache_mp_l2="present"
+    store_l2_env=(
+      "MC_NUM_QP_PER_EP=1"
+      "MC_TCP_BIND_ADDRESS=${host_ip}"
+      "MC_MAX_MR_SIZE=${LMCACHE_MP_STORE_MAX_MR_SIZE:-1099511627776}"
+    )
+    if [[ -n "${mooncake_pool_devices[0]}" ]]; then
+      store_l2_env+=("ATOM_LMCACHE_MOONCAKE_POOLS=$(mooncake_pools_json)")
+    else
+      store_l2_env+=("ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES=$(mooncake_owner_devices_csv)")
+    fi
+    # The Store's own dropper already runs while the workers load.
+    numa_bound=0
+  fi
   if [[ "${numa_bound}" -eq 1 ]]; then
     # Clean weight pages on a bound node would be reclaimed on every L1
     # allocation; drop them now and while the workers load weights. Page
@@ -976,11 +1000,24 @@ start_lmcache_mp_servers() {
       --prometheus-port "${prometheus_port}"
       ${extra_args[@]+"${extra_args[@]}"}
     )
+    if [[ "${#store_l2_env[@]}" -gt 0 ]]; then
+      # The Store L2 registers the whole L1 with the NIC when the server
+      # starts, so the L1 is allocated and pinned up front.
+      server_cmd=(
+        python3 -m atom.kv_transfer.offload.mp.mooncake_l2_server
+        --gpu "${lmcache_mp_plan_first_stage[i]}" --local-hostname "${host_ip}"
+        --master "${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}"
+        --metadata "http://${host_ip}:${ATOMESH_MOONCAKE_METADATA_PORT}/metadata"
+        -- "${server_cmd[@]:3}"
+        --l1-init-size-gb "${lmcache_mp_plan_l1_gb[i]}"
+      )
+    fi
     if [[ -n "${lmcache_mp_plan_numa[i]}" ]]; then
       server_cmd=(python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${lmcache_mp_plan_numa[i]}" "${server_cmd[@]}")
     fi
-    dump_launch_info "LMCACHE_MP" "${server_cmd[@]}"
-    LMCACHE_TRACK_USAGE=false setsid "${server_cmd[@]}" >"${log}" 2>&1 &
+    dump_launch_info "LMCACHE_MP" ${store_l2_env[@]+"${store_l2_env[@]}"} "${server_cmd[@]}"
+    env LMCACHE_TRACK_USAGE=false ${store_l2_env[@]+"${store_l2_env[@]}"} \
+      setsid "${server_cmd[@]}" >"${log}" 2>&1 &
     lmcache_mp_pids+=("$!")
     lmcache_mp_logs+=("${log}")
   done
@@ -1247,10 +1284,38 @@ mooncake_owner_devices_csv() {
 # Refuses a prefill setting the Store L2 cannot run with, and fills the owner
 # plan. Independent of the node: the owners' devices and memory are checked
 # where the Store starts.
+# With LMCACHE_MP_SERVER=1 the Store is the MP servers' L2, not the in-process
+# offload's. LMCache keeps one layout per (model, world size), so a server
+# serving stages with different layer counts would size its L2 prefetches
+# wrongly: each server serves one PP stage ("<numa>:<s>-<s>:<GiB>" entries of
+# LMCACHE_MP_STAGE_SERVERS), and the launcher gives it its --l2-adapter.
+check_mooncake_mp_server_settings() {
+  if [[ -z "${LMCACHE_MP_STAGE_SERVERS:-}" ]]; then
+    echo "[mooncake-store][FAIL] with LMCACHE_MP_SERVER=1 each MP server serves one PP stage: set LMCACHE_MP_STAGE_SERVERS with one entry per stage" >&2
+    exit 2
+  fi
+  plan_lmcache_mp_servers
+  local i
+  for i in "${!lmcache_mp_plan_first_stage[@]}"; do
+    if [[ "${lmcache_mp_plan_first_stage[i]}" != "${lmcache_mp_plan_last_stage[i]}" ]]; then
+      echo "[mooncake-store][FAIL] LMCACHE_MP_STAGE_SERVERS entry $(( i + 1 )) serves stages ${lmcache_mp_plan_first_stage[i]}-${lmcache_mp_plan_last_stage[i]}; with a Store L2 each server serves one stage" >&2
+      exit 2
+    fi
+  done
+  local -a extra_args=()
+  read -r -a extra_args <<< "${LMCACHE_MP_EXTRA_ARGS:-}"
+  local arg
+  for arg in ${extra_args[@]+"${extra_args[@]}"}; do
+    if is_option_abbreviation "${arg}" --l2-adapter; then
+      echo "[mooncake-store][FAIL] ${arg} in LMCACHE_MP_EXTRA_ARGS: under LMCACHE_MOONCAKE_L2=1 the launcher gives each MP server its Store L2" >&2
+      exit 2
+    fi
+  done
+}
+
 check_mooncake_store_settings() {
   if [[ "${LMCACHE_MP_SERVER:-0}" == "1" ]]; then
-    echo "[mooncake-store][FAIL] LMCACHE_MOONCAKE_L2 is the in-process offload's L2 and cannot be combined with LMCACHE_MP_SERVER" >&2
-    exit 2
+    check_mooncake_mp_server_settings
   fi
   local name
   for name in LMCACHE_REMOTE_URL LMCACHE_EXTRA_CONFIG; do
@@ -1339,14 +1404,23 @@ prepare_mooncake_store_memory() {
     pins+=("${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
   done
   # ATOM splits LMCACHE_MAX_LOCAL_CPU_SIZE x PP size over the stages, so the
-  # L1s add up to that much per prefill GPU.
+  # in-process L1s add up to that much per prefill GPU. The L1s of MP servers
+  # are the servers' own, on their LMCACHE_MP_STAGE_SERVERS nodes.
+  local per_gpu_gib="${LMCACHE_MAX_LOCAL_CPU_SIZE:-48}"
+  if [[ -n "${l1_gpus}" && "${LMCACHE_MP_SERVER:-0}" == "1" ]]; then
+    plan_lmcache_mp_servers
+    for i in "${!lmcache_mp_plan_numa[@]}"; do
+      pins+=("${lmcache_mp_plan_numa[i]}:${lmcache_mp_plan_l1_gb[i]}")
+    done
+    per_gpu_gib=0
+  fi
   if ! python3 "${ATOMESH_SCRIPT_DIR}/numa_memory_budget.py" \
     --reserve-gib "$(mooncake_setting LMCACHE_MOONCAKE_NODE_RESERVE_GIB 128)" \
     --gpus "${l1_gpus}" \
-    --per-gpu-gib "${LMCACHE_MAX_LOCAL_CPU_SIZE:-48}" \
+    --per-gpu-gib "${per_gpu_gib}" \
     --compact \
     ${pins[@]+"${pins[@]}"}; then
-    echo "[mooncake-store][FAIL] the Store owners (LMCACHE_MOONCAKE_OWNERS) and the stages' L1s (LMCACHE_MAX_LOCAL_CPU_SIZE per prefill GPU) must fit their NUMA nodes, see numa-budget above" >&2
+    echo "[mooncake-store][FAIL] the Store owners (LMCACHE_MOONCAKE_OWNERS) and the L1s (LMCACHE_MAX_LOCAL_CPU_SIZE per prefill GPU, or the MP servers' LMCACHE_MP_STAGE_SERVERS sizes) must fit their NUMA nodes, see numa-budget above" >&2
     exit 2
   fi
 }
@@ -1786,8 +1860,9 @@ start_prefill() {
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
   reset_lmcache_disk
-  start_lmcache_mp_servers
+  # The Store first: an MP server joins its Store L2 while it starts.
   start_mooncake_store
+  start_lmcache_mp_servers
   # On the env command line, not exported: decode starts from this same shell.
   local -a prefill_offload_env=()
   if lmcache_mp_servers_running; then
@@ -1795,8 +1870,7 @@ start_prefill() {
       "ATOM_KV_OFFLOAD=lmcache_mp"
       "ATOM_KV_OFFLOAD_EXTRA_CONFIG=${lmcache_mp_offload_extra_config}"
     )
-  fi
-  if mooncake_store_running; then
+  elif mooncake_store_running; then
     prefill_offload_env+=("${mooncake_l2_prefill_env[@]}")
   fi
   local -a prefill_cache_env=()
