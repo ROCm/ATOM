@@ -1021,7 +1021,8 @@ start_lmcache_mp_servers() {
       # starts, so the L1 is allocated and pinned up front, on 2 MiB.
       server_cmd=(
         python3 -m atom.kv_transfer.offload.mp.mooncake_l2_server
-        --gpu "${lmcache_mp_plan_first_stage[i]}" --local-hostname "${host_ip}"
+        --gpu "${lmcache_mp_plan_first_stage[i]}" --numa "${lmcache_mp_plan_numa[i]}"
+        --local-hostname "${host_ip}"
         --master "${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}"
         --metadata "http://${host_ip}:${ATOMESH_MOONCAKE_METADATA_PORT}/metadata"
         -- "${server_cmd[@]:3}"

@@ -3,7 +3,7 @@
 
 """Run an LMCache MP server whose L2 is a Mooncake Store pool.
 
-    python3 -m atom.kv_transfer.offload.mp.mooncake_l2_server --gpu G
+    python3 -m atom.kv_transfer.offload.mp.mooncake_l2_server --gpu G --numa N
         --local-hostname IP [--master HOST:PORT --metadata URL]
         -- <lmcache.v1.multiprocess.server arguments>
 
@@ -36,6 +36,9 @@ import runpy
 import sys
 
 from atom.kv_transfer.offload.mooncake_store_l2 import (
+    _collapse_into_huge_pages,
+    _touch_every_huge_page,
+    anon_huge_page_bytes,
     requester_rdma_device,
     store_pool_of,
 )
@@ -89,15 +92,54 @@ def keep_l1_objects_page_aligned() -> None:
     lazy.LazyMemoryAllocator.__init__ = __init__
 
 
+def make_l1_huge_before_pinning(numa_node: int) -> None:
+    """Fault the lazy L1 as huge pages, and collapse the rest, before pinning.
+
+    glibc's THP malloc only advises huge pages; on a fragmented node the first
+    fault of a 2 MiB stretch falls back to 4 KiB pages, and the adapter's one
+    MR for the whole L1 then fails (two half nodes, pit2-p03-g52: compaction
+    reached 99.6% and three of four 96 GiB L1s failed to register with
+    ENOMEM). Each chunk LMCache pins is touched once per 2 MiB, collapsed
+    (MADV_COLLAPSE compacts synchronously, retried on ENOMEM/EAGAIN) and
+    counted; a chunk that is not all huge pages fails the server's start here,
+    with the shortfall named, instead of in the adapter. Pinned pages cannot
+    move, so this has to run before the pin.
+    """
+    from lmcache.v1.memory_allocators import lazy_memory_allocator as lazy
+
+    pin_chunk = lazy.LazyMemoryAllocator._pin_memory_chunk
+    if getattr(pin_chunk, "_atom_huge_before_pinning", False):
+        return
+
+    def _pin_memory_chunk(self, offset: int, size: int) -> None:
+        address = self._buffer.data_ptr() + offset
+        _touch_every_huge_page(address, size, numa_node)
+        _collapse_into_huge_pages(address, size)
+        huge = anon_huge_page_bytes(address, address + size)
+        if huge < size:
+            raise RuntimeError(
+                f"LMCache MP L1 chunk at {address:#x} is {huge / 2**30:.2f} of "
+                f"{size / 2**30:.2f} GiB huge pages after MADV_COLLAPSE on NUMA "
+                f"node {numa_node}; the Store adapter cannot register it as one "
+                "MR. Free or compact the node's memory (the launcher's "
+                "numa_memory_budget.py --compact) and restart"
+            )
+        return pin_chunk(self, offset, size)
+
+    _pin_memory_chunk._atom_huge_before_pinning = True
+    lazy.LazyMemoryAllocator._pin_memory_chunk = _pin_memory_chunk
+
+
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     if "--" not in argv:
         raise SystemExit(
-            "usage: mooncake_l2_server --gpu G --local-hostname IP "
+            "usage: mooncake_l2_server --gpu G --numa N --local-hostname IP "
             "[--master HOST:PORT --metadata URL] -- <LMCache server arguments>"
         )
     split = argv.index("--")
     parser = argparse.ArgumentParser(prog="mooncake_l2_server")
     parser.add_argument("--gpu", type=int, required=True)
+    parser.add_argument("--numa", type=int, required=True)
     parser.add_argument("--local-hostname", required=True)
     parser.add_argument("--master", default="")
     parser.add_argument("--metadata", default="")
@@ -168,6 +210,7 @@ def main(argv: list[str] | None = None) -> None:
         master,
     )
     keep_l1_objects_page_aligned()
+    make_l1_huge_before_pinning(args.numa)
     # The server parses sys.argv itself; JSON with no spaces survives any
     # later whitespace split of the logged command line.
     sys.argv = [
