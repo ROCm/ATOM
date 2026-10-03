@@ -12,6 +12,7 @@ payload mapping and PAGE/SLOT policy.
 from __future__ import annotations
 
 import collections
+import contextvars
 import json
 import logging
 import os
@@ -35,6 +36,76 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
+
+# Set while ``LMCacheEngine.retrieve`` runs. 0.5.5rc3 unpins every retrieved
+# object inside retrieve, and ``lookup_unpin`` unpins those same keys again
+# once the copy has returned. The second decrement drives ``pin_count``
+# negative; LMCache then treats the buffer as free and the next copy can
+# overwrite it. Holding the pin across retrieve leaves ``lookup_unpin`` as
+# the single release, which is what upstream LMCache #5098 did.
+_RETRIEVE_HOLD_PIN = contextvars.ContextVar(
+    "atom_lmcache_retrieve_hold_pin", default=False
+)
+_RETRIEVE_PIN_PATCHED = False
+
+
+def _unpin_unless_retrieve_holds_it(orig):
+    def unpin(self):
+        if _RETRIEVE_HOLD_PIN.get():
+            return True
+        return orig(self)
+
+    return unpin
+
+
+def _hold_pin_during_retrieve(method):
+    def wrapped(self, *args, **kwargs):
+        token = _RETRIEVE_HOLD_PIN.set(True)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _RETRIEVE_HOLD_PIN.reset(token)
+
+    return wrapped
+
+
+def install_single_lookup_unpin() -> None:
+    """Make a retrieved chunk's lookup pin release exactly once.
+
+    Idempotent. No-op when lmcache is not importable (unit tests that never
+    build an engine). Subclasses that override ``unpin`` are patched too,
+    because ``TensorMemoryObj.unpin`` does not call the base.
+    """
+    global _RETRIEVE_PIN_PATCHED
+    if _RETRIEVE_PIN_PATCHED:
+        return
+    try:
+        from lmcache.v1.cache_engine import LMCacheEngine
+        from lmcache.v1.memory_management import MemoryObj
+    except ImportError:
+        return
+
+    def _patch_unpin(cls) -> None:
+        if "unpin" in cls.__dict__:
+            current = cls.__dict__["unpin"]
+            if not getattr(current, "__isabstractmethod__", False) and not getattr(
+                current, "_atom_single_unpin", False
+            ):
+                wrapped = _unpin_unless_retrieve_holds_it(current)
+                wrapped._atom_single_unpin = True
+                cls.unpin = wrapped
+        for sub in list(cls.__subclasses__()):
+            _patch_unpin(sub)
+
+    _patch_unpin(MemoryObj)
+    for name in ("retrieve", "retrieve_layer"):
+        current = getattr(LMCacheEngine, name, None)
+        if current is None or getattr(current, "_atom_hold_pin", False):
+            continue
+        wrapped = _hold_pin_during_retrieve(current)
+        wrapped._atom_hold_pin = True
+        setattr(LMCacheEngine, name, wrapped)
+    _RETRIEVE_PIN_PATCHED = True
 
 
 def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
@@ -111,6 +182,8 @@ def build_offload_engine(
     from lmcache.v1.memory_management import MemoryFormat
 
     from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
+
+    install_single_lookup_unpin()
 
     if cfg is None:
         cfg = offcfg.build_lmcache_config(getattr(config, "kv_transfer_config", None))
@@ -215,6 +288,21 @@ class OffloadWorkerMixin:
                 executor.shutdown(wait=True)
 
     # -- in-flight job tracking (preemption fence) -----------------------
+    def _note_compute_stream(self) -> None:
+        """Hand the forward's stream to the byte-copy layer.
+
+        Called from `start_load_kv`, ahead of the submits rather than from
+        `_track_job`: Python evaluates the `submit()` argument before the
+        `_track_job()` wrapping it, so a job can already be queued on a worker
+        by the time `_track_job` runs.  `start_load_kv` runs on the forward
+        thread, which is the requirement -- `torch.cuda.current_stream` is
+        thread-local, and on a transfer worker it answers the default stream.
+        """
+        connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
+        note = getattr(connector, "note_compute_stream", None)
+        if note is not None:
+            note()
+
     def _track_job(self, req_id, future) -> None:
         """Remember one submitted copy job so a preemption can wait on it.
 
@@ -510,6 +598,7 @@ class OffloadSchedulerMixin(ABC):
         self.total_source_safe_released_blocks = 0  # freed once their save reported
         self.total_abnormal_lease_reclaims = 0  # freed by stall timeout, no report
         self.total_truncated_late_saves = 0  # final save lost evicted prefix blocks
+        self.total_unbacked_saves = 0  # skipped: source blocks already gone
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Apply offload-specific completions and expose plain request IDs."""
@@ -637,6 +726,7 @@ class OffloadSchedulerMixin(ABC):
                 blocks_waiting_for_store=self.blocks_waiting_for_store(),
                 abnormal_lease_reclaims=self.total_abnormal_lease_reclaims,
                 truncated_late_saves=self.total_truncated_late_saves,
+                unbacked_saves=self.total_unbacked_saves,
             )
         return statistics
 
@@ -1026,6 +1116,18 @@ class OffloadSchedulerMixin(ABC):
         need: int,
         chunk: int,
     ) -> None:
+        # Remembered for one reader: the vLLM plugin connector, which on that
+        # path may already have parked this request and now has to withdraw
+        # the promise. The reason is the difference between "the tier lost the
+        # prefix" and "the recurrent state was evicted", and the line that
+        # reports the withdrawal is the only place it is ever seen -- this one
+        # is debug, and the runs that need the answer are not run at debug.
+        skips = getattr(self, "_last_load_skip", None)
+        if skips is None:
+            skips = self._last_load_skip = {}
+        if len(skips) > 1024:
+            skips.clear()
+        skips[str(seq.id)] = reason
         seq.offload_loaded_tokens = hbm
         self._perf_bump("skip_" + reason)
         self._perf_bump("skip_tokens_" + reason, max(0, lmc - hbm))
@@ -1040,6 +1142,12 @@ class OffloadSchedulerMixin(ABC):
             min_load,
             chunk,
             reason,
+        )
+
+    def last_load_skip_reason(self, req_id) -> str:
+        """Why this request's load was last declined, or ``"unknown"``."""
+        return (getattr(self, "_last_load_skip", None) or {}).get(
+            str(req_id), "unknown"
         )
 
     def should_park_for_load_after_alloc(self, seq) -> bool:

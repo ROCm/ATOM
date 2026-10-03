@@ -1011,8 +1011,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_PUBLICATION_POLL_INTERVAL_S": lambda: _finite_float_env(
         "OFFLOAD_PUBLICATION_POLL_INTERVAL_S", 0.01, allow_zero=False
     ),
-    # LMCache MP transfer mode: auto or lmcache_driven (engine_driven is
-    # rejected as not implemented). A kv_connector_extra_config
+    # LMCache MP transfer mode: auto, lmcache_driven, or engine_driven.
+    # engine_driven is rejected only when lmcache.mp.state_transport='mp',
+    # which makes the recurrent state a second KV cache group and LMCache's
+    # engine-driven path accepts exactly one. A kv_connector_extra_config
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
 }

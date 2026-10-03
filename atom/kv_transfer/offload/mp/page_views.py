@@ -52,10 +52,31 @@ def validate_page_views(
             f"views={len(views)} regions={len(regions)}"
         )
 
+    return _validate_views(
+        views,
+        regions,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        label="PAGE",
+        index_offset=0,
+    )
+
+
+def _validate_views(
+    views: list[Any],
+    regions: list[Any],
+    *,
+    num_blocks: int,
+    block_size: int | None,
+    label: str,
+    index_offset: int,
+) -> list[PageView]:
+    """The per-view geometry check both block-major registrations share."""
     validated: list[PageView] = []
     devices: set[torch.device] = set()
-    for index, (view, region) in enumerate(zip(views, regions, strict=True)):
-        name = f"LMCache MP PAGE view {index}"
+    for offset, (view, region) in enumerate(zip(views, regions, strict=True)):
+        index = index_offset + offset
+        name = f"LMCache MP {label} view {index}"
         if not isinstance(view, torch.Tensor):
             raise TypeError(f"{name} is not a Tensor")
         if view.ndim != 3 or int(view.shape[0]) != num_blocks:
@@ -83,12 +104,25 @@ def validate_page_views(
         if view.data_ptr() != int(region.base_addr):
             raise ValueError(f"{name} does not alias its declared region")
         if bool(getattr(region, "reverse_indexed", False)):
-            raise ValueError("lmcache_mp PAGE regions cannot be reverse-indexed")
+            raise ValueError(f"lmcache_mp {label} regions cannot be reverse-indexed")
         devices.add(view.device)
         validated.append(PageView(index, view, region, unit_bytes))
     if len(devices) != 1:
-        raise ValueError("lmcache_mp PAGE views must share one device")
+        raise ValueError(f"lmcache_mp {label} views must share one device")
     return validated
+
+
+@dataclass(frozen=True)
+class _RecurrentViews:
+    """One recurrent group's registration identity, after validation."""
+
+    # Positions in the flat registration order -- what LMCache calls
+    # ``layer_indices`` -- so this group's tensors can be named without
+    # depending on where the PAGE planes ended.
+    tensor_indices: tuple[int, ...]
+    num_blocks: int
+    tokens_per_block: int
+    bytes_per_block: int
 
 
 @dataclass(frozen=True)
@@ -98,6 +132,9 @@ class _CacheViews:
     tensors: dict[str, torch.Tensor]
     layer_groups: tuple[tuple[int, ...], ...]
     bytes_per_block: int
+    # Recurrent groups in ordinal order, registered after the PAGE planes.
+    # Empty on an attention-only layout.
+    recurrent: tuple[_RecurrentViews, ...] = ()
 
 
 def _build_cache_views(
@@ -148,11 +185,78 @@ def _build_cache_views(
         indices_by_layout.setdefault(layout, []).append(index)
         bytes_per_block += page.unit_bytes
 
+    recurrent = _build_recurrent_views(
+        transfer_tensors,
+        tensors=tensors,
+        first_index=len(tensors),
+    )
+
     return _CacheViews(
         tensors=tensors,
         layer_groups=tuple(tuple(indices) for indices in indices_by_layout.values()),
         bytes_per_block=bytes_per_block,
+        recurrent=recurrent,
     )
+
+
+def _build_recurrent_views(
+    transfer_tensors: Any,
+    *,
+    tensors: dict[str, torch.Tensor],
+    first_index: int,
+) -> tuple[_RecurrentViews, ...]:
+    """Validate and add the recurrent groups to the flat registration order.
+
+    They are appended, never interleaved, so a layout that grows or loses a
+    recurrent group does not renumber the PAGE planes -- the plane order is the
+    key space, and renumbering it would make every object already in the tier
+    address the wrong bytes.
+    """
+    groups = tuple(getattr(transfer_tensors, "recurrent_page_groups", None) or ())
+    if not groups:
+        return ()
+
+    built: list[_RecurrentViews] = []
+    index = first_index
+    for ordinal, group in enumerate(groups):
+        pages = list(group.pages)
+        if not pages:
+            raise ValueError(
+                f"lmcache_mp recurrent group {ordinal} published no planes"
+            )
+        num_blocks = int(group.num_blocks)
+        tokens_per_block = int(group.tokens_per_block)
+        if num_blocks <= 0 or tokens_per_block <= 0:
+            raise ValueError(
+                f"lmcache_mp recurrent group {ordinal} has num_blocks="
+                f"{num_blocks} tokens_per_block={tokens_per_block}; both must "
+                "be positive"
+            )
+        validated = _validate_views(
+            [page.view for page in pages],
+            [page.region for page in pages],
+            num_blocks=num_blocks,
+            block_size=None,
+            label=f"recurrent[{ordinal}]",
+            index_offset=index,
+        )
+        indices = []
+        for page in validated:
+            role = str(
+                getattr(page.region, "semantic_role", None) or f"plane_{page.index}"
+            )
+            tensors[f"recurrent.{ordinal}.{page.index}.{role}"] = page.view
+            indices.append(page.index)
+        index += len(validated)
+        built.append(
+            _RecurrentViews(
+                tensor_indices=tuple(indices),
+                num_blocks=num_blocks,
+                tokens_per_block=tokens_per_block,
+                bytes_per_block=sum(page.unit_bytes for page in validated),
+            )
+        )
+    return tuple(built)
 
 
 __all__ = ["PageView", "validate_page_views"]

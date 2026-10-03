@@ -135,6 +135,77 @@ def test_lmcache_mp_is_the_only_kv_transfer_admitted():
         )
 
 
+def vllm_plugin_config(**overrides):
+    """A config the way the vLLM plugin builds one for V4.1.
+
+    `plugin_config.is_vllm` is what distinguishes it from the other plugin
+    backends, which still have no V4.1 bridge; `kv_cache_block_size` is 256
+    because that is the PAGE size `atom.config` forces for this model and the
+    proxy layer's block size on the vLLM side.
+    """
+    fields = {
+        "plugin_config": SimpleNamespace(is_vllm=True),
+        "enable_prefix_caching": False,
+        "kv_cache_block_size": 256,
+    }
+    fields.update(overrides)
+    return runtime_config(**fields)
+
+
+def test_vllm_plugin_text_path_is_admitted():
+    validate_runtime_config(vllm_plugin_config())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        # vLLM's proposer would have to drive ATOM's tentative staging; the
+        # proxy bridge drives a single target-only step.
+        {
+            "speculative_config": SimpleNamespace(
+                method="dspark", num_speculative_tokens=5
+            )
+        },
+        # CSA2 blocks are reusable only at whole-PAGE boundaries after the
+        # compressor has run, so vLLM's hash-based reuse would hand back
+        # blocks whose STATE side was never replayed.
+        {"enable_prefix_caching": True},
+    ],
+)
+def test_vllm_plugin_refuses_what_the_bridge_cannot_drive(override):
+    with pytest.raises(ValueError):
+        validate_runtime_config(vllm_plugin_config(**override))
+
+
+def test_other_plugin_backends_are_still_refused_outright():
+    with pytest.raises(ValueError, match="plugin mode outside vLLM"):
+        validate_runtime_config(
+            runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
+        )
+
+
+def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
+    """The plugin's transport is vLLM's `kv_connector`, not an ATOM name.
+
+    Resolving it through `KVConnectorFactory` is a category error, so the gate
+    forks on the mode. This also pins that the gate is *reachable* at all: it
+    reads `Config.kv_transfer_config`, which the plugin path populates in
+    `atom.plugin.config`. Before that plumbing existed the dict was always
+    empty here and every connector was admitted without the question being
+    asked -- a check that passes because it was never run.
+    """
+    validate_runtime_config(
+        vllm_plugin_config(
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
+        )
+    )
+    for connector in ("LMCacheConnectorV1", "lmcache_mp", "NixlConnector"):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                vllm_plugin_config(kv_transfer_config={"kv_connector": connector})
+            )
+
+
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
@@ -345,3 +416,24 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+def test_prefix_caching_is_admitted_with_the_offload_connector():
+    """The connector is what makes reuse admissible, not a separate feature.
+
+    It stores the CSA2 state at the boundaries vLLM's hashes name and caps
+    every hit -- the block pool's own included -- to one it holds. Without it
+    there is nothing to cap against, so caching stays refused; with it the
+    refusal would be refusing the thing that makes it safe.
+    """
+    validate_runtime_config(
+        vllm_plugin_config(
+            enable_prefix_caching=True,
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"},
+        )
+    )
+
+
+def test_prefix_caching_without_the_connector_is_still_refused():
+    with pytest.raises(ValueError, match="prefix caching"):
+        validate_runtime_config(vllm_plugin_config(enable_prefix_caching=True))

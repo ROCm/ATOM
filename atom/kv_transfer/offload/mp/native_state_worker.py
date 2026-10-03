@@ -23,7 +23,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
-    _storage_kv_transfer_config,
+    storage_kv_transfer_config,
     _tp_replication_factor,
     _validate_mp_config,
 )
@@ -50,7 +50,7 @@ NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 def require_native_state_server(adapter: Any, config: Any) -> None:
     """Validate native transfer geometry shared with the LMCache server."""
     configured_chunk = int(
-        offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size
+        offcfg.build_lmcache_config(storage_kv_transfer_config(config)).chunk_size
     )
     if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
         raise ValueError(

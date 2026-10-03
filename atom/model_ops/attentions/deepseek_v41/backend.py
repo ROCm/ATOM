@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -27,6 +28,74 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
+
+# `prepare_state`'s deferred probe ships the cursor rows asynchronously and
+# renders its stale-slot verdict on the next step, which takes one blocking
+# D2H (~58 us) off each decode step. Under a KV connector at concurrency it
+# reports positions one step out of register with the cursor it reads, and the
+# verdict is a hard refusal -- so it kills the engine on state that is fine.
+#
+# Measured, concurrency 8, chunked prefill, tier active: deferred probe dies
+# within seconds (`needs state at N, found N+1`, every time off by exactly the
+# one token a decode step advances); blocking probe runs full 120 s windows
+# with the tier storing and retrieving. Concurrency 1 is clean either way.
+#
+# So the default is the blocking path, and the deferred one is opt-in until
+# the register slip is understood. A check that fails closed on correct state
+# is worse than the microsecond it saves.
+_BLOCKING_STATE_PROBE = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE", "1") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+
+
+def build_v41_pool_geometry(
+    hf_config,
+    block_size: int,
+    *,
+    packed: bool,
+    speculative_tokens: int = 0,
+) -> V41PoolGeometry:
+    """The pool geometry a CSA2 configuration runs, from its text config alone.
+
+    The single authority for it. The pool is declared twice -- once by the
+    scheduler that sizes it and once by whoever hands the runtime its backing
+    store -- and the two only describe the same bytes if they derive the shape
+    the same way. The vLLM plugin sizes a proxy KV pool from here and the
+    native builder below builds its cache from here, so a change to the
+    topology reaches both or neither.
+
+    ``packed`` is the main pool's FP4 layout (native's ``kv_cache_dtype ==
+    "fp4"``), and ``speculative_tokens`` the draft width a verify step retains;
+    both move the geometry, so neither has a default that guesses.
+    """
+    topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
+    return V41PoolGeometry(
+        len(topology)
+        + (hf_config.num_nextn_predict_layers if speculative_tokens else 0),
+        tuple(
+            (spec.layer_id, spec.ratio)
+            for spec in topology
+            if spec.mode == AttentionMode.FULL
+        ),
+        block_size,
+        hf_config.sliding_window,
+        hf_config.head_dim,
+        hf_config.index_head_dim,
+        hf_config.engram_max_ngram_size - 1,
+        packed=packed,
+        speculative_tokens=speculative_tokens,
+        # Only the ratios the built layers run: a configuration with no
+        # window-only layer gets no buffer for one.
+        layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
+        index_topk=hf_config.index_topk,
+        # Paged at the length candidates are picked in, which is what lets
+        # a candidate list be a block table. A GPU that cannot page that
+        # short refuses when asked, so there is nothing to pre-empt here.
+        index_block_rows=hf_config.candidate_block_size,
+    )
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -93,33 +162,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         for name in ("positions", "batch_id_per_q_token"):
             model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
-        topology = build_attention_topology(self.config)[
-            : self.config.num_hidden_layers
-        ]
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
-        self.geometry = V41PoolGeometry(
-            len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
-            tuple(
-                (spec.layer_id, spec.ratio)
-                for spec in topology
-                if spec.mode == AttentionMode.FULL
-            ),
+        self.geometry = build_v41_pool_geometry(
+            self.config,
             self.block_size,
-            self.config.sliding_window,
-            self.config.head_dim,
-            self.config.index_head_dim,
-            self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
             speculative_tokens=num_drafts,
-            # Only the ratios the built layers run: a configuration with no
-            # window-only layer gets no buffer for one.
-            layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-            index_topk=self.config.index_topk,
-            # Paged at the length candidates are picked in, which is what lets
-            # a candidate list be a block table. A GPU that cannot page that
-            # short refuses when asked, so there is nothing to pre-empt here.
-            index_block_rows=self.config.candidate_block_size,
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -559,7 +608,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=batch is None)
+            else cache.prepare_state(
+                step, histories=batch is None or _BLOCKING_STATE_PROBE
+            )
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
