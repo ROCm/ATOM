@@ -176,16 +176,33 @@ def test_a_frontier_between_boundaries_is_not_offered():
 def test_stepping_over_a_boundary_is_counted_not_deferred():
     """The ring has already moved; there is no hole to come back to."""
     planner, views = make_planner(), FakeViews()
+    sweep(planner, views, 0)                          # fresh: starts at zero
     sweep(planner, views, INTERVAL)
     assert sweep(planner, views, INTERVAL * 3) != []  # lands on one
     assert planner.stats()["boundary_passed"] == 1  # stepped over 2*INTERVAL
+    assert planner.stats()["restored_start"] == 0
+
+
+def test_a_restored_requests_first_frontier_is_not_counted_as_lost():
+    """Its lower boundaries are in the tier, which is why it started there.
+
+    They were once counted as passed, which made a working restore read like
+    a budget problem and would send the next person tuning the wrong knob.
+    """
+    planner, views = make_planner(), FakeViews()
+    sweep(planner, views, INTERVAL * 3 + 7)   # arrives mid-prompt, restored
+    assert planner.stats()["boundary_passed"] == 0
+    assert planner.stats()["restored_start"] == 1
 
 
 def test_a_budget_that_straddles_boundaries_counts_every_one_it_passes():
+    """From the second sighting on, a skipped boundary really is lost."""
     planner, views = make_planner(), FakeViews()
-    sweep(planner, views, INTERVAL * 3 + 7)
+    sweep(planner, views, 0)                   # fresh
+    sweep(planner, views, INTERVAL)            # lands, establishes a cursor
+    sweep(planner, views, INTERVAL * 4 + 7)    # skips 2..4 x INTERVAL
     assert planner.stats()["boundary_passed"] == 3
-    assert planner.stats()["sweep_stores"] == 0
+    assert planner.stats()["restored_start"] == 0
 
 
 def test_an_already_stored_boundary_is_not_stored_again():

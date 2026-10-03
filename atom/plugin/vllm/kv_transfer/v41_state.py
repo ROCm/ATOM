@@ -302,9 +302,16 @@ class V41BoundaryPlanner:
             "sweep_known": 0,
             # V4.1-specific: the frontier moved past a boundary without
             # stopping on it, so that boundary's state no longer exists.
-            # Non-zero means the token budget is not a multiple of the
-            # interval -- not a transient.
+            # Non-zero means prefill chunks are not landing on the interval --
+            # not a transient. Counted only from a request's second sighting
+            # on, because the first says where it *started*, not what it
+            # skipped.
             "boundary_passed": 0,
+            # Requests whose first frontier was already past zero, i.e. served
+            # a restored prefix. Their lower boundaries are in the tier, not
+            # lost, and were once counted as passed -- which made a working
+            # restore read like a budget problem.
+            "restored_start": 0,
             "stage_full": 0,
             # The guard on the hard contract. Must stay zero; anything else
             # means a snapshot was taken at a position the scheduler did not
@@ -468,15 +475,25 @@ class V41BoundaryPlanner:
             # scheduled chunk is larger than the interval passed every
             # boundary inside it, and not counting those would report a clean
             # sweep for the configuration that stores the least.
-            crossed = frontier // self.state_interval - (previous or 0) // (
-                self.state_interval
-            )
-            if frontier % self.state_interval:
-                self._counters["boundary_passed"] += max(0, crossed)
+            if previous is None:
+                # First sighting. A request that was restored starts at the
+                # boundary its hit was capped to, and every boundary below it
+                # is in the tier already -- counting those as lost would
+                # report the restore as a miss and send the next person
+                # tuning a budget that is not the problem. A request that was
+                # not restored starts at 0 and has crossed nothing.
+                self._counters["restored_start"] += 1 if frontier else 0
             else:
-                # The one it landed on is not passed -- it is about to be
-                # offered.
-                self._counters["boundary_passed"] += max(0, crossed - 1)
+                crossed = (
+                    frontier // self.state_interval
+                    - previous // self.state_interval
+                )
+                if frontier % self.state_interval:
+                    self._counters["boundary_passed"] += max(0, crossed)
+                else:
+                    # The one it landed on is not passed -- it is about to be
+                    # offered.
+                    self._counters["boundary_passed"] += max(0, crossed - 1)
             self._swept[req_id] = frontier
             if frontier <= 0 or frontier % self.state_interval:
                 continue

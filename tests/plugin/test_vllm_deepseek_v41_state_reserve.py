@@ -192,18 +192,21 @@ class TestInstallSite:
     call site this pins.
     """
 
-    def test_register_model_installs_the_patch(self, monkeypatch):
+    def test_register_model_installs_the_state_reserve_patch(self):
+        """Checked on the wiring, because the call happens at most once.
+
+        ``register_model`` is idempotent, so watching for the call answers
+        whether some earlier test in the session already made it -- a property
+        of the suite, not of the code. This test did exactly that and failed
+        only in the full run, which is the tell. The patch's own behaviour is
+        covered by ``TestPatchInstallation`` above.
+        """
+        import inspect
+
         register = importlib.import_module("atom.plugin.vllm.register")
-        installed = []
-        monkeypatch.setattr(
-            sys.modules["atom.plugin.vllm.deepseek_v41_state_reserve_patch"],
-            "apply_vllm_v41_state_reserve_patch",
-            lambda: installed.append(True),
-        )
-
-        register.register_model()
-
-        assert installed, (
+        assert "apply_vllm_v41_state_reserve_patch()" in inspect.getsource(
+            register.register_model
+        ), (
             "register_model must install the V4.1 STATE-tail patch; the "
             "platform hook is not guaranteed to run"
         )
