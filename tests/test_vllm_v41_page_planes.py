@@ -167,3 +167,48 @@ def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
         marker in ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
         for marker in _V4_PROXY_LAYER_MARKERS
     )
+
+
+def test_the_state_tier_derives_its_size_and_identity_from_the_geometry():
+    """So speculative decoding, when it lands, cannot reuse the wrong bytes.
+
+    `ring_slots` and `compress_ring_slots` both carry `speculative_tokens`, so
+    turning spec on grows the STATE image. The tier must take both its entry
+    size and its layout identity from the geometry rather than restating them:
+    the first keeps the transfer sized correctly, and the second is what puts
+    the larger images in their own key space instead of over the old ones.
+    """
+    pytest.importorskip("lmcache")
+    from atom.plugin.vllm.kv_transfer.v41_state import V41StateViews
+
+    class Geo(FakeGeometry):
+        layout_id = "dsv41-bf16-...:spec=5"
+
+    cache = FakeCache()
+    cache.geometry = Geo(PAGE_BYTES, PAGED_BYTES, 9_999_991)
+    views = V41StateViews(cache, stage_depth=1)
+    assert views.entry_bytes == cache.geometry.state_bytes
+    assert views.layout_id == cache.geometry.layout_id
+
+
+def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
+    """These two must be changed together or the pool is sized short.
+
+    `v41_proxy_geometry` passes `speculative_tokens=0`, which is only correct
+    while speculative decoding is refused -- the slack it leaves out is real
+    pool bytes. Whoever lifts the refusal has to lift this too, and this test
+    is what says so.
+    """
+    import re
+
+    src = open("atom/plugin/vllm/deepseek_v41_bridge.py").read()
+    assert re.search(r"speculative_tokens=0", src), (
+        "v41_proxy_geometry no longer hardcodes speculative_tokens=0 -- if "
+        "speculative decoding is now supported, drop this test; if not, the "
+        "pool is being sized from an unverified source"
+    )
+    platform = open("atom/plugin/vllm/platform.py").read()
+    assert "does not support speculative" in platform, (
+        "the hardcoded speculative_tokens=0 is only safe while the platform "
+        "refuses speculative decoding, and that refusal is gone"
+    )
