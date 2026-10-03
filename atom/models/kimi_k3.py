@@ -1238,10 +1238,12 @@ class KimiKDAAttention(nn.Module):
         else:
             gate = self.f_b_proj(f_a_view.contiguous())
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
-        out = fused_in.new_empty(
-            (num_actual_tokens, self.num_local_heads, self.head_dim)
-        )
+        # Prefill returns its own contiguous output. Allocate this buffer only
+        # for decode/spec-decode, where the recurrence writes into it directly.
+        if kda_metadata.num_prefills <= 0:
+            out = fused_in.new_empty(
+                (num_actual_tokens, self.num_local_heads, self.head_dim)
+            )
 
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
