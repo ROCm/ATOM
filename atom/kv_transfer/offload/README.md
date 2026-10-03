@@ -1,11 +1,13 @@
 # LMCache CPU/NVMe KV Cache Offload (ATOM standalone)
 
 This module adds a **CPU DRAM (L2) and optional NVMe (L3) cache tier** on top of
-ATOM's native HBM prefix and state caches. It exposes two standalone connector
+ATOM's native HBM prefix and state caches. It exposes three standalone connector
 paths:
 
 - `lmcache_offload` embeds an LMCache engine in each ATOM worker;
-- `lmcache_mp` connects ATOM workers to an external LMCache multiprocess server.
+- `lmcache_mp` connects ATOM workers to an external LMCache multiprocess server;
+- `mooncake_store` puts and gets KV chunks straight to and from a Mooncake Store,
+  with no LMCache anywhere ([its own section](#mooncake-store-offload-without-lmcache-mooncake_store)).
 
 The in-process path keeps dense MHA/MLA data as opaque KV blocks. Stateful
 DeepSeek V4 (DSV4) uses a stricter pair:
@@ -110,6 +112,12 @@ Four rules carry the module:
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | PAGE-backed native-state registration, scheduler leases, and worker transfer/restore lifecycle. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings, and the dense/DCP=1 startup refusals. |
+| `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
+| `mooncake_store/nic.py` | One PCI-local RDMA device per worker; per-NIC Store pools. |
+| `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
+| `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots (HBM by default), with quarantine. |
+| `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (Store lookups, digest-carrying requests) and worker (windowed put/get, startup probe). |
 
 The engine-side counterpart of the state tier lives outside this directory:
 `atom/model_engine/state_offload.py` holds `StateOffloadIndex`, which applies the
@@ -310,6 +318,208 @@ python -m pytest -xvs tests/v1/multiprocess/test_native_state_alias_gpu.py
 The DSv4-Pro TP8 integration test additionally exercises a cold save followed
 by full remote restore, READY reuse, incremental restore, exact next-token
 comparison, per-rank retrieve counts, one-writer storage, and promoted ranges.
+
+## Mooncake Store offload without LMCache (`mooncake_store`)
+
+`mooncake_store` keeps everything of the dense in-process path except LMCache:
+`ChunkedOffloadSchedulerBase` (save cadence, load decisions, early block
+release, exact operation completions), the `DenseOffloadConnector` worker
+plumbing (executors, per-step producer fence, completion reports),
+`BlockGPUConnector` and `DenseKVByteCodec`. What replaces LMCache is a Mooncake
+Store whose memory belongs to separate owner processes -- on the prefill node's
+NUMA nodes and, across two nodes, on the decode node -- reached directly by
+every prefill worker. There is no CPU L1, no LMCache engine or lookup server,
+and no `import lmcache`.
+
+### Data path
+
+```text
+save: KV blocks --pack (Triton) + D2D copy--> slot of the worker's registered pool --batch_put_from--> owners
+load: owners --batch_get_into--> slot of the registered pool --D2D copy + unpack--> KV blocks
+```
+
+- One Store object is one (PP/TP rank, 256-token chunk): the dense codec's
+  opaque bytes of that rank's layers, 16 blocks in one contiguous range
+  (2.99-3.21 MB per stage on GLM-5.2 cpp4).
+- The pool is one HBM allocation per worker, registered with the Store client
+  once and cut into chunk slots: a `save` region (default 256 MiB) and a `load`
+  region (default 1 GiB). The NIC reads and writes HBM directly (GPUDirect,
+  measured 45-49 GB/s per NIC into HBM); slots hold bytes only while a
+  transfer is in flight -- nothing is cached on the worker.
+- Transfers move in windows of `usable region slots / max(threads, 4)`
+  chunks -- at most a quarter of a region, so a transfer whose slots are held
+  back (below) leaves the rest working. A save packs a window (highest chunks
+  first, like the dense tail-to-head order), then puts it; a load gets a
+  window (lowest first), then unpacks it.
+- `mooncake_store.pool_device: cpu` puts the pool in pinned host memory instead
+  -- same code, D2H/H2D copies. Only for small pools: an ionic NIC registers
+  about 3 GiB of 4 KiB pages, shared by every process on it.
+
+### Keys and lookup
+
+- Key: `{namespace}/w{rank}of{world}/{digest}`. `rank` is
+  `pp_rank * tp + tp_rank`, `world` is PP x TP.
+- `namespace` = `atomkv1-` + blake2b of the offload page namespace (model,
+  dtypes, block/chunk size, world, HF geometry, speculative config) plus what a
+  Store that outlives the server also needs: every PP stage's layer span
+  (`VLLM_PP_LAYER_PARTITION` included), the online quantization, and the codec
+  version. Scheduler and workers derive it from the same `Config`.
+- `digest` is a 16-byte prefix chain over the prompt's full chunks:
+  `h_i = blake2b(h_{i-1} || int32-LE tokens of chunk i, person="atom-kv-chain-v1")`
+  from 16 zero bytes (a multimodal prompt starts from its media's
+  `cache_seed`). No `PYTHONHASHSEED` dependence. The scheduler hashes each
+  prompt once (kept on the `Sequence`) and ships the digests in the request
+  metadata (`LMCacheReqMeta.chunk_hashes`) instead of the prompt's token ids.
+- Lookup runs in the scheduler process over its own tcp Store client, opened on
+  the first lookup (every PP stage builds a scheduler; only the head asks):
+  one `batch_is_exist` for every rank x chunk key (split at
+  `lookup_batch_keys`). The hit is the shortest run of present chunks from
+  chunk 0 over all ranks, because a load is all-or-nothing across stages. Any
+  error code or exception answers `None` -- "no answer", retried later --
+  never a remembered miss. A lookup blocks the scheduler thread, and a master
+  that is down holds each call for seconds, so after a failed one lookups
+  answer `None` without asking for 10 s, or ten times as long as the failed
+  call blocked if that is longer.
+- With per-NIC pools the scheduler cannot tell which pool a rank writes to, so
+  it asks every pool for every key, concurrently, and ORs the answers.
+- `batch_is_exist` gives each present key a 10 s read lease (master default),
+  and only the lease keeps it from eviction. A request that waits for KV
+  blocks after its lookup outlives it, so a hit more than a second old is
+  looked up again when its load is dispatched (`_ensure_lookup_pin`): that
+  renews the lease right before the get, and a prefix evicted meanwhile drops
+  the load before anything is read. Workers have nothing to unpin. A miss at
+  get time fails the load and the request recomputes, once.
+- After a load succeeds, the scheduler publishes the loaded prefix into the HBM
+  prefix index (`offload_load_start_tokens`), so a later turn finds it in HBM
+  instead of loading it again (`publish_loaded_prefix`).
+
+### Completion protocol and failure handling
+
+- Every save ends in exactly one store terminal per worker. A failure after
+  all of its GPU reads have finished (a failed put, no usable slot, the source
+  read deadline below) also reports the source quiescent and every chunk it
+  never read as source-safe, so the scheduler may retry at once and every PP
+  stage reports the same per-chunk set (a stage that stopped early would
+  otherwise leave those groups short of their all-stage quorum for good). An
+  exception from the GPU copy claims neither; `_guard` reports the failure.
+- Every load ends in exactly one done or failed, all-or-nothing: any key whose
+  result is not exactly the chunk's size (missing, unready, lease expired, an
+  object of another size) fails the whole load.
+- A slot returns to the pool only when no GPU or NIC access can still reach
+  it. Mooncake leaves RDMA work posted only when a batch runs out its
+  hard-coded 60 s wait: any result of a call that returned sooner -- a
+  `TRANSFER_FAIL` from a dead owner after a second included -- frees its
+  slots. A `TRANSFER_FAIL` (or unknown code) from a call that took 60 s, or a
+  call that raised, holds its slots back for 300 s, well past Mooncake's own
+  retries; one whose GPU copy failed without a device fence is retired for
+  good. A region with no usable slot left fails its transfers at once (logged
+  once as an error) until a held slot returns.
+- The engine reclaims a save's source blocks `save_abandon_timeout_s` after
+  dispatch. A worker therefore stops starting GPU reads for a save that is
+  still queued `timeout - min(60 s, timeout / 5)` after it received it: it would
+  otherwise pack another request's KV into this prompt's keys.
+- A put of a key that already exists succeeds (Mooncake reports 0).
+- At startup every worker sends one chunk of random bytes through the Store and
+  compares it back (`startup_probe`): an unregistered pool, an unreachable
+  owner or a misrouted NIC fails startup instead of turning every lookup into a
+  miss.
+
+### Configuration
+
+`ATOM_KV_OFFLOAD=mooncake_store` selects the connector (alone, or beside a P/D
+producer under `multi`), and `ATOM_KV_OFFLOAD_EXTRA_CONFIG` carries its
+settings. The same keys work in `kv_connector_extra_config` of
+`{"kv_connector": "mooncake_store", "kv_role": "offload"}`. An unknown
+`mooncake_store.*` key is an error.
+
+| Key | Default | Meaning |
+|-----|:-------:|---------|
+| `mooncake_store.master` | required without `pools` | Master RPC address, `host:port`. |
+| `mooncake_store.metadata` | required without `pools` | Metadata server, `http://host:port/metadata` (or `P2PHANDSHAKE`). |
+| `mooncake_store.pools` | -- | Per-NIC pools instead: `{"rdma0": {"master": "h:p", "metadata": "<url>"}, ...}` (object or JSON text). A worker uses its NIC's pool. |
+| `mooncake_store.owner_rdma_devices` | `""` | Without pools, a worker whose NIC is listed here is refused. |
+| `mooncake_store.rdma_devices` | `""` | NIC override: one for every GPU, or one per local GPU ordinal. Default: the GPU's NIC in the PCI tree. |
+| `mooncake_store.protocol` | `rdma` | Worker transfer protocol (`rdma` or `tcp`). Lookups always use tcp. |
+| `mooncake_store.local_hostname` | `ATOM_HOST_IP` / route IP | This host's reachable address for the Store clients. |
+| `mooncake_store.chunk_tokens` | 256 | Tokens per Store object; a multiple of the KV block size. |
+| `mooncake_store.pool_device` | `gpu` | Where the registered transfer pool lives (`gpu` or `cpu`). |
+| `mooncake_store.load_pool_mib` | 1024 | Load region per worker, MiB. |
+| `mooncake_store.save_pool_mib` | 256 | Save region per worker, MiB. |
+| `mooncake_store.lookup_batch_keys` | 8192 | Most keys per `batch_is_exist`. |
+| `mooncake_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source; must be > 0. |
+| `mooncake_store.publish_loaded_prefix` | true | Index a loaded prefix in the HBM prefix cache. |
+| `mooncake_store.startup_probe` | true | One-chunk round trip per worker at startup. |
+| `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way). |
+
+`OFFLOAD_COPY_WORKERS`, `OFFLOAD_LOAD_WORKERS`, `OFFLOAD_MIN_LOAD_TOKENS`,
+`OFFLOAD_PROFILE` and the `OFFLOAD_GPU_STAGING_*` knobs apply as for the dense
+path.
+
+```bash
+# Store: one master, owners on NICs no prefill worker uses (here NUMA1's).
+mooncake_master --rpc_port=26051 --enable_http_metadata_server=true \
+  --http_metadata_server_port=26080 --default_kv_lease_ttl=10000 ...
+GLIBC_TUNABLES=glibc.malloc.hugetlb=1 MC_NUM_QP_PER_EP=1 mooncake_client \
+  --master_server_address=$IP:26051 --metadata_server=http://$IP:26080/metadata \
+  --protocol=rdma --device_names=rdma6,rdma7 --global_segment_size=768GB ...
+
+# Prefill server
+MC_NUM_QP_PER_EP=1 MC_TCP_BIND_ADDRESS=$IP MC_MAX_MR_SIZE=1073741824 \
+ATOM_KV_OFFLOAD=mooncake_store \
+ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"mooncake_store.master": "'$IP':26051",
+  "mooncake_store.metadata": "http://'$IP':26080/metadata",
+  "mooncake_store.owner_rdma_devices": "rdma6,rdma7",
+  "mooncake_store.local_hostname": "'$IP'"}' \
+python -m atom.entrypoints.openai_server --model <model> --kv-cache-dtype fp8 ...
+```
+
+The atomesh launcher (`MOONCAKE_STORE=1`, `.github/scripts/atomesh/pd_server_atom.sh`)
+starts the masters and owners, sizes and binds them to NUMA nodes, and builds
+this worker config. It checks a case's own connector keys
+(`MOONCAKE_STORE_CONNECTOR_CONFIG`) against this table and their types before
+it starts anything.
+
+### Deployment notes
+
+- **`MC_NUM_QP_PER_EP=1` in every Mooncake process** -- owners, masters, the
+  prefill server and the decode server (whose P/D engine must match the
+  prefill's QP count). With Mooncake's default of 2, concurrent reads stalled
+  for 30-60 s and failed. An rdma worker refuses to start without it, and with
+  `MC_MS_AUTO_DISC=1`, which would make it use every NIC. The launcher sets
+  the QP count, and refuses another one or `MC_MS_AUTO_DISC=1` before it
+  starts anything.
+- **One PCI-local NIC per worker, owners on other NICs.** Requesters on several
+  NICs, or owners on the requesters' NICs under one master, stalled concurrent
+  reads. Where the owners must share the workers' NICs (two half nodes), use
+  one master per NIC (`pools`); 4 x 37 GB/s with no retransmission.
+- **Owners need transparent huge pages** (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`,
+  page cache dropped and memory compacted first); 4 KiB pages exhaust the NIC's
+  registration budget.
+- **Leases and timeouts.** A read lease lasts 10 s (`--default_kv_lease_ttl`);
+  a get that completes later returns `LEASE_EXPIRED` and fails its load. Every
+  transfer batch waits at most 60 s, hard-coded in Mooncake.
+- **HBM.** The pool (1.25 GiB per worker by default) is allocated after the KV
+  cache and is not held back from the KV budget: it comes out of the headroom
+  `--gpu-memory-utilization` leaves. `MC_MAX_MR_SIZE=1 GiB` splits its
+  registration into 1 GiB regions.
+- **Store contents outlive the server.** The namespace covers the layout, not
+  the weights' revision: restart the Store (or `remove_all`) after changing
+  weights under the same model path.
+- **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
+  and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
+  `effective_gbps`) per operation, with Mooncake result codes in `errors=`.
+  Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, failures by
+  code, quarantined slots) at most once a minute while it transfers.
+
+### Not supported in phase 1
+
+- Layouts other than dense (DSV4 PAGE+SLOT, MiniMax-M3, Kimi-K3 state tier) and
+  DCP > 1 on the offload side: refused at startup.
+- Decode-side offload, and reading the Store from decode workers: decode DRAM
+  joins as Store owners only.
+- A second offload connector beside it in one `multi`.
+- Sharing the P/D transfer engine: the Store client opens its own, on its own
+  NIC.
 
 ## In-process `lmcache_offload` Architecture
 
@@ -1568,6 +1778,8 @@ python3 multi-round-qa.py \
 | [`tests/test_kv_aggregator.py`](../../../tests/test_kv_aggregator.py) | TP all-rank completion/failure and cross-generation isolation. |
 | [`tests/test_lmcache_offload_disk_integration.py`](../../../tests/test_lmcache_offload_disk_integration.py) | Real-LMCache local-disk PAGE and AOS1 sidecar round trips; explicit skip without LMCache. |
 | [`tests/test_lmcache_offload_gpu_disk_e2e.py`](../../../tests/test_lmcache_offload_gpu_disk_e2e.py) | Real PAGE-region + full-SLOT GPU `LocalDiskBackend` round trip; explicit prerequisite probes for ROCm/CUDA, LMCache, and Triton. |
+| [`tests/test_mooncake_store_offload.py`](../../../tests/test_mooncake_store_offload.py) | `mooncake_store` on CPU with a fake Store: settings, keys and namespace, NIC choice on a fake sysfs, lookups (rank minimum, pools, non-answers), request metadata, windowed save/load, failure terminals, slot quarantine, the PP quorum of a failed stage, the startup probe. |
+| [`tests/test_mooncake_store_offload_gpu_e2e.py`](../../../tests/test_mooncake_store_offload_gpu_e2e.py) | Real GPU KV through a running Mooncake Store and back into other blocks; needs a GPU, Triton, `mooncake.store` and `ATOM_TEST_MOONCAKE_STORE_{MASTER,METADATA}`. |
 
 ## Known Limitations & Future Work
 
