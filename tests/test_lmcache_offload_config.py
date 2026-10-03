@@ -408,7 +408,7 @@ def test_lmcache_metadata_rejects_scalar_lookup_scope(monkeypatch, worker_ids):
     cfg = _lmcache_config()
     cfg.lookup_server_worker_ids = worker_ids
 
-    with pytest.raises(TypeError, match="must be a list or tuple"):
+    with pytest.raises(ValueError, match="must be a list or tuple"):
         offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
 
 
