@@ -12,11 +12,14 @@ reaches back into the cached (not-re-forwarded) region would then read stale
 ring data.
 
 Fix (mirrors native ATOM scheduler "fix B'"): on a hit, drop the last
-``ceil(win_with_spec / block_size)`` cached blocks so those tail tokens are
-re-forwarded, repopulating the ring. The re-forwarded region is >= the ring
-stride, so by the last prompt token ``prefix_swa_count`` collapses to 0 and its
-whole window is served from the freshly computed extend KV. Compressed-KV reuse
-is unaffected: ``n_committed = context_len // ratio`` and
+``ceil(v4_prefix_warmup_tokens / block_size)`` cached blocks so those tail
+tokens are re-forwarded, repopulating the ring. The re-forwarded region is >=
+the ring stride, so by the last prompt token ``prefix_swa_count`` collapses to 0
+and its whole window is served from the freshly computed extend KV. That helper
+is shared with the LMCache offload path, which has to withhold the same tail on
+a CPU load; it also covers the ``index_topk`` floor, which is the binding one on
+DeepSeek-V4-Flash. Compressed-KV reuse is unaffected:
+``n_committed = context_len // ratio`` and
 ``context_len = cached + scheduled`` is invariant under the shift.
 
 In plugin mode vLLM owns the scheduler / KVCacheManager, so the block drop is
@@ -210,14 +213,21 @@ def apply_vllm_v4_prefix_swa_patch(vllm_config) -> None:
     from atom.plugin.vllm.deepseek_v4_bridge import (
         ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         _v4_win_with_spec,
+        v4_prefix_warmup_tokens,
     )
 
     win_with_spec = _v4_win_with_spec(vllm_config, _v4_sliding_window(vllm_config))
-    # The SWA ring's physical stride is win_with_spec = window + num_spec_tokens
-    # (MTP draft tokens get their own ring slots). Rolling back ceil(stride /
-    # block_size) whole blocks guarantees the re-forwarded region covers the full
-    # ring, so the last prompt token reads its entire window from extend KV.
-    warmup_blocks = math.ceil(win_with_spec / ATOM_DEEPSEEK_V4_BLOCK_SIZE)
+    # The rollback is whatever `v4_prefix_warmup_tokens` says, because a local
+    # prefix hit and an offload load have to withhold the same tail: a request
+    # that satisfies one rule but not the other is served from state nobody
+    # rebuilt. Two floors go into it -- the SWA ring's stride (win_with_spec,
+    # since MTP draft tokens get their own ring slots) and `index_topk`, which
+    # is the binding one on DeepSeek-V4-Flash and is empirical: below it the
+    # sparse indexer emits another request's content rather than merely stale
+    # window data.
+    warmup_blocks = math.ceil(
+        v4_prefix_warmup_tokens(vllm_config) / ATOM_DEEPSEEK_V4_BLOCK_SIZE
+    )
     if warmup_blocks <= 0:
         return
 
@@ -243,8 +253,11 @@ def apply_vllm_v4_prefix_swa_patch(vllm_config) -> None:
     KVCacheManager.get_computed_blocks = wrapped_get_computed_blocks
     logger.info(
         "ATOM DeepSeek-V4: prefix caching enabled with SWA recompute "
-        "(drop last %d cached block(s) per hit, win_with_spec=%d, block_size=%d).",
+        "(drop last %d cached block(s) = %d token(s) per hit, win_with_spec=%d, "
+        "index_topk=%d, block_size=%d).",
         warmup_blocks,
+        warmup_blocks * ATOM_DEEPSEEK_V4_BLOCK_SIZE,
         win_with_spec,
+        int(getattr(vllm_config.model_config.hf_config, "index_topk", 0) or 0),
         ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     )
