@@ -11,12 +11,14 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -29,6 +31,8 @@ from atom.kv_transfer.disaggregation.types import (
     SaveCompletionId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload import mooncake_store_l2
+from atom.kv_transfer.offload.remote_check import verify_remote_backend
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -86,6 +90,84 @@ def pp_aware_rank_and_world(config, tp) -> tuple[int, int]:
     return pp_rank * tp.world_size + tp.rank_in_group, pp_size * tp.world_size
 
 
+def _canonical_connector_name(kv_transfer_config: dict) -> str | None:
+    """The registered connector a config's ``kv_connector`` names, None if none."""
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    try:
+        return KVConnectorFactory.canonical_name(kv_transfer_config.get("kv_connector"))
+    except (TypeError, ValueError):
+        return None
+
+
+def offload_transfer_config(kv_transfer_config) -> dict | None:
+    """The in-process offload connector's config: itself, or a "multi" member.
+
+    Names resolve through the connector factory's aliases, as connector
+    construction does.
+    """
+    if not isinstance(kv_transfer_config, dict):
+        return None
+    name = _canonical_connector_name(kv_transfer_config)
+    if name == "lmcache_offload":
+        return kv_transfer_config
+    if name == "multi":
+        for sub in kv_transfer_config.get("connectors") or ():
+            if (
+                isinstance(sub, dict)
+                and _canonical_connector_name(sub) == "lmcache_offload"
+            ):
+                return sub
+    return None
+
+
+def reserve_l1_before_weights_load(config) -> None:
+    """With a Mooncake Store L2, fault this worker's L1 before its weights load.
+
+    The L1 must be all huge pages for the NICs to register it, and the node a
+    weight load leaves behind can be too fragmented for that
+    (:func:`mooncake_store_l2.reserve_thp_l1`); the engine build then takes the
+    region. Sized as the engine sizes it: the offload connector's LMCache
+    config, split across PP stages. A Mooncake Store L2 recipe the engine build
+    would refuse is refused here, before the weights load. Only the reservation
+    is best effort: a worker that cannot reserve allocates at engine build,
+    which checks the pages itself.
+
+    Raises:
+        ValueError: The Mooncake Store L2 recipe would fail
+            (:func:`mooncake_store_l2.validate_mooncake_store_config`).
+        RuntimeError: THP is disabled for this process.
+    """
+    sub = offload_transfer_config(getattr(config, "kv_transfer_config", None))
+    if sub is None:
+        return
+    try:
+        cfg = offcfg.build_lmcache_config(sub)
+    except Exception:  # the engine build raises it again, with its context
+        logger.debug(
+            "LMCache L1: no LMCache config before the weights load", exc_info=True
+        )
+        return
+    if not mooncake_store_l2.uses_mooncake_store(cfg):
+        return
+    # The engine build refuses the same recipe, but only after the weights load.
+    mooncake_store_l2.validate_mooncake_store_config(cfg)
+    mooncake_store_l2.require_thp_allowed()
+    try:
+        offcfg.scale_cpu_size_for_pp(cfg, config)
+        size = int(float(cfg.max_local_cpu_size or 0) * 1024**3)
+        node = mooncake_store_l2.current_gpu_numa_node()
+        if size <= 0 or node is None:
+            return
+        mooncake_store_l2.reserve_thp_l1(size, node)
+    except Exception:
+        logger.warning(
+            "LMCache L1: no reservation before the weights load; the engine "
+            "build allocates it",
+            exc_info=True,
+        )
+
+
 def build_offload_engine(
     config,
     *,
@@ -104,6 +186,12 @@ def build_offload_engine(
     exist. Returns ``(engine, cfg, meta)``. The metadata forces uint8 shapes;
     ``fmt`` is a tensor-accepting ``MemoryFormat`` purely to satisfy the
     LocalCPU allocator.
+
+    With a ``mooncakestore://`` remote it runs
+    :func:`mooncake_store_l2.prepare_mooncake_store_l2` before the build, then
+    ``verify_thp_l1`` and ``release_reserved_l1`` after ``post_init``; with any
+    remote URL, :func:`verify_remote_backend` last. A failure once the engine
+    exists tears it down (:func:`release_failed_engine`) and re-raises.
     """
     from lmcache.v1.cache_engine import LMCacheEngineBuilder
     from lmcache.v1.memory_management import MemoryFormat
@@ -120,12 +208,68 @@ def build_offload_engine(
         base_meta, atom_block_size=int(block_size), bytes_per_block=int(bytes_per_block)
     )
     gpu_connector = gpu_connector_factory(cfg, meta)
+    uses_mooncake_store = mooncake_store_l2.uses_mooncake_store(cfg)
+    if uses_mooncake_store:
+        # Before the engine exists: building it allocates and registers the L1.
+        mooncake_store_l2.prepare_mooncake_store_l2(cfg)
+    other_loop_threads = storage_manager_loop_threads()
     engine = LMCacheEngineBuilder.get_or_create(
         engine_id, cfg, meta, gpu_connector, lambda t, s: None, lambda o, s: o
     )
-    engine.fmt = MemoryFormat.KV_2LTD
-    engine.post_init()
+    try:
+        engine.fmt = MemoryFormat.KV_2LTD
+        engine.post_init()
+        if uses_mooncake_store:
+            mooncake_store_l2.verify_thp_l1(engine)
+            mooncake_store_l2.release_reserved_l1()
+        if getattr(cfg, "remote_url", None):
+            verify_remote_backend(engine, meta)
+    except BaseException:
+        release_failed_engine(engine_id, other_loop_threads)
+        raise
     return engine, cfg, meta
+
+
+# LMCache's name for the storage manager's event-loop thread.
+_STORAGE_MANAGER_LOOP_THREAD = "storage-manager-event-loop"
+
+
+def storage_manager_loop_threads() -> set[threading.Thread]:
+    """The running event-loop threads of LMCache storage managers."""
+    return {
+        thread
+        for thread in threading.enumerate()
+        if thread.name == _STORAGE_MANAGER_LOOP_THREAD and not thread.daemon
+    }
+
+
+def release_failed_engine(
+    engine_id: str, other_loop_threads: Collection[threading.Thread] = ()
+) -> None:
+    """Stop what an engine that failed to start left running.
+
+    LMCache's storage manager runs its event loop on a non-daemon thread, and
+    the interpreter waits for that thread at exit: without this, a worker whose
+    CPU pool or remote tier failed at startup logs the error and then hangs
+    instead of exiting. ``destroy`` stops the loop of a storage manager that was
+    built. One whose constructor raised -- it allocates the CPU pool -- leaves
+    its loop running with no owner, so that loop is stopped through its thread.
+    ``other_loop_threads`` -- those running before the engine was built --
+    belong to other engines and keep running. Best effort: the caller is
+    re-raising the startup error.
+    """
+    from lmcache.v1.cache_engine import LMCacheEngineBuilder
+
+    try:
+        LMCacheEngineBuilder.destroy(engine_id)
+    except Exception:  # cleanup on a path that re-raises
+        logger.warning(
+            "LMCache offload: destroying engine %s failed", engine_id, exc_info=True
+        )
+    for thread in storage_manager_loop_threads() - set(other_loop_threads):
+        for arg in getattr(thread, "_args", ()):
+            if isinstance(arg, asyncio.AbstractEventLoop) and not arg.is_closed():
+                arg.call_soon_threadsafe(arg.stop)
 
 
 class OffloadWorkerMixin:
