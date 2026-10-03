@@ -783,8 +783,9 @@ purge_lmcache_disk() {
 #    node is compacted for its pins (numa_memory_budget.py --compact, stopped
 #    after MOONCAKE_STORE_COMPACT_TIMEOUT seconds, default 600) before the
 #    owners fault them. A node whose compaction runs out of time can leave an
-#    owner 4 KiB pages its NICs refuse to register (seen on pit2-p03-g27 right
-#    after a fresh image pull: NUMA1 held 145 GiB of page cache).
+#    owner 4 KiB pages its NICs refuse to register (seen on pit2-p03-g27, whose
+#    NUMA1 did not compact 768 GiB in 600 s with 1342 GiB free; its NUMA0, like
+#    both nodes of pit2-p03-g19 and -g23, took 34 s).
 # validate_mooncake_store_settings refuses a conflicting setting, or an image
 # without the Store, before the node starts anything. Master and owners start
 # before the workers, which connect (and round-trip a probe chunk) while they
