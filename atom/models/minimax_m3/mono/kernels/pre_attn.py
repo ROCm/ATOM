@@ -56,6 +56,7 @@ from atom.models.minimax_m3.mono.kernels.common import (
     hw_rsq,
     kernel_symbol,
     memrealtime,
+    release_stores,
     rsrc,
     traced,
     uniform,
@@ -184,16 +185,14 @@ def emit_pre_attn(
     ) = ptrs  # fmt: skip
 
     # stores K4 reads in the same launch (signal): device-coherent like the
-    # mailboxes, so the done flags need no L2 writeback
+    # mailboxes, so a done flag needs their completion, not an L2 writeback
     cm_out = CM_DEV if signal is not None else 0
 
     def publish_done(mb_addr, idx, who=None):
         """The CTA's stores done, then flag idx of ``mb_addr`` (from thread 0, or
         from every thread where ``who``)."""
         if const_expr(signal is not None):
-            fx.memory_fence(
-                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
-            )
+            release_stores()
             gpu.barrier()
             if (tid == 0) if who is None else who:
                 mb_put(mb_addr, idx, fx.Int32(1))
@@ -326,9 +325,7 @@ def emit_pre_attn(
                         tk * (HIDDEN // 4) + lts[i] * 2,
                         cache_modifier=CM_DEV,
                     )
-            fx.memory_fence(
-                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
-            )
+            release_stores()
             gpu.barrier()
             if tid == 0:
                 mb_put(x8s_mb, tk, x_scale)

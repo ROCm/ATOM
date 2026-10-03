@@ -52,6 +52,17 @@ def rsrc(addr, nbytes=None):
     return bo.create_buffer_resource_from_addr(addr, num_records_bytes=nbytes)
 
 
+def release_stores():
+    """Order this wave's earlier device-scope (SC1) stores before a flag that
+    other CTAs poll. A workgroup-scope release fence does not wait for global
+    stores, so the flag could land first and a consumer read stale data; the
+    stores write through to L2, so their completion is all it must wait for."""
+    rocdl.s_waitcnt(vmcnt=0)
+    fx.memory_fence(
+        syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
+    )
+
+
 def permlane_swap(off, x, y):
     """v_permlane{32,16}_swap on registers (x, y): off 32 trades x's upper-half
     lanes with y's lower-half lanes; off 16 trades x's odd 16-lane rows with y's
