@@ -298,7 +298,7 @@ stop_mooncake_store
         self.assertTrue(drop.endswith("/scripts/drop_page_cache.py /models/m"), drop)
         self.assertIn(
             "/scripts/numa_memory_budget.py --reserve-gib 128 --gpus 0,1,2,3 "
-            "--per-gpu-gib 0 --compact 0:64 1:96",
+            "--per-gpu-gib 0 --compact --compact-timeout 600 0:64 1:96",
             budget,
         )
         (master,) = self.store_calls("mooncake_master")
@@ -669,7 +669,9 @@ stop_mooncake_store
             for line in self.calls.read_text().splitlines()
             if "numa_memory_budget.py" in line
         ]
-        self.assertIn("--gpus  --per-gpu-gib 0 --compact 0:96 0:96", budget)
+        self.assertIn(
+            "--gpus  --per-gpu-gib 0 --compact --compact-timeout 600 0:96 0:96", budget
+        )
         owners = self.store_calls("mooncake_client")
         self.assertEqual(len(owners), 2)
         for device, pool in (("rdma0", 0), ("rdma1", 1)):
@@ -844,11 +846,15 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             MOONCAKE_STORE_NODE_RESERVE_GIB="64",
             # A transfer pool in host memory pins on each prefill GPU's node.
             MOONCAKE_STORE_HOST_POOL_GIB="1.5",
+            # A fragmented node may need longer than the default 600 s.
+            MOONCAKE_STORE_COMPACT_TIMEOUT="1800",
         )
         calls = self.calls.read_text()
         self.assertIn("/scripts/drop_page_cache.py /share/models /data/cache\n", calls)
         self.assertIn(
-            "--reserve-gib 64 --gpus 0,1,2,3 --per-gpu-gib 1.5 --compact\n", calls
+            "--reserve-gib 64 --gpus 0,1,2,3 --per-gpu-gib 1.5 --compact "
+            "--compact-timeout 1800\n",
+            calls,
         )
 
     def test_owner_devices_must_be_active_and_on_one_numa_node(self):
