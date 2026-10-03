@@ -479,7 +479,7 @@ def validate_lmcache_lookup_scope(cfg: Any, world_size: int) -> None:
     if worker_ids is None:
         return
     if not isinstance(worker_ids, (list, tuple)):
-        raise TypeError(
+        raise ValueError(
             "LMCache lookup_server_worker_ids must be a list or tuple of worker ids, "
             f"got {type(worker_ids).__name__}"
         )
