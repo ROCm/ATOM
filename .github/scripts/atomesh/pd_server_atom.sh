@@ -1052,6 +1052,10 @@ settings = {
         "true or false",
         lambda value: isinstance(value, bool),
     ),
+    "mooncake_store.direct_copy": (
+        "true or false",
+        lambda value: isinstance(value, bool),
+    ),
     "max_pending_saves": ("a positive integer", positive_integer),
 }
 try:

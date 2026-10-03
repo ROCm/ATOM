@@ -44,6 +44,7 @@ _FIELDS = (
     "save_abandon_timeout_s",
     "publish_loaded_prefix",
     "startup_probe",
+    "direct_copy",
 )
 
 
@@ -76,6 +77,9 @@ class MooncakeStoreOffloadConfig:
     publish_loaded_prefix: bool
     # One-chunk Store round trip at worker startup.
     startup_probe: bool
+    # Pack and unpack a window in place in the GPU pool, without the staging
+    # copy, whenever its slots are one run.
+    direct_copy: bool
 
     @property
     def load_pool_bytes(self) -> int:
@@ -191,6 +195,9 @@ def parse_mooncake_store_config(
         ),
         startup_probe=_flag(
             "mooncake_store.startup_probe", values.get("startup_probe", True)
+        ),
+        direct_copy=_flag(
+            "mooncake_store.direct_copy", values.get("direct_copy", True)
         ),
     )
 
