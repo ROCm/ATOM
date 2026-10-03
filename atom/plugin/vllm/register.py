@@ -372,9 +372,13 @@ def register_model() -> None:
     apply_vllm_v41_state_reserve_patch()
     # Same install site and the same reason: the platform hook this would
     # naturally live in is not always activated for V4.1.
-    from atom.plugin.vllm.scheduler import apply_vllm_v41_local_hit_cap_patch
+    from atom.plugin.vllm.scheduler import (
+        apply_vllm_v41_local_hit_cap_patch,
+        apply_vllm_v41_prefill_alignment_patch,
+    )
 
     apply_vllm_v41_local_hit_cap_patch()
+    apply_vllm_v41_prefill_alignment_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 

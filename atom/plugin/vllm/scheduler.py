@@ -177,6 +177,63 @@ class _HybridKVLoadFailureMixin:
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
 
+def apply_vllm_v41_prefill_alignment_patch() -> None:
+    """End V4.1 prefill chunks on a state boundary. Idempotent, no-op elsewhere.
+
+    A STATE image exists only where the frontier *lands*, and vLLM spends one
+    token budget across the whole step: a prefill sharing a batch with six
+    decodes is scheduled 4,090 tokens, not 4,096, so the frontier lands at an
+    arbitrary offset and steps over the interval grid for the rest of the
+    prompt. Measured at concurrency 8: `boundary_passed` 1,315 against
+    `sweep_offered` 106, and seven hits in ten refused for want of a claimed
+    boundary.
+
+    This is the same invariant vLLM already enforces for Mamba in `align`
+    mode (`_mamba_block_aligned_split`: "chunk ends must be block aligned"),
+    with the interval in place of the block. It is gated on `has_mamba_layers`
+    there, which V4.1 is not, so it needs its own.
+
+    **The token budget has to exceed the interval for this to do anything.**
+    Clipping cannot extend a chunk, so with `max-num-batched-tokens` at or
+    below `state_interval` the first boundary is already out of reach and the
+    clip is skipped rather than scheduling zero tokens. Give the budget room
+    for the interval plus the step's decodes.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original = Scheduler._reserve_prefill_lookahead
+    if getattr(original, "_atom_v41_prefill_aligned", False):
+        return
+
+    @functools.wraps(original)
+    def _wrapped(self, request, num_computed_tokens, num_new_tokens):
+        num_new_tokens = original(self, request, num_computed_tokens, num_new_tokens)
+        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        if planner is None or num_new_tokens <= 0:
+            return num_new_tokens
+        interval = int(planner.state_interval)
+        start = int(num_computed_tokens)
+        end = start + int(num_new_tokens)
+        # The last chunk of a prompt is exempt: decode walks its frontier to
+        # the next boundary one token at a time, so clipping it would only
+        # delay the prompt for a landing it reaches anyway.
+        if end >= int(request.num_prompt_tokens):
+            return num_new_tokens
+        aligned = (end // interval) * interval
+        if aligned <= start:
+            # The next boundary is past this chunk. Clipping would schedule
+            # nothing; let it cross and let `boundary_passed` record that the
+            # budget is too small to land.
+            return num_new_tokens
+        return aligned - start
+
+    _wrapped._atom_v41_prefill_aligned = True
+    Scheduler._reserve_prefill_lookahead = _wrapped
+    logger.info(
+        "ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary."
+    )
+
+
 def apply_vllm_v41_local_hit_cap_patch() -> None:
     """Wrap vLLM's local prefix-cache hit so V4.1's is capped. Idempotent.
 
