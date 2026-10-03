@@ -43,6 +43,47 @@ export OFFLOAD_MIN_LOAD_TOKENS=256
 | `OFFLOAD_MIN_LOAD_TOKENS` (default **8192**) | A prompt shorter than this has every load declined by the admission gate *before* the tier is asked. Queries climb, hits stay at zero, and nothing in the log says why. |
 | `max-num-batched-tokens != state_interval` | A prefill chunk larger than the interval steps over boundaries instead of landing on them. `boundary_passed` counts it. |
 
+## Prefix caching
+
+Admitted only alongside this connector, and even then it buys nothing. Enable
+it and vLLM's block pool will offer local hits that the connector never sees;
+those are **refused**, not shortened, and all reuse continues through the
+tier.
+
+Shortening them is the tempting mistake. A local hit capped to a boundary the
+index holds still has nobody to restore that boundary's STATE --
+`resolve_load` runs only for tokens the connector supplied -- so the request
+arrives with its pages in HBM and a slot nobody wrote. Measured as
+`needs state at 8192, found 0`: the cap picked 8192 and no one filled it.
+PAGE reuse and STATE restore are one operation here, and only the connector
+performs both.
+
+Measured cost of enabling it, same window and workload as the table above:
+
+| | req/s | TTFT p50 |
+|---|---|---|
+| prefix caching off | 2.206 | 2913 ms |
+| prefix caching on | 2.139 | 3036 ms |
+
+**−3.1 %.** vLLM does the hashing and bookkeeping; the hits it produces are
+declined. `prefix_cache_hits_total` reads 0 and
+`external_prefix_cache_hits_total` carries the whole workload. Leave it off
+unless something else in the deployment needs it.
+
+Making a local hit useful means giving it a STATE restore of its own -- the
+request would have to park for it, the way a connector load does. That is not
+implemented.
+
+The cap is installed as a patch on `Scheduler._get_local_prefix_cache_hit`
+from `register_model`, not by selecting a scheduler subclass from the
+platform hook: measured on a V4.1 serve, `ATOMPlatform.check_and_update_config`
+ran **zero** times while the model wrapper's own hook ran four. A scheduler
+chosen there is a scheduler never chosen, and the symptom is prefix caching
+coming up uncapped -- the dead engine the cap exists to prevent, reintroduced
+by where it was installed.
+
+## Why caching is off by default here
+
 `--no-enable-prefix-caching` is deliberate, not a limitation. vLLM builds the
 block hasher when `enable_prefix_caching` **or** a KV connector is configured,
 and calls `get_num_new_matched_tokens` on the same condition, so the connector
