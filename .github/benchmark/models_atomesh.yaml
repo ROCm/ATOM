@@ -656,6 +656,119 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemp-1m-c128
           concurrency: [128]
 
+      # The nightly lmcache-1m cells with a small CPU tier per PP stage
+      # (in-process LMCache, 48 GiB base) over a Mooncake Store L2 that the
+      # launcher starts on the prefill node (pd_server_atom.sh:
+      # LMCACHE_MOONCAKE_L2): every chunk is written through to the Store, so
+      # the distinct capacity is about the owners' 768 + 768 GiB. Dispatch-only,
+      # never scheduled: they need an image with Mooncake Store (mooncake_master,
+      # mooncake_client and mooncake.store; the CI image builds Mooncake with
+      # WITH_STORE=OFF), so dispatch with suite=lmcache_mooncake and an explicit
+      # atomesh_image. The owner sizes and NICs fit pit2-p03 (TW MI355X) nodes
+      # only: about 1.5 TiB per NUMA node, NUMA1's NICs named rdma4-7 (Spur
+      # MI350X hosts name theirs ionic_N). These single-node cells have not
+      # run end to end since the compaction, early-L1 and one-load-worker
+      # changes (only the two-half-node cells below have), and the last
+      # single-node start with owner0 at 768 GiB, before those changes,
+      # failed the L1 huge-page check. The suite also holds the two-half-node
+      # cells below; their lmcache-2n cells are the in-process baseline and
+      # need no Store.
+      lmcache_mooncake:
+        - &glm52_agentic_lmcachemc_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c72
+          concurrency: [72]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              # The L1 per stage scales from this base by its layer share
+              # (about 48.6 GiB for 20 of 79 layers); it must stay huge pages,
+              # which ATOM checks at startup.
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "48"
+              LMCACHE_MOONCAKE_L2: "1"
+              # <numa>:<GiB>[:<rdma,...>] per owner, on NIC pairs of rdma4-7,
+              # disjoint from the stages' own NICs (their GPUs' rdma0-3) and
+              # from each other. An ionic NIC registers at most 832-896 GiB
+              # for one process: 960 GiB owners, or 768 + 960 GiB sharing
+              # rdma4-7, failed to mount on pit2-p03-g40. Resize by overriding
+              # ATOMESH_PREFILL_ENV_LMCACHE_MOONCAKE_OWNERS.
+              LMCACHE_MOONCAKE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              # Owners and L1s pin huge pages under MPOL_BIND, so the clean
+              # page cache of every model on the node goes first, not just this
+              # one's: other weights' cache would be reclaimed through
+              # compaction (pit2-p03-g40 held 520 GiB of another model's).
+              LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+            # The launcher adds MC_NUM_QP_PER_EP=1 for the P->D transfer engine.
+            decode: *glm52_cpp4_dcp4_decode_env
+
+        - <<: *glm52_agentic_lmcachemc_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_lmcachemc_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_lmcachemc_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-1m-c128
+          concurrency: [128]
+
+        # The same cells on two nodes that each give the job only GPUs 0-3
+        # with their NUMA node's memory and NICs (rdma0-3): the other half of
+        # each node belongs to another job. Prefill on the first node, decode
+        # on the second, both on GPUs 0-3. "lmcache-2n" keeps the single-node
+        # cells' in-process CPU tier (4 x 256 GiB on the prefill node), so the
+        # decode node's memory stays unused. "lmcachemc-2n" gives each PP
+        # stage a 96 GiB-base L1 over Mooncake Store pools of both nodes'
+        # NUMA0 memory: 4 x 144 GiB on the prefill node, 4 x 240 GiB on the
+        # decode node, 1536 GiB in all (the only 48 GiB-base run also had four
+        # load workers and hung; 96 GiB with one load worker completed c96 and
+        # c112, its L1 running full as well; 48 GiB with one load worker was
+        # not tried). Those owners must share the stages' NICs, so each NIC
+        # is a pool of its own (LMCACHE_MOONCAKE_POOLS=per_nic): one master
+        # for all eight owners stalled reads across two such nodes for good,
+        # one per NIC read 4 x 37 GB/s.
+        - &glm52_agentic_lmcache_2n_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-2n-1m-c96
+          pd_worker_layout: multi_node
+          concurrency: [96]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+            decode: &glm52_cpp4_dcp4_2n_decode_env
+              <<: *glm52_cpp4_dcp4_decode_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+
+        - <<: *glm52_agentic_lmcache_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-2n-1m-c112
+          concurrency: [112]
+
+        - &glm52_agentic_lmcachemc_2n_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-2n-1m-c96
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "96"
+              LMCACHE_MOONCAKE_L2: "1"
+              LMCACHE_MOONCAKE_POOLS: "per_nic"
+              LMCACHE_MOONCAKE_MASTER_NUMA: "0"
+              LMCACHE_MOONCAKE_OWNERS: "0:144:rdma0;0:144:rdma1;0:144:rdma2;0:144:rdma3"
+              LMCACHE_MOONCAKE_DECODE_OWNERS: "0:240:rdma0;0:240:rdma1;0:240:rdma2;0:240:rdma3"
+              # This drops the clean page cache of every model under
+              # ${ATOMESH_MODEL_ROOT} on both nodes, the co-tenant's included
+              # (page cache is per file, node-wide), and the launcher keeps
+              # dropping MODEL_PATH every 45 s for 30 min while the weights load.
+              LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+            decode: *glm52_cpp4_dcp4_2n_decode_env
+
+        - <<: *glm52_agentic_lmcachemc_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcachemc-2n-1m-c112
+          concurrency: [112]
+
     accuracy:
       task: gsm8k
       fewshot: 20
