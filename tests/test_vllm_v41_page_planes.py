@@ -19,11 +19,13 @@ No GPU and no vLLM: the planes are modelled as plain CPU tensors with the
 strides `PagedAttentionCache` gives them.
 """
 
+import itertools
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from atom.plugin.vllm.deepseek_v41_bridge import v41_page_planes  # noqa: E402
+from atom.plugin.vllm.deepseek_v41_bridge import v41_page_planes
 
 # The shipped DeepSeek-V4.1-Flash geometry, BF16 pool: 40 layers, owners
 # (2,2) (8,2) (14,2) (20,1), head_dim 512, index_head_dim 128,
@@ -144,7 +146,7 @@ def test_planes_tile_the_paged_region_without_gaps_or_overlap():
         for _, plane in v41_page_planes(cache)
     )
     assert spans[0][0] == cache.backing.data_ptr()
-    for (_, prev_end), (begin, _) in zip(spans, spans[1:]):
+    for (_, prev_end), (begin, _) in itertools.pairwise(spans):
         assert begin == prev_end
     assert spans[-1][1] == cache.state_bytes.data_ptr()
 
@@ -158,10 +160,10 @@ def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
     an offset past the absolute end of the paged region), which is exactly the
     layout the patch exists to stop vLLM from recycling out from under.
     """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _V4_PROXY_LAYER_MARKERS
     from atom.plugin.vllm.deepseek_v41_bridge import (
         ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
     )
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import _V4_PROXY_LAYER_MARKERS
 
     assert any(
         marker in ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
@@ -201,13 +203,15 @@ def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
     """
     import re
 
-    src = open("atom/plugin/vllm/deepseek_v41_bridge.py").read()
+    with open("atom/plugin/vllm/deepseek_v41_bridge.py") as handle:
+        src = handle.read()
     assert re.search(r"speculative_tokens=0", src), (
         "v41_proxy_geometry no longer hardcodes speculative_tokens=0 -- if "
         "speculative decoding is now supported, drop this test; if not, the "
         "pool is being sized from an unverified source"
     )
-    platform = open("atom/plugin/vllm/platform.py").read()
+    with open("atom/plugin/vllm/platform.py") as handle:
+        platform = handle.read()
     assert "does not support speculative" in platform, (
         "the hardcoded speculative_tokens=0 is only safe while the platform "
         "refuses speculative decoding, and that refusal is gone"

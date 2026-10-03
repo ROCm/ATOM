@@ -153,6 +153,7 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
         state_stored=None,
         state_store_failed=None,
         state_load_failed=None,
+        state_refusals=None,
     ) -> None:
         self.saved: dict[str, int] = dict(saved or {})
         self.load_failed: dict[str, int] = dict(load_failed or {})
@@ -165,6 +166,11 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
         self.state_stored: dict[int, int] = dict(state_stored or {})
         self.state_store_failed: dict[int, int] = dict(state_store_failed or {})
         self.state_load_failed: dict[str, int] = dict(state_load_failed or {})
+        # Why the worker declined to snapshot, by reason. The cursor guard and
+        # the staging ring live there, but the leg's stats line -- the one
+        # place an operator reads -- is on the scheduler half, so the tallies
+        # have to travel or the alarm cannot fire.
+        self.state_refusals: dict[str, int] = dict(state_refusals or {})
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -175,6 +181,7 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
             "state_stored",
             "state_store_failed",
             "state_load_failed",
+            "state_refusals",
         ):
             mine = getattr(self, field)
             for req_id, count in (getattr(other, field, None) or {}).items():
@@ -189,7 +196,8 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
             f"completions={self.completions}, "
             f"state_stored={self.state_stored}, "
             f"state_store_failed={self.state_store_failed}, "
-            f"state_load_failed={self.state_load_failed})"
+            f"state_load_failed={self.state_load_failed}, "
+            f"state_refusals={self.state_refusals})"
         )
 
 
@@ -318,6 +326,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # scheduler's counters -- the one place a reader looks -- say why.
         self._v41_refusals: list = []
         self._v41_refusal_counts: dict = {}
+        # Drained into each step's worker metadata; the counts above are the
+        # worker's own running totals for its log line.
+        self._v41_refusals_to_report: dict = {}
         # No-forward steps never call `wait_for_save`. Nothing writes the
         # boundary page on those steps, so `get_finished` may flush instead.
         self._kda_flush_stores_in_get_finished = False
@@ -1126,6 +1137,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if not stores:
             return
         if self._is_deepseek_v41:
+            if self._v41_leg is None:
+                # Registration did not resolve the page planes on this half, so
+                # there is nothing to snapshot into. Dropping the stores costs
+                # boundaries; dereferencing None costs the step.
+                logger.warning(
+                    "ATOM LMCache offload: %d V4.1 store(s) decided before the "
+                    "state tier was up; dropping them",
+                    len(stores),
+                )
+                return
             # Snapshot now, not at the flush. This runs inside `start_load_kv`,
             # which vLLM calls before the forward; `_flush_kda_stores` runs
             # from `wait_for_save`, after it. By then `advance_cursor` has
@@ -1188,6 +1209,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 store_failed[op_id] = store_failed.get(op_id, 0) + 1
                 self._v41_refusal_counts[reason] = (
                     self._v41_refusal_counts.get(reason, 0) + 1
+                )
+                self._v41_refusals_to_report[reason] = (
+                    self._v41_refusals_to_report.get(reason, 0) + 1
                 )
             logger.info(
                 "ATOM LMCache offload: V4.1 state leg refused %d snapshot(s) "
@@ -1334,6 +1358,26 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         self._flush_kda_stores()
 
+    def _release_v41_slots(self, req_ids) -> None:
+        """Give back the state slots of requests that are done with them.
+
+        A reservation is only cleared by the `assign` that claims it, so a
+        request parked for a restore and then aborted before it ever reaches a
+        forward keeps its slot for the life of the process. Enough of those and
+        every slot is reserved: restores start being refused, and `assign`'s
+        own fallback hands a reserved slot to a batch member -- two requests on
+        one CSA2 ring, which is the corruption the reservation exists to
+        prevent, reached by starving it instead of racing it.
+
+        Releasing a slot whose request ran normally is equally correct: it is
+        finished, and the slot's next tenant resets it.
+        """
+        slots = self._v41_slots
+        if slots is None:
+            return
+        for req_id in req_ids or ():
+            slots.release(str(req_id))
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Translate ATOM's four completion sets into vLLM's two.
 
@@ -1358,6 +1402,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         two contracts; the translation lives here rather than in either side.
         """
         out = self._worker.get_finished()
+        # vLLM's own notion of done, which is the only one that covers a
+        # request aborted before it ever reached a forward -- the case that
+        # leaks a reserved state slot.
+        self._release_v41_slots(finished_req_ids)
 
         finished_recving = {_req_id_of(c) for c in out.finished_loading}
         failed = {_req_id_of(c) for c in out.failed_loading}
@@ -1442,7 +1490,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             state_stored=self._worker_state_stored,
             state_store_failed=self._worker_state_store_failed,
             state_load_failed=self._worker_state_load_failed,
+            state_refusals=self._v41_refusals_to_report,
         )
+        self._v41_refusals_to_report = {}
         self._worker_saved = {}
         self._worker_load_failed = {}
         self._worker_completions = []
@@ -2087,6 +2137,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return
         self._apply_completions(getattr(meta, "completions", None) or ())
         if self._v41_planner is not None:
+            self._v41_planner.absorb_worker_counters(
+                getattr(meta, "state_refusals", None)
+            )
             self._v41_planner.absorb_reports(
                 getattr(meta, "state_stored", None),
                 getattr(meta, "state_store_failed", None),

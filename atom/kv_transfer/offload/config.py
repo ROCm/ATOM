@@ -94,6 +94,16 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
 # `_layout_from_model`, so no override can resurrect them.
 _STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "dsv41"})
 
+# Every spelling of the V4.1 family, mirroring `atom.utils.selector._V41_TYPES`.
+# Matching only the text config's own type left the wrapper and DSpark
+# spellings to fall through to the `compress_ratios` probe below and resolve to
+# `hybrid` -- outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense`
+# override would be honoured on a model that carries per-request state, and
+# sharing DSV4's key space besides.
+_DSV41_MODEL_TYPES = frozenset(
+    {"deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"}
+)
+
 logger = logging.getLogger("atom")
 
 
@@ -222,7 +232,7 @@ def _layout_from_model(config) -> str:
     # share DSV4's key space and leave it outside `_STATE_OWNING_LAYOUTS`, so
     # an `offload_layout: dense` override would silently restore a KV prefix
     # over a window ring that never existed.
-    if model_type == "deepseek_v41_text":
+    if model_type in _DSV41_MODEL_TYPES:
         return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"

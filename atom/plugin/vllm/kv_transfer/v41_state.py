@@ -534,6 +534,20 @@ class V41BoundaryPlanner:
             accepted.append(V41Store(op_id, prefix_hash, req_id, frontier))
         return accepted
 
+    def absorb_worker_counters(self, counts) -> None:
+        """Fold the worker half's refusal tallies into the leg's own stats.
+
+        The worker owns the cursor guard and the staging ring, so it is where
+        `cursor_mismatch` and `stage_full` actually happen -- but `log_stats`
+        here is the single line an operator reads. Without this they are
+        initialised to zero and never written, which makes the alarm the
+        docstring calls "must stay zero" structurally incapable of firing: a
+        run in which every store was dropped for a cursor mismatch reports
+        `cursor_mismatch=0`.
+        """
+        for reason, count in (counts or {}).items():
+            self._counters[reason] = self._counters.get(reason, 0) + int(count)
+
     def absorb_reports(self, stored, failed) -> None:
         """Fold the worker's per-rank store reports into the index.
 

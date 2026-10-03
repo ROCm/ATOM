@@ -201,7 +201,18 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
     """
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    original = Scheduler._reserve_prefill_lookahead
+    # Private vLLM methods, so absence is a version difference rather than a
+    # bug. This runs from `register_model`, the plugin entry point for EVERY
+    # model, so raising here would stop GLM, M3 and K3 loading over a V4.1
+    # feature none of them use.
+    original = getattr(Scheduler, "_reserve_prefill_lookahead", None)
+    if original is None:
+        logger.warning(
+            "ATOM DeepSeek-V4.1: vLLM has no Scheduler._reserve_prefill_lookahead; "
+            "skipping this patch. V4.1 offload needs it -- that model will "
+            "refuse at startup rather than run uncapped."
+        )
+        return
     if getattr(original, "_atom_v41_prefill_aligned", False):
         return
 
@@ -248,7 +259,18 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
     """
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    original = Scheduler._get_local_prefix_cache_hit
+    # Private vLLM methods, so absence is a version difference rather than a
+    # bug. This runs from `register_model`, the plugin entry point for EVERY
+    # model, so raising here would stop GLM, M3 and K3 loading over a V4.1
+    # feature none of them use.
+    original = getattr(Scheduler, "_get_local_prefix_cache_hit", None)
+    if original is None:
+        logger.warning(
+            "ATOM DeepSeek-V4.1: vLLM has no Scheduler._get_local_prefix_cache_hit; "
+            "skipping this patch. V4.1 offload needs it -- that model will "
+            "refuse at startup rather than run uncapped."
+        )
+        return
     if getattr(original, "_atom_v41_hit_cap_patched", False):
         return
 

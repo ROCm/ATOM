@@ -422,8 +422,10 @@ def validate_runtime_config(config):
             # transport is not an ATOM connector at all -- it is vLLM's own
             # `kv_connector`, and feeding that string to ATOM's factory is a
             # category error -- so it is named against its own allow-list.
-            "KV transfer other than lmcache_mp (native) or "
-            "AtomLMCacheOffloadConnector (vLLM plugin)",
+            (
+                "KV transfer other than lmcache_mp (native) or "
+                "AtomLMCacheOffloadConnector (vLLM plugin)"
+            ),
             _kv_transfer_unsupported(config, on_vllm_plugin),
         ),
         ("RapidServe", config.enable_rapidserve),
@@ -442,8 +444,10 @@ def validate_runtime_config(config):
         # hit -- vLLM's own included, through the scheduler mixin -- to one it
         # holds. Without it there is nothing to cap against.
         (
-            "prefix caching on the vLLM plugin without "
-            "AtomLMCacheOffloadConnector",
+            (
+                "prefix caching on the vLLM plugin without "
+                "AtomLMCacheOffloadConnector"
+            ),
             on_vllm_plugin
             and config.enable_prefix_caching
             and not _kv_connector_owns_v41_state(config),

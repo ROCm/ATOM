@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
-from types import SimpleNamespace
-
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -29,7 +28,6 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
-
 
 # `prepare_state`'s deferred probe ships the cursor rows asynchronously and
 # renders its stale-slot verdict on the next step, which takes one blocking

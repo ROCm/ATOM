@@ -57,13 +57,13 @@ class FakeViews:
 
 
 def make_planner(**overrides):
-    fields = dict(
-        hash_block_size=HASH_BLOCK,
-        chunk_size=CHUNK,
-        state_interval=INTERVAL,
-        max_num_batched_tokens=INTERVAL * 2,
-        world_size=1,
-    )
+    fields = {
+        "hash_block_size": HASH_BLOCK,
+        "chunk_size": CHUNK,
+        "state_interval": INTERVAL,
+        "max_num_batched_tokens": INTERVAL * 2,
+        "world_size": 1,
+    }
     fields.update(overrides)
     return V41BoundaryPlanner(**fields)
 
@@ -459,3 +459,19 @@ def test_the_worker_reads_every_cursor_in_one_device_round_trip():
     refused = leg.snapshot_and_submit(decided)
     assert views.cursor_reads == 1
     assert len(refused["cursor_mismatch"]) == 3
+
+
+def test_worker_refusals_reach_the_leg_s_own_stats_line():
+    """Otherwise the alarm the docstring calls "must stay zero" cannot fire.
+
+    The cursor guard and the staging ring live in the worker, so those
+    counters are written there -- but `log_stats` on the planner is the single
+    line an operator reads. Initialised to zero and never written, a run in
+    which every store was dropped for a cursor mismatch would report
+    `cursor_mismatch=0`.
+    """
+    planner = make_planner()
+    planner.absorb_worker_counters({"cursor_mismatch": 3, "stage_full": 1})
+    stats = planner.stats()
+    assert stats["cursor_mismatch"] == 3
+    assert stats["stage_full"] == 1

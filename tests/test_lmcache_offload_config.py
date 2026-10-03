@@ -486,3 +486,19 @@ def test_page_namespace_tracks_deepseek_v41_geometry(mutate):
     moved = _dsv41_config()
     mutate(moved.hf_config)
     assert offcfg.build_page_namespace(moved, _lmcache_config(), 4) != base
+
+
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
+)
+def test_every_v41_spelling_resolves_to_the_state_owning_layout(model_type):
+    """`atom.utils.selector._V41_TYPES` lists three; all three carry the state.
+
+    Matching only the text config's own type left the other two falling
+    through to the `compress_ratios` probe and resolving to `hybrid` -- which
+    is outside `_STATE_OWNING_LAYOUTS`, so a `dense` override would be
+    honoured on a model that has per-request state to lose.
+    """
+    config = _dsv41_config()
+    config.hf_config.model_type = model_type
+    assert offcfg.select_offload_layout(config) == "dsv41"
