@@ -53,6 +53,13 @@ def _flag_env(name: str, default: str = "0") -> bool:
     return bool(raw) and raw not in ("0", "false", "no", "off")
 
 
+def _profiler_detail_env(name: str) -> bool:
+    # Unset or empty falls back to ATOM_PROFILER_MORE, so the per-option flag
+    # always wins when given and ATOM_PROFILER_MORE=1 alone still enables all.
+    raw = os.getenv(name) or os.getenv("ATOM_PROFILER_MORE", "0")
+    return raw == "1"
+
+
 def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     """Unset or empty reads as None; anything else must be an integer."""
     raw = os.getenv(name)
@@ -532,6 +539,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DETOKENIZER_AUDIT_EVERY", ""
     ).strip(),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    "ATOM_PROFILER_RECORD_SHAPES": lambda: _profiler_detail_env(
+        "ATOM_PROFILER_RECORD_SHAPES"
+    ),
+    "ATOM_PROFILER_WITH_STACK": lambda: _profiler_detail_env(
+        "ATOM_PROFILER_WITH_STACK"
+    ),
+    "ATOM_PROFILER_PROFILE_MEMORY": lambda: _profiler_detail_env(
+        "ATOM_PROFILER_PROFILE_MEMORY"
+    ),
     # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
@@ -953,6 +969,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-transfer offload profiling logs.
     "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
+    # admission; this is how many waiting requests per scheduling pass.
+    "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
+        "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
+    ),
+    # How long admission may pass over a request whose async lookup has not
+    # answered before it waits for the answer instead.
+    "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
+        "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
+    ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.

@@ -76,6 +76,43 @@ turns land on different DP ranks, so the prefix KV written by one turn sits on
 a rank the next turn never reaches — and an agentic trace is nothing but
 multi-turn sessions, so the whole workload degrades to cold prefill.
 
+## Server — DP attention with LMCache MP offload
+
+For long-context, high-concurrency agentic replay, where conversation
+prefixes outgrow HBM and get evicted between turns. This variant is not
+generated from the CI catalog: it is the DP attention command above plus a
+standalone LMCache server as a shared CPU tier for all DP ranks.
+
+Start the LMCache server first, on the same host:
+
+```bash
+lmcache server --host 127.0.0.1 --port 5555 \
+  --chunk-size 256 --null-block-id -1 --separate-object-groups \
+  --supported-transfer-mode lmcache_driven \
+  --l1-size-gb 1200 --l1-use-lazy --l1-read-ttl-seconds 900 \
+  --eviction-policy LRU --eviction-trigger-watermark 0.98 \
+  --max-cpu-workers 4
+```
+
+Then launch the DP attention server with these added to its environment:
+
+```bash
+export ATOM_KV_OFFLOAD=lmcache_mp
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": 5555}'
+export LMCACHE_CHUNK_SIZE=256
+export OFFLOAD_MAX_PENDING_SAVES=8
+```
+
+- Size `--l1-size-gb` to the host: the pool is pinned memory, and
+  `--l1-use-lazy` is what lets a pool of this size register (see
+  `atom/kv_transfer/offload/README.md`, "Running the MP server").
+- `ATOM_DP_SESSION_AFFINITY=1` stays on. The MP namespace is shared by every
+  DP rank, so a rank can also restore a prefix another rank stored (sibling
+  subagents placed on different ranks).
+- Keep `--max-gpu-workers` at its default.
+- At concurrency 512 the client's `--warmup-requests-per-lane 10` takes hours
+  before profiling starts; compare runs with the same, smaller value.
+
 ## Client
 
 The environment matters as much as the flags — AIPerf reads these directly, and
