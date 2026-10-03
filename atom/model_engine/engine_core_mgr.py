@@ -10,6 +10,7 @@ import os
 import pickle
 import queue
 import weakref
+from collections import deque
 from dataclasses import dataclass
 from threading import Lock, Thread
 
@@ -148,6 +149,14 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
 
 
 class CoreManager:
+    # Class-level defaults so bare instances built via ``__new__`` (the DP
+    # load-balance unit tests) and any subclass that skips ``_init_shared_state``
+    # still have working backpressure state. Real instances override
+    # _input_send_lock with their own in _init_shared_state; _bp_depth defaults
+    # to 0 (backpressure disabled).
+    _bp_depth = 0
+    _input_send_lock = Lock()
+
     def _init_shared_state(
         self,
         config: Config,
@@ -253,6 +262,25 @@ class CoreManager:
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
         self._lb_lock = Lock()
+        # --- Backpressure (lazy) DP dispatch --------------------------------
+        # ATOM_DP_DISPATCH_DEPTH > 0 enables it; 0 keeps the legacy behaviour of
+        # spraying every seq across ranks up front. The value is the per-rank cap
+        # on in-flight (charged-but-unfinished) requests. Un-dispatched
+        # load-balanced seqs wait in _bp_pending and are released to the lightest
+        # rank only as that rank drains, so a rank that finishes early keeps
+        # getting re-fed instead of running dry and dragging the lockstep DP
+        # group onto the forced-eager path. Must stay >= max_num_seqs so each
+        # rank can still fill a full running batch; ~1.2-1.5x is a good start.
+        try:
+            self._bp_depth = int(os.getenv("ATOM_DP_DISPATCH_DEPTH", "0"))
+        except ValueError:
+            self._bp_depth = 0
+        self._bp_pending: deque = deque()
+        # Backpressure refill runs on the per-rank output threads, which then
+        # also write input_sockets. A ZMQ socket is not thread-safe, so every
+        # input_sockets send is serialized through this lock (see _send_request).
+        # Uncontended in the legacy path, so it costs nothing when disabled.
+        self._input_send_lock = Lock()
         # Control traffic (utility commands, abort, shutdown) travels on its own
         # sockets so that input_sockets keeps a single writer -- see
         # _send_request. These have several writer threads and so do need
@@ -717,6 +745,12 @@ class CoreManager:
                                     exc_info=True,
                                 )
                         self.outputs_queue.put_nowait(seqs)
+                        # These completions freed slots on their ranks — re-feed
+                        # from the pending pool so a fast rank never drains to
+                        # empty while peers still have work. No-op when
+                        # ATOM_DP_DISPATCH_DEPTH is unset (legacy spray path).
+                        if getattr(self, "_bp_depth", 0) > 0 and self._bp_pending:
+                            self._bp_dispatch_or_refill(raise_on_error=False)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -856,9 +890,13 @@ class CoreManager:
         anywhere but that thread's own traceback. So: never send to
         ``input_sockets`` from anywhere but here.
         """
-        self.input_sockets[dp_rank].send_multipart(
-            [self.engine_core_identities[dp_rank], payload], copy=False
-        )
+        # Serialized because backpressure refill (ATOM_DP_DISPATCH_DEPTH) sends
+        # from the per-rank output threads too, not just the single request
+        # thread. The lock is uncontended when backpressure is off.
+        with self._input_send_lock:
+            self.input_sockets[dp_rank].send_multipart(
+                [self.engine_core_identities[dp_rank], payload], copy=False
+            )
 
     def _send_control(self, dp_rank: int, payload: bytes, copy: bool = False) -> None:
         """Send one already-pickled control message. Serialized, never hot.
@@ -945,6 +983,19 @@ class CoreManager:
         # getattr/int pass per seq.
         hints = self._resolve_and_validate_hints(seqs)
 
+        # Backpressure (lazy) dispatch. Only engages for plain load-balanced
+        # batches (no explicit rank hints, no sticky sessions) so the
+        # hinted/affinity semantics below are never altered. Offline batch
+        # inference takes exactly this path, which is where a rank that drains
+        # early otherwise forces the lockstep DP group onto the eager path.
+        if (
+            getattr(self, "_bp_depth", 0) > 0
+            and not self._dp_session_affinity_enabled
+            and all(h is None for h in hints)
+        ):
+            self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
+            return
+
         # round_robin normally skips load bookkeeping. Session affinity still
         # needs queued-prefill counters even if the fallback strategy is RR.
         track_load = (
@@ -1013,6 +1064,79 @@ class CoreManager:
             )
         else:
             logger.info("%s: add %s", self.label, ", ".join(added))
+
+    def _drain_pending_locked(self) -> list[tuple[int, list]]:
+        """Release pending seqs up to the per-rank depth cap. Hold _lb_lock.
+
+        Fills the lightest rank first (fewest in-flight requests), charging each
+        seq as it goes, until every rank is at the cap or the pending pool is
+        empty. Balancing on request count keeps the lockstep DP ranks in phase;
+        the cap is what leaves work queued so a fast rank can be re-fed on its
+        next completion instead of draining to empty. Returns per-rank
+        sub-batches to send after the lock is dropped (ZMQ sends must not hold
+        _lb_lock).
+        """
+        n = self._routable_engine_count
+        batches: list[list] = [[] for _ in range(n)]
+        while self._bp_pending:
+            # Lightest rank by (in-flight reqs, rank) for a stable tie-break.
+            best = min(range(n), key=lambda r: (self._rank_reqs[r], r))
+            if self._rank_reqs[best] >= self._bp_depth:
+                break  # every rank is at/above the cap; hold the rest.
+            seq = self._bp_pending.popleft()
+            self._charge_seq_load_locked(seq, best)
+            batches[best].append(seq)
+        return [(r, s) for r, s in enumerate(batches) if s]
+
+    def _bp_dispatch_or_refill(self, new_seqs=None, raise_on_error: bool = False):
+        """Backpressure dispatch: enqueue, then top ranks up to the cap.
+
+        Called both on add (``new_seqs`` set, request thread) and after each
+        completion (``new_seqs`` None, per-rank output thread) to re-feed the
+        rank that just freed a slot. Charging happens under ``_lb_lock``; the
+        actual ZMQ sends happen after the lock is dropped. On a send failure the
+        just-charged seqs are released so the per-rank counters never leak.
+
+        ``raise_on_error`` propagates on the add path (the offline ``generate``
+        caller fails the run cleanly). The completion path swallows + logs so a
+        broken socket cannot silently kill an output thread.
+        """
+        with self._lb_lock:
+            if new_seqs:
+                self._bp_pending.extend(new_seqs)
+            sends = self._drain_pending_locked()
+        if not sends:
+            return
+        added = []
+        for dp_rank, rank_seqs in sends:
+            try:
+                self._send_request(
+                    dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
+                )
+                added.append(f"rank{dp_rank}: {len(rank_seqs)} req")
+            except Exception:
+                # Roll back this rank's charge; it will never finish to release.
+                for seq in rank_seqs:
+                    self._release_seq_load(seq.id)
+                if raise_on_error:
+                    raise
+                logger.exception(
+                    "%s: backpressure send to rank%d failed; dropped %d seq(s)",
+                    self.label,
+                    dp_rank,
+                    len(rank_seqs),
+                )
+        if added:
+            with self._lb_lock:
+                reqs_snapshot = list(self._rank_reqs)
+                pending = len(self._bp_pending)
+            logger.info(
+                "%s: bp-dispatch %s | in-flight reqs=%s pending=%d",
+                self.label,
+                ", ".join(added),
+                reqs_snapshot,
+                pending,
+            )
 
     def _select_dp_rank_locked(self) -> int:
         """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
@@ -1309,6 +1433,8 @@ class CoreManager:
             self._rank_reqs = [0] * self._routable_engine_count
             self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
+            if getattr(self, "_bp_pending", None) is not None:
+                self._bp_pending.clear()
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
 
