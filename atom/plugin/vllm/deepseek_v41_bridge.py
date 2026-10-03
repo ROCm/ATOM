@@ -608,6 +608,53 @@ def get_deepseek_v41_proxy_metadata_from_vllm_context(
     return None
 
 
+def _dump_v41_state_rows(snapshot, batch, builder, exc) -> None:
+    """Log every column a stale-cursor refusal is a disagreement between.
+
+    Deliberately blind to its own failures: this runs on a path that is
+    already raising, and a diagnostic that masks the error it is explaining is
+    worse than no diagnostic.
+    """
+    try:
+        slots = list(getattr(batch, "state_slots_committed", []) or [])
+        cache = getattr(builder, "cache", None)
+        cursors = None
+        if cache is not None:
+            cursors = cache.cursor[:, 0].tolist()
+        logger.error("DeepSeek-V4.1 stale-cursor refusal: %s", exc)
+        logger.error(
+            "  %-4s %-44s %10s %9s %6s %10s",
+            "row",
+            "req_id",
+            "computed",
+            "query",
+            "slot",
+            "cursor",
+        )
+        for i, req_id in enumerate(snapshot.req_ids):
+            slot = int(slots[i]) if i < len(slots) else -1
+            cursor = (
+                int(cursors[slot]) if cursors is not None and 0 <= slot < len(cursors)
+                else -1
+            )
+            logger.error(
+                "  %-4d %-44s %10d %9d %6d %10d",
+                i,
+                str(req_id)[-44:],
+                int(snapshot.num_computed[i]),
+                int(snapshot.query_lens[i]),
+                slot,
+                cursor,
+            )
+        # Two requests on one slot is a different bug from a cursor that ran
+        # ahead, and the two are indistinguishable from the refusal alone.
+        used = [int(s) for s in slots[: len(snapshot.req_ids)]]
+        if len(set(used)) != len(used):
+            logger.error("  SLOT COLLISION: %s", used)
+    except Exception:  # noqa: BLE001
+        logger.exception("DeepSeek-V4.1: could not dump state rows")
+
+
 def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
     """Refuse a batch whose two orderings disagree, naming the row.
 
@@ -761,7 +808,17 @@ def atom_deepseek_v41_forward_context(
     metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
     # Engram embeddings, the per-request state reset and the cursor advance --
     # everything that must happen once per step, before any layer runs.
-    builder.prepare_model_inputs(input_ids, metadata)
+    try:
+        builder.prepare_model_inputs(input_ids, metadata)
+    except ValueError as exc:
+        if "needs state at" not in str(exc):
+            raise
+        # One shot, at the only place where every column exists together:
+        # ATOM's refusal names a request and two positions but not the batch
+        # that produced them, and the connector is not in the picture at all.
+        # Printing the whole table turns "off by one" into a row to look at.
+        _dump_v41_state_rows(snapshot, batch, builder, exc)
+        raise
 
     is_prefill = metadata.state.value.startswith("prefill")
     context = Context(
