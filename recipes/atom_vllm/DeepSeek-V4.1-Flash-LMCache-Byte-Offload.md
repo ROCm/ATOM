@@ -105,8 +105,19 @@ If it does happen there, the two fail differently:
   and, per that function's own docstring, abort the engine on the first
   failed load.
 
-Worth a `grep` for either function's log line on any serve that depends on
-them, rather than assuming the hook ran.
+Worth checking on any serve that depends on them, rather than assuming the
+hook ran. `grep -c "ATOM: selecting\|KV-load-failure recovery already
+handles"` is the start of that check and **not the whole of it**: zero is
+underdetermined, because `select_scheduler_cls` also returns silently when
+`scheduler_cls` was already set, and `_select_hybrid_aware_scheduler` returns
+before calling it at all when there is no `kv_transfer_config`. Rule both out
+-- neither holds on a serve with a connector and no `--scheduler-cls` -- and
+only then does zero mean the hook did not run.
+
+The discriminator that needs no such ruling-out is a function the hook and
+some other site both call: `enforce_deepseek_v41_constraints` is called from
+the hook *and* from the model wrapper, so its line appearing once per worker
+and never from EngineCore says directly that the hook did not run there.
 
 ## Why caching is off by default here
 
