@@ -10,6 +10,17 @@ ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torc
 # apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking
 # line only changes build-args (see ROCM_INDEX_URL / ROCM_SDK_VERSION).
 ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
+# Mooncake for atom_image and for build_lmcache_mooncake, which builds the same
+# commit again as shared libraries: both read these, so the Store client in
+# lmcache.lmcache_mooncake always matches the image's mooncake_master.
+ARG INSTALL_MOONCAKE=1
+# Upstream Mooncake release tag with HIP dma-buf MR support.
+# Note: this tag does not include the Ionic QP atomic resource clamp.
+ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
+ARG MOONCAKE_COMMIT="v0.3.14-rc1"
+ARG USE_HIP_DMABUF=ON
+# 0 leaves lmcache.lmcache_mooncake out; it is only built with INSTALL_MOONCAKE=1.
+ARG BUILD_LMCACHE_MOONCAKE=1
 
 # ====================================================================
 # ATOM image: multi-stage parallel build
@@ -437,7 +448,158 @@ PY
 FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 
 # --------------------------------------------------------------------
-# Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
+# Stage 3: lmcache.lmcache_mooncake — parallel
+#
+# The LMCache MP server's `mooncake_store` L2 adapter imports
+# lmcache.lmcache_mooncake, which the LMCache wheel does not ship. The
+# extension links -lmooncake_store, a shared library only in a
+# BUILD_SHARED_LIBS=ON Mooncake build, so this stage builds atom_image's
+# Mooncake commit again with that flag and stages the libraries in
+# /opt/mooncake-shared/lib, beside atom_image's Mooncake rather than over it.
+# The extension is built against them from the wheel's LMCache commit.
+# atom_image copies in only /staging, not the build trees. Skipped on the
+# ROCm 10 line (ROCM_HOME set), which builds LMCache from source instead of
+# installing the wheel.
+#
+# libmooncake_store.so and mooncake/store*.so register the same gflags, so
+# lmcache.lmcache_mooncake and mooncake.store must never be imported into one
+# process: gflags aborts with "flag 'enable_http_server' was defined more than
+# once".
+# --------------------------------------------------------------------
+FROM base AS build_lmcache_mooncake
+ARG INSTALL_MOONCAKE
+ARG BUILD_LMCACHE_MOONCAKE
+ARG MOONCAKE_REPO
+ARG MOONCAKE_COMMIT
+ARG USE_HIP_DMABUF
+ARG VENV_PYTHON="/opt/venv/bin/python"
+# LMCACHE_WHEEL_IMAGE's commit: the extension is the native half of that
+# wheel's adapter, so [LMC 3/3] fails when the wheel's +g<sha> differs. Move
+# both pins together (bump_lmcache_wheel_pin.py moves only the wheel).
+ARG LMCACHE_REPO="https://github.com/LMCache/LMCache.git"
+ARG LMCACHE_COMMIT="f22dec2832124ea4ffeb464553b819a6369d4a30"
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# [LMC 1/3] Clone Mooncake and install its build dependencies as [MC 1/4] and
+# [MC 2/4] do, minus the runtime-only tools and the ionic provider.
+RUN set -eux; \
+    mkdir -p /staging; \
+    if [ "${INSTALL_MOONCAKE}" != "1" ] || [ "${BUILD_LMCACHE_MOONCAKE}" != "1" ] || [ -n "${ROCM_HOME:-}" ]; then \
+        echo "========== Skipped lmcache_mooncake (INSTALL_MOONCAKE=${INSTALL_MOONCAKE} BUILD_LMCACHE_MOONCAKE=${BUILD_LMCACHE_MOONCAKE} ROCM_HOME=${ROCM_HOME:-}) =========="; \
+        exit 0; \
+    fi; \
+    echo "========== [LMC 1/3] Clone Mooncake + build dependencies =========="; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        wget gcc make libtool autoconf librdmacm-dev libibverbs-dev rdma-core; \
+    git clone "${MOONCAKE_REPO}" /app/mooncake; \
+    cd /app/mooncake; \
+    git checkout "${MOONCAKE_COMMIT}"; \
+    git submodule update --init --recursive; \
+    bash dependencies.sh -y; \
+    rm -rf /usr/local/go; \
+    wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz; \
+    tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz; \
+    rm go1.22.2.linux-amd64.tar.gz
+
+# [LMC 2/3] [MC 3/4]'s configuration plus BUILD_SHARED_LIBS=ON and an $ORIGIN
+# RUNPATH, so the libraries find each other in /opt/mooncake-shared/lib, the
+# directory the extension's RUNPATH names. Only mooncake_store and what it
+# links are built.
+RUN set -eux; \
+    if [ "${INSTALL_MOONCAKE}" != "1" ] || [ "${BUILD_LMCACHE_MOONCAKE}" != "1" ] || [ -n "${ROCM_HOME:-}" ]; then exit 0; fi; \
+    echo "========== [LMC 2/3] Mooncake BUILD_SHARED_LIBS=ON -> /opt/mooncake-shared/lib =========="; \
+    HSA_PREFIXS="/opt/rocm"; \
+    for cfg in /opt/rocm/lib/cmake/hsa-runtime64/hsa-runtime64Config.cmake \
+               /opt/rocm/lib64/cmake/hsa-runtime64/hsa-runtime64Config.cmake; do \
+        if [ -f "${cfg}" ]; then HSA_PREFIXS="$(dirname "$(dirname "$(dirname "${cfg}")")"):${HSA_PREFIXS}"; fi; \
+    done; \
+    mkdir -p /app/mooncake/build; \
+    cd /app/mooncake/build; \
+    cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
+         -DENABLE_MULTI_PROTOCOL=ON \
+         -DWITH_TE=ON -DWITH_STORE=ON -DWITH_STORE_RUST=OFF \
+         -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+         -DBUILD_SHARED_LIBS:BOOL=ON \
+         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON "-DCMAKE_INSTALL_RPATH=\$ORIGIN" \
+         -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
+         > /tmp/mooncake-cmake.log 2>&1 \
+      || { cat /tmp/mooncake-cmake.log; exit 1; }; \
+    grep -qE '^BUILD_SHARED_LIBS:(BOOL|UNINITIALIZED)=ON$' CMakeCache.txt \
+      || { echo "ERROR: Mooncake was not configured with BUILD_SHARED_LIBS=ON"; exit 1; }; \
+    make -j"$(nproc)" mooncake_store > /tmp/mooncake-make.log 2>&1 \
+      || { echo "ERROR: Mooncake mooncake_store build failed. Compiler diagnostics:"; \
+           grep -nE "error:|fatal error|undefined reference|Error [0-9]" /tmp/mooncake-make.log | head -n 80; \
+           echo "--- tail of build log ---"; \
+           tail -n 120 /tmp/mooncake-make.log; \
+           exit 1; }; \
+    mkdir -p /opt/mooncake-shared/lib; \
+    find . -name 'lib*.so' -type f ! -path './_deps/*' ! -path './mooncake-integration/*' \
+        -exec cp -a -t /opt/mooncake-shared/lib/ {} +; \
+    ls -l /opt/mooncake-shared/lib; \
+    ldd /opt/mooncake-shared/lib/libmooncake_store.so > /tmp/ldd-libmooncake_store.txt; \
+    cat /tmp/ldd-libmooncake_store.txt; \
+    if grep -qE 'not found|/app/mooncake' /tmp/ldd-libmooncake_store.txt; then \
+        echo "ERROR: libmooncake_store.so has unresolved libraries or resolves into the build tree"; \
+        exit 1; \
+    fi; \
+    cp -a --parents /opt/mooncake-shared /staging/
+
+# [LMC 3/3] lmcache_mooncake through LMCache's own setup.py. NO_GPU_EXT=1 skips
+# the HIP kernels (the wheel ships them); the common C++ extensions build too
+# and are dropped. The extension includes Mooncake's real_client.h, so it is
+# compiled with the include dirs and -D defines Mooncake used for store_py.cpp,
+# which includes the same header: a define that changes a class layout has to
+# agree with libmooncake_store.so. CXX=g++, Mooncake's own compiler: hipcc
+# rejects the fmt and asio headers Mooncake pulls in. cp --parents -a carries
+# the parent directories' modes into /staging, so the COPY into atom_image
+# leaves /opt/venv's as they are.
+RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
+    set -eux; \
+    if [ "${INSTALL_MOONCAKE}" != "1" ] || [ "${BUILD_LMCACHE_MOONCAKE}" != "1" ] || [ -n "${ROCM_HOME:-}" ]; then exit 0; fi; \
+    echo "========== [LMC 3/3] lmcache_mooncake from LMCache ${LMCACHE_COMMIT} =========="; \
+    set -- /tmp/lmcache-wheel/*.whl; \
+    lmcache_version="$(basename "$1" | sed -nE 's/^lmcache-([^-]+)-.*\.whl$/\1/p')"; \
+    lmcache_sha8="$(printf '%.8s' "${LMCACHE_COMMIT}")"; \
+    case "${lmcache_version}" in \
+        *"+g${lmcache_sha8}."*) ;; \
+        *) echo "ERROR: LMCACHE_COMMIT=${LMCACHE_COMMIT} did not build $(basename "$1"); move it with LMCACHE_WHEEL_IMAGE"; \
+           exit 1 ;; \
+    esac; \
+    git init -q /app/lmcache; \
+    cd /app/lmcache; \
+    git remote add origin "${LMCACHE_REPO}"; \
+    git fetch -q --depth 1 origin "${LMCACHE_COMMIT}"; \
+    git checkout -q FETCH_HEAD; \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir -r requirements/build.txt; \
+    "${VENV_PYTHON}" -c "import json, shlex; \
+cmds = [e for e in json.load(open('/app/mooncake/build/compile_commands.json')) \
+        if e['file'].endswith('mooncake-integration/store/store_py.cpp')]; \
+assert cmds, 'compile_commands.json has no mooncake-integration/store/store_py.cpp'; \
+a = cmds[0].get('arguments') or shlex.split(cmds[0]['command']); \
+inc = [t if p in ('-I', '-isystem', '-iquote') else t[2:] for p, t in zip([''] + a, a) \
+       if p in ('-I', '-isystem', '-iquote') or (t.startswith('-I') and len(t) > 2)]; \
+dfn = [t for t in a if t.startswith('-D') and not t.split('=')[0].endswith('_EXPORTS')]; \
+open('/tmp/mooncake-include-dirs', 'w').write(';'.join(dict.fromkeys(inc))); \
+open('/tmp/mooncake-cppflags', 'w').write(' '.join(shlex.quote(d) for d in dict.fromkeys(dfn)))"; \
+    CXX=g++ NO_GPU_EXT=1 BUILD_MOONCAKE=1 \
+    MOONCAKE_INCLUDE_DIR="$(cat /tmp/mooncake-include-dirs)" \
+    MOONCAKE_LIB_DIR=/opt/mooncake-shared/lib \
+    CPPFLAGS="$(cat /tmp/mooncake-cppflags)" \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${lmcache_version}" \
+        "${VENV_PYTHON}" setup.py build_ext --inplace > /tmp/lmcache-mooncake-build.log 2>&1 \
+      || { echo "ERROR: lmcache_mooncake build failed. Compiler diagnostics:"; \
+           grep -nE "error:|fatal error|undefined reference" /tmp/lmcache-mooncake-build.log | head -n 80; \
+           echo "--- tail of build log ---"; \
+           tail -n 80 /tmp/lmcache-mooncake-build.log; \
+           exit 1; }; \
+    site_packages="$("${VENV_PYTHON}" -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')"; \
+    mkdir -p "${site_packages}/lmcache"; \
+    cp lmcache/lmcache_mooncake*.so "${site_packages}/lmcache/"; \
+    cp -a --parents "${site_packages}"/lmcache/lmcache_mooncake*.so /staging/
+
+# --------------------------------------------------------------------
+# Stage 4: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
 FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
@@ -475,12 +637,11 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # step below, because that step overwrites the Ubuntu-repo rccl with a custom
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
-ARG INSTALL_MOONCAKE=1
-# Upstream Mooncake release tag with HIP dma-buf MR support.
-# Note: this tag does not include the Ionic QP atomic resource clamp.
-ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="v0.3.14-rc1"
-ARG USE_HIP_DMABUF=ON
+# Defaults are at the top of the file, shared with build_lmcache_mooncake.
+ARG INSTALL_MOONCAKE
+ARG MOONCAKE_REPO
+ARG MOONCAKE_COMMIT
+ARG USE_HIP_DMABUF
 ARG VENV_PYTHON="/opt/venv/bin/python"
 
 # [MC 1/4] Clone
@@ -533,9 +694,13 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # both protocols and excludes HIP IPC for cross-host transfers.
 # USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
 # hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
-# ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
-# and its Rust bindings stay off: they add build surface (cachelib, cargo) that
-# nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
+# ATOM consumes the TransferEngine (`mooncake.engine`) for P->D, and Mooncake
+# Store as an LMCache L2: through the `mooncake.store` client in the workers for
+# the in-process offload (`LMCACHE_REMOTE_URL=mooncakestore://`), and through
+# `lmcache.lmcache_mooncake` (build_lmcache_mooncake) for the LMCache MP
+# server's `mooncake_store` L2 adapter. The atomesh launcher starts the
+# `mooncake_master` / `mooncake_client` processes (`LMCACHE_MOONCAKE_L2=1`).
+# The Store's Rust bindings stay off; nothing here loads them.
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
@@ -549,7 +714,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
              -DENABLE_MULTI_PROTOCOL=ON \
-             -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+             -DWITH_TE=ON -DWITH_STORE=ON -DWITH_STORE_RUST=OFF \
              -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
@@ -557,6 +722,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && cat /tmp/mooncake-cmake.log \
         && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
              || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
+        && { grep -qx 'WITH_STORE:BOOL=ON' CMakeCache.txt \
+             || { echo "ERROR: Mooncake Store was not configured"; exit 1; }; } \
         && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
              grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
                || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
@@ -574,6 +741,10 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && ldconfig \
         && ( grep -a -R -l "ibv_reg_dmabuf_mr" /usr/local/lib /opt/venv 2>/dev/null | head -n 1 \
              || { echo "ERROR: installed Mooncake libs have no ibv_reg_dmabuf_mr"; exit 1; } ) \
+        && { command -v mooncake_master && command -v mooncake_client \
+             || { echo "ERROR: Mooncake Store binaries mooncake_master / mooncake_client are missing"; exit 1; }; } \
+        && { "${VENV_PYTHON}" -c "from mooncake.store import MooncakeDistributedStore" \
+             || { echo "ERROR: the mooncake.store Python module does not import"; exit 1; }; } \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
@@ -734,6 +905,25 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
       assert 'rocm' in torch.__version__, torch.__version__; \
       assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
       print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ; \
+    fi
+
+# lmcache.lmcache_mooncake and the Mooncake libraries it links, from
+# build_lmcache_mooncake (an empty /staging when that stage skips). After the
+# wheel, so the extension lands in the installed lmcache package. Checked in a
+# process of its own: it and mooncake.store must not share one.
+ARG BUILD_LMCACHE_MOONCAKE
+COPY --from=build_lmcache_mooncake /staging/ /
+RUN if [ "${INSTALL_MOONCAKE}" = "1" ] && [ "${BUILD_LMCACHE_MOONCAKE}" = "1" ] && [ -z "${ROCM_HOME}" ]; then \
+        echo "========== [ATOM] Check lmcache.lmcache_mooncake ==========" && \
+        site_packages="$("${VENV_PYTHON}" -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')" && \
+        set -- "${site_packages}"/lmcache/lmcache_mooncake*.so && \
+        ldd "$1" > /tmp/ldd-lmcache-mooncake.txt && \
+        cat /tmp/ldd-lmcache-mooncake.txt && \
+        if grep -q 'not found' /tmp/ldd-lmcache-mooncake.txt; then \
+            echo "ERROR: $1 has unresolved libraries"; exit 1; \
+        fi && \
+        rm /tmp/ldd-lmcache-mooncake.txt && \
+        "${VENV_PYTHON}" -c "from lmcache.lmcache_mooncake import L1RegistrationConfig, LMCacheMooncakeClient"; \
     fi
 
 # ========== SemiAnalysis aiperf agentic benchmark tool ==========
