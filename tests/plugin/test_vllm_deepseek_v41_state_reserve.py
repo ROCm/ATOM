@@ -220,20 +220,27 @@ class TestLocalHitCapInstallSite:
     hit, not a slow one.
     """
 
-    def test_register_model_installs_the_local_hit_cap(self, monkeypatch):
-        import sys
+    def test_register_model_wires_up_both_v41_scheduler_patches(self):
+        """Checked on the wiring, not on a call and not on the end state.
+
+        `register_model` is idempotent and this suite's other install-site
+        test replaces the installer before calling it, which consumes that one
+        shot -- so both "did it call?" and "is it installed?" answer a
+        question about the suite rather than about the code. What has to stay
+        true is that `register_model` is where these are installed, because
+        the platform hook that would otherwise carry them does not reliably
+        run. The patches' own behaviour is covered in
+        tests/test_vllm_v41_prefill_alignment.py.
+        """
+        import inspect
 
         register = importlib.import_module("atom.plugin.vllm.register")
-        installed = []
-        monkeypatch.setattr(
-            sys.modules["atom.plugin.vllm.scheduler"],
+        source = inspect.getsource(register.register_model)
+        for installer in (
             "apply_vllm_v41_local_hit_cap_patch",
-            lambda: installed.append(True),
-        )
-
-        register.register_model()
-
-        assert installed, (
-            "register_model must install the V4.1 local-hit cap; the platform "
-            "hook is not guaranteed to run"
-        )
+            "apply_vllm_v41_prefill_alignment_patch",
+        ):
+            assert f"{installer}()" in source, (
+                f"register_model must install {installer}; the platform hook "
+                "is not guaranteed to run"
+            )
