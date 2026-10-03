@@ -951,7 +951,14 @@ start_lmcache_mp_servers() {
       exit 2
     fi
     lmcache_mp_l2="present"
+    # The adapter registers the whole L1 with the NIC at startup, and an ionic
+    # NIC refuses an MR with even one 4 KiB page in it once its small 4 KiB
+    # budget is spent. glibc's THP malloc, a 2 MiB-aligned L1 (below) and
+    # the compaction that ran before the owners make the L1 huge pages; one
+    # MR for the whole L1 then registers, and a shortfall fails the server's
+    # start instead of every later put.
     store_l2_env=(
+      "GLIBC_TUNABLES=glibc.malloc.hugetlb=1"
       "MC_NUM_QP_PER_EP=1"
       "MC_TCP_BIND_ADDRESS=${host_ip}"
       "MC_MAX_MR_SIZE=${LMCACHE_MP_STORE_MAX_MR_SIZE:-1099511627776}"
@@ -1002,14 +1009,14 @@ start_lmcache_mp_servers() {
     )
     if [[ "${#store_l2_env[@]}" -gt 0 ]]; then
       # The Store L2 registers the whole L1 with the NIC when the server
-      # starts, so the L1 is allocated and pinned up front.
+      # starts, so the L1 is allocated and pinned up front, on 2 MiB.
       server_cmd=(
         python3 -m atom.kv_transfer.offload.mp.mooncake_l2_server
         --gpu "${lmcache_mp_plan_first_stage[i]}" --local-hostname "${host_ip}"
         --master "${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}"
         --metadata "http://${host_ip}:${ATOMESH_MOONCAKE_METADATA_PORT}/metadata"
         -- "${server_cmd[@]:3}"
-        --l1-init-size-gb "${lmcache_mp_plan_l1_gb[i]}"
+        --l1-init-size-gb "${lmcache_mp_plan_l1_gb[i]}" --l1-align-bytes 2097152
       )
     fi
     if [[ -n "${lmcache_mp_plan_numa[i]}" ]]; then
