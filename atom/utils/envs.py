@@ -259,12 +259,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
     # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
-    # Reuse a 128-token MegaMoEV2 instance for native DP-unified small decode/
+    # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
+    # Capacity of that small instance: 128 (aiter's default fixed-slot limit), 256,
+    # 512 or 1024; the larger ones stay fixed-slot only with an aiter whose
+    # AITER_MEGA_FIXED_SLOT_MAX_MTPR admits them (511 / 1023 / 2047).
+    "ATOM_MEGA_DECODE_MTPR": lambda: int(os.getenv("ATOM_MEGA_DECODE_MTPR", "128")),
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
@@ -699,6 +703,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
+    # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
+    # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
+    "ATOM_MORI_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MORI_MASK_PAD_ROWS", "0") == "1",
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
