@@ -985,6 +985,26 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
     )
 
 
+def v4_decode_split_plan(
+    rows: int, heads: int, kv_len: int, split_indptr: torch.Tensor
+) -> tuple[int, torch.Tensor] | None:
+    """aiter's KV split plan for the fp8 decode ASM kernel, or None.
+
+    For a decode call of `rows` query rows (its `qo_indptr` has `rows + 1`
+    entries), `heads` local heads and at most `kv_len` KV per row. The plan's
+    `split_indptr` is written in place into the caller's persistent buffer, so
+    whoever owns a decode CSR builds its plan next to it and passes it on as
+    ``sparse_attn_v4_paged_decode(..., split_plan=plan)``. None on aiter builds
+    before ROCm/aiter#5890, which leaves the split pick to aiter.
+    """
+    import aiter.mla
+
+    plan_fn = getattr(aiter.mla, "get_mla_v4_nm_split_plan", None)
+    if plan_fn is None:
+        return None
+    return plan_fn(rows, heads, kv_len, split_indptr=split_indptr)
+
+
 def _sparse_attn_v4_paged_decode_asm(
     unified_kv: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -997,6 +1017,7 @@ def _sparse_attn_v4_paged_decode_asm(
     qo_indptr: torch.Tensor,
     kv_last_page_lens: torch.Tensor | None = None,  # unused on v4 nm (page_size=1)
     num_kv_splits: int | None = None,
+    split_indptr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native 2buff fp8 V4 decode via the aiter assembly kernel
     ``mla_decode_fwd_v4_nm`` (ROCm/aiter#3112, mi350/gfx950).
@@ -1106,6 +1127,10 @@ def _sparse_attn_v4_paged_decode_asm(
         (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
     )
 
+    # A uniform split plan's prefix is itself a valid plan, so it trims like
+    # qo_indptr.
+    if split_indptr is not None:
+        split_indptr = split_indptr[: N + 1]
     aiter.mla.mla_decode_fwd_v4_nm(
         q_packed,
         q_rope,
@@ -1119,6 +1144,7 @@ def _sparse_attn_v4_paged_decode_asm(
         sink=attn_sink,
         sm_scale=softmax_scale,
         num_kv_splits=num_kv_splits,
+        split_indptr=split_indptr,
     )
     # Drop padded heads. The slice is a non-contiguous view, so .contiguous()
     # gives downstream a dense tensor; no-op (and no copy) when H was unpadded.
@@ -1141,6 +1167,7 @@ def sparse_attn_v4_paged_decode(
     kv_last_page_lens: torch.Tensor | None = None,
     empty_kv_indptr: torch.Tensor | None = None,
     prefix: str = "",
+    split_plan: tuple[int, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """V4 decode sparse attention over a unified KV pool with paged indices.
 
@@ -1149,6 +1176,10 @@ def sparse_attn_v4_paged_decode(
     ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE=1``, gfx1250 H=128 instead reuses the
     sparse-prefill ASM kernel with an empty extend stream. Both paths consume
     pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
+
+    ``split_plan`` is aiter's ``MlaV4NmSplitPlan`` (``num_kv_splits``,
+    ``split_indptr``) for the decode ASM kernel, built by whoever built this
+    call's ``qo_indptr``; None leaves the split pick to aiter.
 
     Otherwise (bf16): the existing Triton / reference path. When ``kv_scales``
     is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and is dequantized
@@ -1174,6 +1205,7 @@ def sparse_attn_v4_paged_decode(
                 q_packed_in,
                 q_rope_in,
             )
+        num_kv_splits, split_indptr = split_plan or (None, None)
         return _sparse_attn_v4_paged_decode_asm(
             unified_kv,
             kv_indices,
@@ -1185,6 +1217,8 @@ def sparse_attn_v4_paged_decode(
             q_rope_in,
             qo_indptr=qo_indptr,
             kv_last_page_lens=kv_last_page_lens,
+            num_kv_splits=num_kv_splits,
+            split_indptr=split_indptr,
         )
     gfx = get_gfx()
     if gfx == "gfx1250" or gfx.startswith("gfx94"):
