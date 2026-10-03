@@ -124,12 +124,40 @@ bit-reproducible under concurrency.
 recoverable boundary`. Concurrency 1 is clean over full 120 s windows with the
 tier actively storing and retrieving.
 
-Bisected: setting `state_interval` past the context length makes the STATE leg
-inert by construction (`cap_hit` declines everything, the sweep never fires,
-`Retrieved` is 0) **and the crash still happens**. So the fault is in the
-connector/PAGE path with a connector attached, not in the STATE leg. The OFF
-arm runs the identical aiperf configuration at concurrency 8 for 120 s without
-incident.
+Characterised by two arms that differ in one variable, with the STATE leg
+structurally inert in **both**:
+
+| `state_interval` | `max-num-batched-tokens` | chunked prefill | result |
+|---|---|---|---|
+| 2^30 (leg inert) | 4096 | on | **crash** |
+| 4096 | 32768 (= `max-model-len`) | off | 124.8 s clean |
+
+So the necessary condition is **chunked prefill x KV connector x
+concurrency**, and the tier's own activity is irrelevant -- it was doing
+nothing in either arm. The OFF arm runs the identical aiperf configuration at
+concurrency 8 for 120 s without incident, and concurrency 1 is clean with the
+tier actively storing and retrieving.
+
+The second row is **not a workaround**: with one-shot prefill the frontier
+jumps straight from 0 to the prompt length, which is not a multiple of the
+interval, so no boundary is ever landed on and the tier supplies nothing
+(measured: `external_prefix_cache_hits_total` 0.0 against 1.45 M queries, and
+0.577 req/s -- *slower* than OFF). The STATE tier needs chunked prefill to
+reach a boundary during prefill, which is exactly what triggers the fault.
+
+Two hypotheses were tested and refuted, both cheaply:
+
+* The missing non-immediate-block-reuse patch (V4.1's layer name does not
+  match V4's substring markers). Real defect, fixed, **not** this one -- the
+  crash survives the fix.
+* Preemption advancing the cursor optimistically. The crash dump reads
+  `preempted_requests=0`.
+
+The failing step is a mixed batch -- one request on a 4,090-token prefill
+chunk, six on 1-token decode -- and the dumped `num_computed_tokens` contains
+the cursor's value but not the position the scheduler asked for. Fixing it
+means going into `_v41_scheduled_batch` / `_prepare` in the bridge, not the
+offload layer.
 
 Two defects *were* found and fixed on the way, both of which put two requests
 on one state slot (signature: two requests straddling one cursor by a token
