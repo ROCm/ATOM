@@ -366,22 +366,33 @@ def snapshot_v41_batch(common_attn_metadata):
     except Exception:  # noqa: BLE001
         input_batch = None
 
+    # One source for the arithmetic, always. `query_lens` comes from
+    # `common_attn_metadata`, so `num_computed` is taken from there too rather
+    # than from the persistent `input_batch`: the two are ordered
+    # independently, and a KV connector parks requests
+    # (WAITING_FOR_REMOTE_KVS) and re-admits them, which condenses the
+    # persistent batch and can leave the two orderings a row apart. Pairing
+    # one request's `num_computed` with another's `query_len` yields a span
+    # whose position is some other request's, and the V4.1 state cursor --
+    # which is checked exactly -- then refuses the forward.
+    seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].cpu()
+    seq_lens_np = np.asarray(seq_lens_cpu[:num_reqs], dtype=np.int64)
+    num_computed = seq_lens_np - query_lens
+
     block_table_np = None
     req_ids = None
     if input_batch is not None:
         try:
             req_ids = list(input_batch.req_ids)[:num_reqs]
-            num_computed = np.asarray(
-                input_batch.num_computed_tokens_cpu[:num_reqs], dtype=np.int64
-            )
             block_table_np = input_batch.block_table[0].block_table.np
+            _check_row_alignment(input_batch, num_computed, num_reqs)
         except Exception:  # noqa: BLE001
             req_ids = None
             block_table_np = None
     if block_table_np is None:
         block_table_np = common_attn_metadata.block_table_tensor.cpu().numpy()
-        seq_lens_np = common_attn_metadata.seq_lens[:num_reqs].cpu().numpy()
-        num_computed = seq_lens_np.astype(np.int64) - query_lens
 
     # `context_lens` in ATOM's batch protocol is the request's end position
     # after this step -- vLLM's `seq_lens`.
@@ -595,6 +606,38 @@ def get_deepseek_v41_proxy_metadata_from_vllm_context(
     if isinstance(meta, list) and meta and isinstance(meta[0], dict):
         return meta[0].get(layer_name)
     return None
+
+
+def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
+    """Refuse a batch whose two orderings disagree, naming the row.
+
+    `req_ids` and the block table are read from the persistent `input_batch`
+    while the spans are built from `common_attn_metadata`. They address the
+    same requests only while their row orders agree. If they ever do not, the
+    state slot is keyed by one request and the position by another -- which is
+    wrong output, not a crash, for every model that does not check its cursor.
+    So it is checked here, where the row can still be named, rather than left
+    to surface as a cursor that is off by the gap between two requests.
+    """
+    batch_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+    if batch_computed is None:
+        return
+    mine = np.asarray(batch_computed[:num_reqs], dtype=np.int64)
+    if mine.shape != num_computed.shape:
+        raise ValueError(
+            "DeepSeek-V4.1: input_batch has "
+            f"{mine.shape[0]} rows but the step describes {num_computed.shape[0]}"
+        )
+    bad = np.flatnonzero(mine != num_computed)
+    if bad.size:
+        row = int(bad[0])
+        raise ValueError(
+            "DeepSeek-V4.1: the persistent batch and this step's attention "
+            f"metadata disagree at row {row}: input_batch says "
+            f"{int(mine[row])} computed tokens, the step says "
+            f"{int(num_computed[row])}. Their row orders have diverged, so "
+            "req_ids and block tables cannot be trusted for this step."
+        )
 
 
 def _v41_scheduled_batch(snapshot, slot_allocator):
