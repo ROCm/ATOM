@@ -103,6 +103,8 @@ Four rules carry the module:
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
 | `atom_lmcache_staging.py` | Per-thread CUDA streams, staging buffer, ready/free events, env helpers. |
+| `mooncake_store_l2.py` | Mooncake Store as the in-process L2: recipe checks, one RDMA device per worker from the PCI topology, the THP pinned L1 allocator, one-RPC lookups, gets that never wait for L1 room ([Mooncake Store as L2](#mooncake-store-as-l2)). |
+| `remote_check.py` | Startup check of any remote tier: backend connected, L1 registered, one chunk round trip. |
 | `mp/connector.py` | Capability-selected public `lmcache_mp` worker/scheduler shells. |
 | `mp/deployment.py` | LMCache MP configuration, topology, model namespace and server adapters. |
 | `mp/worker.py`, `mp/scheduler.py` | Generic PAGE-only LMCache MP connector halves. |
@@ -1136,7 +1138,7 @@ Connector-specific tuning (env):
 |-----|:-------:|---------|
 | `OFFLOAD_MIN_LOAD_TOKENS` | 8192 | Don't reload a hit smaller than this; recompute is cheaper. |
 | `OFFLOAD_COPY_WORKERS` | 1 | SAVE daemon threads. |
-| `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
+| `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. Under PP with a Mooncake Store L2 keep it at 1: four hung the prefill pipeline (see [Mooncake Store as L2](#mooncake-store-as-l2)); more than one under in-process PP has not been tested. |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
 | `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
@@ -1165,6 +1167,115 @@ AOS1 follows the engine's location policy exactly. Submission passes
 `retrieve_locations`, and reads target the backend location returned by that
 search. The local-CPU allocator is therefore not an implicit readable cache tier
 when, for example, policy allows only `LocalDiskBackend`.
+
+### Mooncake Store as L2
+
+With `LMCACHE_REMOTE_URL` set, each worker's LMCache engine writes every chunk
+it keeps in its CPU pool (L1) through to the remote store as well, and reads an
+L1 miss back from it. With `mooncakestore://` that L2 is DRAM owned by separate
+`mooncake_client` processes and read over RDMA, so a small L1 per PP stage sits
+in front of a pool of several hundred GiB per NUMA node. The L2 includes the
+L1, so the distinct capacity is about the Store's.
+
+LMCache's Mooncake connector needs no change, but the worker does. Before the
+engine is built -- for the L1, already at worker start, before the weights
+load -- `mooncake_store_l2.py`:
+
+| Does | Because |
+|------|---------|
+| Faults the L1 itself on the GPU's NUMA node before the weights load (ModelRunner -> `reserve_l1_before_weights_load`): mmap, mbind (any other node is refused), `MADV_HUGEPAGE`, one touch per 2 MiB, then `MADV_COLLAPSE` for any 4 KiB stretch, retried while it fails with ENOMEM/EAGAIN; the engine build takes that region and pins it (`hipHostRegister`). Startup fails unless all of it is transparent huge pages and, once the engine is built, unless LMCache's L1 is that region. | An ionic NIC registers about 3 GiB of 4 KiB pages in all, and one 4 KiB page counts its whole MR against that budget, so LMCache's own NUMA L1 (4 KiB pages) cannot register; LMCache only warns, and every put then fails without an error. With 1 GiB MRs a few 4 KiB pages would still register: requiring all huge pages is a policy that keeps the L1 off the budget. LMCache takes other allocators when it has no NUMA mapping for the GPU, and for hugetlb, shm or P2P pools. A weight load pins staging buffers that fragment the node and never move; an L1 faulted after it kept 1-2 GiB of 4 KiB pages even after `MADV_COLLAPSE`. |
+| Gives each worker one RDMA device, the GPU's: the ACTIVE device sharing the deepest PCI path with it (`ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES` overrides), and refuses one the owners use (`ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES`). With per-NIC pools (`ATOM_LMCACHE_MOONCAKE_POOLS`) the owners share the stages' NICs instead, and the worker joins the pool of its own device. | Under one shared master, where every stage reads every owner, several NICs per requester, or NICs shared with the owners, stalled concurrent reads for 30-60 s before they failed. One NIC per stage, disjoint from the owners', ran 4 x 33 GB/s. Where a job may use only its own GPUs' NICs, one master per NIC keeps a NIC to one stage and its own pool's owners: across two nodes, 4 x 37 GB/s with no retransmission, where one master for the same 8 owners stalled a stage for good. |
+| Answers `batched_contains` with one `batch_is_exist` RPC. | The connector asked the master once per chunk on the scheduler's synchronous lookup path: 25-58 ms per lookup, against 0.4-1 ms. |
+| Makes the connector's gets allocate their L1 buffers without waiting: what eviction frees at once, and once one allocation fails, none for the rest of the batch (those chunks miss). | The get allocates on LMCache's storage event loop, which also finishes the write-through puts whose L1 references keep their chunks from eviction. Busy-waiting there for room spun forever once in-flight puts and pinned chunks filled the L1, and every later put and get of the worker hung (pit2-p03-g40, 8 GiB L1 per stage, agentic 1M traces at 16 sessions). A short get fails the whole load (ATOM loads all-or-nothing): `[hbm, lmc)` is recomputed and saved again. |
+| Refuses `MC_NUM_QP_PER_EP` other than 1 (unset, Mooncake's default of 2, is refused too), a set `MOONCAKE_CONFIG_PATH`, `LMCACHE_NUMA_MODE` other than `auto`/`manual`, `LMCACHE_LOCAL_CPU_USE_HUGEPAGES`, `LMCACHE_BLOCKING_TIMEOUT_SECS` < 30, and in `LMCACHE_EXTRA_CONFIG`: `save_chunk_meta` other than `false`, `transfer_timeout` < 30, `mooncake_global_segment_size` other than `"0"`, no `mooncake_protocol`, and keys Mooncake never sees (`master_server_address`, `device_name`, `mooncake_rdma_devices`, `mooncake_transfer_timeout`). | Each of them fails silently, hangs, or corrupts or leaks objects under load. |
+
+After the engine is built, `remote_check.py` fails startup unless the remote
+tier -- any remote URL -- has a connected `RemoteBackend`, a registered L1 where
+the connector registers one, and stores and returns one probe chunk byte for
+byte. LMCache retries neither a failed connection nor a failed registration.
+
+The worker environment (the atomesh launcher sets all of it except
+`LMCACHE_LOCAL_CPU` and `LMCACHE_NUMA_MODE`, which the case's prefill env must
+set; the `lmcache_mooncake` cells inherit them from the lmcache-1m prefill
+env):
+
+```bash
+export LMCACHE_LOCAL_CPU=True LMCACHE_NUMA_MODE=auto LMCACHE_MAX_LOCAL_CPU_SIZE=48
+export LMCACHE_REMOTE_URL="mooncakestore://${IP}:50051/" LMCACHE_REMOTE_SERDE=naive
+export LMCACHE_BLOCKING_TIMEOUT_SECS=60 OFFLOAD_LOAD_WORKERS=1
+export MC_NUM_QP_PER_EP=1 MC_MAX_MR_SIZE=1073741824 MC_TCP_BIND_ADDRESS="${IP}"
+export LMCACHE_EXTRA_CONFIG='{"save_chunk_meta":false,"transfer_timeout":60,
+  "use_exists_sync":true,"remote_enable_mla_worker_id_as0":false,
+  "mooncake_local_hostname":"'"${IP}"'",
+  "mooncake_metadata_server":"http://'"${IP}"':50080/metadata",
+  "mooncake_master_server_addr":"'"${IP}"':50051","mooncake_protocol":"rdma",
+  "mooncake_global_segment_size":"0","mooncake_local_buffer_size":"67108864"}'
+```
+
+The decode side needs `MC_NUM_QP_PER_EP=1` too: its P->D transfer engine reads
+the same variable, and endpoints with different QP counts cannot connect.
+One load worker: with four (`OFFLOAD_LOAD_WORKERS=4`), GLM-5.2 cpp4/dcp4 at c96
+hung the prefill pipeline in all three runs, single node and two nodes. One
+stage's GPU ran nothing, with its HSA queues stopped at barriers and every
+offload and compute thread waiting on them. With one load worker, as the
+in-process baseline runs, the 30-minute window completed on two half nodes
+(c96 and c112); the single-node cells have not run with one load worker.
+
+Start the master and owners first, and restart the Store whenever the model,
+the PP layer split or the chunk size changes: the key namespace does not cover
+the PP split, and the Store keeps objects across ATOM restarts. Only the dense
+layout is validated; DSV4's SLOT sidecar reads single keys, which the Mooncake
+connector does not serve, so those reads miss.
+
+The atomesh launcher (`.github/scripts/atomesh/pd_server_atom.sh`) runs the
+Store for the prefill role env `LMCACHE_MOONCAKE_L2=1` (CI suite
+`lmcache_mooncake`): a master on NUMA1's CPUs and one owner per NUMA node, each
+bound to its node and serving on its own pair of NUMA1's NICs, with THP segments (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`),
+no GPU, and the role IP (`eno1` is firewalled). Before the node starts anything
+it refuses conflicting settings of either role; before the owners allocate it
+checks that each owner's NICs are ACTIVE and on one node, drops the configured
+page cache, checks that the owners and the stages' L1s fit each NUMA node
+(`numa_memory_budget.py`: too much fails, more than the free memory warns),
+then compacts each node for its pins (`numa_memory_budget.py --compact` runs
+`compact_huge_pages.py` bound to the node, for at most 600 s): owners faulting
+a fragmented node from many threads got 4 KiB pages that the NIC refused
+(`Cannot allocate memory`, -202). It waits until the master's RPC port
+listens and the master counts every owner's capacity, sets the environment
+above on the prefill command line and `MC_NUM_QP_PER_EP=1` on the decode's,
+and at shutdown saves the master's metrics, fails the job if the master lost
+owner capacity during the run, and stops the owners and then the master
+after the workers. The default owners mount on pit2-p03 (TW MI355X) nodes
+(768 + 768 GiB on separate NIC pairs, 12 s): about 1.5 TiB per NUMA node, and
+NUMA1's NICs named `rdma4`-`rdma7`.
+
+With `LMCACHE_MOONCAKE_POOLS=per_nic` the launcher starts one master per owner
+NIC (pool *i* on the base ports + 100 x *i*) and gives the prefill workers
+`ATOM_LMCACHE_MOONCAKE_POOLS` instead of the owners' devices. With
+`LMCACHE_MOONCAKE_DECODE_OWNERS` the decode node (`pd_worker_layout`
+`multi_node`, one prefill node and one decode node) starts owners on its own
+memory before its workers load, dropping its page cache and compacting its
+node for them first the same way; they join the prefill node's masters, and
+the prefill node waits until every pool counts the owners of both nodes. The
+master metrics are saved before anything stops, since the decode node stops
+its owners once the router closes.
+
+| Launcher knob | Default | Meaning |
+|---------------|---------|---------|
+| `LMCACHE_MOONCAKE_OWNERS` | `0:768:rdma4,rdma5;1:768:rdma6,rdma7` | One owner per `<numa>:<GiB>[:<rdma,...>]` entry. An ionic NIC registers at most 832-896 GiB for one process: a 960 GiB owner fails to mount, on one NIC or four, and so did 768 + 960 GiB owners sharing `rdma4`-`rdma7`; 768 + 768 GiB on separate NIC pairs mount in 12 s. |
+| `LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES` | `rdma4,rdma5,rdma6,rdma7` | Devices of an owner entry without its own; must not be a stage's, except with `LMCACHE_MOONCAKE_POOLS=per_nic`. |
+| `LMCACHE_MOONCAKE_POOLS` | `shared` | `shared`: one master for every owner. `per_nic`: one master per owner NIC, every owner on exactly one NIC, each prefill worker on its own NIC's pool. |
+| `LMCACHE_MOONCAKE_DECODE_OWNERS` | unset | Owners the decode node starts, same format, joining the prefill node's masters (`multi_node`, one prefill node and one decode node). |
+| `LMCACHE_MOONCAKE_MASTER_NUMA` | 1 | NUMA node whose CPUs run the masters. |
+| `LMCACHE_MOONCAKE_EVICTION_HIGH_WATERMARK`, `LMCACHE_MOONCAKE_EVICTION_RATIO` | 0.90, 0.05 | Master eviction trigger and step (approximately LRU). |
+| `LMCACHE_MOONCAKE_OWNER_THREADS`, `LMCACHE_MOONCAKE_OWNER_MAX_MR_SIZE` | 4, 64 GiB | Owner service threads; MR size the segment is split into. |
+| `LMCACHE_MOONCAKE_MASTER_WAIT_TIMEOUT`, `LMCACHE_MOONCAKE_WAIT_TIMEOUT` | 120 s, 1200 s | Readiness deadlines of the master and of the owners' capacity. |
+| `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_DIRS` | `MODEL_PATH` | Colon-separated directories whose clean page cache is dropped before the owners allocate (suite `lmcache_mooncake`: `${ATOMESH_MODEL_ROOT}`, every model on the node). |
+| `LMCACHE_MOONCAKE_NODE_RESERVE_GIB` | 128 | Memory each NUMA node keeps beyond the owners and the stages' L1s (`LMCACHE_MAX_LOCAL_CPU_SIZE` per prefill GPU); a plan that leaves less fails the start. |
+| `LMCACHE_MOONCAKE_PAGE_CACHE_DROP_SECONDS` | 1800 | How long the model's page cache keeps being dropped while weights load. |
+| `ATOMESH_MOONCAKE_{MASTER,METADATA,METRICS,OWNER}_PORT` | 26051, 26080, 26090, 26052 | Ports, shifted by `ATOMESH_SERVICE_PORT_OFFSET`; pool *i*'s master uses the base + 100 x *i*, owner *i* the base + *i*. Below Linux's ephemeral port range (32768-60999), where an outgoing connection could hold one. |
+
+The Store needs an image built with Mooncake `WITH_STORE=ON` (`mooncake_master`,
+`mooncake_client`, `mooncake.store`); the CI image builds `WITH_STORE=OFF`.
 
 ## How to Run
 
