@@ -147,3 +147,23 @@ def test_planes_tile_the_paged_region_without_gaps_or_overlap():
     for (_, prev_end), (begin, _) in zip(spans, spans[1:]):
         assert begin == prev_end
     assert spans[-1][1] == cache.state_bytes.data_ptr()
+
+
+def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
+    """V4.1 has V4's global-arena property and must get V4's reuse patch.
+
+    The markers are matched as substrings, and `".atom_deepseek_v4_proxy"` is
+    NOT a substring of `"...atom_deepseek_v41_proxy"` -- so V4.1 silently went
+    without it. Its PAGE and STATE share one address space (a slot's ring is
+    an offset past the absolute end of the paged region), which is exactly the
+    layout the patch exists to stop vLLM from recycling out from under.
+    """
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _V4_PROXY_LAYER_MARKERS
+
+    assert any(
+        marker in ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+        for marker in _V4_PROXY_LAYER_MARKERS
+    )
