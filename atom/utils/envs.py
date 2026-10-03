@@ -159,6 +159,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
     # inheriting their parent's owner.
+    # When this file exists, EPLB stops rebalancing (placement stays fixed).
+    "ATOM_EPLB_FREEZE_FILE": lambda: os.getenv("ATOM_EPLB_FREEZE_FILE", ""),
     "ATOM_DP_SESSION_AFFINITY": lambda: os.getenv(
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()

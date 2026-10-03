@@ -10,6 +10,8 @@ from typing import Any
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.utils import envs
+
 try:
     import triton
     import triton.language as tl
@@ -19,6 +21,7 @@ except ImportError:
     _EPLB_HAS_TRITON = False
 
 import logging
+import os
 
 logger = logging.getLogger("atom")
 
@@ -1657,6 +1660,7 @@ class EPLBManager:
         # SGLang avoids this by issuing migration P2P on a separate (default) group;
         # we mirror that with an EP-membership subgroup used only for migration.
         self._migration_group: Any | None = None
+        self._frozen_latched = False
         self._ep_rank: int = 0
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
@@ -2114,12 +2118,43 @@ class EPLBManager:
                 yield
                 migrate_and_commit(new_meta, layer_ids=chunk)
         """
+        if self._frozen():
+            return
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
             return
         if not self._need_rebalance(physical_load):
             return
         yield from self._execute_rebalance()
+
+    def _frozen(self) -> bool:
+        """True once ATOM_EPLB_FREEZE_FILE exists on any rank of the group.
+
+        Lets a benchmark balance experts during warmup and then hold the
+        placement fixed for the measured window. The flag is MAX-reduced over
+        the migration group: every rank reaches this check at the same step,
+        and they must agree, since the rebalance below is collective.
+        """
+        if self._frozen_latched:
+            return True
+        path = envs.ATOM_EPLB_FREEZE_FILE
+        if not path:
+            return False
+        frozen = os.path.exists(path)
+        if self._migration_group is not None:
+            flag = torch.tensor([int(frozen)], device="cuda", dtype=torch.int32)
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
+            )
+            frozen = bool(flag.item())
+        if frozen:
+            self._frozen_latched = True
+            logger.info(
+                "EPLB frozen after %d rebalances (%s exists)",
+                self._rebalance_count,
+                path,
+            )
+        return self._frozen_latched
 
     def _execute_rebalance(self):
         """Generator: run one rebalance (rearrange + chunked migrate/commit),
@@ -2438,6 +2473,20 @@ def with_eplb_forward_monitor(fn):
     return wrapper
 
 
+def _eplb_owns_layer(meta: Any, layer_id: Any) -> bool:
+    """True when ``layer_id`` is one of the MoE layers EPLB places.
+
+    EPLB covers the target model's MoE layers only. Drafter/MTP MoE layers
+    (e.g. the DSpark drafter's layer 61 on DSV4-Pro) are never migrated, so
+    their logical ids already are physical ids and their load is not tracked.
+    """
+    return (
+        meta is not None
+        and isinstance(layer_id, int)
+        and 0 <= layer_id < meta.logical_to_rank_dispatch_physical_map.shape[0]
+    )
+
+
 def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Tensor:
     """Remap router logical expert ids to physical slot ids for EP dispatch.
 
@@ -2448,7 +2497,7 @@ def eplb_map_logical_to_physical(layer: Any, topk_ids: torch.Tensor) -> torch.Te
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    if meta is None or not isinstance(layer_id, int):
+    if not _eplb_owns_layer(meta, layer_id):
         return topk_ids
     dispatch = meta.logical_to_rank_dispatch_physical_map[layer_id].to(
         device=topk_ids.device
@@ -2487,6 +2536,8 @@ def record_eplb_expert_load(layer: Any, topk_physical: torch.Tensor) -> None:
     if not isinstance(layer_id, int):
         return
     meta = get_live_expert_location_metadata()
+    if meta is not None and not _eplb_owns_layer(meta, layer_id):
+        return
     num_physical = (
         int(meta.num_physical_experts)
         if meta is not None
@@ -2607,7 +2658,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     """
     meta = get_live_expert_location_metadata()
     layer_id = getattr(layer, "layer_id", None)
-    if meta is None or not isinstance(layer_id, int):
+    if not _eplb_owns_layer(meta, layer_id):
         return topk_ids
 
     if not _EPLB_HAS_TRITON:

@@ -144,6 +144,12 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MORI_V2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
+## Expert load balancing (EPLB)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_EPLB_FREEZE_FILE** | str | "" (off) | Path checked at every EPLB rebalance point (`--enable-eplb`). Once the file exists on any rank of the EP migration group, EPLB stops rebalancing for the rest of the server's life; load monitoring continues. The check is MAX-reduced over the group so every rank freezes at the same step. Lets a benchmark balance experts during warmup and hold the placement fixed for the measured window: create the file when measurement starts. A rebalance already in progress finishes; the freeze applies from the next rebalance point. |
+
 ## Fusion passes
 
 ### RMSNorm
