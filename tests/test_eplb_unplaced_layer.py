@@ -11,8 +11,8 @@ from import_guard import skip_if_dependency_missing
 torch = pytest.importorskip("torch")
 
 try:
-    import atom.config  # noqa: F401
-    import atom.model_ops.eplb as eplb
+    import atom.config
+    from atom.model_ops import eplb
 except ImportError as _e:  # aiter/triton absent under bare non-GPU pytest
     skip_if_dependency_missing(_e, "requires full atom import env")
 
