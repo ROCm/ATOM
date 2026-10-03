@@ -170,10 +170,17 @@ the step with decodes still reaches 4,096 and stops there.
 
 Same workload and window as above, concurrency 8:
 
-| | `cap_kept` | `cap_declined` | `sweep_offered` |
-|---|---|---|---|
-| budget 4096, unaligned | 102 | 248 | 106 |
-| budget 8192, aligned | **613** | **2** | **656** |
+| | `cap_kept` | `cap_declined` | `sweep_offered` | `boundary_passed` |
+|---|---|---|---|---|
+| budget 4096, unaligned | 102 | 248 | 106 | 1315 |
+| budget 8192, aligned | **647** | **0** | **687** | **104** |
+
+`restored_start` reads 638 against 647 hits kept, which is the check that
+`boundary_passed` is now counting what its name says: a request served from
+the tier starts at the boundary its hit was capped to, and the intervals
+below that are in the tier rather than lost. Counting them made this number
+read 1,820 in the arm that was restoring the most -- pointing whoever read it
+at a token budget that was not the problem.
 
 Hits kept go from 29 % to 99.7 %, and the tier supplies 75.1 % of prompt
 tokens. Throughput, with the budget's own effect separated out by running the
