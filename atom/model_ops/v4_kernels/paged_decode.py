@@ -1199,8 +1199,8 @@ def sparse_attn_v4_paged_decode(
     sparse-prefill ASM kernel with an empty extend stream. Both paths consume
     pre-packed fp8 Q and the fp8 NoPE + bf16 RoPE pools with no requant.
 
-    ``split_plan`` is aiter's ``MlaV4NmSplitPlan`` (``num_kv_splits``,
-    ``split_indptr``) for the decode ASM kernel, built by whoever built this
+    ``split_plan`` is ``(num_kv_splits, split_indptr)`` (:func:`v4_decode_split_plan`)
+    for the decode ASM kernel, built by whoever built this
     call's ``qo_indptr``; None leaves the split pick to aiter.
 
     ``compress_ratio`` is the calling layer's ratio (0 SWA, 4 CSA, 128 HCA).

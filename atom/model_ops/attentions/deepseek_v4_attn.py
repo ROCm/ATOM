@@ -302,7 +302,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     (= `min(positions[t]+1, win) + (positions[t]+1)//128`). Padded tail = last
     value."""
     split_plan_swa: tuple[int, torch.Tensor] | None = None
-    """aiter `MlaV4NmSplitPlan` (`num_kv_splits`, `split_indptr[padded_T+1]`)
+    """Split plan `(num_kv_splits, split_indptr)` (see `v4_decode_split_plan`)
     for the fp8 decode ASM kernel on SWA layers. None: aiter picks."""
     split_plan_csa: tuple[int, torch.Tensor] | None = None
     """Same for CSA layers."""
