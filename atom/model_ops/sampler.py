@@ -31,6 +31,26 @@ _NATIVE_SAMPLING_WARNING_ISSUED = False
 SAMPLER_EPS = 1e-10
 
 
+_TOPK_SELECT_OK = None
+
+
+def _greedy_pick(x: torch.Tensor) -> torch.Tensor:
+    """Pick each row's first maximum with an older-AITER compatibility fallback.
+
+    Some AITER builds reject architectures that their ``topk_select`` allowlist
+    predates. Keep the optimized selector where it is supported, and use
+    ``torch.argmax`` otherwise; both choose the lowest index on an exact tie.
+    """
+    global _TOPK_SELECT_OK
+    if _TOPK_SELECT_OK is None:
+        from aiter.ops.topk_select import _unsupported_arch
+
+        _TOPK_SELECT_OK = _unsupported_arch() is None
+    if _TOPK_SELECT_OK:
+        return topk_select(x, 1, tie="low")[1].view(-1)
+    return torch.argmax(x, dim=-1).to(torch.int32)
+
+
 def _apply_greedy_tokens(
     probs: torch.Tensor, temperatures: torch.Tensor, next_tokens: torch.Tensor
 ) -> torch.Tensor:
@@ -45,7 +65,7 @@ def _apply_greedy_tokens(
     temperature to it before the sampler sees them (``prepare_sample``), so a
     requested 0 never arrives as 0.
     """
-    greedy_tokens = topk_select(probs, 1, tie="low")[1].view(-1)
+    greedy_tokens = _greedy_pick(probs)
     return torch.where(
         temperatures <= SAMPLER_EPS, greedy_tokens, next_tokens.view(-1).to(torch.int)
     )
@@ -140,7 +160,7 @@ class Sampler(nn.Module):
         # resolve differently from one run (or TP rank) to the next. `logits` is
         # bf16 and stays bf16 -- the reduction widens each element as it reads it.
         if all_greedy:
-            return topk_select(logits, 1, tie="low")[1].view(-1)
+            return _greedy_pick(logits)
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):

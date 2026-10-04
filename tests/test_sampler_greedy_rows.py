@@ -16,6 +16,32 @@ def _torch_topk_select(probs, k, *, tie):
     return None, probs.argmax(-1, keepdim=True).to(torch.int32)
 
 
+def test_greedy_pick_uses_aiter_selector_when_supported(monkeypatch):
+    monkeypatch.setattr(sampler, "_TOPK_SELECT_OK", True)
+    monkeypatch.setattr(sampler, "topk_select", _torch_topk_select)
+    logits = torch.tensor([[0.0, 2.0, 2.0], [4.0, 1.0, 3.0]])
+
+    got = sampler._greedy_pick(logits)
+
+    assert got.dtype == torch.int32
+    assert got.tolist() == [1, 0]
+
+
+def test_greedy_pick_falls_back_when_aiter_selector_is_unsupported(monkeypatch):
+    monkeypatch.setattr(sampler, "_TOPK_SELECT_OK", False)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("unsupported AITER selector must not be called")
+
+    monkeypatch.setattr(sampler, "topk_select", fail_if_called)
+    logits = torch.tensor([[0.0, 2.0, 2.0], [4.0, 1.0, 3.0]])
+
+    got = sampler._greedy_pick(logits)
+
+    assert got.dtype == torch.int32
+    assert got.tolist() == [1, 0]
+
+
 @pytest.mark.parametrize("rows,vocab", [(1, 8), (4, 16), (17, 61), (64, 129)])
 @pytest.mark.parametrize("frac", [0.0, 0.25, 0.5, 1.0])
 @pytest.mark.parametrize("column", [False, True])
