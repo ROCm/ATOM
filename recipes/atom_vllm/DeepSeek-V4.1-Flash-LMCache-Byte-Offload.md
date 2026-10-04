@@ -240,11 +240,20 @@ each paired against its own OFF arm:
 
 | | OFF req/s | ON req/s | delta | OFF TTFT p50 | ON TTFT p50 |
 |---|---|---|---|---|---|
-| seed 7002 | 2.034 | 5.107 | **+151.0 %** | 2541 ms | 590 ms |
-| seed 7303 | 2.039 | 3.876 | **+90.1 %** | 2531 ms | 897 ms |
+| seed 7002 | 2.034 | 5.107 | +151.0 % | 2541 ms | 590 ms |
+| seed 7303 | 2.039 | 3.876 | +90.1 % | 2531 ms | 897 ms |
+| seed 7002, current tree | 2.039 | 4.325 | **+112.1 %** | 2537 ms | 834 ms |
 
-So the tier is worth **+90 % to +151 %** here, depending on how much reuse the
-workload actually offers.
+So the tier is worth roughly **+90 % to +150 %** here, depending on how much
+reuse the workload actually offers.
+
+The third row is the tree as it stands; the first two were taken before the
+defect fixes, the counter correction and the merge with main (which brought
+#2454, itself a change to the offload lookup path). Its ON arm reads 19.6 %
+below the first row at the same seed, and that is **not resolved**: the two
+OFF arms agree to 0.2 %, so the baseline did not move, but a single window at
+this working point has been measured 24 % apart before. Repeat windows on one
+server would separate sampling from regression; they have not been run.
 
 The two OFF arms agree to **0.25 %**, which is the check that makes the spread
 readable: an arm with no reuse is indifferent to the prefix structure, so the
