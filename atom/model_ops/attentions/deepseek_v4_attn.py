@@ -306,7 +306,8 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     split_plan_csa: tuple[int, torch.Tensor] | None = None
     """Same for CSA layers."""
     split_plan_hca: tuple[int, torch.Tensor] | None = None
-    """Same for HCA layers."""
+    """Same for HCA layers; also None when the persistent kernel
+    (`hca_persist`) takes this forward's HCA decode."""
     envelope_rows: int = 0
     """Rows one V4 block takes across every layer of the pool — the stride from
     one block's compressed rows to the next in a layer's view of a plane. What
@@ -446,6 +447,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     kv_block_size (= the CSA row count) to be 64 for N_PHYS=1. Must equal
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
+
+    # Set at init by `_prepare_hca_persist`: HCA decode can take aiter's
+    # persistent kernel (workspace allocated before any capture).
+    _hca_persist: bool = False
 
     capture_owns_cu_seqlens_q = True
     block_size = 256
@@ -726,7 +731,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             model_runner.config.hf_config.num_attention_heads
             // get_tensor_model_parallel_world_size()
         )
-        self._prepare_hca_persist()
+        self._hca_persist = self._prepare_hca_persist()
 
         # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
         # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
@@ -3678,20 +3683,22 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
-    def _prepare_hca_persist(self) -> None:
+    def _prepare_hca_persist(self) -> bool:
         """Allocate the persistent HCA decode workspace here, at init: before
         warmup, before KV sizing (so it is accounted for) and before any
-        CUDA-graph capture, which may be the first forward to reach it."""
-        if not envs.ATOM_V4_HCA_PERSIST:
-            return
-        why = "no HCA (ratio 128) layers" if not self.hca_layers else None
-        why = why or hca_persist.unusable_reason(
-            kv_fp8=self._kv_fp8, heads=self._local_heads, gfx=get_gfx()
+        CUDA-graph capture, which may be the first forward to reach it.
+
+        True when HCA decode can take the persistent kernel. Fixed for the
+        builder's lifetime, so capture and every replay see the same answer.
+        """
+        if not envs.ATOM_V4_HCA_PERSIST or not self.hca_layers:
+            return False
+        return hca_persist.prepare_if_usable(
+            kv_fp8=self._kv_fp8,
+            heads=self._local_heads,
+            gfx=get_gfx(),
+            device=self.device,
         )
-        if why is not None:
-            logger.info("V4 HCA persistent decode not used: %s", why)
-            return
-        hca_persist.prepare(self.device)
 
     def _decode_split_plan(
         self, rows: int, kv_len: int, split_indptr: torch.Tensor
@@ -3837,11 +3844,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.split_plan_csa = self._decode_split_plan(
             T_pad, win + index_topk, var[f"{buf_prefix_ubatch}v4_split_indptr_csa"]
         )
-        attn_metadata.split_plan_hca = self._decode_split_plan(
-            T_pad,
-            win + self.max_committed_hca,
-            var[f"{buf_prefix_ubatch}v4_split_indptr_hca"],
-        )
+        # HCA calls the persistent kernel takes plan their split on the GPU from
+        # the real kv_indptr; a call it then declines (non-dense pool, eager
+        # N below the row gate) gets aiter's own split pick.
+        if self._hca_persist and hca_persist.rows_ok(T_pad):
+            attn_metadata.split_plan_hca = None
+        else:
+            attn_metadata.split_plan_hca = self._decode_split_plan(
+                T_pad,
+                win + self.max_committed_hca,
+                var[f"{buf_prefix_ubatch}v4_split_indptr_hca"],
+            )
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
         # kernels can run once with shape `[decode_rows, 1, ...]`. Source and

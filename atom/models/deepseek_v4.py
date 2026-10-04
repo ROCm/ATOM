@@ -2636,7 +2636,7 @@ class DeepseekV4Attention(nn.Module):
         # sizing and graph capture) on every serving path, native or plugin.
         if self.compress_ratio == hca_persist.HCA_RATIO:
             hca_persist.prepare_if_usable(
-                kv_fp8=str(atom_config.kv_cache_dtype).startswith("fp8"),
+                kv_fp8=self.kv_fp8,
                 heads=self.n_local_heads,
                 gfx=arch,
             )

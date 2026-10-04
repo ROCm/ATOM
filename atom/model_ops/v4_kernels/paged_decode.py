@@ -996,7 +996,7 @@ def v4_decode_split_plan(
     `split_indptr` is written in place into the caller's persistent buffer, so
     whoever owns a decode CSR builds its plan next to it and passes it on as
     ``sparse_attn_v4_paged_decode(..., split_plan=plan)``. None on aiter builds
-    before ROCm/aiter#5890, which leaves the split pick to aiter.
+    before ROCm/aiter#6126, which leaves the split pick to aiter.
     """
     import aiter.mla
 
