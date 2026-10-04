@@ -827,9 +827,21 @@ plan_lmcache_mp_servers() {
 
 # The prefill's lmcache_mp extra config for the planned servers.
 lmcache_mp_extra_config_json() {
+  # LMCACHE_MP_MAX_PENDING_LOOKUPS: how many non-blocking lookups may be out
+  # at once (ATOM's lmcache.mp.max_pending_lookups, default 8). Requests past
+  # it wait in line, so it caps how fast the servers' L2 prefetches can feed
+  # the prefill; pair it with the servers' --l2-prefetch-max-in-flight.
+  local tuning=""
+  if [[ -n "${LMCACHE_MP_MAX_PENDING_LOOKUPS:-}" ]]; then
+    if [[ ! "${LMCACHE_MP_MAX_PENDING_LOOKUPS}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "[lmcache-mp][FAIL] LMCACHE_MP_MAX_PENDING_LOOKUPS=${LMCACHE_MP_MAX_PENDING_LOOKUPS} is not a positive integer" >&2
+      exit 2
+    fi
+    tuning=",\"lmcache.mp.max_pending_lookups\":${LMCACHE_MP_MAX_PENDING_LOOKUPS}"
+  fi
   if [[ -z "${lmcache_mp_plan_first_stage[0]}" ]]; then
-    printf '{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":%s,"lmcache.mp.l2":"%s"}' \
-      "${ATOMESH_LMCACHE_MP_PORT}" "${lmcache_mp_l2}"
+    printf '{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":%s,"lmcache.mp.l2":"%s"%s}' \
+      "${ATOMESH_LMCACHE_MP_PORT}" "${lmcache_mp_l2}" "${tuning}"
     return 0
   fi
   local i rank servers="" ranks
@@ -841,7 +853,8 @@ lmcache_mp_extra_config_json() {
     servers+="${servers:+,}$(printf '{"url":"tcp://127.0.0.1:%s","pp_ranks":[%s]}' \
       "$(( ATOMESH_LMCACHE_MP_PORT + i ))" "${ranks}")"
   done
-  printf '{"lmcache.mp.stage_servers":[%s],"lmcache.mp.l2":"%s"}' "${servers}" "${lmcache_mp_l2}"
+  printf '{"lmcache.mp.stage_servers":[%s],"lmcache.mp.l2":"%s"%s}' \
+    "${servers}" "${lmcache_mp_l2}" "${tuning}"
 }
 
 # Returns 1 and records the first exit status when a server exited on its own.
