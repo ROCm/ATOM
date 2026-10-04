@@ -678,6 +678,42 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
             key = super()._create_key(*args, **kwargs)
             return replace(key, num_kv_readers=num_kv_readers)
 
+        def maybe_submit_lookup_request(
+            self, request_id: str, token_ids: list[int], start: int = 0
+        ) -> None:
+            """LMCache's lookup submit, for the chunks from ``start`` on.
+
+            ``start`` is floored to a chunk. LMCache's own submit always asks
+            from 0, so a later start builds the key here, on the same private
+            state its submit and ``check_lookup_result`` use. A prompt with no
+            whole chunk past ``start`` has nothing to ask for. Its answer is
+            ``start``, as a server that prefetches from ``start`` answers a
+            miss past it: the prefix below is on the GPU, and 0 would have the
+            scheduler store it again.
+            """
+            chunk = int(self.lmcache_tokens_per_chunk)
+            start = (int(start) // chunk) * chunk
+            if start <= 0:
+                super().maybe_submit_lookup_request(request_id, token_ids)
+                return
+            if request_id in self._pending_lookups:
+                return
+            aligned_end = (len(token_ids) // chunk) * chunk
+            if aligned_end <= start:
+                self._lookup_results[request_id] = aligned_end
+                return
+            key = self._create_key(
+                token_ids,
+                start=start,
+                end=aligned_end,
+                request_id=request_id,
+                worker_id=None,
+            )
+            self._client.lookup(key, self._parallel.tp_size).result(
+                timeout=self._mq_timeout
+            )
+            self._pending_lookups.add(request_id)
+
     extra = _extra_config(config)
     mq_timeout = float(extra.get("lmcache.mp.mq_timeout", 300.0))
     servers = _stage_servers(config)

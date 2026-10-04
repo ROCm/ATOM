@@ -199,6 +199,27 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """The prompt extent this layout can safely ask the tier to resume."""
         return list(seq.token_ids[: seq.num_prompt_tokens])
 
+    def _tier_lookup_start(self, seq) -> int:
+        """Where a lookup for this prompt starts: 0, or past its HBM prefix.
+
+        Only for a client that can ask from there (``starts_past_hbm_prefix``):
+        an LMCache MP server reads every chunk of a hit into its L1 before it
+        answers, and the chunks the GPU already holds are never loaded. The
+        HBM prefix can shrink before the request is admitted;
+        `_decide_load_after_alloc` refuses a load that would start below it.
+        """
+        if not getattr(self._lookup_client, "starts_past_hbm_prefix", False):
+            return 0
+        probe = getattr(self._block_manager, "cached_prefix_tokens", None)
+        if probe is None:
+            return 0
+        return self._chunk_floor(min(int(probe(seq)), int(seq.num_prompt_tokens)))
+
+    def _tier_lookup_start_of(self, sid: str) -> int:
+        """The start of the live lookup behind this request's load, or 0."""
+        lookup_start = getattr(self._lookup_client, "lookup_start", None)
+        return 0 if lookup_start is None else int(lookup_start(sid))
+
     def install_hit_cap_hook(self, hook) -> None:
         """Let a hybrid connector shorten every hit this scheduler reports.
 
@@ -257,15 +278,20 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         num_prompt = seq.num_prompt_tokens
         token_ids = self._lookup_token_ids(seq)
+        start = self._tier_lookup_start(seq)
+        # Only a client that asks past the HBM prefix takes `start`.
+        past_hbm = {"start": start} if start else {}
         listed = sid not in self._lookup_in_step
         if listed:
             self._lookup_in_step.append(sid)
         self._lookup_results[sid] = (seq, 0)
         try:
             if not wait and getattr(self._lookup_client, "nonblocking", False):
-                hit = self._lookup_client.lookup_nowait(token_ids, lookup_id=sid)
+                hit = self._lookup_client.lookup_nowait(
+                    token_ids, lookup_id=sid, **past_hbm
+                )
             else:
-                hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+                hit = self._lookup_client.lookup(token_ids, lookup_id=sid, **past_hbm)
         except Exception:
             # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
             # a half-run lookup may have taken.
@@ -413,6 +439,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         need = lmc - hbm
         if lmc <= hbm:
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
+        if hbm < self._tier_lookup_start_of(str(seq.id)):
+            # The lookup started past the HBM prefix of its time, which has
+            # since shrunk: the tier was not asked for the tokens in between.
+            return False, "hbm_below_lookup_start", hbm, lmc, need, chunk
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
         min_load = int(getattr(self, "_min_load_tokens", 8192))

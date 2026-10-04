@@ -8,8 +8,9 @@ layers of each chunk, so a prefix is loadable only as far as every server
 holds it. The fan-out adapter answers the minimum of the servers' hits and,
 like vLLM's multi-server connector, releases each longer server's read locks
 beyond that minimum. From then on every live server holds locks on exactly
-``[0, hit)``, so the single-server lock bookkeeping in ``lookup.py`` applies
-unchanged to each of them.
+``[0, hit)`` -- ``[start, hit)`` for a lookup that started past the HBM
+prefix, on a server that clamps releases to that start -- so the single-server
+lock bookkeeping in ``lookup.py`` applies unchanged to each of them.
 """
 
 from __future__ import annotations
@@ -75,10 +76,11 @@ class _StageServersSchedulerAdapter:
         return window
 
     def maybe_submit_lookup_request(
-        self, request_id: str, token_ids: list[int]
+        self, request_id: str, token_ids: list[int], start: int = 0
     ) -> None:
         if request_id in self._lookups:
             return
+        past_hbm = {"start": start} if start else {}
         state = _FanOutLookup(token_ids=list(token_ids))
         self._lookups[request_id] = state
         now = time.monotonic()
@@ -90,7 +92,7 @@ class _StageServersSchedulerAdapter:
         for index, adapter in enumerate(self._adapters):
             state.submitted.add(index)
             try:
-                adapter.maybe_submit_lookup_request(request_id, token_ids)
+                adapter.maybe_submit_lookup_request(request_id, token_ids, **past_hbm)
             except Exception:
                 state.failed.add(index)
                 window = self._mark_down(index)

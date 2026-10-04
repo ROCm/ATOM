@@ -874,6 +874,55 @@ class BlockManager:
         the manager. Seeded from `seq.cache_seed` like every chain it mints."""
         return self._chain_to(seq, block_hashes, blocks)
 
+    def _chained_prefix_hit(
+        self, seq: Sequence, block_hashes: list[int], reuse_hashes: bool
+    ) -> int:
+        """Hash blocks from the prompt's start whose KV the prefix cache holds.
+
+        The front-to-back chained match: the first miss ends it, since the
+        chain carries every earlier token. The last block is never offered
+        (see `can_allocate`). Appends each matched block's hash to
+        `block_hashes`; `reuse_hashes` reads and extends the per-request hash
+        cache instead of rehashing the prompt.
+        """
+        h = seq.cache_seed
+        hit = 0
+        cached_hashes = None
+        if reuse_hashes:
+            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
+            if seed != h:
+                cached_hashes = []
+            self._prefill_probe_hashes[seq] = (h, cached_hashes)
+        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
+        for i in range(self._n_hash_blocks(seq) - 1):
+            token_ids = self._hash_block_tokens(seq, i)
+            if cached_hashes is not None and i < len(cached_hashes):
+                h = cached_hashes[i]
+            else:
+                h = self.compute_hash(token_ids, h)
+                if cached_hashes is not None and i < immutable_blocks:
+                    cached_hashes.append(h)
+            block_id = self.kv.lookup(h)
+            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+                break
+            block_hashes.append(h)
+            hit += 1
+        return hit
+
+    def cached_prefix_tokens(self, seq: Sequence) -> int:
+        """Prompt tokens at the front of `seq` whose KV is in HBM right now.
+
+        Read-only: the chained match `can_allocate` starts from, without its
+        state gates, its fit check or any recording, so an upper bound on the
+        hit an admission would get. Shares `can_allocate`'s hash cache, so the
+        admission that follows does not hash the prompt again. An external
+        tier needs nothing below it (`_MPLookupClient` starts its lookups
+        there).
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        return self._chained_prefix_hit(seq, [], True) * self.hash_block_size
+
     def can_allocate(
         self,
         seq: Sequence,
@@ -919,28 +968,7 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = seq.cache_seed
-        compressed_hit = 0
-        cached_hashes = None
-        if reuse_hashes:
-            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
-            if seed != h:
-                cached_hashes = []
-            self._prefill_probe_hashes[seq] = (h, cached_hashes)
-        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
-        for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            if cached_hashes is not None and i < len(cached_hashes):
-                h = cached_hashes[i]
-            else:
-                h = self.compute_hash(token_ids, h)
-                if cached_hashes is not None and i < immutable_blocks:
-                    cached_hashes.append(h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                break
-            block_hashes.append(h)
-            compressed_hit += 1
+        compressed_hit = self._chained_prefix_hit(seq, block_hashes, reuse_hashes)
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM

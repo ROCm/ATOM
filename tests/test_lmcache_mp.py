@@ -610,12 +610,14 @@ class _LookupAdapter:
     def __init__(self, results) -> None:
         self.results = deque(results)
         self.submissions = []
+        self.starts = []
         self.freed = []
         self.cleaned = []
         self.ended = []
 
-    def maybe_submit_lookup_request(self, request_id, token_ids):
+    def maybe_submit_lookup_request(self, request_id, token_ids, **past_hbm):
         self.submissions.append((request_id, list(token_ids)))
+        self.starts.append(past_hbm.get("start", 0))
 
     def check_lookup_result(self, request_id):
         if self.results:
@@ -1049,6 +1051,174 @@ def test_commit_time_lookup_waits_even_when_matching_does_not(monkeypatch):
 
     assert scheduler._fresh_tier_lookup(seq, "9") == 12
     assert calls == []
+
+
+def _past_hbm_scheduler(monkeypatch, *, hbm_prefix, hit=12, past_hbm=True):
+    """An MP scheduler whose block manager holds ``hbm_prefix`` tokens."""
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4, hit=hit)
+    lookup.starts_past_hbm_prefix = past_hbm
+    scheduler._block_manager = SimpleNamespace(
+        cached_prefix_tokens=lambda seq: hbm_prefix
+    )
+    seq = SimpleNamespace(
+        id=9,
+        num_prompt_tokens=16,
+        num_cached_tokens=0,
+        token_ids=list(range(16)),
+        block_table=[10, 11, 12, 13],
+    )
+    return scheduler, lookup, seq
+
+
+def test_mp_lookup_asks_from_past_the_hbm_prefix(monkeypatch):
+    # The GPU holds 9 tokens, so the server is asked from the chunk boundary
+    # below them; the answer is still a prefix length.
+    scheduler, lookup, seq = _past_hbm_scheduler(monkeypatch, hbm_prefix=9)
+
+    assert scheduler._fresh_tier_lookup(seq, "9") == 12
+    assert lookup._adapter.starts == [8]
+    assert lookup.lookup_start("9") == 8
+    assert lookup.lookup_start("other") == 0
+
+
+@pytest.mark.parametrize("past_hbm", [False, True])
+def test_mp_lookup_asks_from_zero_when_it_may_not_skip_or_nothing_is_cached(
+    monkeypatch, past_hbm
+):
+    scheduler, lookup, seq = _past_hbm_scheduler(
+        monkeypatch, hbm_prefix=0 if past_hbm else 9, past_hbm=past_hbm
+    )
+
+    assert scheduler._fresh_tier_lookup(seq, "9") == 12
+    assert lookup._adapter.starts == [0]
+    assert lookup.lookup_start("9") == 0
+
+
+def test_load_below_the_lookup_start_is_refused(monkeypatch):
+    # The lookup started at 8; if the HBM prefix shrinks to 4 before the load
+    # is dispatched, nothing ever asked the tier for tokens 4..8.
+    scheduler, _lookup, seq = _past_hbm_scheduler(monkeypatch, hbm_prefix=8)
+    assert scheduler._fresh_tier_lookup(seq, "9") == 12
+    spec = LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=12, can_load=False)
+
+    seq.num_cached_tokens = 4
+    assert scheduler._decide_load_after_alloc(seq, spec)[:2] == (
+        False,
+        "hbm_below_lookup_start",
+    )
+    seq.num_cached_tokens = 8
+    assert scheduler._decide_load_after_alloc(seq, spec)[:2] == (
+        True,
+        "aligned_large_hit",
+    )
+
+
+def test_stage_servers_ask_every_server_from_the_same_start():
+    servers = [_LookupAdapter([12]), _LookupAdapter([16])]
+    for server in servers:
+        server.lmcache_tokens_per_chunk = 4
+    fan_out = mp_stage_servers._StageServersSchedulerAdapter(servers, ["s0", "s1"])
+
+    fan_out.maybe_submit_lookup_request("past", list(range(16)), start=8)
+    fan_out.maybe_submit_lookup_request("zero", list(range(16)))
+
+    assert [server.starts for server in servers] == [[8, 0], [8, 0]]
+
+
+@pytest.fixture
+def lmcache_scheduler_adapter(monkeypatch):
+    """`_ReaderAwareSchedulerAdapter` over a recording LMCache base class."""
+
+    @dataclass(frozen=True)
+    class Key:
+        start: int
+        end: int
+        num_kv_readers: int = 1
+
+    class Future:
+        def result(self, timeout=None):
+            return None
+
+    class Client:
+        def __init__(self):
+            self.lookups = []
+
+        def lookup(self, key, tp_size):
+            self.lookups.append(key)
+            return Future()
+
+    class AtomMPSchedulerAdapter:
+        def __init__(self, **kwargs):
+            self.lmcache_tokens_per_chunk = 256
+            self._pending_lookups = set()
+            self._lookup_results = {}
+            self._client = Client()
+            self._parallel = SimpleNamespace(tp_size=1)
+            self._mq_timeout = 1.0
+            self.from_zero = []
+
+        def maybe_submit_lookup_request(self, request_id, token_ids):
+            self.from_zero.append(request_id)
+
+        def _create_key(self, token_ids, start, end, request_id, worker_id):
+            return Key(start=start, end=end)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    adapter_module.AtomMPSchedulerAdapter = AtomMPSchedulerAdapter
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    return mp_scheduler._make_scheduler_adapter(_config())
+
+
+def test_scheduler_adapter_asks_from_the_chunk_below_the_start(
+    lmcache_scheduler_adapter,
+):
+    adapter = lmcache_scheduler_adapter
+
+    adapter.maybe_submit_lookup_request("past", list(range(1100)), start=600)
+    adapter.maybe_submit_lookup_request("past", list(range(1100)), start=600)
+    adapter.maybe_submit_lookup_request("zero", list(range(1100)), start=200)
+
+    assert [(key.start, key.end) for key in adapter._client.lookups] == [(512, 1024)]
+    assert adapter._pending_lookups == {"past"}
+    assert adapter.from_zero == ["zero"]
+
+
+def test_scheduler_adapter_answers_its_start_with_no_whole_chunk_past_it(
+    lmcache_scheduler_adapter,
+):
+    # Nothing to ask for, and the prefix is on the GPU: the answer must not
+    # read as a miss, or the scheduler would store that prefix again.
+    adapter = lmcache_scheduler_adapter
+
+    adapter.maybe_submit_lookup_request("cached", list(range(1100)), start=1100)
+
+    assert adapter._client.lookups == []
+    assert adapter._lookup_results == {"cached": 1024}
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, False),
+        ({"lmcache.mp.l2": "present"}, True),
+        (
+            {"lmcache.mp.l2": "present", "lmcache.mp.lookup_past_hbm_prefix": False},
+            False,
+        ),
+        ({"lmcache.mp.lookup_past_hbm_prefix": True}, True),
+    ],
+)
+def test_lookup_past_hbm_prefix_defaults_on_with_a_declared_l2(extra, expected):
+    assert mp_scheduler._lookup_past_hbm_prefix(extra) is expected
+
+
+def test_lookup_past_hbm_prefix_setting_must_be_a_bool():
+    with pytest.raises(TypeError, match="lookup_past_hbm_prefix must be true or false"):
+        mp_scheduler._lookup_past_hbm_prefix({"lmcache.mp.lookup_past_hbm_prefix": 1})
 
 
 @pytest.mark.parametrize(

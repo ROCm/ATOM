@@ -343,6 +343,33 @@ class TestPrefixCaching:
         block_manager_prefix.allocate(s2, n)
         assert s2.num_cached_tokens == 4
 
+    def test_cached_prefix_tokens_reads_the_hit_without_taking_it(
+        self, block_manager_prefix, seq_factory
+    ):
+        # The prefix an external tier need not be asked for: reading it takes
+        # no block, and the admission after it gets the same hit.
+        s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        block_manager_prefix.allocate(s1)
+        block_manager_prefix.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        block_manager_prefix.deallocate(s1)
+        used = block_manager_prefix.kv.num_used
+
+        s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 30, 31])
+        assert block_manager_prefix.cached_prefix_tokens(s2) == 8
+        assert block_manager_prefix.kv.num_used == used
+        block_manager_prefix.allocate(s2, block_manager_prefix.can_allocate(s2))
+        assert s2.num_cached_tokens == 8
+
+        s3 = seq_factory([1, 2, 3, 4, 40, 41, 42, 43, 44])
+        assert block_manager_prefix.cached_prefix_tokens(s3) == 4
+
+    def test_cached_prefix_tokens_is_zero_without_prefix_caching(
+        self, block_manager, seq_factory
+    ):
+        s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        block_manager.allocate(s1)
+        assert block_manager.cached_prefix_tokens(seq_factory([1, 2, 3, 4, 5])) == 0
+
     def test_prefix_cache_miss_different_tokens(
         self, block_manager_prefix, seq_factory
     ):

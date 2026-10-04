@@ -19,6 +19,9 @@ logger = logging.getLogger("atom")
 @dataclass
 class _LookupState:
     token_ids: list[int]
+    # First prompt token the question covers; the server locks only the hit
+    # from here on.
+    lookup_start: int = 0
     hit: int | None = None
     retrieve_start: int | None = None
     retrieve_end: int | None = None
@@ -35,6 +38,14 @@ class _MPLookupClient:
     With ``nonblocking`` set, the scheduler asks through ``lookup_nowait``
     instead, which never waits out a prefetch: the request stays in line while
     the server prefetches, and the scheduler admits other work meanwhile.
+
+    With ``starts_past_hbm_prefix`` set, the scheduler passes a ``start``: the
+    prompt's HBM prefix, which it will never load. A server that prefetches
+    from the key's start (``mooncake_l2_server``) then reads only the chunks
+    past it, answers the hit as a prefix length all the same, and locks only
+    its part from ``start`` on; it clamps every release to that start, so the
+    releases below stay ranges from 0. A server that ignores ``start`` answers
+    and locks as if it were 0.
     """
 
     token_database = None
@@ -49,6 +60,7 @@ class _MPLookupClient:
         nonblocking: bool = False,
         max_pending: int = 8,
         nowait_grace: float = 0.02,
+        starts_past_hbm_prefix: bool = False,
     ) -> None:
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("LMCache MP lookup timeout and poll interval must be > 0")
@@ -62,6 +74,7 @@ class _MPLookupClient:
         self._timeout = timeout
         self._poll_interval = poll_interval
         self.nonblocking = bool(nonblocking)
+        self.starts_past_hbm_prefix = bool(starts_past_hbm_prefix)
         self._max_pending = int(max_pending)
         self._nowait_grace = float(nowait_grace)
         self._lookups: dict[str, _LookupState] = {}
@@ -72,13 +85,25 @@ class _MPLookupClient:
                 self._max_pending,
                 self._nowait_grace * 1000,
             )
+        if self.starts_past_hbm_prefix:
+            logger.info("LMCache MP lookups start past each prompt's HBM prefix")
 
-    def _submit(self, token_ids: list[int], lookup_id: str) -> _LookupState:
-        state = _LookupState(token_ids=list(token_ids), submitted_at=time.monotonic())
-        self._lookups[lookup_id] = state
-        self._adapter.maybe_submit_lookup_request(
-            _mp_session_id(self._config, lookup_id), token_ids
+    def _submit(
+        self, token_ids: list[int], lookup_id: str, start: int = 0
+    ) -> _LookupState:
+        state = _LookupState(
+            token_ids=list(token_ids),
+            lookup_start=int(start),
+            submitted_at=time.monotonic(),
         )
+        self._lookups[lookup_id] = state
+        request_id = _mp_session_id(self._config, lookup_id)
+        if start > 0:
+            self._adapter.maybe_submit_lookup_request(
+                request_id, token_ids, start=int(start)
+            )
+        else:
+            self._adapter.maybe_submit_lookup_request(request_id, token_ids)
         return state
 
     def _num_outstanding(self, now: float) -> int:
@@ -88,7 +113,9 @@ class _MPLookupClient:
             if state.hit is None and now - state.submitted_at < self._timeout
         )
 
-    def lookup_nowait(self, token_ids: list[int], lookup_id: str) -> Any:
+    def lookup_nowait(
+        self, token_ids: list[int], lookup_id: str, start: int = 0
+    ) -> Any:
         """``lookup`` without waiting out an L2 prefetch.
 
         Answers the hit once the server has, ``TIER_LOOKUP_PENDING`` while it
@@ -109,7 +136,7 @@ class _MPLookupClient:
         if state is None or state.hit is not None:
             if self._num_outstanding(now) >= self._max_pending:
                 return TIER_LOOKUP_PENDING
-            state = self._submit(token_ids, lookup_id)
+            state = self._submit(token_ids, lookup_id, start)
             deadline = state.submitted_at + self._nowait_grace
         else:
             deadline = now
@@ -133,7 +160,9 @@ class _MPLookupClient:
                 return TIER_LOOKUP_PENDING
             time.sleep(self._poll_interval)
 
-    def lookup(self, token_ids: list[int], lookup_id: str) -> int | None:
+    def lookup(
+        self, token_ids: list[int], lookup_id: str, start: int = 0
+    ) -> int | None:
         """Hit length for this prompt, or None if the tier never answered.
 
         None is a non-answer, not an empty answer: the caller must ask again
@@ -141,7 +170,7 @@ class _MPLookupClient:
         well hold.
         """
 
-        state = self._submit(token_ids, lookup_id)
+        state = self._submit(token_ids, lookup_id, start)
         request_id = _mp_session_id(self._config, lookup_id)
         deadline = state.submitted_at + self._timeout
         while True:
@@ -229,6 +258,11 @@ class _MPLookupClient:
     def hit_tokens(self, lookup_id: str) -> int | None:
         state = self._lookups.get(lookup_id)
         return None if state is None else state.hit
+
+    def lookup_start(self, lookup_id: str) -> int:
+        """Where the live lookup for this request started, or 0 if none is live."""
+        state = self._lookups.get(lookup_id)
+        return 0 if state is None else state.lookup_start
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         state = self._lookups.pop(lookup_id, None)

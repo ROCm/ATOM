@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
+from dataclasses import dataclass, field
 
 import pytest
 import torch
@@ -26,6 +29,7 @@ def ran(monkeypatch):
     monkeypatch.setattr(server, "requester_rdma_device", lambda gpu: f"rdma{3 - gpu}")
     monkeypatch.setattr(server, "keep_l1_objects_page_aligned", lambda: None)
     monkeypatch.setattr(server, "make_l1_huge_before_pinning", lambda numa: None)
+    monkeypatch.setattr(server, "prefetch_from_lookup_start", lambda: None)
     return runs
 
 
@@ -210,3 +214,149 @@ def test_l1_short_of_huge_pages_fails_before_it_is_pinned(monkeypatch):
     with pytest.raises(RuntimeError, match="not all huge pages after MADV_COLLAPSE"):
         allocator._pin_memory_chunk(0, 4 << 20)
     assert ("pin", 0, 4 << 20) not in calls
+
+
+@dataclass(frozen=True)
+class _Key:
+    """The fields of LMCache's IPCCacheServerKey the patch reads."""
+
+    token_ids: tuple
+    start: int
+    end: int
+    request_id: str = field(default="req", compare=False)
+
+
+@pytest.fixture
+def lookups(monkeypatch):
+    """LMCache's LookupModule as the LOOKUP path uses it, with the patch on.
+
+    Chunk size 4. ``found`` is how many chunks the next prefetch finds, counted
+    from the first chunk submitted; ``freed`` records each release's range.
+    """
+    sessions = {}
+
+    class Session:
+        def __init__(self):
+            self.lookup_ipc_key = None
+            self.prefetch_hit_chunks = -1
+            self.prefetch_locked_gids = ()
+
+        def record_prefetch_result(self, hit_chunks, locked_gids):
+            self.prefetch_hit_chunks = hit_chunks
+            self.prefetch_locked_gids = locked_gids
+
+    ctx = types.SimpleNamespace(
+        chunk_size=4,
+        session_manager=types.SimpleNamespace(
+            get_or_create=lambda request_id: sessions.setdefault(request_id, Session())
+        ),
+    )
+
+    class LookupModule:
+        def __init__(self, ctx):
+            self._ctx = ctx
+            self.found = 0
+            self.submitted = []
+            self.freed = []
+
+        def lookup(self, key, tp_size):
+            hashes = [f"h{i}" for i in range(key.end // self._ctx.chunk_size)]
+            self._ctx.session_manager.get_or_create(key.request_id).lookup_ipc_key = key
+            self.submitted.append(module.ipc_key_to_grouped_object_keys(key, hashes))
+
+        def query_prefetch_status(self, request_id: str) -> int | None:
+            session = self._ctx.session_manager.get_or_create(request_id)
+            session.record_prefetch_result(self.found, (0,))
+            return self.found
+
+        def free_lookup_locks(self, key, tp_size: int) -> None:
+            self.freed.append((key.start, key.end))
+
+    module = types.ModuleType("lmcache.v1.multiprocess.modules.lookup")
+    module.LookupModule = LookupModule
+    module.ipc_key_to_grouped_object_keys = lambda key, hashes: list(hashes)
+    for name in (
+        "lmcache",
+        "lmcache.v1",
+        "lmcache.v1.multiprocess",
+        "lmcache.v1.multiprocess.modules",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["lmcache.v1.multiprocess.modules"].lookup = module
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    server.prefetch_from_lookup_start()
+    server.prefetch_from_lookup_start()  # idempotent
+    return LookupModule(ctx), sessions
+
+
+def test_lookup_from_chunk_zero_is_unchanged(lookups):
+    lookup, sessions = lookups
+    lookup.found = 3
+
+    lookup.lookup(_Key(tuple(range(16)), 0, 16), 1)
+
+    assert lookup.submitted == [["h0", "h1", "h2", "h3"]]
+    assert lookup.query_prefetch_status("req") == 3
+    assert sessions["req"].prefetch_hit_chunks == 3
+
+
+def test_lookup_prefetches_from_its_start_and_answers_a_prefix_length(lookups):
+    lookup, sessions = lookups
+    lookup.found = 1
+
+    lookup.lookup(_Key(tuple(range(16)), 8, 16), 1)
+
+    assert lookup.submitted == [["h2", "h3"]]
+    assert lookup.query_prefetch_status("req") == 3
+    # Releases resolve their keys against the recorded hit as a prefix length.
+    assert sessions["req"].prefetch_hit_chunks == 3
+    assert sessions["req"].prefetch_locked_gids == (0,)
+
+
+def test_lookup_past_its_start_with_no_hit_answers_its_start(lookups):
+    # Below the start the prefix is on the GPU: answering 0 would have the
+    # scheduler store it again.
+    lookup, sessions = lookups
+    lookup.found = 0
+
+    lookup.lookup(_Key(tuple(range(16)), 8, 16), 1)
+
+    assert lookup.query_prefetch_status("req") == 2
+    assert sessions["req"].prefetch_hit_chunks == 2
+    lookup.free_lookup_locks(_Key(tuple(range(16)), 0, 8), 1)
+    assert lookup.freed == []
+
+
+def test_release_is_clamped_to_the_lookup_start(lookups):
+    lookup, _sessions = lookups
+    lookup.found = 2
+    lookup.lookup(_Key(tuple(range(16)), 8, 16), 1)
+    lookup.query_prefetch_status("req")
+
+    lookup.free_lookup_locks(_Key(tuple(range(16)), 0, 16), 1)
+    lookup.free_lookup_locks(_Key(tuple(range(16)), 0, 8), 1)
+    lookup.free_lookup_locks(_Key(tuple(range(16)), 12, 16), 1)
+
+    assert lookup.freed == [(8, 16), (12, 16)]
+
+
+def test_lmcache_still_finds_the_patched_lookup_handlers(monkeypatch):
+    lookup_module = pytest.importorskip("lmcache.v1.multiprocess.modules.lookup")
+    from lmcache.v1.multiprocess.request_handler import iter_request_handlers
+
+    module = lookup_module.LookupModule
+    for name in ("__init__", "query_prefetch_status", "free_lookup_locks"):
+        monkeypatch.setattr(module, name, getattr(module, name))
+    monkeypatch.setattr(
+        lookup_module,
+        "ipc_key_to_grouped_object_keys",
+        lookup_module.ipc_key_to_grouped_object_keys,
+    )
+    before = {handler.operation for handler in iter_request_handlers(module)}
+
+    server.prefetch_from_lookup_start()
+
+    after = {handler.operation for handler in iter_request_handlers(module)}
+    assert after == before
+    assert module.query_prefetch_status._atom_from_lookup_start

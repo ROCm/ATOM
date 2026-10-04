@@ -51,10 +51,29 @@ def _nonblocking_lookup(extra: dict[str, Any]) -> bool:
     return configured
 
 
+def _lookup_past_hbm_prefix(extra: dict[str, Any]) -> bool:
+    """``lmcache.mp.lookup_past_hbm_prefix``, by default on with a declared L2.
+
+    A server prefetches a hit from its L2 before it answers. The part the GPU
+    already holds is never loaded, so the scheduler asks from past it; only a
+    server that honours the key's start (``mooncake_l2_server``) reads less,
+    and any other answers as before.
+    """
+    configured = extra.get("lmcache.mp.lookup_past_hbm_prefix")
+    if configured is None:
+        return extra.get("lmcache.mp.l2") == "present"
+    if not isinstance(configured, bool):
+        raise TypeError("lmcache.mp.lookup_past_hbm_prefix must be true or false")
+    return configured
+
+
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     """Scheduler-side LMCache MP connector for generic PAGE offload."""
 
     _supports_early_block_release = True
+    # Admission's hit is the HBM prefix match itself, which is what
+    # `BlockManager.cached_prefix_tokens` reports, so a lookup may start there.
+    _hbm_prefix_is_admission_hit = True
 
     def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
         _validate_mp_config(config)
@@ -78,6 +97,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 nonblocking=_nonblocking_lookup(extra),
                 max_pending=int(extra.get("lmcache.mp.max_pending_lookups", 8)),
                 nowait_grace=float(extra.get("lmcache.mp.lookup_nowait_grace", 0.02)),
+                starts_past_hbm_prefix=(
+                    self._hbm_prefix_is_admission_hit and _lookup_past_hbm_prefix(extra)
+                ),
             )
             self._mp_adapter = adapter
             self._scheduler_deadline_s = (

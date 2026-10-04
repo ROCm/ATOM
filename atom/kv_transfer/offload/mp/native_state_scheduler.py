@@ -65,6 +65,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     """
 
     _supports_early_block_release = True
+    # Admission also needs a READY state checkpoint at the boundary, which the
+    # HBM prefix match does not see: a lookup past it could skip tokens the
+    # admitted hit then lacks.
+    _hbm_prefix_is_admission_hit = False
 
     def __init__(self, config: Any) -> None:
         # The layout is known only after BlockManager builds the native pool.

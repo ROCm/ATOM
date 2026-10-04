@@ -25,11 +25,17 @@ starts the server with glibc's THP malloc and ``--l1-align-bytes 2097152``.
 LMCache aligns every L1 object to that value too, which puts each ~3 MB chunk
 in a 4 MiB slot and wastes a quarter of the L1, so this module keeps the base
 on 2 MiB and puts the objects back on 4 KiB (``keep_l1_objects_page_aligned``).
+
+A lookup reads its whole hit from the Store into L1 before it answers, and the
+part the GPU already holds is never loaded, so ATOM asks from past it and this
+module has the server prefetch from there (``prefetch_from_lookup_start``).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import functools
 import json
 import logging
 import runpy
@@ -130,6 +136,92 @@ def make_l1_huge_before_pinning(numa_node: int) -> None:
     lazy.LazyMemoryAllocator._pin_memory_chunk = _pin_memory_chunk
 
 
+def prefetch_from_lookup_start() -> None:
+    """Have a LOOKUP prefetch only the chunks from its key's start on.
+
+    LMCache's LOOKUP hashes the prompt from 0, prefetches every chunk of the
+    hit into L1 whatever ``key.start`` says, and answers a chunk count from 0.
+    ATOM's scheduler asks from past the prompt's HBM prefix
+    (``lmcache.mp.lookup_past_hbm_prefix``), which it never loads; with the
+    Store as L2, reading it anyway was a third to over half of each server's
+    Store reads (GLM-5.2 cpp4/dcp4: 44-67% of the prefetched tokens were ever
+    retrieved).
+
+    Here a key starting at chunk ``s`` prefetches chunks ``s`` on, and a hit of
+    ``found`` chunks there is answered as ``s + found``, ``found == 0``
+    included: the client reads the answer as a prefix length, and below ``s``
+    the prefix is on the GPU. Answering 0 would tell the scheduler the tier
+    lacks that prefix, and it would store it again; the GPU prefix being in the
+    tier is what the request's own prefill stored, and if it was evicted since,
+    the first lookup that starts below it finds that out. Releases are clamped
+    to the lookup's start: nothing below it was locked, and a release from 0
+    must not drop another request's lock on a shared chunk. A key starting at 0
+    behaves as before.
+    """
+    from lmcache.v1.multiprocess.modules import lookup as lookup_module
+
+    module = lookup_module.LookupModule
+    if getattr(module.query_prefetch_status, "_atom_from_lookup_start", False):
+        return
+    # One LookupModule per server, so one chunk size.
+    chunk_tokens: dict[str, int] = {}
+
+    init = module.__init__
+
+    @functools.wraps(init)
+    def __init__(self, ctx, *args, **kwargs):
+        init(self, ctx, *args, **kwargs)
+        chunk_tokens["size"] = int(ctx.chunk_size)
+
+    group_keys = lookup_module.ipc_key_to_grouped_object_keys
+
+    def keys_from_lookup_start(ipc_key, chunk_hashes, *args, **kwargs):
+        size = chunk_tokens.get("size")
+        if size and ipc_key.start > 0:
+            hashed = min(ipc_key.end, len(ipc_key.token_ids)) // size
+            # Only hashes counted from chunk 0; a LOOKUP that already starts
+            # at the key's start is left alone.
+            if len(chunk_hashes) == hashed:
+                chunk_hashes = chunk_hashes[ipc_key.start // size :]
+        return group_keys(ipc_key, chunk_hashes, *args, **kwargs)
+
+    query = module.query_prefetch_status
+
+    @functools.wraps(query)
+    def query_prefetch_status(self, request_id):
+        found = query(self, request_id)
+        if found is None:
+            return None
+        session = self._ctx.session_manager.get_or_create(request_id)
+        key = session.lookup_ipc_key
+        skip = 0 if key is None else key.start // self._ctx.chunk_size
+        if skip <= 0:
+            return found
+        # Release ranges are resolved against this count as a prefix length.
+        session.record_prefetch_result(skip + found, session.prefetch_locked_gids)
+        return skip + found
+
+    free = module.free_lookup_locks
+
+    @functools.wraps(free)
+    def free_lookup_locks(self, key, tp_size):
+        lookup_key = self._ctx.session_manager.get_or_create(
+            key.request_id
+        ).lookup_ipc_key
+        start = 0 if lookup_key is None else lookup_key.start
+        if key.start < start:
+            if key.end <= start:
+                return None
+            key = dataclasses.replace(key, start=start)
+        return free(self, key, tp_size)
+
+    query_prefetch_status._atom_from_lookup_start = True
+    module.__init__ = __init__
+    lookup_module.ipc_key_to_grouped_object_keys = keys_from_lookup_start
+    module.query_prefetch_status = query_prefetch_status
+    module.free_lookup_locks = free_lookup_locks
+
+
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     if "--" not in argv:
         raise SystemExit(
@@ -211,6 +303,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     keep_l1_objects_page_aligned()
     make_l1_huge_before_pinning(args.numa)
+    prefetch_from_lookup_start()
+    logger.info("LMCache MP server prefetches a LOOKUP from its key's start")
     # The server parses sys.argv itself; JSON with no spaces survives any
     # later whitespace split of the logged command line.
     sys.argv = [
