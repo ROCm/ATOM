@@ -815,6 +815,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # They are configured via --dspark-config (JSON dict) and carried in
     # config.dspark (see atom/config.py DSparkConfig). See
     # recipes/DSpark.md.
+    # Project this many decode tokens per running sequence when deciding whether
+    # another fresh prefill may enter the running queue. Nonpositive disables it.
+    "ATOM_RESERVE_DECODE_TOKENS": lambda: max(
+        0, _int_env_or_default("ATOM_RESERVE_DECODE_TOKENS", 0)
+    ),
     # --- PrefillDelayer (cross-DP prefill alignment) ---
     # Master switch; default on. Set "0" to disable construction.
     # The delayer is a prefill COALESCER: it holds back prefill admission under

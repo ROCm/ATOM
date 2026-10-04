@@ -20,6 +20,12 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
 
+## Scheduler admission
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_RESERVE_DECODE_TOKENS** | int | 0 | Reserve this many projected decode tokens per running sequence when admitting a fresh prefill. The value is rounded up to whole KV blocks; admission requires room for one reservation per sequence after adding the candidate. Already-committed partial prefills may resume. Unset, invalid, zero, or negative values disable the gate and preserve normal scheduling. |
+
 ## Prefill delayer (TP/DCP and DP attention)
 
 Coalesces waiting prefills while decode continues. DP attention enables it by
