@@ -923,6 +923,25 @@ class BlockManager:
             return 0
         return self._chained_prefix_hit(seq, [], True) * self.hash_block_size
 
+    def prefix_cached_through(self, seq: Sequence, tokens: int) -> bool:
+        """Is the hash block that ends at `tokens` still in the prefix cache?
+
+        A one-lookup stand-in for ``cached_prefix_tokens(seq) >= tokens``: a
+        cached prefix loses its tail first (`deallocate` frees a block table
+        back to front), so its last block decides. Reads the hash
+        `cached_prefix_tokens` left in the probe cache; without one, walks.
+        """
+        index = tokens // self.hash_block_size - 1
+        if index < 0 or not self.enable_prefix_caching:
+            return index < 0
+        seed, hashes = self._prefill_probe_hashes.get(seq, (None, []))
+        if seed != seq.cache_seed or index >= len(hashes):
+            return self.cached_prefix_tokens(seq) >= tokens
+        block_id = self.kv.lookup(hashes[index])
+        return block_id != -1 and (
+            self.kv.block(block_id).token_ids == self._hash_block_tokens(seq, index)
+        )
+
     def can_allocate(
         self,
         seq: Sequence,
