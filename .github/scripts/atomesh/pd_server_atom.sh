@@ -839,6 +839,16 @@ lmcache_mp_extra_config_json() {
     fi
     tuning=",\"lmcache.mp.max_pending_lookups\":${LMCACHE_MP_MAX_PENDING_LOOKUPS}"
   fi
+  # LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS: with a Store L2 a lookup starts at the
+  # prompt's HBM prefix; this many tokens below it leaves room for the prefix
+  # to shrink before admission (ATOM's lmcache.mp.lookup_hbm_margin_tokens).
+  if [[ -n "${LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS:-}" ]]; then
+    if [[ ! "${LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS}" =~ ^[0-9]+$ ]]; then
+      echo "[lmcache-mp][FAIL] LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS=${LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS} is not a non-negative integer" >&2
+      exit 2
+    fi
+    tuning+=",\"lmcache.mp.lookup_hbm_margin_tokens\":$(( 10#${LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS} ))"
+  fi
   if [[ -z "${lmcache_mp_plan_first_stage[0]}" ]]; then
     printf '{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":%s,"lmcache.mp.l2":"%s"%s}' \
       "${ATOMESH_LMCACHE_MP_PORT}" "${lmcache_mp_l2}" "${tuning}"

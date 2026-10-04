@@ -125,6 +125,25 @@ echo "JSON $(lmcache_mp_extra_config_json)"
         config = json.loads(lines[-1].removeprefix("JSON "))
         return [line.split("|") for line in lines[:-1]], config
 
+    def test_lookup_tuning_reaches_the_prefill_config(self):
+        _, config = self.plan(
+            LMCACHE_MP_STAGE_SERVERS="0:0-1:1000;1:2-3:1000",
+            HIP_VISIBLE_DEVICES="0,1,2,3",
+            LMCACHE_MP_MAX_PENDING_LOOKUPS="16",
+            LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS="016384",
+        )
+        self.assertEqual(config["lmcache.mp.max_pending_lookups"], 16)
+        self.assertEqual(config["lmcache.mp.lookup_hbm_margin_tokens"], 16384)
+
+    def test_lookup_margin_must_be_a_non_negative_integer(self):
+        self.run_shell(
+            "plan_lmcache_mp_servers; lmcache_mp_extra_config_json",
+            expect_rc=2,
+            LMCACHE_MP_STAGE_SERVERS="0:0-1:1000;1:2-3:1000",
+            HIP_VISIBLE_DEVICES="0,1,2,3",
+            LMCACHE_MP_LOOKUP_HBM_MARGIN_TOKENS="-1",
+        )
+
     def test_stage_spec_plans_one_server_per_numa_group(self):
         servers, config = self.plan(
             LMCACHE_MP_STAGE_SERVERS="0:0-1:1000;1:2-3:1000",
