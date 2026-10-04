@@ -44,8 +44,11 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 # Seconds a lookup answers "no answer" after the Store could not be reached,
-# before it tries again. Connecting blocks the scheduler thread (Mooncake's
-# setup holds the GIL), so a missing master must not cost that on every step.
+# before it tries again, or ten times as long as the failed connect blocked
+# (`_LOOKUP_BACKOFF_FACTOR`), whichever is longer. Connecting blocks the
+# scheduler thread (Mooncake's setup holds the GIL, and retries a master that
+# does not answer for minutes), so a missing master must not cost that on
+# every step.
 _RECONNECT_INTERVAL_S = 30.0
 # After a lookup the Store failed to answer, lookups answer "no answer" without
 # asking it for this long, or for this many times as long as the failed one
@@ -55,7 +58,7 @@ _LOOKUP_BACKOFF_S = 10.0
 _LOOKUP_BACKOFF_FACTOR = 10.0
 # Seconds between two warnings about failing lookups.
 _LOOKUP_WARNING_INTERVAL_S = 60.0
-# A hit older than this is confirmed with the Store before its load is
+# A hit older than this is looked up again right before its load is
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
@@ -265,12 +268,18 @@ class _StoreLookup:
         except Exception:
             for client in clients:
                 _close_quietly(client)
-            self._retry_connect_at = now + _RECONNECT_INTERVAL_S
+            # From when the failed setup returned, which can be minutes after
+            # it started: a pause counted from before it would already be over.
+            failed_at = time.monotonic()
+            pause = max(
+                _RECONNECT_INTERVAL_S, _LOOKUP_BACKOFF_FACTOR * (failed_at - now)
+            )
+            self._retry_connect_at = failed_at + pause
             logger.warning(
                 "Mooncake Store offload: the scheduler cannot reach the Store "
                 "(%s); lookups answer nothing for the next %.0fs",
                 ", ".join(pool.master for pool in self._masters),
-                _RECONNECT_INTERVAL_S,
+                pause,
                 exc_info=True,
             )
             return None
@@ -358,21 +367,39 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         return super()._fresh_tier_lookup(seq, sid)
 
     def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
-        """Confirm a hit with the Store before its load, unless it is fresh.
+        """Renew a hit's read leases before its load, which always goes ahead.
 
         The base trusts a hit it still holds from this request's lookup, a
         live pin for LMCache. A Store lookup holds its chunks only for its
-        read lease, which a request waiting for KV blocks outlives. Forgetting
-        a hit older than ``_LOOKUP_REUSE_S`` makes the base ask again: that
-        renews the lease right before the get, and a prefix evicted meanwhile
-        drops the load before anything is read.
+        read lease, which a request waiting for KV blocks outlives, so a hit
+        older than ``_LOOKUP_REUSE_S``, or one answered from the memo, is
+        looked up again: that renews the lease right before the get.
+
+        The answer does not decide the load. The engine parked the request
+        when it admitted it, before this dispatch, and only the load's report
+        wakes it: a load dropped here would leave it parked for good, holding
+        its KV blocks and a ``max_num_seqs`` slot. A prefix evicted meanwhile
+        fails the worker's all-or-nothing get instead, and the request prefills
+        once that failure reports (``load_failed``).
         """
         looked_up_at = self._looked_up_at.get(sid)
-        if looked_up_at is None or time.monotonic() - looked_up_at > _LOOKUP_REUSE_S:
-            pending = self._lookup_results.get(sid)
-            if pending is not None and pending[0] is seq:
-                del self._lookup_results[sid]
-        return super()._ensure_lookup_pin(seq, sid, spec)
+        pending = self._lookup_results.get(sid)
+        if (
+            pending is None
+            or pending[0] is not seq
+            or looked_up_at is None
+            or time.monotonic() - looked_up_at > _LOOKUP_REUSE_S
+        ):
+            hit = self._fresh_tier_lookup(seq, sid)
+            if hit is None or hit < int(spec.lmcache_cached_tokens):
+                logger.debug(
+                    "[OFFLOAD-LOOKUP] seq=%s the Store now answers %s for a load "
+                    "of %d tokens; dispatched anyway, a missing chunk fails it",
+                    seq.id,
+                    hit,
+                    int(spec.lmcache_cached_tokens),
+                )
+        return True
 
     def _clear_pending_load(self, sid: str) -> None:
         super()._clear_pending_load(sid)
@@ -398,7 +425,8 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         """Save chunks ``[saved, aligned)``: the digests of ``[0, aligned)``.
 
         No token ids: every PP stage receives each request, and the digests
-        are all the worker needs to name its objects.
+        are all the worker needs to name its objects. The dispatch time starts
+        the workers' source read deadline where the reclaim clock starts.
         """
         hashes = prompt_chunk_hashes(seq, self.chunk_size)
         return LMCacheReqMeta(
@@ -409,6 +437,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             is_last_prefill=is_last_prefill,
             save_operation=operation,
             chunk_hashes=hashes[: (aligned // self.chunk_size) * DIGEST_BYTES],
+            dispatched_at=time.time(),
         )
 
     def _build_load_request(
@@ -431,15 +460,15 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
 
     def _new_load_operation(self, seq: Any) -> LoadOperationId:
         operation = super()._new_load_operation(seq)
-        if self._store_cfg.publish_loaded_prefix:
-            # The worker restores KV straight into allocated blocks, which never
-            # pass through `hash_blocks()`. Naming where the load starts lets
-            # `Scheduler._mark_offload_load_ready` publish the loaded prefix
-            # into the HBM prefix index once the load succeeds, so a later turn
-            # hits it in HBM instead of loading it again. Loads are dispatched
-            # only from a chunk-aligned post-allocate HBM frontier, which is
-            # always a hash-block boundary.
-            seq.offload_load_start_tokens = int(seq.num_cached_tokens)
+        # The worker restores KV straight into allocated blocks, which never
+        # pass through `hash_blocks()`. Naming where the load starts lets
+        # `Scheduler._mark_offload_load_ready` publish the loaded prefix into
+        # the HBM prefix index once the load succeeds, so a later turn hits it
+        # in HBM instead of loading it again; without it the suffix prefill
+        # finds its parent block unhashed and cannot register its own blocks
+        # either. Loads are dispatched only from a chunk-aligned post-allocate
+        # HBM frontier, which is always a hash-block boundary.
+        seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
 
     def save_abandon_timeout_s(self) -> float:

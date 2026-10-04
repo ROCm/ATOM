@@ -368,8 +368,11 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
 - `namespace` = `atomkv1-` + blake2b of the offload page namespace (model,
   dtypes, block/chunk size, world, HF geometry, speculative config) plus what a
   Store that outlives the server also needs: every PP stage's layer span
-  (`VLLM_PP_LAYER_PARTITION` included), the online quantization, and the codec
-  version. Scheduler and workers derive it from the same `Config`.
+  (`VLLM_PP_LAYER_PARTITION` included), the online quantization, the KV byte
+  layout the environment selects (`ATOM_MLA_PAGE_SIZE`, `ATOM_USE_TRITON_MLA`,
+  `ATOM_USE_TRITON_MLA_SHUFFLE_KV`, `ATOM_USE_UNIFIED_ATTN`: same block size,
+  bytes arranged differently), and the codec version. Scheduler and workers
+  derive it from the same `Config` and environment.
 - `digest` is a 16-byte prefix chain over the prompt's full chunks:
   `h_i = blake2b(h_{i-1} || int32-LE tokens of chunk i, person="atom-kv-chain-v1")`
   from 16 zero bytes (a multimodal prompt starts from its media's
@@ -392,12 +395,15 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   and only the lease keeps it from eviction. A request that waits for KV
   blocks after its lookup outlives it, so a hit more than a second old is
   looked up again when its load is dispatched (`_ensure_lookup_pin`): that
-  renews the lease right before the get, and a prefix evicted meanwhile drops
-  the load before anything is read. Workers have nothing to unpin. A miss at
-  get time fails the load and the request recomputes, once.
+  renews the lease right before the get. The load goes ahead whatever that
+  lookup answers -- the engine parked the request when it admitted it, and
+  only the load's report wakes it -- so a prefix evicted meanwhile fails the
+  get like any other miss. Workers have nothing to unpin. A miss at get time
+  fails the load and the request recomputes, once.
 - After a load succeeds, the scheduler publishes the loaded prefix into the HBM
   prefix index (`offload_load_start_tokens`), so a later turn finds it in HBM
-  instead of loading it again (`publish_loaded_prefix`).
+  instead of loading it again, and the suffix the request computes chains its
+  own block hashes onto it.
 
 ### Completion protocol and failure handling
 
@@ -422,7 +428,9 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   once as an error) until a held slot returns.
 - The engine reclaims a save's source blocks `save_abandon_timeout_s` after
   dispatch. A worker therefore stops starting GPU reads for a save that is
-  still queued `timeout - min(60 s, timeout / 5)` after it received it: it would
+  still queued `timeout - min(60 s, timeout / 5)` after the scheduler
+  dispatched it (the request carries the dispatch time; a downstream PP stage
+  receives a save only after the forwards queued ahead of it): it would
   otherwise pack another request's KV into this prompt's keys.
 - A put of a key that already exists succeeds (Mooncake reports 0).
 - At startup every worker sends one chunk of random bytes through the Store and
@@ -453,7 +461,6 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.save_pool_mib` | 256 | Save region per worker, MiB. |
 | `mooncake_store.lookup_batch_keys` | 8192 | Most keys per `batch_is_exist`. |
 | `mooncake_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source; must be > 0. |
-| `mooncake_store.publish_loaded_prefix` | true | Index a loaded prefix in the HBM prefix cache. |
 | `mooncake_store.startup_probe` | true | One-chunk round trip per worker at startup. |
 | `mooncake_store.direct_copy` | true | With the pool on the GPU, pack and unpack each window in place in its slots (one kernel per window) instead of through the block GPU connector's staging buffer. |
 | `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way). |
@@ -511,7 +518,8 @@ it starts anything.
   registration into 1 GiB regions.
 - **Store contents outlive the server.** The namespace covers the layout, not
   the weights' revision: restart the Store (or `remove_all`) after changing
-  weights under the same model path.
+  weights under the same model path, or any other setting that rearranges the
+  KV bytes without being named above.
 - **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with Mooncake result codes in `errors=`.
