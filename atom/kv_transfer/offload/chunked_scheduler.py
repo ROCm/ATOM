@@ -213,12 +213,45 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         probe = getattr(self._block_manager, "cached_prefix_tokens", None)
         if probe is None:
             return 0
-        return self._chunk_floor(min(int(probe(seq)), int(seq.num_prompt_tokens)))
+        # Asking from somewhat below the HBM prefix leaves room for it to
+        # shrink -- its tail is evicted first -- before the request is admitted.
+        margin = int(getattr(self._lookup_client, "hbm_prefix_margin", 0))
+        prefix = min(int(probe(seq)), int(seq.num_prompt_tokens))
+        return self._chunk_floor(max(0, prefix - margin))
 
     def _tier_lookup_start_of(self, sid: str) -> int:
         """The start of the live lookup behind this request's load, or 0."""
         lookup_start = getattr(self._lookup_client, "lookup_start", None)
         return 0 if lookup_start is None else int(lookup_start(sid))
+
+    # How far the HBM prefix shrank below a lookup's start before admission,
+    # in tokens: < 4K, < 16K, < 64K, more.
+    _SHRINK_BUCKETS = (4096, 16384, 65536)
+
+    def _record_hbm_shrink(self, tokens: int) -> None:
+        shrink = self.__dict__.setdefault(
+            "_hbm_shrinks", [0] * (len(self._SHRINK_BUCKETS) + 1)
+        )
+        bucket = sum(1 for edge in self._SHRINK_BUCKETS if tokens >= edge)
+        shrink[bucket] += 1
+
+    def _log_load_decisions(self) -> None:
+        """Every minute: loads, and the tier hits left to the prefill and why."""
+        now = time.monotonic()
+        if now - self.__dict__.get("_load_decisions_logged_at", 0.0) < 60.0:
+            return
+        self._load_decisions_logged_at = now
+        skips = self.__dict__.get("_load_skips", {})
+        logger.info(
+            "[OFFLOAD-LOAD-STATS] loads=%d loaded_tokens=%d skipped(count,tier "
+            "tokens)=%s hbm_shrink_below_start(<4K,<16K,<64K,more)=%s "
+            "hits_below_lookup_start=%s",
+            getattr(self, "total_load_requests", 0),
+            getattr(self, "total_loaded_tokens", 0),
+            {reason: skips[reason] for reason in sorted(skips)},
+            self.__dict__.get("_hbm_shrinks"),
+            self.__dict__.get("_hits_below_lookup_start"),
+        )
 
     def install_hit_cap_hook(self, hook) -> None:
         """Let a hybrid connector shorten every hit this scheduler reports.
@@ -309,6 +342,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         else:
             hit = int(hit)
             self._lookup_results[sid] = (seq, hit)
+            if start:
+                below = self.__dict__.setdefault("_hits_below_lookup_start", [0, 0])
+                if hit < start:
+                    below[0] += 1
+                    below[1] += start - hit
         self._remember_tier_hit(seq, sid, hit)
         if logger.isEnabledFor(logging.DEBUG):
             _lh = None
@@ -439,9 +477,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         need = lmc - hbm
         if lmc <= hbm:
             return False, "hbm_satisfies_after_alloc", hbm, lmc, need, chunk
-        if hbm < self._tier_lookup_start_of(str(seq.id)):
+        lookup_start = self._tier_lookup_start_of(str(seq.id))
+        if hbm < lookup_start:
             # The lookup started past the HBM prefix of its time, which has
             # since shrunk: the tier was not asked for the tokens in between.
+            self._record_hbm_shrink(lookup_start - hbm)
             return False, "hbm_below_lookup_start", hbm, lmc, need, chunk
         if hbm % chunk != 0:
             return False, "unaligned_hbm_prefill", hbm, lmc, need, chunk
@@ -552,6 +592,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         meta = LMCacheOffloadMetadata()
+        self._log_load_decisions()
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))

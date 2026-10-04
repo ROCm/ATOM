@@ -1133,6 +1133,10 @@ class OffloadSchedulerMixin(ABC):
     ) -> None:
         seq.offload_loaded_tokens = hbm
         min_load = int(getattr(self, "_min_load_tokens", 8192))
+        # Tier tokens left to the prefill, by reason (`_log_load_decisions`).
+        skips = self.__dict__.setdefault("_load_skips", {})
+        count, tokens = skips.get(reason, (0, 0))
+        skips[reason] = (count + 1, tokens + max(0, int(lmc) - int(hbm)))
         logger.debug(
             "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
             "need=%d min_load=%d chunk=%d reason=%s",

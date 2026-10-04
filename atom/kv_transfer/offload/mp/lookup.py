@@ -61,6 +61,7 @@ class _MPLookupClient:
         max_pending: int = 8,
         nowait_grace: float = 0.02,
         starts_past_hbm_prefix: bool = False,
+        hbm_prefix_margin: int = 0,
     ) -> None:
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("LMCache MP lookup timeout and poll interval must be > 0")
@@ -75,6 +76,8 @@ class _MPLookupClient:
         self._poll_interval = poll_interval
         self.nonblocking = bool(nonblocking)
         self.starts_past_hbm_prefix = bool(starts_past_hbm_prefix)
+        # Tokens below the HBM prefix a lookup still covers.
+        self.hbm_prefix_margin = max(0, int(hbm_prefix_margin))
         self._max_pending = int(max_pending)
         self._nowait_grace = float(nowait_grace)
         self._lookups: dict[str, _LookupState] = {}
@@ -86,7 +89,11 @@ class _MPLookupClient:
                 self._nowait_grace * 1000,
             )
         if self.starts_past_hbm_prefix:
-            logger.info("LMCache MP lookups start past each prompt's HBM prefix")
+            logger.info(
+                "LMCache MP lookups start past each prompt's HBM prefix, less "
+                "%d tokens",
+                self.hbm_prefix_margin,
+            )
 
     def _submit(
         self, token_ids: list[int], lookup_id: str, start: int = 0

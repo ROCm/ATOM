@@ -100,6 +100,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 starts_past_hbm_prefix=(
                     self._hbm_prefix_is_admission_hit and _lookup_past_hbm_prefix(extra)
                 ),
+                hbm_prefix_margin=int(
+                    extra.get("lmcache.mp.lookup_hbm_margin_tokens", 0)
+                ),
             )
             self._mp_adapter = adapter
             self._scheduler_deadline_s = (

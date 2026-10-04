@@ -1094,6 +1094,25 @@ def test_mp_lookup_asks_from_zero_when_it_may_not_skip_or_nothing_is_cached(
     assert lookup.lookup_start("9") == 0
 
 
+def test_mp_lookup_margin_asks_from_below_the_hbm_prefix(monkeypatch):
+    # The tail of an HBM prefix is evicted first; a margin keeps a request
+    # whose prefix shrank a little before admission loadable.
+    scheduler, lookup, seq = _past_hbm_scheduler(monkeypatch, hbm_prefix=13)
+    lookup.hbm_prefix_margin = 4
+
+    assert scheduler._fresh_tier_lookup(seq, "9") == 12
+    assert lookup._adapter.starts == [8]
+
+
+def test_hbm_shrinks_below_the_lookup_start_are_bucketed(monkeypatch):
+    scheduler, _lookup, _seq = _past_hbm_scheduler(monkeypatch, hbm_prefix=8)
+
+    for tokens in (256, 4096, 20000, 100000, 1):
+        scheduler._record_hbm_shrink(tokens)
+
+    assert scheduler._hbm_shrinks == [2, 1, 1, 1]
+
+
 def test_load_below_the_lookup_start_is_refused(monkeypatch):
     # The lookup started at 8; if the HBM prefix shrinks to 4 before the load
     # is dispatched, nothing ever asked the tier for tokens 4..8.
