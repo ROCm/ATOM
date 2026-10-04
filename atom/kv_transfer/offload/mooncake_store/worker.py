@@ -333,12 +333,20 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
         if isinstance(metadata, LMCacheOffloadMetadata):
-            # The source read deadline of a save counts from here, not from
-            # whenever a save thread gets to it; see `_source_read_deadline`.
+            # The source read deadline of a save counts from its dispatch, not
+            # from whenever a save thread gets to it; see
+            # `_source_read_deadline`. Placed on this worker's monotonic clock
+            # here, once: the wall clock is read only to learn how long ago the
+            # scheduler dispatched it.
             received_at = time.monotonic()
+            received_wall = time.time()
             for req in metadata.requests:
-                if req.save_spec is not None:
-                    req._mooncake_store_received_at = received_at
+                if req.save_spec is None:
+                    continue
+                in_transit = 0.0
+                if req.dispatched_at is not None:
+                    in_transit = max(0.0, received_wall - float(req.dispatched_at))
+                req._mooncake_store_dispatched_at = received_at - in_transit
         super().start_load_kv(metadata)
 
     def _source_read_deadline(self, req: LMCacheReqMeta) -> float | None:
@@ -348,14 +356,17 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         ``save_abandon_timeout_s``, counted from its dispatch, and hands the
         blocks to other requests. A save still queued then would pack their
         bytes under this prompt's keys -- a poisoned cache entry. Saves that
-        reach a window past the deadline stop instead: the margin covers the
-        hop from dispatch to this worker, and the copy in flight finishes
-        within milliseconds.
+        reach a window past the deadline stop instead. The window counts from
+        the dispatch too, not from when this worker received the save: a
+        downstream PP stage receives it only after the forwards queued ahead
+        of it, seconds later. The margin covers the copy in flight, which
+        finishes within milliseconds. A save without a dispatch time counts
+        from its receipt.
         """
-        received_at = getattr(req, "_mooncake_store_received_at", None)
-        if received_at is None:
+        dispatched_at = getattr(req, "_mooncake_store_dispatched_at", None)
+        if dispatched_at is None:
             return None
-        return float(received_at) + self._source_read_window_s
+        return float(dispatched_at) + self._source_read_window_s
 
     # -- copy daemon threads ---------------------------------------------
     def _lookup_unpin(self, req_id) -> None:

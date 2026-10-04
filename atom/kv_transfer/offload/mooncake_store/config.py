@@ -42,7 +42,6 @@ _FIELDS = (
     "save_pool_mib",
     "lookup_batch_keys",
     "save_abandon_timeout_s",
-    "publish_loaded_prefix",
     "startup_probe",
     "direct_copy",
 )
@@ -73,8 +72,6 @@ class MooncakeStoreOffloadConfig:
     # Most keys one `batch_is_exist` call carries.
     lookup_batch_keys: int
     save_abandon_timeout_s: float
-    # Name the loaded prefix so the engine indexes it in the HBM prefix cache.
-    publish_loaded_prefix: bool
     # One-chunk Store round trip at worker startup.
     startup_probe: bool
     # Pack and unpack a window in place in the GPU pool, without the staging
@@ -188,10 +185,6 @@ def parse_mooncake_store_config(
         save_abandon_timeout_s=_positive_seconds(
             "mooncake_store.save_abandon_timeout_s",
             values.get("save_abandon_timeout_s", 300.0),
-        ),
-        publish_loaded_prefix=_flag(
-            "mooncake_store.publish_loaded_prefix",
-            values.get("publish_loaded_prefix", True),
         ),
         startup_probe=_flag(
             "mooncake_store.startup_probe", values.get("startup_probe", True)

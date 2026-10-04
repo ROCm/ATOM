@@ -709,11 +709,77 @@ stop_mooncake_store
         result = self.run_shell(
             "start_mooncake_store_decode_owners\n",
             expect_rc=1,
-            **self.decode_node(ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="4"),
+            **self.decode_node(
+                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="4",
+                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="1",
+            ),
         )
-        self.assertIn("prefill-node masters not ready after 4s", result.stderr)
+        # The wait, plus the prefill node's compaction of its one owner node.
+        self.assertIn("prefill-node masters not ready after 5s", result.stderr)
         self.assertEqual(self.store_calls("mooncake_client"), [])
         # The page cache dropper is stopped with the rest.
+        for pid in self.stub_pids():
+            self.assertFalse(self.alive(pid), pid)
+
+    def test_the_compaction_budget_counts_each_pinned_numa_node(self):
+        result = self.run_shell(
+            """
+echo "PREFILL $(mooncake_store_compaction_budget MOONCAKE_STORE_OWNERS host_pools)"
+echo "DECODE $(mooncake_store_compaction_budget MOONCAKE_STORE_DECODE_OWNERS)"
+""",
+            MOONCAKE_STORE_OWNERS="0:8;1:8;1:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="600.5",
+            MOONCAKE_STORE_HOST_POOL_GIB="1.5",
+        )
+        # Two owner nodes and one for the GPUs' host pools, 600.5 s each.
+        self.assertIn("PREFILL 1802\n", result.stdout)
+        self.assertIn("DECODE 601\n", result.stdout)
+
+    def test_decode_owners_allow_for_the_prefill_nodes_compaction(self):
+        # The prefill node starts its masters only once it has compacted its
+        # one owner node, which this node's wait did not wait for: here they
+        # answer 4 s into a 2 s wait, inside its 10 s compaction budget.
+        (self.root / "segments").write_text(f"{self.master_port} {8 * GIB}\n")
+        self.run_shell(
+            f"""
+(
+  until grep -q -- ' --every ' "${{STUB_CALLS}}"; do sleep 0.2; done
+  sleep 4
+  exec setsid python3 /scripts/numa_exec.py 0 mooncake_master \
+    --rpc_port={self.master_port}
+) >/dev/null 2>&1 &
+start_mooncake_store_decode_owners
+stop_mooncake_store
+""",
+            **self.decode_node(
+                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="2",
+                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="10",
+            ),
+        )
+        self.assertEqual(len(self.store_calls("mooncake_client")), 2)
+
+    def test_the_prefill_node_allows_for_the_decode_nodes_compaction(self):
+        # The decode node mounts its owners only once it has compacted its
+        # memory: here 5 s into a 2 s wait, inside its 10 s compaction budget.
+        self.run_shell(
+            f"""
+(
+  until [[ "$(wc -l < "${{STUB_DIR}}/segments" 2>/dev/null)" -ge 2 ]]; do
+    sleep 0.2
+  done
+  sleep 5
+  echo "{self.master_port} {8 * GIB}" >> "${{STUB_DIR}}/segments"
+) >/dev/null 2>&1 &
+start_mooncake_store
+stop_mooncake_store
+""",
+            MOONCAKE_STORE_OWNERS="0:8;1:8",
+            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
+            MOONCAKE_STORE_WAIT_TIMEOUT="2",
+            MOONCAKE_STORE_COMPACT_TIMEOUT="10",
+        )
+        self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
@@ -752,8 +818,46 @@ stop_mooncake_store
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
+    def test_several_prefill_workers_on_a_node_are_refused_before_anything_starts(
+        self,
+    ):
+        # The Store's memory plan and compaction cover one prefill worker's
+        # GPUs. A second worker in the same shell found it only once the first
+        # was up, and its refusal then stopped the Store under the first.
+        for script, env, workers in (
+            ("", {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "2"}, 2),
+            (
+                "prefill_nodes=(0 0)\n",
+                {"ATOMESH_PD_WORKER_LAYOUT": "packed_nodes", "xP": "2"},
+                2,
+            ),
+            (
+                "prefill_nodes=(0 1 1)\n",
+                {"ATOMESH_PD_WORKER_LAYOUT": "packed_nodes", "xP": "3"},
+                2,
+            ),
+        ):
+            with self.subTest(env=env, script=script):
+                result = self.run_shell(
+                    script + "validate_mooncake_store_settings\n", expect_rc=2, **env
+                )
+                self.assertIn(
+                    f"{env['ATOMESH_PD_WORKER_LAYOUT']} starts {workers} prefill "
+                    "workers on one node",
+                    result.stderr,
+                )
+        self.assertEqual(self.calls.read_text(), "")
+        for script, env in (
+            ("", {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "1"}),
+            ("prefill_nodes=(0 1)\n", {"ATOMESH_PD_WORKER_LAYOUT": "packed_nodes"}),
+            ("", {"ATOMESH_PD_WORKER_LAYOUT": "multi_node", "xP": "2"}),
+        ):
+            with self.subTest(env=env, script=script):
+                self.run_shell(script + "check_mooncake_store_settings\n", **env)
+
     def test_a_prefill_worker_on_other_gpus_is_refused(self):
-        # The Store's memory plan covered the first worker's GPUs only.
+        # The Store's memory plan covered the first worker's GPUs only; the
+        # settings check refuses the layouts that would get here first.
         result = self.run_shell(
             """
 start_mooncake_store
