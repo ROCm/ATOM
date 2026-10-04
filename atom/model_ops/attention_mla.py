@@ -2515,8 +2515,8 @@ class MLAAttention(nn.Module):
             # derives tokens-per-seq from q rows // len(seqused_k), so a padded
             # seqused_k makes it 0 and mis-sizes the split-KV workspace (tens of
             # GiB). Off the graph path, cut the per-sequence arrays back to the
-            # real batch, as the paged decode path above does. Capture
-            # (forward_mode None) and replay keep the padded width.
+            # real batch. Capture (forward_mode None) and replay keep the
+            # padded width.
             cu_seqlens_q = attn_metadata.cu_seqlens_q
             seqused_k = attn_metadata.context_lens
             block_tables = attn_metadata.block_tables
