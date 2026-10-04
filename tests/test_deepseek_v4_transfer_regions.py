@@ -162,6 +162,7 @@ def _stub_v4_runtime_imports():
         "hca_compress_paged_offsets",
         "plan_context_lens",
         "v4_decode_split_plan",
+        "v4_uniform_split_table",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):

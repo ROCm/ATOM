@@ -123,6 +123,7 @@ from atom.model_ops.v4_kernels import (
     hca_persist,
     plan_context_lens,
     v4_decode_split_plan,
+    v4_uniform_split_table,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
@@ -306,8 +307,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     split_plan_csa: tuple[int, torch.Tensor] | None = None
     """Same for CSA layers."""
     split_plan_hca: tuple[int, torch.Tensor] | None = None
-    """Same for HCA layers; also None when the persistent kernel
-    (`hca_persist`) takes this forward's HCA decode."""
+    """Same for HCA layers (unused by calls the persistent kernel takes)."""
     envelope_rows: int = 0
     """Rows one V4 block takes across every layer of the pool — the stride from
     one block's compressed rows to the next in a layer's view of a plane. What
@@ -447,10 +447,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     kv_block_size (= the CSA row count) to be 64 for N_PHYS=1. Must equal
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
-
-    # Set at init by `_prepare_hca_persist`: HCA decode can take aiter's
-    # persistent kernel (workspace allocated before any capture).
-    _hca_persist: bool = False
 
     capture_owns_cu_seqlens_q = True
     block_size = 256
@@ -731,7 +727,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             model_runner.config.hf_config.num_attention_heads
             // get_tensor_model_parallel_world_size()
         )
-        self._hca_persist = self._prepare_hca_persist()
+        self._prepare_hca_persist()
 
         # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
         # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
@@ -2611,7 +2607,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indices_swa = swa_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr
         attn_metadata.split_plan_swa = self._decode_split_plan(
-            running_bs, self.window_size, var["v4_draft_split_indptr"]
+            running_bs, self.window_size
         )
         attn_metadata.batch_id_per_q_token = batch_id_per_q_token
 
@@ -3683,36 +3679,30 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
-    def _prepare_hca_persist(self) -> bool:
+    def _prepare_hca_persist(self) -> None:
         """Allocate the persistent HCA decode workspace here, at init: before
         warmup, before KV sizing (so it is accounted for) and before any
-        CUDA-graph capture, which may be the first forward to reach it.
-
-        True when HCA decode can take the persistent kernel. Fixed for the
-        builder's lifetime, so capture and every replay see the same answer.
-        """
-        if not envs.ATOM_V4_HCA_PERSIST or not self.hca_layers:
-            return False
-        return hca_persist.prepare_if_usable(
-            kv_fp8=self._kv_fp8,
-            heads=self._local_heads,
-            gfx=get_gfx(),
-            device=self.device,
-        )
+        CUDA-graph capture, which may be the first forward to reach it."""
+        if envs.ATOM_V4_HCA_PERSIST and self.hca_layers:
+            hca_persist.prepare_if_usable(
+                kv_fp8=self._kv_fp8,
+                heads=self._local_heads,
+                gfx=get_gfx(),
+                device=self.device,
+            )
 
     def _decode_split_plan(
-        self, rows: int, kv_len: int, split_indptr: torch.Tensor
+        self, rows: int, kv_len: int
     ) -> tuple[int, torch.Tensor] | None:
         """Split plan for the fp8 decode ASM kernel (see `v4_decode_split_plan`).
 
-        `rows` and `kv_len` are fixed for a captured graph, so capture and every
-        replay agree. `split_indptr` is a persistent buffer the graph reads;
-        graphs of different sizes share it, so every forward rebuilds its plan
-        (one in-place launch, no host sync) before running.
+        Host only: `rows` and `kv_len` are fixed for a captured graph, so capture
+        and every replay pick the same split count, and the plan's
+        `split_indptr` is a slice of the constant `_split_table`.
         """
         if not self._kv_fp8:
             return None
-        return v4_decode_split_plan(rows, self._local_heads, kv_len, split_indptr)
+        return v4_decode_split_plan(rows, self._local_heads, kv_len, self._split_table)
 
     def _attach_v4_paged_decode_meta(
         self,
@@ -3838,23 +3828,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         # aiter decode split plans: sized by the rows this forward runs and the
         # longest kv_len a token of each layer type can see.
-        attn_metadata.split_plan_swa = self._decode_split_plan(
-            T_pad, win, var[f"{buf_prefix_ubatch}v4_split_indptr_swa"]
+        attn_metadata.split_plan_swa = self._decode_split_plan(T_pad, win)
+        attn_metadata.split_plan_csa = self._decode_split_plan(T_pad, win + index_topk)
+        attn_metadata.split_plan_hca = self._decode_split_plan(
+            T_pad, win + self.max_committed_hca
         )
-        attn_metadata.split_plan_csa = self._decode_split_plan(
-            T_pad, win + index_topk, var[f"{buf_prefix_ubatch}v4_split_indptr_csa"]
-        )
-        # HCA calls the persistent kernel takes plan their split on the GPU from
-        # the real kv_indptr; a call it then declines (non-dense pool, eager
-        # N below the row gate) gets aiter's own split pick.
-        if self._hca_persist and hca_persist.rows_ok(T_pad):
-            attn_metadata.split_plan_hca = None
-        else:
-            attn_metadata.split_plan_hca = self._decode_split_plan(
-                T_pad,
-                win + self.max_committed_hca,
-                var[f"{buf_prefix_ubatch}v4_split_indptr_hca"],
-            )
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
         # kernels can run once with shape `[decode_rows, 1, ...]`. Source and
@@ -4678,10 +4656,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = torch.zeros(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
-        # Written in place by `_decode_split_plan` before each decode forward.
-        bufs["v4_split_indptr_swa"] = torch.zeros(T_dec + 1, **i32)
-        bufs["v4_split_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
-        bufs["v4_split_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
+        # Every decode split plan (verify, MTP draft, TBO ubatches) is a slice
+        # of this constant table; read-only, so all of them share it.
+        self._split_table = v4_uniform_split_table(T_dec, self.device)
         bufs["v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
         # Device-only, and as wide as the `block_tables` it gathers from: a host
         # mirror would be `T_dec * cols * 4` of pinned memory nothing writes.
@@ -4709,7 +4686,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # the per-fwd cost is a slice + H2D.
         bufs["v4_qo_indptr"] = CpuGpuBuffer(T_dec + 1, publication_group="v4_qo", **i32)
         bufs["v4_draft_qo_indptr"] = torch.arange(T_dec + 1, **i32)
-        bufs["v4_draft_split_indptr"] = torch.zeros(T_dec + 1, **i32)
         self._v4_qo_indptr_np = np.arange(T_dec + 1, dtype=np.int32)
         # Immutable, device-only empty CSR for reusing the H=128 sparse-prefill
         # ASM kernel in decode. Shared read-only across layers and TBO ubatches.
@@ -4882,9 +4858,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_swa"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
-            bufs[f"{p}v4_split_indptr_swa"] = torch.zeros(T_dec + 1, **i32)
-            bufs[f"{p}v4_split_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
-            bufs[f"{p}v4_split_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
             if not self._indexer_fp4:
                 bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(

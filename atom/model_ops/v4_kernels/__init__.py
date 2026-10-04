@@ -35,6 +35,7 @@ from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,
     v4_decode_split_plan,
+    v4_uniform_split_table,
 )
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     build_v4_paged_decode_indptr,
@@ -91,6 +92,7 @@ __all__ = [
     "swa_write_2buff_prepacked",
     "update_compressor_states",
     "v4_decode_split_plan",
+    "v4_uniform_split_table",
     "write_v4_paged_decode_indices",
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",

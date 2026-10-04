@@ -122,7 +122,7 @@ def _run(inp, *, n=None, t_pad=None):
     kv_indptr = inp["kv_indptr"][: t_pad + 1]
     kv_len = int((kv_indptr[1:] - kv_indptr[:-1]).max())
     plan = paged_decode.v4_decode_split_plan(
-        t_pad, H, kv_len, torch.zeros(MAX_ROWS_BUF + 1, dtype=torch.int32, device=DEV)
+        t_pad, H, kv_len, paged_decode.v4_uniform_split_table(MAX_ROWS_BUF, DEV)
     )
     return paged_decode.sparse_attn_v4_paged_decode(
         None,
@@ -280,7 +280,7 @@ def test_capture_without_workspace_stays_on_asm(mode, monkeypatch):
         t_pad,
         H,
         int((inp["kv_indptr"][1:] - inp["kv_indptr"][:-1]).max()),
-        torch.zeros(MAX_ROWS_BUF + 1, dtype=torch.int32, device=DEV),
+        paged_decode.v4_uniform_split_table(MAX_ROWS_BUF, DEV),
     )
     before = hca_persist.stats["persist"]
     torch.cuda.synchronize()

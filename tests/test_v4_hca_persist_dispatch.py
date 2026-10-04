@@ -323,39 +323,3 @@ def test_builder_does_nothing_when_off(monkeypatch):
     deepseek_v4_attn.DeepseekV4AttentionMetadataBuilder._prepare_hca_persist(
         SimpleNamespace()
     )
-
-
-def test_builder_reports_whether_hca_takes_the_kernel(monkeypatch):
-    from atom.model_ops.attentions import deepseek_v4_attn
-
-    monkeypatch.setenv("ATOM_V4_HCA_PERSIST", "1")
-    monkeypatch.setattr(deepseek_v4_attn, "get_gfx", lambda: "gfx950")
-    monkeypatch.setattr(hca_persist, "prepare_if_usable", lambda **kw: True)
-    builder = SimpleNamespace(
-        _kv_fp8=True, hca_layers=[2], _local_heads=128, device="cuda:0"
-    )
-    prepare = deepseek_v4_attn.DeepseekV4AttentionMetadataBuilder._prepare_hca_persist
-    assert prepare(builder) is True
-    builder.hca_layers = []
-    assert prepare(builder) is False
-
-
-@pytest.mark.parametrize(
-    "rows,ok", [(14, False), (15, True), (32768, True), (32769, False)]
-)
-def test_rows_gate_shared_by_builder_and_dispatch(monkeypatch, rows, ok):
-    """The builder skips the HCA split plan exactly for the rows dispatch sends
-    to the persistent kernel."""
-    monkeypatch.setenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
-    assert hca_persist.rows_ok(rows) is ok
-
-
-def test_builder_skips_hca_plan_only_for_persistent_rows():
-    import inspect
-
-    from atom.model_ops.attentions import deepseek_v4_attn
-
-    src = inspect.getsource(
-        deepseek_v4_attn.DeepseekV4AttentionMetadataBuilder._attach_v4_paged_decode_meta
-    )
-    assert "self._hca_persist and hca_persist.rows_ok(T_pad)" in src

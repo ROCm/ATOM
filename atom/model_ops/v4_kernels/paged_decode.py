@@ -986,24 +986,44 @@ def _sparse_attn_v4_paged_decode_prefill_asm(
     )
 
 
+# aiter never picks more than 16 KV splits for the v4 nm decode kernel.
+V4_DECODE_MAX_SPLITS = 16
+
+
+def v4_uniform_split_table(rows: int, device) -> torch.Tensor:
+    """``[V4_DECODE_MAX_SPLITS, rows + 1]`` int32; row ``s - 1`` is the uniform
+    ``split_indptr`` ``[0, s, 2s, ...]`` of ``s`` splits per row.
+
+    Built once, outside CUDA-graph capture, and never written again: every
+    split plan is a slice of it, so graphs of any size read constant memory and
+    no forward rewrites a plan before it runs.
+    """
+    splits = torch.arange(1, V4_DECODE_MAX_SPLITS + 1, dtype=torch.int32, device=device)
+    return splits[:, None] * torch.arange(rows + 1, dtype=torch.int32, device=device)
+
+
 def v4_decode_split_plan(
-    rows: int, heads: int, kv_len: int, split_indptr: torch.Tensor
+    rows: int, heads: int, kv_len: int, split_table: torch.Tensor
 ) -> tuple[int, torch.Tensor] | None:
     """aiter's KV split plan for the fp8 decode ASM kernel, or None.
 
     For a decode call of `rows` query rows (its `qo_indptr` has `rows + 1`
-    entries), `heads` local heads and at most `kv_len` KV per row. The plan's
-    `split_indptr` is written in place into the caller's persistent buffer, so
-    whoever owns a decode CSR builds its plan next to it and passes it on as
+    entries), `heads` local heads and at most `kv_len` KV per row. Host only:
+    aiter picks the split count ``s`` and the plan's ``split_indptr`` is row
+    ``s - 1`` of `split_table` (:func:`v4_uniform_split_table`), whose prefix
+    the decode call trims to its rows. Pass it on as
     ``sparse_attn_v4_paged_decode(..., split_plan=plan)``. None on aiter builds
     before ROCm/aiter#6126, which leaves the split pick to aiter.
     """
     import aiter.mla
 
-    plan_fn = getattr(aiter.mla, "get_mla_v4_nm_split_plan", None)
-    if plan_fn is None:
+    num_kv_splits = getattr(aiter.mla, "get_mla_v4_nm_num_kv_splits", None)
+    if num_kv_splits is None:
         return None
-    return plan_fn(rows, heads, kv_len, split_indptr=split_indptr)
+    s = num_kv_splits(rows, heads, kv_len)
+    if s > split_table.shape[0] or rows >= split_table.shape[1]:
+        return None  # outside the table: let aiter pick
+    return s, split_table[s - 1]
 
 
 def _sparse_attn_v4_paged_decode_asm(

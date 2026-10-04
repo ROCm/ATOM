@@ -187,30 +187,56 @@ def test_decode_asm_trims_split_indptr_to_real_rows(monkeypatch):
     assert captured["split_indptr"].tolist() == [0, 2, 4, 6]
 
 
-@pytest.mark.parametrize("has_planner", [True, False])
-def test_v4_decode_split_plan_follows_aiter(monkeypatch, has_planner):
+def test_uniform_split_table_rows():
+    table = paged_decode.v4_uniform_split_table(4, "cpu")
+    assert table.shape == (paged_decode.V4_DECODE_MAX_SPLITS, 5)
+    assert table.dtype == torch.int32
+    assert table[0].tolist() == [0, 1, 2, 3, 4]
+    assert table[2].tolist() == [0, 3, 6, 9, 12]
+
+
+@pytest.mark.parametrize("has_count", [True, False])
+def test_v4_decode_split_plan_follows_aiter(monkeypatch, has_count):
     import aiter.mla
 
     calls = []
 
-    def planner(rows, heads, kv_len, *, split_indptr):
+    def count(rows, heads, kv_len):
         calls.append((rows, heads, kv_len))
-        return 2, split_indptr[: rows + 1]
+        return 3
 
-    if has_planner:
+    if has_count:
         monkeypatch.setattr(
-            aiter.mla, "get_mla_v4_nm_split_plan", planner, raising=False
+            aiter.mla, "get_mla_v4_nm_num_kv_splits", count, raising=False
         )
     else:
-        monkeypatch.delattr(aiter.mla, "get_mla_v4_nm_split_plan", raising=False)
-    buf = torch.zeros(65, dtype=torch.int32)
-    plan = paged_decode.v4_decode_split_plan(28, 128, 1152, buf)
+        monkeypatch.delattr(aiter.mla, "get_mla_v4_nm_num_kv_splits", raising=False)
+    table = paged_decode.v4_uniform_split_table(64, "cpu")
+    plan = paged_decode.v4_decode_split_plan(28, 128, 1152, table)
 
-    if has_planner:
+    if has_count:
+        # A row of the constant table, not a copy: nothing is written per call.
         assert calls == [(28, 128, 1152)]
-        assert plan[0] == 2 and plan[1].shape[0] == 29
+        assert plan[0] == 3 and plan[1].data_ptr() == table[2].data_ptr()
+        assert plan[1][:29].tolist() == list(range(0, 3 * 29, 3))
     else:
         assert plan is None
+
+
+@pytest.mark.parametrize("splits,rows", [(17, 28), (3, 64)])
+def test_v4_decode_split_plan_outside_table_leaves_pick_to_aiter(
+    monkeypatch, splits, rows
+):
+    import aiter.mla
+
+    monkeypatch.setattr(
+        aiter.mla,
+        "get_mla_v4_nm_num_kv_splits",
+        lambda *a: splits,
+        raising=False,
+    )
+    table = paged_decode.v4_uniform_split_table(63, "cpu")
+    assert paged_decode.v4_decode_split_plan(rows, 128, 1152, table) is None
 
 
 @pytest.mark.parametrize("kv_fp8", [True, False])
@@ -221,14 +247,16 @@ def test_builder_decode_split_plan(monkeypatch, kv_fp8):
     monkeypatch.setattr(
         deepseek_v4_attn,
         "v4_decode_split_plan",
-        lambda rows, heads, kv_len, buf: calls.append((rows, heads, kv_len)) or "plan",
+        lambda rows, heads, kv_len, table: calls.append((rows, heads, kv_len, table))
+        or "plan",
     )
-    builder = SimpleNamespace(_kv_fp8=kv_fp8, _local_heads=128)
+    table = paged_decode.v4_uniform_split_table(64, "cpu")
+    builder = SimpleNamespace(_kv_fp8=kv_fp8, _local_heads=128, _split_table=table)
     plan = deepseek_v4_attn.DeepseekV4AttentionMetadataBuilder._decode_split_plan(
-        builder, 28, 1152, torch.zeros(65, dtype=torch.int32)
+        builder, 28, 1152
     )
 
     if kv_fp8:
-        assert plan == "plan" and calls == [(28, 128, 1152)]
+        assert plan == "plan" and calls == [(28, 128, 1152, table)]
     else:
         assert plan is None and calls == []

@@ -140,11 +140,6 @@ def workspace_ready(device) -> bool:
     return idx in _workspaces
 
 
-def rows_ok(rows: int) -> bool:
-    """Row-count gate: smaller calls stay on the ASM path, which is faster there."""
-    return envs.ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= MAX_ROWS
-
-
 def wanted(*, compress_ratio: int | None, heads: int, rows: int, gfx: str) -> bool:
     """Shape/config gate; the layout gate is :func:`layout_ok`."""
     return (
@@ -152,7 +147,7 @@ def wanted(*, compress_ratio: int | None, heads: int, rows: int, gfx: str) -> bo
         and compress_ratio == HCA_RATIO
         and heads == HEADS
         and gfx == "gfx950"
-        and rows_ok(rows)
+        and envs.ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= MAX_ROWS
         and available()
     )
 

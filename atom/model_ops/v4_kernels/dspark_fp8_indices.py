@@ -41,7 +41,10 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import WindowParams
-from atom.model_ops.v4_kernels.paged_decode import v4_decode_split_plan
+from atom.model_ops.v4_kernels.paged_decode import (
+    v4_decode_split_plan,
+    v4_uniform_split_table,
+)
 from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
 
 
@@ -143,7 +146,7 @@ class DSparkIndexBuffers:
     kv_indptr: torch.Tensor  # [max_b*T+1] int32
     draft_rows: torch.Tensor  # [max_b*T] int32
     qo_indptr: torch.Tensor  # [max_b*T+1] int32, constant ramp
-    split_indptr: torch.Tensor  # [max_b*T+1] int32, see `split_plan`
+    split_table: torch.Tensor  # [16, max_b*T+1] int32, constant, see `split_plan`
     batch_ids: torch.Tensor  # [max_b*T] int32, [0]*T ++ [1]*T ++ ..., -1 on pad
     max_batch: int
     draft_width: int  # T
@@ -178,7 +181,7 @@ class DSparkIndexBuffers:
             kv_indptr=torch.empty(n + 1, **i32),
             draft_rows=torch.empty(n, **i32),
             qo_indptr=torch.arange(n + 1, **i32),
-            split_indptr=torch.zeros(n + 1, **i32),
+            split_table=v4_uniform_split_table(n, device),
             batch_ids=torch.arange(n, **i32) // draft,
             max_batch=max_batch,
             draft_width=draft,
@@ -235,7 +238,7 @@ class DSparkIndexBuffers:
             BLOCK_B=triton.next_power_of_2(B),
             BLOCK_K=triton.next_power_of_2(W + T),
         )
-        self.split_plan = v4_decode_split_plan(B * T, heads, W + T, self.split_indptr)
+        self.split_plan = v4_decode_split_plan(B * T, heads, W + T, self.split_table)
         # Last: a launch that raised must not leave the bundle claiming a batch.
         self.built_for = B
 
