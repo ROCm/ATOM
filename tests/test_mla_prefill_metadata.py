@@ -153,3 +153,71 @@ def test_dense_prefill_cuts_the_q_cums_to_the_per_seq_array(monkeypatch):
     assert seen["last_page_lens"] is kv_last_page_lens
     assert seen["cu_seqlens_q"].tolist() == [0, 3, 6]
     assert seen["cu_seqlens_q"].shape[0] == n_seqs + 1
+
+
+@needs_atom_mla
+@pytest.mark.parametrize(
+    "dispatch", ["forced-eager", "cudagraph-replay", "cudagraph-capture"]
+)
+def test_shuffled_decode_metadata_matches_the_dispatch_width(monkeypatch, dispatch):
+    """Only forced-eager decode cuts metadata back to the scheduled batch."""
+    scheduled_bs, padded_bs = 2, 4
+    forward_mode = (
+        None
+        if dispatch == "cudagraph-capture"
+        else SimpleNamespace(use_cudagraph=dispatch == "cudagraph-replay")
+    )
+    monkeypatch.setattr(attention_mla.envs, "ATOM_USE_TRITON_MLA", True)
+    monkeypatch.setattr(attention_mla.envs, "ATOM_USE_TRITON_MLA_SHUFFLE_KV", True)
+    monkeypatch.setattr(
+        attention_mla,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(
+                scheduled_bs=scheduled_bs, forward_mode=forward_mode
+            )
+        ),
+    )
+
+    seen = {}
+
+    def fake_decode(
+        _q, _kv, output, cu_seqlens_q, seqused_k, _max_k, block_tables, *a, **kw
+    ):
+        output.zero_()
+        seen.update(
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            block_tables=block_tables,
+        )
+
+    monkeypatch.setattr(attention_mla, "triton_shuffle_mla_decode_fwd", fake_decode)
+
+    attn = _attn(is_sparse=False)
+    attn._k_scale = torch.tensor(1.0)
+    attn._shuffle_block_size_cached = 64
+    cu_seqlens_q = torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32)
+    context_lens = torch.tensor([101, 202, 0, 0], dtype=torch.int32)
+    block_tables = torch.arange(padded_bs * 3, dtype=torch.int32).view(padded_bs, 3)
+    metadata = SimpleNamespace(
+        causal=True,
+        cu_seqlens_q=cu_seqlens_q,
+        context_lens=context_lens,
+        max_seqlen_k=202,
+        block_tables=block_tables,
+    )
+
+    query_bs = scheduled_bs if dispatch == "forced-eager" else padded_bs
+    q = torch.zeros(query_bs, NUM_HEADS, ENTRY)
+    kv = torch.zeros(64 * 2, ENTRY)
+    out = attn._forward_decode(q, kv, metadata)
+
+    expected_bs = scheduled_bs if dispatch == "forced-eager" else padded_bs
+    assert out.shape == (query_bs, NUM_HEADS, KV_LORA_RANK)
+    torch.testing.assert_close(seen["cu_seqlens_q"], cu_seqlens_q[: expected_bs + 1])
+    torch.testing.assert_close(seen["seqused_k"], context_lens[:expected_bs])
+    torch.testing.assert_close(seen["block_tables"], block_tables[:expected_bs])
+    if dispatch != "forced-eager":
+        assert seen["cu_seqlens_q"] is cu_seqlens_q
+        assert seen["seqused_k"] is context_lens
+        assert seen["block_tables"] is block_tables
