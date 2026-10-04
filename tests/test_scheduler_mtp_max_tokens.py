@@ -50,6 +50,8 @@ class TestMTPMaxTokens:
                 num_rejected=np.asarray([0]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
+                # pp=1 output is deferred (drafts + lagging provisional run).
+                is_deferred_out=True,
             ),
             stream_output_queue=stream_queue,
         )

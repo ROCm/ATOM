@@ -572,7 +572,11 @@ class MLAAttention(nn.Module):
         self.dtype = dtype
 
         self.min_query_heads = kwargs.get("min_query_heads", _MLA_MIN_HEADS)
-        self.padded_num_heads = max(num_heads, self.min_query_heads)
+        # aiter MLA only serves multiples of 16 heads; round up so a per-rank
+        # count like 24 (K3 at tp4) does not abort in get_mla_metadata.
+        self.padded_num_heads = mla_kernel_num_heads(
+            max(num_heads, self.min_query_heads)
+        )
         # Heads past num_heads are dead lanes: the MLA kernels compute them and
         # `_restore_query_heads` throws them away. They are zeros rather than
         # repeats of the real heads because zeros are what a producer can write

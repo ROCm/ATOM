@@ -45,6 +45,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
+    mla_kernel_num_heads,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -381,7 +382,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        # Must equal `MLAAttention.padded_num_heads`: that pads the query, this
+        # sizes the kernel's work descriptors for it.
+        self.padded_num_attention_heads = mla_kernel_num_heads(
+            max(self.num_attention_heads, _MLA_MIN_HEADS)
+        )
         self.is_sparse = model_runner.has_mla_indexer
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
@@ -2489,10 +2494,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
         if not batch.is_dummy_run and max_seqlen_q > 1:
-            # Get num_rejected (already mapped to current batch order in prepare_input_ids)
-            num_rejected = self.model_runner.tokenID_processor.num_rejected
-            if num_rejected is not None:
-                context_lens -= num_rejected
+            # Already in current batch order (prepare_input_ids); see
+            # `verify_context_shift` for why this is not `num_rejected` under PP.
+            shift = self.model_runner.tokenID_processor.verify_context_shift()
+            if shift is not None:
+                context_lens -= shift
                 num_blocks = cdiv(context_lens, self.model_runner.block_size)
                 block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
         positions = decode_positions(context_lens, max_seqlen_q)
