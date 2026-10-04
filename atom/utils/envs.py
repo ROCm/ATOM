@@ -45,6 +45,23 @@ def _positive_float_env(name: str, default: str) -> float:
     return float(default)
 
 
+def _positive_int_env(name: str, default: str) -> int:
+    raw_value = os.getenv(name, default)
+    try:
+        value = int(raw_value)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r: expected a positive integer; using default %s",
+        name,
+        raw_value,
+        default,
+    )
+    return int(default)
+
+
 def _flag_env(name: str, default: str = "0") -> bool:
     # Stripped, and empty reads as off: `VAR=` is how a shell script clears a
     # flag inline, and a bare membership test reads the empty string as ON --
@@ -520,6 +537,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
+    ),
+    "ATOM_LOG_ENGINE_STATS": lambda: _flag_env("ATOM_LOG_ENGINE_STATS"),
+    "ATOM_ENGINE_STATS_INTERVAL": lambda: _positive_int_env(
+        "ATOM_ENGINE_STATS_INTERVAL", "40"
     ),
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
         "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
