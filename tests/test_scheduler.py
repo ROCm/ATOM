@@ -2394,6 +2394,32 @@ class TestPendingConnectorLookup:
         assert first.id in scheduled
         assert asked.count(first.id) == 2
 
+    def test_a_lookup_below_the_hbm_hit_keeps_its_place_while_asked_again(
+        self, seq_factory
+    ):
+        # The connector's lookup no longer reaches the HBM hit admission would
+        # get; it asks again, and the request waits instead of being admitted
+        # into a refused load.
+        first = seq_factory(tuple(range(8)))
+        second = seq_factory(tuple(range(100, 108)))
+        sched, _asked = self._sched({first.id: (4, True)})
+        covers = []
+        sched.kv_connector.lookup_covers_hbm_prefix = lambda seq, hbm: (
+            covers.append((seq.id, hbm)) or len(covers) > 1
+        )
+        sched.kv_connector.should_park_for_load_after_alloc = lambda seq: False
+        sched.waiting.extend([first, second])
+
+        _batch, scheduled = sched.schedule()
+
+        assert first.id not in scheduled and second.id in scheduled
+        assert list(sched.waiting) == [first]
+
+        _batch, scheduled = sched.schedule()
+
+        assert first.id in scheduled
+        assert [seq_id for seq_id, _hbm in covers] == [first.id, first.id]
+
     def test_pending_requests_keep_their_order(self, seq_factory):
         seqs = [seq_factory(tuple(range(i * 100, i * 100 + 8))) for i in range(3)]
         answers = {seq.id: (None, False) for seq in seqs[:2]}

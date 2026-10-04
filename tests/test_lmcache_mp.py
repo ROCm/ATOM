@@ -1113,31 +1113,25 @@ def test_hbm_shrinks_below_the_lookup_start_are_bucketed(monkeypatch):
     assert scheduler._hbm_shrinks == [2, 1, 1, 1]
 
 
-def test_a_lookup_whose_hbm_prefix_shrank_is_asked_again(monkeypatch):
-    # Answered from 8; the HBM prefix then lost its tail. The request asks
-    # again from the prefix it has now, and from 0 if that shrinks too, so it
-    # loads instead of recomputing what the tier holds.
+def test_a_lookup_the_hbm_hit_fell_below_is_asked_again(monkeypatch):
+    # Answered from 8; admission would get only 5 HBM tokens, so the lookup
+    # is released and asked again from 4 (then from 0), and the request waits.
     scheduler, lookup, seq = _past_hbm_scheduler(monkeypatch, hbm_prefix=8)
     adapter = lookup._adapter
     adapter.results.extend([12, 12])
-    prefix = {"tokens": 8}
-    scheduler._block_manager = SimpleNamespace(
-        cached_prefix_tokens=lambda seq: prefix["tokens"],
-        prefix_cached_through=lambda seq, tokens: prefix["tokens"] >= tokens,
-    )
 
     assert scheduler.get_num_new_matched_tokens(seq) == (12, True)
-    prefix["tokens"] = 5
+    assert scheduler.lookup_covers_hbm_prefix(seq, 8)
+    assert not scheduler.lookup_covers_hbm_prefix(seq, 5)
     assert scheduler.get_num_new_matched_tokens(seq) == (12, True)
-    prefix["tokens"] = 2
-    assert scheduler.get_num_new_matched_tokens(seq) == (12, True)
+    assert not scheduler.lookup_covers_hbm_prefix(seq, 2)
+    assert scheduler.lookup_covers_hbm_prefix(seq, 0)
 
     assert adapter.starts == [8, 4, 0]
     assert [(call["start"], call["end"]) for call in adapter.freed] == [
         (0, 12),
         (0, 12),
     ]
-    assert seq.offload_lookups_again == 2
     assert scheduler._lookups_again == [1, 1]
 
 

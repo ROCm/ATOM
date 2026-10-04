@@ -549,6 +549,11 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
     # The scheduler guards every one of these with hasattr(), so MultiConnector
     # only needs to expose them when a sub-connector implements them.
 
+    def lookup_covers_hbm_prefix(self, seq: Any, hbm_tokens: int) -> bool:
+        # The load's owner asked the lookup; only it knows where it started.
+        covers = getattr(self._load_owner(seq), "lookup_covers_hbm_prefix", None)
+        return True if covers is None else covers(seq, hbm_tokens)
+
     def should_park_for_load_after_alloc(self, seq: Any) -> bool:
         # Route to the sub that armed this request's load (`_load_owner`), not
         # the tier sub: the question is whether the forward must wait for the

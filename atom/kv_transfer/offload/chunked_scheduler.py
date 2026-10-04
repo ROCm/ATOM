@@ -292,8 +292,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         if pending is not None:
             hit = pending[1]
-            if self._hbm_prefix_shrank_below_lookup(seq, sid):
-                hit = self._lookup_again(seq, sid)
         else:
             remembered, hit = self._remembered_tier_hit(seq, sid)
             if not remembered:
@@ -304,44 +302,43 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         return self._answer_from_tier_hit(seq, sid, hit)
 
-    def _hbm_prefix_shrank_below_lookup(self, seq, sid: str) -> bool:
-        """Has this request's HBM prefix fallen below where its lookup started?
+    def lookup_covers_hbm_prefix(self, seq, hbm_tokens: int) -> bool:
+        """Does this request's lookup still reach down to its HBM hit?
 
-        The tail of a prefix is evicted first, and a request can wait seconds
-        between its lookup and its admission: two-node c112 refused 79 loads in
-        30 minutes for it, with 91K tier tokens each, most after the prefix
-        shrank by 16K tokens or more. Checked on every pass, before admission,
-        so the request can still ask again instead of recomputing.
+        Asked by the scheduler right after `can_allocate`, with the HBM hit
+        this admission would get. A lookup that started past the HBM prefix of
+        its time covers nothing below that start, and the prefix can shrink
+        while the request waits: two-node c112 refused 79-98 loads per run for
+        it, ~100K tier tokens each, recomputed instead. Rather than admit the
+        request into that refusal, release the lookup, ask again from this hit
+        (from 0 the second time), and answer False; the request keeps its
+        place until the new answer arrives.
         """
+        sid = str(seq.id)
         start = self._tier_lookup_start_of(sid)
-        if start <= 0:
-            return False
-        cached_through = getattr(self._block_manager, "prefix_cached_through", None)
-        return cached_through is not None and not cached_through(seq, start)
+        if start <= 0 or int(hbm_tokens) >= start:
+            return True
+        self._lookup_again(seq, sid, int(hbm_tokens))
+        return False
 
-    def _lookup_again(self, seq, sid: str):
-        """Drop a lookup whose start the HBM prefix fell below; ask again.
-
-        From the HBM prefix as it is now; should it shrink below that too,
-        from 0, which needs no HBM prefix at all. Returns what
-        `_fresh_tier_lookup` returns, usually ``TIER_LOOKUP_PENDING``: the
-        request waits for the new answer like any other.
-        """
+    def _lookup_again(self, seq, sid: str, hbm_tokens: int) -> None:
+        """Drop the lookup and ask again from ``hbm_tokens``, or from 0."""
         seq.offload_lookups_again = getattr(seq, "offload_lookups_again", 0) + 1
         again = self.__dict__.setdefault("_lookups_again", [0, 0])
-        again[min(seq.offload_lookups_again, 2) - 1] += 1
+        from_zero = seq.offload_lookups_again > 1
+        again[int(from_zero)] += 1
         # Releases the old lookup's locks and drops its client state.
         self._clear_pending_load(sid)
         self._lookup_results.pop(sid, None)
         if sid in self._lookup_in_step:
             self._lookup_in_step.remove(sid)
         self._forget_tier_hit(sid)
-        return self._fresh_tier_lookup(
-            seq, sid, wait=False, from_zero=seq.offload_lookups_again > 1
-        )
+        margin = int(getattr(self._lookup_client, "hbm_prefix_margin", 0))
+        start = 0 if from_zero else self._chunk_floor(max(0, hbm_tokens - margin))
+        self._fresh_tier_lookup(seq, sid, wait=False, start=start)
 
     def _fresh_tier_lookup(
-        self, seq, sid: str, *, wait: bool = True, from_zero: bool = False
+        self, seq, sid: str, *, wait: bool = True, start: int | None = None
     ):
         """Ask the tier, take its pin, and remember the hit. None if it did not answer.
 
@@ -352,7 +349,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         num_prompt = seq.num_prompt_tokens
         token_ids = self._lookup_token_ids(seq)
-        start = 0 if from_zero else self._tier_lookup_start(seq)
+        if start is None:
+            start = self._tier_lookup_start(seq)
         # Only a client that asks past the HBM prefix takes `start`.
         past_hbm = {"start": start} if start else {}
         listed = sid not in self._lookup_in_step

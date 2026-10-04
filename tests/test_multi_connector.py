@@ -351,6 +351,18 @@ def test_pending_sub_holds_the_answer_and_later_subs_are_not_asked():
     assert 7 not in sched._load_winner
 
 
+def test_lookup_coverage_is_asked_of_the_load_owner_only():
+    owner = FakeSchedSub(is_offload=True, offload_methods=True, match=(4, True))
+    owner.lookup_covers_hbm_prefix = lambda seq, hbm: hbm >= 8
+    seq = SimpleNamespace(id=7)
+    sched = _sched([FakeSchedSub(), owner])
+
+    assert sched.lookup_covers_hbm_prefix(seq, 4)  # no load owner yet
+    assert sched.get_num_new_matched_tokens(seq) == (4, True)
+    assert not sched.lookup_covers_hbm_prefix(seq, 4)
+    assert sched.lookup_covers_hbm_prefix(seq, 8)
+
+
 def test_pending_sub_behind_a_winner_is_cancelled_like_any_loser():
     winner = FakeSchedSub(is_producer=True, match=(5, True))
     pending = FakeSchedSub(is_offload=True, offload_methods=True, match=(None, False))

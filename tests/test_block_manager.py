@@ -363,28 +363,6 @@ class TestPrefixCaching:
         s3 = seq_factory([1, 2, 3, 4, 40, 41, 42, 43, 44])
         assert block_manager_prefix.cached_prefix_tokens(s3) == 4
 
-    def test_prefix_cached_through_follows_the_evicted_tail(self, seq_factory):
-        # A cached prefix loses its tail first, so its last block tells
-        # whether the prefix still reaches a token.
-        bm = BlockManager(
-            MockConfig(
-                num_kvcache_blocks=4, kv_cache_block_size=4, enable_prefix_caching=True
-            )
-        )
-        s1 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 9])
-        bm.allocate(s1)
-        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
-        bm.deallocate(s1)
-        s2 = seq_factory([1, 2, 3, 4, 5, 6, 7, 8, 30, 31])
-        assert bm.cached_prefix_tokens(s2) == 8
-        assert bm.prefix_cached_through(s2, 8)
-
-        bm.allocate(seq_factory(list(range(100, 112))))
-
-        assert not bm.prefix_cached_through(s2, 8)
-        assert bm.prefix_cached_through(s2, 4)
-        assert bm.prefix_cached_through(s2, 0)
-
     def test_cached_prefix_tokens_is_zero_without_prefix_caching(
         self, block_manager, seq_factory
     ):

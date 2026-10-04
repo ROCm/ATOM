@@ -218,6 +218,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def should_park_for_load_after_alloc(self, seq) -> bool:
         return self._impl.should_park_for_load_after_alloc(seq)
 
+    def lookup_covers_hbm_prefix(self, seq, hbm_tokens: int) -> bool:
+        covers = getattr(self._impl, "lookup_covers_hbm_prefix", None)
+        return True if covers is None else covers(seq, hbm_tokens)
+
     def should_defer_free(self, seq) -> bool:
         return self._impl.should_defer_free(seq)
 

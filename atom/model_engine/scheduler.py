@@ -1797,6 +1797,15 @@ class Scheduler:
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
+            if needs_remote_load and not self._connector_lookup_covers(
+                seq, num_cached_blocks * self.block_manager.hash_block_size
+            ):
+                # Its HBM prefix fell below where the connector's lookup
+                # started, and the connector is asking again from the prefix
+                # this admission would have had. Keeps its place like a lookup
+                # still running.
+                prefix_waiters.append(seq)
+                continue
 
             # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
             # their decoded tokens — preempt() frees their KV blocks but keeps
@@ -2661,6 +2670,11 @@ class Scheduler:
     def _notify_connector_after_prefill_alloc(self, seq: Sequence) -> None:
         if self.kv_connector is not None:
             self.kv_connector.update_state_after_alloc(seq)
+
+    def _connector_lookup_covers(self, seq: Sequence, hbm_tokens: int) -> bool:
+        """Whether the connector's lookup still reaches down to this HBM hit."""
+        covers = getattr(self.kv_connector, "lookup_covers_hbm_prefix", None)
+        return True if covers is None else bool(covers(seq, hbm_tokens))
 
     def _confirm_remote_load_after_alloc(
         self, seq: Sequence, needs_remote_load: bool

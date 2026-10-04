@@ -47,6 +47,7 @@ class SeqView:
         # "no load emitted" and "slot never declared" the same observation.
         "offload_load_start_tokens",
         "offload_loaded_tokens",
+        "offload_lookups_again",
         "prefix_hashes_published",
     )
 
