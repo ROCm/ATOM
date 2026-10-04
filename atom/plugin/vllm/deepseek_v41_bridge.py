@@ -642,7 +642,8 @@ def _dump_v41_state_rows(snapshot, batch, builder, exc) -> None:
         for i, req_id in enumerate(snapshot.req_ids):
             slot = int(slots[i]) if i < len(slots) else -1
             cursor = (
-                int(cursors[slot]) if cursors is not None and 0 <= slot < len(cursors)
+                int(cursors[slot])
+                if cursors is not None and 0 <= slot < len(cursors)
                 else -1
             )
             logger.error(
@@ -753,6 +754,61 @@ def _v41_dummy_batch(running_tokens, *, max_req_tokens, max_reqs):
     )
 
 
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+except ImportError:  # vLLM too old for breakable capture; the break is a no-op
+
+    def eager_break_during_capture(fn):
+        return fn
+
+
+def _v41_capture_active() -> bool:
+    """Whether a breakable cudagraph capture is recording this forward."""
+    try:
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    except ImportError:
+        return False
+    return bool(BreakableCUDAGraphCapture.is_active())
+
+
+@eager_break_during_capture
+def v41_stage_step(builder, batch, running_bs, running_tokens, input_ids, snapshot):
+    """One CSA2 step's host-side work, as a single break point.
+
+    Both halves have to be in the *same* eager break, and the break has to be
+    here rather than on ``prepare_model_inputs`` alone. ``_prepare`` stages the
+    step's index/indptr/slot tensors with kernels of its own; captured, they
+    would replay the batch that happened to be scheduled when the graph was
+    recorded, and the state work that follows would then be reading a stale
+    description of the batch. ``prepare_model_inputs`` carries its own break
+    decorator for the native engine; nested inside this one it is inert
+    (``add_eager`` leaves ``_capturing`` False while it runs the callable), so
+    this does not double-break.
+
+    The decorator's in-place contract is met by construction rather than by
+    care: ``_prepare`` returns a slice of the persistent ``positions.gpu``
+    buffer, and everything else it produces is host-side and consumed only at
+    capture time. A replay runs this function and no other Python here, so the
+    captured segments keep reading the addresses they recorded while the
+    contents are refreshed underneath them.
+    """
+    metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
+    # Engram embeddings, the per-request state reset and the cursor advance --
+    # everything that must happen once per step, before any layer runs.
+    try:
+        builder.prepare_model_inputs(input_ids, metadata)
+    except ValueError as exc:
+        if "needs state at" not in str(exc):
+            raise
+        # One shot, at the only place where every column exists together:
+        # ATOM's refusal names a request and two positions but not the batch
+        # that produced them, and the connector is not in the picture at all.
+        # Printing the whole table turns "off by one" into a row to look at.
+        _dump_v41_state_rows(snapshot, batch, builder, exc)
+        raise
+    return metadata, step_positions
+
+
 @contextmanager
 def atom_deepseek_v41_forward_context(
     *,
@@ -813,20 +869,9 @@ def atom_deepseek_v41_forward_context(
         running_bs = int(snapshot.num_reqs)
         running_tokens = max(running_tokens, batch.total_tokens_num)
 
-    metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
-    # Engram embeddings, the per-request state reset and the cursor advance --
-    # everything that must happen once per step, before any layer runs.
-    try:
-        builder.prepare_model_inputs(input_ids, metadata)
-    except ValueError as exc:
-        if "needs state at" not in str(exc):
-            raise
-        # One shot, at the only place where every column exists together:
-        # ATOM's refusal names a request and two positions but not the batch
-        # that produced them, and the connector is not in the picture at all.
-        # Printing the whole table turns "off by one" into a row to look at.
-        _dump_v41_state_rows(snapshot, batch, builder, exc)
-        raise
+    metadata, step_positions = v41_stage_step(
+        builder, batch, running_bs, running_tokens, input_ids, snapshot
+    )
 
     is_prefill = metadata.state.value.startswith("prefill")
     context = Context(
@@ -844,10 +889,12 @@ def atom_deepseek_v41_forward_context(
         atom_config=atom_config,
         context=context,
         num_tokens=running_tokens,
-        # V4.1 runs eager on the plugin path (cudagraph_mode is forced NONE):
-        # its step carries host-side Engram and state work that no captured
-        # graph can replay.
-        in_hipgraph=False,
+        # True only while a breakable capture is recording: the step work
+        # above ran in an eager break, so the segments around it may be
+        # captured. Read at capture time, which is the only time this code
+        # runs -- a replay reruns the break and nothing else -- so it labels
+        # the kernels being recorded, which is exactly what it is for.
+        in_hipgraph=_v41_capture_active(),
     )
     try:
         yield step_positions

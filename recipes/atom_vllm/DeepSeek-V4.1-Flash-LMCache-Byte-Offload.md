@@ -359,3 +359,74 @@ sent `_acquire` to its slot-0 fallback; and `assign` evicted reserved slots,
 which are absent from its batch by definition. A reservation can now also be
 refused -- `batch + reservations` may exceed the pool even though vLLM caps
 concurrency at its size -- and a refused restore recomputes instead.
+
+## CUDA graphs: why the numbers above are eager, and what blocks graphs
+
+Every measurement in this document was taken with `cudagraph_mode=NONE`, on
+both arms. That is a real limit on what they mean: eager decode spends
+107-194 ms per inter-token interval here, and graphs would take a large bite
+out of exactly the part of the step that the offload speedup is measured
+against. **The ON/OFF ratios below are not extrapolable to a graph-mode
+deployment**, and the right reading of them is "offload helps this much when
+decode is eager", not "offload helps this much".
+
+Graphs were attempted, measured and stood down. The record, so the next
+attempt does not start from the beginning:
+
+**What was removed.** The stated reason V4.1 ran eager was that ATOM's plugin
+models are not fx-split, so vLLM's PIECEWISE mode had nothing to split on and
+would swallow the backbone whole. `VLLM_USE_BREAKABLE_CUDAGRAPH=1` ends the
+stream capture at runtime instead of splitting an fx graph, so that reason
+does not survive it. With it:
+
+- `v41_stage_step` (`deepseek_v41_bridge.py`) carries the break around the
+  step's host work -- `_prepare` *and* `prepare_model_inputs` in one break,
+  because `_prepare` stages the step's index/indptr/slot tensors with kernels
+  of its own.
+- `cudagraph_mode` must be **PIECEWISE exactly**, not merely non-NONE:
+  `eager_break_during_capture` *skips the break* when the forward context
+  reports a FULL runtime mode. Under FULL the step work is recorded into the
+  graph and never runs again -- a frozen cursor, every replayed step
+  re-answering the first, with nothing raised.
+- The proxy builder's `AttentionCGSupport.NEVER` needs no change: vLLM's three
+  NEVER gates in `resolve_cudagraph_mode_and_sizes` all test FULL
+  (`mixed_mode`, `decode_mode`, `has_full_cudagraphs`), so PIECEWISE passes
+  them untouched and the honest declaration stays.
+- The dummy-batch cache must be reused, not rebuilt per call. `_prepare`'s
+  dummy branch allocated a scratch `PagedAttentionCache` each time; captured
+  kernels hold its addresses, it is freed when the capture returns, and the
+  first replay reads freed memory. Symptom: `illegal memory access`, reported
+  asynchronously inside an unrelated `copy_to_gpu`. Fixed by `_dummy_cache`.
+
+**What still blocks it.** With all of the above, V4.1 captures and serves
+without raising, and the answers degenerate into noise after the first few
+tokens (measured: 8/8 prompts, greedy, against a byte-identical eager arm that
+answers all 8 correctly). The attention is what stays behind: its kernels are
+launched with per-step host values -- the batch's longest KV extent among them
+-- which a capture freezes at whatever length it recorded while every decode
+step grows past it.
+
+The ordinary remedy, an eager break on the attention op the way vLLM does for
+`unified_attention_with_output`, **does not apply as a decoration**: the
+decorator requires an in-place output buffer ("a fresh tensor returned by `fn`
+would change address each replay"), and V4.1's `Attention.forward` returns a
+fresh tensor. Applied anyway, it faults *inside capture*, not at replay.
+
+So capturing V4.1 is attention-level work -- a persistent per-layer output
+buffer plus a device-side length bound -- not configuration. Two routes, both
+real:
+
+1. V4's road: hoist every per-step host value into fixed-address buffers and
+   declare `UNIFORM_BATCH` (see `deepseek_v4_bridge.py`). Large, and V4.1's
+   step work is the thing its own builder docstring says must run inside the
+   forward.
+2. Give attention a persistent output buffer so it can legally carry the
+   break, and move the KV length bound to device memory. Costs one buffer per
+   layer at the captured width.
+
+**The gate is closed by default and deliberately.** `_breakable_cudagraph_available`
+returns False unless `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` is set, *in addition*
+to vLLM's own flag. vLLM auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH` for some
+architectures; without the second condition, a vLLM upgrade that adds V4.1 to
+that list would turn correct answers into noise with nothing in the log.
+`tests/plugin/test_vllm_deepseek_v41_cudagraph_mode.py` holds that shut.
