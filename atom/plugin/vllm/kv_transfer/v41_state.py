@@ -108,9 +108,27 @@ class V41StateViews:
         # One contiguous arena rather than `depth` allocations: it is handed
         # out a slab at a time and never resized, so a single reservation is
         # also a single statement of how much HBM this leg costs.
-        self._staging = torch.empty(
-            (depth, self.entry_bytes), dtype=torch.uint8, device=cache.state_bytes.device
-        )
+        # Allocated after vLLM sized the KV pool against
+        # `gpu_memory_utilization`, so these bytes are outside that budget.
+        # Nothing subtracts them, which at a tight utilisation turns into an
+        # OOM during connector registration -- and the thing that has to shrink
+        # is the KV pool or this depth, not the model. Say the figure at the
+        # point of allocation so the traceback has it.
+        want = depth * self.entry_bytes
+        try:
+            self._staging = torch.empty(
+                (depth, self.entry_bytes),
+                dtype=torch.uint8,
+                device=cache.state_bytes.device,
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            raise torch.cuda.OutOfMemoryError(
+                f"ATOM LMCache offload: V4.1 state staging needs {want} B "
+                f"({depth} x {self.entry_bytes}) on top of the KV pool vLLM "
+                "already sized to fill gpu_memory_utilization. Lower "
+                "`atom.offload.v41.state_stage_depth`, or leave the pool room "
+                "with a smaller --gpu-memory-utilization."
+            ) from exc
         self._free: list[int] = list(range(depth))
         self._lock = threading.Lock()
         self.layout_id = str(cache.geometry.layout_id)
@@ -255,7 +273,7 @@ class V41StateWorkerLeg:
                 continue
             self._views.snapshot(int(slot), stage)
             self._stage_of_op[int(store.op_id)] = stage
-            submitted.append((int(store.op_id), stage))
+            submitted.append((store, stage))
         if submitted:
             # One event for the whole batch of copies: they are all on this
             # stream and in order, so the last one completing means every slab
@@ -263,10 +281,10 @@ class V41StateWorkerLeg:
             # steps is recorded and waited on by two different steps at once.
             event = torch.cuda.Event()
             event.record()
-            for op_id, stage in submitted:
-                store = next(s for s in stores if int(s.op_id) == op_id)
+            for store, stage in submitted:
                 self._tier.submit_store(
-                    KdaStore(op_id, int(store.prefix_hash), (stage,)), event
+                    KdaStore(int(store.op_id), int(store.prefix_hash), (stage,)),
+                    event,
                 )
         return refused
 
@@ -306,7 +324,6 @@ class V41BoundaryPlanner:
         self._index = StateOffloadIndex(can_store=can_store, can_load=can_load)
         self._next_op_id = 0
         self._pending_stores: dict[int, _PendingStore] = {}
-        self._stores: list[KdaStore] = []
         self._loads: list[KdaLoad] = []
         self._lookup_ctx: tuple[str, Any] | None = None
         # req_id -> the last frontier this request was swept at, so one step's
@@ -607,10 +624,6 @@ class V41BoundaryPlanner:
             )
         )
         return True
-
-    def take_stores(self) -> list[KdaStore]:
-        stores, self._stores = self._stores, []
-        return stores
 
     def take_loads(self) -> list[KdaLoad]:
         loads, self._loads = self._loads, []
