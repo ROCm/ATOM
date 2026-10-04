@@ -1049,6 +1049,14 @@ def getLogger():
         # and then discards it -- 10.4% of the API server's CPU at c=2048.
         logger.setLevel(logging.INFO)
 
+        # Never propagate to the root logger. atom attaches its own handler
+        # below, so propagation only ever caused DEBUG records to be re-emitted
+        # by whatever permissive root handler the embedding app installed
+        # (the harness basicConfig) -> multi-GB per-token log floods.
+        # This runs on import in EVERY process (front + spawned EngineCore /
+        # ModelRunner), unlike a setLevel() applied only in the parent.
+        logger.propagate = False
+
         console_handler = logging.StreamHandler()
         from atom.utils import envs as _envs
 
@@ -1064,6 +1072,17 @@ def getLogger():
             )
         console_handler.setFormatter(formatter)
         console_handler.setLevel(logging.INFO)
+
+        # Let logging parse the name so its standard aliases (for example WARN
+        # and FATAL) keep the same behavior as Logger.setLevel. Invalid names
+        # retain the INFO defaults above instead of preventing process startup.
+        level_name = os.getenv("ATOM_LOG_LEVEL", "INFO").strip().upper()
+        try:
+            logger.setLevel(level_name)
+            console_handler.setLevel(level_name)
+        except ValueError:
+            logger.setLevel(logging.INFO)
+            console_handler.setLevel(logging.INFO)
 
         logger.addHandler(console_handler)
         ignored_logger_methods = {
