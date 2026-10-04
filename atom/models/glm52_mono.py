@@ -16,12 +16,12 @@ from aiter.dist.parallel_state import (
 
 from atom.model_ops.monokernel.config import (
     EPS,
-    GLM5_AGENTX_BATCHES,
     GLM5_CONFIG,
     AttentionWeight,
     KvCacheLayout,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
+    glm5_agentx_batches,
     glm5_kernel_samples,
     glm5_tp_config,
 )
@@ -323,6 +323,7 @@ class Glm52MonoDecode:
         self._announced: set[int] = set()
         self._enabled = mode != "off"
         self._required = False
+        self._agentx_batches = glm5_agentx_batches(envs.ATOM_GLM_NATIVE_FP4_MFMA)
         if not self._enabled:
             return
 
@@ -577,7 +578,7 @@ class Glm52MonoDecode:
         query_length = metadata.max_seqlen_q
         active_batch = getattr(context, "scheduled_bs", None)
         active_batch = samples // query_length if active_batch is None else active_batch
-        if query_length in (5, 6) and active_batch not in GLM5_AGENTX_BATCHES:
+        if query_length in (5, 6) and active_batch not in self._agentx_batches:
             return self._unsupported(f"concurrency C={active_batch}")
         if (
             select_backend(

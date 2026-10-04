@@ -283,6 +283,10 @@ GLM5_GLOBAL_HEADS = GLM5_CONFIG.local_heads * GLM5_REFERENCE_TP
 GLM5_GLOBAL_INTER = GLM5_CONFIG.inter * GLM5_REFERENCE_TP
 
 
+def glm5_agentx_batches(native_fp4_mfma: bool = False) -> tuple[int, ...]:
+    return (1, *GLM5_AGENTX_BATCHES) if native_fp4_mfma else GLM5_AGENTX_BATCHES
+
+
 def glm5_tp_config(tp_size: int) -> LayerConfig:
     """Return the one GLM-5 shard geometry for ``tp_size``."""
 

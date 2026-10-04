@@ -17,6 +17,7 @@ from atom.model_ops.monokernel.config import (
     KimiDecodeGeometry,
     conv_state_offset,
     conv_state_shape,
+    glm5_agentx_batches,
     glm5_kernel_samples,
     glm5_tp_config,
 )
@@ -397,6 +398,11 @@ def test_glm_native_fp4_mfma_flag(monkeypatch):
     assert getattr(envs, name) is False
     monkeypatch.setenv(name, "1")
     assert getattr(envs, name) is True
+
+
+def test_glm_native_fp4_agentx_concurrency_contract():
+    assert glm5_agentx_batches() == tuple(range(2, 11))
+    assert glm5_agentx_batches(True) == tuple(range(1, 11))
 
 
 @pytest.mark.parametrize(
@@ -989,6 +995,7 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
         module,
         "envs",
         SimpleNamespace(
+            ATOM_GLM_NATIVE_FP4_MFMA=False,
             ATOM_USE_TRITON_MLA_SHUFFLE_KV=False,
             ATOM_MLA_PAGE_SIZE=1,
         ),
@@ -1059,6 +1066,7 @@ def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
     samples, active = 16 * 6, 8 * 6
     runner = object.__new__(module.Glm52MonoDecode)
     runner._enabled, runner._mode, runner._required = True, "auto", True
+    runner._agentx_batches = glm5_agentx_batches()
     runner._shard = glm5_tp_config(4)
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=4,
