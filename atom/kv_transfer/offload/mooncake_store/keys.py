@@ -9,8 +9,9 @@ a prompt, exactly as the dense codec packs them. Its key is
     ``{namespace}/w{rank}of{world}/{digest}``
 
 * ``namespace`` fingerprints everything that changes those bytes -- model,
-  dtypes, block and chunk size, world, the HF geometry, the speculative config
-  and each PP stage's layer span -- so a Store shared by differently configured
+  dtypes, block and chunk size, world, the HF geometry, the speculative config,
+  each PP stage's layer span and the environment switches that pick the
+  attention backend's KV layout -- so a Store shared by differently configured
   servers never serves one of them another's layout.
 * ``digest`` is the chunk's link in a prefix chain over the prompt's tokens, so
   a chunk's key names the whole prefix up to and including it.
@@ -31,6 +32,7 @@ from typing import Any
 import numpy as np
 
 from atom.kv_transfer.offload import config as offcfg
+from atom.utils import envs
 
 DIGEST_BYTES = 16
 _CHAIN_PERSON = b"atom-kv-chain-v1"
@@ -59,6 +61,26 @@ def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
     ]
 
 
+def kv_layout_selectors() -> dict[str, Any]:
+    """The environment switches that rearrange the bytes inside a KV block.
+
+    Each picks a layout the attention backend writes at the same block size --
+    the segmented MLA cache (``ATOM_MLA_PAGE_SIZE``), the Triton MLA backend's
+    shuffled one (``ATOM_USE_TRITON_MLA`` with
+    ``ATOM_USE_TRITON_MLA_SHUFFLE_KV``) and the MHA kernels' block
+    (``ATOM_USE_UNIFIED_ATTN``) -- so neither the codec's opaque bytes nor the
+    size a load checks tell them apart. The scheduler and the workers it
+    spawns read the same environment. A switch a model does not use costs a
+    miss across servers that differ in it, never another layout's KV.
+    """
+    return {
+        "mla_page_size": int(envs.ATOM_MLA_PAGE_SIZE),
+        "triton_mla": bool(envs.ATOM_USE_TRITON_MLA),
+        "triton_mla_shuffle_kv": bool(envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV),
+        "unified_attn": bool(envs.ATOM_USE_UNIFIED_ATTN),
+    }
+
+
 def store_namespace(config: Any, chunk_tokens: int) -> str:
     """The key prefix every chunk of this server's KV layout is stored under.
 
@@ -66,7 +88,8 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
     dtypes, block/chunk size, world (PP x TP), HF geometry and speculative
     config, plus what it lacks for a Store that outlives the server: the PP
     layer split -- PP4 x TP1 and PP1 x TP4 have the same world -- the online
-    quantization, and the codec's byte layout.
+    quantization, the KV layout the environment selects
+    (`kv_layout_selectors`), and the codec's byte layout.
     """
     world = offcfg.lmcache_replica_world_size(config)
     document = {
@@ -77,6 +100,7 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
         "online_quant": json.dumps(
             getattr(config, "online_quant_config", None), sort_keys=True, default=str
         ),
+        "kv_layout": kv_layout_selectors(),
         "codec": CODEC_ID,
     }
     canonical = json.dumps(

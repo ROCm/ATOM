@@ -786,6 +786,17 @@ purge_lmcache_disk() {
 #    owner 4 KiB pages its NICs refuse to register (seen on pit2-p03-g27, whose
 #    NUMA1 did not compact 768 GiB in 600 s with 1342 GiB free; its NUMA0, like
 #    both nodes of pit2-p03-g19 and -g23, took 34 s).
+#  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
+#    Store once this node has compacted: for every pool to count its owners,
+#    and on a decode node for the prefill node's masters. A wait on the other
+#    node's part also allows for that node's compaction, which its Store waits
+#    for and this node's did not: MOONCAKE_STORE_COMPACT_TIMEOUT per NUMA node
+#    it pins. MOONCAKE_STORE_MASTER_WAIT_TIMEOUT (default 120 s) bounds the
+#    wait for this node's own masters.
+#  - One Store per node, planned for one prefill worker: its memory plan and
+#    compaction cover that worker's GPUs, so a layout that starts several
+#    prefill workers on one node (prefill_single_node with xP > 1, packed_nodes
+#    with two prefill workers on a node) is refused.
 # validate_mooncake_store_settings refuses a conflicting setting, or an image
 # without the Store, before the node starts anything. Master and owners start
 # before the workers, which connect (and round-trip a probe chunk) while they
@@ -1048,10 +1059,6 @@ settings = {
         "a positive number of seconds",
         positive_seconds,
     ),
-    "mooncake_store.publish_loaded_prefix": (
-        "true or false",
-        lambda value: isinstance(value, bool),
-    ),
     "mooncake_store.startup_probe": (
         "true or false",
         lambda value: isinstance(value, bool),
@@ -1110,10 +1117,30 @@ check_mooncake_store_settings() {
   fi
   require_mooncake_qp_per_endpoint
   refuse_mooncake_nic_auto_discovery
-  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" prefill_nodes="${xP:-1}" decode_nodes="${yD:-1}"
+  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
-    && [[ "${layout}" != "multi_node" || "${prefill_nodes}" != "1" || "${decode_nodes}" != "1" ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${prefill_nodes}), whose masters they join, and one decode node (here ${decode_nodes}): the pools count the decode owners once" >&2
+    && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
+    exit 2
+  fi
+  # This shell starts one Store, planned for its first prefill worker's GPUs;
+  # a second worker would find it only once the first is up. The packed
+  # layout's node of each prefill worker is in prefill_nodes.
+  local workers_on_a_node=1 node
+  local -A prefill_workers_on=()
+  case "${layout}" in
+    prefill_single_node) workers_on_a_node="${num_prefill}" ;;
+    packed_nodes)
+      for node in ${prefill_nodes[@]+"${prefill_nodes[@]}"}; do
+        prefill_workers_on[${node}]=$(( ${prefill_workers_on[${node}]:-0} + 1 ))
+        if (( ${prefill_workers_on[${node}]} > workers_on_a_node )); then
+          workers_on_a_node="${prefill_workers_on[${node}]}"
+        fi
+      done
+      ;;
+  esac
+  if (( workers_on_a_node > 1 )); then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its memory plan and compaction cover; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
     exit 2
   fi
   if [[ ! "${MOONCAKE_STORE_LEASE_TTL_MS:-10000}" =~ ^[0-9]+$ ]] \
@@ -1470,6 +1497,25 @@ report_mooncake_store_owners() {
   done
 }
 
+# mooncake_store_compaction_budget <owner setting> [host_pools]: the longest
+# the node whose owners <owner setting> lists compacts its memory before its
+# Store starts. numa_memory_budget.py compacts each NUMA node with pins in turn
+# and stops each after MOONCAKE_STORE_COMPACT_TIMEOUT; host_pools counts one
+# more node for the prefill GPUs' host transfer pools when
+# MOONCAKE_STORE_HOST_POOL_GIB is set (an overcount when theirs is an owner's).
+mooncake_store_compaction_budget() {
+  local -a numa=() gib=() devices=()
+  parse_mooncake_owner_spec "$1" numa gib devices
+  local host_pool_gib=0 nodes
+  if [[ "${2:-}" == "host_pools" ]]; then
+    host_pool_gib="$(mooncake_setting MOONCAKE_STORE_HOST_POOL_GIB 0)"
+  fi
+  nodes="$(printf '%s\n' "${numa[@]}" | sort -u | wc -l)"
+  awk -v nodes="${nodes}" -v pool="${host_pool_gib}" \
+    -v timeout="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    'BEGIN { if (pool + 0 > 0) nodes++; s = nodes * timeout; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
+}
+
 # The connector's mooncake_store.pools for per_nic pools: each pool's NIC and
 # its master.
 mooncake_pools_json() {
@@ -1501,8 +1547,9 @@ mooncake_store_launcher_config_json() {
 
 start_mooncake_store() {
   mooncake_store_requested || return 0
-  # Several prefill workers in one shell share one Store, whose memory plan
-  # and compaction covered the first worker's GPUs only.
+  # check_mooncake_store_settings refuses a layout that starts several prefill
+  # workers from one shell; should one get here anyway, it shares the Store,
+  # whose memory plan and compaction covered the first worker's GPUs only.
   if mooncake_store_running; then
     if [[ "${mooncake_store_started_for}" != "${HIP_VISIBLE_DEVICES:-}" ]]; then
       echo "[mooncake-store][FAIL] the Store was planned for the prefill GPUs ${mooncake_store_started_for}; this prefill worker uses GPUs ${HIP_VISIBLE_DEVICES:-}" >&2
@@ -1556,7 +1603,13 @@ start_mooncake_store() {
     capacity=$(( capacity + mooncake_pool_capacity[pool] ))
   done
   echo "[wait] mooncake-store pools=${#mooncake_pool_devices[@]} owners here=${#mooncake_owner_plan_numa[@]} capacity=${capacity} bytes"
-  wait_for_mooncake_store "owners" "${MOONCAKE_STORE_WAIT_TIMEOUT:-1200}" \
+  local owners_timeout="${MOONCAKE_STORE_WAIT_TIMEOUT:-1200}" budget
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    # The decode node mounts its owners only once it has compacted its memory.
+    budget="$(mooncake_store_compaction_budget MOONCAKE_STORE_DECODE_OWNERS)"
+    owners_timeout=$(( owners_timeout + budget ))
+  fi
+  wait_for_mooncake_store "owners" "${owners_timeout}" \
     mooncake_store_capacity_reaches "${host_ip}"
   mooncake_store_ready=1
   report_mooncake_store_owners
@@ -1591,9 +1644,11 @@ start_mooncake_store_decode_owners() {
   mooncake_store_logs=()
   mooncake_store_names=()
   mooncake_store_master_count=0
-  local timeout
+  local timeout budget
   timeout="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)"
-  wait_for_mooncake_store "prefill-node masters" "${timeout}" \
+  # The prefill node starts its masters only once it has compacted its memory.
+  budget="$(mooncake_store_compaction_budget MOONCAKE_STORE_OWNERS host_pools)"
+  wait_for_mooncake_store "prefill-node masters" "$(( timeout + budget ))" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
@@ -2219,13 +2274,16 @@ run_benchmark_and_eval() {
 validate_mooncake_store_settings
 write_metadata
 
+# A branch that starts several servers installs its EXIT trap before the first
+# (the pids expand at exit): a start that fails stops those started before it,
+# and their Store.
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"
   decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))
   start_decode "decode-rank-0" "${DECODE_PORT}" "${decode_handshake_port}"
   decode_pid="${server_pid}"
-  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   for ip in "${prefill_ips[@]}"; do
     wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
   done
@@ -2239,6 +2297,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
 elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
   worker_pids=()
   declare -A local_worker_pid=()
+  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
   # Save the base handshake port; each worker overrides it so
   # apply_role_env expands ${HANDSHAKE_PORT} to the per-worker value.
   PACKED_BASE_HANDSHAKE_PORT="${HANDSHAKE_PORT}"
@@ -2264,7 +2323,6 @@ elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
     worker_pids+=("${server_pid}")
     local_worker_pid["decode-${idx}"]="${server_pid}"
   done
-  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
   if [[ "${NODE_RANK}" -eq 0 ]]; then
     for idx in "${!prefill_ips[@]}"; do
       wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
@@ -2295,6 +2353,7 @@ elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
   cleanup_processes "${router_pid:-}" "${worker_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in $(seq 0 $((xP - 1))); do
     gpu_start=$((idx * PREFILL_TP_SIZE))
     gpu_end=$((gpu_start + PREFILL_TP_SIZE - 1))
@@ -2306,7 +2365,6 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
     start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}" "${prefill_dp_master_port}" "${prefill_dp_base_port}"
     prefill_pids+=("${server_pid}")
   done
-  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -2340,6 +2398,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()
+  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   for idx in $(seq 0 $((yD - 1))); do
     gpu_start=$((idx * DECODE_TP_SIZE))
     gpu_end=$((gpu_start + DECODE_TP_SIZE - 1))
@@ -2351,7 +2410,6 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}" "${decode_handshake_port}" "${decode_dp_master_port}" "${decode_dp_base_port}"
     decode_pids+=("${server_pid}")
   done
-  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
   wait_router_closed
   cleanup_processes "${decode_pids[@]}"
