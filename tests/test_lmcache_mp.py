@@ -1156,9 +1156,16 @@ def lmcache_scheduler_adapter(monkeypatch):
             self._parallel = SimpleNamespace(tp_size=1)
             self._mq_timeout = 1.0
             self.from_zero = []
+            self.freed = []
 
         def maybe_submit_lookup_request(self, request_id, token_ids):
             self.from_zero.append(request_id)
+
+        def free_lookup_locks(self, token_ids, start, end, request_id):
+            self.freed.append((request_id, start, end))
+
+        def cleanup_lookup_result(self, request_id):
+            self._lookup_results.pop(request_id, None)
 
         def _create_key(self, token_ids, start, end, request_id, worker_id):
             return Key(start=start, end=end)
@@ -1198,6 +1205,22 @@ def test_scheduler_adapter_answers_its_start_with_no_whole_chunk_past_it(
 
     assert adapter._client.lookups == []
     assert adapter._lookup_results == {"cached": 1024}
+
+
+def test_scheduler_adapter_sends_no_release_for_a_lookup_it_answered(
+    lmcache_scheduler_adapter,
+):
+    # No server looked the prompt up, and a server releasing for a session it
+    # never looked up releases the whole range -- other requests' locks too.
+    adapter = lmcache_scheduler_adapter
+    adapter.maybe_submit_lookup_request("cached", list(range(1100)), start=1100)
+
+    adapter.free_lookup_locks(list(range(1100)), 0, 1024, "cached")
+    adapter.cleanup_lookup_result("cached")
+    adapter.maybe_submit_lookup_request("cached", list(range(1100)), start=600)
+    adapter.free_lookup_locks(list(range(1100)), 0, 1024, "cached")
+
+    assert adapter.freed == [("cached", 0, 1024)]
 
 
 @pytest.mark.parametrize(

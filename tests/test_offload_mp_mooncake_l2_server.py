@@ -341,6 +341,16 @@ def test_release_is_clamped_to_the_lookup_start(lookups):
     assert lookup.freed == [(8, 16), (12, 16)]
 
 
+def test_release_for_a_session_never_looked_up_is_dropped(lookups):
+    # LMCache would release the whole range for it, dropping other requests'
+    # locks on shared chunks.
+    lookup, _sessions = lookups
+
+    lookup.free_lookup_locks(_Key(tuple(range(16)), 0, 16, request_id="other"), 1)
+
+    assert lookup.freed == []
+
+
 def test_lmcache_still_finds_the_patched_lookup_handlers(monkeypatch):
     lookup_module = pytest.importorskip("lmcache.v1.multiprocess.modules.lookup")
     from lmcache.v1.multiprocess.request_handler import iter_request_handlers

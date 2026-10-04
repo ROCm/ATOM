@@ -155,8 +155,9 @@ def prefetch_from_lookup_start() -> None:
     tier is what the request's own prefill stored, and if it was evicted since,
     the first lookup that starts below it finds that out. Releases are clamped
     to the lookup's start: nothing below it was locked, and a release from 0
-    must not drop another request's lock on a shared chunk. A key starting at 0
-    behaves as before.
+    must not drop another request's lock on a shared chunk. For the same reason
+    a release for a session this server never looked up is dropped: LMCache
+    would release the whole range. A key starting at 0 behaves as before.
     """
     from lmcache.v1.multiprocess.modules import lookup as lookup_module
 
@@ -208,11 +209,12 @@ def prefetch_from_lookup_start() -> None:
         lookup_key = self._ctx.session_manager.get_or_create(
             key.request_id
         ).lookup_ipc_key
-        start = 0 if lookup_key is None else lookup_key.start
-        if key.start < start:
-            if key.end <= start:
+        if lookup_key is None:
+            return None
+        if key.start < lookup_key.start:
+            if key.end <= lookup_key.start:
                 return None
-            key = dataclasses.replace(key, start=start)
+            key = dataclasses.replace(key, start=lookup_key.start)
         return free(self, key, tp_size)
 
     query_prefetch_status._atom_from_lookup_start = True
