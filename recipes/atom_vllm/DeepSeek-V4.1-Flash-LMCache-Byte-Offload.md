@@ -242,18 +242,43 @@ each paired against its own OFF arm:
 |---|---|---|---|---|---|
 | seed 7002 | 2.034 | 5.107 | +151.0 % | 2541 ms | 590 ms |
 | seed 7303 | 2.039 | 3.876 | +90.1 % | 2531 ms | 897 ms |
-| seed 7002, current tree | 2.039 | 4.325 | **+112.1 %** | 2537 ms | 834 ms |
+| seed 7002, current tree | 2.049 | **5.607** | **+173.6 %** | 2526 ms | 579 ms |
 
 So the tier is worth roughly **+90 % to +150 %** here, depending on how much
 reuse the workload actually offers.
 
-The third row is the tree as it stands; the first two were taken before the
-defect fixes, the counter correction and the merge with main (which brought
-#2454, itself a change to the offload lookup path). Its ON arm reads 19.6 %
-below the first row at the same seed, and that is **not resolved**: the two
-OFF arms agree to 0.2 %, so the baseline did not move, but a single window at
-this working point has been measured 24 % apart before. Repeat windows on one
-server would separate sampling from regression; they have not been run.
+The third row is the tree as it stands, two windows per arm: ON 5.526 / 5.688
+(2.9 % apart), OFF 2.041 / 2.057 (0.8 %). The effect is ~60x that spread.
+
+### Window noise here is ~1 %, not 24 %
+
+Worth stating because it was got wrong once. Three windows on one server at
+this working point read 4.108 (cold) / 4.348 / 4.381 -- the two warm ones
+0.7 % apart. The 24 % figure quoted earlier was two *different seeds*, and
+the seed is the workload, not a resample. Conflating them turned a real 20 %
+regression into "probably sampling" for one round.
+
+### What that regression was
+
+An intermediate tree measured 4.21-4.27 against 5.383 before it. Bisected by
+arm, with the state leg's own counters as the corroborating signal:
+
+| tree | req/s | stores/window | dedup |
+|---|---|---|---|
+| before the review fixes | 5.383 | 16.5 | 96.4 % |
+| with them | 4.21-4.27 | 59.5 | 90.6 % |
+| with the narrowed fix | **5.607** | 17.5 | 97.4 % |
+
+The cause was releasing *every* finished request's state slot. That fixed a
+real leak -- a reservation made for a parked restore and then aborted is only
+ever cleared by the `assign` that claims it -- but a request that actually
+ran has its slot recycled by the allocator's eviction, and taking those back
+eagerly tripled the 5 MiB state stores. Releasing only the unclaimed
+reservations keeps the fix and gives the throughput back.
+
+Two hypotheses were tested and refuted first: that the gap was sampling (the
+window noise above), and that it came from the merged #2443 commits (measured
+separately at **+21 %** -- they help).
 
 The two OFF arms agree to **0.25 %**, which is the check that makes the spread
 readable: an arm with no reuse is indifferent to the prefix structure, so the
