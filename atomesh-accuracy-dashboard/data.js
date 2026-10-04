@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1790960277292,
+  "lastUpdate": 1791137650176,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3629,6 +3629,57 @@ window.BENCHMARK_DATA = {
             "value": 0.9014,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37033186139 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610021511 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.213 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "honglie",
+            "username": "yhl-amd",
+            "email": "hyi@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "868cb029cc154038fb748c24397afb35e7c2bc57",
+          "message": "[DSV4] Tuned ASM FP8 decode with split plans; HCA on aiter's persistent V4-NM kernel (#2462)\n\n* perf(dsv4): adapt tuned AITER ASM FP8 decode\n\n* style: use functools cache for device arch\n\n* perf(dsv4): steer AITER decode split pick with kv_len_hint\n\nAITER's V4 NM wrapper can now pick num_kv_splits from a latency model when\ntold the per-token KV length to plan for (`kv_len_hint`). ATOM's decode\nkv_indices buffers are capacity-sized, so AITER cannot derive that length\nitself; the builder publishes the worst case per layer type and the decode\ncall forwards it:\n\n- CSA: window + index_topk\n- HCA: window + max_model_len // 128\n\nBoth depend only on config, so the pick stays fixed across CUDA graph\ncapture and replay. With an AITER build that predates `kv_len_hint`\n(detected from the wrapper signature), CSA keeps the batch split table and\nHCA keeps AITER's own auto pick.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* perf(dsv4): pass AITER decode split plans through attention metadata\n\nReplace kv_len_hint with an explicit split plan. The V4 metadata builder\ncalls AITER's get_mla_v4_nm_split_plan once per decode step for each sparse\nlayer type and stores (num_kv_splits, split_indptr) on the attention\nmetadata; the fp8 ASM decode forwards both to mla_decode_fwd_v4_nm.\n\n- Plans are sized for the padded row count and the longest kv_len of the\n  layer type (SWA: window, CSA: window + index_topk, HCA: window +\n  max_model_len // 128), so capture and replay agree.\n- split_indptr lives in persistent forward_vars buffers (per ubatch prefix)\n  that the builder rewrites in place before each forward; graphs of\n  different sizes share them.\n- MTP draft steps clear the SWA plan (it is sized for the verify rows) and\n  fall back to AITER's own pick.\n- AITER builds without get_mla_v4_nm_split_plan keep the CSA batch table.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* refactor(dsv4): one split-plan path, owned by whoever builds the decode CSR\n\n- v4_decode_split_plan (paged_decode) is the single place that knows about\n  aiter's get_mla_v4_nm_split_plan; it returns None on older aiter, which\n  leaves the split pick to aiter.\n- Each owner of a decode CSR builds its plan next to it, in its own\n  persistent split_indptr buffer: the V4 metadata builder (SWA/CSA/HCA for\n  verify, SWA for the MTP draft) and DSpark's DSparkIndexBuffers (built with\n  the CSR at stage 0, read by every stage).\n- sparse_attn_v4_paged_decode takes one split_plan argument; the model picks\n  it in the same ratio branch as kv_indices / kv_indptr.\n- Drop the legacy CSA batch table and the query_group / kv_kind parameters\n  it needed.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* [DSV4] Run HCA fp8 decode through aiter's persistent V4-NM kernel\n\nHCA (compress_ratio 128) decode calls now use\naiter.mla.mla_decode_fwd_v4_nm_ps: one launch that plans the KV split on\nthe GPU from kv_indptr and merges the partials in-kernel, so no host-side\nsplit plan and no stage-2 merge.\n\n- atom/model_ops/v4_kernels/hca_persist.py: gates, per-device workspace\n  (get_mla_v4_nm_ps_workspace) and the call. Taken only for fp8 KV, 128\n  local heads, gfx950, row-dense KV pools and\n  ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768; everything else stays on\n  the decode ASM + split plan. An aiter without the kernel stays on the\n  ASM path and logs once.\n- The V4 metadata builder allocates the workspace at init, before warmup,\n  KV sizing and graph capture. All HCA decode calls run on the forward's\n  compute stream, so one workspace per device is enough.\n- sparse_attn_v4_paged_decode takes the caller's compress_ratio (passed\n  from DeepseekV4Attention's decode call site).\n- ATOM_V4_HCA_PERSIST (default 1) and ATOM_V4_HCA_PERSIST_MIN_ROWS\n  (default 15), documented in docs/environment_variables.md.\n- Tests: mocked dispatch rules, and a gfx950 test against the ASM path\n  and the torch reference, including padded rows, an offset kv_indptr and\n  CUDA-graph replay with changing KV lengths.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* [DSV4] Allocate the persistent HCA workspace at model load on every path\n\nOnly the native V4 metadata builder called hca_persist.prepare(). The vLLM\nand SGLang plugins reach the same persistent HCA decode branch without that\nbuilder, so their workspace was allocated lazily on the first qualifying\ncall: after KV sizing, and as a hard failure if that call was being\ncaptured into a CUDA graph.\n\n- Every HCA DeepseekV4Attention layer now calls\n  hca_persist.prepare_if_usable() at construction (switch on, fp8 KV,\n  128 local heads, gfx950), so model load allocates the workspace in native\n  ATOM and in both plugins, before KV sizing and graph capture. The native\n  builder call stays (idempotent) and shares the eligibility check.\n- The dispatch gate asks hca_persist.workspace_ready(): a call that finds\n  no workspace allocates it when eager, and stays on the ASM path under\n  capture instead of raising.\n- Tests: CPU dispatch tests for the capture fallback and the layer-init\n  hook; GPU test capturing a graph with no workspace (ASM result checked\n  against the reference).\n\nSigned-off-by: yihonglie <hyi@amd.com>\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* [DSV4] Satisfy ruff in the persistent HCA changes\n\nFold hca_persist into the existing v4_kernels import, drop the E402 noqa\ndirectives ruff no longer enables, use dict literals in the GPU test, and\nunderscore an unused unpacked tensor. No behaviour change.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* [DSV4] Fix the non-GPU unit tests for the split-plan and HCA imports\n\ntest_deepseek_v4_transfer_regions loads the real deepseek_v4_attn against a\nfixed set of import stubs, which did not cover what the decode changes added:\naiter.dist.parallel_state.get_tensor_model_parallel_world_size,\nv4_kernels.v4_decode_split_plan and v4_kernels.hca_persist. Under the CPU\nrunner the module then failed to import (41 errors); with test_pp collected\nfirst, its narrower parallel_state stub was picked up instead. Supply the\nthree in the test's own stub set (hca_persist reports itself unusable, as it\nis without aiter), and use a dict literal in the prefill dispatch test.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* [DSV4] Skip the HCA split plan where the persistent kernel runs; review fixes\n\n- The metadata builder no longer builds the HCA split plan for forwards whose\n  HCA decode the persistent kernel takes (it plans on the GPU from the real\n  kv_indptr). The decision uses only init-time state (workspace allocated\n  before any capture) and the row gate shared with dispatch\n  (hca_persist.rows_ok), so capture and every replay agree; a call the kernel\n  then declines gets aiter's own split pick.\n- _prepare_hca_persist delegates to hca_persist.prepare_if_usable and returns\n  whether HCA can take the kernel.\n- DeepseekV4Attention passes its own kv_fp8 flag to prepare_if_usable.\n- Docs: the workspace is allocated at model load, not by the builder; the\n  split-plan helper reference points at ROCm/aiter#6126.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* [DSV4] Build decode split plans on the host from one constant table\n\nEvery fp8 decode split plan is now (s, split_table[s - 1]): aiter's host-only\nsplit count (get_mla_v4_nm_num_kv_splits) and a row of a [16, T + 1]\nuniform split_indptr table built once at init (v4_uniform_split_table).\nNo forward writes a split_indptr any more, and CUDA graphs of every size\nread constant memory, so a graph can no longer see another size's plan.\n\n- The builder's per-layer-type, per-ubatch and MTP-draft split_indptr\n  buffers are replaced by the one shared table; DSparkIndexBuffers keeps its\n  own table sized for its draft rows.\n- With planning free, the HCA plan is built again for every forward (the\n  persistent kernel ignores it), so the builder no longer tracks whether HCA\n  takes that kernel.\n- A split count beyond the table, or rows beyond it, leaves the pick to aiter.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n* [DSV4] Describe split plans as plain tuples in the docstrings\n\naiter no longer has MlaV4NmSplitPlan; ATOM's plans were already\n(num_kv_splits, split_indptr) tuples from v4_decode_split_plan.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nSigned-off-by: yihonglie <hyi@amd.com>\n\n---------\n\nSigned-off-by: yihonglie <hyi@amd.com>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+          "timestamp": "2026-10-04T15:20:15Z",
+          "url": "https://github.com/ROCm/ATOM/commit/868cb029cc154038fb748c24397afb35e7c2bc57"
+        },
+        "date": 1791137649492,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37220817574 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610041628 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37220817574 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610041628 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.01,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37220817574 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610041628 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.887,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37220817574 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610041628 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.21 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
