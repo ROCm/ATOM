@@ -155,6 +155,41 @@ def _register_custom_attention_to_sglang() -> None:
     install_upstream_glm52_graph_metadata_adapter()
 
 
+def _keep_atom_backend_for_qwen_qsa() -> None:
+    """Stop SGLang from replacing ATOM's full-attention backend on Qwen QSA models.
+
+    Since v0.5.20 SGLang's hybrid-GDN backend wrapper swaps the full-attention
+    child for its own ``QwenSparseAttnBackend`` whenever ``is_qwen_qsa`` holds.
+    ATOM's Qwen4Exp runs its own QSA kernels and fills their CUDA-graph page
+    tables from ``ATOMAttnBackendForSgl.init_forward_metadata_out_graph``; with
+    the swap that hook never runs and graph capture fails on the unallocated
+    buffers. Report "not QSA" to SGLang only for Qwen4Exp models ATOM serves.
+    """
+    try:
+        import sglang.srt.layers.attention.qsa.config as sglang_qsa_config
+    except ImportError:
+        return
+    if getattr(sglang_qsa_config, "_atom_keep_backend_patched", False):
+        return
+    if "atom.plugin.sglang" not in os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE", ""):
+        return
+
+    original_is_qwen_qsa = sglang_qsa_config.is_qwen_qsa
+
+    def is_qwen_qsa(config) -> bool:
+        arches = getattr(config, "architectures", None) or []
+        if any("Qwen4Exp" in str(arch) for arch in arches):
+            return False
+        return original_is_qwen_qsa(config)
+
+    sglang_qsa_config.is_qwen_qsa = is_qwen_qsa
+    sglang_qsa_config._atom_keep_backend_patched = True
+    logger.info(
+        "ATOM plugin: keep ATOMAttnBackendForSgl for Qwen4Exp QSA layers "
+        "(SGLang QwenSparseAttnBackend disabled)"
+    )
+
+
 def _patch_sglang_dsv4_draft_backends() -> None:
     """Route hard-coded speculative factories to ATOM-owned backends.
 
@@ -162,6 +197,10 @@ def _patch_sglang_dsv4_draft_backends() -> None:
     of going through the attention registry.  SGLang's native backend asserts a
     native DeepSeekV4TokenToKVPool, while ATOM plugin mode uses a proxy KV pool,
     so patch the factory methods to return the ATOM shim.
+
+    SGLang 0.5.19 ``DraftBackendFactory._create_backend`` unpacks
+    ``stamp, backend = factory()``.  Both decode and draft-extend factories
+    must return that pair; a bare backend raises TypeError before lm_eval.
 
     GLM-5.2 uses SGLang's AITER multi-step lifecycle with ATOM's general
     attention backend.
@@ -181,16 +220,22 @@ def _patch_sglang_dsv4_draft_backends() -> None:
         return
 
     def _create_atom_dsv4_decode_backend(self):
-        return ATOMDeepseekV4BackendForSgl(
-            self.draft_model_runner,
-            topk=self.topk,
-            speculative_num_steps=self.speculative_num_steps,
+        return (
+            "dsv4",
+            ATOMDeepseekV4BackendForSgl(
+                self.draft_model_runner,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
+            ),
         )
 
     def _create_atom_dsv4_prefill_backend(self):
-        return ATOMDeepseekV4BackendForSgl(
-            self.draft_model_runner,
-            skip_prefill=False,
+        return (
+            "dsv4",
+            ATOMDeepseekV4BackendForSgl(
+                self.draft_model_runner,
+                skip_prefill=False,
+            ),
         )
 
     DraftBackendFactory._create_dsv4_decode_backend = _create_atom_dsv4_decode_backend
@@ -268,6 +313,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             )
         except Exception:
             return False
+
+    def _is_qwen4_exp_nextn_runner(runner) -> bool:
+        model_config = getattr(runner, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        return "Qwen4ExpForCausalLMNextN" in (
+            getattr(hf_config, "architectures", None) or []
+        )
 
     def _is_dsv4_or_glm52_nextn_runner(runner) -> bool:
         return _is_dsv4_nextn_runner(runner) or _is_glm52_nextn_runner(runner)
@@ -788,15 +840,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
+            # Flash draft stays eager: mRoPE positions are [3, N], same as
+            # Native EagleProposer skipping mid-step graphs.
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
-            )
+            ) or _is_qwen4_exp_nextn_runner(draft_runner)
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
                 original_capture_cuda_graphs = self._capture_cuda_graphs
-                self._capture_cuda_graphs = lambda: None
+
+                def _skip_draft_cuda_graphs(_self=self):
+                    _self.cuda_graph_runner = None
+                    _self.cuda_graph_runner_for_draft_extend = None
+
+                self._capture_cuda_graphs = _skip_draft_cuda_graphs
             original_draft_extend_backend = None
             hide_draft_extend_backend = (
                 not _draft_extend_graph_enabled(draft_runner)
@@ -1041,6 +1100,7 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     )
 
     _register_custom_attention_to_sglang()
+    _keep_atom_backend_for_qwen_qsa()
     _patch_sglang_dsv4_draft_backends()
     patch_sglang_eagle3_runtime_compat()
     _patch_sglang_dsv4_spec_cuda_graph()

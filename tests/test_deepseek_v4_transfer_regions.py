@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
     INDEX_CACHE_FP4_PREFIX,
     KVTransferRegion,
     KVTransferTensors,
+    PageRegion,
 )
 from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -42,7 +43,7 @@ _FP4_K_TILES = _INDEX_HEAD_DIM // 128
 
 
 def test_generic_transfer_tensors_default_to_no_full_slot_expectation():
-    transfer = KVTransferTensors(block_regions=[], slot_regions=[])
+    transfer = KVTransferTensors()
 
     assert transfer.expected_full_slot_region_count is None
 
@@ -70,11 +71,10 @@ class TestTheBlockIdSpacePageRegionsAreAddressedIn:
 
     def test_regions_in_the_scheduler_block_are_accepted(self):
         transfer = KVTransferTensors(
-            block_regions=[
-                _page_region(8, 2080, "kv.layer_0"),
-                _page_region(8, 132, "index.layer_0"),
-            ],
-            slot_regions=[],
+            pages=[
+                PageRegion(_page_region(8, 2080, "kv.layer_0")),
+                PageRegion(_page_region(8, 132, "index.layer_0")),
+            ]
         )
 
         transfer.set_block_count(8)
@@ -87,11 +87,10 @@ class TestTheBlockIdSpacePageRegionsAreAddressedIn:
         `1/block_ratio` the bytes -- the same total, which is why no byte count
         catches it."""
         transfer = KVTransferTensors(
-            block_regions=[
-                _page_region(8, 2080, "kv.layer_0"),
-                _page_region(8 * 16, 2080 // 16, "kv.layer_1"),
-            ],
-            slot_regions=[],
+            pages=[
+                PageRegion(_page_region(8, 2080, "kv.layer_0")),
+                PageRegion(_page_region(8 * 16, 2080 // 16, "kv.layer_1")),
+            ]
         )
 
         with pytest.raises(ValueError, match="kv.layer_1 holds 128 blocks"):
@@ -99,8 +98,9 @@ class TestTheBlockIdSpacePageRegionsAreAddressedIn:
 
     def test_a_region_that_does_not_divide_into_whole_blocks_is_refused(self):
         transfer = KVTransferTensors(
-            block_regions=[KVTransferRegion(0x1000, 100, 32, semantic_role="ragged")],
-            slot_regions=[],
+            pages=[
+                PageRegion(KVTransferRegion(0x1000, 100, 32, semantic_role="ragged"))
+            ]
         )
 
         with pytest.raises(ValueError, match="does not divide into whole blocks"):
@@ -110,7 +110,7 @@ class TestTheBlockIdSpacePageRegionsAreAddressedIn:
         """`init=False` is the enforcement: a backend cannot state a count that
         its own regions contradict, because it cannot state one at all."""
         with pytest.raises(TypeError):
-            KVTransferTensors(block_regions=[], slot_regions=[], num_blocks=8)
+            KVTransferTensors(num_blocks=8)
 
 
 @contextmanager
@@ -789,8 +789,8 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
     owners, src, dst, conn, req = _fp4_pd_pair(
         v4_builder_cls, mooncake_page_writer, kv_dtype, coalesce
     )
-    src_regions = src.block_regions + src.swa_block_regions
-    dst_regions = dst.block_regions + dst.swa_block_regions
+    src_regions = [*src.block_regions, *src.swa_block_regions]
+    dst_regions = [*dst.block_regions, *dst.swa_block_regions]
     expected = []
     for n, (sr, dr) in enumerate(zip(src_regions, dst_regions, strict=True)):
         # Different layers and byte offsets expose missing scales, swapped

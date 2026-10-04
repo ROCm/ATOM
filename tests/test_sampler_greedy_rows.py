@@ -41,6 +41,35 @@ def test_greedy_correction_preserves_sampled_rows(
     assert (sampled == -1).all()  # Caller-owned sampled results are not mutated.
 
 
+def _noise_picks_the_high_tie(logits, temperatures, needs_independent_noise=False):
+    """Stand-in for the Gumbel draw: on an exact tie it may land on either id."""
+    return torch.full((logits.shape[0],), 5, dtype=torch.int)
+
+
+@pytest.mark.parametrize("filters", [(None, None), (None, 0.9)])
+def test_all_greedy_batch_takes_the_low_tie_whatever_its_filters(monkeypatch, filters):
+    # Temperatures as the runner hands them over: clamped to SAMPLER_EPS.
+    monkeypatch.setattr(sampler, "topk_select", _torch_topk_select)
+    instance = sampler.Sampler()
+    monkeypatch.setattr(instance, "_temperature_sample", _noise_picks_the_high_tie)
+    logits = torch.zeros(3, 8)
+    logits[:, 2] = logits[:, 5] = 1.0
+    temperatures = torch.full((3,), sampler.SAMPLER_EPS)
+    got = instance(logits, temperatures, *filters, all_greedy=True)
+    assert got.tolist() == [2, 2, 2]
+
+
+def test_mixed_batch_greedy_rows_take_the_low_tie(monkeypatch):
+    monkeypatch.setattr(sampler, "topk_select", _torch_topk_select)
+    instance = sampler.Sampler()
+    monkeypatch.setattr(instance, "_temperature_sample", _noise_picks_the_high_tie)
+    logits = torch.zeros(4, 8)
+    logits[:, 2] = logits[:, 5] = 1.0
+    temperatures = torch.tensor([sampler.SAMPLER_EPS, 0.7, sampler.SAMPLER_EPS, 1.0])
+    got = instance(logits, temperatures, None, None, all_greedy=False)
+    assert got.tolist() == [2, 5, 2, 5]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("path", ["aiter", "native"])
 @pytest.mark.parametrize("greedy", ["none", "mixed", "all"])

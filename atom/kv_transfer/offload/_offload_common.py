@@ -11,6 +11,8 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
+import collections
+import json
 import logging
 import os
 import threading
@@ -29,6 +31,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveCompletionId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
@@ -154,9 +157,7 @@ class OffloadWorkerMixin:
         # behind fire-and-forget saves. OFFLOAD_COPY_WORKERS tunes the save pool,
         # OFFLOAD_LOAD_WORKERS the load pool.
         n_save = (
-            int(os.environ.get("OFFLOAD_COPY_WORKERS", "1"))
-            if save_workers is None
-            else int(save_workers)
+            envs.OFFLOAD_COPY_WORKERS if save_workers is None else int(save_workers)
         )
         if n_save <= 0:
             raise ValueError("offload save worker count must be positive")
@@ -169,9 +170,7 @@ class OffloadWorkerMixin:
         # threads are independent; each costs one more
         # `gpu_staging_buffer_bytes` allocation per rank.
         n_load = (
-            int(os.environ.get("OFFLOAD_LOAD_WORKERS", "1"))
-            if load_workers is None
-            else int(load_workers)
+            envs.OFFLOAD_LOAD_WORKERS if load_workers is None else int(load_workers)
         )
         if n_load <= 0:
             raise ValueError("offload load worker count must be positive")
@@ -326,14 +325,7 @@ class OffloadWorkerMixin:
 
     @staticmethod
     def _profile_enabled() -> bool:
-        # Same env-flag semantics as `atom_lmcache_staging._env_flag` (kept
-        # inline rather than imported: that module pulls in torch and this one
-        # is torch-free). Strip, and read the empty string as OFF -- `VAR=` is
-        # how a shell clears a flag inline, and a bare membership test would
-        # read "" as ON (not in the false set), the opposite of what the
-        # operator wrote; `VAR="off "` had the same trap.
-        raw = os.environ.get("OFFLOAD_PROFILE", "0").strip().lower()
-        return bool(raw) and raw not in {"0", "false", "no", "off"}
+        return envs.OFFLOAD_PROFILE
 
     def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
@@ -517,6 +509,7 @@ class OffloadSchedulerMixin(ABC):
         self.total_leased_source_blocks = 0  # ever protected by a save lease
         self.total_source_safe_released_blocks = 0  # freed once their save reported
         self.total_abnormal_lease_reclaims = 0  # freed by stall timeout, no report
+        self.total_truncated_late_saves = 0  # final save lost evicted prefix blocks
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Apply offload-specific completions and expose plain request IDs."""
@@ -643,6 +636,7 @@ class OffloadSchedulerMixin(ABC):
                 source_safe_released_blocks=self.total_source_safe_released_blocks,
                 blocks_waiting_for_store=self.blocks_waiting_for_store(),
                 abnormal_lease_reclaims=self.total_abnormal_lease_reclaims,
+                truncated_late_saves=self.total_truncated_late_saves,
             )
         return statistics
 
@@ -667,16 +661,16 @@ class OffloadSchedulerMixin(ABC):
     def max_pending_saves(self) -> int | None:
         """Running-plus-queued save bound this connector enforces, else None.
 
-        The public read of the per-connector `_max_pending_saves` that
-        `max_pending_saves(kvc, save_workers)` computes from
-        `kv_connector_extra_config` and `OFFLOAD_COPY_WORKERS`. The state leg
+        The public read of the connector's `_max_pending_saves`, computed from
+        a `kv_connector_extra_config` `"max_pending_saves"` override, else the
+        `OFFLOAD_MAX_PENDING_SAVES` setting, else the default derived from
+        `OFFLOAD_COPY_WORKERS`. The state leg
         (`Scheduler._state_store_pending_cap`) shares this exact number with the
-        KV leg's `_may_emit_save` so both legs pin the same slice of the pool,
-        and honours a per-connector `"max_pending_saves"` override the env reader
-        never sees. None when the connector does not bound its save queue
-        (`_may_emit_save` always True, as on dense) -- the scheduler then falls
-        back to the env reader. Exposed so the scheduler never reaches through
-        the delegating shell's `_impl` for it.
+        KV leg's `_may_emit_save` so both legs pin the same slice of the pool.
+        None when the connector does not bound its save queue (`_may_emit_save`
+        always True, as on dense) -- the scheduler then falls back to the env
+        reader. Exposed so the scheduler never reaches through the delegating
+        shell's `_impl` for it.
         """
         return getattr(self, "_max_pending_saves", None)
 
@@ -736,27 +730,8 @@ class OffloadSchedulerMixin(ABC):
 
         # sid -> (weak ref to the sequence asked about, hit or None, budget).
         self._tier_hit_memo: dict[str, tuple[object, int | None, int]] = {}
-        self._tier_memo_steps = self._positive_env("OFFLOAD_LOOKUP_MEMO_STEPS", 32)
-        self._tier_retry_steps = self._positive_env("OFFLOAD_LOOKUP_RETRY_STEPS", 32)
-
-    @staticmethod
-    def _positive_env(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        if raw is None:
-            return default
-        try:
-            value = int(raw)
-        except ValueError:
-            value = -1
-        if value < 0:
-            logger.warning(
-                "LMCache offload scheduler: invalid %s=%r; using %d",
-                name,
-                raw,
-                default,
-            )
-            return default
-        return value
+        self._tier_memo_steps = envs.OFFLOAD_LOOKUP_MEMO_STEPS
+        self._tier_retry_steps = envs.OFFLOAD_LOOKUP_RETRY_STEPS
 
     @staticmethod
     def _weak_seq(seq):
@@ -1005,6 +980,43 @@ class OffloadSchedulerMixin(ABC):
         )
         return True
 
+    def _perf_bump(self, key: str, n: int = 1) -> None:
+        """Cumulative diagnostic counter, summarised by `_perf_maybe_log`."""
+
+        counters = self.__dict__.get("_perf_counters")
+        if counters is None:
+            counters = self._perf_counters = collections.Counter()
+        counters[key] += int(n)
+
+    def _perf_maybe_log(self) -> None:
+        """One INFO line per minute with the diagnostic counters and statistics.
+
+        Only with `OFFLOAD_PROFILE`; the counters themselves are always kept.
+        """
+
+        if not envs.OFFLOAD_PROFILE:
+            return
+        now = time.monotonic()
+        last = self.__dict__.get("_perf_last_log")
+        if last is None:
+            self._perf_last_log = now
+            return
+        if now - last < 60.0:
+            return
+        self._perf_last_log = now
+        counters = self.__dict__.get("_perf_counters")
+        if not counters:
+            return
+        try:
+            statistics = self.get_statistics()
+        except Exception:  # noqa: BLE001  # diagnostics must never fail a step
+            statistics = {}
+        logger.info(
+            "[OFFLOAD-PERF] %s | %s",
+            json.dumps(dict(sorted(counters.items()))),
+            json.dumps(statistics),
+        )
+
     def _mark_load_skip(
         self,
         seq,
@@ -1015,6 +1027,8 @@ class OffloadSchedulerMixin(ABC):
         chunk: int,
     ) -> None:
         seq.offload_loaded_tokens = hbm
+        self._perf_bump("skip_" + reason)
+        self._perf_bump("skip_tokens_" + reason, max(0, lmc - hbm))
         min_load = int(getattr(self, "_min_load_tokens", 8192))
         logger.debug(
             "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "
@@ -1066,7 +1080,7 @@ class OffloadSchedulerMixin(ABC):
     def _has_pending_save(self, seq) -> bool:
         sid = str(seq.id)
         entry = self._save_tracker.get(sid)
-        if entry is None:
+        if entry is None or entry[0] is not seq:
             return False
         return self._save_frontier(seq) > int(entry[1])
 
@@ -1083,14 +1097,9 @@ def max_pending_saves(kvc, save_workers: int) -> int:
     extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
     configured = extra.get("max_pending_saves")
     if configured is None:
-        configured = os.environ.get(
-            "OFFLOAD_MAX_PENDING_SAVES",
-            str(max(2, 2 * save_workers)),
-        )
-        try:
-            capacity = int(configured)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("max pending saves must be a positive integer") from exc
+        capacity = envs.OFFLOAD_MAX_PENDING_SAVES
+        if capacity is None:
+            capacity = max(2, 2 * save_workers)
     else:
         if isinstance(configured, bool) or not isinstance(configured, int):
             raise ValueError("max pending saves must be a positive integer")

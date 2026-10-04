@@ -365,6 +365,35 @@ class BlockPool:
             del self._raw_unit_owner[block_id]
             self.free(block_id)
 
+    def rekey_units(
+        self,
+        unit_ids: Iterable[int],
+        old_owner: Hashable,
+        new_owner: Hashable,
+    ) -> None:
+        """Atomically transfer a raw reservation between logical owners.
+
+        The units remain allocated throughout the hand-off.  This is required
+        when an external-transfer scratch image becomes a reusable checkpoint:
+        releasing and re-reserving would briefly expose the units through the
+        free list, allowing another allocation to overwrite bytes that the new
+        checkpoint index already advertises.
+        """
+        ids = list(unit_ids)
+        if len(ids) != len(set(ids)):
+            raise ValueError("a raw-unit ownership transfer contains duplicate ids")
+        if old_owner is None or new_owner is None:
+            raise ValueError("raw-unit ownership transfer needs both owners")
+        for piece_index, block_id in enumerate(ids):
+            actual = self._raw_unit_owner.get(block_id)
+            expected = (old_owner, piece_index)
+            if actual != expected:
+                raise AssertionError(
+                    f"raw unit {block_id} belongs to {actual!r}, not {expected!r}"
+                )
+        for piece_index, block_id in enumerate(ids):
+            self._raw_unit_owner[block_id] = (new_owner, piece_index)
+
     # ------------------------------ resizing ------------------------------- #
     def extend(self, count: int) -> int:
         """Grow the pool by up to `count` blocks; returns how many it took.

@@ -16,6 +16,25 @@ logger = logging.getLogger("atom")
 VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD = 4096
 
 
+def get_sglang_server_args():
+    """Read SGLang operator ServerArgs (raw input record).
+
+    Prefer ``runtime_context.get_server_args()``. This is the operator's
+    *input*, not resolution-decided values. Fields known to diverge after
+    resolution include ``mem_fraction_static`` (``get_schedule()``),
+    ``attention_backend`` (``get_exec().kernel``), ``max_running_requests``,
+    and ``context_length``. Callers that need the in-effect value should
+    read the corresponding namespace bag.
+    """
+    try:
+        from sglang.srt.runtime_context import get_server_args
+    except ImportError:
+        # Only ≤0.5.18 lacks runtime_context.get_server_args.
+        from sglang.srt.server_args import get_global_server_args as get_server_args
+
+    return get_server_args()
+
+
 def _get_sglang_tbo_flags(enable_two_batch_overlap: bool) -> tuple[bool, bool]:
     """Translate SGLang's TBO switch and ATOM mode into ATOM config flags."""
     if not enable_two_batch_overlap:
@@ -268,6 +287,48 @@ def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
     )
 
 
+def _build_atom_speculative_config_from_sglang(server_args: Any, hf_config: Any):
+    """SGLang EAGLE/NEXTN → ATOM ``SpeculativeConfig``.
+
+    Native Qwen4Exp returns the unmixed HC bundle only when
+    ``atom_config.speculative_config is not None``. SGLang owns scheduling;
+    this object is that ABI flag plus the Native draft-token horizon
+    (``speculative_num_steps``, not SGLang's ``steps+1`` draft-token count).
+    """
+    algo = getattr(server_args, "speculative_algorithm", None)
+    name = str(getattr(algo, "name", algo)).strip().upper()
+    if name in {"", "NONE", "NULL", "FALSE"}:
+        return None
+
+    text = getattr(hf_config, "text_config", None) or hf_config
+    if getattr(text, "model_type", None) not in {"qwen4_exp", "qwen4_exp_text"}:
+        return None
+    if name not in {"EAGLE", "NEXTN"}:
+        raise ValueError("Flash MTP requires speculative_algorithm=EAGLE (or NEXTN)")
+    if getattr(server_args, "speculative_eagle_topk", 1) != 1:
+        raise ValueError("Flash MTP requires speculative_eagle_topk=1")
+    draft_path = getattr(server_args, "speculative_draft_model_path", None)
+    if draft_path and draft_path != server_args.model_path:
+        raise ValueError(
+            "Flash MTP requires the target and draft to share a checkpoint"
+        )
+
+    from atom.config import SpeculativeConfig
+
+    steps = getattr(server_args, "speculative_num_steps", None)
+    num_spec = int(steps) if steps is not None else None
+    logger.info(
+        "SGLang+ATOM speculative_config method=mtp tokens=%s model=%s",
+        num_spec,
+        server_args.model_path,
+    )
+    return SpeculativeConfig(
+        method="mtp",
+        model=server_args.model_path,
+        num_speculative_tokens=num_spec,
+    )
+
+
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     from atom.config import CompilationConfig, Config
 
@@ -389,7 +450,6 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
         PortArgs,
-        get_global_server_args,
     )
 
     from atom.config import CompilationConfig, Config, ParallelConfig
@@ -397,7 +457,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # sglang's ModelRunner already parsed and stored ServerArgs globally
     # before OOT model loading, so we can retrieve it directly.
     try:
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
     except Exception as exc:
         raise RuntimeError(
             "Failed to retrieve SGLang global ServerArgs. Ensure this "
@@ -586,12 +646,18 @@ def _generate_atom_config_from_sglang_config(config: Any):
     if str(atom_kv_cache_dtype).startswith("fp8"):
         atom_kv_cache_dtype = "fp8"
 
+    atom_speculative_config = _build_atom_speculative_config_from_sglang(
+        server_args, sgl_model_config.hf_config
+    )
+
     return Config(
         model=server_args.model_path,
         trust_remote_code=server_args.trust_remote_code,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=server_args.max_running_requests or 512,
         max_model_len=server_args.context_length,
+        # Operator raw input. AITER long-ctx may later scale this via
+        # get_schedule().mem_fraction_static; ATOM's pool is owned by SGLang.
         gpu_memory_utilization=server_args.mem_fraction_static,
         tensor_parallel_size=atom_tensor_parallel_size,
         prefill_context_parallel_size=atom_prefill_context_parallel_size,
@@ -617,6 +683,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
         plugin_config=plugin_config,
         online_quant_config=online_quant_config,
         hf_overrides=hf_overrides,
+        speculative_config=atom_speculative_config,
     )
 
 

@@ -1395,20 +1395,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
             INDEX_CACHE_ROLE,
             MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
+            PageRegion,
         )
 
         runner = self.model_runner
         if self.kv_pool is None:
             return None
-        if self._indexer_fp4:
-            # A connector is handed one `INDEX_CACHE_ROLE` region per layer --
-            # the whole vocabulary it and its DCP shard plan have for the
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        if (
+            self._indexer_fp4
+            and not KVConnectorFactory.topology_region_readers_copy_whole_blocks(
+                runner.config
+            )
+        ):
+            # A P/D connector is handed one `INDEX_CACHE_ROLE` region per layer
+            # -- the whole vocabulary it and its DCP shard plan have for the
             # indexer -- and the FP4 cache is two planes neither parses.
+            # A transport registered with `copies_whole_block_regions`
+            # (`lmcache_mp`) is the exception, admitted above: it copies whole
+            # blocks of every published region, so the FP4 data and its e8m0
+            # scale plane travel as two regions per layer (see below).
             #
             # That is a statement about the REGION MAP, so it only binds the
             # transports that read one. Dense offload does not: it never looks
@@ -1423,17 +1436,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # answers whether a backend needs compressor P/D staging, and
             # `lmcache_mp` declares that False while still requiring these
             # regions. Ask the question actually being asked.
-            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
             if KVConnectorFactory.topology_reads_block_regions(runner.config):
                 raise NotImplementedError(
                     "KV transfer that addresses the cache through the PAGE "
-                    "region map is unsupported with the FP4 sparse indexer: "
-                    "the map cannot describe its separate e8m0 scale plane. "
-                    "That is every P/D backend, lmcache_mp, and the hybrid/m3/"
-                    "kimi_k3 offload layouts. Pass --index_cache_dtype fp8 to "
-                    "use one; dense CPU/NVMe offload (lmcache_offload) carries "
-                    "both planes and needs no change."
+                    "region map is unsupported with the FP4 sparse indexer "
+                    "unless lmcache_mp is the only transport reading the map: "
+                    "the P/D backends and the hybrid/m3/kimi_k3 offload layouts "
+                    "parse one index region per layer and cannot place its "
+                    "separate e8m0 scale plane. Pass --index_cache_dtype fp8 to "
+                    "use one; lmcache_mp and dense CPU/NVMe offload "
+                    "(lmcache_offload) carry both planes and need no change."
                 )
             return None
         # What the pool was built with, not what the hook would recompute: a
@@ -1447,32 +1459,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # and no per-field override to keep in step with the pooling ones.
         # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
         # `dsa.index_cache`) rather than the pool's per-layer names.
-        region_tensors = self.kv_pool.region_tensors()
-        block_regions: list[KVTransferRegion] = []
-        for role, t in region_tensors:
-            bpb = t.stride(0) * t.element_size()
+        pages: list[PageRegion] = []
+        for role, t in self.kv_pool.region_tensors():
             if role.startswith("index."):
-                block_regions.append(
-                    KVTransferRegion(
-                        base_addr=t.data_ptr(),
-                        total_bytes=t.numel() * t.element_size(),
-                        unit_bytes=bpb,
-                        semantic_role=INDEX_CACHE_ROLE,
-                    )
-                )
+                pages.append(page_region(t, semantic_role=INDEX_CACHE_ROLE))
                 index_tensors.append(t)
                 continue
-            block_regions.append(
-                KVTransferRegion(
-                    base_addr=t.data_ptr(),
-                    total_bytes=t.numel() * t.element_size(),
-                    unit_bytes=bpb,
+            pages.append(
+                page_region(
+                    t,
                     semantic_role=(
                         MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
                     ),
                 )
             )
-        block_tensor_views = [t for _, t in region_tensors]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1565,6 +1565,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
                 for layer_id in local_index_layer_ids
             ]
+            if self._indexer_fp4:
+                # `region_tensors` publishes the FP4 scale planes after the
+                # index data planes, one per index layer; number them after
+                # every consumer's index regions so the list still names one
+                # consumer region per published PAGE region.
+                block_region_consumer_indices += [
+                    num_global_kv_layers
+                    + len(global_index_layer_ids)
+                    + global_compact_index_slot_by_layer[layer_id]
+                    for layer_id in local_index_layer_ids
+                ]
 
         index_staging_region = None
         index_staging_pool_size = 0
@@ -1635,9 +1646,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 return slot.data_ptr(), pages
 
         return KVTransferTensors(
-            block_regions=block_regions,
-            slot_regions=[],
-            block_tensor_views=block_tensor_views,
+            pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,

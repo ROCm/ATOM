@@ -1095,12 +1095,15 @@ class ModelRunner:
         """
         Start profiling for this rank.
 
-        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
-        - Set to "1" to enable record_shapes, with_stack, and profile_memory.
-        - Set to "0" or unset to disable these features (default).
+        Set ATOM_PROFILER_RECORD_SHAPES, ATOM_PROFILER_WITH_STACK, or
+        ATOM_PROFILER_PROFILE_MEMORY to "1"/"0" to enable/disable the matching
+        profiler option. Any left unset falls back to ATOM_PROFILER_MORE, which
+        enables all three when "1" (default: all disabled).
         """
         if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            record_shapes = envs.ATOM_PROFILER_RECORD_SHAPES
+            with_stack = envs.ATOM_PROFILER_WITH_STACK
+            profile_memory = envs.ATOM_PROFILER_PROFILE_MEMORY
             model_name = os.path.basename(self.config.model.rstrip("/"))
             safe_model_name = "".join(
                 c if c.isalnum() or c in ("_", "-", ".") else "_" for c in model_name
@@ -1158,16 +1161,19 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+                profile_memory=profile_memory,
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
             logger.info(
-                "Rank %d: profiler started (detailed=%s, dir=%s)",
+                "Rank %d: profiler started "
+                "(record_shapes=%s, with_stack=%s, profile_memory=%s, dir=%s)",
                 self.rank,
-                enable_detailed_profiling,
+                record_shapes,
+                with_stack,
+                profile_memory,
                 self.profiler_dir,
             )
         return True
@@ -2103,9 +2109,9 @@ class ModelRunner:
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
-            if draft_regions:
-                transfer_tensors.block_regions.extend(draft_regions)
+            transfer_tensors.merge_pages(
+                self.draft_kv_builder.get_kv_transfer_tensors()
+            )
         if transfer_tensors is not None:
             # After the draft's regions are in, and here because this is the
             # only place holding both the complete region list and the
@@ -3653,14 +3659,19 @@ class ModelRunner:
             self.profiler_dir is not None and self.mark_trace
         )
         if self._capture_profile_enabled:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            record_shapes = envs.ATOM_PROFILER_RECORD_SHAPES
+            with_stack = envs.ATOM_PROFILER_WITH_STACK
+            profile_memory = envs.ATOM_PROFILER_PROFILE_MEMORY
             self._capture_trace_tag = None
             self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
             os.makedirs(self.capture_traces_dir, exist_ok=True)
             logger.info(
-                "%s: Starting CUDA graph capture profiler (detailed=%s)...",
+                "%s: Starting CUDA graph capture profiler "
+                "(record_shapes=%s, with_stack=%s, profile_memory=%s)...",
                 self.label,
-                enable_detailed_profiling,
+                record_shapes,
+                with_stack,
+                profile_memory,
             )
 
             def on_trace_ready(prof):
@@ -3692,9 +3703,9 @@ class ModelRunner:
                 # capture loop lands in its own file with nothing dropped between
                 # them (wait>0 would silently skip alternate batch sizes).
                 schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+                profile_memory=profile_memory,
                 on_trace_ready=on_trace_ready,
             )
         else:

@@ -117,6 +117,24 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
+def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+    validate_runtime_config(
+        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
+    )
+    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                runtime_config(kv_transfer_config={"kv_connector": connector})
+            )
+    with pytest.raises(ValueError, match="RapidServe"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "lmcache_mp"},
+                enable_rapidserve=True,
+            )
+        )
+
+
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime

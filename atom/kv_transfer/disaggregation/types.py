@@ -11,6 +11,7 @@ KV output aggregator.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -189,11 +190,29 @@ class KVTransferRegion:
         return self.base_addr + index * self.unit_bytes
 
 
+@dataclass(frozen=True)
+class PageRegion:
+    """One PAGE region and the tensor that aliases exactly its bytes.
+
+    The region is the address form every transport reads (P/D, dense offload);
+    the view is the tensor form LMCache MP registers. They describe the same
+    bytes, so they travel as one value and cannot fall out of step. A producer
+    that only has addresses leaves ``view`` None; LMCache MP then refuses the
+    layout rather than register a partial one. Build one from a tensor with
+    `atom.kv_transfer.disaggregation.page_region.page_region`.
+    """
+
+    region: KVTransferRegion
+    view: Any = None
+
+
 @dataclass
 class KVTransferTensors:
     """Physical PAGE, SLOT, and compressor-only staging region contract.
 
-    ``block_regions`` contain forward-indexed, block-indexed PAGE units.
+    ``pages`` are forward-indexed, block-indexed PAGE units, each with its
+    region and (when published) its tensor view; ``block_regions`` and
+    ``block_tensor_views`` read them back.
     ``swa_block_regions`` is a legacy field name for complete reverse-indexed
     per-request SLOT units, including both compressor state and SWA.
     ``expected_full_slot_region_count`` makes a stateful layout's complete
@@ -213,9 +232,9 @@ class KVTransferTensors:
     protocol can describe replication per region group.
     """
 
-    # Block-indexed PAGE regions, indexed forward by block id.
-    block_regions: list[KVTransferRegion]
-    slot_regions: list[KVTransferRegion]
+    # Block-indexed PAGE regions with their views, indexed forward by block id.
+    pages: list[PageRegion] = field(default_factory=list)
+    slot_regions: list[KVTransferRegion] = field(default_factory=list)
     num_slots: int = 0
     # Optional producer-local -> consumer-global mapping for non-uniform block
     # region layouts. Uniform per-layer groups leave this unset and use the
@@ -231,12 +250,6 @@ class KVTransferTensors:
     scatter_slot: Callable[[int, int], None] | None = None
     # Appended for positional compatibility with existing generic descriptors.
     expected_full_slot_region_count: int | None = None
-    # Zero-copy, physical-order views paired with block regions.
-    # Each view is [num_units, physical_slots_per_unit, opaque_width]; it may
-    # retain its native dtype, and one dim-0 unit must cover exactly the paired
-    # region's unit_bytes. The last two dimensions describe copy geometry, not
-    # a semantic token/head layout.
-    block_tensor_views: list[Any] = field(default_factory=list)
     # Number of TP workers whose complete PAGE layout is byte-identical.
     # ``1`` means no cross-rank deduplication is safe.
     tp_replication_factor: int = 1
@@ -257,17 +270,62 @@ class KVTransferTensors:
     gather_sharded_index: Callable[..., tuple[int, int]] | None = None
     # Appended after the original staging fields for positional compatibility.
     prepare_sharded_index: Callable[..., Any] | None = None
+    # Native PAGE-backed state image contract. The spec names the exact codec
+    # and image geometry; the callback restores that image into an Active SLOT
+    # after a remote retrieve has finished writing its PAGE units. These are
+    # intentionally untyped model-engine objects to keep this module free of
+    # model-engine imports. The PAGE tensor views retain the source allocations;
+    # neither field asks the connector to snapshot a complete live SLOT.
+    paged_state_checkpoint_spec: object | None = None
+    execute_paged_state_copies: Callable[..., None] | None = None
+    # Same declaration for PAGE-backed native state checkpoint images. Kept
+    # separate so future layouts can describe PAGE and recurrent-state
+    # replication independently. Appended for positional compatibility.
+    native_state_tp_replication_factor: int = 1
+    # How many leading `block_regions` make up one native checkpoint PAGE unit.
+    # A draft with a pool of its own appends its regions after the target's;
+    # those are ordinary PAGE KV, never part of the state image. None means
+    # every region. Appended for positional compatibility.
+    paged_state_region_count: int | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is
     # the same number. Set through `set_block_count`.
     num_blocks: int = field(init=False, default=0)
 
+    @property
+    def block_regions(self) -> tuple[KVTransferRegion, ...]:
+        """Every PAGE region, in publication order (read-only; add `pages`)."""
+        return tuple(page.region for page in self.pages)
+
+    @property
+    def block_tensor_views(self) -> tuple[Any, ...]:
+        """The published views, each a zero-copy byte alias of its region.
+
+        ``uint8 [num_units, 1, unit_bytes]``: the last two dimensions are
+        opaque copy geometry for LMCache MP, not a token/head layout. Empty when
+        the producer published addresses only.
+        """
+        return tuple(page.view for page in self.pages if page.view is not None)
+
+    def merge_pages(self, other: KVTransferTensors) -> None:
+        """Append another contributor's PAGE units (a draft's own pool).
+
+        Replication is a whole-PAGE declaration: one sharded contributor makes
+        the combined object sharded even when this one alone is replicated.
+        """
+        if not other.pages:
+            return
+        self.pages.extend(other.pages)
+        self.tp_replication_factor = math.gcd(
+            self.tp_replication_factor, other.tp_replication_factor
+        )
+
     def set_block_count(self, num_blocks: int) -> None:
         """Fix the block id space, and check every region is in it.
 
-        Called once the last contributor's regions are in the list; a draft
-        appends its own after construction, so this cannot be a `__post_init__`.
+        Called once the last contributor's regions are in; a draft's are merged
+        after construction (`merge_pages`), so this cannot be a `__post_init__`.
 
         A region that does not divide into exactly `num_blocks` units was
         registered in some other unit. Both ends would still agree on

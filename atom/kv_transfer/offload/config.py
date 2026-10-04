@@ -280,6 +280,15 @@ def _stable_hf_geometry(hf: object) -> dict[str, Any]:
     return geometry
 
 
+def snapshot_page_hf_geometry(hf: object) -> dict[str, Any]:
+    """The HF geometry `build_page_namespace` hashes, taken once at config time.
+
+    `Config` stores it before the config reaches the scheduler and the workers,
+    so both hash the same values even after a worker mutates `hf_config`.
+    """
+    return _stable_hf_geometry(hf)
+
+
 def build_page_namespace(
     config,
     cfg,
@@ -328,7 +337,9 @@ def build_page_namespace(
             ),
             minimum=1,
         ),
-        "hf_geometry": _stable_hf_geometry(hf),
+        # The config-time snapshot when there is one; see `Config.__post_init__`.
+        "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
+        or _stable_hf_geometry(hf),
         "speculative_config": _stable_config_value(
             getattr(config, "speculative_config", None)
         ),

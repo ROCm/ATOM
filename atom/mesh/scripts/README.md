@@ -1,4 +1,12 @@
-# Atomesh PD Disaggregation Scripts
+# Atomesh Integration Scripts
+
+For a single-host **Envoy + Atomesh + ATOM Engine** setup using
+Qwen3-0.6B with TP=1 / DP=2, see [the ext-proc manual test guide](ext-proc/README.md).
+Run `ext-proc/test_envoy_atom.sh` on the host; Atomesh and Engine share the same ATOM image.
+The script starts the services and leaves them running for manual testing.
+The `ext-proc/` directory also contains the test-image Dockerfile.
+
+## PD Disaggregation
 
 End-to-end guide for building, deploying, and benchmarking the Atomesh prefill-decode (PD) disaggregation setup.
 
