@@ -102,6 +102,26 @@ class StateSlotAllocator:
         self._last_seen[slot] = self._step
         return slot
 
+    def release_unclaimed(self, key) -> bool:
+        """Release *key* only if it is a reservation no batch ever claimed.
+
+        That is the whole leak: `reserve` binds a slot for a request parked on
+        a restore, and only the `assign` that claims it clears the
+        reservation, so a request aborted before it ever reaches a forward
+        keeps its slot for good.
+
+        A request that *did* run is deliberately left alone. Its slot is
+        recycled by `_acquire`'s eviction exactly as before, and releasing it
+        eagerly instead measured -21% throughput: the slot churn tripled the
+        stores (16.5 to 59.5 per window) and cost 20% on ITL, because each
+        store is a 5 MiB device-to-host copy contending with decode. The leak
+        is real and the fix for it has to be this narrow.
+        """
+        if key not in self._reserved:
+            return False
+        self.release(key)
+        return True
+
     def release(self, key) -> None:
         """Give a reserved slot back, for a request that will never arrive.
 

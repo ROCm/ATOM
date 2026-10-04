@@ -1369,14 +1369,17 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         one CSA2 ring, which is the corruption the reservation exists to
         prevent, reached by starving it instead of racing it.
 
-        Releasing a slot whose request ran normally is equally correct: it is
-        finished, and the slot's next tenant resets it.
+        Only unclaimed reservations: a request that actually ran has its slot
+        recycled by the allocator's own eviction, and releasing those eagerly
+        as well measured -21% throughput -- the churn tripled the 5 MiB state
+        stores and cost 20% on ITL. The leak is specifically the reservation
+        nobody claimed.
         """
         slots = self._v41_slots
         if slots is None:
             return
         for req_id in req_ids or ():
-            slots.release(str(req_id))
+            slots.release_unclaimed(str(req_id))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Translate ATOM's four completion sets into vLLM's two.
