@@ -116,16 +116,16 @@ def test_ineligible_decode_keeps_dedicated_asm(monkeypatch, kwargs):
 
 
 def _decode_rows(n: int, heads: int = 128) -> dict:
-    return dict(
-        unified_kv=torch.empty((4, 512)),
-        kv_indices=torch.empty(0, dtype=torch.int32),
-        kv_indptr=torch.zeros(n + 1, dtype=torch.int32),
-        attn_sink=torch.empty(heads),
-        softmax_scale=512**-0.5,
-        unified_kv_rope=torch.empty((4, 64)),
-        q_packed_in=torch.empty((n, heads, 512)),
-        q_rope_in=torch.empty((n, heads, 64)),
-    )
+    return {
+        "unified_kv": torch.empty((4, 512)),
+        "kv_indices": torch.empty(0, dtype=torch.int32),
+        "kv_indptr": torch.zeros(n + 1, dtype=torch.int32),
+        "attn_sink": torch.empty(heads),
+        "softmax_scale": 512**-0.5,
+        "unified_kv_rope": torch.empty((4, 64)),
+        "q_packed_in": torch.empty((n, heads, 512)),
+        "q_rope_in": torch.empty((n, heads, 64)),
+    }
 
 
 @pytest.mark.parametrize(
