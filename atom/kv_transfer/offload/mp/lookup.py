@@ -19,8 +19,8 @@ logger = logging.getLogger("atom")
 @dataclass
 class _LookupState:
     token_ids: list[int]
-    # First prompt token the question covers; the server locks only the hit
-    # from here on.
+    # Where the scheduler asked from: the prompt's HBM prefix at the time,
+    # below which nothing is loaded.
     lookup_start: int = 0
     hit: int | None = None
     retrieve_start: int | None = None
@@ -40,12 +40,12 @@ class _MPLookupClient:
     the server prefetches, and the scheduler admits other work meanwhile.
 
     With ``starts_past_hbm_prefix`` set, the scheduler passes a ``start``: the
-    prompt's HBM prefix, which it will never load. A server that prefetches
-    from the key's start (``mooncake_l2_server``) then reads only the chunks
-    past it, answers the hit as a prefix length all the same, and locks only
-    its part from ``start`` on; it clamps every release to that start, so the
-    releases below stay ranges from 0. A server that ignores ``start`` answers
-    and locks as if it were 0.
+    prompt's HBM prefix, which it will never load. A server that reads from the
+    key's start (``mooncake_l2_server``) still looks the whole prompt up and
+    answers the hit as a prefix length, but reads and locks only the hit's
+    chunks from about ``start`` on, and clamps every release to what it
+    locked, so the releases below stay ranges from 0. A server that ignores
+    ``start`` reads, locks and answers as if it were 0.
     """
 
     token_database = None

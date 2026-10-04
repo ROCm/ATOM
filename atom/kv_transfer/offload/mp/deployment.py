@@ -674,11 +674,6 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
     class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
         """Reserve one LMCache read lock for every collapsed TP consumer."""
 
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            # Lookups answered here, which no server holds a lock for.
-            self._answered_without_server: set[str] = set()
-
         def _create_key(self, *args: Any, **kwargs: Any) -> Any:
             key = super()._create_key(*args, **kwargs)
             return replace(key, num_kv_readers=num_kv_readers)
@@ -686,29 +681,23 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
         def maybe_submit_lookup_request(
             self, request_id: str, token_ids: list[int], start: int = 0
         ) -> None:
-            """LMCache's lookup submit, for the chunks from ``start`` on.
+            """LMCache's lookup submit, with the key starting at ``start``.
 
-            ``start`` is floored to a chunk. LMCache's own submit always asks
-            from 0, so a later start builds the key here, on the same private
-            state its submit and ``check_lookup_result`` use. A prompt with no
-            whole chunk past ``start`` has nothing to ask for. Its answer is
-            ``start``, as a server that prefetches from ``start`` answers a
-            miss past it: the prefix below is on the GPU, and 0 would have the
-            scheduler store it again. No server saw that lookup, so none of its
-            releases may reach one (`free_lookup_locks`).
+            LMCache's own submit always starts the key at 0, so a later start
+            builds the key here, on the same private state its submit and
+            ``check_lookup_result`` use. ``start`` is floored to a chunk and
+            kept below the last whole chunk: a server that reads from the
+            start (``mooncake_l2_server``) still looks the whole prompt up,
+            which renews the Store leases of the prefix the GPU holds, and it
+            needs a chunk to read -- a read window of 0 means all of them.
             """
-            self._answered_without_server.discard(request_id)
             chunk = int(self.lmcache_tokens_per_chunk)
-            start = (int(start) // chunk) * chunk
+            aligned_end = (len(token_ids) // chunk) * chunk
+            start = min((int(start) // chunk) * chunk, aligned_end - chunk)
             if start <= 0:
                 super().maybe_submit_lookup_request(request_id, token_ids)
                 return
             if request_id in self._pending_lookups:
-                return
-            aligned_end = (len(token_ids) // chunk) * chunk
-            if aligned_end <= start:
-                self._lookup_results[request_id] = aligned_end
-                self._answered_without_server.add(request_id)
                 return
             key = self._create_key(
                 token_ids,
@@ -721,21 +710,6 @@ def _make_scheduler_adapter(config: Any, *, checkpoint_spec: Any = None) -> Any:
                 timeout=self._mq_timeout
             )
             self._pending_lookups.add(request_id)
-
-        def free_lookup_locks(
-            self, token_ids: list[int], start: int, end: int, request_id: str
-        ) -> None:
-            # A server with no lookup for the session would release the whole
-            # range -- other requests' locks on shared chunks included.
-            if request_id in self._answered_without_server:
-                return
-            super().free_lookup_locks(
-                token_ids=token_ids, start=start, end=end, request_id=request_id
-            )
-
-        def cleanup_lookup_result(self, request_id: str) -> None:
-            self._answered_without_server.discard(request_id)
-            super().cleanup_lookup_result(request_id)
 
     extra = _extra_config(config)
     mq_timeout = float(extra.get("lmcache.mp.mq_timeout", 300.0))
