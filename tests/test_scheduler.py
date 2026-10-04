@@ -1085,6 +1085,160 @@ class TestSchedule:
         assert list(seq.output_tokens) == [999, sched.eos_token_id]
 
 
+class TestReserveDecodeAdmission:
+    @pytest.mark.parametrize("value", [None, "", "0", "-1", "bad", "1.5", "nan", "inf"])
+    def test_unset_invalid_or_nonpositive_values_disable_gate(
+        self, monkeypatch, seq_factory, value
+    ):
+        if value is None:
+            monkeypatch.delenv("ATOM_RESERVE_DECODE_TOKENS", raising=False)
+        else:
+            monkeypatch.setenv("ATOM_RESERVE_DECODE_TOKENS", value)
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=4,
+                kv_cache_block_size=4,
+            )
+        )
+        for token in range(4):
+            sched.add(seq_factory([token]))
+
+        batch, _ = sched.schedule()
+
+        assert sched.reserve_decode_tokens == 0
+        assert batch.total_seqs_num_prefill == 4
+
+    def test_new_prefills_already_in_running_are_counted_once(
+        self, monkeypatch, seq_factory
+    ):
+        # Five reserved tokens round up to two 4-token blocks. Six blocks
+        # therefore allow three committed sequences.
+        monkeypatch.setenv("ATOM_RESERVE_DECODE_TOKENS", "5")
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=8,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=6,
+                kv_cache_block_size=4,
+            )
+        )
+        sched.add(seq_factory([0]))
+        sched.schedule()
+        for token in range(1, 5):
+            sched.add(seq_factory([token]))
+
+        batch, _ = sched.schedule()
+
+        assert batch.total_seqs_num_prefill == 2
+        assert len(sched.running) == 3
+        assert len(sched.waiting) == 2
+
+    @pytest.mark.parametrize(
+        ("is_local", "protects_decode"),
+        [(False, False), (True, False), (True, True)],
+    )
+    def test_delayer_signals_exclude_reservation_blocked_waiting(
+        self, monkeypatch, seq_factory, is_local, protects_decode
+    ):
+        class DecisionCaptured(Exception):
+            pass
+
+        class RecordingDelayer:
+            max_queue_ms = None
+
+            def __init__(self):
+                self.is_local = is_local
+                self.decision = None
+
+            def protects_decode(self, running_decode_batch):
+                assert running_decode_batch == 1
+                return protects_decode
+
+            def should_allow_prefill(self, **decision):
+                self.decision = decision
+                raise DecisionCaptured
+
+        monkeypatch.setenv("ATOM_RESERVE_DECODE_TOKENS", "8")
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=2,
+                kv_cache_block_size=4,
+            )
+        )
+        sched.add(seq_factory([0]))
+        sched.schedule()
+        sched.add(seq_factory([1]))
+        delayer = RecordingDelayer()
+        sched.set_prefill_delayer(delayer)
+
+        with pytest.raises(DecisionCaptured):
+            sched.schedule()
+
+        assert delayer.decision["prefillable"] is False
+        assert delayer.decision["pending_tokens"] == 0
+
+    def test_committed_partial_prefill_resumes_when_gate_is_full(
+        self, monkeypatch, seq_factory
+    ):
+        class RecordingDelayer:
+            is_local = False
+            max_queue_ms = None
+
+            def __init__(self):
+                self.decision = None
+
+            def protects_decode(self, running_decode_batch):
+                assert running_decode_batch == 0
+                return False
+
+            def should_allow_prefill(self, **decision):
+                self.decision = decision
+                return True
+
+        monkeypatch.setenv("ATOM_RESERVE_DECODE_TOKENS", "16")
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=8,
+                long_prefill_token_threshold=4,
+                max_model_len=32,
+                num_kvcache_blocks=4,
+                kv_cache_block_size=4,
+                enable_chunked_prefill=True,
+            )
+        )
+        partial = seq_factory(list(range(8)))
+        sched.add(partial)
+        first_batch, _ = sched.schedule()
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=first_batch,
+        )
+        assert partial.is_partial_prefill is True
+        fresh = seq_factory([20, 21, 22, 23])
+        sched.add(fresh)
+        delayer = RecordingDelayer()
+        sched.set_prefill_delayer(delayer)
+
+        second_batch, _ = sched.schedule()
+
+        assert delayer.decision["prefillable"] is True
+        assert delayer.decision["pending_tokens"] == 4
+        assert list(second_batch.req_ids) == [partial.id]
+        assert fresh in sched.waiting
+
+
 # ── _waiting_new_token_count (PrefillDelayer queue signal) ─────────────────
 
 
