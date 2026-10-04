@@ -1317,6 +1317,30 @@ def test_kimi_prebuilds_kda_and_mla_tail_once():
     assert runner._prebuilt
 
 
+def test_kimi_staged_c1_prebuilds_only_tail_ops():
+    module = _kimi_mono_module()
+    layers = [
+        SimpleNamespace(layer_idx=1, is_linear_attn=True, block_sparse_moe=object()),
+        SimpleNamespace(layer_idx=2, is_linear_attn=False, block_sparse_moe=object()),
+    ]
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._staged_c1_enabled = True
+    runner._prebuilt = False
+    runner._geometry_template = KimiDecodeGeometry(1, 8, 10, "fp16", False)
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, start_layer=0, end_layer=2)
+    )
+    seen = []
+    runner._op = lambda layer, _geometry, kind, width: seen.append(
+        (layer.layer_idx, kind, width)
+    )
+
+    runner.prepare()
+
+    assert seen == [(1, "tail", 8), (2, "tail", 8)]
+
+
 def test_kimi_q1_prebuilds_shared_chunk_widths():
     module = _kimi_mono_module()
     layers = [
@@ -2247,6 +2271,35 @@ def test_kimi_mla_uses_baseline_attention_and_fused_tail(monkeypatch):
     assert events[-2:] == [("tail", None, 1), ("dense", None, None)]
     assert len(captures) == 1
     assert torch.equal(captures[0], torch.full_like(output, 6))
+
+
+def test_kimi_staged_c1_tail_consumes_production_attnres_outputs():
+    import torch
+
+    module = _kimi_mono_module()
+    geometry = KimiDecodeGeometry(1, 8, 10, "fp16", False)
+    updated_prefix = torch.ones(8, module.KIMI_K3_CONFIG.hidden)
+    moe_input = torch.full_like(updated_prefix, 2)
+    calls = []
+
+    class Tail:
+        @staticmethod
+        def forward_from_moe_input(prefix, moe, *, x_out, epoch_layer):
+            calls.append((prefix, moe, epoch_layer))
+            x_out.copy_(prefix + moe)
+
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._output = lambda *_args: torch.empty_like(moe_input)
+    runner._op = lambda *_args: SimpleNamespace(op=Tail())
+    layer = SimpleNamespace(layer_idx=7)
+
+    output = runner._run_staged_c1_tail(layer, geometry, updated_prefix, moe_input)
+
+    assert torch.equal(output, torch.full_like(output, 3))
+    assert len(calls) == 1
+    assert torch.equal(calls[0][0], updated_prefix)
+    assert torch.equal(calls[0][1], moe_input)
+    assert calls[0][2] == 7
 
 
 def test_kimi_replayssm_uses_baseline_kda_and_fused_tail(monkeypatch):

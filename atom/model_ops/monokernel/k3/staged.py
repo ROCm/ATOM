@@ -912,6 +912,25 @@ class _KimiK3FusedTail(_KimiK3MlaPath):
             self.advance_step()
         return target
 
+    def forward_from_moe_input(
+        self,
+        updated_prefix: torch.Tensor,
+        moe_input: torch.Tensor,
+        *,
+        x_out: torch.Tensor | None = None,
+        epoch_layer: int = 0,
+        advance: bool = True,
+    ) -> torch.Tensor:
+        expected = (self.S, self.config.hidden)
+        if updated_prefix.shape != expected or moe_input.shape != expected:
+            raise ValueError(f"updated_prefix and moe_input must have shape {expected}")
+        self.latent_projection.quantize_input(moe_input)
+        target = self.output if x_out is None else x_out
+        self._moe(moe_input, epoch_layer, updated_prefix, target)
+        if advance:
+            self.advance_step()
+        return target
+
 
 class _KimiK3KdaStagedPath(_KimiK3MlaPath):
     """Internal staged Kimi-K3 KDA + latent-MoE reference path."""

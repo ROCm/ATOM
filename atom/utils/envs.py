@@ -383,11 +383,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
     # GLM-5.2 / Kimi-K3 native TP8 decode MonoKernel. Model construction
-    # resolves off|auto|mono|staged once; unsupported forwards use the baseline.
+    # resolves off|auto|mono|staged|staged_c1 once; unsupported forwards use the baseline.
     "ATOM_NATIVE_DECODE_MONOKERNEL": lambda: _choice_env(
         "ATOM_NATIVE_DECODE_MONOKERNEL",
         "off",
-        ("off", "auto", "mono", "staged"),
+        ("off", "auto", "mono", "staged", "staged_c1"),
     ),
     # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
     # atom/models/minimax_m3/mono), on by default. Only a configuration the mono

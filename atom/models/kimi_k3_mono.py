@@ -395,6 +395,7 @@ class KimiMonoDecode:
         self._prebuilt = False
         self._geometry_template: KimiDecodeGeometry | None = None
         self._enabled = mode != "off"
+        self._staged_c1_enabled = mode == "staged_c1"
         if not self._enabled:
             return
         checks = (
@@ -642,9 +643,14 @@ class KimiMonoDecode:
         for layer in model.layers[model.start_layer : model.end_layer]:
             if not hasattr(layer, "block_sparse_moe"):
                 continue
-            kind = (
-                "tail" if (not layer.is_linear_attn or geometry.replay_mode) else "kda"
-            )
+            if getattr(self, "_staged_c1_enabled", False):
+                kind = "tail"
+            else:
+                kind = (
+                    "tail"
+                    if (not layer.is_linear_attn or geometry.replay_mode)
+                    else "kda"
+                )
             for launch_width in self._launch_widths(geometry):
                 self._op(layer, geometry, kind, launch_width)
         self._prebuilt = True
@@ -743,6 +749,24 @@ class KimiMonoDecode:
             )
         return output
 
+    def _run_staged_c1_tail(
+        self,
+        layer,
+        geometry: KimiDecodeGeometry,
+        updated_prefix: torch.Tensor,
+        moe_input: torch.Tensor,
+    ) -> torch.Tensor:
+        output = self._output(layer.layer_idx, geometry, "tail", moe_input)
+        for start, end in kimi_launch_slices(geometry):
+            owned = self._op(layer, geometry, "tail", end - start)
+            owned.op.forward_from_moe_input(
+                updated_prefix[start:end],
+                moe_input[start:end],
+                x_out=output[start:end],
+                epoch_layer=layer.layer_idx,
+            )
+        return output
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -761,6 +785,7 @@ class KimiMonoDecode:
             if inputs_embeds is None
             else inputs_embeds
         )
+        staged_c1_enabled = getattr(self, "_staged_c1_enabled", False)
         blocks = hidden.new_zeros(samples, 0, hidden.shape[-1])
         pending = pending2 = None
         state_indices = None
@@ -788,7 +813,9 @@ class KimiMonoDecode:
 
             hook_input = hidden
             hook_kwargs = {"pending_add": pending, "pending_add2": pending2}
-            baseline_attention = not layer.is_linear_attn or geometry.replay_mode
+            baseline_attention = (
+                not layer.is_linear_attn or geometry.replay_mode or staged_c1_enabled
+            )
             if baseline_attention:
                 attention_input, prefix_sum = layer.self_attention_attn_res(
                     hidden, blocks, pending, pending2
@@ -807,13 +834,21 @@ class KimiMonoDecode:
                         f"attention layer {layer.layer_idx} changed graph rows from "
                         f"{hidden.shape[0]} to {attention_delta.shape[0]}"
                     )
-                hidden = self._run_tail(
-                    layer,
-                    geometry,
-                    prefix_sum,
-                    blocks,
-                    attention_delta,
-                )
+                if staged_c1_enabled:
+                    moe_input, updated_prefix = layer.mlp_attn_res(
+                        prefix_sum, blocks, attention_delta
+                    )
+                    hidden = self._run_staged_c1_tail(
+                        layer, geometry, updated_prefix, moe_input
+                    )
+                else:
+                    hidden = self._run_tail(
+                        layer,
+                        geometry,
+                        prefix_sum,
+                        blocks,
+                        attention_delta,
+                    )
             else:
                 hidden = fold_kimi_pending(hidden, pending, pending2)
                 pending = pending2 = None
