@@ -44,8 +44,8 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    use_fp4_non_shuffle_triton_gemm,
-    use_triton_gemm,
+    can_fuse_mxfp4_activation_quant,
+    weight_is_stored_preshuffled,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -400,18 +400,20 @@ class KimiSparseMoeBlock(nn.Module):
                 quant_config, up_proj_prefix
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
-            # AITER RMSNorm+quant emits the activation layout consumed directly by
-            # the routed up-projection. FP4 Triton paths choose an M-dependent
-            # shuffled/non-shuffled scale layout, so keep those on their existing
-            # standalone quant path until the fused kernel supports both layouts.
-            fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
-                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
+            # Fused RMSNorm emits preshuffled MXFP4 scales, but the compatible
+            # backend needs row-major scales for routed M < 32.
+            fp4_fused_quant_compatible = can_fuse_mxfp4_activation_quant(
+                up_proj_quant_dtype,
+                weight_is_stored_preshuffled(
+                    up_proj_quant_type,
+                    up_proj_quant_dtype,
+                ),
             )
             self.fuse_routed_norm_quant = latent_moe_use_norm and (
                 (
                     up_proj_quant_type == QuantType.per_1x32
                     and up_proj_quant_dtype == dtypes.fp4x2
-                    and not fp4_triton_active
+                    and fp4_fused_quant_compatible
                 )
                 or (
                     up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)

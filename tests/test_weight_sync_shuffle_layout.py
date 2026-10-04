@@ -33,6 +33,8 @@ from aiter import QuantType, dtypes
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
     LinearBase,
+    can_fuse_mxfp4_activation_quant,
+    needs_compatible_mxfp4_preshuffle_backend,
     weight_is_stored_preshuffled,
 )
 from atom.rollout.weight_updater import WeightUpdaterMixin
@@ -110,6 +112,47 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
 
 
+def test_gfx1250_mxfp4_preshuffle_requires_compatible_backend():
+    assert needs_compatible_mxfp4_preshuffle_backend(dtypes.fp4x2, True, arch="gfx1250")
+
+
+def test_mxfp4_backend_override_is_layout_and_arch_specific():
+    assert not needs_compatible_mxfp4_preshuffle_backend(
+        dtypes.fp4x2, True, arch="gfx950"
+    )
+    assert not needs_compatible_mxfp4_preshuffle_backend(
+        dtypes.fp4x2, False, arch="gfx1250"
+    )
+    assert not needs_compatible_mxfp4_preshuffle_backend(
+        dtypes.fp8, True, arch="gfx1250"
+    )
+
+
+def test_fused_mxfp4_quant_rejects_m_dependent_gfx1250_layout(monkeypatch):
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+
+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx1250")
+    assert can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx950")
+
+
+def test_fused_mxfp4_quant_rejects_triton_layouts(monkeypatch):
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: True)
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx950")
+
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, False, arch="gfx950")
+
+
+def test_fused_mxfp4_quant_is_dtype_and_layout_specific(monkeypatch):
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp8, True, arch="gfx950")
+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, False, arch="gfx950")
+
+
 # ── the property: load and sync agree ─────────────────────────────────────
 
 
@@ -153,6 +196,11 @@ def _updater_double():
 def _loader_shuffles(monkeypatch, case, *, dim=2):
     calls = []
     monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(
+        linear_mod,
+        "needs_compatible_mxfp4_preshuffle_backend",
+        lambda *a, **k: False,
+    )
     # per_1x32 shuffles its scale through aiter at the end of the method; that
     # is not what is under test and it wants a real e8m0 tensor.
     monkeypatch.setattr(
@@ -160,6 +208,23 @@ def _loader_shuffles(monkeypatch, case, *, dim=2):
     )
     LinearBase.process_weights_after_loading(_linear_double(*case, dim=dim))
     return bool(calls)
+
+
+def test_loader_caches_mxfp4_backend_capability(monkeypatch):
+    module = _linear_double(QuantType.per_1x32, dtypes.fp4x2, False)
+    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: None)
+    monkeypatch.setattr(
+        linear_mod.fp4_utils, "e8m0_shuffle", lambda scale: scale, raising=False
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "needs_compatible_mxfp4_preshuffle_backend",
+        lambda *a, **k: True,
+    )
+
+    LinearBase.process_weights_after_loading(module)
+
+    assert module._needs_compatible_mxfp4_preshuffle_backend is True
 
 
 def _sync_shuffles(monkeypatch, case, *, dim=2):
