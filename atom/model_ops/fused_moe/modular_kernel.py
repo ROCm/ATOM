@@ -433,6 +433,49 @@ class FusedMoEModularKernel(torch.nn.Module):
         # quant method's apply() via `moe_extra_args`.
         extra_kwargs = dict(moe_extra_args or {})
 
+        # A route policy layered on top of a normal dispatch may need to expose
+        # a different local weight layout to fused_moe (for example resident
+        # and prefetched expert slots). This path keeps the dispatcher's ordinary
+        # token/top-k layout and therefore receives the dispatched ids and route
+        # weights unchanged.
+        run_dispatched_experts = getattr(
+            self.prepare_finalize, "run_dispatched_experts", None
+        )
+        if run_dispatched_experts is not None:
+            # The policy path intentionally uses AITER fused_moe over its
+            # resident/prefetch views, not the optional Triton experts selected
+            # by the ordinary MoRI path.
+            extra_kwargs.pop("triton_experts", None)
+            fused_out = run_dispatched_experts(
+                dispatch_a1,
+                w1,
+                w2,
+                topk_weights=dispatch_weights,
+                topk_ids=dispatch_ids,
+                expert_mask=expert_mask,
+                num_local_tokens=expert_tokens_meta.expert_num_tokens,
+                activation=activation,
+                quant_type=quant_type,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=dispatch_scale if dispatch_scale is not None else a1_scale,
+                a2_scale=a2_scale,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                dtype=hidden_states.dtype,
+                extra_kwargs=extra_kwargs,
+            )
+            return self._finalize(
+                output,
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                apply_router_weight_on_input,
+            )
+
         # Triton backend for the routed-expert GEMMs, in place of flydsl
         # fused_moe. Sits between dispatch and combine, so `_prepare`/`_finalize`
         # (and therefore the mori all-to-all) are untouched. The a8w4-specific
