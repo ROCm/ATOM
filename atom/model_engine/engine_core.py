@@ -18,7 +18,12 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
+from atom.model_engine.scheduler import (
+    DecodeScheduler,
+    PrefillScheduler,
+    ScheduledBatch,
+    Scheduler,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -173,6 +178,8 @@ class EngineCore:
                 and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
             ):
                 self._init_prefill_delayer(config)
+
+        self._init_engine_stats_reporter(config)
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -399,6 +406,89 @@ class EngineCore:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
+    def _init_engine_stats_reporter(self, config: Config) -> None:
+        """Initialize the opt-in, decode-step-based MLPerf reporter.
+
+        This reporter is intentionally separate from the scheduler-owned
+        :class:`EngineStats`, whose status line has a time-based cadence and a
+        configuration-controlled default.
+        """
+        self._engine_stats_enabled = envs.ATOM_LOG_ENGINE_STATS
+        # Do not parse an inert interval. In particular, setting only a malformed
+        # interval must not affect startup while the opt-in reporter is off.
+        self._engine_stats_interval = (
+            envs.ATOM_ENGINE_STATS_INTERVAL if self._engine_stats_enabled else None
+        )
+        self._engine_stats_dp_rank = getattr(
+            config.parallel_config, "data_parallel_rank", 0
+        )
+        self._engine_stats_decode_steps = 0
+        self._engine_stats_interval_decode_tokens = 0
+        self._engine_stats_interval_prefill_tokens = 0
+        self._engine_stats_interval_prefill_seqs = 0
+        self._engine_stats_last_time = time.monotonic()
+        if self._engine_stats_enabled:
+            logger.info(
+                f"{self.label}: engine-stats logging ON "
+                f"(every {self._engine_stats_interval} decode steps)"
+            )
+
+    def _record_engine_stats(self, scheduled_batch: ScheduledBatch) -> None:
+        """Accumulate counters and emit on the configured pure-decode cadence.
+
+        A "decode step" is a forward with no prefill tokens. Throughput is
+        measured with a monotonic clock over the interval; ``kv_cache_util``,
+        ``running``, and ``waiting`` are the instantaneous scheduler state at
+        emit time.
+        """
+        interval = self._engine_stats_interval
+        if interval is None:
+            return
+
+        self._engine_stats_interval_prefill_tokens += (
+            scheduled_batch.total_tokens_num_prefill
+        )
+        self._engine_stats_interval_decode_tokens += (
+            scheduled_batch.total_tokens_num_decode
+        )
+        self._engine_stats_interval_prefill_seqs += (
+            scheduled_batch.total_seqs_num_prefill
+        )
+
+        is_decode_step = (
+            scheduled_batch.total_tokens_num_prefill == 0
+            and scheduled_batch.total_tokens_num_decode > 0
+        )
+        if not is_decode_step:
+            return
+
+        self._engine_stats_decode_steps += 1
+        if self._engine_stats_decode_steps % interval != 0:
+            return
+
+        now = time.monotonic()
+        dt = now - self._engine_stats_last_time
+        num_running, num_waiting = self.scheduler.get_request_counts()
+        kv_util = self.scheduler._kv_usage()
+        decode_tps = self._engine_stats_interval_decode_tokens / dt if dt > 0 else 0.0
+        prefill_tps = self._engine_stats_interval_prefill_tokens / dt if dt > 0 else 0.0
+        logger.info(
+            f"[EngineStats DP{self._engine_stats_dp_rank}] "
+            f"decode_step={self._engine_stats_decode_steps} "
+            f"running_reqs={num_running} waiting_reqs={num_waiting} "
+            f"kv_cache_util={kv_util:.1%} "
+            f"decode_bs={scheduled_batch.total_seqs_num_decode} "
+            f"decode_tput={decode_tps:.1f}tok/s prefill_tput={prefill_tps:.1f}tok/s "
+            f"| interval={interval}steps/{dt:.2f}s "
+            f"prefill_tokens={self._engine_stats_interval_prefill_tokens} "
+            f"prefill_reqs={self._engine_stats_interval_prefill_seqs}"
+        )
+
+        self._engine_stats_last_time = now
+        self._engine_stats_interval_decode_tokens = 0
+        self._engine_stats_interval_prefill_tokens = 0
+        self._engine_stats_interval_prefill_seqs = 0
+
     def _process_engine_step(self):
         try:
             return self._process_engine_step_inner()
@@ -440,6 +530,9 @@ class EngineCore:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
             self._advance_idle_kv_transfer()
             return False
+
+        if self._engine_stats_enabled:
+            self._record_engine_stats(scheduled_batch)
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
         if (
