@@ -228,9 +228,6 @@ def rocm_aiter_biased_grouped_topk_impl(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-
-    from aiter import biased_grouped_topk
-
     token = gating_output.shape[0]
     device = gating_output.device
     if num_fused_shared_experts > 0:
@@ -254,16 +251,42 @@ def rocm_aiter_biased_grouped_topk_impl(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    biased_grouped_topk(
+    from atom.model_ops.triton_k3_grouped_topk import (
+        can_use_k3_biased_topk,
+        k3_biased_grouped_topk,
+    )
+
+    if can_use_k3_biased_topk(
         gating_output,
         correction_bias,
         topk_weights,
         topk_ids,
         num_expert_group,
         topk_group,
-        need_renorm,
-        routed_scaling_factor,
-    )
+        topk,
+        num_fused_shared_experts,
+    ):
+        k3_biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            need_renorm,
+            routed_scaling_factor,
+        )
+    else:
+        from aiter import biased_grouped_topk
+
+        biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            need_renorm,
+            routed_scaling_factor,
+        )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
