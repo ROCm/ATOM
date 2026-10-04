@@ -389,6 +389,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "off",
         ("off", "auto", "mono", "staged", "staged_c1"),
     ),
+    # GLM production experts use ATOM's 16-byte/lane W4 and shuffled E8M0 ABI.
+    "ATOM_GLM_NATIVE_FP4_MFMA": lambda: (
+        os.getenv("ATOM_GLM_NATIVE_FP4_MFMA", "0") == "1"
+    ),
     # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
     # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
     # path supports is ever routed to it; every other batch keeps the original

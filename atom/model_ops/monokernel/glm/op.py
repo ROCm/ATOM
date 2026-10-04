@@ -135,6 +135,7 @@ class Glm5MonoKernel:
         prepared_weights: dict[str, torch.Tensor] | None = None,
         runtime: "Glm5MonoKernel | None" = None,
         dcp_size: int = 1,
+        native_fp4_mfma: bool = False,
         timeline=False,
     ):
         expected_config = glm5_tp_config(npes)
@@ -176,6 +177,9 @@ class Glm5MonoKernel:
             and W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
             and W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
         )
+        if native_fp4_mfma and not self.atom_experts:
+            raise ValueError("native FP4 MFMA requires ATOM MXFP4 expert storage")
+        self.native_fp4_mfma = native_fp4_mfma
         self.packed = dict(
             prepare_glm5_weights(W, self.attention_weight)
             if prepared_weights is None
@@ -209,6 +213,7 @@ class Glm5MonoKernel:
             inter=W.config.inter,
             output_heads=output_heads,
             dcp_size=dcp_size,
+            native_fp4_mfma=native_fp4_mfma,
         )
         dev = torch.device("cuda", torch.cuda.current_device())
         self.stages = stage_tasks(
@@ -284,6 +289,7 @@ class Glm5MonoKernel:
             inter=W.config.inter,
             output_heads=output_heads,
             dcp_size=dcp_size,
+            native_fp4_mfma=native_fp4_mfma,
             uv_scale_rows=(
                 128
                 if self.attention_weight

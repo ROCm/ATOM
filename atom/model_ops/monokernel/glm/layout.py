@@ -102,6 +102,7 @@ N_ROW_TILES = HIDDEN // ROW_TILE
 N_ROUTER = N_EXPERTS // ROUTER_TILE
 N_UG_PER_SLOT = INTER // UG_TILE
 XQ_BLOCKS = HIDDEN // 128
+XQ_GROUPS = HIDDEN // 32
 XQ_WAVES = (XQ_BLOCKS + N_ROUTER - 1) // N_ROUTER
 assert XQ_WAVES * 4 <= WAVES
 
@@ -115,7 +116,7 @@ def dn_tile(samples: int, expert_mxfp4: bool = False) -> int:
 def sparse_keys_per_task(samples: int, heads: int = WAVES) -> int:
     """Use narrower sparse tiles when samples or attention heads fill LDS."""
 
-    return 32 if samples > 4 or heads > 2 * WAVES else 64
+    return 32 if heads > 2 * WAVES else 64
 
 
 def sample_wave_batches(samples: int) -> int:
@@ -126,8 +127,20 @@ def ug_task_rounds(inter: int) -> int:
     return (inter + BLOCKS - 1) // BLOCKS
 
 
-def down_x_words(samples: int, inter: int, expert_mxfp4: bool) -> int:
-    return samples * MOE_SLOTS * inter // (2 if expert_mxfp4 else 4)
+def down_prefetch_batch(samples: int, native_fp4_mfma: bool = False) -> int:
+    if samples <= 4:
+        return 9
+    if native_fp4_mfma:
+        return 4 if samples <= 6 else 3
+    return 8
+
+
+def down_x_words(
+    samples: int, inter: int, expert_mxfp4: bool, native_fp4_mfma: bool = False
+) -> int:
+    return (
+        samples * MOE_SLOTS * inter // (4 if native_fp4_mfma or not expert_mxfp4 else 2)
+    )
 
 
 def dcp_softmax_weights(maxima, sums):
@@ -177,6 +190,7 @@ def layout(
     inter: int = INTER,
     output_heads: int | None = None,
     dcp_size: int = 1,
+    native_fp4_mfma: bool = False,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers."""
 
@@ -199,7 +213,10 @@ def layout(
         ("a", samples * HIDDEN * pair_bytes),
         ("scores", samples * N_EXPERTS * pair_bytes),
         ("xq", samples * HIDDEN // 4 * pair_bytes),
-        ("xqs", samples * XQ_BLOCKS * pair_bytes),
+        (
+            "xqs",
+            samples * (XQ_GROUPS if native_fp4_mfma else XQ_BLOCKS) * pair_bytes,
+        ),
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
         ("mid", samples * MOE_SLOTS * inter * pair_bytes),

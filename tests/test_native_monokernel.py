@@ -389,6 +389,16 @@ def test_native_decode_flag(monkeypatch):
         getattr(envs, name)
 
 
+def test_glm_native_fp4_mfma_flag(monkeypatch):
+    from atom.utils import envs
+
+    name = "ATOM_GLM_NATIVE_FP4_MFMA"
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) is False
+    monkeypatch.setenv(name, "1")
+    assert getattr(envs, name) is True
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -681,8 +691,17 @@ def test_glm_tp4_symmetric_and_split_schedule_contracts():
             samples, cfg.local_heads, 2048, expert_mxfp4=True, inter=cfg.inter
         )
     )
-    assert stages["split"] == samples * 2 * (2048 // 32)
+    assert stages["split"] == samples * 2 * (
+        2048 // glm_layout.sparse_keys_per_task(samples, cfg.local_heads)
+    )
     assert stages["ug"] >= samples * 9 * (cfg.inter // glm_layout.UG_TILE)
+    assert [glm_layout.down_prefetch_batch(s, True) for s in (4, 5, 6, 8, 12)] == [
+        9,
+        4,
+        4,
+        3,
+        3,
+    ]
 
 
 def test_glm_required_c8_decode_does_not_fallback():

@@ -301,6 +301,7 @@ class _GlmLayerOp:
             kv_cache_dtype=kv_cache_dtype,
             prepared_weights=prepared_weights,
             runtime=runtime,
+            native_fp4_mfma=envs.ATOM_GLM_NATIVE_FP4_MFMA,
         )
 
     def close(self) -> None:
