@@ -90,6 +90,8 @@ on:
             glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-lmcache-1m-c56
 
           GLM mooncake_store (suite=mooncake_store; needs an atomesh_image with Mooncake Store; pit2-p03 (TW MI355X) nodes only):
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c48,
+            glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c56,
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c72,
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c96,
             glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112,

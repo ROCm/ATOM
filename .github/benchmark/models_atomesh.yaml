@@ -630,9 +630,9 @@ models:
       mooncake_store:
         - &glm52_agentic_mcstore_cpp4_dcp4
           <<: *glm52_agentic_lmcache_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c72
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c48
           display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE
-          concurrency: [72]
+          concurrency: [48]
           env:
             common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
             # Restated: a merge cannot drop the nightly cells' LMCACHE_* keys.
@@ -659,6 +659,14 @@ models:
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
             # The launcher adds MC_NUM_QP_PER_EP=1 for the P->D transfer engine.
             decode: *glm52_cpp4_dcp4_decode_env
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c56
+          concurrency: [56]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c72
+          concurrency: [72]
 
         - <<: *glm52_agentic_mcstore_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c96
