@@ -277,7 +277,8 @@ class KimiMLP(nn.Module):
             quant_config, f"{prefix}.down_proj"
         )
         self._fuse_act_quant = (
-            down_type == QuantType.per_Token and down_dtype == dtypes.fp8
+            down_type == QuantType.per_Token
+            and down_dtype == dtypes.fp8
             # AITER situv2_and_mul_quant only supports D <= 16376 and D % 8 == 0.
             # K3's dense layer has D=33792; shared experts have D=6144.
             and intermediate_size <= 16376

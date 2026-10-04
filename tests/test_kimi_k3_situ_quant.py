@@ -12,11 +12,11 @@ from torch import nn
 try:
     from aiter import QuantType, dtypes
 
-    import atom.models.kimi_k3 as kimi_k3
     from atom.model_ops.kimi_k3.activations import (
         situ_and_mul,
         situ_and_mul_quant,
     )
+    from atom.models import kimi_k3
 
     _IMPORT_ERR = None
 except ImportError as _e:  # aiter/triton absent on a CPU-only runner

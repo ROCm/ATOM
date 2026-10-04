@@ -214,9 +214,7 @@ def situ_and_mul_quant(
         activation = situ_and_mul(x2, beta, linear_beta)
         quant = get_hip_quant(QuantType.per_Token)
         return quant(activation, quant_dtype=dtypes.fp8)
-    _aiter_situ_quant(
-        out, x2.contiguous(), scale, d, float(beta), float(linear_beta)
-    )
+    _aiter_situ_quant(out, x2.contiguous(), scale, d, float(beta), float(linear_beta))
     return out, scale
 
 
