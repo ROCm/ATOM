@@ -259,8 +259,9 @@ def _offload_subconfig(cfg: dict) -> tuple[dict | None, str]:
     one would never be reported.
 
     Two offload sub-connectors (e.g. `[lmcache_offload(dense),
-    lmcache_offload(kimi_k3)]`) is refused *loudly* here, the one place the
-    composite is inspected, rather than degraded to a no-tier fallback. A silent
+    lmcache_offload(kimi_k3)]`) is refused *loudly* here -- and, for any two
+    offload backends, by `_build_subconnectors` when the composite is built --
+    rather than degraded to a no-tier fallback. A silent
     fallback disabled the state tier but left the KV load path live: dense won
     `get_num_new_matched_tokens` and queued its H2D, the tier never armed, and
     the prefill forward ran over the block table dense's worker was still
@@ -280,7 +281,7 @@ def _offload_subconfig(cfg: dict) -> tuple[dict | None, str]:
             "connectors, but the state tier's bytes and completions ride one "
             "connector's worker half -- two would each hold half an answer and "
             "a request parked on the wrong one would never be reported. Use at "
-            "most one `lmcache_offload` sub-connector."
+            "most one offload sub-connector."
         )
     return offload[0], ""
 

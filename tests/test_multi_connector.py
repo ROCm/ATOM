@@ -474,7 +474,7 @@ def test_process_completions_refuses_two_offload_subs():
     # destructive over the FULL sets it is handed -- it cannot partition. There
     # is no shared key by which the composite could split the completions per
     # sub, so one sub would retire the other's saves and clear its channels.
-    # That composite is refused at startup (`_offload_subconfig`); reaching this
+    # That composite is refused at startup (`_build_subconnectors`); reaching this
     # method with two offload handlers is a should-never-happen guarded loudly,
     # because silently corrupting saves is the worse failure.
     dense = DestructiveSub(owned_load="dense_load", owned_channel="dense_ch")
@@ -664,7 +664,7 @@ def test_state_calls_route_by_tier_ownership_not_method_presence():
     no tier; the kimi_k3-like shell is second and does. Every state call must
     land on the second.
 
-    A two-offload composite is refused at startup (`_offload_subconfig`, finding
+    A two-offload composite is refused at startup (`_build_subconnectors`, finding
     0), so this shape does not reach a running engine; the test exercises the
     selector directly to keep it robust if that refusal is ever bypassed.
     """
@@ -964,6 +964,46 @@ def test_only_one_producer_sub_is_allowed(monkeypatch):
         mc_module._build_subconnectors(
             _factory_config("mooncake", "moriio"), role="scheduler"
         )
+
+
+@pytest.mark.parametrize(
+    "sub_names",
+    [
+        ("mooncake_store", "mooncake_store"),
+        ("mooncake_store", "lmcache_mp"),
+        # Aliases count as the backend they name.
+        ("mooncake", "MooncakeStoreOffloadConnector", "LMCacheConnectorV1"),
+    ],
+)
+def test_two_offload_subs_are_refused_before_either_is_built(monkeypatch, sub_names):
+    """Each offload scheduler rewrites the completion sets it is handed, and no
+    completion names its sub, so two would retire each other's saves and
+    loads. Refused before any sub is built, rather than at the first poll."""
+    built = []
+    import atom.kv_transfer.disaggregation.factory as factory_mod
+
+    monkeypatch.setattr(
+        factory_mod.KVConnectorFactory,
+        "create_connector",
+        staticmethod(lambda config, role: built.append(config)),
+    )
+    with pytest.raises(ValueError, match="at most one offload sub-connector"):
+        mc_module._build_subconnectors(_factory_config(*sub_names), role="scheduler")
+    assert built == []
+
+
+def test_one_offload_sub_beside_a_producer_is_built(monkeypatch):
+    _patch_factory(
+        monkeypatch,
+        {
+            "mooncake": lambda: FakeSchedSub(is_producer=True),
+            "mooncake_store": lambda: FakeSchedSub(is_offload=True),
+        },
+    )
+    subs = mc_module._build_subconnectors(
+        _factory_config("mooncake", "mooncake_store"), role="scheduler"
+    )
+    assert [c.is_producer for c in subs] == [True, False]
 
 
 def test_send_finished_reaches_the_producer_sub():

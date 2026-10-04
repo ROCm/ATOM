@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from conftest import MockConfig
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
@@ -42,7 +43,10 @@ from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
     DENSE_PAGE_STORE_CHANNEL,
 )
-from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+from atom.kv_transfer.offload.dense.connector import (
+    DenseOffloadConnector,
+    DenseOffloadScheduler,
+)
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
@@ -74,6 +78,9 @@ from atom.model_engine.arg_utils import (
     compose_kv_offload_config,
     kv_offload_connector_config,
 )
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import Sequence, SequenceStatus
+from atom.sampling_params import SamplingParams
 
 MASTER = "10.0.0.1:26051"
 METADATA = "http://10.0.0.1:26080/metadata"
@@ -436,12 +443,20 @@ def slow_calls(monkeypatch):
 
 @pytest.fixture
 def scheduler_clock(monkeypatch):
-    """The scheduler module's monotonic clock, advanced by hand."""
+    """The scheduler module's monotonic clock, advanced by hand.
+
+    Its wall clock, which only stamps a save's dispatch time for the workers,
+    stays the real one the workers read.
+    """
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr(
         scheduler_mod,
         "time",
-        SimpleNamespace(monotonic=lambda: clock.now, perf_counter=time.perf_counter),
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            perf_counter=time.perf_counter,
+            time=time.time,
+        ),
     )
     return clock
 
@@ -472,7 +487,7 @@ def test_config_defaults_and_shared_master():
     assert cfg.chunk_tokens == 256 and cfg.lookup_batch_keys == 8192
     assert (cfg.load_pool_bytes, cfg.save_pool_bytes) == (1024 << 20, 256 << 20)
     assert cfg.save_abandon_timeout_s == 300.0
-    assert cfg.publish_loaded_prefix and cfg.startup_probe and cfg.direct_copy
+    assert cfg.startup_probe and cfg.direct_copy
     assert cfg.owner_rdma_devices == cfg.rdma_devices == ()
     assert cfg.store_masters() == [nic.StorePool(MASTER, METADATA)]
 
@@ -555,7 +570,8 @@ def test_config_takes_the_launcher_worker_config(launcher_json):
         ({"save_abandon_timeout_s": 0}, "finite and > 0"),
         ({"save_abandon_timeout_s": float("inf")}, "finite and > 0"),
         ({"save_abandon_timeout_s": "300"}, "number of seconds"),
-        ({"publish_loaded_prefix": "true"}, "true or false"),
+        # Gone: switching it off left every block after a load unhashed.
+        ({"publish_loaded_prefix": False}, "unknown Mooncake Store offload"),
         ({"startup_probe": 1}, "true or false"),
         ({"direct_copy": "false"}, "true or false"),
         ({"rdma_devices": ["rdma0"]}, "comma-separated string"),
@@ -680,6 +696,37 @@ def test_namespace_fingerprints_the_layout(monkeypatch):
         (5, 7),
         (7, 8),
     ]
+
+
+_KV_LAYOUT_ENV = (
+    "ATOM_MLA_PAGE_SIZE",
+    "ATOM_USE_TRITON_MLA",
+    "ATOM_USE_TRITON_MLA_SHUFFLE_KV",
+    "ATOM_USE_UNIFIED_ATTN",
+)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        # Segmented MLA: every token's nope, then every token's pe, per block.
+        {"ATOM_MLA_PAGE_SIZE": "64"},
+        # The Triton MLA backend's shuffled view of the same allocation.
+        {"ATOM_USE_TRITON_MLA": "1", "ATOM_USE_TRITON_MLA_SHUFFLE_KV": "1"},
+        # The MHA kernels' block becomes the scheduler's.
+        {"ATOM_USE_UNIFIED_ATTN": "1"},
+    ],
+)
+def test_namespace_fingerprints_the_kv_layout_the_environment_selects(monkeypatch, env):
+    # Same block size and bytes per block, arranged differently: a load checks
+    # only the size, so only the namespace keeps the layouts apart.
+    for name in _KV_LAYOUT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    config = _config(kv_cache_block_size=64)
+    base = keys.store_namespace(config, 256)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert keys.store_namespace(config, 256) != base
 
 
 def test_key_spellings():
@@ -1251,6 +1298,35 @@ def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
     assert len(cluster.stores) == 2
 
 
+@pytest.mark.parametrize("blocked_s", [31.0, 88.0])
+def test_a_connect_that_blocked_pauses_ten_times_as_long(
+    cluster, scheduler_clock, monkeypatch, blocked_s
+):
+    lookup = MooncakeStoreOffloadScheduler(_config())._lookup_client
+    setup = FakeStore.setup
+
+    def unanswered_setup(store, *args):
+        # Mooncake's setup retries a master that does not answer, holding the
+        # scheduler thread (and the GIL) all along, then fails.
+        scheduler_clock.now += blocked_s
+        store.setup_args = args
+        return store_client.RPC_TIMEOUT
+
+    monkeypatch.setattr(FakeStore, "setup", unanswered_setup)
+    assert lookup.lookup(list(range(16))) is None
+    # Paused from the failure, not from before the setup that blocked.
+    assert lookup._retry_connect_at == pytest.approx(
+        scheduler_clock.now + 10 * blocked_s
+    )
+    scheduler_clock.now += 0.01  # the next request's lookup
+    assert lookup.lookup(list(range(16))) is None
+    assert len(cluster.stores) == 1
+    monkeypatch.setattr(FakeStore, "setup", setup)
+    scheduler_clock.now += 10 * blocked_s
+    assert lookup.lookup(list(range(16))) == 0
+    assert len(cluster.stores) == 2
+
+
 def test_lookup_hashes_a_sequence_prompt_once(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     seq = _seq(4, 20)
@@ -1290,9 +1366,12 @@ def test_save_requests_carry_digests_not_tokens(cluster):
     seq = _seq(6, 30)
     scheduler.update_state_after_alloc(seq)
     seq.num_cached_tokens = 16
+    before = time.time()
     [first] = scheduler.build_connector_meta().requests
     assert first.token_ids == [] and first.save_spec.skip_leading_tokens == 0
     assert first.chunk_hashes == _hashes(16)
+    # Where the reclaim clock starts, for the workers' source read deadline.
+    assert before <= first.dispatched_at <= time.time()
     scheduler.save_finished(first.save_operation)
     seq.num_cached_tokens = 30
     [second] = scheduler.build_connector_meta().requests
@@ -1317,10 +1396,10 @@ def test_load_requests_carry_digests_and_publish_the_loaded_prefix(cluster):
     assert request.chunk_hashes == _hashes(48)
 
 
-def test_a_hit_that_waited_for_blocks_is_confirmed_before_its_load(
+def test_a_hit_that_waited_for_blocks_is_looked_up_again_before_its_load(
     cluster, scheduler_clock
 ):
-    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
+    scheduler = MooncakeStoreOffloadScheduler(_config("offload"))
     scheduler._min_load_tokens = 0
     hashes = _hashes(40)
     _store_chunks(cluster, hashes, range(5))
@@ -1341,10 +1420,18 @@ def test_a_hit_that_waited_for_blocks_is_confirmed_before_its_load(
     namespace = scheduler._namespace
     del cluster.objects[MASTER][_key(hashes, 3, namespace=namespace)]
     scheduler.update_state_after_alloc(seq)
-    # Admitted: asked again before anything is read, and the load dropped.
-    assert scheduler.build_connector_meta().requests == []
+    # Admitted, so parked: asked again right before the get, which renews the
+    # leases, and the load dispatched whatever the answer -- only its report
+    # wakes the request.
+    [request] = scheduler.build_connector_meta().requests
+    assert request.load_spec.lmcache_cached_tokens == 40
     assert asked() == 2
-    assert scheduler._looked_up_at == {}
+    # The worker's get misses chunk 3 and fails the load: the request prefills
+    # and its prompt is saved again from the HBM frontier.
+    assert scheduler._save_tracker["50"][1] == 40
+    assert scheduler.load_failed(request.load_operation)
+    assert scheduler._save_tracker["50"][1] == 0
+    assert not scheduler.has_pending_work()
 
 
 def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
@@ -1372,14 +1459,154 @@ def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     assert "52" not in scheduler._looked_up_at
 
 
-def test_publishing_the_loaded_prefix_can_be_turned_off(cluster):
-    scheduler = MooncakeStoreOffloadScheduler(
-        _config("kv_consumer", extra=_extra(publish_loaded_prefix=False))
+@pytest.fixture
+def store_engine(cluster, monkeypatch):
+    """The engine's scheduler, prefix caching on, offloading to the Store.
+
+    ``withheld.on`` refuses every allocation, as a full KV cache does: a
+    request then waits at the head of the queue on the hit of its first lookup.
+    """
+    engine = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=40,
+            max_model_len=128,
+            max_num_batched_tokens=128,
+            enable_prefix_caching=True,
+        )
     )
-    seq = _seq(9, 40)
-    _arm_load(scheduler, seq, hbm=8, lmc=32)
-    scheduler.build_connector_meta()
-    assert not hasattr(seq, "offload_load_start_tokens")
+    offload = MooncakeStoreOffloadScheduler(_config("offload"))
+    offload._min_load_tokens = 0
+    offload.bind_block_manager(engine.block_manager)
+    engine.kv_connector = offload
+    withheld = SimpleNamespace(on=False)
+    can_allocate = engine.block_manager.can_allocate
+    monkeypatch.setattr(
+        engine.block_manager,
+        "can_allocate",
+        lambda seq, **kwargs: -1 if withheld.on else can_allocate(seq, **kwargs),
+    )
+    return SimpleNamespace(engine=engine, offload=offload, withheld=withheld)
+
+
+def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwhile):
+    """Admit a 41-token prompt with a 40-token hit after 3 s without KV blocks.
+
+    ``meanwhile`` happens while it waits. Returns the sequence and the load
+    the admitting step dispatched.
+    """
+    engine, offload = store_engine.engine, store_engine.offload
+    hashes = _hashes(40)
+    _store_chunks(cluster, hashes, range(5))
+    seq = Sequence(list(range(41)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    store_engine.withheld.on = True
+    engine.schedule()  # looked up: a 40-token hit, but no KV blocks
+    assert seq.status == SequenceStatus.WAITING
+    [store] = cluster.stores
+    asked = sum(1 for call in store.calls if call[0] == "exists")
+    scheduler_clock.now += 3.0  # its lookup's leases have run out
+    key = _key(hashes, 3, namespace=offload._namespace)
+    if meanwhile == "evicted":
+        del cluster.objects[MASTER][key]
+    elif meanwhile == "store_error":
+        store.exist_codes[key] = store_client.RPC_FAIL
+    elif meanwhile == "lookups_paused":  # another prompt's lookup just failed
+        offload._lookup_client._retry_lookup_at = scheduler_clock.now + 10.0
+    store_engine.withheld.on = False
+    batch, _ = engine.schedule()
+    # Admitted and parked, and its load dispatched in the same step.
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    loads = [r for r in batch.connector_meta_output.requests if r.load_spec]
+    assert [r.load_spec.lmcache_cached_tokens for r in loads] == [40]
+    # Asked again right before the get, unless lookups are paused.
+    again = int(meanwhile != "lookups_paused")
+    assert sum(1 for call in store.calls if call[0] == "exists") == asked + again
+    return seq, loads[0]
+
+
+@pytest.mark.parametrize(
+    "meanwhile", ["nothing", "evicted", "store_error", "lookups_paused"]
+)
+def test_a_parked_request_is_woken_by_its_load_whatever_the_store_answers(
+    cluster, scheduler_clock, store_engine, make_worker, meanwhile
+):
+    engine, offload = store_engine.engine, store_engine.offload
+    seq, request = _park_after_a_wait_for_blocks(
+        cluster, scheduler_clock, store_engine, meanwhile
+    )
+    worker, _ = make_worker(namespace=offload._namespace)
+    worker._do_load_req(request)
+    engine._update_from_kv_xfer_finished(worker.get_finished())
+    batch, _ = engine.schedule()
+    assert seq.status == SequenceStatus.RUNNING
+    assert engine._num_parked_remote_kv == 0
+    if meanwhile == "evicted":
+        # The get missed chunk 3: prefilled from the start, and the prompt is
+        # saved again once computed.
+        assert batch.num_cached_tokens == [0]
+        assert offload._save_tracker[str(seq.id)][1] == 0
+    else:
+        assert batch.num_cached_tokens == [40]
+
+
+def test_an_aborted_parked_load_frees_its_blocks_when_it_reports(
+    cluster, scheduler_clock, store_engine, make_worker
+):
+    engine, offload = store_engine.engine, store_engine.offload
+    free = engine.block_manager.kv.num_free
+    seq, request = _park_after_a_wait_for_blocks(
+        cluster, scheduler_clock, store_engine, "evicted"
+    )
+    assert engine.abort_request(seq.id)
+    assert seq.id in engine.deferred_free_blocks  # the worker may be writing
+    worker, _ = make_worker(namespace=offload._namespace)
+    worker._do_load_req(request)
+    engine._update_from_kv_xfer_finished(worker.get_finished())
+    assert seq.id not in engine.deferred_free_blocks
+    assert engine.block_manager.kv.num_free == free
+    assert engine._num_parked_remote_kv == 0
+    assert not offload.has_pending_work()
+
+
+def test_a_loaded_prefix_is_published_and_the_suffix_hashes_onto_it(
+    cluster, store_engine, make_worker, caplog
+):
+    engine, offload = store_engine.engine, store_engine.offload
+    _store_chunks(cluster, _hashes(40), range(5))
+    seq = Sequence(list(range(49)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+    batch, _ = engine.schedule()
+    [request] = [r for r in batch.connector_meta_output.requests if r.load_spec]
+    worker, _ = make_worker(namespace=offload._namespace)
+    worker._do_load_req(request)
+    engine._update_from_kv_xfer_finished(worker.get_finished())
+    kv = engine.block_manager.kv
+    with caplog.at_level(logging.ERROR, logger="atom"):
+        batch, _ = engine.schedule()  # the suffix, [40, 49)
+        assert batch.num_cached_tokens == [40]
+        # Woken: the ten loaded blocks are indexed before any forward.
+        assert all(kv.block(block).hash != -1 for block in seq.block_table[:10])
+        engine.postprocess(
+            [seq],
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(7,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+    # The two blocks the suffix filled chain their hashes onto the loaded ones.
+    assert all(kv.block(block).hash != -1 for block in seq.block_table[:12])
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    # A later turn finds the prefix in HBM and loads nothing.
+    again = Sequence(list(range(49)), BLOCK, sampling_params=SamplingParams())
+    engine.add(again)
+    batch, _ = engine.schedule()
+    assert again.status == SequenceStatus.RUNNING
+    assert [r for r in batch.connector_meta_output.requests if r.load_spec] == []
+    assert again.num_cached_tokens >= 40
 
 
 def test_dense_scheduler_load_request_is_unchanged(monkeypatch):
@@ -1614,7 +1841,7 @@ def test_gpu_copy_failure_without_a_fence_retires_its_slots(
 def test_a_save_queued_past_its_deadline_reads_nothing(cluster, make_worker):
     worker, gpu = make_worker()
     request = _save_req(22, 24)
-    request._mooncake_store_received_at = time.monotonic() - 10_000
+    request._mooncake_store_dispatched_at = time.monotonic() - 10_000
     worker._do_save_req(request)
     assert gpu.calls == []
     assert cluster.objects.get(MASTER, {}) == {}
@@ -1626,6 +1853,52 @@ def test_a_save_queued_past_its_deadline_reads_nothing(cluster, make_worker):
     }
     # The deadline leaves a margin inside the scheduler's reclaim window.
     assert worker._source_read_window_s == 240.0
+
+
+@pytest.mark.parametrize(("runs_after_s", "stored"), [(7.5, True), (8.5, False)])
+def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
+    cluster, make_worker, monkeypatch, runs_after_s, stored
+):
+    clock = SimpleNamespace(monotonic=5000.0, wall=1.75e9)
+    monkeypatch.setattr(
+        worker_mod,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.monotonic,
+            time=lambda: clock.wall,
+            perf_counter=time.perf_counter,
+        ),
+    )
+    # Enqueue nothing: the test runs the save when its thread would get to it.
+    monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda *_: None)
+    worker, gpu = make_worker(config=_config(extra=_extra(save_abandon_timeout_s=10)))
+    # The scheduler may reclaim the source 10 s after the dispatch.
+    assert worker._source_read_window_s == 8.0
+    request = _save_req(26, 24)
+    request.dispatched_at = clock.wall
+    # A downstream PP stage receives it 3 s later, after the forwards queued
+    # ahead of it.
+    clock.monotonic += 3.0
+    clock.wall += 3.0
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(request)
+    worker.start_load_kv(metadata)
+    assert request._mooncake_store_dispatched_at == clock.monotonic - 3.0
+    clock.monotonic += runs_after_s - 3.0
+    worker._do_save_req(request)
+    operation = request.save_operation
+    completions = worker.get_finished().connector_completions
+    if stored:
+        assert len(cluster.objects[MASTER]) == 3
+        assert _store(operation) in completions
+    else:
+        # Past the window counted from the dispatch, though not from receipt.
+        assert gpu.calls == [] and cluster.objects.get(MASTER, {}) == {}
+        assert completions == {
+            _store(operation, False),
+            _quiescent(operation),
+            *(_safe(operation, index) for index in range(3)),
+        }
 
 
 def test_a_late_exception_still_leaves_exactly_one_terminal(
@@ -1671,7 +1944,8 @@ def test_start_load_kv_stamps_saves_and_shares_one_fence(
     before = time.monotonic()
     worker.start_load_kv(metadata)
     worker._save_executor.shutdown(wait=True)
-    assert all(r._mooncake_store_received_at >= before for r in metadata.requests)
+    # No dispatch time: the deadline counts from receipt.
+    assert all(r._mooncake_store_dispatched_at >= before for r in metadata.requests)
     assert len(events) == 1 and gpu.events == [events[0], events[0]]
     output = worker.get_finished()
     assert output.finished_saving == {r.save_operation for r in metadata.requests}
@@ -1895,6 +2169,26 @@ def test_registered_under_its_name_and_alias():
         KVConnectorFactory.canonical_name("MooncakeStoreOffloadConnector")
         == "mooncake_store"
     )
+
+
+def test_a_second_offload_connector_beside_it_is_refused_at_startup(cluster):
+    assert KVConnectorFactory.is_offload_backend("mooncake_store")
+    assert not KVConnectorFactory.is_offload_backend("mooncake")
+    store = {
+        "kv_connector": "mooncake_store",
+        "kv_role": "offload",
+        "kv_connector_extra_config": _extra(),
+    }
+    for other in (store, {"kv_connector": "lmcache_mp", "kv_role": "offload"}):
+        config = _config()
+        config.kv_transfer_config = {
+            "kv_connector": "multi",
+            "connectors": [store, other],
+        }
+        for role in ("scheduler", "worker"):
+            with pytest.raises(ValueError, match="at most one offload sub-connector"):
+                KVConnectorFactory.create_connector(config, role=role)
+    assert cluster.stores == []
 
 
 def test_factory_builds_both_halves(cluster):
