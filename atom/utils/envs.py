@@ -642,6 +642,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_V4_PREFILL_ASM_FOR_DECODE": lambda: (
         os.getenv("ATOM_USE_V4_PREFILL_ASM_FOR_DECODE", "0") == "1"
     ),
+    # DeepSeek-V4 HCA (compress_ratio 128) fp8 decode through aiter's
+    # persistent V4-NM kernel (one launch, in-kernel split + merge) instead of
+    # the decode ASM + split plan. gfx950, 128 local heads only; quietly off
+    # when aiter lacks mla_decode_fwd_v4_nm_ps.
+    "ATOM_V4_HCA_PERSIST": lambda: os.getenv("ATOM_V4_HCA_PERSIST", "1") == "1",
+    # Calls with fewer q rows stay on the ASM path, which is faster there.
+    "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
+        os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
+    ),
     # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
     # FlyDSL GPU work planner, built once per forward in the metadata
