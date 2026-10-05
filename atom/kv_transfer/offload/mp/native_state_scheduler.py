@@ -160,6 +160,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         boundary = self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
         return list(seq.token_ids[:boundary])
 
+    def _lookup_len(self, seq: Any) -> int:
+        return self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
+
     def get_num_new_matched_tokens(self, seq: Any) -> tuple[int, bool]:
         if not getattr(seq, "has_per_req_cache", False):
             return 0, False

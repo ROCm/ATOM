@@ -112,6 +112,7 @@ from atom.model_ops.v4_kernels import (
     csa_translate_pack,
     fp4_indexer_enabled,
     fused_compress_attn,
+    hca_persist,
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
     scale_indexer_weights,
@@ -2631,6 +2632,14 @@ class DeepseekV4Attention(nn.Module):
         # traces unchanged. The rope planes (swa_plane_rope / unified_kv_rope) are
         # bound onto the module by DeepseekV4AttentionMetadataBuilder.
         self.kv_fp8 = atom_config.kv_cache_dtype == "fp8"
+        # Persistent HCA decode workspace: allocate at model load (before KV
+        # sizing and graph capture) on every serving path, native or plugin.
+        if self.compress_ratio == hca_persist.HCA_RATIO:
+            hca_persist.prepare_if_usable(
+                kv_fp8=self.kv_fp8,
+                heads=self.n_local_heads,
+                gfx=arch,
+            )
 
     def process_weights_after_loading(self) -> None:
         """Prepare wo_a (FP8 + e8m0 block scale) for the grouped output LoRA.
@@ -3313,12 +3322,15 @@ class DeepseekV4Attention(nn.Module):
             if ratio == 0:
                 kv_indices = attn_md.kv_indices_swa
                 kv_indptr = attn_md.kv_indptr_swa
+                split_plan = attn_md.split_plan_swa
             elif ratio == 4:
                 kv_indices = attn_md.kv_indices_csa
                 kv_indptr = attn_md.kv_indptr_csa
+                split_plan = attn_md.split_plan_csa
             else:  # ratio == 128
                 kv_indices = attn_md.kv_indices_hca
                 kv_indptr = attn_md.kv_indptr_hca
+                split_plan = attn_md.split_plan_hca
             # Dispatch on kv-cache layout inside the wrapper: fp8 2buff
             # (unified_kv_rope set) → aiter ASM with pre-packed fp8 Q + the
             # 2buff fp8/bf16 pools read with no requant. The optional H=128
@@ -3336,6 +3348,8 @@ class DeepseekV4Attention(nn.Module):
                 qo_indptr=attn_md.qo_indptr,
                 empty_kv_indptr=attn_md.empty_kv_indptr,
                 prefix=f"{self.layer_name}.sparse_attn_decode",
+                split_plan=split_plan,
+                compress_ratio=ratio,
             )  # [S, H, head_dim]
         else:
             # Two-source paged prefill: prefix from `unified_kv` (per-ratio

@@ -29,6 +29,9 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_PROFILER_MORE",
+    "ATOM_PROFILER_RECORD_SHAPES",
+    "ATOM_PROFILER_WITH_STACK",
+    "ATOM_PROFILER_PROFILE_MEMORY",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
@@ -38,6 +41,12 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+]
+
+_PROFILER_DETAIL_VARS = [
+    "ATOM_PROFILER_RECORD_SHAPES",
+    "ATOM_PROFILER_WITH_STACK",
+    "ATOM_PROFILER_PROFILE_MEMORY",
 ]
 
 
@@ -104,6 +113,10 @@ class TestEnvsDefaults:
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
 
+    @pytest.mark.parametrize("name", _PROFILER_DETAIL_VARS)
+    def test_profiler_detail_default(self, name):
+        assert getattr(_get_envs(), name) is False
+
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
 
@@ -169,6 +182,25 @@ class TestEnvsOverrides:
     def test_profiler_more_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
+
+    @pytest.mark.parametrize("name", _PROFILER_DETAIL_VARS)
+    @pytest.mark.parametrize("more", [None, "", "0", "1"])
+    def test_profiler_detail_falls_back_to_profiler_more(self, monkeypatch, name, more):
+        if more is not None:
+            monkeypatch.setenv("ATOM_PROFILER_MORE", more)
+        monkeypatch.setenv(name, "")
+        assert getattr(_get_envs(), name) is (more == "1")
+
+    @pytest.mark.parametrize("name", _PROFILER_DETAIL_VARS)
+    @pytest.mark.parametrize("value, more", [("1", "0"), ("0", "1")])
+    def test_profiler_detail_overrides_profiler_more(
+        self, monkeypatch, name, value, more
+    ):
+        monkeypatch.setenv("ATOM_PROFILER_MORE", more)
+        monkeypatch.setenv(name, value)
+        assert getattr(_get_envs(), name) is (value == "1")
+        others = [n for n in _PROFILER_DETAIL_VARS if n != name]
+        assert [getattr(_get_envs(), n) for n in others] == [more == "1"] * 2
 
     def test_metrics_device_timer_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
