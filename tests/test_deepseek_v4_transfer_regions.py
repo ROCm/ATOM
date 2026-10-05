@@ -146,6 +146,10 @@ def _stub_v4_runtime_imports():
         "CommonAttentionBuilder",
     ):
         setattr(backends, name, type(name, (), {}))
+    # Reserved key for the base per-request allocation, which V4 publishes so a
+    # rapidserve prefill can export its IPC handle. A value, not a class, so it
+    # is stubbed by hand rather than by the loop above.
+    backends.PER_REQ_POOL_ATTR = "per_req_pool"
 
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
     kernels.FP4_MQA_BLOCK_K = 128

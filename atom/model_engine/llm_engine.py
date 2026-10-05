@@ -58,6 +58,14 @@ class LLMEngine:
         # multi-node topology back to a single local rank.
         if "parallel_config" not in config_kwargs:
             config.parallel_config.data_parallel_size = data_parallel_size
+            # Same reason as the rapidserve pair configs: __post_init__ already
+            # resolved size_local against the *default* dp_size of 1, and it does
+            # not re-run. Left alone, a legacy `data_parallel_size=N` call looks
+            # like a one-rank slice of an N-rank group (is_multinode_dp) and
+            # CoreManager spawns a single engine. ATOM_DP_SIZE_LOCAL is the one
+            # deliberate way to say otherwise, so it still wins.
+            if not envs.is_set("ATOM_DP_SIZE_LOCAL"):
+                config.parallel_config.data_parallel_size_local = data_parallel_size
             if data_parallel_master_port is not None:
                 config.parallel_config.data_parallel_master_port = (
                     data_parallel_master_port

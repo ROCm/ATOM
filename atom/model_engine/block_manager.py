@@ -117,6 +117,14 @@ class BlockManager:
         block_size = config.kv_cache_block_size
         num_blocks = config.num_kvcache_blocks
         assert num_blocks > 0
+        # For the prefix-hash logs only. Under DP attention every rank runs its
+        # own BlockManager over its own pool, and all of them write to one log
+        # -- so two ranks each publishing their first request into their own
+        # physical block 0 is indistinguishable from one rank republishing,
+        # unless the line says which rank it came from.
+        self._log_dp_rank = getattr(
+            getattr(config, "parallel_config", None), "data_parallel_rank", -1
+        )
         self.block_size = block_size
         self.dcp_world_size = config.decode_context_parallel_size
         # DCP KV-cache interleave granularity S (1 = token-level round-robin).
@@ -930,6 +938,28 @@ class BlockManager:
                 if cached_hashes is not None and i < immutable_blocks:
                     cached_hashes.append(h)
             block_id = self.kv.lookup(h)
+            if i == 0:
+                # The probe side of `[prefix-hash] publish`. Three outcomes and
+                # they mean different things: a different `h` means the two
+                # sides hashed different tokens; `block_id=-1` on a matching
+                # `h` means the entry went (evicted, or never indexed); a hit
+                # with `tok_match=False` means the hash collided or the stored
+                # tokens were overwritten under it.
+                logger.info(
+                    "[prefix-hash] dp=%d probe   seq=%s blk=%d h=%d block_id=%d "
+                    "ntok=%d tok_match=%s",
+                    self._log_dp_rank,
+                    seq.id,
+                    i,
+                    h,
+                    block_id,
+                    len(token_ids),
+                    (
+                        None
+                        if block_id == -1
+                        else self.kv.block(block_id).token_ids == token_ids
+                    ),
+                )
             if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
                 break
             block_hashes.append(h)
@@ -1645,6 +1675,28 @@ class BlockManager:
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             self.kv.publish(seq.block_table[i], h, token_ids)
+            if i == start:
+                # Block 0 only, so one line per publish. Paired with the probe
+                # log in `can_allocate`: the two print the same quantity from
+                # the two sides, which is the only way to tell a hash that
+                # differs from a hash that was never indexed.
+                logger.info(
+                    "[prefix-hash] dp=%d publish seq=%s blk=%d h=%d block_id=%d "
+                    "ntok=%d base=%d start=%d end=%d num_new=%d cached=%d "
+                    "explicit_start=%s",
+                    self._log_dp_rank,
+                    seq.id,
+                    i,
+                    h,
+                    seq.block_table[i],
+                    len(token_ids),
+                    base,
+                    start,
+                    end,
+                    num_new_tokens,
+                    seq.num_cached_tokens,
+                    start_tokens is not None,
+                )
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
@@ -2079,6 +2131,61 @@ class BlockManager:
             return
         self.state.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
+
+    def reserve_prefill_checkpoint(self, seq: Sequence, cut: int):
+        """Reserve the image a rapidserve prefill will write at `cut`.
+
+        `cut` comes from `checkpoint_cut`, so it is a hash-block boundary and a
+        position `checkpointers_at` accepts -- the two have to agree, and this
+        keeps the third caller reading the same arithmetic rather than a copy
+        of it.
+
+        The hash is the chained hash of the last block the cut covers. It comes
+        off `seq.block_hashes`, which `_extend_hash_chain` fills for the WHOLE
+        prompt -- `block_hashes` proper stops at the first miss, so on a cold
+        prompt it holds one entry and never reaches the rung.
+
+        Returns `(hash, op)`, or `(0, None)` when nothing was reserved: no
+        checkpoint coordinator, no rung, a chain too short, or a pool that
+        could not free the units. Every one of those costs reuse and nothing
+        else, so the caller ships no op and prefill runs unchunked.
+        """
+        if self.paged_state_checkpoints is None or cut <= 0:
+            return 0, None
+        h = self._chain_hash_to(seq, cut // self.hash_block_size)
+        if h is None:
+            return 0, None
+        op = self.paged_state_checkpoints.reserve_store(seq, h)
+        return (h, op) if op is not None else (0, None)
+
+    def _chain_hash_to(self, seq: Sequence, blocks: int) -> int | None:
+        """Chained hash of block `blocks - 1`, computed here and now.
+
+        NOT read off `seq.block_hashes`: that list is built only for a backend
+        that reserves midstep (`_extend_hash_chain` returns at its first line
+        otherwise, deliberately -- it would be a hash pass over the whole
+        prompt on every admission, spent on nothing). A COPY backend is not
+        midstep-readable, so the list is empty exactly when this needs it.
+
+        So the chain is walked here instead, and only as far as the rung --
+        four blocks for the shipped geometry, against the whole prompt that
+        `_extend_hash_chain` would have done -- and only once a cut has been
+        found, which is the one case where a checkpoint is actually wanted.
+
+        Identical arithmetic to `hash_blocks`, which is what will publish
+        these same hashes after the forward: same seed from
+        `_chain_parent_hash(seq, 0)`, same `_hash_block_tokens` slices, same
+        `compute_hash` chaining. The two must agree or the image is filed
+        under a hash no lookup will ever produce.
+        """
+        if blocks <= 0:
+            return None
+        h = self._chain_parent_hash(seq, 0)
+        if h is None:
+            return None
+        for i in range(blocks):
+            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+        return h
 
     def checkpoint_cut(
         self, seq: Sequence, start: int, end: int, *, record: bool = True

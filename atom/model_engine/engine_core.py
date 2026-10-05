@@ -134,6 +134,11 @@ class EngineCore:
             # adding an architecture never touches this line.
             config.pool_entries = block_info.get("pool_entries", {})
             config.pool_entries_per_req = block_info.get("pool_entries_per_req", {})
+            # Carried whole as well as in pieces: the two dicts above are what
+            # BlockManager reads, and the plan is what a runner on the far side
+            # of an IPC boundary needs, because backends take their entry counts
+            # off `model_runner.pool_plan`.
+            config.pool_plan = block_info.get("pool_plan")
             self.state_runtime = StateRuntime.from_wire(block_info["state_runtime"])
             ret = self.runner_mgr.call_func(
                 "allocate_kv_cache", num_blocks, wait_out=True
@@ -964,11 +969,20 @@ class DPEngineCoreProc(EngineCore):
 # the kvcache bootstrap bundle to decode, which applies them before building its
 # BlockManager. Add here whenever get_num_blocks() starts feeding another value
 # into config for the scheduler.
+#
+# These used to be four plain ints — `per_req_cache_equiv_blocks`,
+# `num_per_req_cache_groups`, `num_swa_blocks`, `swa_window_size`. None of them
+# survived #1771/#2147: their successor is the per-class entry table, which
+# `BlockManager` reads as `pool_entries` / `pool_entries_per_req`. The rename
+# went unnoticed here because both ends defaulted to 0, so the bundle kept
+# shipping four keys that no longer existed and decode kept applying zeros —
+# which reads as "this model has no per-request state" rather than as an error.
+# Hence no defaults below: a key that stops existing must break the bootstrap,
+# not quietly disable the state pool.
 _SCHED_DIM_KEYS = (
-    "per_req_cache_equiv_blocks",
-    "num_per_req_cache_groups",
-    "num_swa_blocks",
-    "swa_window_size",
+    "pool_entries",
+    "pool_entries_per_req",
+    "pool_plan",
 )
 
 
@@ -1117,14 +1131,24 @@ class PrefillEngineCore(DPEngineCoreProc):
                 "num_kvcache_blocks": self._config.num_kvcache_blocks,
                 # Scheduler-side dims that get_num_blocks() derives HERE, in the
                 # prefill process, from its memory profile. Decode's
-                # get_num_blocks() short-circuits (it owns no KV memory), so its
-                # config leaves all of these at 0 and its BlockManager comes up
-                # crippled: num_per_req_cache_groups=0 makes can_allocate()
-                # return -1 for every sequence of a stateful model (DeepSeek-V4
-                # → "Cannot allocate prefill"), and num_swa_blocks=0 silently
-                # disables the SWA pool. Both processes must agree on these —
-                # decode allocates SWA block IDs that prefill writes into.
-                **{k: getattr(self._config, k, 0) for k in _SCHED_DIM_KEYS},
+                # get_num_blocks() short-circuits (it owns no KV memory), so
+                # without these its BlockManager comes up with
+                # `num_state_slots=0` and `can_allocate()` refuses every
+                # sequence of a stateful model (DeepSeek-V4 → "Cannot allocate
+                # prefill"). Both processes must agree on them: decode hands out
+                # the indices prefill writes into.
+                #
+                # No getattr default — see _SCHED_DIM_KEYS. EngineCore.__init__
+                # sets both from `block_info` before this runs, so a missing one
+                # is a bug worth the AttributeError.
+                **{k: getattr(self._config, k) for k in _SCHED_DIM_KEYS},
+                # The transfer kind and, for a COPY backend, the PAGE checkpoint
+                # geometry. Decode builds its own from its short-circuited
+                # get_num_blocks, which knows the kind but never sized a pool
+                # and so carries no `checkpoint_spec`; prefill's is the complete
+                # one, and `StateRuntime.from_wire` re-validates that the
+                # layout ids agree on the way in.
+                "state_runtime": self.state_runtime.to_wire(),
             }
         )
         logger.info(
@@ -1214,10 +1238,15 @@ class PrefillEngineCore(DPEngineCoreProc):
                     assignment = self._pending_assignments.pop(seq.id)
                     seq.block_table = new_block_table(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
-                    # Paged-SWA parallel table, already window-materialized by
-                    # decode. Must stay positionally aligned with block_table —
-                    # the V4 index kernels use absolute logical indexing.
-                    seq.swa_block_table = list(assignment.swa_block_table)
+                    # The STATE slots decode allocated for this request. This
+                    # forward writes its state into them, and decode continues
+                    # from what it leaves there — the two processes carve the
+                    # same views over one per-request pool, so the index is all
+                    # that has to travel.
+                    seq.state_slots = list(assignment.state_slots)
+                    # Decode's cut and its reserved image. Prefill computes
+                    # neither -- it has no BlockManager -- it only honours them.
+                    seq.prefill_cuts = list(assignment.prefill_cuts)
                     # Which decode rank sent this. Under the paired topology a
                     # prefill process only ever serves its own decode rank, so
                     # this is informational rather than a routing key.
@@ -1258,6 +1287,28 @@ class PrefillEngineCore(DPEngineCoreProc):
                 sampled_token_ids,
             )
         ):
+            # A chunked prompt sends one of these per chunk. The partial ones
+            # carry real KV -- decode publishes their hashes, which is how the
+            # blocks the checkpoint covers reach the content index -- but no
+            # token: the request is mid-prompt, so nothing was sampled for it
+            # and decode must not promote it to `running`.
+            # `seqs`, the dict `schedule()` returned alongside the batch --
+            # NOT `scheduled_batch.seqs`, which does not exist: the batch
+            # consumes the mapping in `__init__` to derive `req_ids` and the
+            # per-seq arrays, and keeps none of it.
+            seq = seqs.get(seq_id)
+            is_final = not getattr(seq, "is_partial_prefill", False)
+            # After the forward, not at schedule time: the runner reads this as
+            # the chunk's start offset, so advancing it earlier stages nothing.
+            #
+            # Unconditional, not gated on `prefill_cut_pos`. A chunk can be
+            # short because the rung said so OR because the token budget did,
+            # and only the second kind exists for a prompt with no rung at all
+            # -- gating on the cut left those never advancing, so every pass
+            # re-ran the same first chunk. This is the prefill process's own
+            # copy of the sequence; decode advances its own from PrefillDone.
+            if seq is not None:
+                seq.num_cached_tokens += int(num_tokens)
             done = PrefillDone(
                 seq_id=seq_id,
                 num_tokens_computed=int(num_tokens),
@@ -1268,9 +1319,13 @@ class PrefillEngineCore(DPEngineCoreProc):
                     if i < len(draft_token_ids)
                     else []
                 ),
+                is_final=is_final,
             )
             # One socket: this prefill process serves exactly one decode rank.
-            self._seq_target_rank.pop(seq_id, None)
+            # Only on the last chunk -- the routing entry is what lets a later
+            # chunk of the same prompt find its decode peer.
+            if is_final:
+                self._seq_target_rank.pop(seq_id, None)
             self._p2d_socks[0].send(
                 pickle.dumps((DisaggMsgType.PREFILL_DONE, done))
             )
@@ -1392,15 +1447,34 @@ class DecodeEngineCore(DPEngineCoreProc):
             raw = sock.recv()
         bundle = pickle.loads(raw)
         num_kvcache_blocks = bundle["num_kvcache_blocks"]
+        # Checked here, before anything reads the bundle, rather than beside the
+        # application further down: the runners are handed this sizing first,
+        # and a short bundle should say so instead of surfacing as a KeyError
+        # inside an IPC import.
+        missing = [_k for _k in (*_SCHED_DIM_KEYS, "state_runtime") if _k not in bundle]
+        if missing:
+            raise RuntimeError(
+                f"kvcache bundle from prefill is missing {missing}; prefill and "
+                "decode disagree on what the bootstrap carries. Both processes "
+                "must run the same ATOM revision."
+            )
         logger.info(
             f"DecodeEngineCore: received kvcache bundle ({num_kvcache_blocks} blocks)"
         )
 
         # --- Import kvcache — sets self.kv_cache + binds to attention modules ---
+        #
+        # The sizing travels as arguments, not on `config`: the runners are
+        # separate processes, so the `_SCHED_DIM_KEYS` applied to this process's
+        # config below never reaches them. Read straight off the bundle here for
+        # the same reason the application below cannot be hoisted — it has to
+        # happen in both places, and this is the one that has to happen first.
         self.runner_mgr.call_func(
             "import_kv_cache_ipc_handle",
             bundle["kvcache_args"],
             num_kvcache_blocks,
+            bundle["pool_plan"],
+            bundle["state_runtime"],
             wait_out=True,
         )
         logger.info("DecodeEngineCore: kvcache IPC import complete")
@@ -1417,13 +1491,20 @@ class DecodeEngineCore(DPEngineCoreProc):
             )
 
         # Apply prefill's scheduler dims BEFORE building DecodeScheduler — its
-        # BlockManager reads them at construction (per-req cache group free-list
-        # and SWA pool size). Without this they stay 0 and every allocate fails.
+        # BlockManager reads them at construction (the state slot free list is
+        # sized from `pool_entries`). Without them every allocate fails.
+        #
+        # Presence was demanded when the bundle arrived; this is the half that
+        # has to happen in THIS process, after the runners got their own copy
+        # as arguments.
         for _k in _SCHED_DIM_KEYS:
-            setattr(config, _k, bundle.get(_k, 0))
+            setattr(config, _k, bundle[_k])
+        # Prefill's is the one with a checkpoint_spec; see the send side.
+        self.state_runtime = StateRuntime.from_wire(bundle["state_runtime"])
         logger.info(
             "DecodeEngineCore: scheduler dims from prefill: "
-            + ", ".join(f"{k}={bundle.get(k, 0)}" for k in _SCHED_DIM_KEYS)
+            + ", ".join(f"{k}={bundle[k]}" for k in _SCHED_DIM_KEYS)
+            + f", state_transfer={self.state_runtime.transfer.kind}"
         )
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
@@ -1535,11 +1616,46 @@ class DecodeEngineCore(DPEngineCoreProc):
                 done.num_tokens_computed,
                 done.sampled_token_id,
                 done.draft_token_ids,
+                is_final=done.is_final,
             )
             logger.info(
-                f"DecodeEngineCore: seq {done.seq_id} prefill done "
-                f"({done.num_tokens_computed} tokens cached), moved to running queue"
+                "DecodeEngineCore: seq %s prefill %s (%d tokens cached)",
+                done.seq_id,
+                "done, moved to running queue" if done.is_final else "chunk landed",
+                done.num_tokens_computed,
             )
+
+    def _flush_state_maintenance(self):
+        """Run this pass's queued state moves now, and wait for them.
+
+        The normal path lets `StateMaintenanceOps` ride the ScheduledBatch and
+        executes them in `build()`, on the same stream as the forward that
+        reads them. Under rapidserve an admission's restore has no such
+        forward on this side: the request's next forward is prefill's. So the
+        ops are drained here and executed against the shared per-request pool,
+        and this side blocks until the copy has landed.
+
+        Only reached when the pair shares that pool — otherwise
+        `_bind_kv_cache_to_modules` refused at startup and there are no
+        checkpoints to restore.
+
+        Draining here is also what keeps the batch path correct: ops taken now
+        are not taken again by `schedule()`, so no copy runs twice.
+        """
+        bm = getattr(self.scheduler, "block_manager", None)
+        if bm is None:
+            return
+        ops = bm.take_state_maintenance_ops()
+        if ops.empty:
+            return
+        logger.debug(
+            "DecodeEngineCore: flushing state maintenance "
+            "(%d relocations, %d stores, %d restores)",
+            len(ops.relocations),
+            len(ops.checkpoint_stores),
+            len(ops.checkpoint_restores),
+        )
+        self.runner_mgr.call_func("flush_state_maintenance", ops, wait_out=True)
 
     def _send_block_assignment(self, seq: Sequence):
         """Send BlockAssignment to prefill for a newly allocated sequence."""
@@ -1550,7 +1666,11 @@ class DecodeEngineCore(DPEngineCoreProc):
             block_table=list(seq.block_table),
             num_cached_tokens=seq.num_cached_tokens,
             context_len=seq.num_tokens,
-            swa_block_table=list(seq.swa_block_table),
+            state_slots=list(seq.state_slots),
+            # Where to stop, and what to write there. Both computed by decode
+            # in `_prepare_prefill_checkpoint`; 0/None when this prompt has no
+            # rung, which is the unchunked path prefill has always taken.
+            prefill_cuts=list(seq.prefill_cuts),
             target_rank=self._decode_rank,
         )
         self._d2p_sock.send(pickle.dumps((DisaggMsgType.BLOCK_ASSIGNMENT, assignment)))
@@ -1591,8 +1711,22 @@ class DecodeEngineCore(DPEngineCoreProc):
         # iteration's value, engines_running) says some rank has work, so the
         # entry condition is itself identical on every rank. An idle cluster
         # reaches neither, which is what stops the spin.
-        for seq in self.scheduler.allocate_waiting():
-            self._send_block_assignment(seq)
+        # Before `schedule()`, on the engine thread. Two reasons it cannot stay
+        # in `postprocess`: a partial chunk has no decode forward and so never
+        # reaches one, and a checkpoint filed here is drained by the very next
+        # `schedule()` while the slot still holds what the chunk left in it.
+        self.scheduler.publish_landed_prefill_chunks()
+        newly_allocated = self.scheduler.allocate_waiting()
+        if newly_allocated:
+            # Before the assignments go out, not after. Admission is what
+            # queues a checkpoint restore, and the forward that reads the
+            # restored slot is PREFILL's — in the other process, on a stream
+            # this one cannot order against. A ZMQ send is not a stream
+            # barrier, so the copy has to be finished, not merely issued,
+            # before prefill is told the request is ready.
+            self._flush_state_maintenance()
+            for seq in newly_allocated:
+                self._send_block_assignment(seq)
         if not self.scheduler.has_requests():
             return False
         result = self.scheduler.schedule()

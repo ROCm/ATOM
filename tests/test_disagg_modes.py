@@ -340,14 +340,18 @@ class TestDecodeLockstep:
         ec = pytest.importorskip("atom.model_engine.engine_core")
 
         obj = object.__new__(ec.DecodeEngineCore)
-        # allocate_waiting now runs first (it ticks the delayer's collective),
-        # so the stub has to provide it even when there is nothing to admit.
+        # Both run before the early return: `publish_landed_prefill_chunks`
+        # registers the hashes of chunks that landed since the last pass, and
+        # `allocate_waiting` ticks the delayer's collective. A rank that skips
+        # either is out of step with the others, so the stub has to provide
+        # them even when there is nothing to admit.
         obj.scheduler = type(
             "S",
             (),
             {
                 "has_requests": lambda self: False,
                 "allocate_waiting": lambda self: [],
+                "publish_landed_prefill_chunks": lambda self: None,
             },
         )()
         assert obj._process_engine_step() is False
@@ -753,6 +757,88 @@ class TestPairedTopologyLayout:
         decode = set(range(got["decode_idx0"], got["local_engine_count"]))
         assert not (prefill & decode)
         assert len(prefill) == len(decode) == got["n_pairs"]
+
+
+class TestPairedDataParallelBounds:
+    """The paired configs must carry data_parallel_size_local, not just _size.
+
+    ParallelConfig resolves size_local once, in __post_init__. `_pair_config`
+    deepcopies an already-built config and only then raises
+    data_parallel_size to n_pairs, so size_local does not follow it: a plain
+    `-tp 8` launch left it at 1 while local ranks ran 0..7, and every rank but
+    0 died in DPEngineCoreProc._init_data_parallel with
+    `local_dp_rank=k outside [0,1)`. The same stale value reaches MoRI as
+    gpu_per_node (moe.py local_ep_size), so the assert was the first symptom,
+    not the only one.
+    """
+
+    @staticmethod
+    def _dp_engine_core_proc():
+        """Bind the class against a fake AITER — async_proc needs a real build
+        at import time, which the no-GPU runner does not have."""
+        from aiter_stub import stubbed_aiter
+
+        with stubbed_aiter():
+            from atom.model_engine.engine_core import DPEngineCoreProc
+
+        return DPEngineCoreProc
+
+    @staticmethod
+    def _pair_parallel_config(k, n_pairs):
+        """The parallel_config `_pair_config` hands one paired process."""
+        import copy
+
+        from atom.config import ParallelConfig
+
+        # As built by a `-tp 8` launch, before DisaggCoreManager reshapes it:
+        # dp_size 1, so __post_init__ pins size_local to 1.
+        pc = copy.deepcopy(ParallelConfig())
+        pc.data_parallel_size = n_pairs
+        pc.data_parallel_size_local = n_pairs
+        pc.data_parallel_rank = k
+        pc.data_parallel_rank_local = k
+        return pc
+
+    def test_size_local_does_not_track_a_later_dp_size(self):
+        """The trap itself: assigning dp_size after construction is not enough."""
+        from atom.config import ParallelConfig
+
+        pc = ParallelConfig()
+        assert pc.data_parallel_size_local == 1
+        pc.data_parallel_size = 8
+        assert pc.data_parallel_size_local == 1
+
+    @pytest.mark.parametrize("k", range(8))
+    def test_every_pair_rank_passes_the_bound_check(self, k):
+        import types
+
+        DPEngineCoreProc = self._dp_engine_core_proc()
+
+        pc = self._pair_parallel_config(k, n_pairs=8)
+        pc.stateless_init_dp_group = lambda: "dp_group"
+        obj = object.__new__(DPEngineCoreProc)
+
+        DPEngineCoreProc._init_data_parallel(
+            obj, types.SimpleNamespace(parallel_config=pc)
+        )
+
+        assert obj.dp_rank == k
+        assert obj.dp_group == "dp_group"
+
+    def test_stale_size_local_is_what_broke_rank_4(self):
+        """Guard the guard: without the fix the bound check must still fire."""
+        import types
+
+        DPEngineCoreProc = self._dp_engine_core_proc()
+
+        pc = self._pair_parallel_config(4, n_pairs=8)
+        pc.data_parallel_size_local = 1  # the pre-fix value
+        obj = object.__new__(DPEngineCoreProc)
+
+        with pytest.raises(AssertionError, match=r"local_dp_rank=4 outside \[0,1\)"):
+            DPEngineCoreProc._init_data_parallel(
+                obj, types.SimpleNamespace(parallel_config=pc)
+            )
 
 
 class TestPairedRequestRouting:

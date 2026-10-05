@@ -18,6 +18,7 @@ Phase 2 (weight sharing):
 """
 
 import logging
+from collections.abc import Sequence
 
 import torch
 from torch import nn
@@ -67,32 +68,64 @@ def _import_tensor(meta: dict) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def export_kv_cache_handle(kv_cache: torch.Tensor) -> dict:
-    """Export the paged pool as a CUDA IPC handle.
+def export_kv_cache_handle(named: dict) -> dict:
+    """Export a rapidserve pair's shared allocations, keyed by runner attribute.
 
-    One handle because there is one allocation: the dequantization scales, any
-    indexer key cache and a draft's sibling pool are regions of it, and the
-    decode side finds them by carving with the same declarations rather than by
-    being sent a tensor per region.
+    Name-keyed rather than one handle for one buffer, because #1771's "one
+    allocation" is true of the paged pool and not of a model. DeepSeek-V4 prices
+    `paged_pool_bytes` at zero and holds its bytes in two allocations of its
+    own -- the standalone CSA indexer cache, and the plane+arena pool
+    `allocate_per_req_cache` makes -- so `kv_cache` is EMPTY for it and shipping
+    only that would share nothing. A name-keyed payload is what this was before
+    #1771 collapsed the paged side; the backend now says which names matter
+    (`shared_runner_attrs`) instead of the transport guessing.
 
-    This replaced a name-keyed `export_kv_cache_handles(named_values)` that
-    shipped one handle per backend attribute, because #1771 collapsed the five
-    named allocations into this single buffer. The name-keyed version is in
-    git history if a future per-request STATE handoff needs it back -- it also
-    knew how to ship tensor LISTS (V4's per-layer pools) and plain scalars.
+    A None value means "this side has no such tensor", which is not the same as
+    a missing key: a key absent from the payload is a peer that does not know
+    about the name at all. Both reach the consumer intact.
 
-    Must be called from the process that allocated the tensor (prefill).
+    Must be called from the process that allocated the tensors (prefill).
     """
-    return {"kv_cache": _export_tensor(kv_cache)}
+    return {
+        name: (None if t is None else _export_tensor(t)) for name, t in named.items()
+    }
 
 
-def import_kv_cache(meta: dict) -> torch.Tensor:
-    """Reconstruct the paged pool from its CUDA IPC handle.
+def import_kv_cache(meta: dict) -> torch.Tensor | None:
+    """Reconstruct the paged pool, or None when the producer had none.
+
+    None is the DeepSeek-V4 case and is not an error: its PAGE bytes live in
+    the per-request pool, so `_carve_paged_pool` returns an empty buffer and the
+    runner never assigns `kv_cache` at all.
 
     Must be called from the consumer process (decode). The returned tensor
     shares GPU memory with prefill's allocation — no copy.
     """
-    return _import_tensor(meta["kv_cache"])
+    wire = meta.get("kv_cache")
+    return None if wire is None else _import_tensor(wire)
+
+
+def import_shared_pools(meta: dict, names: Sequence[str]) -> dict:
+    """Reconstruct the named allocations a backend asked to share.
+
+    Every name the backend declared must be present in the payload. Missing one
+    is a version skew between the two processes, and the cost of defaulting it
+    is a decode process reading its own freshly zeroed tensor while prefill
+    writes another -- no error, no layout mismatch, just an indexer that returns
+    nothing and an accuracy loss nobody can attribute.
+    """
+    missing = [n for n in names if n not in meta]
+    if missing:
+        raise KeyError(
+            f"kvcache IPC handles carry no {missing}; the prefill peer does not "
+            "share the allocations this backend declared in shared_runner_attrs"
+        )
+    out = {}
+    for name in names:
+        wire = meta[name]
+        if wire is not None:
+            out[name] = _import_tensor(wire)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +169,26 @@ _PRODUCER_ONLY_ATTRS = (
     # Set only when a8w8 preshuffle pads the output (linear.py:827) and read
     # alongside is_output_padded to slice the pad off (linear.py:985-987).
     "_output_size_before_padding",
+    # DeepSeek-V4's wo_a path selector (deepseek_v4.py:2514, read at :2757).
+    # On gfx950 the post-load hook KEEPS wo_a in FP8 and routes the grouped
+    # LoRA through `batched_gemm_a8w8_mxscale*`; everywhere else it dequants
+    # the weight to BF16 for the einsum. The weight itself aliases either way,
+    # so a consumer that misses this flag holds the producer's FP8 tensor and
+    # takes the BF16 branch -- `expected scalar type BFloat16 but found
+    # Float8_e4m3fn`, from the einsum, with nothing wrong with the weight.
+    #
+    # Leading underscore, so `_module_meta_attrs`' sweep skips it; the dtype
+    # beside it is a `torch.dtype`, which the str/bool filter would skip too.
+    # Both are exactly what this tuple is for.
+    "_wo_a_mxscale",
+    "_wo_a_fp8_dtype",
+    # Kimi-K3's KDA in-projection fusion latch (kimi_k3.py:1119, read at
+    # :1088 as `getattr(self, "_in_proj_fused", False)`). Same shape as the
+    # V4 pair above: the fused weight it guards rides across as a plain tensor
+    # attribute, and a consumer missing the latch re-fuses from the producer's
+    # already-fused buffers. Named now rather than when K3 first runs paired,
+    # because the failure is arithmetic, not a type error.
+    "_in_proj_fused",
 )
 
 

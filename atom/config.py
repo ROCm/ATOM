@@ -1879,6 +1879,14 @@ class Config:
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
     disagg_prefill_max_num_seqs: int | None = None
+    # Decode's max_num_seqs, carried on the PREFILL config so its sizing can
+    # reach a number its own max_num_seqs no longer holds. A state slot is held
+    # for a request's whole life — decode assigns it, prefill writes it, decode
+    # reads it — so the STATE floor has to cover decode's concurrency, and
+    # `disagg_prefill_max_num_seqs` above deliberately lowers prefill's. Only
+    # set on the prefill side of a rapidserve pair; None everywhere else, where
+    # max_num_seqs is already the right number.
+    disagg_decode_max_num_seqs: int | None = None
     # When True (and enable_rapidserve=True), use CU-masked streams + shm
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.

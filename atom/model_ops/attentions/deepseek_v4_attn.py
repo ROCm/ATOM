@@ -66,6 +66,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attentions.backends import (
+    PER_REQ_POOL_ATTR,
     AttentionBackend,
     AttentionMetadataBuilder,
     CommonAttentionBuilder,
@@ -1454,7 +1455,38 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ),
         }
 
-    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
+    def shared_runner_attrs(self) -> tuple[str, ...]:
+        """V4 holds its bytes outside `kv_cache`, so these are all of them.
+
+        `paged_pool_bytes` is zero for this backend, which makes the runner's
+        carved pool empty and leaves `kv_cache` unassigned — sharing it would
+        share nothing. What prefill actually writes is the indexer cache
+        (allocated standalone in `allocate_kv_cache_tensors`) and the
+        plane+arena pool, and decode reads both.
+
+        The scale pool exists only under FP4, where the indexer is two regions
+        — packed data and its separate e8m0 scales. Naming it unconditionally
+        would have the consumer demand a handle the producer never made.
+        """
+        indexer = ("v4_csa_idx_kv", "v4_csa_idx_kv_scale")
+        if not self._indexer_fp4:
+            indexer = ("v4_csa_idx_kv",)
+        return (*indexer, PER_REQ_POOL_ATTR)
+
+    def shares_per_req_cache(self) -> bool:
+        """Yes: everything below is carved from one buffer, and `buf` replaces it.
+
+        What makes V4 safe to share is that the layout is a pure function of
+        `pool_geometry`, which both sides derive from the same config and the
+        same block count, and that the geometry is already cross-checked against
+        the sizing spec below. A skew that would make the two carve differently
+        fails that check before a single view exists.
+        """
+        return True
+
+    def allocate_per_req_cache(
+        self, entries: dict[str, int], buf: torch.Tensor | None = None
+    ) -> dict[str, object]:
         """Carve the two KV planes + the compressor arena out of one allocation.
 
         One `torch.zeros` holds every per-request pool, in this order:
@@ -1548,7 +1580,27 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Zeroed once, which is also what `EntryMajorArena`'s `buf` contract asks
         # for. Nothing holds the pool but the carved views — they keep the
         # allocation alive, so it must not be dropped from any of them.
-        per_req_pool = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
+        if buf is None:
+            per_req_pool = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
+        else:
+            # Rapidserve decode, carving over prefill's allocation. NOT zeroed:
+            # the bytes are prefill's live state, and this side is here to read
+            # them.
+            #
+            # The size check is the whole safety argument for sharing. Every
+            # offset below comes from `geo`, so two processes agreeing on the
+            # total is two processes agreeing on the split — and a disagreement
+            # would otherwise land as views at the right addresses for the wrong
+            # layout, which reads as one request holding another's compressor
+            # state and raises nothing.
+            if buf.numel() != total_bytes or buf.dtype != torch.uint8:
+                raise RuntimeError(
+                    "imported per-request pool does not match this process's "
+                    f"geometry: got {buf.numel()}B of {buf.dtype}, derived "
+                    f"{total_bytes}B of {torch.uint8}. Prefill and decode "
+                    "disagree on the V4 pool layout."
+                )
+            per_req_pool = buf
 
         def _plane(start: int, field: EntryField) -> torch.Tensor:
             width = field.per_layer_numel
@@ -1624,6 +1676,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             state_pool = torch.empty(0, dtype=self._state_dtype, device=device)
 
         return {
+            # The base allocation, so a rapidserve prefill can hand its IPC
+            # handle to the decode process that will carve the same views.
+            PER_REQ_POOL_ATTR: per_req_pool,
             "v4_state_arena": arena,
             "v4_kv_plane": kv_plane,
             "v4_kv_plane_rope": kv_plane_rope,

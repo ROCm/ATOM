@@ -303,7 +303,26 @@ class PageUnitCheckpointStore:
             self._evict(victim)
         return True
 
-    def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
+    def mark_inflight(self, prefix_hash: int) -> bool:
+        """Arm a reserved record for the next `complete_inflight`.
+
+        Split out of `begin_store` for the store whose scatter this process
+        does not issue. `complete_inflight` is what publishes an image, and it
+        runs every scheduling pass -- so a record armed at reservation would
+        be published before the peer had written a byte, and a resumer would
+        restore whatever those units held before.
+
+        Armed instead when the peer reports the copy landed.
+        """
+        checkpoint_id = self._pending_by_hash.get(prefix_hash, -1)
+        if checkpoint_id < 0 or checkpoint_id in self._inflight_stores:
+            return False
+        self._inflight_stores.append(checkpoint_id)
+        return True
+
+    def begin_store(
+        self, prefix_hash: int, src_slot: int, inflight: bool = True
+    ) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
         needed = self.units_per_checkpoint
@@ -338,7 +357,12 @@ class PageUnitCheckpointStore:
         )
         self.records[checkpoint_id] = record
         self._pending_by_hash[prefix_hash] = checkpoint_id
-        self._inflight_stores.append(checkpoint_id)
+        # False only for a store another process will issue: see
+        # `mark_inflight`. Publishing is `complete_inflight`'s job and it runs
+        # every pass, so arming a record before its bytes exist would hand a
+        # resumer an image that was never written.
+        if inflight:
+            self._inflight_stores.append(checkpoint_id)
         return CheckpointStoreOp(
             src_slot=src_slot,
             unit_ids=record.unit_ids,
@@ -888,6 +912,54 @@ class PagedStateCheckpointCoordinator:
 
     def begin_restore(self, h: int, dst_slot: int) -> bool:
         return self.store.begin_restore(h, dst_slot) is not None
+
+    def reserve_store(self, seq: Sequence, h: int) -> CheckpointStoreOp | None:
+        """Reserve an image for `(seq, h)` now, for someone else to write.
+
+        `checkpoint` + `take_checkpoint_ops` are two phases on purpose: filing
+        a boundary costs nothing, and the slot is read only at the drain, by
+        which time the forward that produced it has landed. That split assumes
+        the forward is ours.
+
+        Under rapidserve it is not. The prefill process owns the forward, and
+        the only moment its slot holds the state as of a rung is between the
+        chunk that ends there and the one after it -- inside another process,
+        on a stream this one cannot order against. So the units are reserved
+        here, at admission, and the op travels in `BlockAssignment` for prefill
+        to execute between its two chunks, where stream order makes it free.
+
+        The cost of reserving this early is that the units stay pinned for the
+        whole prefill rather than for one scheduling pass, which is what
+        `_checkpoint_has_room` and `has_available_units` are written against.
+        Accepted deliberately as the first cut.
+
+        Returns None when there is nothing to reserve -- the hash is already
+        held or in flight, the seq has no slot, or the pool cannot free the
+        units -- and the caller simply ships no op, costing reuse and nothing
+        else.
+        """
+        if not self.applies(seq) or seq.state_slot < 0:
+            return None
+        # Same dedup `take_checkpoint_ops` applies: a hash already stored or
+        # already being stored needs no second image.
+        if self.store.contains_or_pending(h):
+            return None
+        # `inflight=False`: the scatter is the peer's to issue, so the record
+        # stays unarmed until `settle_prefill_store` says the bytes landed.
+        op = self.store.begin_store(h, seq.state_slot, inflight=False)
+        if op is None:
+            self.checkpoints_dropped += 1
+            return None
+        self.checkpoints_kept += 1
+        return op
+
+    def settle_prefill_store(self, h: int) -> bool:
+        """The peer reported its scatter landed; let the next pass publish it.
+
+        Separated from the reservation because the two are separated in time by
+        a whole prefill, and only the second end knows the bytes exist.
+        """
+        return self.store.mark_inflight(h)
 
     def take_checkpoint_ops(
         self,

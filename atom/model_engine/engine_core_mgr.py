@@ -1597,6 +1597,18 @@ class DisaggCoreManager(CoreManager):
                 # derive the same N-way expert/tensor split.
                 c.tensor_parallel_size = 1
                 c.parallel_config.data_parallel_size = n_pairs
+                # Every pair lives on this node (CUDA IPC for the weight/KV
+                # aliasing, ipc:// for the channels, one shm for the CU split),
+                # so the local slice IS the whole group. Setting it is not
+                # optional: `config` here is a deepcopy of an already
+                # __post_init__'d ParallelConfig, so size_local is frozen at
+                # whatever the pre-flatten dp_size was (1 for the usual
+                # `-tp 8` launch) and does not follow data_parallel_size above.
+                # DPEngineCoreProc._init_data_parallel then bounds-checks
+                # local rank k against it, and moe.py reads it as MoRI's
+                # gpu_per_node. This mirrors CoreManager.__init__'s
+                # `data_parallel_size_local = local_engine_count`.
+                c.parallel_config.data_parallel_size_local = n_pairs
                 c.parallel_config.data_parallel_rank = k
                 # ModelRunner derives its GPU as
                 #   (data_parallel_rank_local * pp + pp_rank) * (tp * pcp) + rank
@@ -1616,6 +1628,12 @@ class DisaggCoreManager(CoreManager):
         prefill_configs = []
         for k in range(n_pairs):
             pc = _pair_config(k, is_decode=False)
+            # Recorded before the override, so it keeps the number decode will
+            # actually run at. Prefill sizes the pools for the whole pair —
+            # decode owns no KV memory and skips sizing — and the STATE floor
+            # has to cover the requests decode admits, not the narrower prefill
+            # batch `disagg_prefill_max_num_seqs` asks for.
+            pc.disagg_decode_max_num_seqs = config.max_num_seqs
             if config.disagg_prefill_max_num_seqs is not None:
                 pc.max_num_seqs = config.disagg_prefill_max_num_seqs
             pc.enforce_eager = True

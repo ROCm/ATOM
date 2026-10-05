@@ -68,12 +68,41 @@ class BlockAssignment:
     # and must write the KV from the prefill TP rank sharing its GPU. Always 0
     # for symmetric rapidserve (single decode rank).
     target_rank: int = 0
-    # Paged-SWA (DeepSeek-V4) parallel block table, positionally aligned with
-    # block_table. The PREFILL forward is what writes the sliding-window KV, but
-    # only decode owns the SlidingWindowPool — so decode materializes the
-    # trailing window and ships the resulting slots here. Empty list for models
-    # without paged SWA.
-    swa_block_table: list = field(default_factory=list)
+    # Per-request STATE slot indices, in `Sequence.state_slots` order (index 0
+    # is the committed slot; the rest are speculative rollback slots).
+    #
+    # Same shape of problem the paged-SWA table used to solve, and its direct
+    # replacement: the PREFILL forward is what writes this request's
+    # compressor/recurrent state, but only decode owns `StateSlotPool` — so
+    # decode allocates and ships the indices here. What changed with #1771 is
+    # only what a slot holds: the sliding window became a ring inside the STATE
+    # entry rather than a parallel table of blocks, so one index per slot
+    # replaces a table positionally aligned with `block_table`.
+    #
+    # An index means the same bytes in both processes only because they share
+    # one per-request pool over CUDA IPC (`shares_per_req_cache`). Empty list
+    # for a model with no per-request state.
+    state_slots: list = field(default_factory=list)
+    # Ascending `(cut, CheckpointStoreOp)` pairs: every rung of the checkpoint
+    # ladder this prompt crosses, and the image reserved at each. Empty for a
+    # prompt with no rung, which is prefill's "run it on the budget alone".
+    #
+    # `cut` is where a forward must END. A checkpoint is filed under a block
+    # hash, so it sits on a hash-block boundary, and it holds the state as of a
+    # forward's last token -- so only a forward ending exactly there makes the
+    # image real. The ordinary scheduler gets this by shortening the chunk
+    # (`_finalize_prefill_chunk` -> `checkpoint_cut`); prefill has no
+    # BlockManager and can compute neither the rung nor the units, so decode
+    # computes both and sends them.
+    #
+    # A LIST because `checkpoint_cut` answers with the rightmost rung inside
+    # the window it is given: one question about a whole prompt returns one
+    # checkpoint near its end, where the ordinary scheduler asks once per chunk
+    # and walks the ladder. Decode steps the same budget-sized window here.
+    #
+    # The third instance of this pair's one contract: decode allocates
+    # (`block_table`, `state_slots`, these units), prefill writes.
+    prefill_cuts: list = field(default_factory=list)
 
 
 @dataclass
@@ -92,3 +121,7 @@ class PrefillDone:
     # drafters prefill does not run (see RapidServeModelRunner.prefill_forward),
     # in which case decode falls back to placeholder drafts.
     draft_token_ids: list = field(default_factory=list)
+    # False while this prompt has chunks left. A partial chunk carries real KV
+    # -- decode publishes its hashes -- but the request is not decodable yet,
+    # so it must not be promoted to `running` and carries no sampled token.
+    is_final: bool = True

@@ -53,7 +53,7 @@ from atom.model_engine.sequence import (
     SequenceType,
     new_block_table,
 )
-from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -161,6 +161,26 @@ def max_schedulable_decode_bs(
     `tokens_per_decode_seq`.
     """
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
+
+
+def _state_floor_num_seqs(config) -> int:
+    """Concurrency one STATE entry class has to be reserved for.
+
+    `plan_pools` multiplies this by `entries_per_req` to get the floor it
+    reserves before the PAGE class takes the remainder — it is the STATE
+    multiplier and nothing else, since PAGE is sized from what is left.
+
+    Normally that is this process's `max_num_seqs`. It is not under rapidserve:
+    prefill sizes the pools for the whole pair (decode owns no KV memory and
+    skips sizing), and a state slot is held for a request's whole life — decode
+    assigns it, prefill writes it, decode reads it — so one request never needs
+    two. The floor therefore has to cover the requests *decode* admits, while
+    `--disagg-prefill-max-num-seqs` deliberately makes prefill's own bound
+    smaller. Sizing from prefill's would build a pool decode then cannot admit
+    into, and the shortfall surfaces across an IPC boundary from the number
+    that caused it.
+    """
+    return config.disagg_decode_max_num_seqs or config.max_num_seqs
 
 
 class TokenLocations(NamedTuple):
@@ -1631,8 +1651,14 @@ class ModelRunner:
         # called, is the backend's business — the runner sizes them and
         # publishes the counts, then every consumer looks up the class it
         # declared itself.
+        # Bound once and reused by the hints below: they tell the reader which
+        # number to reduce, and under rapidserve prefill that is not
+        # `config.max_num_seqs` — the floor that overran the budget was built
+        # for decode's concurrency, so quoting this process's own bound would
+        # send them to a number that is already smaller than the problem.
+        state_num_seqs = _state_floor_num_seqs(config)
         try:
-            plan = plan_pools(specs, available_for_kv, config.max_num_seqs)
+            plan = plan_pools(specs, available_for_kv, state_num_seqs)
         except InsufficientPoolBudget as exc:
             # Minimum gpu_memory_utilization that makes the budget just cover the
             # per-request pools. Rounded UP to the next 0.01 so the printed value
@@ -1665,20 +1691,20 @@ class ModelRunner:
                     f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
                     f"(other processes may be holding memory); raising "
                     f"--gpu-memory-utilization will NOT help. Free GPU memory or "
-                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                    f"reduce --max-num-seqs (currently {state_num_seqs})."
                 )
             elif min_util_hint <= 1.0:
                 fix_msg = (
                     f" Set --gpu-memory-utilization >= {min_util_hint:.2f} "
                     f"(this only zeroes out the deficit; use a higher value for "
                     f"actual KV capacity) or reduce --max-num-seqs "
-                    f"(currently {config.max_num_seqs})."
+                    f"(currently {state_num_seqs})."
                 )
             else:
                 fix_msg = (
                     f" Even --gpu-memory-utilization 1.0 is insufficient "
                     f"(would need {min_util:.2f}); reduce --max-num-seqs "
-                    f"(currently {config.max_num_seqs}) or free GPU memory."
+                    f"(currently {state_num_seqs}) or free GPU memory."
                 )
             raise RuntimeError(base_msg + fix_msg) from exc
 
@@ -1712,10 +1738,29 @@ class ModelRunner:
                 "parallelism: every stage must first agree on one atomic "
                 "checkpoint/unit ownership transaction"
             )
-        if uses_paged_state and config.enable_rapidserve:
+        if (
+            uses_paged_state
+            and config.enable_rapidserve
+            and not self.attn_metadata_builder.shares_per_req_cache()
+        ):
+            # Narrowed from "rapidserve at all". A COPY checkpoint's units come
+            # out of the paged pool, which the pair already shares, and its
+            # source and destination are Active Slots — so what the pair needs
+            # is for the slots to be shared too. A backend that says
+            # `shares_per_req_cache` has made that true: prefill exports the
+            # per-request pool and decode carves the same views over it, so one
+            # slot index names one set of bytes on both sides and the
+            # coordinator in decode can address a slot prefill filled.
+            #
+            # What remains unsupported is a COPY backend that does NOT share,
+            # where a store would read a slot in the wrong process's memory.
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support RapidServe "
-                "prefill/decode disaggregation"
+                "prefill/decode disaggregation for "
+                f"{type(self.attn_metadata_builder).__name__}, which does not "
+                "share its per-request pool (shares_per_req_cache() is False). "
+                "A checkpoint is copied out of an Active Slot, so the pair has "
+                "to be addressing one."
             )
         checkpoint_spec = None
         if uses_paged_state:
@@ -1821,6 +1866,13 @@ class ModelRunner:
             "num_kvcache_blocks": num_kvcache_blocks,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
+            # The plan itself, not just the two dicts carved off it. Backends
+            # read their counts off `model_runner.pool_plan` rather than off
+            # whatever `allocate_per_req_cache` was handed -- V4's
+            # `num_state_slots` is `pool_plan.entries[STATE_SLOT_CLASS]` -- so a
+            # process given only the dicts sizes every class at zero and builds
+            # views over nothing.
+            "pool_plan": plan,
             "state_runtime": state_runtime.to_wire(),
         }
 
@@ -4395,14 +4447,26 @@ class RapidServeModelRunner(ModelRunner):
         # prefill.
         if self.config.disagg_is_decode:
             transfer = self.attn_metadata_builder.state_transfer()
-            if transfer.copies:
+            builder = self.attn_metadata_builder
+            if transfer.copies and not builder.shares_per_req_cache():
                 raise RuntimeError(
                     "PAGE-backed state checkpoints do not yet support RapidServe "
-                    "prefill/decode disaggregation"
+                    "prefill/decode disaggregation for "
+                    f"{type(self.attn_metadata_builder).__name__}, which does "
+                    "not share its per-request pool. See the matching check in "
+                    "ModelRunner.get_num_blocks."
                 )
+            # `state_runtime` here carries the transfer kind and nothing else:
+            # this side never sized a pool, so it cannot build the checkpoint
+            # spec that a COPY transfer requires. Prefill's complete one arrives
+            # with the kvcache bundle and replaces this
+            # (DecodeEngineCore.__init__), which is why a bare `StateTransfer`
+            # is enough to return.
             return {
                 "num_kvcache_blocks": 0,
-                "state_runtime": StateRuntime(transfer=transfer).to_wire(),
+                "state_runtime": StateRuntime(
+                    transfer=StateTransfer.none() if transfer.copies else transfer
+                ).to_wire(),
             }
         return super().get_num_blocks()
 
@@ -4657,16 +4721,47 @@ class RapidServeModelRunner(ModelRunner):
                 f"MoE layers after IPC import"
             )
 
+    def _shared_pool_names(self) -> tuple[str, ...]:
+        """Runner attributes this pair shares, `kv_cache` first.
+
+        `kv_cache` is always named even when this process has none: the
+        consumer has to be able to tell "the producer had no paged pool" (V4,
+        whose bytes are elsewhere) from "the producer never heard of the name".
+        Only the backend's own allocations are conditional, and only on the
+        capability -- a backend that will not share them names none and the
+        pair refuses the model at bind.
+        """
+        if not self.attn_metadata_builder.shares_per_req_cache():
+            return ("kv_cache",)
+        return ("kv_cache", *self.attn_metadata_builder.shared_runner_attrs())
+
     def export_kv_cache_ipc_handle(self) -> list[str] | None:
-        """Export self.kv_cache — the whole paged pool — as a CUDA IPC handle.
+        """Export this process's shared allocations as CUDA IPC handles.
+
+        The paged pool when there is one, plus whatever the backend declared in
+        `shared_runner_attrs` -- for V4 the indexer cache and the plane+arena
+        pool, which is what lets decode continue from the compressor state
+        prefill wrote rather than needing it copied per request.
+
+        `getattr(..., None)` rather than a bare attribute read: `kv_cache` is
+        assigned only when the carved pool is non-empty, and for a backend that
+        prices `paged_pool_bytes` at zero it never is.
 
         TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
         all ranks and returns the list of paths; other ranks return None.
         """
         from atom.model_engine.ipc_utils import export_kv_cache_handle
 
-        logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
-        handles = export_kv_cache_handle(self.kv_cache)
+        named = {n: getattr(self, n, None) for n in self._shared_pool_names()}
+        logger.info(
+            "ModelRunner rank %d: export_kv_cache_ipc_handle (%s)",
+            self.rank,
+            ", ".join(
+                f"{n}={'none' if t is None else str(t.numel()) + 'B'}"
+                for n, t in named.items()
+            ),
+        )
+        handles = export_kv_cache_handle(named)
         self._disagg_write_rank_file("kvcache", handles)
         paths = self._disagg_collect_rank_files("kvcache")
         if paths is not None:
@@ -4676,16 +4771,36 @@ class RapidServeModelRunner(ModelRunner):
         return paths  # non-None only for rank 0
 
     def import_kv_cache_ipc_handle(
-        self, paths: list[str], num_kvcache_blocks: int
+        self,
+        paths: list[str],
+        num_kvcache_blocks: int,
+        pool_plan=None,
+        state_runtime: dict | None = None,
     ) -> bool:
         """Import kvcache from prefill's GPU allocation into this (decode) process.
 
-        Takes prefill's paged pool, then binds through the SAME builder
-        protocol allocate_kv_cache uses (`_back_paged_pools` +
+        Takes prefill's paged pool and, when the backend shares one, its
+        per-request pool, then binds through the SAME builder protocol
+        allocate_kv_cache uses (`_back_paged_pools` + `allocate_per_req_cache` +
         `build_kv_cache_tensor`, via `_bind_kv_cache_to_modules`). Decode does
         not reimplement binding, so any backend the builder supports works here
-        -- except one declaring a per-request STATE class, which
-        `_bind_kv_cache_to_modules` refuses; see its docstring.
+        -- except one declaring a per-request STATE class it will not share,
+        which `_bind_kv_cache_to_modules` refuses; see its docstring.
+
+        `pool_plan` and `state_runtime` are prefill's sizing, arriving as
+        ARGUMENTS rather than on `self.config`: the runner is a separate
+        process, so what the engine wrote to its own copy of the config after
+        reading the bootstrap bundle is not visible here. They are what this
+        side has instead of ever running `get_num_blocks` — the entry counts
+        the per-request views are carved at, and the checkpoint geometry V4
+        cross-checks its own against.
+
+        The whole plan, not the entry dict alone, because a backend reads its
+        counts off `model_runner.pool_plan` and not off whatever
+        `allocate_per_req_cache` was handed: V4's `num_state_slots` is
+        `pool_plan.entries[STATE_SLOT_CLASS]`, so a runner left holding
+        `PoolPlan.empty()` builds an arena with zero slot views and fails in
+        warmup describing a copy with no source rows.
 
         TP-aware: each worker reads the handles file written by the prefill rank
         on its own GPU (index=_disagg_paths_index) and deletes it after import.
@@ -4693,7 +4808,21 @@ class RapidServeModelRunner(ModelRunner):
         """
         import pickle
 
-        from atom.model_engine.ipc_utils import import_kv_cache
+        from atom.model_engine.ipc_utils import import_kv_cache, import_shared_pools
+
+        if state_runtime is not None:
+            # Replaces the bare default installed at construction. Must land
+            # before `_bind_kv_cache_to_modules`: V4's `allocate_per_req_cache`
+            # reads `model_runner.state_runtime.checkpoint_spec` to check the
+            # geometry it just derived, and refuses outright when it is missing.
+            self.state_runtime = StateRuntime.from_wire(state_runtime)
+        if pool_plan is not None:
+            # Replaces `PoolPlan.empty()`. Mirrored onto the config as well, so
+            # anything on this side that reads the counts the allocating path's
+            # way finds them where it expects.
+            self.pool_plan = pool_plan
+            self.config.pool_entries = dict(pool_plan.entries)
+            self.config.pool_entries_per_req = dict(pool_plan.entries_per_req)
 
         # The block count travels with the handle and reaches the builder
         # through `_bind_kv_cache_to_modules` -> `allocate_kv_cache_tensors`
@@ -4708,11 +4837,160 @@ class RapidServeModelRunner(ModelRunner):
             meta = pickle.load(f)
         os.remove(path)
         logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
-        self.kv_cache = import_kv_cache(meta)
-        logger.info(
-            f"[KV-IMPORT] rank {self.rank}: imported the paged pool "
-            f"({self.kv_cache.numel()} B) — binding via builder protocol"
+        paged = import_kv_cache(meta)
+        if paged is not None:
+            self.kv_cache = paged
+        # Names declared by THIS side's backend, so a producer that shared
+        # fewer is caught rather than silently leaving a tensor unshared.
+        shared = import_shared_pools(
+            meta, [n for n in self._shared_pool_names() if n != "kv_cache"]
         )
+        logger.info(
+            "[KV-IMPORT] rank %d: imported %s — binding via builder protocol",
+            self.rank,
+            ", ".join(
+                [f"kv_cache={'none' if paged is None else str(paged.numel()) + 'B'}"]
+                + [f"{n}={t.numel()}B" for n, t in shared.items()]
+            ),
+        )
+        self._bind_kv_cache_to_modules(num_kvcache_blocks, shared)
+        return True
+
+    def flush_state_maintenance(self, ops) -> bool:
+        """Execute queued state moves and block until the GPU has done them.
+
+        The decode engine calls this before it tells prefill a request is ready.
+        Both halves matter: the copies run against the per-request pool the two
+        processes share, and the synchronize is what orders them against a
+        forward on the *other* process's stream — a ZMQ message carries no
+        stream dependency, so issuing the copy is not enough.
+
+        Same hooks `build()` uses on the batch path, so a backend implements
+        one relocation and one copy routine, not two.
+        """
+        if ops.relocations:
+            self.attn_metadata_builder.relocate_state_slots(ops.relocations)
+        if ops.checkpoint_stores or ops.checkpoint_restores:
+            self.attn_metadata_builder.execute_paged_state_copies(
+                ops.checkpoint_stores, ops.checkpoint_restores
+            )
+        # What makes this span two processes is the HOST, not the device: this
+        # call returns only once the copies have run, the engine sends the
+        # BlockAssignment only after it returns, and prefill launches only after
+        # it receives. CUDA IPC shares memory, not stream order, so without a
+        # wait somewhere in that chain prefill's forward and this gather are two
+        # unordered queues and prefill can read the slot before it is filled --
+        # silently, since every layout check still passes and only the bytes are
+        # stale.
+        #
+        # So the wait only has to cover the copies, and covering more is pure
+        # cost: `torch.cuda.synchronize()` would also wait on
+        # `self._decode_streams`, where this process's in-flight decode batch
+        # runs, and that is precisely the work rapidserve exists to overlap with
+        # prefill. An event recorded here waits for what was enqueued on this
+        # stream up to this point and nothing else.
+        done = torch.cuda.Event()
+        done.record()
+        done.synchronize()
+        return True
+
+    def _bind_kv_cache_to_modules(self, num_kvcache_blocks: int, shared=None):
+        """Bind IPC-imported pools to every attention module.
+
+        The decode side of a P/D pair gets the pools as handles, so it never
+        reaches `allocate_kv_cache`'s bind loop. What it must not do is bind
+        them a *second way*: this used to spell the views out again, with a 4-D
+        V where every builder declared 5-D. Nothing could catch that — the two
+        agree on every byte and differ only in what a reader branches on. So it
+        runs the same loop over the same hooks, down to backing the pools.
+
+        Per-request state is bound here too, from `shared`, and that is the only
+        way it can be: the compressor state prefill leaves in a slot is what
+        decode continues from, so the two processes have to be addressing one
+        allocation. A backend that will not share it (`shares_per_req_cache`
+        False, so prefill sent nothing) is refused up front rather than met as
+        an `AttributeError` on whichever layer binds first.
+
+        The entry counts come from `config.pool_entries`, which rode the
+        bootstrap bundle: this side never ran sizing, so `self.pool_plan` is
+        still `PoolPlan.empty()` and would size every class at zero.
+        """
+        from atom.model_ops.attentions.backends import PER_REQ_POOL_ATTR
+
+        shared = dict(shared or {})
+        per_req_buf = shared.pop(PER_REQ_POOL_ATTR, None)
+        stateful = self._state_pool_names()
+        if stateful and per_req_buf is None:
+            raise NotImplementedError(
+                f"per-request state {stateful} is not shared across this P/D "
+                "pair: the prefill peer exported no per-request pool, because "
+                f"{type(self.attn_metadata_builder).__name__}."
+                "shares_per_req_cache() is False. Run this model without "
+                "disaggregation."
+            )
+        # `getattr(self, 'kv_cache', None)`: a backend pricing
+        # `paged_pool_bytes` at zero never had one, and `_carve_paged_pool`
+        # takes None to mean "allocate what the declarations ask for", which is
+        # nothing. Still called, because this is also what hands each builder
+        # its block count.
+        self._back_paged_pools(num_kvcache_blocks, buf=getattr(self, "kv_cache", None))
+
+        # AFTER the line above, which is what allocated the tensors these
+        # replace. A backend holding paged bytes outside `kv_cache` -- V4's
+        # standalone indexer cache -- just allocated a private copy that prefill
+        # will never write; overwriting it here drops that copy and points the
+        # attribute at the producer's. Binding reads these attributes further
+        # down, so the substitution has to land before the loop, not after.
+        for name, tensor in shared.items():
+            setattr(self, name, tensor)
+
+        if stateful:
+            # `self.pool_plan.entries`, the same expression the allocating path
+            # uses — installed from the bundle by the caller. Read through the
+            # plan rather than through a dict passed alongside it, because the
+            # backends read it that way too and two spellings of one count is
+            # how this failed the first time.
+            if not self.pool_plan.entries:
+                raise RuntimeError(
+                    f"per-request state {stateful} has no entry count on this "
+                    "side of the P/D pair: `pool_plan` is still empty, so the "
+                    "bootstrap bundle did not carry sizing. See "
+                    "_SCHED_DIM_KEYS in engine_core.py."
+                )
+            for name, value in self.attn_metadata_builder.allocate_per_req_cache(
+                self.pool_plan.entries, buf=per_req_buf
+            ).items():
+                setattr(self, name, value)
+            # Same ordering as the allocating path: the pools are reachable
+            # through `self` only now, and this is the last moment before a
+            # request could reach them.
+            self.attn_metadata_builder.warmup_per_req_cache()
+
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            models_to_bind.append(("draft", self.drafter.model))
+
+        kv_cache_data = {}
+        for model_name, model in models_to_bind:
+            for module in model.modules():
+                # Same dispatch as the allocating path's loop: a draft with a
+                # pool of its own binds through its own builder, and its pool
+                # is now a region of the same imported buffer.
+                bound = None
+                if model_name == "draft" and hasattr(self, "draft_kv_builder"):
+                    bound = self.draft_kv_builder.build_kv_cache_tensor(module)
+                if bound is None:
+                    bound = self.attn_metadata_builder.build_kv_cache_tensor(module)
+                if bound is not None:
+                    # The same key the allocating path uses. Keyed by the walk's
+                    # ordinal here until now, which agreed with it only while
+                    # the first bound module was layer 0.
+                    kv_cache_data[f"layer_{module.layer_num}"] = bound
+
+        from atom.utils.forward_context import set_kv_cache_data
+
+        set_kv_cache_data(kv_cache_data)
+
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward
     # ------------------------------------------------------------------

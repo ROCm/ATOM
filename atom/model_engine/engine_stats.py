@@ -761,7 +761,12 @@ class EngineStats:
         # from the cache section rather than have the caller thread it in.
         # Windowed, like every other field on this line, and None — rendered
         # `n/a` — when nothing has been measured. "0.0%" is a claim about
-        # reuse, and a P/D decode engine never reaches `update_cache` at all.
+        # reuse, and an engine that never reaches `update_cache` has made no
+        # such claim: a rapidserve PREFILL engine, whose `PrefillScheduler`
+        # holds no BlockManager and is handed its hit count rather than finding
+        # it. Its decode peer does the lookup and does the accounting
+        # (`DecodeScheduler.allocate_waiting`), so the pair reports the rate
+        # once, on the side that measured it.
         prefix_cache_hit_rate = (
             self.recent_cache_hit_rate if self.cache_enabled else None
         )

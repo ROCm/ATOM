@@ -2560,7 +2560,21 @@ class Scheduler:
         )
 
     def _record_cache_reuse(self, seq: Sequence) -> None:
-        """Account local prefix reuse at prefill or first PD decode admission."""
+        """Account local prefix reuse at prefill or first PD decode admission.
+
+        Three callers, one per way a request can first be charged for its
+        prompt: `_schedule_prefill_seq` for an ordinary engine,
+        `_schedule_first_decode_after_remote_kv` for a Mooncake/MORI-IO decode,
+        and `DecodeScheduler.allocate_waiting` for a rapidserve one.
+
+        The last is decode's because it is decode's BlockManager that does the
+        lookup: rapidserve's prefill process runs a `PrefillScheduler` with no
+        BlockManager at all, and is handed the hit count in
+        `BlockAssignment.num_cached_tokens` rather than finding it. Accounting
+        it there as well would double-count, which is the same reason
+        `PrefillScheduler` carries `_METRICS_ROLE = "prefill"` and the
+        aggregator drops its counts.
+        """
         if self.engine_stats.cache_enabled:
             # Hit counts are in hash blocks — one block_table entry spans
             # `block_size * dcp_world_size` tokens — so scaling by block_size
@@ -3136,11 +3150,56 @@ class Scheduler:
             # later in this loop, so they're not part of the prompt hash
             # chain — leaving them in would mint a stale partial-block hash.
             if not seq.prefix_hashes_published:
+                # INFO, not DEBUG: `getLogger()` pins both the logger and its
+                # handler at INFO on purpose (a DEBUG logger feeding an INFO
+                # handler still builds a LogRecord per call -- 10.4% of the API
+                # server's CPU at c=2048), so `logger.debug` is never emitted
+                # anywhere in ATOM. Once per sequence, the same cadence as the
+                # per-request lines the disagg path already logs.
+                logger.info(
+                    "[prefix-publish] seq %s: batch_is_none=%s pending_start=%d "
+                    "cached=%d tokens=%d blocks=%d hashed_before=%d",
+                    seq.id,
+                    batch is None,
+                    seq.pending_hash_start,
+                    seq.num_cached_tokens,
+                    seq.num_tokens,
+                    len(seq.block_table),
+                    seq.num_hashed_tokens,
+                )
                 if batch is None:
-                    _num_new = seq.num_tokens - seq.num_cached_tokens
-                    if need_placeholder:
-                        _num_new -= num_placeholder
-                    self.block_manager.hash_blocks(seq, max(0, _num_new))
+                    if seq.pending_hash_start >= 0:
+                        # Rapidserve: prefill ran in the other process and
+                        # `on_prefill_done` already advanced
+                        # `num_cached_tokens` past what it computed, so the
+                        # default offset points at the END of the prompt and
+                        # the range collapses. Publish the range prefill
+                        # actually filled instead — from the prefix-cache hit
+                        # it was handed, up to the whole prompt.
+                        _start = seq.pending_hash_start
+                        _num_new = seq.num_cached_tokens - _start
+                        self.block_manager.hash_blocks(
+                            seq, max(0, _num_new), start_tokens=_start
+                        )
+                        seq.pending_hash_start = -1
+                        # `hash_blocks` sets `num_hashed_tokens` only on the
+                        # path that actually publishes, so this is the readout
+                        # that separates "published" from "returned early" --
+                        # the four numbers above say which term collapsed the
+                        # range.
+                        logger.info(
+                            "[prefix-publish] seq %s: published start=%d "
+                            "num_new=%d hashed_after=%d",
+                            seq.id,
+                            _start,
+                            _num_new,
+                            seq.num_hashed_tokens,
+                        )
+                    else:
+                        _num_new = seq.num_tokens - seq.num_cached_tokens
+                        if need_placeholder:
+                            _num_new -= num_placeholder
+                        self.block_manager.hash_blocks(seq, max(0, _num_new))
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
@@ -4074,6 +4133,13 @@ class PrefillScheduler:
         num_scheduled_tokens = []
         num_batched_tokens = 0
         num_seqs = 0
+        # Images for chunks that already landed on their rung, carried by the
+        # batch that runs next. `build()` drains these before the forward
+        # ("Run state maintenance on the compute stream before the forward"),
+        # so on one stream the order is: chunk ending at the rung, scatter,
+        # chunk after it. No event and no sync -- the copy simply sits between
+        # the forward that produced the state and the one that overwrites it.
+        stores: list = []
 
         with self._pending_lock:
             # Collect ready sequences (have received BlockAssignment from decode)
@@ -4082,17 +4148,66 @@ class PrefillScheduler:
             for seq in ready:
                 if num_seqs >= self.max_num_seqs:
                     break
-                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-                if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                # The budget FIRST, then the rung inside it -- the order
+                # `Scheduler._finalize_prefill_chunk` uses, and it is not
+                # cosmetic. Taken the other way round, a rung further out than
+                # one batch allows produces a chunk nothing can schedule, and
+                # the `break` below parks it at the head of the queue forever:
+                # a 226k prompt against a 16k budget asks for its 221184-token
+                # rung, never fits, and every request behind it stops too.
+                #
+                # Bounding here is also what gives this scheduler chunked
+                # prefill at all. It never had any -- it took the whole
+                # remaining prompt and broke when that did not fit -- so a
+                # prompt longer than `max_num_batched_tokens` could not be run,
+                # only queued. The partial machinery the cut needed is exactly
+                # what a long prompt needs, so the two are one mechanism.
+                budget = self.max_num_batched_tokens - num_batched_tokens
+                if budget <= 0:
                     break
-                self.waiting.remove(seq)
+                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+                partial = False
+                if num_new_tokens > budget:
+                    num_new_tokens = budget
+                    partial = True
+                # Stop on the rung decode picked, when it falls inside the
+                # chunk this pass can afford. A checkpoint holds the state as
+                # of a forward's LAST token, so the only way the image at
+                # `prefill_cut_pos` can be real is for a forward to end exactly
+                # there. A rung beyond the budget is simply not this chunk's to
+                # land on; a later pass, starting further in, will reach it.
+                cut = getattr(seq, "prefill_cut_pos", 0)
+                if seq.num_cached_tokens < cut < seq.num_cached_tokens + num_new_tokens:
+                    num_new_tokens = cut - seq.num_cached_tokens
+                    partial = True
+                if num_new_tokens <= 0:
+                    break
+                # A partial chunk leaves the request in `waiting`: it is not
+                # running anything after this forward, and the next pass has to
+                # find it again to run the remainder. Only the final chunk
+                # promotes.
+                if not partial:
+                    self.waiting.remove(seq)
+                    self.running.append(seq)
                 seq.status = SequenceStatus.RUNNING
                 seq.type = SequenceType.PREFILL
-                self.running.append(seq)
+                seq.is_partial_prefill = partial
                 scheduled_seqs[seq.id] = seq
                 num_scheduled_tokens.append(num_new_tokens)
                 num_batched_tokens += num_new_tokens
                 num_seqs += 1
+                # Read BEFORE the advance below, which is what decides whether
+                # this seq is past its rung. Taken after it, the op would
+                # attach to the very chunk that produces the state and the
+                # scatter would run before the forward that fills the slot.
+                op = seq.take_prefill_store_op()
+                if op is not None:
+                    stores.append(op)
+                # NOT advanced here. The runner derives a chunk's start
+                # offset from `num_cached_tokens` and this batch does not
+                # carry a pre-advance copy, so moving it now stages zero
+                # tokens. The prefill engine advances it after the forward,
+                # beside the PrefillDone it sends for the same chunk.
 
         if not scheduled_seqs:
             return None, {}
@@ -4115,6 +4230,11 @@ class PrefillScheduler:
                 total_seqs_num=num_seqs,
                 total_seqs_num_prefill=num_seqs,
                 cu_stream_fraction=cu_fraction,
+                state_maintenance_ops=(
+                    StateMaintenanceOps(checkpoint_stores=tuple(stores))
+                    if stores
+                    else None
+                ),
             ),
             scheduled_seqs,
         )
@@ -4226,6 +4346,11 @@ class DecodeScheduler(Scheduler):
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
         self.prefill_waiting: dict[int, Sequence] = {}
         self.prefill_done: deque[Sequence] = deque()
+        # Chunks that landed but left the request mid-prompt. Separate from
+        # `prefill_done`, which means "decodable now": these are only waiting
+        # to have their hashes published, and the request stays in
+        # `prefill_waiting` until its final chunk arrives.
+        self.prefill_partial: deque[Sequence] = deque()
         # Shared memory for dynamic CU partitioning.
         self._cu_shm = None
         # 4 bytes per pair; this rank publishes at offset 4*decode_rank so the
@@ -4330,10 +4455,17 @@ class DecodeScheduler(Scheduler):
         while self.waiting:
             seq = self.waiting[0]
             with self._prefill_lock:
-                if self.block_manager.can_allocate(seq) < 0:
+                # The hit count, not just its sign. `allocate` defaults it to 0
+                # -- "0 if caller didn't call it" -- so dropping it here told
+                # `allocate` every block was fresh: it claimed the whole prompt,
+                # recorded `num_cached_tokens = 0`, and no request ever reused
+                # anything however full the cache was. The ordinary path passes
+                # it (`allocate(seq, num_cached_blocks)`); this one must too.
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks < 0:
                     logger.warning("Cannot allocate prefill")
                     break
-                if not self.block_manager.allocate(seq):
+                if not self.block_manager.allocate(seq, num_cached_blocks):
                     # Disown could not be backed (finding #2); leave the seq at
                     # the front of waiting to retry once the pool has room.
                     self.block_manager.deallocate(seq)
@@ -4343,10 +4475,26 @@ class DecodeScheduler(Scheduler):
                 # sliding-window slots to write into. #1771 removed the paged
                 # SWA pool: the window is a ring inside the per-request STATE
                 # entry now, addressed by `seq.state_slots` rather than by a
-                # parallel block table. Nothing to pre-fill, and nothing yet
-                # ships `state_slots` to the prefill process — see the merge
-                # note on `ModelRunner._bind_kv_cache_to_modules`, which refuses
-                # stateful models on the decode side of a P/D pair outright.
+                # parallel block table. Nothing to pre-fill: `allocate` above
+                # took the slots, and `BlockAssignment.state_slots` carries
+                # their indices to the prefill process, which writes this
+                # request's state into them.
+                #
+                # Inside the success path and inside the lock, because every
+                # field it reads is one `allocate` just set. After `popleft`
+                # would also count the refusals above as zero-reuse
+                # admissions, which never happened and which drag the windowed
+                # rate down.
+                self._record_cache_reuse(seq)
+                # After `_record_cache_reuse`, which reads the admission as it
+                # stands; reserving units does not change the hit, but the two
+                # are read together in the funnel and the order should say so.
+                #
+                # Both halves here, under the same lock as the allocation:
+                # `checkpoint_cut` and `reserve_store` are decode's to compute
+                # (prefill has no BlockManager), and prefill can only act on
+                # them if they travel with the assignment.
+                self._prepare_prefill_checkpoint(seq)
             self.waiting.popleft()
 
             # Shared-cache prefill writes into this allocation; there is no
@@ -4355,12 +4503,149 @@ class DecodeScheduler(Scheduler):
             newly_allocated.append(seq)
         return newly_allocated
 
+    def publish_landed_prefill_chunks(self) -> None:
+        """Register the hashes of every prefill chunk that has landed.
+
+        Called by the engine before `schedule()`, which is the whole point of
+        it being here rather than in `postprocess`:
+
+        - a PARTIAL chunk never reaches `postprocess` at all. Its request is
+          still in `prefill_waiting`, so decode runs no forward for it and the
+          one-shot publish there is unreachable. Without this the blocks a
+          checkpoint covers are never indexed and the checkpoint is useless.
+        - a checkpoint filed here is drained by the `schedule()` immediately
+          after, while the slot still holds what the chunk left in it. Filed
+          from `postprocess` it would be drained a forward later, against a
+          slot that has moved -- an image one step ahead of the hash it is
+          stored under, which nothing downstream can detect.
+
+        `PrefillDone` is a GPU-completion signal (the prefill engine records an
+        event after each forward and sends only once it has retired), so the
+        KV these hashes describe is real by the time this runs.
+        """
+        pending, self.prefill_partial = self.prefill_partial, deque()
+        for seq in pending:
+            self._publish_prefill_hashes(seq)
+
+    def _publish_prefill_hashes(self, seq: Sequence) -> None:
+        """Hash the blocks one landed chunk filled, from its own start offset.
+
+        `hash_blocks` reads its base off `num_cached_tokens`, which
+        `on_prefill_done` has already advanced past this chunk -- so the offset
+        has to be handed in explicitly. Same `start_tokens` override pipeline
+        parallelism uses, for the same reason.
+        """
+        start = seq.pending_hash_start
+        # Counted per seq, so a seq draining twice is visible as a second line
+        # rather than as an extra publish nobody can place.
+        seq.publish_drains = getattr(seq, "publish_drains", 0) + 1
+        logger.info(
+            "[prefix-drain] seq %s: drain#%d start=%d cached=%d hashed=%d "
+            "blocks=%d",
+            seq.id,
+            seq.publish_drains,
+            start,
+            seq.num_cached_tokens,
+            seq.num_hashed_tokens,
+            len(seq.block_table),
+        )
+        if start < 0 or not seq.block_table:
+            return
+        # The prefix below `start` is already in the index -- being found there
+        # is what the hit WAS -- so it is hashed whether or not this call
+        # publishes anything. `hash_blocks` advances the watermark only on the
+        # path that publishes, and a request resuming entirely from cache takes
+        # the other one: it would leave `num_hashed_tokens` at 0, and
+        # `hash_decode_blocks` reads that as "nothing has ever been hashed" and
+        # re-hashes the whole prompt on the first decode step. Idempotent, but
+        # an O(prompt) pass per cache hit and a watermark that is simply wrong.
+        seq.num_hashed_tokens = max(seq.num_hashed_tokens, start)
+        num_new = seq.num_cached_tokens - start
+        if num_new > 0:
+            self.block_manager.hash_blocks(seq, num_new, start_tokens=start)
+        seq.pending_hash_start = -1
+
+    #: Most rungs one prompt may reserve an image for. Each reservation pins
+    #: `units_per_checkpoint` blocks from admission until the chunk that writes
+    #: it, so an unbounded ladder on a 226k prompt would hold ~27 images for
+    #: the whole prefill. The last rungs are the ones agentic traffic resumes
+    #: at (`_record_checkpoint_end`: 93.5% of resumes land on a previous prompt
+    #: end, 0.0% on the 8192 ladder), so when the ladder is longer than this
+    #: the TAIL is what gets kept.
+    MAX_PREFILL_CHECKPOINTS = 8
+
+    def _prepare_prefill_checkpoint(self, seq: Sequence) -> None:
+        """Walk this prompt's ladder, reserving an image at every rung.
+
+        Per chunk, not per prompt. `checkpoint_cut` collapses the grid to one
+        candidate -- the rightmost rung within the `end` it is handed -- so
+        asking once for the whole prompt yields a single checkpoint near its
+        end. The ordinary scheduler asks once per chunk
+        (`_finalize_prefill_chunk`) and so walks the whole ladder; this mirrors
+        that by stepping the same budget-sized window decode knows prefill will
+        use.
+
+        Both halves are decode's to compute and prefill's to carry out: prefill
+        has no BlockManager, so it can neither find a rung nor own the units.
+
+        Failure is always "fewer checkpoints", never an error. A prompt with no
+        rung, a pool with no room, a model with no per-request state all leave
+        the list shorter, and prefill chunks on the budget alone.
+        """
+        seq.prefill_cuts = []
+        seq.prefill_store_hashes = []
+        bm = self.block_manager
+        if bm.paged_state_checkpoints is None:
+            return
+        budget = max(1, self.max_num_batched_tokens)
+        pos = seq.num_cached_tokens
+        end = seq.num_prompt_tokens
+        while pos < end:
+            window = min(pos + budget, end)
+            cut = bm.checkpoint_cut(seq, pos, window)
+            if not cut:
+                # No rung in this window; the next one starts where this chunk
+                # will. Stepping by the budget is what keeps this walk in step
+                # with the chunking prefill actually does.
+                pos = window
+                continue
+            h, op = bm.reserve_prefill_checkpoint(seq, cut)
+            # `pos` advances past the rung either way: a rung that could not be
+            # reserved is still a rung, and re-asking this window would return
+            # it again forever.
+            pos = cut
+            if op is None:
+                continue
+            seq.prefill_cuts.append((cut, op))
+            seq.prefill_store_hashes.append(h)
+        if len(seq.prefill_cuts) > self.MAX_PREFILL_CHECKPOINTS:
+            dropped = len(seq.prefill_cuts) - self.MAX_PREFILL_CHECKPOINTS
+            # Release what the cap drops rather than leaking the units: they
+            # were reserved by `begin_store` and nothing else will free them,
+            # since the op that would have written them is being discarded.
+            # `unindex` reaches `_release_record` for exactly these -- pending,
+            # unarmed (`inflight=False`), unpinned.
+            for h in seq.prefill_store_hashes[:dropped]:
+                bm.paged_state_checkpoints.unindex(h)
+            seq.prefill_cuts = seq.prefill_cuts[dropped:]
+            seq.prefill_store_hashes = seq.prefill_store_hashes[dropped:]
+        if seq.prefill_cuts:
+            logger.info(
+                "[prefill-cut] seq %s: %d rung(s) %s prompt=%d cached=%d",
+                seq.id,
+                len(seq.prefill_cuts),
+                [c for c, _ in seq.prefill_cuts],
+                seq.num_prompt_tokens,
+                seq.num_cached_tokens,
+            )
+
     def on_prefill_done(
         self,
         seq_id: int,
         num_tokens_computed: int,
         sampled_token_id: int,
         draft_token_ids: list | None = None,
+        is_final: bool = True,
     ) -> None:
         """Promote a sequence from prefill_waiting directly to running.
 
@@ -4370,13 +4655,55 @@ class DecodeScheduler(Scheduler):
         match the non-disagg postprocess state before the first decode step.
         """
 
+        if not is_final:
+            # A partial chunk: real KV, no token. Its hashes are published (the
+            # engine does that before `schedule()`), but the request cannot
+            # decode yet, so it stays in `prefill_waiting` and nothing is
+            # promoted. Only the offset moves, and only far enough to describe
+            # what this chunk wrote -- the same `record then advance` pair the
+            # ordinary scheduler uses, for the same reason.
+            seq = self.prefill_waiting.get(seq_id)
+            if seq is not None:
+                if seq.pending_hash_start < 0:
+                    seq.pending_hash_start = seq.num_cached_tokens
+                seq.num_cached_tokens += num_tokens_computed
+                self.prefill_partial.append(seq)
+            return
         seq = self.prefill_waiting.pop(seq_id, None)
         if seq is not None:
+            # The peer's scatter has landed -- PrefillDone is sent only after
+            # the forward's event retires, and the copy was enqueued ahead of
+            # it on the same stream. Arming the record here is what lets the
+            # next `complete_inflight` publish the image; before this it is
+            # reserved but unpublishable, which is the point.
+            cp = self.block_manager.paged_state_checkpoints
+            if seq.prefill_store_hashes and cp is not None:
+                # Every image this prompt reserved, not one: the peer wrote
+                # them all, each between the chunk that produced its state and
+                # the one after it, and PrefillDone retires only once they have
+                # all landed.
+                for h in seq.prefill_store_hashes:
+                    cp.settle_prefill_store(h)
+                seq.prefill_store_hashes = []
+            # Also published on the engine thread, before the next schedule():
+            # the final chunk's blocks need hashing too, and a checkpoint filed
+            # there is drained while the slot still holds what it left.
+            self.prefill_partial.append(seq)
             # `num_tokens_computed` is the DELTA prefill actually ran
             # (PrefillScheduler: num_tokens - num_cached_tokens), not the total.
             # Assigning it would clobber a nonzero prefix-cache hit and make the
             # one-shot hash publish in postprocess re-hash from mid-prompt.
             # `+=` mirrors the non-disagg `seq.num_cached_tokens += chunk`.
+            #
+            # Recorded BEFORE the advance, because it is the offset the advance
+            # is about to destroy: the blocks prefill just filled run from here
+            # to `num_cached_tokens`, and `hash_blocks` would otherwise start
+            # looking at the end of them. Not published here — this runs on the
+            # PrefillDone receive thread, and the publish mutates the block pool
+            # and the checkpoint coordinator that the engine thread is draining.
+            # `postprocess` does it; see `Sequence.pending_hash_start`.
+            if seq.pending_hash_start < 0:
+                seq.pending_hash_start = seq.num_cached_tokens
             seq.num_cached_tokens += num_tokens_computed
             seq.append_token(sampled_token_id)
             # T0 lives in seq.token_ids (so the first decode forward reads it as

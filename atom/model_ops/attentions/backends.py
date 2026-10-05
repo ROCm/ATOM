@@ -48,6 +48,15 @@ T = TypeVar("T", bound="BroadcastableModelInput")
 # and `fla_ops.replayssm` skip on.
 PAD_SLOT_ID = -1
 
+# Reserved key in `allocate_per_req_cache`'s result: the single allocation its
+# views are carved out of. A name rather than a second hook, because the views
+# are what keep it alive and the backend already returns them all here -- the
+# runner needs the base only to hand its IPC handle to a rapidserve peer, and
+# `setattr`ing it alongside the views costs nothing. Absent for a backend that
+# allocates nothing, and for every backend whose `shares_per_req_cache` is
+# False.
+PER_REQ_POOL_ATTR = "per_req_pool"
+
 
 class BroadcastableModelInput(ABC):
 
@@ -247,7 +256,45 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return []
 
-    def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
+    def shares_per_req_cache(self) -> bool:
+        """Whether `allocate_per_req_cache` can carve from someone else's buffer.
+
+        Opt-in, per backend, because the only consumer is rapidserve: the two
+        processes of a pair share one GPU, so decode can read the state prefill
+        wrote if — and only if — both carve identical views over one allocation.
+        A backend says True once its `allocate_per_req_cache` honours `buf` and
+        publishes the base allocation under `PER_REQ_POOL_ATTR`.
+
+        False keeps the pair refusing the model outright, which is the safe
+        answer: the failure from two processes carving *almost* the same layout
+        is one request reading another's compressor state, and nothing
+        downstream can tell. Better to not start.
+        """
+        return False
+
+    def shared_runner_attrs(self) -> tuple[str, ...]:
+        """Runner attributes a rapidserve pair must address as one allocation.
+
+        Everything this backend holds that prefill writes and decode reads, and
+        that is NOT already a region of `kv_cache`. The paired processes run on
+        one GPU, so these are shared by IPC handle rather than copied.
+
+        `kv_cache` itself is handled by the runner and is not named here.
+        Naming a backend's own allocations is necessary because "one paged
+        allocation" is a property of the paged pool, not of a model: DeepSeek-V4
+        prices `paged_pool_bytes` at zero and keeps its bytes in the standalone
+        indexer cache plus the plane+arena pool, so for it `kv_cache` is empty
+        and these names are all of it.
+
+        The omission that matters is silent. A tensor prefill writes and decode
+        left freshly zeroed raises nothing -- the shapes match, the layouts
+        match, and the only symptom is an indexer that finds nothing.
+        """
+        return ()
+
+    def allocate_per_req_cache(
+        self, entries: dict[str, int], buf: "torch.Tensor | None" = None
+    ) -> dict[str, object]:
         """Allocate this backend's per-request state.
 
         Called by ModelRunner.allocate_kv_cache() with the entry count sizing
@@ -259,7 +306,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         Values are usually tensors, but a backend may also publish the object
         that owns them — DeepSeek-V4 publishes its `EntryMajorArena` alongside the
         per-layer views so the PD path can address a whole entry.
+
+        `buf` is the rapidserve decode side handing back prefill's allocation,
+        imported over CUDA IPC. Carve the same views over it instead of
+        allocating, and check its size against the geometry you just derived —
+        that check is the only thing standing between a version skew and two
+        processes addressing one buffer at two layouts. Only reached for a
+        backend whose `shares_per_req_cache` is True.
         """
+        del buf
         return {}
 
     def state_transfer(self) -> StateTransfer:
