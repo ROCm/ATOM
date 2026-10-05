@@ -812,6 +812,9 @@ class ForwardContext:
     cudagraph_runtime_mode: Any = None
     batch_descriptor: Any | None = None
 
+    # The DP pad-row work this forward already did (see `step_pad_rows`).
+    pad_rows_done: set = field(default_factory=set)
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -826,54 +829,86 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
 
-# Device-side DP pad-row mask, `row >= scheduled_tokens`, for consumers recorded
-# into CUDA graphs, which cannot read the host count on replay. Allocated on
-# first request and all False (no padding) until published; every pass publishes
-# it before its forward or replay (`set_forward_context`, the drafters'
-# `_publish_draft_shape`). Consumers read it per call and keep no reference.
-_pad_rows_device: torch.Tensor | None = None
+# DP pad-row mask for consumers recorded into CUDA graphs (MegaMoE). A replay
+# runs no Python, so each pass derives its mask on the device, on its first call,
+# from buffers every step already refreshes -- never from a host count:
+#   target pass: rows at or past `cu_seqlens_q[running_bs]` (padded requests
+#     have length 0, so that entry is this rank's real token count);
+#   draft pass (`[running_bs, q]` rows): rows at or past q times the real request
+#     count the step's target pass recorded.
+# A target pass records that count first thing, whatever else it decides, so a
+# draft never reads an older step's; one that cannot tell (no cu_seqlens_q, a TBO
+# micro-batch) records "no padding". The buffers are persistent because graphs,
+# and the pieces of a piecewise graph, record their addresses.
+_NO_PADDING = 1 << 30
 _row_index_device: torch.Tensor | None = None
+_pad_rows_device: torch.Tensor | None = None
+_real_requests_device: torch.Tensor | None = None
 
 
 def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
-    """Allocate or grow the `[rows, 1]` mask. Call before any capture: a graph
-    records the buffer's address."""
-    global _pad_rows_device, _row_index_device
+    """Allocate (or grow) the mask buffers. Call before any capture."""
+    global _row_index_device, _pad_rows_device, _real_requests_device
     if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
+        # int64: the draft threshold (requests x q, or _NO_PADDING x q) is a 0-d
+        # int64 tensor, which would be cast to the row index's dtype.
         _row_index_device = torch.arange(
-            num_rows, dtype=torch.int32, device=device
+            num_rows, dtype=torch.int64, device=device
         ).unsqueeze(1)
         _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
         _logger.info("DP pad-row mask enabled for %d rows", num_rows)
-
-
-def publish_scheduled_tokens(scheduled_tokens: int) -> None:
-    """Mark rows at or past `scheduled_tokens` as padding: one compare on the
-    current stream, no host sync. Skipped while capturing, where it would freeze
-    the capture's count into the graph."""
-    pad = _pad_rows_device
-    if pad is None or torch.cuda.is_current_stream_capturing():
-        return
-    torch.ge(_row_index_device, scheduled_tokens, out=pad)
+    if _real_requests_device is None:
+        _real_requests_device = torch.full(
+            (), _NO_PADDING, dtype=torch.int64, device=device
+        )
 
 
 def step_pad_rows(num_rows: int) -> torch.Tensor | None:
-    """The `[num_rows, 1]` pad-row mask for this pass, or None when no row can be
-    padding: the rows are not the pass's `running_tokens` (a PCP shard, a
-    sub-slice), an eager pass has no padding, or the mask is not enabled. While
-    capturing it always returns the mask, so each replay follows its publish."""
-    context = get_forward_context().context
-    if context is None or num_rows != context.running_tokens:
+    """The `[num_rows, 1]` DP pad-row mask for this pass, or None when no row can
+    be padding: masking is off, a TBO micro-batch, the rows are not the pass's
+    `running_tokens` (a PCP shard, a sub-slice), or an eager pass has no padding.
+    While capturing it always returns the mask, so each replay follows its step."""
+    from atom.utils.tbo.ubatching import tbo_active
+
+    forward_context = get_forward_context()
+    context = forward_context.context
+    if context is None or _pad_rows_device is None:
         return None
-    if (
-        not torch.cuda.is_current_stream_capturing()
-        and context.scheduled_tokens >= num_rows
-    ):
+    capturing = torch.cuda.is_current_stream_capturing()
+    done = forward_context.pad_rows_done
+    cu = getattr(forward_context.attn_metadata, "cu_seqlens_q", None)
+    running_bs = context.running_bs
+    tbo = tbo_active()
+    if not context.is_draft and ("requests", capturing) not in done:
+        done.add(("requests", capturing))
+        if tbo or cu is None or not 0 < running_bs < cu.shape[0]:
+            _real_requests_device.fill_(_NO_PADDING)
+        else:
+            _real_requests_device.copy_(
+                (cu[1 : running_bs + 1] > cu[:running_bs]).sum()
+            )
+    if tbo or num_rows != context.running_tokens:
         return None
-    pad_rows = _pad_rows_device
-    if pad_rows is None or pad_rows.shape[0] < num_rows:
+    if not capturing and context.scheduled_tokens >= num_rows:
         return None
-    return pad_rows[:num_rows]
+    if _pad_rows_device.shape[0] < num_rows:
+        return None
+    pad_rows = _pad_rows_device[:num_rows]
+    key = ("mask", context.is_draft, num_rows, capturing)
+    if key not in done:
+        rows = _row_index_device[:num_rows]
+        if context.is_draft:
+            if running_bs <= 0 or num_rows % running_bs:
+                return None
+            torch.ge(
+                rows, _real_requests_device * (num_rows // running_bs), out=pad_rows
+            )
+        else:
+            if cu is None or not 0 < running_bs < cu.shape[0]:
+                return None
+            torch.ge(rows, cu[running_bs], out=pad_rows)
+        done.add(key)
+    return pad_rows
 
 
 # Thread-local storage for TBO dual-thread execution
@@ -1003,7 +1038,6 @@ def set_forward_context(
     context.running_tokens_across_dp = (
         None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
     )
-    publish_scheduled_tokens(context.scheduled_tokens)
 
     _forward_context = ForwardContext(
         attn_metadata=attn_metadata,

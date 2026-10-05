@@ -18,7 +18,6 @@ from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
     get_forward_context,
-    publish_scheduled_tokens,
     set_forward_context,
 )
 from atom.utils.h2d import h2d_producer
@@ -625,8 +624,6 @@ class Drafter(abc.ABC):
         context = forward_context.context
         context.scheduled_tokens = scheduled_tokens
         context.running_tokens = running_tokens
-        # Draft graphs read the device pad-row mask too.
-        publish_scheduled_tokens(scheduled_tokens)
         parallel_config = self.config.parallel_config
         # A group of one is uniform whatever it runs; only the table needs peers.
         if parallel_config.data_parallel_size <= 1:
