@@ -28,6 +28,7 @@ _ATOM_ENV_VARS = [
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
+    "ATOM_SHUTDOWN_TIMEOUT_S",
     "ATOM_PROFILER_MORE",
     "ATOM_PROFILER_RECORD_SHAPES",
     "ATOM_PROFILER_WITH_STACK",
@@ -119,6 +120,10 @@ class TestEnvsDefaults:
 
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
+
+    def test_shutdown_timeout_default(self, caplog):
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
+        assert not caplog.records
 
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
@@ -227,6 +232,19 @@ class TestEnvsOverrides:
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
+
+    @pytest.mark.parametrize("value", ["0.5", "1800"])
+    def test_shutdown_timeout_override(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", value)
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == float(value)
+        assert not caplog.records
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "", "bad"])
+    def test_shutdown_timeout_warns_and_defaults(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", value)
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
+        assert len(caplog.records) == 1
+        assert f"ATOM_SHUTDOWN_TIMEOUT_S={value!r}" in caplog.records[0].getMessage()
 
     def test_model_sensitive_rmsnorm_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
