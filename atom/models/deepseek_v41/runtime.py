@@ -49,8 +49,8 @@ def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     if not metadata.step.requests:
         return torch.zeros_like(hidden)
     layer, rope = context.no_compile_layers[layer_name]
-    # Through the block's own body, so the input norm and the quantized pair it
-    # may hand the first GEMM stay on one side of this boundary.
+    # `hidden` arrives normed: the mHC seam (`pre_delayed`) applies the norm
+    # before this boundary, so only the attention body runs here.
     return Block.attention_forward(layer, hidden, metadata.cache, metadata.step, rope)
 
 
@@ -68,8 +68,8 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
 class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
 
-    def attention_forward(self, hidden, cache, step, rope):
-        return v41_attention(hidden, self.layer_name)
+    def attention_forward(self, normed, cache, step, rope):
+        return v41_attention(normed, self.layer_name)
 
     def engram_forward(self, residual, embeddings, image_mask):
         return v41_engram(residual, self.layer_name)

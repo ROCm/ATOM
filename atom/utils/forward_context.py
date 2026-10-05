@@ -168,7 +168,11 @@ class DPMetadata:
 
 @dataclass
 class SpecDecodeMetadata:
-    draft_token_ids: torch.Tensor
+    # The step's input ids. Draft r is input_ids[target_logits_indices[r] + 1]:
+    # logits row t verifies the token that follows it. Read in place by the
+    # rejection sampler, on the forward stream the next step publishes its
+    # input ids on, so they cannot be overwritten under it.
+    input_ids: torch.Tensor
     num_spec_steps: int
     num_draft_tokens_np: np.ndarray
     cu_num_draft_tokens: torch.Tensor
@@ -596,6 +600,10 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # The FP4 sparse indexer's key bound for each query token (its position +
+    # 1), published once per decode step for every full layer; a draft step's
+    # aliases context_lens.
+    index_row_ends: torch.Tensor | None = None
     # Block-table row per query token, for the same indexer -- both aiter ops
     # address the table by row. Aliases block_tables at one query per sequence.
     # Every producer that rewrites block_tables must rewrite this too: a stale
@@ -638,6 +646,7 @@ class AttentionMetaData:
         sparse_kv_indptr: torch.Tensor | None = None,
         sparse_kv_last_page_lens: torch.Tensor | None = None,
         dcp_local_context_lens: torch.Tensor | None = None,
+        index_row_ends: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -678,6 +687,7 @@ class AttentionMetaData:
         self.sparse_kv_indptr = sparse_kv_indptr
         self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
         self.dcp_local_context_lens = dcp_local_context_lens
+        self.index_row_ends = index_row_ends
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set

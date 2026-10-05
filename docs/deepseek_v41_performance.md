@@ -52,7 +52,7 @@ and buffer addresses remain fixed across steps. Padding tokens carry V4's
 ## Cache format and attention boundary
 
 The main pool accepts `kv_cache_dtype="bf16"` or `"fp4"`. The index plane is
-independent and requires `index_cache_dtype="fp8"`.
+independent: `index_cache_dtype="fp8"` (default) or `"fp4"`.
 
 | Region | BF16 main-pool configuration | FP4 main-pool configuration |
 |---|---|---|

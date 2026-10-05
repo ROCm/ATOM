@@ -231,15 +231,20 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
     )
 
 
-@pytest.mark.parametrize("index_dtype", ["bf16", "fp4"])
-def test_an_index_plane_other_than_fp8_is_refused(index_dtype):
-    """The paged scorer is the only one a cache has, and it reads FP8.
+@pytest.mark.parametrize("index_dtype", ["bf16", "fp8_e4m3"])
+def test_an_index_plane_other_than_fp8_or_fp4_is_refused(index_dtype):
+    """The paged scorer reads FP8 or FP4 and nothing else.
 
     A plane stored otherwise has no reader, which is a load-time refusal and
-    not a slower path: the format is the runtime's, not a tuning knob.
+    not a slower path.
     """
-    with pytest.raises(ValueError, match="index plane other than fp8"):
+    with pytest.raises(ValueError, match="index plane other than fp8 or fp4"):
         validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
+
+
+@pytest.mark.parametrize("index_dtype", ["fp8", "fp4"])
+def test_an_fp8_or_fp4_index_plane_is_admitted(index_dtype):
+    validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
 
 
 @pytest.mark.parametrize("graph", [False, True])

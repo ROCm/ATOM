@@ -124,7 +124,7 @@
       "config": {
         "tp": 4,
         "kv_cache_dtype": "bf16",
-        "extra_args": "--index_cache_dtype fp8"
+        "extra_args": "--index_cache_dtype fp4"
       },
       "variants": [
         {

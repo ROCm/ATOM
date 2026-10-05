@@ -527,3 +527,47 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratio
                     dtype=torch.int32,
                 )
                 torch.testing.assert_close(extend, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_candidate_blocks_are_bound_once_a_forward(small_config, monkeypatch):
+    """Every REINDEX layer one source bounds reads one binding, rebuilt once the
+    next forward begins: the table is a fresh allocation, so a binding that
+    outlived `begin_forward` would be one a captured graph never rebuilds."""
+    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+    from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
+
+    builds = []
+
+    def counted(*args, **kwargs):
+        builds.append(args)
+        return bind_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "bind_candidates", counted)
+    geo = geometry(small_config)
+    cache = PagedAttentionCache(geo, 8, 2, "cuda")
+    step = begin_step(cache, [PagedRequest(0, 40, 0, 3, 0, (3, 5))])
+    source, ratio = small_config.candidate_source_layer_id, 1
+    # ascending logical blocks, the newest visible one kept
+    newest = (step.visible[ratio] - 1) // geo.index_block_rows
+    kept = torch.stack([torch.zeros_like(newest), newest], dim=1).to(torch.int32)
+    step.candidates[source] = kept
+
+    first = cache.candidate_blocks(step, source, ratio)
+    assert cache.candidate_blocks(step, source, ratio) is first
+    assert len(builds) == 1
+    expected = bind_candidates(
+        kept,
+        step.block_tables,
+        step.batch_ids,
+        geo.index_blocks_per_page(ratio),
+        step.visible[ratio],
+        rows_per_block=geo.index_block_rows,
+    )
+    assert torch.equal(first.table, expected.table)
+    assert torch.equal(first.context, expected.context)
+
+    step.begin_forward()
+    step.candidates[source] = kept
+    assert cache.candidate_blocks(step, source, ratio) is not first
+    assert len(builds) == 2

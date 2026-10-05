@@ -16,9 +16,14 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 )
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
+from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
-from atom.model_ops.deepseek_v41.index_write import write_index_rows
+from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+from atom.model_ops.deepseek_v41.index_write import (
+    write_index_rows,
+    write_index_rows_fp4,
+)
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.unit_table import unit_table
 from atom.model_ops.v4_kernels import make_compress_plans
@@ -35,10 +40,13 @@ from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    def __init__(self, geometry, pages, slots, device, max_tokens=0):
+    def __init__(self, geometry, pages, slots, device, max_tokens=0, workspace=None):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
+        # The scorer's `ScoreWorkspace`, owned by the builder so the startup
+        # profile's throwaway cache and the serving one share it.
+        self.workspace = workspace
         self.packed = geometry.packed
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
@@ -52,20 +60,29 @@ class PagedAttentionCache:
             buf=self.backing[:main_bytes],
             slot_stride=geometry.page_bytes,
         )
-        # One plane per owner, `[pages, rows, width]`, dense in its own rows:
-        # the stride a paged reader is handed is the rows' and not the PAGE's.
-        # Both sides of the index plane take the view from here.
+        # Each owner's `geometry.index_planes`, each `[pages, rows, width]` and
+        # dense in its own rows: the stride a paged reader is handed is the
+        # rows' and not the PAGE's. Both sides of the index plane take the
+        # views from here.
         self.index_planes = {
-            owner: self._index_plane(
-                index_offsets[owner], geometry.rows_per_page(ratio)
+            owner: tuple(
+                self._index_plane(offset, geometry.rows_per_page(ratio), width)
+                for offset, (_, width) in zip(
+                    index_offsets[owner], geometry.index_planes
+                )
             )
             for owner, ratio in geometry.owners
         }
         # The same bytes as `[tiles, tile rows, width]`, which is what a block
         # id addresses and what the scorer is handed.
         self.index_units = {
-            owner: plane.view(-1, geometry.index_block_rows, plane.shape[-1])
-            for owner, plane in self.index_planes.items()
+            owner: IndexUnits(
+                *(
+                    plane.view(-1, geometry.index_block_rows, plane.shape[-1])
+                    for plane in planes
+                )
+            )
+            for owner, planes in self.index_planes.items()
         }
         self.state = EntryMajorArena(
             geometry.state_fields,
@@ -147,7 +164,8 @@ class PagedAttentionCache:
         regions = [(self.page_bytes.data_ptr(), self.geometry.page_bytes)]
         regions += [
             (plane.data_ptr(), plane.stride(0) * plane.element_size())
-            for plane in self.index_planes.values()
+            for planes in self.index_planes.values()
+            for plane in planes
         ]
         return regions
 
@@ -155,22 +173,23 @@ class PagedAttentionCache:
         """The same regions for one unit, named as `uint8` views."""
         return [self.page_bytes[unit]] + [
             plane[unit].flatten().view(torch.uint8)
-            for plane in self.index_planes.values()
+            for planes in self.index_planes.values()
+            for plane in planes
         ]
 
-    def _index_plane(self, offset, rows):
-        """`[pages, rows, bytes]` at `offset`, untyped.
+    def _index_plane(self, offset, rows, width):
+        """`[pages, rows, width]` bytes at `offset`, untyped.
 
-        A preshuffled FP8 row interleaves its bytes across the tile and carries
-        its scale past the block's data, so a row has no element type to take a
-        view in -- the writer and the scorer both address it as bytes.
+        A preshuffled row interleaves its bytes across the tile (and an FP8
+        one carries its scale past the block's data), so a row has no element
+        type to take a view in -- the writer and the scorer both address it as
+        bytes.
 
         `as_strided`'s storage offset is absolute, so the retyped view's own has
         to be added -- omit it and every plane addresses from the front of the
         pool, over the main pages.
         """
         typed = self.backing.view(torch.uint8)
-        width = self.geometry.index_row_bytes
         return typed.as_strided(
             (self.num_pages, rows, width),
             (rows * width, width, 1),
@@ -222,6 +241,7 @@ class PagedAttentionCache:
         publication_group=None,
         query_prefix_ready=False,
         query_prefix_republish_reason=None,
+        planners=(),
     ):
         self.require_committed()
         requests = tuple(requests)
@@ -267,6 +287,7 @@ class PagedAttentionCache:
             publication_group=publication_group,
             query_prefix_ready=query_prefix_ready,
             query_prefix_republish_reason=query_prefix_republish_reason,
+            planners=planners,
         )
         step.plans = (
             self._private_plans(requests, tentative) if plans is None else plans
@@ -424,10 +445,10 @@ class PagedAttentionCache:
         rows[:, 1:] = histories
         self.cursor[step.slots[:count].long()] = self._cursor_staging.copy_to_gpu(count)
 
-    def commit_tentative(self, step, accepted_lengths):
+    def commit_tentative(self, step, anchors):
         if self.pending is None or self.pending.step is not step:
             raise RuntimeError("Tentative state was not prepared for this step")
-        self.pending.commit(accepted_lengths)
+        self.pending.commit(anchors)
         self.pending = None
 
     def compress(self, owner, compressor, values, scores, step, rope):
@@ -458,9 +479,10 @@ class PagedAttentionCache:
         itself, so nothing here computes one -- `ratio` is all it needs to
         turn the plan's position into a compressed row.
         """
+        (plane,) = self.index_planes[owner]
         write_index_rows(
             index[0],
-            self.index_planes[owner],
+            plane,
             step.plans[ratio].compress_plan_gpu,
             step.block_tables,
             self.geometry.rows_per_page(ratio),
@@ -469,22 +491,55 @@ class PagedAttentionCache:
             scale_fmt=INDEX_FP8_SCALE_FMT,
         )
 
+    def write_index_fp4(self, owner, step, keys, ratio, norm, rope):
+        """`write_index` on the FP4 plane, from the keys before their norm:
+        the same pass norms and rotates them as `Indexer.project_keys` does."""
+        write_index_rows_fp4(
+            keys,
+            self.index_units[owner],
+            step.plans[ratio].compress_plan_gpu,
+            step.block_tables,
+            self.geometry.rows_per_page(ratio),
+            ratio=ratio,
+            norm=norm,
+            rope=rope,
+        )
+
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
 
         Memoized on the step and dropped by `begin_forward` rather than built
-        with it, unlike the indptrs: these rows are a fresh allocation, so a
-        table built outside the graph is one a replay reads at the capture's
-        address.
+        with it, unlike the indptrs: a table built outside the graph is one a
+        replay reads without rebuilding. With a `workspace` the table is its
+        ratio's fixed rows, rewritten each step; without one, a fresh
+        allocation.
         """
         table = step.tiles.get(ratio)
         if table is None:
             table = step.tiles[ratio] = unit_table(
                 step.block_tables,
                 step.batch_ids,
-                self.geometry.rows_per_page(ratio) // self.geometry.index_block_rows,
+                self.geometry.index_blocks_per_page(ratio),
+                workspace=self.workspace,
+                ratio=ratio,
             )
         return table
+
+    def candidate_blocks(self, step, source, ratio):
+        """Layer `source`'s candidates bound to their requests' PAGEs at this
+        ratio: one per forward, shared by every REINDEX layer they bound.
+        Memoized on the step for the reason `unit_tiles` is."""
+        bound = step.candidate_blocks.get(source)
+        if bound is None:
+            bound = step.candidate_blocks[source] = bind_candidates(
+                step.candidates[source],
+                step.block_tables,
+                step.batch_ids,
+                self.geometry.index_blocks_per_page(ratio),
+                step.visible[ratio],
+                rows_per_block=self.geometry.index_block_rows,
+            )
+        return bound
 
     def _scatter_rows(self, pages, step, value, ratio):
         """Scatter plan rows with V4's dtype-agnostic, sentinel-aware writer.
