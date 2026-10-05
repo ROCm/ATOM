@@ -39,9 +39,16 @@ def _mark_v4_proxy_cache_mode(static_forward_context, is_profiling: bool) -> Non
             layer._atom_v4_profiling_kv_cache = is_profiling
 
 
+# Matched as substrings of a layer name, so "v4" must not be written in a way
+# that also has to match "v41": `".atom_deepseek_v4_proxy" in
+# "...atom_deepseek_v41_proxy"` is False, which is how V4.1 went without this
+# patch while having exactly the global-arena property it exists for -- its
+# PAGE and STATE share one address space, a slot's ring being addressed as an
+# offset past the absolute end of the paged region.
 _V4_PROXY_LAYER_MARKERS = (
     ".atom_deepseek_v4_proxy",
     ".atom_deepseek_v4_draft_proxy",
+    ".atom_deepseek_v41_proxy",
 )
 
 

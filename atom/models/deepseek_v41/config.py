@@ -342,13 +342,49 @@ def validate_speculative_config(config):
         )
 
 
+# The vLLM-plugin connectors that own a tier for V4.1's per-request CSA2 STATE.
+# A plugin-mode transport is named by vLLM's own `kv_connector` string, which is
+# not an ATOM connector name, so it is matched here rather than resolved through
+# `KVConnectorFactory`.
+_VLLM_PLUGIN_KV_CONNECTORS = ("AtomLMCacheOffloadConnector",)
+
+
+def _kv_connector_owns_v41_state(config) -> bool:
+    """Whether a connector with a tier for V4.1's per-request state is on."""
+    kv = config.kv_transfer_config or {}
+    return kv.get("kv_connector") in _VLLM_PLUGIN_KV_CONNECTORS
+
+
+def _kv_transfer_unsupported(config, on_vllm_plugin: bool) -> bool:
+    """Whether this run's KV transport is one V4.1 does not implement."""
+    kv_transfer_config = config.kv_transfer_config
+    if not kv_transfer_config:
+        return False
+    if on_vllm_plugin:
+        name = kv_transfer_config.get("kv_connector")
+        return name not in _VLLM_PLUGIN_KV_CONNECTORS
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    return KVConnectorFactory.connector_name(kv_transfer_config) not in (
+        None,
+        "lmcache_mp",
+    )
+
+
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
+    plugin = config.plugin_config
+    # The vLLM plugin path is text-only and runs the backbone alone: vLLM owns
+    # scheduling and block allocation, and the bridge in
+    # `atom.plugin.vllm.deepseek_v41_bridge` maps its block tables onto CSA2's
+    # PAGE/STATE pool. Everything V4.1 layers on top of that backbone --
+    # DSpark drafting, the vision tower, prefix reuse across the compressed
+    # pool -- still has no plugin-side counterpart, so each is named below.
+    on_vllm_plugin = plugin is not None and bool(getattr(plugin, "is_vllm", False))
     for name, enabled in (
         (
             "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
@@ -378,15 +414,44 @@ def validate_runtime_config(config):
         ),
         ("TBO", config.enable_tbo or config.enable_tbo_decode),
         (
-            # `lmcache_mp` is the one transport admitted: it checkpoints STATE
-            # through the backend's PAGE-backed copies. P/D and in-process
-            # offload read SLOT regions and codecs this runtime does not publish.
-            "KV transfer other than lmcache_mp",
-            KVConnectorFactory.connector_name(config.kv_transfer_config)
-            not in (None, "lmcache_mp"),
+            # Two orthogonal questions, so two separate gates. Natively the
+            # transport is an ATOM connector name and `lmcache_mp` is the one
+            # admitted: it checkpoints STATE through the backend's PAGE-backed
+            # copies, while P/D and in-process offload read SLOT regions and
+            # codecs this runtime does not publish. On the vLLM plugin the
+            # transport is not an ATOM connector at all -- it is vLLM's own
+            # `kv_connector`, and feeding that string to ATOM's factory is a
+            # category error -- so it is named against its own allow-list.
+            (
+                "KV transfer other than lmcache_mp (native) or "
+                "AtomLMCacheOffloadConnector (vLLM plugin)"
+            ),
+            _kv_transfer_unsupported(config, on_vllm_plugin),
         ),
         ("RapidServe", config.enable_rapidserve),
-        ("plugin mode", config.plugin_config is not None),
+        ("plugin mode outside vLLM", plugin is not None and not on_vllm_plugin),
+        # TODO: DSpark under the vLLM plugin needs vLLM's proposer to drive
+        # ATOM's tentative staging; the proxy bridge drives a single
+        # target-only step today.
+        (
+            "speculative decoding on the vLLM plugin",
+            on_vllm_plugin and config.speculative_config is not None,
+        ),
+        # CSA2 blocks are reusable only at whole-PAGE boundaries after the
+        # compressor has run, and the STATE side is not replayed by a
+        # block-table hit. The offload connector is what makes reuse
+        # admissible: it stores the STATE at those boundaries and caps every
+        # hit -- vLLM's own included, through the scheduler mixin -- to one it
+        # holds. Without it there is nothing to cap against.
+        (
+            (
+                "prefix caching on the vLLM plugin without "
+                "AtomLMCacheOffloadConnector"
+            ),
+            on_vllm_plugin
+            and config.enable_prefix_caching
+            and not _kv_connector_owns_v41_state(config),
+        ),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (

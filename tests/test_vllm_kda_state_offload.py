@@ -188,6 +188,30 @@ def test_index_cache_follows_the_layer_that_owns_it():
     assert set(per_group[1]) == {"model.layers.1.kda"}
 
 
+def test_glm_indexer_follows_its_attention_layer_across_groups():
+    """GLM registers ``<p>.indexer.k_cache``, not ``<layer>.index_cache``.
+
+    Stripping only the M3 suffix leaves the GLM entry unmapped. On a
+    multi-group model that is either a boot failure or, if the entry were
+    guessed into a group, the indexer bytes stored under the wrong layer.
+    """
+    attn = "model.layers.0.self_attn.attn"
+    indexer = "model.layers.0.self_attn.indexer.k_cache"
+    kda = "model.layers.1.kda"
+    caches = {
+        attn: torch.zeros(4, 8),
+        indexer: torch.zeros(4, 132),
+        kda: torch.zeros(3, 8),
+    }
+    groups = [FakeGroup([attn]), FakeGroup([kda])]
+
+    per_group = split_kv_caches_by_group(caches, groups)
+
+    assert indexer in per_group[0]
+    assert attn in per_group[0]
+    assert set(per_group[1]) == {kda}
+
+
 def test_layer_belonging_to_no_group_is_an_error_not_a_guess():
     caches = {
         "model.layers.0.attn": torch.zeros(4, 8),
@@ -521,6 +545,34 @@ def test_unresolvable_destination_is_queued_as_a_failing_load():
     assert load.error_block_ids == (22,)
 
 
+def test_failed_kda_load_never_names_a_mamba_block_as_invalid():
+    """``scheduler.py`` skips non-attention groups when truncating a failed
+    load. That skip is only safe if this connector reports attention ids.
+    A mamba id in ``error_block_ids`` would be invisible to recovery, and
+    vLLM would cache the MLA prefix as if the recurrent state had arrived.
+    """
+    planner = make_planner()
+    request = FakeRequest("r0")
+    mamba_blocks = [11, 12, 13, 14]
+    attention_blocks = [21, 22, 23]
+
+    planner.resolve_load(
+        request,
+        (attention_blocks, mamba_blocks, [31, 32]),
+        CHUNK,
+        ATTENTION_GROUP,
+        CHUNK,
+        CHUNK,
+    )
+
+    (load,) = planner.take_loads()
+    named = set(load.error_block_ids)
+    assert named
+    assert named.isdisjoint(mamba_blocks)
+    assert named.isdisjoint([31, 32])
+    assert named <= set(attention_blocks)
+
+
 def test_unaligned_hit_fails_closed_instead_of_writing_the_wrong_row():
     """``n // block - 1`` and ``(n - 1) // block`` disagree when n is not a
     multiple of the mamba block. The forward reads the second. Writing the
@@ -689,7 +741,10 @@ def test_a_load_whose_second_group_has_no_destination_fails_whole():
 def test_mamba_groups_must_agree_on_block_size():
     """A boundary is one block in every group at the same token count."""
     pytest.importorskip("vllm")
-    from vllm.v1.kv_cache_interface import MambaSpec
+    try:
+        from vllm.v1.kv_cache_interface import MambaSpec
+    except ImportError:
+        pytest.skip("vllm is present but has no MambaSpec (stub or old tree)")
 
     from atom.plugin.vllm.kv_transfer.kda_state import find_mamba_groups
 
@@ -1164,3 +1219,139 @@ def test_stats_name_every_reason_a_boundary_was_not_stored():
         "cap_declined",
     ):
         assert name in stats
+
+
+# --------------------------------------------------------------------------
+# rides_page: the state travels inside the PAGE transfer object
+# --------------------------------------------------------------------------
+def _riding_planner(pool=None):
+    planner = make_planner(group_ids=(MAMBA_GROUP, MAMBA_GROUP_2), rides_page=True)
+    planner.bind_gpu_block_pool(pool if pool is not None else FakePool())
+    return planner
+
+
+def test_riding_planner_issues_no_jobs_of_its_own():
+    """There is no second tier to drive: the PAGE object carries the state."""
+    planner = _riding_planner()
+    request = FakeRequest("r1")
+    assert (
+        planner.collect_stores(
+            {"r1": [(MAMBA_GROUP, 7, CHUNK), (MAMBA_GROUP_2, 9, CHUNK)]},
+            {"r1": request},
+        )
+        == []
+    )
+    assert (
+        planner.collect_cached_boundary_stores({"r1": 4 * CHUNK}, {"r1": request}) == []
+    )
+
+
+def test_a_save_takes_its_source_from_the_hash_keyed_pool():
+    """Not from a block table: a superseded block still sits in a table."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(
+        request.block_hashes[CHUNK // HASH_BLOCK - 1],
+        {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
+    )
+    state = planner.take_ride_state(request, "r1", CHUNK, operation="op1")
+    assert state is not None
+    assert state.boundary_tokens == CHUNK
+    assert state.block_ids == (7, 9)
+    # Pinned for the same reason a store pins: the copy is asynchronous.
+    assert pool.touched == ["blk7", "blk9"]
+
+
+def test_a_rides_source_pin_is_given_back_when_its_save_retires():
+    """The ride issues no store, so nothing else ever unpins it. Before this
+    reconciliation the pool lost one block per mamba group per ride until it
+    had none left and the engine stalled at zero running requests."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(
+        request.block_hashes[CHUNK // HASH_BLOCK - 1],
+        {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
+    )
+    planner.take_ride_state(request, "r1", CHUNK, operation="op1")
+    assert planner.has_pending_work()
+
+    # Still dispatched: the worker may be mid-copy.
+    planner.retire_ride_pins({"op1"})
+    assert pool.freed == []
+
+    planner.retire_ride_pins(set())
+    assert pool.freed == ["blk7", "blk9"]
+    assert not planner.has_pending_work()
+    # Idempotent: a second reconciliation must not double-free.
+    planner.retire_ride_pins(set())
+    assert pool.freed == ["blk7", "blk9"]
+
+
+def test_a_load_destination_is_not_pinned():
+    """Those blocks are the parked request's own allocation; vLLM holds them
+    until the load releases the request, which is longer than the transfer.
+    A share taken here is one the retire path would never see an operation
+    for."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    planner._record_ride_boundary("r1", CHUNK, (40, 60))
+    state = planner.take_ride_state(FakeRequest("r1"), "r1", CHUNK)
+    assert state.block_ids == (40, 60)
+    assert pool.touched == []
+
+
+def test_a_boundary_missing_one_group_carries_nothing():
+    """A half state under a whole key is exactly what this leg prevents."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(request.block_hashes[CHUNK // HASH_BLOCK - 1], {MAMBA_GROUP: 7})
+    assert planner.take_ride_state(request, "r1", CHUNK) is None
+
+
+def test_a_load_uses_the_destination_vllm_just_allocated():
+    """The committed state is what a hit does *not* have yet; the recorded
+    destination is the only correct answer for a load."""
+    pool = FakePool()
+    planner = _riding_planner(pool)
+    request = FakeRequest("r1")
+    pool.publish(
+        request.block_hashes[CHUNK // HASH_BLOCK - 1],
+        {MAMBA_GROUP: 7, MAMBA_GROUP_2: 9},
+    )
+    group_blocks = ([], [], [])
+    row = (CHUNK - 1) // MAMBA_BLOCK
+    group_blocks = list(group_blocks)
+    group_blocks[MAMBA_GROUP] = [40 + i for i in range(row + 1)]
+    group_blocks[MAMBA_GROUP_2] = [60 + i for i in range(row + 1)]
+    planner.resolve_load(
+        request,
+        tuple(group_blocks),
+        CHUNK,
+        attention_group_id=0,
+        num_external_tokens=CHUNK,
+        attention_block_size=HASH_BLOCK,
+    )
+    assert planner.take_loads() == []
+    state = planner.take_ride_state(request, "r1", CHUNK)
+    assert state.block_ids == (40 + row, 60 + row)
+
+
+def test_cap_hit_truncates_to_a_chunk_without_probing_an_index():
+    """Nothing was ever stored on a leg of its own, so an index probe would
+    decline every hit; what still has to hold is the chunk shape."""
+    planner = _riding_planner()
+    request = FakeRequest("r1")
+    planner.begin_lookup(request)
+    assert planner.cap_hit(FakeSeq("r1"), CHUNK * 2 + 5) == CHUNK * 2
+    assert planner.cap_hit(FakeSeq("r1"), CHUNK - 1) == 0
+    planner.end_lookup()
+
+
+def test_forgetting_a_request_drops_its_recorded_destinations():
+    planner = _riding_planner()
+    planner._record_ride_boundary("r1", CHUNK, (40, 60))
+    planner.forget_request("r1")
+    assert planner.take_ride_state(FakeRequest("r1"), "r1", CHUNK) is None

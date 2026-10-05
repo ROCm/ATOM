@@ -121,7 +121,14 @@ def init_aiter_topK_meta_data(
     fake_expertid = n_routed_experts + n_shared_experts
 
     # all layers reuse same buffer
-    total_topk_ids = torch.empty(
+    #
+    # Zeros, not empty: only the shared columns are initialized below, so the
+    # `top_k` routed columns would otherwise hold raw allocator memory for any
+    # row the routing kernel does not write in a given step.  moe_sorting and
+    # the scatter/reduce kernel index expert-sized storage with these ids, so a
+    # stale id is an out-of-range access, not a wrong number.  Expert 0 with
+    # weight 0 (below) is inert.
+    total_topk_ids = torch.zeros(
         (max_num_tokens, top_k + n_shared_experts + is_EP),
         dtype=torch.int32,
         device="cuda",
@@ -140,7 +147,7 @@ def init_aiter_topK_meta_data(
         s_topk_ids_list = [range(n_routed_experts, fake_expertid)] * max_num_tokens
     s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=torch.int32, device="cuda")
 
-    total_topk_weights = torch.empty(
+    total_topk_weights = torch.zeros(
         (max_num_tokens, top_k + n_shared_experts + is_EP),
         dtype=torch.float32,
         device="cuda",

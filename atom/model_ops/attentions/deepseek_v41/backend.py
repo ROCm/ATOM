@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,8 +26,111 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
+
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+except ImportError:  # native ATOM runs without vLLM installed
+
+    def eager_break_during_capture(fn):
+        return fn
+
+
+def _breakable_cudagraph_enabled() -> bool:
+    """Whether graphs may be captured around this model's step work.
+
+    Read per call rather than once at import: the env var is set before the
+    worker imports vLLM, but a test may flip it, and the cost is a dict lookup
+    next to a cache allocation.
+    """
+    try:
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+    except ImportError:
+        return False
+    return bool(is_breakable_cudagraph_enabled())
+
+
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
+
+
+# `prepare_state`'s deferred probe ships the cursor rows asynchronously and
+# renders its stale-slot verdict on the next step, which takes one blocking
+# D2H (~58 us) off each decode step. Under a KV connector at concurrency it
+# reports positions one step out of register with the cursor it reads, and the
+# verdict is a hard refusal -- so it kills the engine on state that is fine.
+#
+# Measured, concurrency 8, chunked prefill, tier active: deferred probe dies
+# within seconds (`needs state at N, found N+1`, every time off by exactly the
+# one token a decode step advances); blocking probe runs full 120 s windows
+# with the tier storing and retrieving. Concurrency 1 is clean either way.
+#
+# So the default is the blocking path, and the deferred one is opt-in until
+# the register slip is understood. A check that fails closed on correct state
+# is worse than the microsecond it saves.
+def _blocking_state_probe(config) -> bool:
+    """Whether to render the stale-slot verdict in the step that asks for it.
+
+    Default on for the plugin path and off for the native one, because that is
+    where the fault was observed and where the cost is justified. The native
+    engine keeps the deferred probe's ~58 us per decode step; it drives its own
+    scheduler and has not been seen to produce the register slip.
+
+    `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way: 1 to buy the check on
+    the native path too, 0 to take the risk on the plugin path.
+    """
+    override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+    if override is not None and override != "":
+        return override not in ("0", "false", "False")
+    return getattr(config, "plugin_config", None) is not None
+
+
+def build_v41_pool_geometry(
+    hf_config,
+    block_size: int,
+    *,
+    packed: bool,
+    speculative_tokens: int = 0,
+) -> V41PoolGeometry:
+    """The pool geometry a CSA2 configuration runs, from its text config alone.
+
+    The single authority for it. The pool is declared twice -- once by the
+    scheduler that sizes it and once by whoever hands the runtime its backing
+    store -- and the two only describe the same bytes if they derive the shape
+    the same way. The vLLM plugin sizes a proxy KV pool from here and the
+    native builder below builds its cache from here, so a change to the
+    topology reaches both or neither.
+
+    ``packed`` is the main pool's FP4 layout (native's ``kv_cache_dtype ==
+    "fp4"``), and ``speculative_tokens`` the draft width a verify step retains;
+    both move the geometry, so neither has a default that guesses.
+    """
+    topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
+    return V41PoolGeometry(
+        len(topology)
+        + (hf_config.num_nextn_predict_layers if speculative_tokens else 0),
+        tuple(
+            (spec.layer_id, spec.ratio)
+            for spec in topology
+            if spec.mode == AttentionMode.FULL
+        ),
+        block_size,
+        hf_config.sliding_window,
+        hf_config.head_dim,
+        hf_config.index_head_dim,
+        hf_config.engram_max_ngram_size - 1,
+        packed=packed,
+        speculative_tokens=speculative_tokens,
+        # Only the ratios the built layers run: a configuration with no
+        # window-only layer gets no buffer for one.
+        layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
+        index_topk=hf_config.index_topk,
+        # Paged at the length candidates are picked in, which is what lets
+        # a candidate list be a block table. A GPU that cannot page that
+        # short refuses when asked, so there is nothing to pre-empt here.
+        index_block_rows=hf_config.candidate_block_size,
+    )
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -93,33 +197,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         for name in ("positions", "batch_id_per_q_token"):
             model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
-        topology = build_attention_topology(self.config)[
-            : self.config.num_hidden_layers
-        ]
+        self._blocking_state_probe = _blocking_state_probe(model_runner.config)
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
-        self.geometry = V41PoolGeometry(
-            len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
-            tuple(
-                (spec.layer_id, spec.ratio)
-                for spec in topology
-                if spec.mode == AttentionMode.FULL
-            ),
+        self.geometry = build_v41_pool_geometry(
+            self.config,
             self.block_size,
-            self.config.sliding_window,
-            self.config.head_dim,
-            self.config.index_head_dim,
-            self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
             speculative_tokens=num_drafts,
-            # Only the ratios the built layers run: a configuration with no
-            # window-only layer gets no buffer for one.
-            layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-            index_topk=self.config.index_topk,
-            # Paged at the length candidates are picked in, which is what lets
-            # a candidate list be a block table. A GPU that cannot page that
-            # short refuses when asked, so there is nothing to pre-empt here.
-            index_block_rows=self.config.candidate_block_size,
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -326,6 +411,44 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
+    def _dummy_cache(self, pages, slots, running_tokens):
+        """Scratch for a dummy batch: per call, except under graph capture.
+
+        A dummy run must never touch a live PAGE or STATE slot, so it gets its
+        own cache. Allocating a fresh one per call is right while nothing is
+        being captured -- it is freed again immediately, and the eager path
+        pays nothing for it.
+
+        Under a breakable capture it is fatal, and loudly so. The kernels
+        recorded during capture hold this cache's addresses; the object dies
+        when the capture returns, and the first replay reads freed memory as an
+        illegal access, reported asynchronously somewhere else entirely. So
+        while capture is possible, hand out one cache, allocated once at the
+        capture ceiling and kept alive on the builder. Every bucket's dummy
+        batch fits inside it -- its page, slot and token counts are caps, and
+        the batch indexes from zero -- so one allocation serves them all
+        without the per-bucket cost of a cache each (the STATE side alone is
+        ~5 MiB per slot).
+        """
+        if not _breakable_cudagraph_enabled():
+            return PagedAttentionCache(
+                self.geometry, pages, slots, self.device, max_tokens=running_tokens
+            )
+        cached = getattr(self, "_capture_dummy_cache", None)
+        if cached is None:
+            ceiling_pages = max(
+                pages, -(-self.max_num_batched_tokens // self.block_size)
+            )
+            cached = PagedAttentionCache(
+                self.geometry,
+                ceiling_pages,
+                max(slots, self.max_bs),
+                self.device,
+                max_tokens=max(running_tokens, self.max_num_batched_tokens),
+            )
+            self._capture_dummy_cache = cached
+        return cached
+
     def _prepare(
         self,
         batch,
@@ -367,13 +490,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
         cache = (
-            PagedAttentionCache(
-                self.geometry,
-                max(next_page, 1),
-                max(len(spans), 1),
-                self.device,
-                max_tokens=running_tokens,
-            )
+            self._dummy_cache(max(next_page, 1), max(len(spans), 1), running_tokens)
             if batch.is_dummy_run
             else self.cache
         )
@@ -536,7 +653,24 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if tentative:
             cache.pending.staged_on_device = True
 
+    @eager_break_during_capture
     def prepare_model_inputs(self, input_ids, metadata):
+        """One CSA2 step's host-side work: Engram rows, state, cursor.
+
+        A break point for breakable cudagraph capture, which is what lets this
+        model be captured at all. None of this can be replayed from a graph --
+        the Engram row staging hashes token ids, `prepare_state` resets the
+        slots this batch recycled, and `advance_cursor` writes the committed
+        position -- and it has to happen once, in order, per step.
+
+        It meets the decorator's contract without restructuring: it returns no
+        tensor and writes only into `forward_vars` buffers that were reserved
+        once and never reallocated, precisely so a replay (which reruns no host
+        code) finds the addresses its kernels recorded. See `_reserve_indptrs`.
+
+        Outside a capture context the decorator is identity, so the native
+        engine's path is unchanged.
+        """
         step, cache = metadata.step, metadata.cache
         # The rows the requests own, not the rows the forward runs: the padding
         # tail is zeroed inside `run_model`, after this, so what stands there
@@ -559,7 +693,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=batch is None)
+            else cache.prepare_state(
+                step, histories=batch is None or self._blocking_state_probe
+            )
         )
         if self.engram is not None:
             prepared = self.engram.prepare(

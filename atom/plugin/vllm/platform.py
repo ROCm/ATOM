@@ -20,7 +20,20 @@ _V4_MAX_SINGLE_FORWARD_TOKENS = 131072
 _V4_MAX_SINGLE_FORWARD_TOKENS_ENV = "ATOM_V4_MAX_SINGLE_FORWARD_TOKENS"
 
 
+# DeepSeek-V4.1's architecture string starts with the V4 one, so a substring
+# test for V4 matches it too. Both branches below are keyed on these, and V4.1
+# must not take V4's.
+_DEEPSEEK_V41_ARCHES = ("DeepseekV41ForCausalLM",)
+
+
+def _is_deepseek_v41(model_config) -> bool:
+    arches = getattr(model_config, "architectures", None) or []
+    return any(str(a) in _DEEPSEEK_V41_ARCHES for a in arches)
+
+
 def _is_deepseek_v4(model_config) -> bool:
+    if _is_deepseek_v41(model_config):
+        return False
     arches = getattr(model_config, "architectures", None) or []
     return any("DeepseekV4" in str(a) for a in arches)
 
@@ -126,6 +139,172 @@ def _select_hybrid_aware_scheduler(vllm_config) -> None:
         sc.scheduler_cls = chosen
 
 
+_V41_EXPERIMENTAL_CUDAGRAPH_ENV = "ATOM_V41_EXPERIMENTAL_CUDAGRAPH"
+
+
+def _breakable_cudagraph_available() -> bool:
+    """Whether to let V4.1 be captured. Off unless explicitly asked for.
+
+    Breakable capture removes the *stated* reason V4.1 ran eager: that reason
+    was that ATOM's plugin models are not fx-split, so vLLM's PIECEWISE mode
+    had nothing to split on, and breakable capture ends the stream capture at
+    runtime instead of splitting an fx graph. Everything that follows from
+    that is in place -- `v41_stage_step` carries the break, PIECEWISE passes
+    vLLM's three `AttentionCGSupport.NEVER` gates untouched (all three test
+    FULL), and the dummy-batch cache is reused rather than freed under the
+    recorded kernels.
+
+    It is still not enough, and this is measured, not assumed. With the above,
+    V4.1 captures and serves without raising -- and answers degenerate into
+    noise after the first few tokens. What stays behind is the attention
+    itself: its kernels are launched with per-step host values (the batch's
+    longest KV extent among them), which a capture freezes at the length it
+    happened to record while every decode step grows past it. The ordinary
+    remedy -- an eager break on the attention op, as vLLM does for
+    `unified_attention_with_output` -- does not apply as a decoration, because
+    V4.1's attention returns a fresh tensor and the decorator requires an
+    in-place output buffer; applying it anyway faults inside capture.
+
+    So capturing V4.1 needs attention-level work (a persistent per-layer
+    output buffer and a device-side length bound), not configuration. Until
+    then this returns False by default, so a vLLM that auto-enables
+    VLLM_USE_BREAKABLE_CUDAGRAPH cannot quietly turn V4.1's answers to noise.
+    Set ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 to pick that work back up; it is
+    wrong on purpose and is not a serving configuration.
+    """
+    if os.environ.get(_V41_EXPERIMENTAL_CUDAGRAPH_ENV, "") not in ("1", "true", "True"):
+        return False
+    try:
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+    except ImportError:
+        return False
+    return bool(is_breakable_cudagraph_enabled())
+
+
+def _v41_state_tier_configured(vllm_config) -> bool:
+    """Whether this run has a connector that owns V4.1's per-request state."""
+    kv = getattr(vllm_config, "kv_transfer_config", None)
+    if kv is None:
+        return False
+    name = getattr(kv, "kv_connector", None)
+    if name is None and isinstance(kv, dict):
+        name = kv.get("kv_connector")
+    return name == "AtomLMCacheOffloadConnector"
+
+
+def enforce_deepseek_v41_constraints(vllm_config) -> None:
+    """Apply V4.1-specific plugin constraints to one config. Idempotent.
+
+    1. Run eager. A V4.1 step does host-side work every forward -- Engram row
+       staging, per-request state reset, the cursor advance -- that no captured
+       graph replays, and the plugin's ATOM models are not fx-split, so the
+       PIECEWISE mode vLLM falls back to on its own (it reads the proxy
+       backend's ``AttentionCGSupport.NEVER`` and only demotes FULL by one
+       step) would swallow the whole backbone rather than break around
+       attention. Say NONE outright.
+
+    2. Refuse prefix caching. CSA2 blocks are only reusable once the compressor
+       has run over a whole PAGE, and the per-request STATE side is not
+       replayed by a block-table hit, so vLLM's hash reuse would hand back a
+       prefix whose window ring never existed. ``validate_runtime_config``
+       refuses it too, but only once the worker is already up.
+
+    3. Refuse speculative decoding, which the proxy bridge does not drive.
+
+    Called from two places, because neither alone covers the process that acts
+    on the result: ``ATOMPlatform.check_and_update_config`` is the natural
+    config-time site but vLLM may never activate ``ATOMPlatform`` at all (see
+    ``deepseek_v41_state_reserve_patch``), and the model wrapper's ``__init__``
+    runs in every worker during ``load_model`` -- after the config dump, but
+    still ahead of ``initialize_cudagraph_capture`` and of any forward.
+    """
+    mc = getattr(vllm_config, "model_config", None)
+    if mc is None or not _is_deepseek_v41(mc):
+        return
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if (
+        cache_config is not None
+        and getattr(cache_config, "enable_prefix_caching", False)
+        and not _v41_state_tier_configured(vllm_config)
+    ):
+        msg = (
+            "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "
+            "alongside AtomLMCacheOffloadConnector, which owns a tier for the "
+            "per-request window ring, compressor rings and Engram cursor that a "
+            "block-table hit does not replay -- and caps every hit, local or "
+            "external, to a boundary whose state was stored. Without it a hit "
+            "restores the compressed pages over state that never existed. Pass "
+            "--no-enable-prefix-caching, or configure the connector."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    if getattr(vllm_config, "speculative_config", None) is not None:
+        msg = (
+            "DeepSeek-V4.1 on the vLLM plugin does not support speculative "
+            "decoding yet; DSpark drafting needs ATOM's tentative staging, which "
+            "the proxy bridge does not drive. Run the native ATOM engine for "
+            "DSpark, or drop --speculative-config."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
+
+    from vllm.config import CUDAGraphMode
+
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if (
+        compilation_config is not None
+        and getattr(compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
+        and not _breakable_cudagraph_available()
+    ):
+        logger.info(
+            "DeepSeek-V4.1 plugin mode runs eager: forcing cudagraph_mode=NONE. "
+            "Its per-step Engram and state work cannot be replayed from a graph, "
+            "and the fx splitting vLLM's PIECEWISE mode needs is not done for "
+            "ATOM's plugin models, so PIECEWISE would swallow the backbone whole. "
+            "Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 to capture it instead: that mode "
+            "breaks the capture at runtime around the step work, which is what "
+            "`v41_stage_step` is marked for."
+        )
+        compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    elif (
+        compilation_config is not None
+        # An explicit NONE is a request, not an absence: it is how the eager
+        # arm of an on/off comparison is held comparable. Setting the env var
+        # must not silently turn that arm into a graph arm.
+        and getattr(compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
+        and _breakable_cudagraph_available()
+    ):
+        # PIECEWISE, and not any mode carrying FULL, for two independent
+        # reasons -- either alone would be enough:
+        #
+        # 1. `eager_break_during_capture` *skips the break* when the forward
+        #    context reports a FULL runtime mode (it assumes the backend
+        #    declared itself capturable). Under FULL our step work would be
+        #    recorded into the graph and never run again, which is silent: the
+        #    cursor would freeze and every replayed step would re-answer the
+        #    first one.
+        # 2. The proxy builder declares `AttentionCGSupport.NEVER`, which is
+        #    honest -- it cannot be captured. vLLM's three NEVER gates in
+        #    `resolve_cudagraph_mode_and_sizes` all test FULL (mixed_mode,
+        #    decode_mode, has_full_cudagraphs), so PIECEWISE passes them
+        #    untouched and NEVER stays true. Nothing here is a claim that the
+        #    attention is graph-safe; the breaks are.
+        if compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE:
+            logger.info(
+                "DeepSeek-V4.1 plugin mode: VLLM_USE_BREAKABLE_CUDAGRAPH=1, so "
+                "setting cudagraph_mode=%s -> PIECEWISE. Breakable capture ends "
+                "the segment at runtime around V4.1's per-step host work "
+                "instead of splitting an fx graph, which is what makes this "
+                "model capturable at all.",
+                compilation_config.cudagraph_mode,
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+
 if not disable_vllm_plugin:
     from vllm.platforms.rocm import RocmPlatform
 
@@ -143,6 +322,7 @@ if not disable_vllm_plugin:
             super().check_and_update_config(vllm_config)
             _enforce_deepseek_v4_constraints(vllm_config)
             _select_hybrid_aware_scheduler(vllm_config)
+            enforce_deepseek_v41_constraints(vllm_config)
 
 else:
     ATOMPlatform = None
