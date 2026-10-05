@@ -1086,7 +1086,8 @@ class WeightUpdaterMixin:
 
         Scales are never sent over the wire -- they are derived when a
         full-precision tensor is requantised -- so without this they look
-        permanently missing and ``verify_full_load`` would reject every stream.
+        permanently missing and commit's full-load check would reject every
+        stream.
         """
         scale = getattr(module, "weight_scale", None)
         if isinstance(scale, torch.nn.Parameter):
@@ -1157,11 +1158,6 @@ class WeightUpdaterMixin:
 
         self._weight_update_version = version
         self._last_started_weight_version = version
-        # Over a fence, nothing committed stands behind what this reload does
-        # not resend; see commit_weight_update.
-        self._weight_update_recovering = not getattr(
-            self, "_weight_update_healthy", True
-        )
         self._reset_reload_coverage()
         self._weight_update_sources: set[str] = set()
         self._weight_update_skipped: set[str] = set()
@@ -1211,8 +1207,13 @@ class WeightUpdaterMixin:
             "skipped": sorted(counts["skipped_names"]),
         }
 
-    def commit_weight_update(self, version: int, verify_full_load: bool = True) -> dict:
-        """Finalise the reload and make the new version eligible to serve."""
+    def commit_weight_update(self, version: int) -> dict:
+        """Finalise the reload and make the new version eligible to serve.
+
+        Only a reload that rewrote every parameter commits. There is no waiver:
+        a commit of part of the model would serve the rest from another
+        version, which is the state this transaction exists to rule out.
+        """
         version = int(version)
         active = getattr(self, "_weight_update_version", None)
         if active is None:
@@ -1241,32 +1242,12 @@ class WeightUpdaterMixin:
             missing = sorted(
                 name for name, param in params.items() if id(param) not in covered
             )
-            incomplete = bool(missing or self._weight_update_skipped)
-            # The check can be waived for an update that resends only part of
-            # the model, since what it leaves out keeps serving the committed
-            # version it was loaded with. Over a fence there is none -- those
-            # parameters are whatever the failed reload left -- so there the
-            # check stands, whatever was asked.
-            over_fence = getattr(self, "_weight_update_recovering", False)
-            if incomplete and (verify_full_load or over_fence):
+            if missing or self._weight_update_skipped:
                 raise RuntimeError(
                     "incomplete weight reload: wrote "
                     f"{len(params) - len(missing)}/{len(params)} "
                     f"parameters; missing={missing[:20]} "
                     f"skipped={sorted(self._weight_update_skipped)[:20]}"
-                    + (
-                        "; verify_full_load=False cannot lift the fence a "
-                        "failed reload left"
-                        if over_fence and not verify_full_load
-                        else ""
-                    )
-                )
-            if incomplete:
-                logger.warning(
-                    f"{self.label}: v{version} committed without the full-load "
-                    f"check, as asked: {len(missing)}/{len(params)} parameters "
-                    f"not rewritten {missing[:5]}, "
-                    f"skipped={sorted(self._weight_update_skipped)[:5]}"
                 )
 
             self.clear_kv_cache()
@@ -1279,7 +1260,6 @@ class WeightUpdaterMixin:
             "buckets": self._weight_update_buckets,
             "bytes": self._weight_update_bytes,
             "loaded_internal": len(covered),
-            "missing": len(missing),
             "skipped": sorted(self._weight_update_skipped),
         }
         self._weight_update_version = None
