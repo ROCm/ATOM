@@ -141,11 +141,11 @@ def _cpu_relayout(monkeypatch):
     )
 
 
-def _reload(runner, buckets, version=1, verify_full_load=True):
+def _reload(runner, buckets, version=1):
     runner.begin_weight_update(version)
     for bucket in buckets:
         runner.apply_weight_bucket(list(bucket.items()))
-    return runner.commit_weight_update(version, verify_full_load=verify_full_load)
+    return runner.commit_weight_update(version)
 
 
 # ── coverage is by the parameter written, not the name sent ────────────────
@@ -318,33 +318,18 @@ def test_an_abort_after_commit_still_fences():
     assert runner.get_weight_update_status()["failure"] == "device fault"
 
 
-def test_an_unverified_commit_cannot_lift_the_fence():
-    """The full-load check can be waived over a committed version, which keeps
-    serving whatever an update does not resend. Over a failed reload's
-    leftovers there is nothing to keep serving, and the waiver lifted the fence
-    on the caller's word."""
-    runner = _fenced(_Runner(_dense_model()))
-    runner.begin_weight_update(2)
-    ckpt = _dense_checkpoint()
-    runner.apply_weight_bucket([("attn.o_proj.weight", ckpt["attn.o_proj.weight"])])
-
-    with pytest.raises(RuntimeError, match="cannot lift the fence"):
-        runner.commit_weight_update(2, verify_full_load=False)
-    with pytest.raises(RuntimeError, match="fenced"):
-        runner.assert_weight_update_ready()
-
-
-def test_an_unverified_partial_update_says_what_it_left(caplog):
+def test_a_partial_update_over_a_committed_version_is_refused():
+    """What it leaves out would keep serving the last version beside the new
+    one, which is the mixed model the transaction exists to rule out -- so
+    commit offers no way to skip the check."""
     runner = _Runner(_dense_model())
     _reload(runner, [_dense_checkpoint()])
     update = {"attn.o_proj.weight": _dense_checkpoint(fill=2.0)["attn.o_proj.weight"]}
 
-    with caplog.at_level(logging.WARNING, logger="atom"):
-        manifest = _reload(runner, [update], version=2, verify_full_load=False)
-
-    assert manifest["missing"] == 1  # qkv_proj, which keeps serving v1
-    assert "without the full-load check" in caplog.text
-    runner.assert_weight_update_ready()
+    with pytest.raises(RuntimeError, match=r"missing=\['attn\.qkv_proj\.weight'\]"):
+        _reload(runner, [update], version=2)
+    with pytest.raises(TypeError):
+        runner.commit_weight_update(2, verify_full_load=False)
 
 
 def test_the_non_transactional_path_keeps_no_coverage():

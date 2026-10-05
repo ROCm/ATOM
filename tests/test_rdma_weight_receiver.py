@@ -252,9 +252,9 @@ class _Runner:
         if self.applied == self.fail_on_bucket:
             raise RuntimeError(f"bucket {self.applied} rejected")
 
-    def commit_weight_update(self, version, verify_full_load=True):
+    def commit_weight_update(self, version):
         self.events.append("commit")
-        return {"loaded_internal": 1, "missing": 0}
+        return {"loaded_internal": 1}
 
     def abort_weight_update(self, version, error):
         self.events.append(f"abort: {error}")
@@ -349,16 +349,58 @@ def test_a_version_mismatch_drains_before_raising(monkeypatch):
     assert runner.events[:1] == ["begin"] and "apply1" not in runner.events
 
 
-def test_a_header_whose_sizes_cannot_be_received_fails_at_once(monkeypatch):
-    """No buffer of a negative size can be posted, so there is no step left
-    to keep; failing at once is the only option."""
+@pytest.mark.parametrize(
+    ("metadata_bytes", "payload_bytes", "reason"),
+    [
+        (-1, 8, "negative size"),
+        (1, 2**63 - 1, "payload over"),
+        ((64 << 20) + 1, 8, "metadata over"),
+    ],
+    ids=["negative", "payload-ceiling", "metadata-ceiling"],
+)
+def test_a_frame_that_cannot_be_allocated_for_fails_at_its_header(
+    monkeypatch, metadata_bytes, payload_bytes, reason
+):
+    """A broadcast is received whole, so a frame no buffer can be posted for
+    leaves no step to keep. Tried anyway, the allocation raised past the
+    stream's own handling, and the bad header was never named."""
     import torch
 
-    bad = torch.tensor([_CMD_BUCKET, -1, 8, 1], dtype=torch.int64)
+    bad = torch.tensor([_CMD_BUCKET, metadata_bytes, payload_bytes, 1])
     trainer = _Trainer([bad, *_frames(_three_buckets())])
     runner = _Runner()
+    allocated = []
+    empty = torch.empty
 
-    with pytest.raises(RuntimeError, match="invalid RDMA weight header"):
+    def recording_empty(*args, **kwargs):
+        if kwargs.get("dtype") is torch.uint8:
+            allocated.append(args)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", recording_empty)
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match=reason):
+        _receive(monkeypatch, trainer, runner)
+    assert allocated == [], "nothing may be allocated for the frame"
+    assert runner.events[-1].startswith("abort")
+
+
+def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
+    """Within the bounds, memory can still run out -- fragmentation, another
+    allocation in between. That is the same position: the frame cannot be
+    received, so the stream cannot be followed."""
+    import torch
+
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner()
+    empty = torch.empty
+
+    def exhausted(*args, **kwargs):
+        if kwargs.get("dtype") is torch.uint8:
+            raise torch.OutOfMemoryError("out of memory")
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", exhausted)
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="out of memory"):
         _receive(monkeypatch, trainer, runner)
     assert runner.events[-1].startswith("abort")
 
@@ -400,13 +442,13 @@ def test_a_refused_begin_still_receives_the_stream(monkeypatch):
 
 
 def _transacting_runner():
-    """The real transaction, over a model of one weight."""
+    """The real transaction and RDMA entry points, over a model of one weight."""
     import torch
     from torch import nn
 
     from atom.rollout.weight_updater import WeightUpdaterMixin
 
-    class _Real(WeightUpdaterMixin):
+    class _Real(WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin):
         device = torch.device("cpu")
         label = "test"
         rank = 0
@@ -460,6 +502,57 @@ def test_a_replayed_stream_leaves_the_committed_weights_serving(monkeypatch):
 
     runner.assert_weight_update_ready()
     assert runner.get_weight_update_status()["last_committed"] == 1
+
+
+def test_a_rank_out_of_step_leaves_the_group(monkeypatch):
+    """The sender is mid-broadcast in a frame this rank never posted, so a later
+    stream on the same group would be read out of step from its first header."""
+    import torch
+
+    group = object()
+    destroyed = []
+    trainer = _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])])
+    monkeypatch.setattr(
+        receiver,
+        "dist",
+        SimpleNamespace(
+            broadcast=trainer.broadcast, destroy_process_group=destroyed.append
+        ),
+    )
+    runner = _transacting_runner()
+    runner._rdma_weight_groups = {"g": group}
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep):
+        runner.receive_weights_rdma("g", 1)
+
+    assert destroyed == [group]
+    with pytest.raises(RuntimeError, match="not initialized"):
+        runner.receive_weights_rdma("g", 2)
+
+
+def test_verify_full_load_false_does_not_waive_the_check(monkeypatch, caplog):
+    """Accepted because the caller drives the vLLM worker with the same
+    arguments. Honoured, it committed part of the model and served the rest
+    from another version."""
+    import logging
+
+    import torch
+
+    trainer = _Trainer(_frames(_three_buckets()))  # nothing this model has
+    monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    runner = _transacting_runner()
+    runner._rdma_weight_groups = {"g": object()}
+
+    with (
+        caplog.at_level(logging.WARNING, logger="atom"),
+        pytest.raises(RuntimeError, match="incomplete weight reload"),
+    ):
+        runner.receive_weights_rdma("g", 1, verify_full_load=False)
+
+    assert "verify_full_load=False ignored" in caplog.text
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
 
 
 def test_an_end_marker_carrying_sizes_is_not_a_clean_finish(monkeypatch):

@@ -1,0 +1,51 @@
+name: LumenRL Sender Contract
+
+# atom/rollout/rdma_weight_receiver.py decodes a stream whose format LumenRL's
+# sender owns. The unit tests hold the receiver to a snapshot of that sender,
+# tests/fixtures/lumenrl_rdma_sender.txt; this job holds the snapshot to
+# LumenRL itself -- on any change to the receiver, its tests or the snapshot,
+# and daily, since LumenRL can move without ATOM changing at all. LumenRL's
+# source is only read as text here; nothing from it runs.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'atom/rollout/rdma_weight_receiver.py'
+      - 'tests/test_rdma_weight_receiver.py'
+      - 'tests/fixtures/lumenrl_rdma_sender.txt'
+      - '.github/workflows/lumenrl-sender-contract.yaml'
+  workflow_dispatch:
+  schedule:
+    - cron: '30 22 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  sender-contract:
+    name: Check the sender snapshot against LumenRL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Set up Python environment
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip3 install torch --index-url https://download.pytorch.org/whl/cpu
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e .
+          pip3 install pytest
+      - name: Checkout LumenRL
+        uses: actions/checkout@v6
+        with:
+          repository: ZhangDanyang-AMD/Lumen-RL
+          path: lumenrl
+          persist-credentials: false
+      - name: Run the sender contract tests
+        env:
+          LUMENRL_ROOT: ${{ github.workspace }}/lumenrl
+        run: python -m pytest tests/test_rdma_weight_receiver.py -k "sender or snapshot" -rs

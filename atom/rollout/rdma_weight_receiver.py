@@ -47,6 +47,47 @@ _CMD_END = 0
 _CMD_BUCKET = 1
 _HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
 
+# What a header is held to before anything is allocated for it. Metadata is a
+# JSON entry per tensor, so 64 MiB is hundreds of thousands of them, and no
+# bucket carries a terabyte: past either, the header is corrupt or another
+# protocol's.
+_MAX_METADATA_BYTES = 64 << 20
+_MAX_PAYLOAD_BYTES = 1 << 40
+
+
+class RDMAStreamOutOfStep(RuntimeError):
+    """This rank can no longer follow the stream.
+
+    A broadcast is received whole, into a buffer of the size it was sent with,
+    so a frame this rank cannot allocate for is one it cannot take part in --
+    and the sender, already broadcasting it, cannot be told. Nothing more can
+    ride the group: ``receive_weights_rdma`` tears down this rank's end, and
+    the sender and any peer still in that broadcast are released by the
+    group's timeout.
+    """
+
+
+def _unreceivable(
+    device: torch.device, metadata_bytes: int, payload_bytes: int
+) -> str | None:
+    """Why a frame of these sizes cannot be allocated for here, if it cannot."""
+    if metadata_bytes < 0 or payload_bytes < 0:
+        return "a negative size"
+    if metadata_bytes > _MAX_METADATA_BYTES:
+        return f"metadata over the {_MAX_METADATA_BYTES}-byte ceiling"
+    if payload_bytes > _MAX_PAYLOAD_BYTES:
+        return f"a payload over the {_MAX_PAYLOAD_BYTES}-byte ceiling"
+    if device.type == "cuda":
+        free, _ = torch.cuda.mem_get_info(device)
+        # Blocks the caching allocator holds unused are allocatable too.
+        cached = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
+            device
+        )
+        needed = metadata_bytes + payload_bytes
+        if needed > free + cached:
+            return f"{needed} bytes needed, {free + cached} free on {device}"
+    return None
+
 
 def _recv_header(group, *, device: torch.device) -> tuple[int, int, int, int]:
     header = torch.empty(_HEADER_WORDS, dtype=torch.int64, device=device)
@@ -124,7 +165,6 @@ def receive_weight_stream(
     *,
     device: torch.device,
     expected_version: int,
-    verify_full_load: bool = True,
 ) -> dict[str, float]:
     """Consume one weight stream and apply it as a single transaction.
 
@@ -138,7 +178,9 @@ def receive_weight_stream(
     hangs all of them in the next one -- the orchestrator then sees a timeout
     naming nobody instead of this rank's error. So the rest of the stream is
     received and discarded, the header's sizes being all that is needed to stay
-    in step, and the failure is raised once the end marker arrives.
+    in step, and the failure is raised once the end marker arrives. The one
+    exception is a frame this rank cannot allocate for, which raises
+    ``RDMAStreamOutOfStep`` at its header.
     """
     total_bytes = 0
     total_weights = 0
@@ -191,30 +233,36 @@ def receive_weight_stream(
                         f"payload_bytes={payload_bytes}, both must be 0"
                     )
                 break
-            if metadata_bytes < 0 or payload_bytes < 0:
-                # The one frame that cannot be drained: there is no buffer of a
-                # negative size to post, so no staying in step with the sender.
-                raise RuntimeError(
-                    f"invalid RDMA weight header: command={command} "
-                    f"metadata_bytes={metadata_bytes} payload_bytes={payload_bytes}"
+            frame = (
+                f"command={command} metadata_bytes={metadata_bytes} "
+                f"payload_bytes={payload_bytes}"
+            )
+            # Checked before anything is allocated: an allocation that fails
+            # here takes this rank out of the broadcast the sender has begun.
+            reason = _unreceivable(device, metadata_bytes, payload_bytes)
+            if reason is not None:
+                raise RDMAStreamOutOfStep(
+                    f"RDMA weight frame cannot be received: {frame} ({reason})"
                 )
 
             # Every frame but the end marker is followed by these two
             # broadcasts, so they are received before the frame is judged: one
             # this rank cannot use still has to keep it in step.
-            metadata_tensor = torch.empty(
-                metadata_bytes, dtype=torch.uint8, device=device
-            )
-            payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+            try:
+                metadata_tensor = torch.empty(
+                    metadata_bytes, dtype=torch.uint8, device=device
+                )
+                payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+            except RuntimeError as exc:  # out of memory, within the bounds
+                raise RDMAStreamOutOfStep(
+                    f"RDMA weight frame cannot be received: {frame} ({exc})"
+                ) from exc
             dist.broadcast(metadata_tensor, src=0, group=group)
             dist.broadcast(payload, src=0, group=group)
             if failure is None and (
                 command != _CMD_BUCKET or metadata_bytes == 0 or payload_bytes == 0
             ):
-                failure = RuntimeError(
-                    f"invalid RDMA weight header: command={command} "
-                    f"metadata_bytes={metadata_bytes} payload_bytes={payload_bytes}"
-                )
+                failure = RuntimeError(f"invalid RDMA weight header: {frame}")
             if failure is not None:
                 drained += 1
                 continue
@@ -250,9 +298,7 @@ def receive_weight_stream(
                 )
             raise failure
 
-        manifest = runner.commit_weight_update(
-            expected_version, verify_full_load=verify_full_load
-        )
+        manifest = runner.commit_weight_update(expected_version)
         # Inside the try: the writes are asynchronous, so a device fault in
         # them, or in commit's own finalisation, surfaces only here, after
         # commit has declared the version good.
@@ -273,7 +319,6 @@ def receive_weight_stream(
         "seconds": elapsed,
         "gbps": (total_bytes * 8 / 1e9 / elapsed) if elapsed > 0 else 0.0,
         "loaded_internal": float(manifest["loaded_internal"]),
-        "missing": float(manifest["missing"]),
     }
 
 
@@ -366,29 +411,43 @@ class RDMAWeightReceiverMixin:
     ) -> dict[str, float]:
         """Receive one version of the weights into resident memory.
 
-        ``verify_full_load=False`` waives the check that the stream rewrote
-        every parameter, for an update that resends only part of the model;
-        the parameters it did not rewrite are counted in ``missing``. Over a
-        fence it waives nothing -- see ``commit_weight_update``.
+        Commits only a stream that rewrote every parameter. ``verify_full_load``
+        is accepted because the caller drives the vLLM worker with the same
+        arguments, but it cannot turn that off: a commit of part of the model
+        would serve the rest from another version.
         """
+        label = getattr(self, "label", "runner")
         groups = getattr(self, "_rdma_weight_groups", {})
         if group_name not in groups:
             raise RuntimeError(
                 f"RDMA weight group is not initialized: {group_name!r}; "
                 "call init_rdma_weight_group first"
             )
-        stats = receive_weight_stream(
-            groups[group_name],
-            self,
-            device=self.device,
-            expected_version=int(version),
-            verify_full_load=bool(verify_full_load),
-        )
+        if not verify_full_load:
+            logger.warning(
+                "%s: verify_full_load=False ignored; an RDMA reload commits only "
+                "once it has rewritten every parameter",
+                label,
+            )
+        try:
+            stats = receive_weight_stream(
+                groups[group_name],
+                self,
+                device=self.device,
+                expected_version=int(version),
+            )
+        except RDMAStreamOutOfStep as exc:
+            logger.error(
+                "%s: left RDMA weight group %s, which has to be initialized "
+                "again: %s",
+                label,
+                group_name,
+                exc,
+            )
+            self.destroy_rdma_weight_group(group_name)
+            raise
         logger.info(
-            "%s: RDMA weight reload v%d committed: %s",
-            getattr(self, "label", "runner"),
-            int(version),
-            stats,
+            "%s: RDMA weight reload v%d committed: %s", label, int(version), stats
         )
         return stats
 
