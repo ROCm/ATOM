@@ -227,6 +227,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
     ),
+    # Explicit gfx1250 QH128 ASM decode from aiter PR #6133. 0 keeps the
+    # existing backend; 1 requires token-major KV, 64 requires shuffled KV.
+    "ATOM_MLA_QH128_ASM_PAGE_SIZE": lambda: int(
+        os.getenv("ATOM_MLA_QH128_ASM_PAGE_SIZE", "0")
+    ),
     # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
     # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
     # this selects the a8w4 GUGU (gate/up-interleaved) kernel -- the default --
