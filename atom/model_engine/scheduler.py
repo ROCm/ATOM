@@ -19,6 +19,7 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 
 from __future__ import annotations
 
+import itertools
 import logging
 import struct
 import threading
@@ -1543,6 +1544,12 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
+        if self.kv_connector is not None and self.waiting:
+            prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
+            if prefetch is not None:
+                prefetch(
+                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
+                )
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -1683,6 +1690,14 @@ class Scheduler:
                 continue
 
             offload_resume = self._is_offload_prefill_resume(seq)
+            if (
+                not remote_ready_for_decode
+                and not offload_resume
+                and self.kv_connector is not None
+                and self._offload_lookup_pending(seq)
+            ):
+                prefix_waiters.append(seq)
+                continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
                 skip=remote_ready_for_decode or offload_resume,
@@ -2408,6 +2423,11 @@ class Scheduler:
             )
             and len(seq.block_table) > 0
         )
+
+    def _offload_lookup_pending(self, seq: Sequence) -> bool:
+        """Whether the connector's lookup for `seq` is still in flight."""
+        pending = getattr(self.kv_connector, "lookup_pending", None)
+        return bool(pending(seq)) if pending is not None else False
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
         """Ask the connector whether this prefill should park for remote KV."""
