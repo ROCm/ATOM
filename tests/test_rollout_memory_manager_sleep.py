@@ -21,6 +21,7 @@ a recording per warmed batch. Each is asked separately below, because a gate
 they shared is what left three of them behind.
 """
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -675,3 +676,116 @@ def test_a_failed_recapture_is_quiet_about_an_option_nobody_set(caplog):
     # wake that kept asking would try again on every cycle.
     assert runner._graphs_released_for_sleep is False
     assert "now inert" not in caplog.text
+
+
+# ── aiter's split-K capture semaphore pool ────────────────────────────────
+
+
+_POOL_SLOTS = 4096
+_SLOTS_PER_CAPTURE = 105
+
+
+def _fake_aiter_pool(monkeypatch, **module_attrs):
+    """Stand-in for `aiter.ops.gemm_op_a16w16`: a per-device cursor into a
+    fixed pool, advanced by every split-K launch a capture records and never
+    rewound by aiter itself."""
+    gemm = SimpleNamespace(**module_attrs)
+    monkeypatch.setitem(sys.modules, "aiter.ops.gemm_op_a16w16", gemm)
+    return gemm
+
+
+def _capture_from_pool(runner, ring_next):
+    """A capture that takes its slots the way aiter's does, and raises the way
+    aiter's does once the pool is spent."""
+
+    def _capture():
+        idx = ring_next.get("cuda:0", 0)
+        if idx + _SLOTS_PER_CAPTURE > _POOL_SLOTS:
+            raise RuntimeError("split-K a16w16 capture semaphore pool exhausted")
+        ring_next["cuda:0"] = idx + _SLOTS_PER_CAPTURE
+        runner.captures += 1
+        runner.graphs = {1: object()}
+
+    return _capture
+
+
+def test_a_release_hands_the_capture_semaphores_back(monkeypatch):
+    ring_next = {"cuda:0": 3 * _SLOTS_PER_CAPTURE}
+    _fake_aiter_pool(monkeypatch, _capture_ring_next=ring_next)
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    memory_manager.release_cudagraphs(runner)
+
+    assert ring_next == {}
+
+
+@pytest.mark.parametrize(
+    "runner_kwargs",
+    [
+        # Nothing captured, so nothing was dropped that held a slot.
+        {"enforce_eager": False, "keep_resident": False, "with_graphs": False},
+        {"enforce_eager": True, "keep_resident": False},
+    ],
+    ids=["nothing-captured", "eager"],
+)
+def test_no_release_leaves_the_capture_semaphores_alone(monkeypatch, runner_kwargs):
+    """Rewinding while a graph still holds its slots would hand the same
+    atomic counter to the next capture as well."""
+    ring_next = {"cuda:0": _SLOTS_PER_CAPTURE}
+    _fake_aiter_pool(monkeypatch, _capture_ring_next=ring_next)
+    runner = _Runner(**runner_kwargs)
+
+    memory_manager.release_cudagraphs(runner)
+
+    assert ring_next == {"cuda:0": _SLOTS_PER_CAPTURE}
+
+
+def test_a_resident_sleep_leaves_the_capture_semaphores_alone(monkeypatch):
+    ring_next = {"cuda:0": _SLOTS_PER_CAPTURE}
+    _fake_aiter_pool(monkeypatch, _capture_ring_next=ring_next)
+    runner = _Runner(enforce_eager=False, keep_resident=True)
+
+    runner.release_memory()
+
+    assert ring_next == {"cuda:0": _SLOTS_PER_CAPTURE}
+
+
+def test_sleep_wake_cycles_outlast_the_capture_semaphore_pool(monkeypatch):
+    """The long-run failure: ~39 recaptures spend the pool, the 40th raises,
+    and the runner stays eager for the rest of the run."""
+    ring_next = {}
+    _fake_aiter_pool(monkeypatch, _capture_ring_next=ring_next)
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+    _report_weights_on_device(runner)
+    runner.capture_cudagraph = _capture_from_pool(runner, ring_next)
+    cycles = 2 * _POOL_SLOTS // _SLOTS_PER_CAPTURE
+
+    for _ in range(cycles):
+        memory_manager.release_cudagraphs(runner)
+        runner._recapture_cudagraphs_if_needed()
+
+    assert runner.enforce_eager is False
+    assert runner.captures == cycles
+
+
+def test_an_aiter_without_the_cursor_is_named(monkeypatch, caplog):
+    """The reset leans on an aiter private; losing it must be visible before
+    the pool runs out, not only once the runner has gone eager."""
+    _fake_aiter_pool(monkeypatch)
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    with caplog.at_level("WARNING", logger="atom"):
+        memory_manager.release_cudagraphs(runner)
+
+    assert "_capture_ring_next" in caplog.text
+
+
+def test_a_process_that_never_loaded_the_gemm_still_releases(monkeypatch):
+    """Nothing to rewind, and nothing imported to find that out: importing
+    aiter off a GPU raises from `rocminfo`, not ImportError."""
+    monkeypatch.delitem(sys.modules, "aiter.ops.gemm_op_a16w16", raising=False)
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    memory_manager.release_cudagraphs(runner)
+
+    assert runner.graphs == {}

@@ -3,6 +3,7 @@
 
 import logging
 import os
+import sys
 
 import torch
 
@@ -86,8 +87,44 @@ def release_cudagraphs(runner) -> None:
     # -- `warmup_draft_graphs` publishes it there -- since a piecewise capture
     # records no whole-forward graph to own one.
     runner.graph_pool = None
+    _reset_aiter_capture_semaphores()
     logger.info(f"{runner.label}: CUDA graphs released for sleep")
     _warn_if_recapture_will_fault(runner)
+
+
+def _reset_aiter_capture_semaphores() -> None:
+    """Hand aiter's split-K capture semaphore slots back for the recapture.
+
+    Every split-K a16w16 launch recorded into a graph takes its own slot of a
+    fixed per-device pool (`CAPTURE_SEMAPHORE_POOL_SLOTS`, 4096), and aiter only
+    ever advances the cursor: dropping the graph does not return its slots. A
+    rollout recaptures on every wake, so the pool runs out after a few dozen
+    sleep/wake cycles, the capture raises, and `_recapture_cudagraphs_if_needed`
+    pins the runner to eager for the rest of the run.
+
+    Rewinding is safe only here, once every store above has dropped its
+    graphs: a slot still recorded in a live graph that a new capture also
+    takes would be one atomic counter shared by two graphs. Each graph records
+    the zero-fill of its slot ahead of the launch, so a reused slot starts
+    from zero on replay.
+
+    `_capture_ring_next` is private to aiter; until aiter can release a
+    graph's slots itself, this is the only handle there is. Looked up rather
+    than imported: a process that never loaded the module captured nothing
+    through it, and importing aiter off a GPU raises more than ImportError.
+    """
+    gemm_op_a16w16 = sys.modules.get("aiter.ops.gemm_op_a16w16")
+    if gemm_op_a16w16 is None:
+        return
+    ring_next = getattr(gemm_op_a16w16, "_capture_ring_next", None)
+    if ring_next is None:
+        logger.warning(
+            "aiter.ops.gemm_op_a16w16._capture_ring_next is gone; split-K "
+            "capture semaphores are not reset on sleep, and repeated "
+            "sleep/wake recaptures may exhaust the pool"
+        )
+        return
+    ring_next.clear()
 
 
 def _release_tbo_graphs(runner) -> bool:
