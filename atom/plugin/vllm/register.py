@@ -151,6 +151,15 @@ def register_platform() -> str | None:
         logger.info("Disable ATOM OOT plugin platforms")
         return None
 
+    try:
+        _apply_platform_patches()
+    except ImportError:
+        logger.debug("ATOM plugin: deferring platform patches", exc_info=True)
+
+    return "atom.plugin.vllm.platform.ATOMPlatform"
+
+
+def _apply_platform_patches() -> None:
     from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
         apply_vllm_rocm_dcp_full_graph_patch,
     )
@@ -180,9 +189,6 @@ def register_platform() -> str | None:
     apply_vllm_v4_block_reuse_patch()
 
     _register_kv_connectors()
-
-    # return the ATOM platform to vllm
-    return "atom.plugin.vllm.platform.ATOMPlatform"
 
 
 def _register_kv_connectors() -> None:
@@ -317,6 +323,7 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    _apply_platform_patches()
     # The general-plugin hook runs in the EngineCore process that owns the
     # scheduler/KVCacheManager; install this here as well as in the platform hook.
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
