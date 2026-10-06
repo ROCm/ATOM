@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791137650176,
+  "lastUpdate": 1791306646810,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3680,6 +3680,57 @@ window.BENCHMARK_DATA = {
             "value": 0.887,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37220817574 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610041628 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.21 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "97359d6df46c59736468168b7be8bc50b482a1a9",
+          "message": "ci: locate Pre Checkin run by commit; add concurrency 1 to benchmark grid (#2480)\n\n* ci: locate the Pre Checkin run by commit in check_signal.sh\n\nThe gate listed Pre Checkin runs with server-side --branch/--event\nfilters and then matched the SHA locally. Those filtered listings\nintermittently return stale pages: on 2026-10-06 the newest run they\nreturned was from 2026-09-29, so \"Check Pre Checkin Signal\" in run\n37479756946 retried 20 times and failed, although the Pre Checkin run\nfor the same commit (37479757234) had already succeeded at 14:39.\n\nQuery by --commit (the head_sha filter) instead, and apply the branch\nand event conditions in the jq select. Matching semantics are unchanged:\nschedule and workflow_call still skip the event condition.\n\n* ci(benchmark): add concurrency 1 to the native benchmark grid\n\nThe lowest concurrency in both default scenarios (nightly 8k/1k, weekly\n1k/1k) was 4. Add 1 to both lists, and lower conc_min from 4 to 1 on the\neight speculative-decoding variants (MTP3, DSpark, EAGLE3) so they run it\ntoo: concurrency 1 is where speculative decoding pays off the most. The\nlegacy matrix had excluded MTP3 at 1 and 2 only to save CI time.\n\nEach cadence gains 21 GPU jobs (13 base + 8 speculative variants):\nnightly 169 -> 190, weekly 164 -> 185. The first-level matrix size is\nunchanged (28 / 26 configs).\n\ntest_benchmark_catalog: drop (\"-mtp3\", 1) and (\"-mtp3\", 2) from the\nexpected exclusions, and add (\"-dpa\", 1) since DPA keeps conc_min 64 and\nthe grid now contains 1. README example updated to match.",
+          "timestamp": "2026-10-06T15:20:36Z",
+          "url": "https://github.com/ROCm/ATOM/commit/97359d6df46c59736468168b7be8bc50b482a1a9"
+        },
+        "date": 1791306646351,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9553,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37495102243 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610061600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37495102243 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610061600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.19,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37495102243 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610061600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9538 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.99,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8855,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37495102243 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610061600 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1706 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
