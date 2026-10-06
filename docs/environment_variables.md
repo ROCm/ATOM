@@ -365,6 +365,12 @@ the host, give each its own endpoints.
 | **ATOM_KV_EVENTS_REPLAY_ENDPOINT** | str | `""` | ZMQ ROUTER bind address for replay requests. Empty disables replay (PUB-only). A consumer sends an 8-byte big-endian start sequence and receives every retained batch with `seq >= start`, followed by a `REPLAY_DONE` terminal frame carrying the retained `[oldest, latest]` window. Offset per DP rank the same way as the PUB endpoint. Replay is serviced on the sender thread with non-blocking sends: a client that stops reading has its replay abandoned (counted in `replay_aborted`) rather than stalling live publication. |
 | **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Must be >= 1 when replay is enabled. |
 
+## Shutdown
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_SHUTDOWN_TIMEOUT_S** | float | 5 | Seconds that shutdown waits for child processes to exit on their own before terminating them (SIGTERM, then SIGKILL): the server process waits this long for its EngineCores, and each EngineCore for its ModelRunner workers. All the children of one process share the same deadline. Must be finite and positive. Raise it when workers need longer to finish on exit, for example to write a profiler's output (`rocprofv3` writing a thread trace can take minutes). Set it before starting the server; every process reads it. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |

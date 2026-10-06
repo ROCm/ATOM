@@ -79,6 +79,11 @@ def _responses(out):
     return drained
 
 
+def _counts(*updated):
+    """One direct-update reply per rank, each with its updated-parameter count."""
+    return [RpcResult("u", rank, value=n) for rank, n in enumerate(updated)]
+
+
 # ── the command is registered and reachable ────────────────────────────────
 
 
@@ -213,10 +218,10 @@ def test_an_unknown_command_answers_instead_of_being_dropped():
 def test_update_weights_now_answers():
     """Previously response-less, so broadcast_utility_command_sync on it could
     only time out. The _shm and _ipc variants always answered."""
-    h, _, out = _handler()
+    h, _, out = _handler(replies=_counts(4, 4))
     h._execute_utility_command("update_weights", {"named_tensors": []})
     body = _responses(out)[0]
-    assert body == {"cmd": "update_weights", "result": "rank0"}
+    assert body == {"cmd": "update_weights", "result": 4}
 
 
 _DIRECT_UPDATES = [
@@ -238,12 +243,47 @@ _DIRECT_UPDATE_CALLS = {
 def test_a_direct_update_runs_on_every_rank(cmd, args):
     """call_func waited on rank 0's answer alone, so every other rank's outcome
     went unheard."""
-    h, mgr, out = _handler(proc_num=3)
+    h, mgr, out = _handler(replies=_counts(4, 4, 4))
     h._execute_utility_command(cmd, args)
 
     ((method, payload, _),) = mgr.calls
     assert (method, payload.args) == _DIRECT_UPDATE_CALLS[cmd]
-    assert _responses(out) == [{"cmd": cmd, "result": "rank0"}]
+    assert _responses(out) == [{"cmd": cmd, "result": 4}]
+
+
+@pytest.mark.parametrize(
+    ("cmd", "barrier"),
+    [
+        ("update_weights", False),
+        ("update_weights_shm", True),
+        ("update_weights_ipc", True),
+    ],
+)
+def test_the_shared_buffer_updates_keep_their_barrier(cmd, barrier):
+    """On the call_func path, _BARRIER_FUNCS held every rank until all had read
+    the caller's buffer. Moving these updates to the generic path must not
+    quietly drop that."""
+    h, mgr, _ = _handler(replies=_counts(4, 4))
+    h._execute_utility_command(cmd, dict(_DIRECT_UPDATES)[cmd])
+    ((_, payload, _),) = mgr.calls
+    assert payload.barrier is barrier
+
+
+@pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
+def test_ranks_that_updated_different_counts_are_an_error(cmd, args):
+    """Every rank is sent the same tensors. One that updated fewer skipped a
+    tensor its peers wrote -- a shape it could not shard, say -- and still
+    returned normally, so no rank failed and rank 0's count read as success."""
+    h, _, out = _handler(replies=_counts(4, 3))
+    h._execute_utility_command(cmd, args)
+
+    assert _responses(out) == [
+        {
+            "cmd": cmd,
+            "error": "TP ranks updated different numbers of parameters: "
+            "rank 0 updated 4, rank 1 updated 3",
+        }
+    ]
 
 
 @pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
@@ -268,6 +308,44 @@ def test_a_direct_update_the_manager_cannot_run_is_answered(cmd, args):
     h, _, out = _handler(raises=RuntimeError("shm is gone"))
     h._execute_utility_command(cmd, args)
     assert _responses(out) == [{"cmd": cmd, "error": "RuntimeError: shm is gone"}]
+
+
+# ── a bucketed sync and the engine's sleep state ───────────────────────────
+
+
+def _asleep_after(cmd, is_last, **kw):
+    """Run one bucket of a sync on an engine whose weights are offloaded."""
+    h, _, out = _handler(**kw)
+    engine = _Engine()
+    engine._is_rl_weights_offloaded = True
+    pending = queue.Queue()
+    pending.put_nowait((cmd, {"bucket_meta": {}, "is_last": is_last}))
+    h.process_queue(pending, engine)
+    assert len(_responses(out)) == 1, "the bucket must still be answered"
+    return engine._is_rl_weights_offloaded
+
+
+@pytest.mark.parametrize("cmd", ["update_weights_shm", "update_weights_ipc"])
+def test_the_last_bucket_landing_on_every_rank_wakes_the_engine(cmd):
+    assert not _asleep_after(cmd, True, replies=_counts(4, 4))
+    assert _asleep_after(cmd, False, replies=_counts(4, 4)), "not before the last"
+
+
+@pytest.mark.parametrize("cmd", ["update_weights_shm", "update_weights_ipc"])
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"replies": [RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]},
+        {"replies": _counts(4, 3)},
+        {"raises": RuntimeError("shm is gone")},
+    ],
+    ids=["a rank failed", "the ranks disagree", "the manager failed"],
+)
+def test_a_failed_last_bucket_leaves_the_engine_asleep(cmd, outcome):
+    """A failed update is answered rather than taking the engine down, so the
+    loop carries on -- and waking would then schedule onto weights that are
+    part old and part new."""
+    assert _asleep_after(cmd, True, **outcome)
 
 
 def _raise(exc):

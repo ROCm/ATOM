@@ -77,7 +77,9 @@ class EngineUtilityHandler:
         ``False`` so that the next busy-loop iteration can skip the check.
 
         Sleep/wake state is tracked on *engine._is_rl_weights_offloaded* so that the
-        busy-loop can skip model execution while the weights are offloaded.
+        busy-loop can skip model execution while the weights are offloaded. A
+        bucketed weight sync wakes the engine only if its last bucket was
+        applied on every rank.
         """
         if not engine._has_pending_utility:
             return
@@ -85,7 +87,7 @@ class EngineUtilityHandler:
         while True:
             try:
                 cmd, args = utility_queue.get_nowait()
-                self._execute_utility_command(cmd, args)
+                reply = self._execute_utility_command(cmd, args)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
@@ -107,27 +109,37 @@ class EngineUtilityHandler:
                             if isinstance(args, dict)
                             else True
                         )
-                        if is_last:
+                        if is_last and "error" not in reply:
                             engine._is_rl_weights_offloaded = False
                             logger.info(
                                 f"{self.label}: engine exited sleep mode (weights updated)"
+                            )
+                        elif is_last and engine._is_rl_weights_offloaded:
+                            # Waking would schedule onto weights this sync did
+                            # not finish writing.
+                            logger.error(
+                                f"{self.label}: the weight update failed, so the "
+                                f"engine stays in sleep mode: {reply['error']}"
                             )
             except queue.Empty:
                 engine._has_pending_utility = False
                 break
 
-    def _execute_utility_command(self, cmd: str, args: dict):
+    def _execute_utility_command(self, cmd: str, args: dict) -> dict | None:
+        """Run *cmd*'s handler and return what it returned: the weight
+        updates hand back the reply they sent."""
         import time as _time
 
         log = logger.info
         log(f"{self.label}: executing utility command: {cmd}")
         t0 = _time.monotonic()
 
+        reply = None
         handler_name = self._UTILITY_HANDLERS.get(cmd)
         if handler_name:
             handler = getattr(self, handler_name)
             try:
-                handler(args)
+                reply = handler(args)
             except Exception as exc:
                 # Still fatal to the engine, as before; but a synchronous
                 # caller now hears why instead of waiting out its timeout.
@@ -151,6 +163,7 @@ class EngineUtilityHandler:
 
         elapsed = _time.monotonic() - t0
         log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
+        return reply
 
     @staticmethod
     def _error_reply(cmd: str, args, exc: Exception) -> dict:
@@ -243,7 +256,9 @@ class EngineUtilityHandler:
             )
         )
 
-    def _update_on_every_rank(self, cmd: str, method: str, *call_args) -> dict:
+    def _update_on_every_rank(
+        self, cmd: str, method: str, *call_args, barrier: bool = False
+    ) -> dict:
         """Run a direct weight update on every TP rank; the reply for all.
 
         ``call_func`` returns rank 0's result alone, so a rank that rejected a
@@ -251,8 +266,18 @@ class EngineUtilityHandler:
         updated model -- if that rank's raise had not ended its worker. Through
         the generic path every rank answers on its own channel, a failure is
         caught where it happens, and success means every rank succeeded.
+
+        Every rank is sent the same tensors, so every rank should update the
+        same number of parameters: one that updated fewer skipped what its
+        peers wrote, and the shards no longer belong to one model.
+
+        *barrier* holds each rank at the worker barrier until every rank has
+        finished, as ``AsyncIOProc._BARRIER_FUNCS`` does for the shared-buffer
+        updates on the ``call_func`` path.
         """
-        payload = RpcPayload(request_id=f"{cmd}-{uuid.uuid4().hex}", args=call_args)
+        payload = RpcPayload(
+            request_id=f"{cmd}-{uuid.uuid4().hex}", args=call_args, barrier=barrier
+        )
         try:
             replies = self.runner_mgr.collective_rpc(
                 method, payload, timeout=_DIRECT_UPDATE_TIMEOUT_S
@@ -262,16 +287,20 @@ class EngineUtilityHandler:
         failed = [r for r in replies if not r.ok]
         if failed:
             error = "; ".join(f"TP rank {r.tp_rank}: {r.error}" for r in failed)
-            logger.error(
-                f"{self.label}: {cmd} failed on {len(failed)} of {len(replies)} "
-                f"TP rank(s): {error}"
+        elif any(r.value != replies[0].value for r in replies[1:]):
+            error = "TP ranks updated different numbers of parameters: " + ", ".join(
+                f"rank {r.tp_rank} updated {r.value}" for r in replies
             )
-            return {"cmd": cmd, "error": error}
-        result = replies[0].value
-        logger.info(f"{self.label}: {cmd} completed on every TP rank, updated={result}")
-        return {"cmd": cmd, "result": result}
+        else:
+            result = replies[0].value
+            logger.info(
+                f"{self.label}: {cmd} completed on every TP rank, updated={result}"
+            )
+            return {"cmd": cmd, "result": result}
+        logger.error(f"{self.label}: {cmd} failed: {error}")
+        return {"cmd": cmd, "error": error}
 
-    def _handle_update_weights(self, args: dict):
+    def _handle_update_weights(self, args: dict) -> dict:
         """Handle direct weight update command."""
         reply = self._update_on_every_rank(
             "update_weights",
@@ -280,8 +309,9 @@ class EngineUtilityHandler:
             args.get("flush_cache", True),
         )
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
-    def _handle_update_weights_shm(self, args: dict):
+    def _handle_update_weights_shm(self, args: dict) -> dict:
         """Handle shared-memory weight update command.
 
         Only lightweight metadata (shm_name, bucket_meta) travels through the
@@ -300,10 +330,12 @@ class EngineUtilityHandler:
             args.get("shm_name", ""),
             args.get("bucket_meta", {}),
             args.get("is_last", True),
+            barrier=True,
         )
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
-    def _handle_update_weights_ipc(self, args: dict):
+    def _handle_update_weights_ipc(self, args: dict) -> dict:
         """Handle CUDA IPC weight update command.
 
         The caller (LLMEngine) sends a CUDA IPC handle pointing to a GPU
@@ -321,8 +353,10 @@ class EngineUtilityHandler:
             args.get("bucket_meta", {}),
             args.get("is_last", True),
             args.get("ipc_handles"),
+            barrier=True,
         )
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
     def _handle_release_memory(self, args: dict):
         """Handle memory release command (sleep mode)."""

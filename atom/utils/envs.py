@@ -501,6 +501,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM": lambda: (
         os.getenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "0") == "1"
     ),
+    # --- Shutdown ---
+    # How long a shutting-down process waits for its children (EngineCore,
+    # ModelRunner workers) to exit before it terminates them.
+    "ATOM_SHUTDOWN_TIMEOUT_S": lambda: _positive_float_env(
+        "ATOM_SHUTDOWN_TIMEOUT_S", "5"
+    ),
     # --- Profiling & Logging ---
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"

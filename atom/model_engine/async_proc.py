@@ -37,6 +37,7 @@ from atom.model_engine.block_table_codec import (
 )
 from atom.model_engine.collective_rpc import RpcPayload, RpcResult
 from atom.utils import (
+    envs,
     get_mp_context,
     get_open_zmq_ipc_path,
     init_exit_handler,
@@ -532,9 +533,10 @@ class AsyncIOProcManager:
         self.still_running = False
         self._cleanup_shared_memory()
         logger.info(f"{self.label}: shutdown all runners...")
+        deadline = time.monotonic() + envs.ATOM_SHUTDOWN_TIMEOUT_S
         for proc in self.procs:
             if proc.is_alive():
-                proc.join(timeout=5)
+                proc.join(timeout=max(deadline - time.monotonic(), 0))
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
         self.output_thread.join(timeout=1)
