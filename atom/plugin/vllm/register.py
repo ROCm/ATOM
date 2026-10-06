@@ -27,6 +27,9 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGenerationVllm"
+    ),
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -211,6 +214,26 @@ def _register_kv_connectors() -> None:
     logger.info("Registered ATOM KV connector: %s", name)
 
 
+def _register_glm5_next_arch_config() -> None:
+    from vllm.transformers_utils import model_arch_config_convertor as convertors
+
+    if "glm5_next" in convertors.MODEL_ARCH_CONFIG_CONVERTORS:
+        return
+
+    class Glm5NextModelArchConfigConvertor(convertors.ModelArchConfigConvertorBase):
+        def is_deepseek_mla(self) -> bool:
+            return getattr(self.hf_text_config, "kv_lora_rank", None) is not None
+
+        def get_head_size(self) -> int:
+            from atom.plugin.vllm.glm5_kpool import GLM5_NEXT_MLA_ROPE_PAD
+
+            return self.hf_text_config.kv_lora_rank + GLM5_NEXT_MLA_ROPE_PAD
+
+    convertors.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next"] = (
+        Glm5NextModelArchConfigConvertor
+    )
+
+
 def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
     orig = attention.process_weights_after_loading
 
@@ -306,6 +329,7 @@ def register_model() -> None:
 
     register_gdn_attention_backend()
     _patch_vllm_harmony_parser_manager()
+    _register_glm5_next_arch_config()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 
