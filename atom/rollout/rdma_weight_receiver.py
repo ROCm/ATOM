@@ -60,9 +60,10 @@ class RDMAStreamOutOfStep(RuntimeError):
 
     A broadcast is received whole, into a buffer of the size it was sent with,
     so a frame this rank cannot allocate for is one it cannot take part in --
-    and the sender, already broadcasting it, cannot be told. Nothing more can
-    ride the group: ``receive_weights_rdma`` tears down this rank's end, and
-    the sender and any peer still in that broadcast are released by the
+    and the sender, already broadcasting it, cannot be told. A broadcast that
+    failed, typically because a peer left, puts the group in the same place.
+    Nothing more can ride it: ``receive_weights_rdma`` tears down this rank's
+    end, and the sender and any peer still in a broadcast are released by the
     group's timeout.
     """
 
@@ -158,6 +159,23 @@ def _decode_bucket(
     return weights
 
 
+def _alone(ready: bool, began: bool) -> tuple[bool, bool]:
+    """The decision on a stream this rank took by itself."""
+    return ready, began
+
+
+def vote_on_stream(group, ready: bool, began: bool) -> tuple[bool, bool]:
+    """The decision on a stream every rank of *group* took.
+
+    Each rank says whether it can commit, and whether it began the stream at
+    all; the answer is whether every rank can commit, and whether any began.
+    *group* is a CPU one: the ballot is two integers.
+    """
+    ballot = torch.tensor([int(ready), -int(began)], dtype=torch.int64)
+    dist.all_reduce(ballot, op=dist.ReduceOp.MIN, group=group)
+    return bool(ballot[0].item()), ballot[1].item() < 0
+
+
 @torch.no_grad()
 def receive_weight_stream(
     group,
@@ -165,22 +183,31 @@ def receive_weight_stream(
     *,
     device: torch.device,
     expected_version: int,
+    agree=_alone,
 ) -> dict[str, float]:
     """Consume one weight stream and apply it as a single transaction.
 
     Returns throughput and coverage statistics. Once this stream's reload has
     begun, any failure fences the runner rather than leaving it half-updated --
     see ``abort_weight_update``. A stream refused at begin wrote nothing, and
-    leaves the runner as it was, a reload another caller has open included.
+    leaves the runner as it was, a reload another caller has open included --
+    unless a peer took it.
+
+    *agree* is how the ranks taking one stream decide on it; see
+    ``vote_on_stream``. One rank's version alone would serve the engine mixed,
+    so each rank prepares its commit and then votes, and commits only if every
+    rank can. If the vote fails and any rank began the stream, every rank ends
+    fenced. Each rank votes once per stream, whatever happened to it, or a peer
+    already in the vote would wait for it until its group timed out.
 
     A failure on this rank does not end its part in the stream. The trainer and
     every other rank are still in the broadcasts, and one rank leaving early
     hangs all of them in the next one -- the orchestrator then sees a timeout
     naming nobody instead of this rank's error. So the rest of the stream is
     received and discarded, the header's sizes being all that is needed to stay
-    in step, and the failure is raised once the end marker arrives. The one
-    exception is a frame this rank cannot allocate for, which raises
-    ``RDMAStreamOutOfStep`` at its header.
+    in step, and the failure is raised once the end marker arrives. Anything
+    that breaks the stream off before then -- a frame this rank cannot allocate
+    for, a broadcast that fails -- raises ``RDMAStreamOutOfStep``.
     """
     total_bytes = 0
     total_weights = 0
@@ -189,6 +216,8 @@ def receive_weight_stream(
     failure: Exception | None = None
     drained = 0
     began = False
+    ended = False
+    voted = False
 
     try:
         try:
@@ -197,9 +226,9 @@ def receive_weight_stream(
         except Exception as exc:  # noqa: BLE001 - raised at the end marker
             # Refused before anything was written -- a replayed or older
             # version, or a reload already open. Received all the same, or the
-            # trainer and every other rank wait in the next broadcast. Not
-            # aborted on the way out: a reload already open is its caller's to
-            # finish, and the weights are as the refusal found them.
+            # trainer and every other rank wait in the next broadcast. Nothing
+            # is aborted on the way out: a reload already open is its caller's
+            # to finish.
             failure = exc
             logger.error(
                 "RDMA weight stream v%d refused on this rank, receiving it "
@@ -232,6 +261,7 @@ def receive_weight_stream(
                         f"invalid RDMA end marker: metadata_bytes={metadata_bytes} "
                         f"payload_bytes={payload_bytes}, both must be 0"
                     )
+                ended = True
                 break
             frame = (
                 f"command={command} metadata_bytes={metadata_bytes} "
@@ -288,6 +318,21 @@ def receive_weight_stream(
             total_weights += len(weights)
             total_buckets += 1
 
+        if failure is None:
+            try:
+                runner.prepare_weight_commit(expected_version)
+                # Before the vote: the writes are asynchronous, so a device
+                # fault in them, or in the relayout, surfaces only here.
+                torch.cuda.synchronize(device)
+            except Exception as exc:  # noqa: BLE001 - voted on, then raised
+                failure = exc
+        all_ready, any_began = agree(failure is None, began)
+        voted = True
+        if failure is None and not all_ready:
+            failure = RuntimeError(
+                f"RDMA weight stream v{expected_version} not committed: another "
+                f"rank taking it could not"
+            )
         if failure is not None:
             if drained:
                 logger.error(
@@ -298,16 +343,26 @@ def receive_weight_stream(
                 )
             raise failure
 
-        manifest = runner.commit_weight_update(expected_version)
-        # Inside the try: the writes are asynchronous, so a device fault in
-        # them, or in commit's own finalisation, surfaces only here, after
-        # commit has declared the version good.
-        torch.cuda.synchronize(device)
+        manifest = runner.finish_weight_commit(expected_version)
     except Exception as exc:
+        if not voted:
+            try:
+                _, any_began = agree(False, began)
+            except Exception:  # noqa: BLE001 - the stream's own failure is raised
+                any_began = True  # unknown, so take it that a peer began
         if began:
             # Fence before re-raising: the parameters are now a mix of
             # versions, so serving must stop until a later full reload succeeds.
             runner.abort_weight_update(expected_version, exc)
+        elif any_began:
+            # A peer took what this rank refused, so the engine's ranks no
+            # longer hold one version -- and a rank still serving would wait in
+            # its next forward's collectives for peers that refuse to.
+            runner.fence_weight_update(exc)
+        if not ended and not isinstance(exc, RDMAStreamOutOfStep):
+            raise RDMAStreamOutOfStep(
+                f"RDMA weight stream broke off before its end marker: {exc}"
+            ) from exc
         raise
 
     elapsed = time.perf_counter() - started
@@ -403,6 +458,18 @@ class RDMAWeightReceiverMixin:
         )
         return True
 
+    def _vote_with_tp_peers(self, ready: bool, began: bool) -> tuple[bool, bool]:
+        """The stream's decision across this engine's TP ranks, every one of
+        which takes it: one rank's yes is not enough to serve it."""
+        if int(getattr(self, "world_size", 1) or 1) <= 1:
+            return ready, began
+        from aiter.dist.parallel_state import get_tp_group
+
+        tp = get_tp_group()
+        if tp.world_size <= 1:
+            return ready, began
+        return vote_on_stream(tp.cpu_group, ready, began)
+
     def receive_weights_rdma(
         self,
         group_name: str,
@@ -435,6 +502,7 @@ class RDMAWeightReceiverMixin:
                 self,
                 device=self.device,
                 expected_version=int(version),
+                agree=self._vote_with_tp_peers,
             )
         except RDMAStreamOutOfStep as exc:
             logger.error(

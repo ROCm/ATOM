@@ -1158,6 +1158,7 @@ class WeightUpdaterMixin:
 
         self._weight_update_version = version
         self._last_started_weight_version = version
+        self._weight_update_manifest = None
         self._reset_reload_coverage()
         self._weight_update_sources: set[str] = set()
         self._weight_update_skipped: set[str] = set()
@@ -1192,6 +1193,8 @@ class WeightUpdaterMixin:
                 # coverage would still pass.
                 raise RuntimeError(f"weights sent twice in one reload: {resent[:20]}")
             self._weight_update_sources.update(names)
+            # Whatever was prepared did not include this bucket.
+            self._weight_update_manifest = None
             counts = self._apply_named_tensors(named_tensors)
         except Exception as exc:
             self.abort_weight_update(self._weight_update_version, exc)
@@ -1213,6 +1216,17 @@ class WeightUpdaterMixin:
         Only a reload that rewrote every parameter commits. There is no waiver:
         a commit of part of the model would serve the rest from another
         version, which is the state this transaction exists to rule out.
+        """
+        self.prepare_weight_commit(version)
+        return self.finish_weight_commit(version)
+
+    def prepare_weight_commit(self, version: int) -> dict:
+        """Everything commit checks, short of serving the version.
+
+        Apart from ``finish_weight_commit`` so that ranks taking one stream can
+        decide together: each prepares, they agree, and only then does any of
+        them serve it -- one rank's version alone serves the engine mixed. A
+        rank that cannot commit aborts here, and raises.
         """
         version = int(version)
         active = getattr(self, "_weight_update_version", None)
@@ -1255,14 +1269,27 @@ class WeightUpdaterMixin:
             self.abort_weight_update(version, exc)
             raise
 
-        manifest = {
+        self._weight_update_manifest = {
             "version": version,
             "buckets": self._weight_update_buckets,
             "bytes": self._weight_update_bytes,
             "loaded_internal": len(covered),
             "skipped": sorted(self._weight_update_skipped),
         }
+        return self._weight_update_manifest
+
+    def finish_weight_commit(self, version: int) -> dict:
+        """Serve the version ``prepare_weight_commit`` verified."""
+        version = int(version)
+        manifest = getattr(self, "_weight_update_manifest", None)
+        if (
+            manifest is None
+            or manifest["version"] != version
+            or getattr(self, "_weight_update_version", None) != version
+        ):
+            raise RuntimeError(f"weight update v{version} has not been prepared")
         self._weight_update_version = None
+        self._weight_update_manifest = None
         self._last_committed_weight_version = version
         self._weight_update_healthy = True
         self._weight_update_failure = None
@@ -1274,6 +1301,22 @@ class WeightUpdaterMixin:
         )
         return manifest
 
+    def fence_weight_update(self, error: object) -> dict:
+        """Stop serving until a full reload, leaving a reload in progress be.
+
+        For a rank that took no part in a stream its peers took: its own weights
+        are whole, but no longer the version the rest of the engine holds. A
+        reload in progress here fences already, and is its caller's to end.
+        """
+        if getattr(self, "_weight_update_version", None) is None and getattr(
+            self, "_weight_update_healthy", True
+        ):
+            self._weight_update_healthy = False
+            self._weight_update_failure = str(error)
+            self._reset_reload_coverage()
+            logger.error(f"{self.label}: serving fenced: {error}")
+        return self.get_weight_update_status()
+
     def abort_weight_update(self, version: int, error: object) -> dict:
         """Discard the transaction and fence serving."""
         active = getattr(self, "_weight_update_version", None)
@@ -1284,6 +1327,7 @@ class WeightUpdaterMixin:
             return {"version": int(version), "state": "aborted", "error": failure}
         version = int(active if active is not None else version)
         self._weight_update_version = None
+        self._weight_update_manifest = None
         self._weight_update_healthy = False
         self._weight_update_failure = str(error)
         # Counted afresh from here: what lifts the fence is a reload that

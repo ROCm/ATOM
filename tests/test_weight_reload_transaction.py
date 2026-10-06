@@ -318,6 +318,53 @@ def test_an_abort_after_commit_still_fences():
     assert runner.get_weight_update_status()["failure"] == "device fault"
 
 
+def test_a_prepared_reload_serves_only_once_finished():
+    """Commit is split so that ranks taking one stream can decide together:
+    each prepares, they agree, and only then does any of them serve it."""
+    runner = _Runner(_dense_model())
+    runner.begin_weight_update(1)
+    runner.apply_weight_bucket(list(_dense_checkpoint().items()))
+    runner.prepare_weight_commit(1)
+
+    with pytest.raises(RuntimeError, match="in progress"):
+        runner.assert_weight_update_ready()
+    runner.finish_weight_commit(1)
+    runner.assert_weight_update_ready()
+
+
+def test_only_what_was_prepared_can_be_finished():
+    """A bucket applied after prepare is one prepare never checked."""
+    runner = _Runner(_dense_model())
+    runner.begin_weight_update(1)
+    with pytest.raises(RuntimeError, match="not been prepared"):
+        runner.finish_weight_commit(1)
+
+    runner.apply_weight_bucket(list(_dense_checkpoint().items()))
+    runner.prepare_weight_commit(1)
+    runner.apply_weight_bucket([("extra.weight", torch.ones(1))])
+    with pytest.raises(RuntimeError, match="not been prepared"):
+        runner.finish_weight_commit(1)
+
+
+def test_a_fence_stops_a_serving_runner_but_leaves_a_reload_in_progress():
+    """For a rank that refused a stream its peers took: its weights are whole,
+    but not the version the engine holds. A reload open there is its caller's
+    to end."""
+    serving = _Runner(_dense_model())
+    _reload(serving, [_dense_checkpoint()])
+    serving.fence_weight_update(RuntimeError("peers took v2"))
+    with pytest.raises(RuntimeError, match="fenced"):
+        serving.assert_weight_update_ready()
+
+    reloading = _Runner(_dense_model())
+    reloading.begin_weight_update(1)
+    reloading.fence_weight_update(RuntimeError("peers took v2"))
+    assert reloading.get_weight_update_status()["in_progress"] == 1
+    reloading.apply_weight_bucket(list(_dense_checkpoint().items()))
+    reloading.commit_weight_update(1)
+    reloading.assert_weight_update_ready()
+
+
 def test_a_partial_update_over_a_committed_version_is_refused():
     """What it leaves out would keep serving the last version beside the new
     one, which is the mixed model the transaction exists to rule out -- so
