@@ -113,6 +113,8 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         enable_dp_attention=False,
         index_cache_dtype="fp8",
         hf_config=SimpleNamespace(),
+        max_model_len=4096,
+        max_num_seqs=256,
     )
     return Config.compute_hash(stub)
 

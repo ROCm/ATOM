@@ -944,6 +944,221 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
         )
 
 
+# One GLM-5.3 IQ2R workspace per device and shape, shared by every MoE layer:
+# layers run serially on a rank, so a fixed buffer set is also graph-safe.
+_IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
+
+
+class Iq2rMoEMethod(FusedMoEMethodBase):
+    """AITER IQ2R experts in the ``glm53-packed-v1`` layout.
+
+    The layout covers GLM-5.3 with the shared expert fused as expert 256, at
+    TP4/TP8. The checkpoint holds full layers; each rank slices its share of
+    the intermediate dimension as it loads.
+    """
+
+    def __init__(
+        self,
+        quant_config: LayerQuantConfig,
+        moe: FusedMoEConfig,
+        layout: str | None = None,
+    ):
+        super().__init__(moe)
+        self.quant_config = quant_config
+        if layout != "glm53-packed-v1":
+            raise ValueError(
+                f"unsupported IQ2R layout {layout!r}; ATOM runs only "
+                "'glm53-packed-v1' checkpoints"
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        # The layout fixes the model shapes and load_weight checks every
+        # buffer against them, so only the parallel setup is checked here.
+        parallel = self.moe.moe_parallel_config
+        if (
+            parallel.tp_size not in (4, 8)
+            or parallel.ep_size != 1
+            or layer.has_bias
+            or layer.num_fused_shared_experts != 1
+        ):
+            raise NotImplementedError(
+                "the glm53-packed-v1 IQ2R layout runs at TP4/TP8 without EP, "
+                "with the shared expert fused"
+            )
+        self.tp_size = parallel.tp_size
+        self.tp_rank = parallel.tp_rank
+
+        from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+        from aiter.ops.iq2r_format import IQ2RMetadata
+
+        gate_metadata = IQ2RMetadata(
+            logical_n=2 * intermediate_size_per_partition,
+            logical_k=hidden_size,
+        )
+        down_metadata = IQ2RMetadata(
+            logical_n=hidden_size,
+            logical_k=intermediate_size_per_partition,
+        )
+        self.num_experts = num_experts
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size_per_partition
+        layer.iq2r_down_metadata = down_metadata
+        shapes = {
+            "w13_weight": iq2r_glm53_gate_bytes(gate_metadata.logical_n),
+            "w13_weight_scale": gate_metadata.auxiliary_bytes,
+            "w2_weight": down_metadata.data_bytes,
+            "w2_weight_scale": down_metadata.auxiliary_bytes,
+        }
+        for name, nbytes in shapes.items():
+            parameter = atom_parameter(
+                torch.empty((num_experts, nbytes), dtype=torch.uint8)
+            )
+            layer.register_parameter(name, parameter)
+            set_weight_attrs(parameter, extra_weight_attrs)
+            parameter.iq2r_name = name
+
+    def load_weight(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        name = param.iq2r_name
+        if self.tp_size > 1:
+            loaded_weight = self._glm53_tp_slice(name, loaded_weight)
+        if tuple(param.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"IQ2R {name} shape mismatch: target={tuple(param.shape)}, "
+                f"checkpoint={tuple(loaded_weight.shape)}"
+            )
+        param.data.copy_(loaded_weight)
+
+    def _glm53_tp_slice(self, name: str, weight: torch.Tensor) -> torch.Tensor:
+        """This rank's intermediate-dimension shard of a full packed layer."""
+        from aiter.iq2r_glm53 import iq2r_glm53_slice_gate
+        from aiter.ops.iq2r_format import (
+            IQ2RMetadata,
+            iq2r_slice_input_data,
+            iq2r_slice_output_auxiliary,
+        )
+
+        shard = self.intermediate_size
+        full = shard * self.tp_size
+        if name == "w13_weight":
+            return iq2r_glm53_slice_gate(weight, 2 * shard * self.tp_rank, 2 * shard)
+        if name == "w13_weight_scale":
+            return iq2r_slice_output_auxiliary(
+                weight,
+                IQ2RMetadata(logical_n=2 * full, logical_k=self.hidden_size),
+                2 * shard * self.tp_rank,
+                2 * shard,
+            )
+        if name == "w2_weight":
+            return iq2r_slice_input_data(
+                weight,
+                IQ2RMetadata(logical_n=self.hidden_size, logical_k=full),
+                shard * self.tp_rank,
+                shard,
+            )
+        # Down codebooks and exponents cover all output columns.
+        return weight
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from aiter.ops.iq2r_format import iq2r_validate_expert_weights
+
+        # Only the down records keep the canonical layout the validator checks.
+        iq2r_validate_expert_weights(
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            layer.iq2r_down_metadata,
+            expert_count=self.num_experts,
+        )
+        self._glm53_workspace(layer.w13_weight.device)
+
+    def _glm53_workspace(self, device: torch.device):
+        from aiter.iq2r_glm53 import IQ2RGlm53Workspace
+
+        key = (device, self.moe.max_num_tokens, self.intermediate_size)
+        workspace = _IQ2R_GLM53_WORKSPACES.get(key)
+        if workspace is None:
+            workspace = IQ2RGlm53Workspace.allocate(
+                self.moe.max_num_tokens, self.intermediate_size, device=device
+            )
+            _IQ2R_GLM53_WORKSPACES[key] = workspace
+        return workspace
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
+
+    @mark_trace(prefix="iq2r_moe", torch_compile=False)
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: int | None = None,
+        num_expert_group: int | None = None,
+        global_num_experts: int = -1,
+        expert_map: torch.Tensor | None = None,
+        custom_routing_function: Callable | None = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: torch.Tensor | None = None,
+        fused_shared_experts_scoring_func: str | None = None,
+        apply_router_weight_on_input: bool = False,
+        activation: ActivationType = ActivationType.Silu,
+        prefix: str = "",
+    ) -> torch.Tensor:
+        if activation != ActivationType.Silu:
+            raise ValueError(f"IQ2R does not support {activation} here")
+
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=global_num_experts,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+
+        from aiter.iq2r_glm53 import iq2r_glm53_moe_out
+
+        output = torch.empty_like(x)
+        iq2r_glm53_moe_out(
+            x,
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            output,
+            self._glm53_workspace(x.device),
+        )
+        return output
+
+
 def rocm_asm_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -3571,6 +3786,12 @@ class FusedMoE(torch.nn.Module):
             self.quant_method: QuantizeMethodBase | None = UnquantizedFusedMoEMethod(
                 moe
             )
+        elif quant_method_str == "iq2r":
+            self.quant_method = Iq2rMoEMethod(
+                layer_quant_config,
+                moe,
+                layout=(quant_config.hf_quant_config or {}).get("iq2r_layout"),
+            )
         elif (
             quant_method_str == "compressed-tensors"
             and layer_quant_config.quant_dtype == dtypes.fp8
@@ -4884,6 +5105,10 @@ class FusedMoE(torch.nn.Module):
         shard_id: str = "",
         expert_id: int = 0,
     ) -> None:
+        if isinstance(self.quant_method, Iq2rMoEMethod):
+            self.quant_method.load_weight(param, loaded_weight)
+            return
+
         is_nvfp4 = bool(
             self.layer_quant_config is not None
             and self.layer_quant_config.quant_dtype == NVFP4_DTYPE

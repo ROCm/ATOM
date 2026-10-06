@@ -547,6 +547,41 @@ class ModelOptParser(QuantConfigParser):
         )
 
 
+@register_quant_parser("iq2r")
+class Iq2rParser(QuantConfigParser):
+    """Parse AITER IQ2R checkpoint configs."""
+
+    def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
+        base_config = hf_quant_config.get("base_quantization_config") or {}
+        if not isinstance(base_config, dict):
+            raise TypeError("base_quantization_config must be a JSON object")
+        base_method = str(base_config.get("quant_method") or "_generic")
+        if base_method == "iq2r":
+            raise ValueError("an IQ2R overlay cannot use IQ2R as its base format")
+        base = get_quant_parser(base_method).parse(base_config)
+        patterns = hf_quant_config.get("iq2r_modules")
+        if (
+            not isinstance(patterns, list)
+            or not patterns
+            or not all(isinstance(pattern, str) and pattern for pattern in patterns)
+        ):
+            raise TypeError("iq2r_modules must be a non-empty list of patterns")
+        iq2r_spec = LayerQuantConfig(
+            quant_type=QuantType.iq2r_2bit,
+            quant_dtype=torch.uint8,
+            is_dynamic=False,
+            quant_method="iq2r",
+        )
+        return ParsedQuantConfig(
+            global_spec=base.global_spec,
+            layer_pattern_specs=[
+                *((pattern, iq2r_spec) for pattern in patterns),
+                *base.layer_pattern_specs,
+            ],
+            exclude_layers=list(base.exclude_layers),
+        )
+
+
 # -- Online quantization ----------------------------------------------------
 
 
