@@ -236,6 +236,9 @@ impl HealthService {
     }
 
     fn current_status(app: &AppContext, draining: &AtomicBool) -> i32 {
+        if app.prepare_pool.stats().failed {
+            return 2;
+        }
         let eligible: Vec<_> = app
             .worker_registry
             .get_all()

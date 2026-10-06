@@ -1,8 +1,5 @@
 //! Shared HTTP proxy contract. The routing view never replaces the original payload.
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::{sync::Arc, time::Instant};
 
 use axum::{
     extract::{Path, RawQuery, Request, State},
@@ -15,12 +12,17 @@ use http::{HeaderMap, Uri};
 
 use crate::{
     app_context::AppContext,
-    core::{Worker, WorkerType},
+    core::{
+        prepare_pool::{InputLease, JobContext, PrepareError, PrepareHandle},
+        Worker, WorkerRegistry, WorkerType,
+    },
+    policies::PolicyRegistry,
     routers::{
         comm::error::{IngressError, MeshLocalError},
         prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference},
     },
     server::AppState,
+    tokenizer::TokenizerRegistry,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,16 +140,14 @@ impl EndpointSpec {
                     return IngressError::invalid("failed to read request body").response(&path);
                 }
             };
-        let envelope = match InferenceEnvelope::parse(parts.uri, parts.headers, body) {
-            Ok(envelope) => envelope,
-            Err(error) => return error.response(&path),
-        };
+        let envelope =
+            match InferenceEnvelope::parse(parts.uri, parts.headers, body, &state.context).await {
+                Ok(envelope) => envelope,
+                Err(error) => return error.response(&path),
+            };
         MeshLocalError::format_response(
             &path,
-            state
-                .router
-                .route_inference(&envelope, &state.context)
-                .await,
+            state.router.route_inference(envelope, &state.context).await,
         )
     }
 
@@ -217,32 +217,101 @@ impl EndpointSpec {
     }
 }
 
+struct RetainedInput {
+    body: Bytes,
+    _lease: InputLease,
+}
+
+impl AsRef<[u8]> for RetainedInput {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
 pub struct InferenceEnvelope {
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub parsed: ParsedInference,
     pub metadata: InferenceMetadata,
+    /// Shared by JSON parsing and every subsequent prepare submission.
+    pub(crate) prepare_deadline: Instant,
 }
 impl InferenceEnvelope {
-    pub fn parse(uri: Uri, headers: HeaderMap, body: Bytes) -> Result<Self, IngressError> {
+    pub async fn parse(
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        app: &AppContext,
+    ) -> Result<Self, IngressError> {
         Self::validate_headers(&headers)?;
-        let parsed = ParsedInference::parse(uri.path(), &body).map_err(IngressError::invalid)?;
-        let metadata = parsed.metadata_with_text(false);
-        if metadata
-            .model
-            .as_deref()
-            .is_some_and(|model| model.trim().is_empty())
-        {
-            return Err(IngressError::invalid("model is required"));
-        }
-        Ok(Self {
-            uri,
-            headers,
+        let deadline = app.prepare_pool.prepare_deadline();
+        let lease = app.prepare_pool.retain_input(body.len())?;
+        // Raw Bytes clones keep the budget charged through upstream sends.
+        let body = Bytes::from_owner(RetainedInput {
             body,
-            parsed,
-            metadata,
-        })
+            _lease: lease,
+        });
+        let inline_limit = app.router_config.prepare_pool.parse_inline_max_bytes;
+        let inline = inline_limit != 0 && body.len() <= inline_limit;
+        let parse = move || -> Result<Self, IngressError> {
+            let started = Instant::now();
+            let parsed =
+                ParsedInference::parse(uri.path(), &body).map_err(IngressError::invalid)?;
+            metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "json_parse")
+                .record(started.elapsed().as_secs_f64());
+            let metadata = parsed.metadata_with_text(false);
+            if metadata
+                .model
+                .as_deref()
+                .is_some_and(|model| model.trim().is_empty())
+            {
+                return Err(IngressError::invalid("model is required"));
+            }
+            Ok(Self {
+                uri,
+                headers,
+                body,
+                parsed,
+                metadata,
+                prepare_deadline: deadline,
+            })
+        };
+        if inline {
+            let request = parse()?;
+            if Instant::now() >= deadline {
+                return Err(PrepareError::Timeout.into());
+            }
+            return Ok(request);
+        }
+        app.prepare_pool
+            .try_submit(deadline, move |ctx| -> Result<Self, IngressError> {
+                ctx.check()?;
+                let request = parse()?;
+                ctx.check()?;
+                Ok(request)
+            })?
+            .wait()
+            .await?
+    }
+
+    /// Move the envelope and its input lease through the job and result together.
+    pub(crate) async fn prepare<T: Send + 'static>(
+        self,
+        pool: &PrepareHandle,
+        work: impl FnOnce(&Self, &JobContext) -> Result<T, IngressError> + Send + 'static,
+    ) -> Result<(Self, T), IngressError> {
+        pool.try_submit(
+            self.prepare_deadline,
+            move |ctx| -> Result<_, IngressError> {
+                ctx.check()?;
+                let value = work(&self, ctx)?;
+                ctx.check()?;
+                Ok((self, value))
+            },
+        )?
+        .wait()
+        .await?
     }
 
     pub(crate) fn validate_headers(headers: &HeaderMap) -> Result<(), IngressError> {
@@ -278,18 +347,29 @@ impl InferenceEnvelope {
     }
 }
 
-pub(crate) struct IngressRouting<'a> {
-    app: &'a AppContext,
+#[derive(Clone)]
+pub(crate) struct IngressRouting {
+    policy_registry: Arc<PolicyRegistry>,
+    worker_registry: Arc<WorkerRegistry>,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    pd: bool,
+    max_tokenize_bytes: usize,
 }
 
-impl<'a> IngressRouting<'a> {
-    pub(crate) fn new(app: &'a AppContext) -> Self {
-        Self { app }
+impl IngressRouting {
+    pub(crate) fn new(app: &AppContext) -> Self {
+        Self {
+            policy_registry: app.policy_registry.clone(),
+            worker_registry: app.worker_registry.clone(),
+            tokenizer_registry: app.tokenizer_registry.clone(),
+            pd: app.router_config.mode.is_pd_mode(),
+            max_tokenize_bytes: app.router_config.resolved_max_tokenize_bytes(),
+        }
     }
 
     fn requirements(&self, model: Option<&str>) -> (bool, bool) {
-        let registry = &self.app.policy_registry;
-        if self.app.router_config.mode.is_pd_mode() {
+        let registry = &self.policy_registry;
+        if self.pd {
             let prefill = registry.get_prefill_policy();
             let decode = registry.get_decode_policy();
             (
@@ -305,6 +385,7 @@ impl<'a> IngressRouting<'a> {
         }
     }
 
+    #[cfg(feature = "ext-proc")]
     pub(crate) fn needs_tokens(&self, model: Option<&str>) -> bool {
         self.requirements(model).1
     }
@@ -312,8 +393,9 @@ impl<'a> IngressRouting<'a> {
     pub(crate) fn prepare(
         &self,
         parsed: &ParsedInference,
-        canceled: &AtomicBool,
+        ctx: &JobContext,
     ) -> Result<(InferenceMetadata, Option<Vec<u32>>), IngressError> {
+        ctx.check()?;
         let mut metadata = parsed.metadata_with_text(false);
         if metadata
             .model
@@ -324,12 +406,18 @@ impl<'a> IngressRouting<'a> {
         }
         let endpoint = EndpointSpec::find(metadata.route)
             .ok_or_else(|| IngressError::invalid("unsupported inference API"))?;
-        endpoint.validate_topology(self.app.router_config.mode.is_pd_mode())?;
-        let (text, tokens) = self.requirements(metadata.model.as_deref());
-        if text || tokens {
+        endpoint.validate_topology(self.pd)?;
+        let (needs_text, needs_tokens) = self.requirements(metadata.model.as_deref());
+        if needs_text || needs_tokens {
             metadata = parsed.metadata();
         }
-        let tokens = self.tokens(parsed, &metadata, canceled)?;
+        ctx.check()?;
+        let tokens = if needs_tokens {
+            Some(self.tokens(parsed, &metadata, ctx)?)
+        } else {
+            None
+        };
+        ctx.check()?;
         Ok((metadata, tokens))
     }
 
@@ -340,11 +428,11 @@ impl<'a> IngressRouting<'a> {
     ) -> Result<Vec<Arc<dyn Worker>>, IngressError> {
         let endpoint = EndpointSpec::find(metadata.route)
             .ok_or_else(|| IngressError::invalid("unsupported inference API"))?;
-        let pd = self.app.router_config.mode.is_pd_mode();
+        let pd = self.pd;
         endpoint.validate_topology(pd)?;
         let mut workers = match metadata.model.as_deref() {
-            Some(model) => self.app.worker_registry.get_by_model(model).to_vec(),
-            None => self.app.worker_registry.get_all(),
+            Some(model) => self.worker_registry.get_by_model(model).to_vec(),
+            None => self.worker_registry.get_all(),
         };
         workers.retain(|w| matches!(w.connection_mode(), crate::core::ConnectionMode::Http));
         let configured = !workers.is_empty();
@@ -387,27 +475,11 @@ impl<'a> IngressRouting<'a> {
         &self,
         parsed: &ParsedInference,
         metadata: &InferenceMetadata,
-        canceled: &AtomicBool,
-    ) -> Result<Option<Vec<u32>>, IngressError> {
-        let check = || {
-            if canceled.load(Ordering::Acquire) {
-                Err(IngressError::new(
-                    http::StatusCode::from_u16(499).expect("valid cancellation status"),
-                    "parser_canceled",
-                    "request parsing canceled",
-                ))
-            } else {
-                Ok(())
-            }
-        };
-        check()?;
-        let app = self.app;
-        let needs_tokens = self.needs_tokens(metadata.model.as_deref());
-        if !needs_tokens {
-            return Ok(None);
-        }
+        ctx: &JobContext,
+    ) -> Result<Vec<u32>, IngressError> {
+        ctx.check()?;
         if let Some(ids) = parsed.input_tokens().map_err(IngressError::invalid)? {
-            return Ok(Some(ids));
+            return Ok(ids);
         }
         if matches!(
             parsed,
@@ -418,7 +490,7 @@ impl<'a> IngressRouting<'a> {
         let tokenizer = metadata
             .model
             .as_deref()
-            .and_then(|m| app.tokenizer_registry.get(m))
+            .and_then(|m| self.tokenizer_registry.get(m))
             .ok_or_else(|| {
                 IngressError::new(
                     http::StatusCode::SERVICE_UNAVAILABLE,
@@ -426,10 +498,7 @@ impl<'a> IngressRouting<'a> {
                     "token routing requires input_ids or a model with a registered tokenizer",
                 )
             })?;
-        #[cfg(feature = "ext-proc")]
-        let limit = app.router_config.ext_proc.max_tokenize_bytes;
-        #[cfg(not(feature = "ext-proc"))]
-        let limit = 1024 * 1024;
+        let limit = self.max_tokenize_bytes;
         if metadata.text.len() > limit {
             return Err(IngressError::new(
                 http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -437,6 +506,8 @@ impl<'a> IngressRouting<'a> {
                 "prompt exceeds the synchronous tokenizer byte limit",
             ));
         }
+        ctx.check()?;
+        let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
             super::prepare::chat_template::process_chat_messages(chat, &*tokenizer)
                 .map_err(IngressError::invalid)?
@@ -444,7 +515,9 @@ impl<'a> IngressRouting<'a> {
         } else {
             metadata.text.clone()
         };
-        check()?;
+        metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "template")
+            .record(template_started.elapsed().as_secs_f64());
+        ctx.check()?;
         if prompt.len() > limit {
             return Err(IngressError::new(
                 http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -452,13 +525,16 @@ impl<'a> IngressRouting<'a> {
                 "prompt exceeds the synchronous tokenizer byte limit",
             ));
         }
+        let encode_started = Instant::now();
         let tokens = tokenizer
             .encode(&prompt, false)
             .map_err(|e| IngressError::invalid(e.to_string()))?
             .token_ids()
             .to_vec();
-        check()?;
-        Ok(Some(tokens))
+        metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "encode")
+            .record(encode_started.elapsed().as_secs_f64());
+        ctx.check()?;
+        Ok(tokens)
     }
 }
 

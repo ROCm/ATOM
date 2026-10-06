@@ -10,7 +10,7 @@ use tower::ServiceExt;
 async fn http_preserves_all_api_requests_and_json_sse_errors() {
     for key in [None, Some("worker-secret")] {
         let mut backend = multi_api::Backend::start().await;
-        let (context, worker) = backend.context(key).await;
+        let (context, worker, _prepare_runtime) = backend.context(key).await;
         let app = multi_api::http_app(context).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -26,7 +26,7 @@ async fn http_preserves_all_api_requests_and_json_sse_errors() {
 #[tokio::test]
 async fn api_validation_errors_follow_the_requested_protocol() {
     let backend = multi_api::Backend::start().await;
-    let (context, _) = backend.context(None).await;
+    let (context, _, _prepare_runtime) = backend.context(None).await;
     let app = multi_api::http_app(context).await;
     for path in multi_api::APIS {
         for body in [
@@ -71,7 +71,7 @@ async fn api_validation_errors_follow_the_requested_protocol() {
 #[tokio::test]
 async fn messages_method_and_size_errors_are_protocol_errors() {
     let backend = multi_api::Backend::start().await;
-    let (context, _) = backend.context(None).await;
+    let (context, _, _prepare_runtime) = backend.context(None).await;
     let app = multi_api::http_app(context).await;
     for (method, body, content_length, status) in [
         ("GET", String::new(), true, StatusCode::METHOD_NOT_ALLOWED),
@@ -129,7 +129,7 @@ async fn messages_method_and_size_errors_are_protocol_errors() {
 async fn disconnect_drops_upstream_and_refunds_load_for_every_api() {
     use http_body_util::BodyExt;
     let backend = multi_api::Backend::start().await;
-    let (context, worker) = backend.context(None).await;
+    let (context, worker, _prepare_runtime) = backend.context(None).await;
     let app = multi_api::http_app(context).await;
     for path in multi_api::APIS {
         let mut value = multi_api::request(path, true);
@@ -162,7 +162,7 @@ async fn disconnect_drops_upstream_and_refunds_load_for_every_api() {
 async fn responses_submissions_are_never_retried_after_backend_failure() {
     for path in multi_api::APIS {
         let mut backend = multi_api::Backend::start().await;
-        let (context, worker) = backend.context(None).await;
+        let (context, worker, _prepare_runtime) = backend.context(None).await;
         let mut context = (*context).clone();
         context.router_config.disable_retries = false;
         context.router_config.retry.max_retries = 3;
@@ -199,7 +199,7 @@ async fn responses_submissions_are_never_retried_after_backend_failure() {
 #[tokio::test]
 async fn broken_upload_is_not_reported_as_oversized() {
     let backend = multi_api::Backend::start().await;
-    let (context, _) = backend.context(None).await;
+    let (context, _, _prepare_runtime) = backend.context(None).await;
     let app = multi_api::http_app(context).await;
     let body = Body::from_stream(futures_util::stream::once(async {
         Err::<bytes::Bytes, _>(std::io::Error::new(
@@ -256,17 +256,17 @@ async fn response_resources_preserve_methods_queries_credentials_and_streaming()
             .await
             .unwrap();
     });
+    let config = RouterConfig {
+        dp_aware: true,
+        disable_retries: true,
+        ..Default::default()
+    };
+    let prepare_runtime =
+        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
     let context = Arc::new(
-        AppContext::from_config(
-            RouterConfig {
-                dp_aware: true,
-                disable_retries: true,
-                ..Default::default()
-            },
-            5,
-        )
-        .await
-        .unwrap(),
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
     );
     for rank in 0..2 {
         context.worker_registry.register(Arc::new(

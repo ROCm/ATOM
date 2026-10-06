@@ -14,8 +14,7 @@ use tower::ServiceExt;
 
 use crate::{
     app_helpers::{
-        create_mocker_app_with_context, create_mocker_context,
-        create_mocker_context_with_parsers,
+        create_mocker_app_with_context, create_mocker_context, create_mocker_context_with_parsers,
     },
     BackendFixture, ConnectionModeFixture, MockCase, VirtualRequest, VirtualResponse,
     VirtualWorkerPool, VirtualWorkerPoolConfig, VirtualWorkerSpec, WorkerKindFixture,
@@ -152,12 +151,13 @@ impl TestHarness {
         let worker_urls = workers.urls();
 
         let config = self.router_config(&worker_urls);
-        let app_context = match self.case.route.connection_mode {
+        let (app_context, _prepare_runtime) = match self.case.route.connection_mode {
             ConnectionModeFixture::Http => create_mocker_context(config.clone()).await,
             ConnectionModeFixture::Grpc => {
-                let app_context = create_mocker_context_with_parsers(config.clone()).await;
+                let (app_context, prepare_runtime) =
+                    create_mocker_context_with_parsers(config.clone()).await;
                 register_mock_tokenizer(&app_context.tokenizer_registry, &self.case.model).await?;
-                app_context
+                (app_context, prepare_runtime)
             }
         };
         initialize_workers(&app_context, &config, worker_urls.len()).await?;
@@ -212,11 +212,7 @@ impl TestHarness {
             .map(|_| VirtualWorkerSpec::from_case(self.case.clone()))
             .collect();
 
-        VirtualWorkerPool::start(
-            VirtualWorkerPoolConfig::new("127.0.0.1", base_port),
-            specs,
-        )
-        .await
+        VirtualWorkerPool::start(VirtualWorkerPoolConfig::new("127.0.0.1", base_port), specs).await
     }
 
     fn router_config(&self, worker_urls: &[String]) -> RouterConfig {

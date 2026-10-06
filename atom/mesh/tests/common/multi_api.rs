@@ -250,19 +250,33 @@ impl Backend {
             .unwrap()
     }
 
-    pub async fn context(&self, key: Option<&str>) -> (Arc<AppContext>, Arc<dyn Worker>) {
+    pub async fn context(
+        &self,
+        key: Option<&str>,
+    ) -> (
+        Arc<AppContext>,
+        Arc<dyn Worker>,
+        mesh::core::prepare_pool::PreparePoolRuntime,
+    ) {
         let config = RouterConfig {
             disable_retries: true,
             ..Default::default()
         };
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime =
+            mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool())
+                .unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         let mut builder = BasicWorkerBuilder::new(&self.url).model_id("test-model");
         if let Some(key) = key {
             builder = builder.api_key(key);
         }
         let worker: Arc<dyn Worker> = Arc::new(builder.build());
         app.worker_registry.register(worker.clone());
-        (app, worker)
+        (app, worker, prepare_runtime)
     }
 
     pub async fn verify_url(&mut self, url: &str, key: Option<&str>) {

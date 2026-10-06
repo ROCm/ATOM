@@ -34,7 +34,9 @@ fn app_context_full(
     workers: Vec<Arc<dyn Worker>>,
     tokenizer_registry: Arc<TokenizerRegistry>,
 ) -> Arc<AppContext> {
+    // These fixtures exercise synchronous native pipeline helpers, not ingress.
     let ctx = AppContextBuilder::new()
+        .prepare_pool(crate::core::prepare_pool::PrepareHandle::closed())
         .client(reqwest::Client::new())
         .router_config(RouterConfig::default())
         .tokenizer_registry(tokenizer_registry)

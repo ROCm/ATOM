@@ -9,7 +9,7 @@ use std::{
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{BasicWorkerBuilder, Worker},
+    core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, Worker},
     ext_proc::{
         proto::{
             envoy::{
@@ -30,13 +30,19 @@ struct Fixture {
     app: Arc<AppContext>,
     runtime: ExtProcRuntime,
     worker: Arc<dyn Worker>,
+    _prepare_runtime: PreparePoolRuntime,
 }
 
 impl Fixture {
     async fn new(mut config: RouterConfig) -> Self {
         config.ext_proc.enabled = true;
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://127.0.0.1:18001")
                 .model_id("test-model")
@@ -48,6 +54,7 @@ impl Fixture {
             app,
             runtime,
             worker,
+            _prepare_runtime: prepare_runtime,
         }
     }
 
@@ -1405,7 +1412,12 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
     config.max_concurrent_requests = 1;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
     config.ext_proc.executor_listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     for kind in [
         WorkerType::Prefill {
             bootstrap_port: Some(9000),
@@ -1455,6 +1467,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         app: app.clone(),
         runtime,
         worker: workers[0].clone(),
+        _prepare_runtime: prepare_runtime,
     };
     let client = reqwest::Client::new();
     let body = br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#;

@@ -77,6 +77,12 @@ impl From<crate::routers::comm::error::IngressError> for ProcessingError {
     }
 }
 
+impl From<crate::core::prepare_pool::PrepareError> for ProcessingError {
+    fn from(error: crate::core::prepare_pool::PrepareError) -> Self {
+        Self::from(crate::routers::comm::error::IngressError::from(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::{signal, spawn};
+use tokio::signal;
 use tracing::{debug, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
@@ -512,12 +512,58 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
+    let mut prepare_runtime = crate::core::prepare_pool::PreparePoolRuntime::new(
+        config.router_config.resolved_prepare_pool(),
+    )?;
+    info!(
+        workers = config.router_config.resolved_prepare_workers(),
+        source = config.router_config.prepare_workers_source(),
+        queue_capacity = config.router_config.prepare_pool.queue_capacity,
+        max_retained_input_bytes = config.router_config.prepare_pool.max_retained_input_bytes,
+        max_tokenize_bytes = config.router_config.resolved_max_tokenize_bytes(),
+        "Request preparation pool started"
+    );
+    #[cfg(feature = "ext-proc")]
+    if config.router_config.ext_proc.enabled
+        && config
+            .router_config
+            .prepare_pool
+            .max_tokenize_bytes
+            .is_some()
+    {
+        info!(
+            legacy_limit = config.router_config.ext_proc.max_tokenize_bytes,
+            effective_limit = config.router_config.resolved_max_tokenize_bytes(),
+            "Common preparation tokenization limit overrides the ext-proc setting"
+        );
+    }
+    // Drain the pool on both normal shutdown and startup failure.
+    let result = serve_with_prepare_pool(&config, http_address, prepare_runtime.handle()).await;
+    // Keep submissions open until transport drain ends.
+    let shutdown = prepare_runtime.shutdown().await;
+    if shutdown.remaining_workers != 0 {
+        warn!(
+            remaining_workers = shutdown.remaining_workers,
+            "Preparation shutdown deadline reached; synchronous jobs are still finishing"
+        );
+    }
+    result
+}
+
+async fn serve_with_prepare_pool(
+    config: &ServerConfig,
+    http_address: std::net::SocketAddr,
+    prepare_pool: crate::core::prepare_pool::PrepareHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Drop aborts the signal listener on any exit.
+    let mut signal_tasks = tokio::task::JoinSet::new();
     let app_context = Arc::new(
         crate::app_context::AppContextBuilder::from_config(
             config.router_config.clone(),
             config.request_timeout_secs,
         )
         .await?
+        .prepare_pool(prepare_pool)
         .atom_standalone_runtime(config.atom_standalone_runtime.clone())
         .build()
         .map_err(|e| e.to_string())?,
@@ -713,7 +759,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let handle_clone = handle.clone();
     let app_state_clone = app_state.clone();
     let grace_period = Duration::from_secs(config.shutdown_grace_period_secs);
-    spawn(async move {
+    signal_tasks.spawn(async move {
         shutdown_signal().await;
         #[cfg(feature = "ext-proc")]
         if let Some(shutdown) = ext_proc_shutdown {
@@ -738,7 +784,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             result = runtime.wait() => {
                 if let Err(error) = result {
                     handle.shutdown();
-                    return Err(error);
+                    return Err(error as Box<dyn std::error::Error>);
                 }
                 // SIGTERM also starts HTTP's graceful shutdown. Let it finish.
                 http.await?;
@@ -750,9 +796,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     #[cfg(not(feature = "ext-proc"))]
     http.await?;
-
-    // HA handler shutdown is handled by the signal in mesh_run! macro
-    // No need to manually shutdown here
 
     Ok(())
 }

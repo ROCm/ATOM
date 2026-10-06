@@ -1,20 +1,15 @@
-use std::{
-    collections::HashSet,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinHandle,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use prost_types::value::Kind;
 
-use crate::app_context::AppContext;
+use crate::{
+    app_context::AppContext,
+    core::prepare_pool::{InputLease, PrepareHandle},
+    routers::ingress::IngressRouting,
+};
 
 use super::{core, error::ProcessingError, pb};
 use crate::routers::prepare::inference::{InferenceMetadata, ParsedInference};
@@ -29,6 +24,9 @@ pub(super) struct RequestEnvelope {
     buffered_bytes: usize,
     budget: Option<Arc<Semaphore>>,
     memory: Vec<OwnedSemaphorePermit>,
+    // Held until the request is dropped.
+    input_leases: Vec<InputLease>,
+    input_pool: Option<PrepareHandle>,
 }
 
 pub(super) struct RoutingInput {
@@ -139,6 +137,8 @@ impl RequestEnvelope {
             buffered_bytes: 0,
             budget: None,
             memory: Vec::new(),
+            input_leases: Vec::new(),
+            input_pool: None,
         })
     }
 
@@ -217,7 +217,13 @@ impl RequestEnvelope {
                 "prepared request body limit exceeded",
             ));
         }
+        let retained: usize = self.input_leases.iter().map(InputLease::bytes).sum();
+        let extra = match &self.input_pool {
+            Some(pool) if body.len() > retained => Some(pool.retain_input(body.len() - retained)?),
+            _ => None,
+        };
         self.reserve_buffer(body.len(), limit)?;
+        self.input_leases.extend(extra);
         metrics::gauge!("mesh_ext_proc_buffered_request_bytes")
             .decrement(self.buffered_bytes as f64);
         self.raw.clear();
@@ -242,123 +248,51 @@ impl RequestEnvelope {
         metrics::gauge!("mesh_ext_proc_buffered_request_bytes").increment(body.len() as f64);
         Ok(())
     }
-
-    pub fn parse(
-        &self,
-        app: &AppContext,
-        canceled: &AtomicBool,
-    ) -> Result<RoutingInput, ProcessingError> {
-        check_canceled(canceled)?;
-        let parsed =
-            ParsedInference::parse(&self.path, &self.raw).map_err(ProcessingError::invalid)?;
-        let (metadata, tokens) = crate::routers::ingress::IngressRouting::new(app)
-            .prepare(&parsed, canceled)
-            .map_err(ProcessingError::from)?;
-        check_canceled(canceled)?;
-        Ok(RoutingInput {
-            metadata,
-            tokens,
-            state_reference: parsed.requires_state_domain(),
-        })
-    }
 }
 
-fn check_canceled(canceled: &AtomicBool) -> Result<(), ProcessingError> {
-    if canceled.load(Ordering::Acquire) {
-        Err(ProcessingError::new(
-            499,
-            "parser_canceled",
-            "request parsing canceled",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// Running synchronous work retains its slot and buffer budget until it exits.
-/// Cancellation stops queued work and is checked between parsing stages; an
-/// individual synchronous tokenizer call cannot be preempted.
+/// Parses owned requests on the shared preparation pool.
 pub(super) struct RequestParser {
-    app: Arc<AppContext>,
-    slots: Arc<Semaphore>,
+    routing: IngressRouting,
+    pool: PrepareHandle,
     pub budget: Arc<Semaphore>,
 }
 
-struct BlockingTask<T> {
-    task: JoinHandle<Result<T, ProcessingError>>,
-    canceled: Arc<AtomicBool>,
-}
-impl<T> Drop for BlockingTask<T> {
-    fn drop(&mut self) {
-        self.canceled.store(true, Ordering::Release);
-        self.task.abort(); // Also prevents a not-yet-started blocking job from running.
-    }
-}
-
 impl RequestParser {
-    pub fn new(app: Arc<AppContext>) -> Self {
-        let count = app
-            .router_config
-            .ext_proc
-            .parser_concurrency
-            .min(app.router_config.ext_proc.max_streams);
+    pub fn new(app: &AppContext) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(count)),
+            routing: IngressRouting::new(app),
+            pool: app.prepare_pool.clone(),
             budget: Arc::new(Semaphore::new(
                 app.router_config.ext_proc.max_buffered_bytes,
             )),
-            app,
         }
-    }
-
-    async fn run<T: Send + 'static>(
-        &self,
-        job: impl FnOnce(&AtomicBool) -> Result<T, ProcessingError> + Send + 'static,
-    ) -> Result<T, ProcessingError> {
-        let permit =
-            self.slots.clone().acquire_owned().await.map_err(|_| {
-                ProcessingError::new(503, "parser_closed", "request parser is closed")
-            })?;
-        let canceled = Arc::new(AtomicBool::new(false));
-        let cancel = canceled.clone();
-        let mut task = BlockingTask {
-            canceled,
-            task: tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                check_canceled(&cancel)?;
-                // Log inside the job as well: its caller may already have disconnected.
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&cancel)))
-                    .unwrap_or_else(|panic| {
-                        let detail = panic
-                            .downcast_ref::<String>()
-                            .map(String::as_str)
-                            .or_else(|| panic.downcast_ref::<&str>().copied())
-                            .unwrap_or("non-string panic");
-                        tracing::error!(panic = detail, "request parser panicked");
-                        Err(ProcessingError::new(
-                            500,
-                            "parser_panicked",
-                            "request parser panicked",
-                        ))
-                    })
-            }),
-        };
-        (&mut task.task).await.map_err(|error| {
-            tracing::error!(%error, "request parser task failed");
-            ProcessingError::new(500, "parser_failed", "request parser task failed")
-        })?
     }
 
     pub async fn parse(
         &self,
-        request: RequestEnvelope,
+        mut request: RequestEnvelope,
+        decision_deadline: Instant,
     ) -> Result<(RequestEnvelope, RoutingInput), ProcessingError> {
-        let app = self.app.clone();
-        self.run(move |canceled| {
-            let input = request.parse(&app, canceled)?;
-            Ok((request, input))
-        })
-        .await
+        let deadline = decision_deadline.min(self.pool.prepare_deadline());
+        let lease = self.pool.retain_input(request.raw.len())?;
+        request.input_leases.push(lease);
+        request.input_pool = Some(self.pool.clone());
+        let routing = self.routing.clone();
+        self.pool
+            .try_submit(deadline, move |context| {
+                context.check()?;
+                let parsed = ParsedInference::parse(&request.path, &request.raw)
+                    .map_err(ProcessingError::invalid)?;
+                let (metadata, tokens) = routing.prepare(&parsed, context)?;
+                let input = RoutingInput {
+                    metadata,
+                    tokens,
+                    state_reference: parsed.requires_state_domain(),
+                };
+                Ok::<_, ProcessingError>((request, input))
+            })?
+            .wait()
+            .await?
     }
 }
 
@@ -372,7 +306,11 @@ impl Drop for RequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::core::prepare_pool::PreparePoolRuntime;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     fn envelope(budget: Arc<Semaphore>, size: usize) -> RequestEnvelope {
         let mut request = RequestEnvelope::new(
@@ -418,6 +356,35 @@ mod tests {
         assert_eq!(budget.available_permits(), 1024);
     }
 
+    #[test]
+    fn body_rewrite_keeps_both_input_budgets_until_drop() {
+        let runtime = PreparePoolRuntime::new(crate::core::prepare_pool::PoolConfig {
+            max_retained_input_bytes: 800,
+            ..Default::default()
+        })
+        .unwrap();
+        let pool = runtime.handle();
+        let budget = Arc::new(Semaphore::new(1024));
+        let mut request = envelope(budget.clone(), 300);
+        request.input_leases.push(pool.retain_input(300).unwrap());
+        request.input_pool = Some(pool.clone());
+
+        request.replace_body(vec![b'x'; 700], 1024).unwrap();
+        assert_eq!(pool.stats().retained_input_bytes, 700);
+        assert_eq!(budget.available_permits(), 0);
+        let error = request.replace_body(vec![b'y'; 801], 1024).unwrap_err();
+        assert_eq!(error.code, "prepare_input_budget");
+        assert_eq!(request.raw, vec![b'x'; 700]);
+        assert_eq!(pool.stats().retained_input_bytes, 700);
+
+        request.replace_body(vec![b'z'; 10], 1024).unwrap();
+        // A rewrite can retain the old allocation; release conservatively at drop.
+        assert_eq!(pool.stats().retained_input_bytes, 700);
+        drop(request);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(budget.available_permits(), 1024);
+    }
+
     #[tokio::test]
     async fn tokenization_rejects_oversized_text_and_rendered_chat_prompt() {
         let mut config = crate::config::RouterConfig::default();
@@ -425,10 +392,14 @@ mod tests {
             prefix_token_count: 4,
             load_factor: 1.25,
         };
-        config.ext_proc.max_tokenize_bytes = 4;
-        let mut app = AppContext::from_config(config, 5).await.unwrap();
+        config.prepare_pool.max_tokenize_bytes = Some(4);
+        let _runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let mut app = AppContext::from_config(config, 5, _runtime.handle())
+            .await
+            .unwrap();
         app.tokenizer_registry =
             crate::routers::test_mocks::tokenizer::tokenizer_registry_with_hf("test-model");
+        let parser = RequestParser::new(&app);
         for (path, body) in [
             (
                 "/v1/completions",
@@ -444,70 +415,69 @@ mod tests {
             request
                 .replace_body(body.as_bytes().to_vec(), 1024)
                 .unwrap();
-            let error = request.parse(&app, &AtomicBool::new(false)).err().unwrap();
+            let error = parser
+                .parse(request, parser.pool.prepare_deadline())
+                .await
+                .err()
+                .unwrap();
             assert_eq!(error.status, 413);
             assert_eq!(error.code, "tokenizer_input_too_large");
-            assert_eq!(
-                request
-                    .parse(&app, &AtomicBool::new(true))
-                    .err()
-                    .unwrap()
-                    .code,
-                "parser_canceled"
-            );
         }
     }
 
     #[tokio::test]
-    async fn canceled_parser_holds_real_slot_and_buffer_until_job_exits() {
-        let mut config = crate::config::RouterConfig::default();
-        config.ext_proc.parser_concurrency = 1;
-        let parser = Arc::new(RequestParser::new(Arc::new(
-            AppContext::from_config(config, 5).await.unwrap(),
-        )));
+    async fn canceled_jobs_keep_ext_proc_buffers_until_cleanup() {
+        let runtime = PreparePoolRuntime::new(crate::core::prepare_pool::PoolConfig {
+            workers: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let pool = runtime.handle();
         let budget = Arc::new(Semaphore::new(1024));
-        let request = envelope(budget.clone(), 512);
+        let mut request = envelope(budget.clone(), 512);
+        request.input_leases.push(pool.retain_input(512).unwrap());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let stages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task = tokio::spawn({
-            let parser = parser.clone();
-            let stages = stages.clone();
-            async move {
-                parser
-                    .run(move |canceled| {
-                        let _request = request;
-                        started_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-                        check_canceled(canceled)?;
-                        stages.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    })
-                    .await
-            }
-        });
+        let completed_stages = stages.clone();
+        let running = pool
+            .try_submit(pool.prepare_deadline(), move |context| {
+                let _request = request;
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                context.check()?;
+                completed_stages.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::core::prepare_pool::PrepareError>(())
+            })
+            .unwrap();
+        let task = tokio::spawn(running.wait());
         started_rx.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(parser.slots.available_permits(), 0);
+        assert_eq!(pool.stats().busy_workers, 1);
+        assert_eq!(pool.stats().retained_input_bytes, 512);
         assert_eq!(budget.available_permits(), 512);
 
-        let queued_request = envelope(budget.clone(), 512);
+        let mut queued_request = envelope(budget.clone(), 512);
+        queued_request
+            .input_leases
+            .push(pool.retain_input(512).unwrap());
         let queued_ran = Arc::new(AtomicBool::new(false));
-        let mut queued = Box::pin(parser.run({
-            let ran = queued_ran.clone();
-            move |_| {
+        let ran = queued_ran.clone();
+        let queued = pool
+            .try_submit(pool.prepare_deadline(), move |_| {
                 let _request = queued_request;
                 ran.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }));
-        assert!(futures_util::poll!(&mut queued).is_pending());
+            })
+            .unwrap();
         drop(queued);
-        assert_eq!(budget.available_permits(), 512);
+        // Cancellation retains queued buffers until dequeue.
+        assert_eq!(budget.available_permits(), 0);
+        assert_eq!(pool.stats().retained_input_bytes, 1024);
+        assert_eq!(pool.stats().queued_jobs, 1);
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while parser.slots.available_permits() == 0 {
+            while pool.stats().retained_input_bytes != 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -516,11 +486,5 @@ mod tests {
         assert_eq!(budget.available_permits(), 1024);
         assert_eq!(stages.load(Ordering::SeqCst), 0);
         assert!(!queued_ran.load(Ordering::SeqCst));
-        let error = parser
-            .run::<()>(|_| panic!("test parser panic"))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "parser_panicked");
-        assert_eq!(parser.slots.available_permits(), 1);
     }
 }

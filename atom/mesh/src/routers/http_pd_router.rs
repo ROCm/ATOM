@@ -1959,25 +1959,30 @@ impl RouterTrait for PDRouter {
 
     async fn route_inference(
         &self,
-        request: &super::ingress::InferenceEnvelope,
+        request: super::ingress::InferenceEnvelope,
         app: &Arc<crate::app_context::AppContext>,
     ) -> Response {
         let routing = super::ingress::IngressRouting::new(app);
-        let (metadata, tokens) =
-            match routing.prepare(&request.parsed, &std::sync::atomic::AtomicBool::new(false)) {
-                Ok(prepared) => prepared,
-                Err(err) => return err.response(request.metadata.route),
-            };
+        let resources = routing.clone();
+        let route = request.metadata.route;
+        let (request, (metadata, tokens, body)) = match request
+            .prepare(&app.prepare_pool, move |request, ctx| {
+                let (metadata, tokens) = resources.prepare(&request.parsed, ctx)?;
+                ctx.check()?;
+                let body: Value = serde_json::from_slice(&request.body)
+                    .map_err(|err| error::IngressError::invalid(err.to_string()))?;
+                ctx.check()?;
+                Ok((metadata, tokens, body))
+            })
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(err) => return err.response(route),
+        };
         let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
         {
             Ok(workers) => workers,
             Err(err) => return err.response(metadata.route),
-        };
-        let body: Value = match serde_json::from_slice(&request.body) {
-            Ok(body) => body,
-            Err(err) => {
-                return error::IngressError::invalid(err.to_string()).response(metadata.route)
-            }
         };
         let planner = DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::with_candidates(

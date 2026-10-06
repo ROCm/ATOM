@@ -168,6 +168,16 @@ pub struct IngressError {
     pub code: &'static str,
     pub message: String,
 }
+impl From<crate::core::prepare_pool::PrepareError> for IngressError {
+    fn from(error: crate::core::prepare_pool::PrepareError) -> Self {
+        Self::new(
+            StatusCode::from_u16(error.status_code()).expect("valid prepare error status"),
+            error.code(),
+            error.to_string(),
+        )
+    }
+}
+
 impl IngressError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {

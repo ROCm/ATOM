@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{BasicWorkerBuilder, Worker},
+    core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, Worker},
     ext_proc::ExtProcRuntime,
 };
 use serde_json::{json, Value};
@@ -299,7 +299,12 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
     config.ext_proc.max_body_bytes = 1024;
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{address}"))
             .model_id("test-model")
@@ -420,7 +425,12 @@ async fn real_envoy_preserves_chunked_body_and_bidirectional_trailers() {
     let mut config = RouterConfig::default();
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{worker_address}"))
             .model_id("test-model")
@@ -474,7 +484,12 @@ async fn real_envoy_rejects_incompatible_modes_without_waiting_for_body() {
     let mut config = RouterConfig::default();
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let runtime = ExtProcRuntime::start(app).await.unwrap();
     for (field, mode) in [
         ("request_body_mode", "BUFFERED"),
@@ -522,7 +537,12 @@ async fn real_envoy_local_errors_keep_the_original_status_and_body() {
     let mut config = RouterConfig::default();
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{address}"))
             .model_id("test-model")
@@ -697,7 +717,12 @@ impl PdBackend {
         config.ext_proc.enabled = true;
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
         config.ext_proc.executor_listen = "127.0.0.1:0".parse().unwrap();
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         for prefill in [true, false] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -919,7 +944,12 @@ async fn real_envoy_preserves_correlation_and_filters_client_headers() {
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
         config.request_id_headers =
             custom.then(|| vec!["x-customer-id".into(), "x-correlation-id".into()]);
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         let mut worker =
             BasicWorkerBuilder::new(format!("http://{address}")).model_id("test-model");
         if custom {
@@ -1026,7 +1056,7 @@ mod multi_api;
 async fn real_envoy_three_api_contract_matches_http() {
     for key in [None, Some("worker-secret")] {
         let mut backend = multi_api::Backend::start().await;
-        let (context, worker) = backend.context(key).await;
+        let (context, worker, _prepare_runtime) = backend.context(key).await;
         let mut context = (*context).clone();
         context.router_config.ext_proc.enabled = true;
         context.router_config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
