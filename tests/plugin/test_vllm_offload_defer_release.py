@@ -29,6 +29,8 @@ dense_mod = pytest.importorskip(
     reason="the dense scheduler pulls the offload stack",
 )
 
+from vllm.v1.request import RequestStatus
+
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload import config as offcfg
 
@@ -59,6 +61,8 @@ def _adapter(monkeypatch):
     adapter._scheduler = dense_mod.DenseOffloadScheduler(config)
     adapter._config = config
     adapter._seqs = SeqViewRegistry()
+    adapter._requests = {}
+    adapter._kda_planner = None
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
@@ -295,3 +299,44 @@ def test_the_store_completion_does_not_double_complete_the_save(monkeypatch):
 
     assert second.save_operation != first.save_operation
     assert scheduler._save_inflight == {"r0": second.save_operation}
+
+
+def _finish_after_first_chunk(adapter, status):
+    request, seq = _admit(adapter)
+    (first,) = _emit_save(adapter, seq, 128)
+    _report(adapter, first.save_operation)
+    request.status = status
+    return request, seq
+
+
+def test_a_request_finishing_on_its_last_chunk_still_saves_it(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    request, _seq = _finish_after_first_chunk(
+        adapter, RequestStatus.FINISHED_LENGTH_CAPPED
+    )
+
+    deferred, _ = adapter.request_finished(request, [])
+
+    assert deferred is True, "the last chunk is still to be saved"
+    (final,) = list(scheduler.build_connector_meta().requests)
+    assert final.save_spec.skip_leading_tokens == 128
+    assert len(final.token_ids) == PROMPT
+
+
+def test_an_abort_keeps_the_frontier_vllm_reported(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    request, _seq = _finish_after_first_chunk(adapter, RequestStatus.FINISHED_ABORTED)
+
+    assert adapter.request_finished(request, []) == (False, None)
+    assert list(scheduler.build_connector_meta().requests) == []
+
+
+def test_the_finish_frontier_stops_at_the_block_table(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    request, seq = _finish_after_first_chunk(adapter, RequestStatus.FINISHED_STOPPED)
+    seq.set_block_table([0, 1, 2])
+
+    adapter.request_finished(request, [])
+
+    (final,) = list(scheduler.build_connector_meta().requests)
+    assert len(final.token_ids) == 3 * BLOCK
