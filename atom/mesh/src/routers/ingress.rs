@@ -208,7 +208,7 @@ impl EndpointSpec {
         Ok(())
     }
 
-    fn supports(&self, worker: &dyn Worker) -> bool {
+    pub(crate) fn supports(&self, worker: &dyn Worker) -> bool {
         worker
             .metadata()
             .labels

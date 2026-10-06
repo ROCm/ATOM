@@ -30,6 +30,18 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
 | `GET /v1/models` | Model metadata |
 
+Responses resource operations (GET, DELETE, cancel and input_items) probe regular
+HTTP backends that support `/v1/responses`. A `mesh.apis` label restricts supported
+APIs using comma-separated paths, such as `/v1/chat/completions,/v1/responses`;
+omitting the label preserves the default of accepting all supported API routes.
+
+When multiple eligible backend addresses exist, requests carrying `authorization`
+or `x-api-key` require a configured worker API key for every candidate. Otherwise,
+Mesh returns `503 ambiguous_response_credentials` before contacting any backend.
+A single backend can still receive client credentials when it has no worker key.
+If all probes fail, server errors take precedence over other errors, and a 404
+cannot replace a non-404 error.
+
 ## Installation
 
 ### Prerequisites
