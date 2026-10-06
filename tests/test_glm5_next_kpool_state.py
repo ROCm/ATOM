@@ -236,3 +236,46 @@ def test_decode_tail_fork_reads_input_and_materializes_output_slot():
     assert out.shape == (1, 128)
     assert tail[9, 0, :, 0].cpu().tolist() == [1, 2, 3, 4]
     assert tail[9, 1, :, 0].cpu().tolist() == [11, 12, 13, 14]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises Triton tail copy")
+def test_tail_ring_wider_than_the_pool_is_addressed_by_position():
+    device = torch.device("cuda")
+    kpool = KPOOL_INDEXER.kpool
+    tail = torch.zeros((3, 2, 8, 128), dtype=torch.bfloat16, device=device)
+    keys = torch.randn((12, 128), dtype=torch.bfloat16, device=device)
+    gates = torch.randn_like(keys)
+    ape = torch.randn((4, 128), dtype=torch.float32, device=device)
+    slot = torch.tensor([2], dtype=torch.int32, device=device)
+
+    kpool.kpool_seed_tail(
+        tail,
+        keys[:10],
+        gates[:10],
+        torch.arange(10, dtype=torch.int64, device=device),
+        torch.tensor([0, 10], dtype=torch.int32, device=device),
+        slot,
+        4,
+    )
+    assert torch.equal(tail[2, 0, 0], keys[8]) and torch.equal(tail[2, 0, 1], keys[9])
+    assert torch.equal(tail[2, 1, 1], gates[9])
+
+    for pos in (10, 11):
+        pooled = kpool.kpool_decode_stash_and_pool(
+            tail,
+            keys[pos : pos + 1],
+            gates[pos : pos + 1],
+            torch.tensor([pos], dtype=torch.int64, device=device),
+            slot,
+            ape,
+            4,
+        )
+    assert torch.equal(tail[2, 0, 3], keys[11])
+
+    expected = kpool.pool_compress_ref(
+        keys[8:12].float()[None], gates[8:12].float()[None], ape
+    )
+    expected = kpool.hadamard128_ref(expected.to(torch.bfloat16).float())
+    torch.testing.assert_close(
+        pooled.float(), expected.to(torch.bfloat16).float(), rtol=2e-2, atol=2e-2
+    )
