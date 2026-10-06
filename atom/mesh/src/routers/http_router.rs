@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -21,7 +21,8 @@ use crate::{
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
-        AttachedBody, RetryExecutor, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        AttachedBody, ConnectionMode, RetryExecutor, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -373,17 +374,7 @@ impl Router {
         response
     }
 
-    // Helper: return base worker URL (strips DP suffix when enabled)
-    fn worker_base_url(&self, worker_url: &str) -> String {
-        if self.dp_aware {
-            if let Ok((prefix, _)) = Self::extract_dp_rank(worker_url) {
-                return prefix.to_string();
-            }
-        }
-        worker_url.to_string()
-    }
-
-    // Stored response ownership is backend-local, so probe each distinct origin.
+    // Resource IDs have no model/owner hint, so probe eligible backend origins.
     async fn route_simple_request(
         &self,
         headers: Option<&HeaderMap>,
@@ -395,47 +386,79 @@ impl Router {
         if workers.is_empty() {
             return error::service_unavailable("no_workers", "No available workers");
         }
-        let headers = headers.cloned().unwrap_or_default();
-        let mut origins = HashSet::new();
-        let futures: Vec<_> = workers
-            .into_iter()
-            .filter_map(|worker| {
-                let base = self.worker_base_url(worker.url());
-                origins.insert(base.clone()).then_some((worker, base))
-            })
-            .map(|(worker, base)| {
-                let url = match query {
-                    Some(query) => format!("{base}/{endpoint}?{query}"),
-                    None => format!("{base}/{endpoint}"),
-                };
-                let client = self.client.clone();
-                let method = method.clone();
-                let headers = header_utils::inference_request_headers(
-                    &headers,
-                    "/v1/responses",
-                    worker.api_key().as_deref(),
-                );
-                async move {
-                    let headers = headers.map_err(|_| {
-                        error::service_unavailable(
-                            "invalid_backend_credentials",
-                            "configured worker credential is not a valid HTTP header",
-                        )
-                    })?;
-                    client
-                        .request(method, url)
-                        .headers(headers)
-                        .send()
-                        .await
-                        .map_err(convert_reqwest_error)
+        let api = super::ingress::EndpointSpec::find("/v1/responses")
+            .expect("Responses endpoint is registered");
+        let mut origins = BTreeMap::new();
+        for worker in workers.into_iter().filter(|worker| {
+            matches!(worker.connection_mode(), ConnectionMode::Http)
+                && matches!(worker.worker_type(), WorkerType::Regular)
+                && api.supports(worker.as_ref())
+        }) {
+            // An unhealthy worker can still own the requested resource.
+            let key = worker.api_key().clone();
+            match origins.entry(worker.base_url().trim_end_matches('/').to_owned()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(key);
                 }
-            })
-            .collect();
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    if entry.get() != &key {
+                        return error::service_unavailable(
+                            "conflicting_backend_credentials",
+                            "Responses workers at the same backend URL must use the same credential",
+                        );
+                    }
+                }
+            }
+        }
+        if origins.is_empty() {
+            return error::not_implemented(
+                "unsupported_api",
+                "no configured HTTP backend supports Responses resource operations",
+            );
+        }
+        let headers = headers.cloned().unwrap_or_default();
+        if origins.len() > 1
+            && (headers.contains_key("authorization") || headers.contains_key("x-api-key"))
+            && origins.values().any(Option::is_none)
+        {
+            return error::service_unavailable(
+                "ambiguous_response_credentials",
+                "Responses resource lookup cannot forward client credentials to multiple backends; configure a worker API key for each backend or use a single backend",
+            );
+        }
 
+        // Validate every credential before sending any DELETE or cancel request.
+        let mut requests = Vec::with_capacity(origins.len());
+        for (base, key) in origins {
+            let headers = match header_utils::inference_request_headers(
+                &headers,
+                "/v1/responses",
+                key.as_deref(),
+            ) {
+                Ok(headers) => headers,
+                Err(_) => {
+                    return error::service_unavailable(
+                        "invalid_backend_credentials",
+                        "configured worker credential is not a valid HTTP header",
+                    );
+                }
+            };
+            let url = match query {
+                Some(query) => format!("{base}/{endpoint}?{query}"),
+                None => format!("{base}/{endpoint}"),
+            };
+            requests.push(self.client.request(method.clone(), url).headers(headers));
+        }
+        let futures = requests
+            .into_iter()
+            .enumerate()
+            .map(|(index, request)| async move {
+                (index, request.send().await.map_err(convert_reqwest_error))
+            });
         let mut stream = stream::iter(futures).buffer_unordered(32);
-        let mut last_response = None;
-        while let Some(result) = stream.next().await {
-            match result {
+        let mut best_error: Option<((u8, usize), Response)> = None;
+        while let Some((index, result)) = stream.next().await {
+            let response = match result {
                 Ok(upstream) => {
                     let status = upstream.status();
                     let headers = header_utils::preserve_response_headers(upstream.headers());
@@ -446,12 +469,29 @@ impl Router {
                     if status.is_success() {
                         return response;
                     }
-                    last_response = Some(response);
+                    response
                 }
-                Err(response) => last_response = Some(response),
+                Err(response) => response,
+            };
+            let status = response.status();
+            let priority = if status.is_server_error() {
+                0
+            } else if status == StatusCode::NOT_FOUND {
+                2
+            } else {
+                1
+            };
+            // Prefer server failures, then non-404 errors; ties follow URL order.
+            let rank = (priority, index);
+            if best_error
+                .as_ref()
+                .is_none_or(|(current, _)| rank < *current)
+            {
+                best_error = Some((rank, response));
             }
         }
-        last_response
+        best_error
+            .map(|(_, response)| response)
             .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
 
@@ -985,40 +1025,6 @@ mod tests {
     fn test_extract_dp_rank_multiple_at() {
         let result = Router::extract_dp_rank("http://worker@8000@2");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_worker_base_url() {
-        let router = create_test_regular_router();
-        assert_eq!(
-            router.worker_base_url("http://worker:8000"),
-            "http://worker:8000"
-        );
-    }
-
-    #[test]
-    fn test_worker_base_url_dp_aware() {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::RoundRobin,
-        ));
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
-        ));
-        let router = Router {
-            worker_registry,
-            planner,
-            policies: Arc::new(PolicyRegistryAdapter::new(policy_registry)),
-            dp_aware: true,
-            client: Client::new(),
-            retry_config: RetryConfig::default(),
-        };
-        // With dp_aware, should extract base URL before @
-        assert_eq!(
-            router.worker_base_url("http://worker:8000@2"),
-            "http://worker:8000"
-        );
     }
 
     #[test]

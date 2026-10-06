@@ -38,6 +38,7 @@ The `common/` directory provides shared test utilities used across all test modu
 | `parser_endpoints_test.rs` | 12 | Tests for `/parse/function_call` and `/parse/reasoning` endpoints. Verifies function call extraction from model output and reasoning/thinking block parsing. |
 | `request_formats_test.rs` | 6 | Request format validation for `/generate`, `/v1/chat/completions`, and `/v1/completions`. Tests various payload shapes: text, input_ids, batch requests, sampling params, and special parameters (logprobs, json_schema, ignore_eos). |
 | `proxy_contract_test.rs` | 7 | Request/response preservation, API errors, cancellation, and Responses resource forwarding. |
+| `resource_fanout_test.rs` | 7 | Responses resource candidate filtering, credential checks, DP address deduplication, concurrent error selection and streaming. |
 | `responses_api_test.rs` | 11 | Responses API (conversations) CRUD operations. Tests creating, listing, retrieving, and deleting conversation sessions via the conversation handlers. |
 | `streaming_tests.rs` | 7 | SSE streaming response tests. Verifies streaming output for `/generate` and `/v1/chat/completions`, including chunked transfer and stream termination. |
 
