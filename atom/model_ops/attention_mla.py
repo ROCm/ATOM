@@ -174,6 +174,12 @@ def _sparse_index_workspace(
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (  # isort: skip
+    # Triton BF16 batched GEMM (Y[i] = X[i] @ W[i]^T). Used for the BF16 MLA-absorb
+    # path: gfx1250 hipBLASLt's bf16 batched GEMM (what torch.bmm dispatches to)
+    # memory-faults, so route BF16 absorb through this Triton kernel instead.
+    batched_gemm_bf16 as _aiter_triton_bf16_bmm,
+)
 
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
@@ -418,6 +424,17 @@ def qrep_tp_override(tp_size: int) -> dict:
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
+
+
+def _mla_absorb_bf16_enabled() -> bool:
+    """Keep the MLA-absorb weights (W_K/W_V from kv_b_proj, the absorbed up-proj
+    matrices) in BF16 instead of per-batched-tensor FP8. Mirrors sglang
+    SGLANG_MLA_ABSORB_BF16 (PR #31604): on the tight MLPerf DeepSeek-R1 accuracy
+    gate the low-precision absorb bmm is decisive, and BF16 recovers the margin.
+    Default off (unchanged FP8 behavior)."""
+    import os
+
+    return os.environ.get("ATOM_MLA_ABSORB_BF16", "0") == "1"
 
 
 def _maybe_view_mxfp4_weight_for_gather(
@@ -1204,27 +1221,41 @@ class MLAAttention(nn.Module):
             )
             W_K = W_UK.transpose(0, 1)  # 16 512 128
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
-            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=dtypes.fp8
-            )
-            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=dtypes.fp8
-            )
+            absorb_bf16 = _mla_absorb_bf16_enabled()
+            if absorb_bf16:
+                # BF16 absorb: keep the up-proj matrices in BF16 and skip the
+                # per-batched-tensor FP8 quant; the bmm sites run torch.bmm. A
+                # None scale is the BF16 marker the bmm paths branch on.
+                self.W_K, self.W_K_scale = W_K.contiguous(), None
+                self.W_V, self.W_V_scale = W_V.contiguous(), None
+            else:
+                self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
+                    W_K, dtype=dtypes.fp8
+                )
+                self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
+                    W_V, dtype=dtypes.fp8
+                )
             if self.qrep_enabled:
                 # Gather bf16 and quantize once: gathering fp8 would need the
                 # per-rank scalar scales stitched together. Head order already
                 # matches the effective-TP q_proj shard. self.W_K stays for prefill.
                 W_K_qrep = self.dcp_group.all_gather(W_K.contiguous(), dim=0)
-                self.W_K_qrep, self.W_K_qrep_scale = dynamic_per_batched_tensor_quant(
-                    W_K_qrep, dtype=dtypes.fp8
-                )
+                if absorb_bf16:
+                    self.W_K_qrep, self.W_K_qrep_scale = W_K_qrep.contiguous(), None
+                else:
+                    self.W_K_qrep, self.W_K_qrep_scale = (
+                        dynamic_per_batched_tensor_quant(W_K_qrep, dtype=dtypes.fp8)
+                    )
             if self.pbm_enabled:
                 # PBM projects the head-gathered output, i.e. before the merge
                 # would have cut it back to this rank's heads -- so W_V must too.
                 W_V_dcp = self.dcp_group.all_gather(W_V.contiguous(), dim=0)
-                self.W_V_dcp, self.W_V_dcp_scale = dynamic_per_batched_tensor_quant(
-                    W_V_dcp, dtype=dtypes.fp8
-                )
+                if absorb_bf16:
+                    self.W_V_dcp, self.W_V_dcp_scale = W_V_dcp.contiguous(), None
+                else:
+                    self.W_V_dcp, self.W_V_dcp_scale = dynamic_per_batched_tensor_quant(
+                        W_V_dcp, dtype=dtypes.fp8
+                    )
 
     def _local_q_proj(self):
         """This rank's rows of the QREP-widened q_proj, built on first use.
@@ -1409,6 +1440,12 @@ class MLAAttention(nn.Module):
             )
             # x = x.transpose(0, 1).flatten(1, 2)
             x = output
+        elif W_V_scale is None:
+            # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
+            # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
+            # X @ W^T with W (B,N,K): x (N,B,L) @ W_V (N,V,L)^T -> (N,B,V), then
+            # -> (B,N,V) to match the fp8/fp4 output layout.
+            x = _aiter_triton_bf16_bmm(x, W_V).transpose(0, 1)
         else:
             x = _aiter_triton_fp8_bmm(
                 x, W_V, W_V_scale, group_size=128, transpose_bm=True
@@ -1457,6 +1494,12 @@ class MLAAttention(nn.Module):
                 prequant=True,
                 y_scale=None,
             )
+        elif W_K_scale is None:
+            # BF16 absorb via Triton batched GEMM (gfx1250-safe; torch.bmm's
+            # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
+            # X @ W^T with W (B,N,K): q_nope (N,B,P) @ W_K (N,L,P)^T -> (N,B,L),
+            # then -> (B,N,L) to match the fp8/fp4 output layout.
+            ql_nope = _aiter_triton_bf16_bmm(q_nope, W_K).transpose(0, 1)
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
