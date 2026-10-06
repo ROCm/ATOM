@@ -14,6 +14,7 @@ every metric otherwise healthy.
 
 from __future__ import annotations
 
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -301,6 +302,18 @@ def test_the_store_completion_does_not_double_complete_the_save(monkeypatch):
     assert scheduler._save_inflight == {"r0": second.save_operation}
 
 
+class _Pool:
+    def __init__(self, n: int = 8) -> None:
+        self.blocks = [SimpleNamespace(block_id=i) for i in range(n)]
+        self.held = Counter()
+
+    def touch(self, blocks) -> None:
+        self.held.update(b.block_id for b in blocks)
+
+    def free_blocks(self, blocks) -> None:
+        self.held.subtract(b.block_id for b in blocks)
+
+
 def _finish_after_first_chunk(adapter, status):
     request, seq = _admit(adapter)
     (first,) = _emit_save(adapter, seq, 128)
@@ -340,3 +353,21 @@ def test_the_finish_frontier_stops_at_the_block_table(monkeypatch):
 
     (final,) = list(scheduler.build_connector_meta().requests)
     assert len(final.token_ids) == 3 * BLOCK
+
+
+def test_an_idle_engine_keeps_stepping_until_the_final_save_lands(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    adapter._gpu_block_pool = pool = _Pool()
+    request, _seq = _finish_after_first_chunk(
+        adapter, RequestStatus.FINISHED_LENGTH_CAPPED
+    )
+
+    assert adapter.request_finished(request, []) == (False, None)
+    assert +pool.held == Counter({2: 1, 3: 1})
+    assert adapter.has_pending_push_work()
+
+    (final,) = list(scheduler.build_connector_meta().requests)
+    _report(adapter, final.save_operation)
+
+    assert +pool.held == Counter()
+    assert not adapter.has_pending_push_work()

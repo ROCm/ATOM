@@ -1186,7 +1186,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self._kda_planner is not None and self._kda_planner.has_pending_work():
             return True
-        return bool(self._deferred_frees or self._releases_in_flight)
+        if self._deferred_frees or self._releases_in_flight:
+            return True
+        pending = getattr(self._scheduler, "has_pending_work", None)
+        return bool(pending is not None and pending())
 
     # Steps a promised load may go undispatched before it is called out. Loads
     # are emitted on the step after the promise, so anything past a handful of
