@@ -8,6 +8,19 @@ This document describes the environment variables used in the ATOM project.
 |----------|------|---------|-------------|
 | **ATOM_H2D_BACKEND** | str | `packed` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
 
+## Experimental MiniMax-M3 replicated o-projection
+
+`ATOM_M3_TP_REPLICATED_O_PROJ=1` selects TP-sharded QKV and replicated `o_proj`
+weights with `--tensor-parallel-size 4 --sequence-parallel-size 1`. It exchanges
+attention output heads for local token chunks, gathers FFN inputs, and adds each
+rank's owned attention output before one TP all-reduce. Default: `0` (existing TP/SP
+behavior). Requires native BF16 MiniMax-M3, DP1/PP1/PCP1/DCP1, without EP, TBO,
+indexer CP or speculative decoding.
+
+QuickReduce quantizes the combined attention/FFN increment; the accumulated
+replicated residual stays outside the collective. See the [dataflow and validation notes](
+experiments/m3_tp_replicated_o_proj.md) before using it for comparisons.
+
 ## Data parallelism
 
 | Variable | Type | Default | Description |
