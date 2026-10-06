@@ -155,6 +155,15 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MEGA_MASK_PAD_ROWS** | bool | 0 (false) | If set to `1`, the MegaMoE backend (`--moe-backend mega`) routes this rank's DP pad rows (past `scheduled_tokens` on a step padded to the DP group's `running_tokens`) to expert `-1`: they are not dispatched or computed and come back as zeros, so identical pad rows also stop piling onto the same experts. Covers target and draft passes, eager and CUDA graph. With an aiter whose MegaMoEV2 masks `-1` slots in combine (`supports_combine_mask`) the op returns the zeros; otherwise each MoE layer pays one extra select. Not used by plugin frontends. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
+## EPLB
+
+Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
+(`load_window_size`, `rebalance_interval`, `rebalance_min_balancedness`, ...).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_EPLB_MAX_REBALANCES** | int | 0 (no limit) | Stop periodic rebalancing once this many rebalances have run, and serve with that expert placement for the rest of the process: balance on early traffic, then pay no further migrations. Only rebalances that run count; an interval the balancedness gate skips does not. The limit is checked after a rebalance's last migration chunk commits, on every rank in lockstep; after it, the manager also stops reducing the per-step has-prefill flag. Load recording continues (its buffers are fixed for CUDA graphs) but is no longer read. `0` or a negative value keeps rebalancing for the life of the process. Read when the EPLB manager is built, so set it before the server starts. |
+
 ## Fusion passes
 
 ### RMSNorm

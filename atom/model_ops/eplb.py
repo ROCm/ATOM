@@ -10,6 +10,8 @@ from typing import Any
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.utils import envs
+
 try:
     import triton
     import triton.language as tl
@@ -1640,6 +1642,9 @@ class EPLBManager:
             "min",
             "mean",
         ), "eplb_rebalance_balancedness_agg must be one of {'min','mean'}"
+        # 0 = rebalance for the life of the process.
+        self.max_rebalances = max(0, envs.ATOM_EPLB_MAX_REBALANCES)
+        self._rebalancing_stopped = False
         self._gen = self._entrypoint()
         self._rebalance_count = 0
         self._last_balancedness: float | None = None
@@ -2049,12 +2054,19 @@ class EPLBManager:
     def last_balancedness(self) -> float | None:
         return self._last_balancedness
 
+    @property
+    def rebalancing_stopped(self) -> bool:
+        return self._rebalancing_stopped
+
     def on_forward_pass_end(
         self,
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
     ) -> None:
-        if not self.enabled:
+        # Once stopped there is nothing left to schedule, so skip the per-step
+        # has-prefill reduction too. The stop latches on the same step on every
+        # rank (rebalance counts move in lockstep), so all ranks skip it together.
+        if not self.enabled or self._rebalancing_stopped:
             return
 
         # Resolve a migration-group-uniform has-prefill flag.
@@ -2098,11 +2110,28 @@ class EPLBManager:
         first_window = max(1, self.rebalance_interval // 4)
         for _ in range(first_window):
             yield
-        yield from self._rebalance()
-        while True:
+        while not self._max_rebalances_reached():
+            yield from self._rebalance()
+            if self._max_rebalances_reached():
+                break
             for _ in range(self.rebalance_interval):
                 yield
-            yield from self._rebalance()
+        self._stop_rebalancing()
+        # Never finish: a caller that still advances the generator idles here.
+        while True:
+            yield
+
+    def _max_rebalances_reached(self) -> bool:
+        return 0 < self.max_rebalances <= self._rebalance_count
+
+    def _stop_rebalancing(self) -> None:
+        self._rebalancing_stopped = True
+        logger.info(
+            "EPLB stopped after %d rebalances (ATOM_EPLB_MAX_REBALANCES=%d); "
+            "the current expert placement is kept from now on",
+            self._rebalance_count,
+            self.max_rebalances,
+        )
 
     def _rebalance(self):
         """Periodic rebalance generator (with balancedness gate).
