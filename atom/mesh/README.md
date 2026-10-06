@@ -42,6 +42,12 @@ A single backend can still receive client credentials when it has no worker key.
 If all probes fail, server errors take precedence over other errors, and a 404
 cannot replace a non-404 error.
 
+DP-aware forwarding writes the selected worker's rank to `data_parallel_rank` in
+the request body, including Messages and Responses, overriding any client value.
+The backend must consume that field to route to the selected rank. Verify support
+for each backend and API before including it in a DP worker's `mesh.apis` label;
+accepting an unknown JSON field does not establish rank-routing support.
+
 ## Installation
 
 ### Prerequisites
