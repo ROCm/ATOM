@@ -6,6 +6,7 @@ use crate::protocols::{
     generate::GenerateRequest,
     validated::Normalizable,
 };
+use serde::{Serialize, Serializer};
 use validator::Validate;
 
 #[derive(Debug, Clone)]
@@ -410,6 +411,23 @@ impl ParsedInference {
         }
     }
 }
+
+// Keep stable context before input without cloning the request.
+struct RoutingView<'a> {
+    body: &'a serde_json::Value,
+    keys: &'static [&'static str],
+}
+
+impl Serialize for RoutingView<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.keys
+                .iter()
+                .filter_map(|key| self.body.get(*key).map(|value| (*key, value))),
+        )
+    }
+}
+
 impl InferenceRequest for ParsedInference {
     fn metadata(&self) -> InferenceMetadata {
         self.metadata_with_text(true)
@@ -422,22 +440,19 @@ impl InferenceRequest for ParsedInference {
             Self::Messages(body) | Self::Responses(body) => {
                 let messages = matches!(self, Self::Messages(_));
                 let keys: &[&str] = if messages {
-                    &["system", "messages", "tools", "tool_choice"]
+                    &["system", "tools", "tool_choice", "messages"]
                 } else {
                     &[
                         "instructions",
-                        "input",
                         "tools",
                         "tool_choice",
+                        "input",
                         "previous_response_id",
                         "conversation",
                     ]
                 };
                 let text = if include_text {
-                    let view: std::collections::BTreeMap<&str, &serde_json::Value> = keys
-                        .iter()
-                        .filter_map(|key| body.get(*key).map(|v| (*key, v)))
-                        .collect();
+                    let view = RoutingView { body, keys };
                     serde_json::to_string(&view).expect("JSON values are serializable")
                 } else {
                     String::new()
