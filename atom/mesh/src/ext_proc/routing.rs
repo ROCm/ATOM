@@ -156,10 +156,9 @@ impl EndpointRouter {
         };
         if worker.is_dp_aware() {
             let body = serde_json::from_slice(&request.raw)?;
-            let body = worker
-                .prepare_request(body)
-                .await
-                .map_err(|e| ProcessingError::invalid(e.to_string()))?;
+            let body = worker.prepare_request(body).await.map_err(|e| {
+                ProcessingError::new(500, "worker_request_preparation_failed", e.to_string())
+            })?;
             request.replace_body(
                 serde_json::to_vec(&body)?,
                 self.app.router_config.ext_proc.max_body_bytes,

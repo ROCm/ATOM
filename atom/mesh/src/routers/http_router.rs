@@ -146,7 +146,14 @@ impl Router {
             };
             let body = match worker.prepare_request(body).await {
                 Ok(body) => body,
-                Err(err) => return IngressError::invalid(err.to_string()).response(metadata.route),
+                Err(err) => {
+                    return IngressError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "worker_request_preparation_failed",
+                        err.to_string(),
+                    )
+                    .response(metadata.route)
+                }
             };
             builder = builder.json(&body);
         } else {

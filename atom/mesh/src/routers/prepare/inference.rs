@@ -152,6 +152,15 @@ impl ParsedInference {
         ["previous_response_id", "conversation"]
             .iter()
             .any(|key| body.get(*key).is_some_and(|v| !v.is_null()))
+            || body
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str)
+                            == Some("item_reference")
+                    })
+                })
     }
 
     fn validate_api_body(body: &serde_json::Value, messages: bool) -> Result<(), String> {
