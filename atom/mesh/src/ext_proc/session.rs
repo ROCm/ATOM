@@ -441,7 +441,9 @@ impl Session {
         Box::pin(async move {
             let started = Instant::now();
             let prepared = timeout(decision_timeout, async {
-                let (mut request, input) = parser.parse(request).await?;
+                let (mut request, input) = parser
+                    .parse(request, started.into_std() + decision_timeout)
+                    .await?;
                 let mut observation = crate::observability::request::RequestMetrics::new(
                     "ext_proc",
                     backend,

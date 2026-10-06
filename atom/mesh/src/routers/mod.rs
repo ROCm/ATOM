@@ -47,7 +47,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Raw ingress dispatch. Native backends retain their existing typed API handling.
     async fn route_inference(
         &self,
-        request: &ingress::InferenceEnvelope,
+        request: ingress::InferenceEnvelope,
         _app: &std::sync::Arc<crate::app_context::AppContext>,
     ) -> Response {
         use prepare::inference::ParsedInference;

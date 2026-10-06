@@ -30,8 +30,6 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
 | `GET /v1/models` | Model metadata |
 
-See the [multi-API compatibility guide](../../docs/mesh_multi_api_guide.md) for the HTTP/ext-proc support matrix, headers, backend capabilities and state-routing limits.
-
 ## Installation
 
 ### Prerequisites

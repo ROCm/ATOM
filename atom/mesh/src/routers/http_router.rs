@@ -669,17 +669,23 @@ impl RouterTrait for Router {
 
     async fn route_inference(
         &self,
-        request: &super::ingress::InferenceEnvelope,
+        request: super::ingress::InferenceEnvelope,
         app: &Arc<AppContext>,
     ) -> Response {
         use super::ingress::IngressRouting;
         use crate::core::placement::traits::PolicySource;
         let routing = IngressRouting::new(app);
-        let (metadata, tokens) =
-            match routing.prepare(&request.parsed, &std::sync::atomic::AtomicBool::new(false)) {
-                Ok(prepared) => prepared,
-                Err(err) => return err.response(request.metadata.route),
-            };
+        let resources = routing.clone();
+        let route = request.metadata.route;
+        let (request, (metadata, tokens)) = match request
+            .prepare(&app.prepare_pool, move |request, ctx| {
+                resources.prepare(&request.parsed, ctx)
+            })
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(err) => return err.response(route),
+        };
         let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
         {
             Ok(workers) => workers,
@@ -713,7 +719,7 @@ impl RouterTrait for Router {
             &self.retry_config,
             |_| async {
                 let response = self
-                    .send_inference_once(request, &descriptor, &planner, policy.clone())
+                    .send_inference_once(&request, &descriptor, &planner, policy.clone())
                     .await;
                 MeshMetrics::record_router_upstream_response(
                     metrics_labels::ROUTER_HTTP,

@@ -423,6 +423,7 @@ mod admission_tests {
             crate::app_context::AppContextBuilder::from_config(config, 5)
                 .await
                 .unwrap()
+                .prepare_pool(crate::core::prepare_pool::PrepareHandle::closed())
                 .rate_limiter(Some(bucket.clone()))
                 .build()
                 .unwrap(),

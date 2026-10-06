@@ -7,7 +7,7 @@ use data_connector::{
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{LoadMonitor, WorkerRegistry},
+    core::{prepare_pool::PreparePoolRuntime, LoadMonitor, WorkerRegistry},
     middleware::TokenBucket,
     policies::PolicyRegistry,
     routers::RouterTrait,
@@ -22,7 +22,8 @@ pub fn create_test_app(
     router: Arc<dyn RouterTrait>,
     client: Client,
     router_config: &RouterConfig,
-) -> Router {
+) -> (Router, PreparePoolRuntime) {
+    let prepare_runtime = PreparePoolRuntime::new(router_config.resolved_prepare_pool()).unwrap();
     // Initialize rate limiter
     let rate_limiter = match router_config.max_concurrent_requests {
         n if n <= 0 => None,
@@ -62,6 +63,7 @@ pub fn create_test_app(
     // Create AppContext using builder pattern
     let app_context = Arc::new(
         AppContext::builder()
+            .prepare_pool(prepare_runtime.handle())
             .router_config(router_config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
@@ -98,10 +100,13 @@ pub fn create_test_app(
     });
 
     // Use the actual server's build_app function
-    build_app(
-        app_state,
-        router_config.max_payload_size,
-        request_id_headers,
+    (
+        build_app(
+            app_state,
+            router_config.max_payload_size,
+            request_id_headers,
+        ),
+        prepare_runtime,
     )
 }
 
@@ -141,8 +146,9 @@ pub fn create_test_app_with_context(
 
 /// Create a minimal test AppContext for unit tests
 #[allow(dead_code)]
-pub async fn create_test_app_context() -> Arc<AppContext> {
+pub async fn create_test_app_context() -> (Arc<AppContext>, PreparePoolRuntime) {
     let router_config = RouterConfig::default();
+    let prepare_runtime = PreparePoolRuntime::new(router_config.resolved_prepare_pool()).unwrap();
     let client = Client::new();
 
     // Initialize empty OnceLocks
@@ -158,8 +164,9 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
     let conversation_storage = Arc::new(MemoryConversationStorage::new());
     let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
 
-    Arc::new(
+    let app_context = Arc::new(
         AppContext::builder()
+            .prepare_pool(prepare_runtime.handle())
             .router_config(router_config)
             .client(client)
             .rate_limiter(None)
@@ -176,5 +183,6 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .workflow_engines(workflow_engines)
             .build()
             .unwrap(),
-    )
+    );
+    (app_context, prepare_runtime)
 }

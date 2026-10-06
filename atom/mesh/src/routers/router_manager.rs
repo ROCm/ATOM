@@ -298,7 +298,7 @@ impl RouterTrait for RouterManager {
 
     async fn route_inference(
         &self,
-        request: &super::ingress::InferenceEnvelope,
+        request: super::ingress::InferenceEnvelope,
         app: &Arc<AppContext>,
     ) -> Response {
         match self

@@ -155,6 +155,35 @@ pub fn parse_from(py: Python<'_>, args: Vec<String>) -> PyResult<Py<PyDict>> {
     )?;
     cli_args_dict.set_item("request_id_headers", cli_args.request_id_headers)?;
     cli_args_dict.set_item("request_timeout_secs", cli_args.request_timeout_secs)?;
+    cli_args_dict.set_item("prepare_workers", cli_args.prepare_pool.workers)?;
+    cli_args_dict.set_item(
+        "prepare_queue_capacity",
+        cli_args.prepare_pool.queue_capacity,
+    )?;
+    cli_args_dict.set_item(
+        "prepare_max_retained_input_bytes",
+        cli_args.prepare_pool.max_retained_input_bytes,
+    )?;
+    cli_args_dict.set_item(
+        "prepare_queue_timeout_ms",
+        cli_args.prepare_pool.queue_timeout_ms,
+    )?;
+    cli_args_dict.set_item(
+        "prepare_timeout_ms",
+        cli_args.prepare_pool.prepare_timeout_ms,
+    )?;
+    cli_args_dict.set_item(
+        "prepare_shutdown_grace_ms",
+        cli_args.prepare_pool.shutdown_grace_ms,
+    )?;
+    cli_args_dict.set_item(
+        "prepare_max_tokenize_bytes",
+        cli_args.prepare_pool.max_tokenize_bytes,
+    )?;
+    cli_args_dict.set_item(
+        "prepare_parse_inline_max_bytes",
+        cli_args.prepare_pool.parse_inline_max_bytes,
+    )?;
     cli_args_dict.set_item(
         "shutdown_grace_period_secs",
         cli_args.shutdown_grace_period_secs,
@@ -265,10 +294,47 @@ pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "ext-proc"))]
-mod ext_proc_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
+    #[test]
+    fn python_parser_preserves_prepare_pool_options() {
+        Python::attach(|py| {
+            let parsed = parse_from(
+                py,
+                vec![
+                    "--prepare-workers".into(),
+                    "2".into(),
+                    "--prepare-max-tokenize-bytes".into(),
+                    "8192".into(),
+                ],
+            )
+            .unwrap();
+            let cli = parsed.bind(py).get_item("cli_args").unwrap().unwrap();
+            assert_eq!(
+                cli.get_item("prepare_workers")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                cli.get_item("prepare_max_tokenize_bytes")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                8192
+            );
+            let object = parsed.bind(py).get_item("server_config").unwrap().unwrap();
+            let config: PyRef<'_, PyServerConfig> = object.extract().unwrap();
+            let router = &config.inner.as_ref().unwrap().router_config;
+            assert_eq!(router.resolved_prepare_workers(), 2);
+            assert_eq!(router.resolved_max_tokenize_bytes(), 8192);
+        });
+    }
+
+    #[cfg(feature = "ext-proc")]
     #[test]
     fn python_parser_preserves_ext_proc_server_configuration() {
         Python::attach(|py| {
@@ -286,6 +352,15 @@ mod ext_proc_tests {
             let ext_proc = &config.inner.as_ref().unwrap().router_config.ext_proc;
             assert!(ext_proc.enabled);
             assert_eq!(ext_proc.listen.port(), 9012);
+            assert_eq!(
+                config
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .router_config
+                    .resolved_prepare_workers(),
+                10
+            );
         });
     }
 }

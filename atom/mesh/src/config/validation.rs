@@ -5,6 +5,7 @@ pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        config.prepare_pool.validate()?;
         #[cfg(feature = "ext-proc")]
         config.ext_proc.validate(config)?;
         Self::validate_mode(&config.mode)?;
@@ -401,6 +402,26 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::core::ConnectionMode;
+
+    #[test]
+    fn prepare_pool_validation_is_independent_of_ext_proc() {
+        for invalidate in [
+            |config: &mut PreparePoolConfig| config.workers = Some(0),
+            |config: &mut PreparePoolConfig| config.queue_capacity = 0,
+            |config: &mut PreparePoolConfig| config.queue_capacity = usize::MAX,
+            |config: &mut PreparePoolConfig| config.max_retained_input_bytes = 0,
+            |config: &mut PreparePoolConfig| config.queue_timeout_ms = 0,
+            |config: &mut PreparePoolConfig| config.prepare_timeout_ms = 0,
+            |config: &mut PreparePoolConfig| config.shutdown_grace_ms = 0,
+            |config: &mut PreparePoolConfig| config.max_tokenize_bytes = Some(0),
+        ] {
+            let mut config = RouterConfig::default();
+            invalidate(&mut config.prepare_pool);
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("prepare_pool."), "{error}");
+        }
+        RouterConfig::default().validate().unwrap();
+    }
 
     #[test]
     fn test_validate_regular_mode() {

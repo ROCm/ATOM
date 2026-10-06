@@ -17,6 +17,7 @@ pub mod error;
 pub mod job_queue;
 pub mod listener;
 pub mod placement;
+pub mod prepare_pool;
 pub mod retry;
 pub mod steps;
 pub mod tls;

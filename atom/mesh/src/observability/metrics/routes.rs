@@ -39,6 +39,9 @@ async fn liveness() -> Response {
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    if state.context.prepare_pool.stats().failed {
+        return prepare_pool_unavailable();
+    }
     let workers = state.context.worker_registry.get_all();
     let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
@@ -82,7 +85,21 @@ async fn health(_state: State<Arc<AppState>>) -> Response {
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if state.context.prepare_pool.stats().failed {
+        return prepare_pool_unavailable();
+    }
     state.router.health_generate(req).await
+}
+
+fn prepare_pool_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "status": "not ready",
+            "reason": "request preparation worker failed"
+        })),
+    )
+        .into_response()
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
