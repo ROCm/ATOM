@@ -530,18 +530,75 @@ def test_a_partial_shm_or_ipc_reload_keeps_it(path):
 
 
 @pytest.mark.parametrize("path", ["shm", "ipc"])
-def test_a_requantisation_that_did_not_write_is_not_counted(monkeypatch, path):
+def test_a_requantisation_that_did_not_write_fails_the_reload(monkeypatch, path):
     """Counted as updated regardless, a reload that wrote nothing reported
-    success and lifted the fence over the old weights."""
+    success and lifted the fence over the old weights. Counted as skipped, it
+    still answered with a count, which said nothing of the stale weight."""
     monkeypatch.setattr(
         WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: False
     )
     runner = _fenced(_Runner(_fp8_model()))
     incoming = {"layer.weight": torch.ones(4, HIDDEN, dtype=torch.bfloat16)}
 
-    assert _legacy_reload(runner, path, incoming) == 0
+    with pytest.raises(RuntimeError, match=r"could not be written.*'layer\.weight'"):
+        _legacy_reload(runner, path, incoming)
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
+
+
+# ── a direct update that leaves a parameter it named stale fails ───────────
+
+
+def _direct_reload(runner, path, checkpoint):
+    if path == "direct":
+        return runner.update_weights(list(checkpoint.items()))
+    return _legacy_reload(runner, path, checkpoint)
+
+
+@pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
+def test_a_weight_that_does_not_fit_its_parameter_fails_the_update(path):
+    """Logged and counted as skipped, it was answered with the count of the
+    rest: a success, over a parameter still holding its earlier value."""
+    runner = _Runner(_dense_model())
+    ckpt = _dense_checkpoint(fill=2.0)
+    ckpt["attn.o_proj.weight"] = torch.ones(HIDDEN + 1, 4, dtype=torch.bfloat16)
+
+    with pytest.raises(
+        RuntimeError, match=r"could not be written.*'attn\.o_proj\.weight'"
+    ):
+        _direct_reload(runner, path, ckpt)
+    # The rest of the batch still lands, and is finalised, rather than being
+    # left half-done as well.
+    assert runner.model.attn.qkv_proj.weight.eq(2.0).all()
+    assert runner.model.attn.o_proj.weight.eq(0.0).all()
+    assert runner.kv_cleared == 1
+
+
+@pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
+def test_a_name_the_model_has_no_parameter_for_is_still_only_skipped(path):
+    """A trainer sends layers a rollout may not build -- an MTP head, a vision
+    tower. No parameter here goes stale for want of them."""
+    runner = _Runner(_dense_model())
+    ckpt = _dense_checkpoint() | {"mtp.head.weight": torch.ones(2, 2)}
+
+    assert _direct_reload(runner, path, ckpt) == len(_dense_checkpoint())
+
+
+def test_a_fused_fp8_parameter_whose_requantisation_refused_fails_the_update(
+    monkeypatch,
+):
+    """Every shard arrived and the requantiser wrote nothing, and the shard
+    that completed the set was taken for a name this model does not have."""
+    monkeypatch.setattr(
+        WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: False
+    )
+    model = _dense_model()
+    model.attn.qkv_proj.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
+    model.attn.qkv_proj.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+    runner = _Runner(model)
+
+    with pytest.raises(RuntimeError, match=r"could not be written.*'attn\.v_proj"):
+        runner.update_weights(list(_dense_checkpoint().items()))
 
 
 def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():

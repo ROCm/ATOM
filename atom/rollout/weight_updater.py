@@ -235,6 +235,7 @@ class WeightUpdaterMixin:
         Returns:
             'updated'     – fused param fully updated (all shards received)
             'accumulated' – shard stored, waiting for remaining shards
+            'unwritten'   – every shard arrived, but requantisation refused them
             'skipped'     – not a packed param or lookup failed
         """
         resolved = self._resolve_packed_name(name, param_to_module)
@@ -279,7 +280,7 @@ class WeightUpdaterMixin:
                 wrote = self._requantize_fp8_weight(module, param_name, param, buf.data)
                 del self._packed_weight_accum[atom_name]
                 if not wrote:
-                    return "skipped"
+                    return "unwritten"
                 # Composed from every shard, so the whole parameter is new, and
                 # so is the scale requantisation rewrote alongside it.
                 self._credit_reload(param)
@@ -962,6 +963,10 @@ class WeightUpdaterMixin:
 
         Returns:
             Number of parameters successfully updated
+
+        Raises:
+            RuntimeError: a tensor named a parameter but could not be written
+                to it. Raised once the rest of the batch is applied.
         """
         counts = self._apply_named_tensors(named_tensors)
         updated = counts["updated"]
@@ -980,6 +985,7 @@ class WeightUpdaterMixin:
             f"ignored_scales={counts['ignored_scales']}"
         )
         self._warn_if_nothing_matched(updated, counts["skipped"])
+        self._refuse_unwritten(counts)
         self._lift_partial_reload_fence("direct")
         return updated
 
@@ -997,6 +1003,10 @@ class WeightUpdaterMixin:
 
         Every write is credited by the parameter it landed in, whenever writes
         are being counted; see ``_counting_writes``.
+
+        ``unwritten_names`` are the skipped names that do resolve to a
+        parameter here, which therefore still holds its earlier value -- unlike
+        a name this model has no parameter for at all.
         """
         param_to_module = self._get_param_to_module_mapping()
 
@@ -1004,6 +1014,7 @@ class WeightUpdaterMixin:
         skipped = 0
         ignored_scales = 0
         skipped_names: set[str] = set()
+        unwritten_names: set[str] = set()
 
         for name, tensor in named_tensors:
             if name not in param_to_module:
@@ -1016,6 +1027,10 @@ class WeightUpdaterMixin:
                     # A shard of a fused parameter; it counts once the group
                     # completes, which may be in a later bucket.
                     pass
+                elif result == "unwritten":
+                    skipped += 1
+                    skipped_names.add(name)
+                    unwritten_names.add(name)
                 elif "weight_scale" in name or "input_scale" in name:
                     ignored_scales += 1
                 else:
@@ -1041,6 +1056,7 @@ class WeightUpdaterMixin:
                     # parameter still holds the old weight.
                     skipped += 1
                     skipped_names.add(name)
+                    unwritten_names.add(name)
             elif self._is_fp8_param(module, param) and tensor.dtype == param.dtype:
                 tensor = tensor.to(device=self.device)
                 self._copy_into_param(param, tensor)
@@ -1064,6 +1080,7 @@ class WeightUpdaterMixin:
                     )
                     skipped += 1
                     skipped_names.add(name)
+                    unwritten_names.add(name)
             else:
                 tp_size = self.world_size
                 tp_rank = self.rank
@@ -1079,13 +1096,31 @@ class WeightUpdaterMixin:
                     )
                     skipped += 1
                     skipped_names.add(name)
+                    unwritten_names.add(name)
 
         return {
             "updated": updated,
             "skipped": skipped,
             "ignored_scales": ignored_scales,
             "skipped_names": skipped_names,
+            "unwritten_names": unwritten_names,
         }
+
+    def _refuse_unwritten(self, counts: dict) -> None:
+        """Fail a direct, SHM or IPC update that left a parameter it named stale.
+
+        Returning the count alone reported success over it: nothing told the
+        caller, and where only some ranks skipped, the shards stopped belonging
+        to one model. Called once the batch is applied and finalised, so the
+        rest of it is not left half-done as well.
+        """
+        unwritten = counts["unwritten_names"]
+        if unwritten:
+            raise RuntimeError(
+                f"{self.label}: {len(unwritten)} weight(s) could not be written "
+                f"to the parameter they name, which keeps its earlier value: "
+                f"{sorted(unwritten)[:20]}"
+            )
 
     # ── what a reload has rewritten ───────────────────────────────────────
     #
@@ -1466,6 +1501,10 @@ class WeightUpdaterMixin:
 
         Returns:
             Number of parameters successfully updated in this bucket.
+
+        Raises:
+            RuntimeError: a tensor named a parameter but could not be written
+                to it. Raised once the rest of the bucket is applied.
         """
         from multiprocessing import shared_memory as _shm_mod
         from unittest.mock import patch
@@ -1506,13 +1545,15 @@ class WeightUpdaterMixin:
                             f"{list(self._packed_weight_accum.keys())}"
                         )
                     self._packed_weight_accum.clear()
-                self._lift_partial_reload_fence("SHM")
             logger.info(
                 f"{self.label}: SHM weight update bucket done - "
                 f"updated={updated}, skipped={skipped}, "
                 f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
             )
             self._warn_if_nothing_matched(updated, skipped)
+            self._refuse_unwritten(counts)
+            if is_last:
+                self._lift_partial_reload_fence("SHM")
             return updated
         finally:
             shm.close()
@@ -1554,6 +1595,10 @@ class WeightUpdaterMixin:
 
         Returns:
             Number of parameters successfully updated in this bucket.
+
+        Raises:
+            RuntimeError: a tensor named a parameter but could not be written
+                to it. Raised once the rest of the bucket is applied.
         """
         # Cache the IPC buffer mapping: only open once per weight-update cycle.
         if not hasattr(self, "_ipc_buffer") or self._ipc_buffer is None:
@@ -1627,11 +1672,13 @@ class WeightUpdaterMixin:
                         f"{list(self._packed_weight_accum.keys())}"
                     )
                 self._packed_weight_accum.clear()
-            self._lift_partial_reload_fence("IPC")
         logger.info(
             f"{self.label}: IPC weight update bucket done - "
             f"updated={updated}, skipped={skipped}, "
             f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
         )
         self._warn_if_nothing_matched(updated, skipped)
+        self._refuse_unwritten(counts)
+        if is_last:
+            self._lift_partial_reload_fence("IPC")
         return updated
