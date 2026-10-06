@@ -52,9 +52,9 @@ from atom.models.deepseek_v41.mono.state import bind_aux_taps
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.walk_plan import walk_plan_name
 from atom.models.deepseek_v41.mono.weights import bind_model
-from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
-from atom.mono.runtime.lifecycle import bind_agreed, owned_peer_buffer
+from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.widths import WidthBuilds

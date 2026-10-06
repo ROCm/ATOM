@@ -25,3 +25,15 @@ def tp_agree(ok: bool, group) -> bool:
     flag = torch.tensor([int(ok)], dtype=torch.int32)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
     return bool(flag.item())
+
+
+def bind_agreed(bind, group) -> None:
+    """``bind()`` on this rank (raising ``MonoUnsupported`` to refuse), then every
+    rank's verdict agreed: a rank that raised re-raises, the others raise too."""
+    try:
+        bind()
+    except Exception:
+        tp_agree(False, group)
+        raise
+    if not tp_agree(True, group):
+        raise MonoUnsupported("another TP rank refused mono")

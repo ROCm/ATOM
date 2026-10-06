@@ -68,14 +68,14 @@ from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_l
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
-from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import (
     DIAG_BYTES,
     given_up_waits,
     raise_if_given_up,
     region_namer,
 )
-from atom.mono.runtime.lifecycle import bind_agreed, owned_peer_buffer
+from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.widths import WidthBuilds
@@ -124,7 +124,7 @@ class MonoDecodeRunner:
     """Owns the per-layer weight views, scratch, peer buffers and compiled kernels.
 
     Construction is collective over the TP group: every rank binds and checks its
-    shard, then all agree (``lifecycle.bind_agreed``) before the peer handshake, so a rank that
+    shard, then all agree (``consensus.bind_agreed``) before the peer handshake, so a rank that
     refuses turns mono off on every rank instead of leaving the others waiting."""
 
     def __init__(self, causal_lm) -> None:

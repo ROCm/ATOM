@@ -145,8 +145,7 @@ def test_the_framework_package_is_found():
 
 # --------------------------------------------------------------- shared runner parts
 from atom.mono.runtime import route
-from atom.mono.runtime.consensus import MonoUnsupported
-from atom.mono.runtime.lifecycle import bind_agreed
+from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 
 
