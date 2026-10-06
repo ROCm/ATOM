@@ -88,6 +88,7 @@ from atom.models.minimax_m3.mono.kernels.common import (
     kernel_symbol,
     memrealtime,
     permlane_swap,
+    release_stores,
     rsrc,
     uniform,
     unlikely,
@@ -1156,10 +1157,7 @@ def build_post_attn_kernel(
                         k * (O_K // 4) + tid,
                         cache_modifier=CM_DEV,
                     )
-                    fx.memory_fence(
-                        syncscope=rocdl.SyncScope.Workgroup,
-                        ordering=fx.AtomicOrdering.Release,
-                    )
+                    release_stores()
                     gpu.barrier()
                     if tid == 0:
                         mb_put(mb("attnq_s"), k, x_scale)
@@ -1378,16 +1376,16 @@ def build_post_attn_kernel(
             base = (expert * (rows // 32) + rg // 2) * (cols // 8) + kc // 2
             return (base * 64 + lane) * 4 + (kc % 2) * 2 + rg % 2
 
-        def route_top4(k, k0, sc0, k1, sc1, sig, wave_mask=None):
+        def route_top4(k, k0, sc0, k1, sc1, sig, wave_mask=None, mask_bit=0):
             """route[8k : 8k+4] / rwt[..] := token k's sigmoid top-k gating from the
             router tasks' routing keys ``k0`` / ``k1`` (experts ``lane`` / ``lane +
             64``, sigmoid + bias, see route_key) and unbiased sigmoids (wave k % WAVES
             computes it, looking the sigmoids up in LDS at ``sig``): a pick is one
             wave max; the weights are the picks' sigmoids renormalized and scaled by
             route_scale. Slot 4 is the fused shared expert. ``wave_mask``: this
-            wave's expert -> token mask, the picks' bit k set (the picks are
-            distinct, and the wave's tokens run in program order). The caller
-            syncs."""
+            wave's expert -> token mask, ``mask_bit`` (bit k, or 0) or-ed in at the
+            picks (they are distinct, and the wave's tokens run in program order).
+            The caller syncs."""
             if wave == k % WAVES:
                 # the unbiased weights, looked up by expert once the picks are known
                 fx.ptr_store(sc0, sig + (k * N_ROUTED + lane))
@@ -1408,7 +1406,7 @@ def build_post_attn_kernel(
                     )
                     if const_expr(wave_mask is not None):
                         was = fx.Int32(fx.ptr_load(wave_mask + pid))
-                        fx.ptr_store(was | (fx.Int32(1) << k), wave_mask + pid)
+                        fx.ptr_store(was | mask_bit, wave_mask + pid)
                 if lane == 0:
                     fx.ptr_store(fx.Int32(SHARED_EXPERT), route + (8 * k + TOP_K))
                     fx.ptr_store(fx.Float32(shared_weight), rwt + (8 * k + TOP_K))
@@ -1641,10 +1639,7 @@ def build_post_attn_kernel(
                 if const_expr(WIDE):
                     # this task's xn slice is out: its flag (after the logits, not
                     # in front of them)
-                    fx.memory_fence(
-                        syncscope=rocdl.SyncScope.Workgroup,
-                        ordering=fx.AtomicOrdering.Release,
-                    )
+                    release_stores()
                     gpu.barrier()
                     if tid == 0:
                         mb_put(mb("xndone"), tt, fx.Int32(1))
@@ -2145,9 +2140,7 @@ def build_post_attn_kernel(
                         row * MIDSC_ROW_WORDS + blk_,
                         cache_modifier=CM_DEV,
                     )
-            fx.memory_fence(
-                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
-            )
+            release_stores()
             gpu.barrier()
             if tid == 0:
                 mb_put(mb("ugdone"), pr, fx.Int32(1))
@@ -2197,8 +2190,14 @@ def build_post_attn_kernel(
                     for h in range(2)
                 ]
             )
+            # a CUDA-graph pad row (seq_len <= 0) joins no expert: the down GEMV
+            # runs over the live rows' experts, so a pad row cannot reorder their sums
+            r_seq = rsrc(seq_lens)
             for j in range_constexpr(ROUTE_ITERS):
                 if wave + WAVES * j < tokens:
+                    tk_seq = uniform(
+                        bo.buffer_load(r_seq, wave_toks[j], vec_width=1, dtype=T.i32)
+                    )
                     route_top4(
                         wave_toks[j],
                         sg[2 * j][0],
@@ -2207,6 +2206,7 @@ def build_post_attn_kernel(
                         sg[2 * j + 1][1].bitcast(fx.Float32),
                         fpool + W_SIG,
                         wave_mask,
+                        (tk_seq > 0).select(fx.Int32(1) << wave_toks[j], fx.Int32(0)),
                     )
             stamp(2)
             gpu.barrier()
