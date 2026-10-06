@@ -216,7 +216,58 @@ def test_update_weights_now_answers():
     h, _, out = _handler()
     h._execute_utility_command("update_weights", {"named_tensors": []})
     body = _responses(out)[0]
-    assert body == {"cmd": "update_weights", "result": 7}
+    assert body == {"cmd": "update_weights", "result": "rank0"}
+
+
+_DIRECT_UPDATES = [
+    ("update_weights", {"named_tensors": ["t"], "flush_cache": False}),
+    ("update_weights_shm", {"shm_name": "s", "bucket_meta": {"w": 1}}),
+    (
+        "update_weights_ipc",
+        {"ipc_handle": "h", "bucket_meta": {"w": 1}, "is_last": False},
+    ),
+]
+_DIRECT_UPDATE_CALLS = {
+    "update_weights": ("update_weights", (["t"], False)),
+    "update_weights_shm": ("update_weights_from_shm", ("s", {"w": 1}, True)),
+    "update_weights_ipc": ("update_weights_from_ipc", ("h", {"w": 1}, False, None)),
+}
+
+
+@pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
+def test_a_direct_update_runs_on_every_rank(cmd, args):
+    """call_func waited on rank 0's answer alone, so every other rank's outcome
+    went unheard."""
+    h, mgr, out = _handler(proc_num=3)
+    h._execute_utility_command(cmd, args)
+
+    ((method, payload, _),) = mgr.calls
+    assert (method, payload.args) == _DIRECT_UPDATE_CALLS[cmd]
+    assert _responses(out) == [{"cmd": cmd, "result": "rank0"}]
+
+
+@pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
+def test_a_direct_update_that_fails_on_a_nonzero_rank_is_an_error(cmd, args):
+    """Rank 0 succeeding said nothing about rank 1, and the caller went on with
+    a partly updated model."""
+    h, _, out = _handler(
+        replies=[
+            RpcResult("u1", 0, value=4),
+            RpcResult("u1", 1, error="ValueError: rejected q_proj"),
+        ]
+    )
+    h._execute_utility_command(cmd, args)
+
+    assert _responses(out) == [
+        {"cmd": cmd, "error": "TP rank 1: ValueError: rejected q_proj"}
+    ]
+
+
+@pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
+def test_a_direct_update_the_manager_cannot_run_is_answered(cmd, args):
+    h, _, out = _handler(raises=RuntimeError("shm is gone"))
+    h._execute_utility_command(cmd, args)
+    assert _responses(out) == [{"cmd": cmd, "error": "RuntimeError: shm is gone"}]
 
 
 def _raise(exc):
@@ -227,17 +278,16 @@ def _raise(exc):
 
 
 def test_a_raising_handler_answers_before_the_engine_goes_down():
-    """``update_weights`` answered only on success. A loader that rejected a
-    tensor escaped the busy loop with no reply, and the caller waited out its
-    timeout for an engine that was already gone."""
+    """A handler that raised escaped the busy loop with no reply, and the
+    caller waited out its timeout for an engine that was already gone."""
     h, mgr, out = _handler()
-    mgr.call_func = _raise(RuntimeError("loader rejected q_proj"))
+    mgr.call_func = _raise(RuntimeError("cannot release weights"))
 
-    with pytest.raises(RuntimeError, match="loader rejected"):
-        h._execute_utility_command("update_weights", {"named_tensors": []})
+    with pytest.raises(RuntimeError, match="cannot release"):
+        h._execute_utility_command("release_memory", {"tags": ["weights"]})
 
     assert _responses(out) == [
-        {"cmd": "update_weights", "error": "RuntimeError: loader rejected q_proj"}
+        {"cmd": "release_memory", "error": "RuntimeError: cannot release weights"}
     ]
 
 

@@ -3,6 +3,7 @@
 
 import logging
 import queue
+import uuid
 from typing import ClassVar
 
 from atom.model_engine.collective_rpc import COLLECTIVE_RPC_CMD, RpcPayload
@@ -16,6 +17,10 @@ logger = logging.getLogger("atom")
 # broadcast_utility_command_sync reads by position, so an unrequested reply left
 # there is taken by the next synchronous caller as its own.
 FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
+
+# As long as broadcast_utility_command_sync waits on each engine by default:
+# a rank still busy past that is answering a caller who has gone.
+_DIRECT_UPDATE_TIMEOUT_S = 300.0
 
 
 class EngineUtilityHandler:
@@ -238,20 +243,43 @@ class EngineUtilityHandler:
             )
         )
 
+    def _update_on_every_rank(self, cmd: str, method: str, *call_args) -> dict:
+        """Run a direct weight update on every TP rank; the reply for all.
+
+        ``call_func`` returns rank 0's result alone, so a rank that rejected a
+        tensor still reported success and the caller went on with a partly
+        updated model -- if that rank's raise had not ended its worker. Through
+        the generic path every rank answers on its own channel, a failure is
+        caught where it happens, and success means every rank succeeded.
+        """
+        payload = RpcPayload(request_id=f"{cmd}-{uuid.uuid4().hex}", args=call_args)
+        try:
+            replies = self.runner_mgr.collective_rpc(
+                method, payload, timeout=_DIRECT_UPDATE_TIMEOUT_S
+            )
+        except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
+            return self._error_reply(cmd, None, exc)
+        failed = [r for r in replies if not r.ok]
+        if failed:
+            error = "; ".join(f"TP rank {r.tp_rank}: {r.error}" for r in failed)
+            logger.error(
+                f"{self.label}: {cmd} failed on {len(failed)} of {len(replies)} "
+                f"TP rank(s): {error}"
+            )
+            return {"cmd": cmd, "error": error}
+        result = replies[0].value
+        logger.info(f"{self.label}: {cmd} completed on every TP rank, updated={result}")
+        return {"cmd": cmd, "result": result}
+
     def _handle_update_weights(self, args: dict):
         """Handle direct weight update command."""
-        named_tensors = args.get("named_tensors", [])
-        flush_cache = args.get("flush_cache", True)
-        result = self.runner_mgr.call_func(
-            "update_weights", named_tensors, flush_cache, wait_out=True
+        reply = self._update_on_every_rank(
+            "update_weights",
+            "update_weights",
+            args.get("named_tensors", []),
+            args.get("flush_cache", True),
         )
-        logger.info(f"{self.label}: update_weights completed, updated={result}")
-        # Without this, broadcast_utility_command_sync("update_weights", ...)
-        # can only ever time out. The _shm and _ipc variants always responded;
-        # this one never did.
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "update_weights", "result": result})
-        )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
 
     def _handle_update_weights_shm(self, args: dict):
         """Handle shared-memory weight update command.
@@ -266,20 +294,14 @@ class EngineUtilityHandler:
         After completion, a ``UTILITY_RESPONSE`` is pushed so the caller
         (LLMEngine) can synchronise.
         """
-        shm_name = args.get("shm_name", "")
-        bucket_meta = args.get("bucket_meta", {})
-        is_last = args.get("is_last", True)
-        result = self.runner_mgr.call_func(
-            "update_weights_from_shm", shm_name, bucket_meta, is_last, wait_out=True
+        reply = self._update_on_every_rank(
+            "update_weights_shm",
+            "update_weights_from_shm",
+            args.get("shm_name", ""),
+            args.get("bucket_meta", {}),
+            args.get("is_last", True),
         )
-        logger.info(
-            f"{self.label}: update_weights_shm completed, "
-            f"updated={result}, is_last={is_last}"
-        )
-        # Signal completion back to CoreManager / LLMEngine
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "update_weights_shm", "result": result})
-        )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
 
     def _handle_update_weights_ipc(self, args: dict):
         """Handle CUDA IPC weight update command.
@@ -292,26 +314,15 @@ class EngineUtilityHandler:
         When ``ipc_handles`` (per-GPU dict) is present, each ModelRunner
         opens only its own GPU's handle — always same-GPU IPC, safe on ROCm.
         """
-        ipc_handle = args.get("ipc_handle")
-        bucket_meta = args.get("bucket_meta", {})
-        is_last = args.get("is_last", True)
-        ipc_handles = args.get("ipc_handles")
-        result = self.runner_mgr.call_func(
+        reply = self._update_on_every_rank(
+            "update_weights_ipc",
             "update_weights_from_ipc",
-            ipc_handle,
-            bucket_meta,
-            is_last,
-            ipc_handles,
-            wait_out=True,
+            args.get("ipc_handle"),
+            args.get("bucket_meta", {}),
+            args.get("is_last", True),
+            args.get("ipc_handles"),
         )
-        logger.info(
-            f"{self.label}: update_weights_ipc completed, "
-            f"updated={result}, is_last={is_last}"
-        )
-        # Signal completion back to CoreManager / LLMEngine
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "update_weights_ipc", "result": result})
-        )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
 
     def _handle_release_memory(self, args: dict):
         """Handle memory release command (sleep mode)."""
