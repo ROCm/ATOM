@@ -18,7 +18,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -92,6 +92,26 @@ def test_a_bucket_round_trips_through_the_real_encoding():
     assert got_b.dtype == torch.float32 and tuple(got_b.shape) == (3,)
     assert torch.equal(got_a, a)
     assert torch.equal(got_b, b)
+
+
+def test_metadata_is_decoded_without_a_list_entry_per_byte():
+    """tolist() built a list slot per metadata byte, eight bytes each, before
+    JSON saw any of it: half a gigabyte of host memory at the 64 MiB ceiling."""
+    import tracemalloc
+
+    import torch
+
+    meta, payload = _encode([("w" * (1 << 20), torch.zeros(1))])
+    _decode_bucket(meta, payload)  # any lazy import, outside the measurement
+    tracemalloc.start()
+    try:
+        _decode_bucket(meta, payload)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    # The bytes, their text and the name decoded from it: a few copies of the
+    # frame, where the list alone was eight.
+    assert peak < 6 * meta.numel()
 
 
 def test_the_decoded_tensors_are_views_not_copies():
@@ -766,6 +786,55 @@ def test_every_worker_of_every_dp_engine_gets_its_own_rank(
             )
 
     assert sorted(joined) == list(range(1, 1 + dp * workers))
+
+
+def _world(monkeypatch, size):
+    """aiter's world group as the vote finds it, and the groups voted over."""
+    world = SimpleNamespace(world_size=size, cpu_group=object())
+    parallel_state = ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_world_group = lambda: world
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+    voted = []
+
+    def vote(group, ready, began):
+        voted.append(group)
+        return ready, began
+
+    monkeypatch.setattr(receiver, "vote_on_stream", vote)
+    return world.cpu_group, voted
+
+
+@pytest.mark.parametrize(
+    ("tp_world", "pcp"), [(1, 2), (2, 2), (2, 1)], ids=["pcp", "tp-and-pcp", "tp"]
+)
+def test_every_worker_of_the_engine_decides_the_stream(monkeypatch, tp_world, pcp):
+    """The vote was over the TP group, which holds one prefill-context rank of
+    the receivers: under PCP one TP group could commit while another failed,
+    and the engine served two versions. At TP=1 nobody voted at all."""
+    world, voted = _world(monkeypatch, tp_world * pcp)
+    worker = _Worker(0, 0, tp=tp_world, tp_world=tp_world, pcp=pcp)
+
+    assert worker._vote_with_engine_peers(True, True) == (True, True)
+    assert voted == [world]
+
+
+def test_a_single_worker_engine_decides_alone(monkeypatch):
+    _, voted = _world(monkeypatch, 1)
+    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+
+    assert worker._vote_with_engine_peers(False, True) == (False, True)
+    assert voted == []
+
+
+def test_a_world_that_is_not_the_engine_is_not_voted_in(monkeypatch):
+    """With ranks beyond the stream's the vote would hang; without some of its
+    receivers it would let the rest commit alone."""
+    _, voted = _world(monkeypatch, 2)
+    worker = _Worker(0, 0, tp=2, tp_world=2, pcp=2)
+
+    with pytest.raises(RuntimeError, match=r"world has 2 rank.*engine 4 worker"):
+        worker._vote_with_engine_peers(True, True)
+    assert voted == []
 
 
 def test_the_receiver_reads_the_header_in_the_documented_order(monkeypatch):

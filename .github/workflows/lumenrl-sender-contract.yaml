@@ -47,5 +47,7 @@ jobs:
           persist-credentials: false
       - name: Run the sender contract tests
         env:
+          # The checkout's root, which holds the lumenrl/ package: the test
+          # appends lumenrl/engine/inference/... to it.
           LUMENRL_ROOT: ${{ github.workspace }}/lumenrl
         run: python -m pytest tests/test_rdma_weight_receiver.py -k "sender or snapshot" -rs
