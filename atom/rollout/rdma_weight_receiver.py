@@ -108,7 +108,9 @@ def _decode_bucket(
     application, and copying here would double the peak footprint of a transfer
     already sized in tens of GB.
     """
-    metadata = json.loads(bytes(metadata_tensor.cpu().tolist()).decode("utf-8"))
+    # Through a byte buffer: tolist() builds a list slot per byte, which at the
+    # metadata ceiling is half a gigabyte of host memory before JSON sees it.
+    metadata = json.loads(metadata_tensor.cpu().numpy().tobytes().decode("utf-8"))
     if not isinstance(metadata, list) or not metadata:
         raise RuntimeError("invalid RDMA weight metadata: expected a non-empty list")
 
@@ -157,6 +159,16 @@ def _decode_bucket(
                 f"{prev_end}, {name} starts at {start}"
             )
     return weights
+
+
+def _workers_per_engine(config) -> int:
+    """The engine's own stride, which ModelRunner places devices by: one
+    worker per TP shard that has a process, per prefill-context rank. The
+    logical TP width over-counts under simulated TP and under-counts under
+    PCP."""
+    return int(getattr(config, "tp_world_size", 1) or 1) * int(
+        getattr(config, "prefill_context_parallel_size", 1) or 1
+    )
 
 
 def _alone(ready: bool, began: bool) -> tuple[bool, bool]:
@@ -422,13 +434,9 @@ class RDMAWeightReceiverMixin:
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         dp_rank_local = int(getattr(parallel, "data_parallel_rank_local", 0) or 0)
-        # The engine's own stride, which ModelRunner places devices by: one
-        # worker per TP shard that has a process, per prefill-context rank. The
-        # logical TP width over-counts under simulated TP and under-counts under
-        # PCP, where one DP replica then takes another's ranks.
-        workers = int(getattr(config, "tp_world_size", 1) or 1) * int(
-            getattr(config, "prefill_context_parallel_size", 1) or 1
-        )
+        # Not the logical TP width: under PCP one DP replica would then take
+        # another's ranks.
+        workers = _workers_per_engine(config)
         rank = int(base_rank) + dp_rank_local * workers + int(self.rank)
 
         if rank <= 0 or rank >= int(world_size):
@@ -458,17 +466,28 @@ class RDMAWeightReceiverMixin:
         )
         return True
 
-    def _vote_with_tp_peers(self, ready: bool, began: bool) -> tuple[bool, bool]:
-        """The stream's decision across this engine's TP ranks, every one of
-        which takes it: one rank's yes is not enough to serve it."""
-        if int(getattr(self, "world_size", 1) or 1) <= 1:
-            return ready, began
-        from aiter.dist.parallel_state import get_tp_group
+    def _vote_with_engine_peers(self, ready: bool, began: bool) -> tuple[bool, bool]:
+        """The stream's decision across this engine's workers, every one of
+        which takes it: one worker's yes is not enough to serve it.
 
-        tp = get_tp_group()
-        if tp.world_size <= 1:
+        Over aiter's world group, not its TP group. A runner's world is its
+        engine's workers alone, DP being isolated per engine, and holds every
+        prefill-context rank the stream reaches, where a TP group holds one.
+        """
+        workers = _workers_per_engine(getattr(self, "config", None))
+        if workers <= 1:
             return ready, began
-        return vote_on_stream(tp.cpu_group, ready, began)
+        from aiter.dist.parallel_state import get_world_group
+
+        world = get_world_group()
+        if world.world_size != workers:
+            # A wider world would hang the vote; a narrower one would leave
+            # some of the stream's receivers out of it.
+            raise RuntimeError(
+                f"cannot decide the RDMA stream: the process world has "
+                f"{world.world_size} rank(s), the engine {workers} worker(s)"
+            )
+        return vote_on_stream(world.cpu_group, ready, began)
 
     def receive_weights_rdma(
         self,
@@ -502,7 +521,7 @@ class RDMAWeightReceiverMixin:
                 self,
                 device=self.device,
                 expected_version=int(version),
-                agree=self._vote_with_tp_peers,
+                agree=self._vote_with_engine_peers,
             )
         except RDMAStreamOutOfStep as exc:
             logger.error(
