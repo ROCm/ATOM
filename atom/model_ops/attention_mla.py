@@ -174,6 +174,11 @@ def _sparse_index_workspace(
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
+from aiter.ops.triton.gemm.batched.batched_gemm_a16w8 import (  # isort: skip
+    # A16W8 batched GEMM: BF16 activation x FP8 weight (weight upcast in-register).
+    # Drop-in for the a8w8 per-token-group fp8 bmm, used by the A16W8 absorb path.
+    batched_gemm_a16w8 as _aiter_triton_a16w8_bmm,
+)
 
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
@@ -418,6 +423,40 @@ def qrep_tp_override(tp_size: int) -> dict:
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
     return envs.ATOM_USE_TRITON_MXFP4_BMM
+
+
+def _mla_absorb_a16w8_enabled() -> bool:
+    """A16W8 MLA-absorb: keep the absorb-bmm ACTIVATION in BF16 while the weight
+    stays FP8 (batched_gemm_a16w8, a documented drop-in for the a8w8 per-token-
+    group path). Goal: fp8-weight speed (2-3.6x over BF16 at decode M=1536) while
+    recovering the accuracy that a8w8 loses to the runtime activation fp8 quant.
+    Default off. ATOM_MLA_ABSORB_A16W8=1 (scalar scale) or =ph (per-head)."""
+    import os
+
+    return os.environ.get("ATOM_MLA_ABSORB_A16W8", "0") in ("1", "ph")
+
+
+def _mla_absorb_a16w8_perhead_enabled() -> bool:
+    """Per-head variant: quantize each head's absorb weight with its own fp8
+    scale (vs one scalar for all heads). The a16w8 kernel applies only a scalar
+    scale, so the per-head scale is folded out: quantize to full fp8 range with
+    scale=1 in the kernel, then multiply the bmm output by the per-head dequant
+    factor (cheap (1,B,1) broadcast). Enabled by ATOM_MLA_ABSORB_A16W8=ph."""
+    import os
+
+    return os.environ.get("ATOM_MLA_ABSORB_A16W8", "0") == "ph"
+
+
+def _per_head_fp8_quant(W):
+    """Per-head FP8 quant of an MLA-absorb weight W (B=heads, N, K). Returns the
+    fp8 weight (scaled to full e4m3 range per head) and the per-head dequant
+    factor rscale (B, 1, 1) to re-apply to the bmm output."""
+    fp8_max = torch.finfo(dtypes.fp8).max
+    amax = W.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-10)  # (B,1,1)
+    scale = fp8_max / amax
+    Wq = (W * scale).clamp(-fp8_max, fp8_max).to(dtypes.fp8).contiguous()
+    rscale = (amax / fp8_max).float().contiguous()  # (B,1,1) dequant factor
+    return Wq, rscale
 
 
 def _maybe_view_mxfp4_weight_for_gather(
@@ -1190,12 +1229,21 @@ class MLAAttention(nn.Module):
             )
             W_K = W_UK.transpose(0, 1)  # 16 512 128
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
-            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=dtypes.fp8
-            )
-            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=dtypes.fp8
-            )
+            if _mla_absorb_a16w8_perhead_enabled():
+                # Per-head A16W8: each head gets its own fp8 scale, folded out as
+                # a post-bmm (1,B,1) multiply. Kernel sees scalar scale=1.
+                _ones = torch.ones(1, dtype=torch.float32, device=W_K.device)
+                self.W_K, self.W_K_phscale = _per_head_fp8_quant(W_K)
+                self.W_K_scale = _ones
+                self.W_V, self.W_V_phscale = _per_head_fp8_quant(W_V)
+                self.W_V_scale = _ones
+            else:
+                self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
+                    W_K, dtype=dtypes.fp8
+                )
+                self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
+                    W_V, dtype=dtypes.fp8
+                )
             if self.qrep_enabled:
                 # Gather bf16 and quantize once: gathering fp8 would need the
                 # per-rank scalar scales stitched together. Head order already
@@ -1395,6 +1443,13 @@ class MLAAttention(nn.Module):
             )
             # x = x.transpose(0, 1).flatten(1, 2)
             x = output
+        elif _mla_absorb_a16w8_enabled():
+            # A16W8: BF16 activation x FP8 weight (same fp8 W_V/W_V_scale as the
+            # a8w8 path, no runtime activation quant). Output (M, B=heads, V).
+            x = _aiter_triton_a16w8_bmm(x, W_V, W_V_scale, transpose_bm=True)
+            if _mla_absorb_a16w8_perhead_enabled():
+                # re-apply the folded-out per-head dequant factor (per B=head)
+                x = x * self.W_V_phscale.view(1, num_heads, 1)
         else:
             x = _aiter_triton_fp8_bmm(
                 x, W_V, W_V_scale, group_size=128, transpose_bm=True
@@ -1443,6 +1498,15 @@ class MLAAttention(nn.Module):
                 prequant=True,
                 y_scale=None,
             )
+        elif _mla_absorb_a16w8_enabled():
+            # A16W8: BF16 activation x FP8 weight (same fp8 W_K/W_K_scale as the
+            # a8w8 path, no runtime activation quant). Output (M, B=heads, L).
+            ql_nope = _aiter_triton_a16w8_bmm(
+                q_nope, W_K, W_K_scale, transpose_bm=True
+            )
+            if _mla_absorb_a16w8_perhead_enabled():
+                # re-apply the folded-out per-head dequant factor (per B=head)
+                ql_nope = ql_nope * self.W_K_phscale.view(1, ql_nope.shape[1], 1)
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
