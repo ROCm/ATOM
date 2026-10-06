@@ -18,7 +18,12 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from atom.config import get_current_atom_config
 from atom.model_ops.attentions.aiter_mla import aligned_index_cache_dim
 from atom.model_ops.glm5_next import kpool
+from atom.model_ops.glm5_next.geometry import speculative_kpool_history_size
 from atom.model_ops.glm5_next.indexer import _kpool_write_completed_pools
+from atom.model_ops.glm5_next.speculative import (
+    build_speculative_pool_candidates,
+    update_speculative_kpool_history,
+)
 from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.plugin.vllm.attention.backend import AiterMlaBackendForVllm
 from atom.plugin.vllm.attention.layer_sparse_mla import (
@@ -38,6 +43,11 @@ def index_proxy_layer_name(text_config) -> str:
     num_layers = int(text_config.num_hidden_layers)
     num_mtp = int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
     return f"model.layers.{num_layers + num_mtp}.glm5_kpool_index"
+
+
+def num_speculative_tokens(vllm_config) -> int:
+    spec = getattr(vllm_config, "speculative_config", None)
+    return int(getattr(spec, "num_speculative_tokens", 0) or 0) if spec else 0
 
 
 class _SlotAllocator:
@@ -69,7 +79,9 @@ class _SlotAllocator:
 
 class Glm5KpoolTailStore:
     def __init__(self, vllm_config, text_config, num_layers: int) -> None:
-        self.ring = int(text_config.index_kpool)
+        pool = int(text_config.index_kpool)
+        num_spec = num_speculative_tokens(vllm_config)
+        self.ring = speculative_kpool_history_size(pool, num_spec or None)
         max_reqs = int(vllm_config.scheduler_config.max_num_seqs)
         self.allocator = _SlotAllocator(2 * max_reqs)
         self.tensor = torch.zeros(
@@ -223,6 +235,9 @@ class Glm5KpoolIndexProxy(nn.Module, AttentionLayerBase):
         self.__dict__["_indexers"] = list(indexers)
         self.__dict__["tail_store"] = tail_store
 
+    def add_indexers(self, indexers: list) -> None:
+        self._indexers.extend(indexers)
+
     def get_attn_backend(self):
         return Glm5KpoolIndexBackend
 
@@ -267,12 +282,16 @@ class Glm5KpoolIndexProxy(nn.Module, AttentionLayerBase):
         )
 
 
-def register_kpool_index_proxy(vllm_config, text_config, mla_layer, indexers):
+def register_kpool_index_proxy(
+    vllm_config, text_config, mla_layer, indexers, num_draft_layers: int = 0
+):
     sfc = vllm_config.compilation_config.static_forward_context
     name = index_proxy_layer_name(text_config)
     if name in sfc:
         raise ValueError(f"Duplicate layer name: {name}")
-    store = Glm5KpoolTailStore(vllm_config, text_config, len(indexers))
+    store = Glm5KpoolTailStore(
+        vllm_config, text_config, len(indexers) + num_draft_layers
+    )
     proxy = Glm5KpoolIndexProxy(name, mla_layer, indexers, store)
     sfc[name] = proxy
     return proxy
@@ -362,6 +381,89 @@ def _run_decode(
     kpool.expand_pools_and_append_tail(
         pool_topk, seq_lens.to(torch.int32), pool, out=topk_indices[:bs]
     )
+
+
+def _run_verify(
+    indexer,
+    md: Glm5KpoolIndexMetadata,
+    k,
+    gate,
+    q_fp8,
+    weights,
+    positions,
+    tail,
+    index_cache,
+    pool_bt,
+    topk_indices,
+) -> None:
+    n = md.num_decode_tokens
+    num_reqs = md.num_decodes
+    pool = indexer.index_kpool
+    rows = index_cache.shape[1]
+    device = k.device
+    keys, gates, pos = k[:n], gate[:n], positions[:n].to(torch.int64)
+    query_start = md.query_start_loc[: num_reqs + 1]
+    slots = md.slots[:num_reqs]
+    pooled, req_idx = build_speculative_pool_candidates(
+        tail,
+        keys,
+        gates,
+        pos,
+        query_start,
+        slots,
+        indexer.index_kpool_compress_ape,
+        pool,
+    )
+    closes = (pos % pool == pool - 1) & (slots[req_idx] >= 0)
+    pool_ids = torch.where(closes, pos // pool, torch.full_like(pos, -1))
+    write_slots = kpool.pool_slot_mapping(pool_bt[:num_reqs], pool_ids, req_idx, rows)
+    indexer_k_quant_and_cache(
+        pooled,
+        index_cache,
+        write_slots,
+        indexer.head_dim,
+        indexer.scale_fmt,
+        preshuffle=True,
+    )
+    update_speculative_kpool_history(tail, keys, gates, pos, query_start, slots, slots)
+
+    seq_lens = (pos + 1).to(torch.int32)
+    pool_lens = (seq_lens // pool).contiguous()
+    token_bt = pool_bt[:num_reqs][req_idx].contiguous()
+    max_pools = -(-indexer.max_model_len // pool)
+    select_k = indexer.topk_tokens // pool
+    n_head = q_fp8.shape[1]
+    chunk = min(n, 128)
+    logits = torch.empty((chunk, max_pools), dtype=torch.float32, device=device)
+    pool_topk = torch.empty((chunk, select_k), dtype=torch.int32, device=device)
+    for begin in range(0, n, chunk):
+        end = min(n, begin + chunk)
+        count = end - begin
+        deepgemm_fp8_paged_mqa_logits(
+            q_fp8[begin:end].view(count, 1, n_head, indexer.head_dim),
+            index_cache.unsqueeze(-2),
+            weights[begin:end],
+            logits[:count],
+            pool_lens[begin:end],
+            token_bt[begin:end],
+            max_pools,
+            KVBlockSize=rows,
+            Preshuffle=True,
+        )
+        top_k_per_row_decode(
+            logits[:count],
+            1,
+            pool_lens[begin:end],
+            pool_topk[:count],
+            count,
+            logits.stride(0),
+            logits.stride(1),
+            k=select_k,
+            stable=indexer.stable_topk,
+        )
+        kpool.expand_pools_and_append_tail(
+            pool_topk[:count], seq_lens[begin:end], pool, out=topk_indices[begin:end]
+        )
 
 
 def _run_prefill(
@@ -511,7 +613,10 @@ def _kpool_indexer_run(
         topk_indices,
     )
     if md.num_decodes > 0:
-        _run_decode(*args)
+        if tail_store.ring > indexer.index_kpool:
+            _run_verify(*args)
+        else:
+            _run_decode(*args)
     if md.prefill is not None:
         _run_prefill(*args)
 

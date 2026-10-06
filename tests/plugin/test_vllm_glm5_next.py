@@ -30,6 +30,11 @@ def test_glm5_next_plugin_registries_are_synchronized():
         _ATOM_MODEL_CLASSES[arch]
         == "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGeneration"
     )
+    assert (
+        _ATOM_MODEL_CLASSES["Glm5NextMTPModel"]
+        == "atom.plugin.vllm.models.glm5_next:Glm5NextMTP"
+    )
+    assert "Glm5NextMTPModel" in _VLLM_MODEL_REGISTRY_OVERRIDES
 
 
 def test_vllm_sizes_glm5_next_as_mla_with_the_padded_latent():
@@ -48,6 +53,85 @@ def test_vllm_sizes_glm5_next_as_mla_with_the_padded_latent():
         c = conv.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next"](outer, text)
         assert c.is_deepseek_mla()
         assert c.get_head_size() == 576
+        text.num_nextn_predict_layers = 1
+        draft = conv.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next_mtp"](outer, text)
+        assert draft.get_num_hidden_layers() == 1 and draft.get_head_size() == 576
+        """)
+
+
+def test_mtp_method_resolves_a_glm5_next_draft():
+    _run_without_test_stubs("""
+        import typing
+
+        import vllm.config
+        from transformers import PretrainedConfig
+        from vllm.config import speculative
+        from vllm.config.speculative import SpeculativeConfig
+
+        from atom.plugin.vllm.register import _register_glm5_next_mtp_draft_config
+
+        for _ in range(2):
+            _register_glm5_next_mtp_draft_config()
+        assert "glm5_next_mtp" in typing.get_args(speculative.MTPModelTypes)
+
+        cfg = PretrainedConfig(
+            model_type="glm5_next",
+            architectures=["Glm5NextForConditionalGeneration"],
+            text_config={"num_nextn_predict_layers": 1},
+        )
+        cfg.model_type = "glm5_next"
+        cfg.text_config = PretrainedConfig(num_nextn_predict_layers=1)
+        out = SpeculativeConfig.hf_config_override(cfg)
+        assert out.model_type == "glm5_next_mtp"
+        assert out.architectures == ["Glm5NextMTPModel"] and out.n_predict == 1
+
+        other = PretrainedConfig(architectures=["DeepseekV3ForCausalLM"])
+        other.model_type = "deepseek_v3"
+        other.num_nextn_predict_layers = 1
+        assert SpeculativeConfig.hf_config_override(other).architectures == [
+            "DeepSeekMTPModel"
+        ]
+        """)
+
+
+def test_glm5_next_kda_state_follows_vllm_kda_with_speculative_rows():
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        import torch
+        from transformers import PretrainedConfig
+
+        from atom.plugin.vllm.models.glm5_next import (
+            Glm5NextForConditionalGenerationVllm as M,
+        )
+
+        layer_types = ["linear_attention"] * 3 + ["deepseek_sparse_attention"]
+        text = PretrainedConfig(
+            model_type="glm5_next_text", num_hidden_layers=4,
+            num_attention_heads=64, layer_types=layer_types,
+            linear_attn_config={"num_heads": 64, "head_dim": 128,
+                                "short_conv_kernel_size": 4},
+            index_head_dim=128, index_kpool=4, index_topk=2048,
+            qk_rope_head_dim=0, qk_nope_head_dim=256, kv_lora_rank=512,
+        )
+
+        def config(num_spec):
+            spec = SimpleNamespace(num_speculative_tokens=num_spec) if num_spec else None
+            return SimpleNamespace(
+                model_config=SimpleNamespace(hf_text_config=text, dtype=torch.bfloat16),
+                cache_config=SimpleNamespace(mamba_cache_dtype="auto",
+                                             mamba_ssm_cache_dtype="auto"),
+                parallel_config=SimpleNamespace(tensor_parallel_size=8),
+                speculative_config=spec,
+            )
+
+        plain = M.get_mamba_state_shape_from_config(config(0))
+        mtp = M.get_mamba_state_shape_from_config(config(3))
+        assert len(plain) == len(M.get_mamba_state_dtype_from_config(config(0))) == 2
+        assert len(M.get_mamba_state_copy_func()) == 2
+        conv_rows = lambda shape: min(shape)
+        assert conv_rows(mtp[0]) == conv_rows(plain[0]) + 3
+        assert mtp[1] == plain[1]
         """)
 
 
@@ -69,8 +153,9 @@ def test_kpool_index_proxy_carves_one_sub_block_per_indexer_layer():
         store = SimpleNamespace(tensor=torch.empty(12), ring=4)
         indexers = [Indexer() for _ in range(11)]
         proxy = Glm5KpoolIndexProxy(
-            "model.layers.46.glm5_kpool_index", None, indexers, store
+            "model.layers.46.glm5_kpool_index", None, indexers[:10], store
         )
+        proxy.add_indexers(indexers[10:])
         pages = torch.arange(3 * 64 * 576, dtype=torch.int64).to(torch.uint8)
         pages = pages.view(3, 64, 576)
         proxy.bind_kv_cache(pages)

@@ -30,6 +30,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Glm5NextForConditionalGeneration": (
         "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGenerationVllm"
     ),
+    "Glm5NextMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
@@ -235,9 +236,50 @@ def _register_glm5_next_arch_config() -> None:
 
             return self.hf_text_config.kv_lora_rank + GLM5_NEXT_MLA_ROPE_PAD
 
+    class Glm5NextMTPModelArchConfigConvertor(Glm5NextModelArchConfigConvertor):
+        def get_num_hidden_layers(self) -> int:
+            return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
+
     convertors.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next"] = (
         Glm5NextModelArchConfigConvertor
     )
+    convertors.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next_mtp"] = (
+        Glm5NextMTPModelArchConfigConvertor
+    )
+
+
+_vllm_draft_hf_config_override = None
+
+
+def glm5_next_draft_hf_config_override(hf_config):
+    if getattr(hf_config, "model_type", None) != "glm5_next":
+        if _vllm_draft_hf_config_override is None:
+            _register_glm5_next_mtp_draft_config()
+        return _vllm_draft_hf_config_override(hf_config)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    n_predict = int(getattr(text_config, "num_nextn_predict_layers", 1) or 1)
+    hf_config.model_type = "glm5_next_mtp"
+    hf_config.update({"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]})
+    return hf_config
+
+
+def _register_glm5_next_mtp_draft_config() -> None:
+    import typing
+
+    from vllm.config import speculative
+    from vllm.config.speculative import SpeculativeConfig
+
+    global _vllm_draft_hf_config_override
+    current = SpeculativeConfig.__dict__["hf_config_override"].__func__
+    if current is glm5_next_draft_hf_config_override:
+        return
+    _vllm_draft_hf_config_override = current
+    SpeculativeConfig.hf_config_override = staticmethod(
+        glm5_next_draft_hf_config_override
+    )
+    mtp_types = typing.get_args(speculative.MTPModelTypes)
+    if "glm5_next_mtp" not in mtp_types:
+        speculative.MTPModelTypes = typing.Literal[(*mtp_types, "glm5_next_mtp")]
 
 
 def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
@@ -337,6 +379,7 @@ def register_model() -> None:
     register_gdn_attention_backend()
     _patch_vllm_harmony_parser_manager()
     _register_glm5_next_arch_config()
+    _register_glm5_next_mtp_draft_config()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 

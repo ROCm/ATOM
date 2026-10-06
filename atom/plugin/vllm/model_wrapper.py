@@ -44,6 +44,7 @@ logger = logging.getLogger("atom")
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
@@ -51,6 +52,7 @@ _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     # vLLM/HF draft arch name: ATOM server-mode draft class
@@ -150,6 +152,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm5NextForConditionalGeneration": (
         "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGeneration"
     ),
+    "Glm5NextMTPModel": "atom.plugin.vllm.models.glm5_next:Glm5NextMTP",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",

@@ -1,3 +1,4 @@
+import copy
 from contextlib import contextmanager
 
 import torch
@@ -12,6 +13,7 @@ from vllm.model_executor.models.interfaces import IsHybrid
 
 from atom.model_ops.glm5_next import kpool as kpool_ops
 from atom.models import glm5_next as glm5_next_base
+from atom.models import glm5_next_mtp as glm5_next_mtp_base
 from atom.models.glm5_next import _ROPE_PAD, _normalize_glm5_next_config
 from atom.plugin.vllm import glm5_kpool
 from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
@@ -36,6 +38,7 @@ def _get_glm5_state_shape(vllm_config: VllmConfig) -> tuple[tuple[int, ...], ...
         num_k_heads=config.linear_num_key_heads,
         head_k_dim=config.linear_key_head_dim,
         conv_kernel_size=config.linear_conv_kernel_dim,
+        num_spec=glm5_kpool.num_speculative_tokens(vllm_config),
     )
 
 
@@ -46,10 +49,18 @@ def _get_glm5_state_dtype(vllm_config: VllmConfig) -> tuple[torch.dtype, ...]:
     )
 
 
+def _num_draft_layers(vllm_config: VllmConfig, text_config) -> int:
+    spec = vllm_config.speculative_config
+    if spec is None:
+        return 0
+    return int(getattr(text_config, "num_nextn_predict_layers", 0) or 0)
+
+
 def _check_supported(vllm_config: VllmConfig) -> None:
     unsupported = []
-    if vllm_config.speculative_config is not None:
-        unsupported.append("speculative decoding")
+    spec = vllm_config.speculative_config
+    if spec is not None and spec.method != "mtp":
+        unsupported.append(f"speculative method {spec.method!r} (only mtp)")
     if vllm_config.parallel_config.pipeline_parallel_size > 1:
         unsupported.append("pipeline parallelism")
     if unsupported:
@@ -149,7 +160,35 @@ class Glm5NextForConditionalGeneration(glm5_next_base.Glm5NextForConditionalGene
             self.config,
             attns[0].mla_attn,
             [attn.indexer for attn in attns],
+            num_draft_layers=_num_draft_layers(vllm_config, self.config),
         )
+
+
+class Glm5NextMTP(glm5_next_mtp_base.Glm5NextMTP):
+    def __init__(self, atom_config, prefix: str = "") -> None:
+        vllm_config = atom_config.plugin_config.vllm_config
+        text_config = copy.copy(_text_config(atom_config.hf_config))
+        atom_config.hf_config = text_config
+        spec = atom_config.speculative_config
+        if spec is not None:
+            atom_config.speculative_config = copy.copy(spec)
+            atom_config.speculative_config.draft_model_hf_config = text_config
+        with _swap_layer_classes():
+            super().__init__(atom_config, prefix=prefix)
+        attns = _sparse_attentions(
+            layer.mtp_block.self_attn for layer in self.model.layers.values()
+        )
+        sfc = vllm_config.compilation_config.static_forward_context
+        sfc[glm5_kpool.index_proxy_layer_name(text_config)].add_indexers(
+            [attn.indexer for attn in attns]
+        )
+
+    # Top-k reuse needs a per-token index layout the plugin's ragged buffer lacks.
+    def set_skip_topk(self, skip: bool) -> None:
+        return None
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        return None
 
 
 class Glm5NextForConditionalGenerationVllm(ATOMMoEForCausalLM, IsHybrid):
