@@ -1,4 +1,4 @@
-//! PD load accounting while prefill and decode responses are held independently.
+//! PD load accounting and credential forwarding to prefill and decode workers.
 use super::*;
 use crate::core::{BasicWorkerBuilder, WorkerType};
 use axum::{routing::post, Router};
@@ -24,24 +24,32 @@ const KINDS: [DispatchKind; 3] = [DispatchKind::Atom, DispatchKind::Vllm, Dispat
 struct GatedServer {
     worker: Arc<dyn Worker>,
     entered: Arc<Notify>,
+    captured: mpsc::UnboundedReceiver<HeaderMap>,
     response: Option<oneshot::Sender<Response>>,
     task: JoinHandle<()>,
 }
 
 impl GatedServer {
     async fn start(role: WorkerType) -> Self {
+        Self::start_with_api_key(role, None).await
+    }
+
+    async fn start_with_api_key(role: WorkerType, api_key: Option<&str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let entered = Arc::new(Notify::new());
         let notify = entered.clone();
         let (tx, rx) = oneshot::channel::<Response>();
         let response = Arc::new(Mutex::new(Some(rx)));
+        let (capture, captured) = mpsc::unbounded_channel();
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(move || {
+            post(move |headers: HeaderMap| {
                 let notify = notify.clone();
                 let response = response.clone();
+                let capture = capture.clone();
                 async move {
+                    capture.send(headers).unwrap();
                     let rx = response.lock().await.take().unwrap();
                     notify.notify_one();
                     rx.await
@@ -50,9 +58,14 @@ impl GatedServer {
             }),
         );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut worker = BasicWorkerBuilder::new(url).worker_type(role);
+        if let Some(key) = api_key {
+            worker = worker.api_key(key);
+        }
         Self {
-            worker: Arc::new(BasicWorkerBuilder::new(url).worker_type(role).build()),
+            worker: Arc::new(worker.build()),
             entered,
+            captured,
             response: Some(tx),
             task,
         }
@@ -111,6 +124,16 @@ fn dispatch(
     d: &GatedServer,
     streaming: bool,
 ) -> JoinHandle<Response> {
+    dispatch_with_headers(kind, p, d, streaming, None)
+}
+
+fn dispatch_with_headers(
+    kind: DispatchKind,
+    p: &GatedServer,
+    d: &GatedServer,
+    streaming: bool,
+    headers: Option<HeaderMap>,
+) -> JoinHandle<Response> {
     let mut router = tests::create_test_pd_router();
     let prefill = p.worker.clone();
     let decode = d.worker.clone();
@@ -131,7 +154,7 @@ fn dispatch(
             tokens: None,
             planner: None,
             model_id: None,
-            headers: None,
+            headers: headers.clone().map(Arc::new),
         };
         let placement = router
             .reserve_pair(
@@ -141,14 +164,14 @@ fn dispatch(
                     prefill_policy: "round_robin",
                     decode_policy: "round_robin",
                 },
-                None,
+                headers.as_ref(),
             )
             .unwrap();
         match kind {
             DispatchKind::Atom => {
                 router
                     .dispatch_atom_relay_internal(
-                        None,
+                        headers.as_ref(),
                         json!({}),
                         json!({}),
                         context,
@@ -162,7 +185,7 @@ fn dispatch(
             DispatchKind::Vllm => {
                 router
                     .dispatch_vllm_mooncake_internal(
-                        None,
+                        headers.as_ref(),
                         json!({}),
                         json!({}),
                         context,
@@ -175,7 +198,7 @@ fn dispatch(
             DispatchKind::Sglang => {
                 router
                     .execute_dual_dispatch_internal(
-                        None,
+                        headers.as_ref(),
                         json!({}),
                         context,
                         placement,
@@ -202,6 +225,67 @@ async fn result(task: JoinHandle<Response>) -> Response {
         .await
         .unwrap()
         .unwrap()
+}
+
+#[tokio::test]
+async fn pd_dispatch_uses_each_workers_credentials_without_leaking_client_keys() {
+    for kind in KINDS {
+        for (prefill_key, decode_key) in [
+            (Some("prefill-secret"), Some("decode-secret")),
+            (Some("prefill-secret"), None),
+            (None, Some("decode-secret")),
+            (None, None),
+        ] {
+            let mut p = GatedServer::start_with_api_key(
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                prefill_key,
+            )
+            .await;
+            let mut d = GatedServer::start_with_api_key(WorkerType::Decode, decode_key).await;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                HeaderValue::from_static("Bearer client-secret"),
+            );
+            headers.append("x-api-key", HeaderValue::from_static("client-key"));
+            headers.append("X-Api-Key", HeaderValue::from_static("second-client-key"));
+            headers.insert("x-request-id", HeaderValue::from_static("pd-credentials"));
+            headers.insert("cookie", HeaderValue::from_static("private=session"));
+            let task = dispatch_with_headers(kind, &p, &d, false, Some(headers));
+
+            p.wait_entered().await;
+            p.respond(prefill_response());
+            d.wait_entered().await;
+            d.respond(axum::Json(json!({"choices": []})).into_response());
+            let response = result(task).await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind:?}");
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+
+            for (server, key) in [(&mut p, prefill_key), (&mut d, decode_key)] {
+                let received = server.captured.try_recv().unwrap();
+                assert_eq!(received.get_all("authorization").iter().count(), 1);
+                if let Some(key) = key {
+                    assert_eq!(received["authorization"], format!("Bearer {key}"));
+                    assert!(
+                        !received.contains_key("x-api-key"),
+                        "{kind:?}: client API keys leaked to a worker with its own credentials"
+                    );
+                } else {
+                    assert_eq!(received["authorization"], "Bearer client-secret");
+                    assert_eq!(
+                        received.get_all("x-api-key").iter().collect::<Vec<_>>(),
+                        ["client-key", "second-client-key"]
+                    );
+                }
+                assert_eq!(received["x-request-id"], "pd-credentials");
+                assert!(!received.contains_key("cookie"));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

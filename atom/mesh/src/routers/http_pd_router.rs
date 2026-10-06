@@ -8,10 +8,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
@@ -1749,28 +1746,26 @@ impl PDRouter {
             )
         })?;
 
+        // Resolve credentials for each PD worker with the same rules as regular ingress.
+        let headers = header_utils::inference_request_headers(
+            headers.unwrap_or(&HeaderMap::new()),
+            route,
+            worker.api_key().as_deref(),
+        )
+        .map_err(|_| {
+            error::IngressError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "invalid_backend_credentials",
+                "configured worker credential is not a valid HTTP header",
+            )
+            .response(route)
+        })?;
         let mut request = client
             .post(worker.endpoint_url(route))
+            .headers(headers)
             .json(&prepared_request);
         if connection_close {
             request = request.header("Connection", "close");
-        }
-        let api_key = worker.api_key();
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                // bearer_auth appends, so omit client credentials when the worker has its own.
-                if name == AUTHORIZATION && api_key.is_some() {
-                    continue;
-                }
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-        if let Some(key) = api_key {
-            request = request.bearer_auth(key);
         }
         Ok(request)
     }

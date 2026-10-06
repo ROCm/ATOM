@@ -1415,18 +1415,28 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = calls.clone();
-        let router = axum::Router::new().route(
-            "/v1/chat/completions",
-            axum::routing::post(
-                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    if body["slow"] == true {
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
-                    }
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(serde_json::json!({"choices":[{"text":"ok"}]}))
-                },
-            ),
-        );
+        let key = match kind {
+            WorkerType::Prefill { .. } => "prefill-secret",
+            _ => "decode-secret",
+        };
+        let router =
+            axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(
+                    move |headers: http::HeaderMap,
+                          axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {key}"));
+                        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+                        assert!(!headers.contains_key("x-api-key"));
+                        assert_eq!(headers["x-request-id"], "pd-credentials");
+                        if body["slow"] == true {
+                            tokio::time::sleep(Duration::from_millis(1200)).await;
+                        }
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"choices":[{"text":"ok"}]}))
+                    },
+                ),
+            );
         servers.push(tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         }));
@@ -1434,6 +1444,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
             BasicWorkerBuilder::new(format!("http://{address}"))
                 .model_id("test-model")
                 .worker_type(kind)
+                .api_key(key)
                 .build(),
         );
         app.worker_registry.register(worker.clone());
@@ -1452,7 +1463,19 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
             br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"slow":true}"#;
         let body: &[u8] = if attempt == 4 { slow_body } else { body };
         let mut stream = fixture.open().await;
-        stream.headers_only().await;
+        stream
+            .send(Request::RequestHeaders(Stream::headers(
+                &[
+                    (":method", "POST"),
+                    (":path", "/v1/chat/completions"),
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer client-secret"),
+                    ("x-api-key", "client-key"),
+                    ("x-request-id", "pd-credentials"),
+                ],
+                false,
+            )))
+            .await;
         stream.body(body, true).await;
         let response = stream.recv().await;
         let Response::RequestHeaders(headers) = response else {
@@ -1521,6 +1544,9 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         let response = client
             .post(&url)
             .header("x-mesh-execution-id", id)
+            .header("authorization", "Bearer client-secret")
+            .header("x-api-key", "client-key")
+            .header("x-request-id", "pd-credentials")
             .body(if attempt != 1 {
                 body.to_vec()
             } else {
