@@ -85,14 +85,6 @@ def test_supported_deployment_has_no_refusal(native, tp):
         (
             {
                 "compilation_config": SimpleNamespace(
-                    level=3, cudagraph_mode=_Mode(False)
-                )
-            },
-            "compile level 3",
-        ),
-        (
-            {
-                "compilation_config": SimpleNamespace(
                     level=0, cudagraph_mode=_Mode(True)
                 )
             },

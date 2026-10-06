@@ -27,14 +27,10 @@ INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use V4.1 mono, or None."""
     spec = atom_config.speculative_config
-    compilation = atom_config.compilation_config
     hf = atom_config.hf_config
     keys = hf.sliding_window + hf.index_topk
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
-        # level 0 runs the wrapped model's forward as Python; a traced forward
-        # would bake the routing decision into the compiled graph
-        (compilation.level == 0, f"compile level {compilation.level}"),
         (
             atom_config.kv_cache_dtype == "bf16",
             f"kv cache {atom_config.kv_cache_dtype}",
