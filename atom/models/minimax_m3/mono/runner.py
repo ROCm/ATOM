@@ -274,10 +274,11 @@ class MonoDecodeRunner:
             self.rank,
             self.npes,
             dev,
-            debug=self.debug,
         )
-        # every mailbox pair, cleared at each step's start (forward)
-        self.mailboxes = StepMailboxes(self.peers, self.scratch1, self.scratch4)
+        # every mailbox pair, zeroed at each step's start (forward)
+        self.mailboxes = StepMailboxes(
+            self.peers, self.scratch1, self.scratch4, debug=self.debug
+        )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
         # previous layer's output) and writes ars[(i + 1) % 2], likewise h_mids
@@ -489,4 +490,4 @@ class MonoDecodeRunner:
             self.scratch4[off : off + DIAG_BYTES],
             region_namer(diag_region_names(n, self.index_heads)),
         )
-        raise_if_given_up("MiniMax-M3 mono", self.rank, n, waits, self.peers)
+        raise_if_given_up("MiniMax-M3 mono", self.rank, n, waits, self.mailboxes)
