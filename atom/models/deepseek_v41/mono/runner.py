@@ -145,9 +145,8 @@ class V41MonoDecodeRunner:
             self.rank,
             self.tp,
             self.scratch.device,
-            debug=self.debug,
         )
-        self.mailboxes = StepMailboxes(self.peers, self.scratch)
+        self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
         self.widths = WidthBuilds(
             self._rows_build, self._row_kernels, group, "V4.1 mono"
         )
@@ -617,7 +616,7 @@ class V41MonoDecodeRunner:
         }
         diag = self.scratch[self.diag_off : self.diag_off + DIAG_BYTES]
         waits = given_up_waits(diag, kernel_debug.region_names(regions))
-        raise_if_given_up("V4.1 mono", self.rank, rows, waits, self.peers)
+        raise_if_given_up("V4.1 mono", self.rank, rows, waits, self.mailboxes)
 
     def _rope_positions(self, cache, step) -> torch.Tensor:
         """Each row's position for RoPE (int64 [S])."""

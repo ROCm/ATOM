@@ -50,9 +50,9 @@ Key entry points:
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
-  (`consensus.bind_agreed`), peer memory with the step fence and its owned
-  buffer (`lifecycle`), the step's mailbox clear
-  (`mailboxes.StepMailboxes.begin_step`), per-width builds (`widths`), the routing wrapper's
+  (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),
+  the step's mailbox zeroing and peer fence, one FlyDSL launch
+  (`mailboxes.StepMailboxes.begin_step` -> `step_begin`), per-width builds (`widths`), the routing wrapper's
   lazy runner (`route`), debug wait reports, kernel argument tables, compile-only
   builds and their traced hand-offs (`compile.trace` / `compile.check_traced`),
   the refusals every model shares (`deployment`), check-mode
