@@ -1501,9 +1501,7 @@ class MLAAttention(nn.Module):
         elif _mla_absorb_a16w8_enabled():
             # A16W8: BF16 activation x FP8 weight (same fp8 W_K/W_K_scale as the
             # a8w8 path, no runtime activation quant). Output (M, B=heads, L).
-            ql_nope = _aiter_triton_a16w8_bmm(
-                q_nope, W_K, W_K_scale, transpose_bm=True
-            )
+            ql_nope = _aiter_triton_a16w8_bmm(q_nope, W_K, W_K_scale, transpose_bm=True)
             if _mla_absorb_a16w8_perhead_enabled():
                 # re-apply the folded-out per-head dequant factor (per B=head)
                 ql_nope = ql_nope * self.W_K_phscale.view(1, ql_nope.shape[1], 1)
