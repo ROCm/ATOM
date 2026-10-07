@@ -1162,7 +1162,7 @@ models:
   DeepSeek-V4-Flash-vLLM-Survey:
     backend: vllm
     image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
-    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Flash"
+    model_path: "/share_nfs/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
     precision: checkpoint
     env:
       common:

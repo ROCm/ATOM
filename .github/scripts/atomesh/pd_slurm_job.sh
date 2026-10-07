@@ -331,6 +331,12 @@ EOF
   if [[ -d /share_nfs/models ]]; then
     docker_args+=(-v /share_nfs/models:/share_nfs/models)
   fi
+  # Keep the original Flash snapshot's ../../blobs symlinks visible, read-only.
+  local flash_cache="/share_nfs/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash"
+  if [[ "${MODEL_NAME}" == "DeepSeek-V4-Flash-vLLM-Survey" &&
+        "${MODEL_PATH}" == "${flash_cache}/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1" ]]; then
+    docker_args+=(--mount "type=bind,source=${flash_cache},target=${flash_cache},readonly")
+  fi
 
   if [[ "${rank}" -eq 0 \
     && "${EVAL_TASK:-}" == "swebench_lite" \

@@ -1764,6 +1764,10 @@ jobs:
           model = cell['model_path']
           # The existing machine-paths contract maps the shared model root here.
           root = '/share_nfs/models' if model.startswith('/share_nfs/models/') else os.environ['ATOMESH_MODEL_ROOT']
+          flash_cache = '/share_nfs/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash'
+          if (cell.get('model') == 'DeepSeek-V4-Flash-vLLM-Survey'
+                  and model == flash_cache + '/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1'):
+              root = flash_cache
           manifest = cell.get('vllm', {}).get('checkpoint_manifest')
           extra = ['--manifest', str(Path('.github/scripts/atomesh') / manifest)] if manifest else []
           draft = cell.get('vllm', {}).get('draft_model_path')

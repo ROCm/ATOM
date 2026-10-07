@@ -16,6 +16,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / ".github/scripts/atomesh"
+FLASH_CACHE = "/share_nfs/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash"
+FLASH_SNAPSHOT = FLASH_CACHE + "/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
 
 
 def load_script(name):
@@ -23,6 +25,141 @@ def load_script(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize(
+    "name,path,expected_root,mounted",
+    [
+        ("DeepSeek-V4-Flash-vLLM-Survey", FLASH_SNAPSHOT, FLASH_CACHE, True),
+        (
+            "DeepSeek-V4-Flash-vLLM-Survey",
+            FLASH_SNAPSHOT + "-other",
+            "/mnt/models",
+            False,
+        ),
+        (
+            "DeepSeek-V4-Flash-vLLM-Survey",
+            FLASH_CACHE + "/snapshots/other",
+            "/mnt/models",
+            False,
+        ),
+        ("other", FLASH_SNAPSHOT, "/mnt/models", False),
+        (
+            "Kimi-K3-vLLM-Survey",
+            "/share_nfs/models/moonshotai/Kimi-K3",
+            "/share_nfs/models",
+            False,
+        ),
+    ],
+)
+def test_flash_snapshot_root_and_readonly_parent_mount(
+    tmp_path, monkeypatch, name, path, expected_root, mounted
+):
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/atomesh-benchmark.yaml").read_text()
+    )
+    step = next(
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("name") == "Survey pre-submit visibility and queue check"
+    )
+    code = step["run"].split("python3 - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+    (tmp_path / "survey-preflight").mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ATOMESH_MODEL_ROOT", "/mnt/models")
+    monkeypatch.setenv(
+        "CELL_JSON",
+        json.dumps(
+            {
+                "model": name,
+                "model_path": path,
+                "vllm": {
+                    "nixl_model_profile": "v4",
+                    "checkpoint_manifest": "v4-checkpoint-identity.json",
+                },
+            }
+        ),
+    )
+    calls = []
+
+    def capture(command, *, check):
+        assert check is True
+        calls.append(command)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, "run", capture)
+        exec(code, {})  # noqa: S102 - execute checked-in CPU workflow gate
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[2] == path
+    assert argv[argv.index("--model-root") + 1] == expected_root
+    assert (
+        argv[argv.index("--manifest") + 1]
+        == ".github/scripts/atomesh/v4-checkpoint-identity.json"
+    )
+
+    source = (SCRIPTS / "pd_slurm_job.sh").read_text()
+    start = source.index("  local flash_cache=")
+    fragment = source[start : source.index("\n  fi", start) + len("\n  fi")]
+    shell = (
+        "render() {\nlocal -a docker_args=()\n"
+        + fragment
+        + '\nprintf "%s\\n" "${docker_args[@]}"\n}\nrender'
+    )
+    result = subprocess.run(
+        ["bash", "-c", shell],
+        env={**os.environ, "MODEL_NAME": name, "MODEL_PATH": path},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.split() == (
+        ["--mount", f"type=bind,source={FLASH_CACHE},target={FLASH_CACHE},readonly"]
+        if mounted
+        else []
+    )
+
+
+def test_hf_snapshot_symlinks_and_manifest_remain_fail_closed(tmp_path):
+    cache = tmp_path / "cache"
+    model = cache / "snapshots" / "revision"
+    blobs = cache / "blobs"
+    model.mkdir(parents=True)
+    blobs.mkdir()
+    files = {
+        "config.json": b'{"architectures":["DeepseekV4ForCausalLM"]}',
+        "model.safetensors.index.json": b'{"weight_map":{"weight":"model-1.safetensors"}}',
+        "model-1.safetensors": b"12345678weights",
+        "tokenizer_config.json": b"{}",
+        "tokenizer.json": b"tokenizer bytes",
+    }
+    for name, data in files.items():
+        (blobs / name).write_bytes(data)
+        (model / name).symlink_to(Path("../../blobs") / name)
+    manifest = tmp_path / "identity.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "config_sha256": hashlib.sha256(files["config.json"]).hexdigest(),
+                "index_sha256": hashlib.sha256(
+                    files["model.safetensors.index.json"]
+                ).hexdigest(),
+                "shards": {"model-1.safetensors": len(files["model-1.safetensors"])},
+            }
+        )
+    )
+    checker = load_script("pd_survey_preflight")
+    assert checker.check_weights(model, cache, manifest)["status"] == "FILES_VISIBLE"
+    (blobs / "config.json").write_bytes(files["config.json"] + b" ")
+    failed = checker.check_weights(model, cache, manifest)
+    assert failed["status"] == "BLOCKED_ENV"
+    assert "config_sha256 mismatch" in failed["error"]
+    (blobs / "config.json").write_bytes(files["config.json"])
+    (blobs / "model-1.safetensors").unlink()
+    assert checker.check_weights(model, cache, manifest)["status"] == "BLOCKED_ENV"
 
 
 def test_v4_matrix_and_rendered_launch(tmp_path, monkeypatch):
@@ -51,7 +188,7 @@ def test_v4_matrix_and_rendered_launch(tmp_path, monkeypatch):
     assert len(cells) == 1
     cell = cells[0]
     assert cell["num_nodes"] == 2
-    assert cell["model_path"] == "/share_nfs/models/deepseek-ai/DeepSeek-V4-Flash"
+    assert cell["model_path"] == FLASH_SNAPSHOT
     assert cell["isl"] == [255, 257, 513]
     assert cell["vllm"]["source"]["sha"] == "b22494cc0cb4bd9db4a62fb107d92429a4a3249d"
     identity = json.loads((SCRIPTS / cell["vllm"]["checkpoint_manifest"]).read_text())
