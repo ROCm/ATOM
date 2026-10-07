@@ -115,6 +115,30 @@ def run_composition(tmp_path, fault=None):
                 pending[host] = 2
         n = len(body["prompt"]) - int(p)
         if host == "decode":
+            if fault == "decode_failure":
+                references = [
+                    json.loads(line)
+                    for line in (tmp_path / "direct-references.jsonl")
+                    .read_text()
+                    .splitlines()
+                ]
+                assert len(references) == 2
+                for reference in references:
+                    prompt = reference["request"]["prompt"]
+                    assert reference["url"] == "http://prefill"
+                    assert reference["request"]["max_tokens"] == 16
+                    assert "kv_transfer_params" not in reference["request"]
+                    assert reference["response"] == {
+                        "choices": [
+                            {
+                                "prompt_token_ids": prompt,
+                                "token_ids": list(range(16)),
+                                "text": "same text",
+                                "finish_reason": "length",
+                            }
+                        ]
+                    }
+                raise httpx.ReadError("decode failed")
             assert all(params[k] == value for k, value in handoff.items())
             c[
                 (
@@ -171,6 +195,21 @@ def run_composition(tmp_path, fault=None):
     ):
         asyncio.run(profile.run(args))
     return calls
+
+
+def test_composition_direct_references_survive_decode_failure(tmp_path):
+    with pytest.raises(httpx.ReadError, match="decode failed"):
+        run_composition(tmp_path, "decode_failure")
+    assert not (tmp_path / "complete.json").exists()
+    references = [
+        json.loads(line)
+        for line in (tmp_path / "direct-references.jsonl").read_text().splitlines()
+    ]
+    assert [len(ref["request"]["prompt"]) for ref in references] == [1026, 1153]
+    assert (
+        json.loads((tmp_path / "composition-cold-evidence.json").read_text())["status"]
+        == "FAIL"
+    )
 
 
 @pytest.mark.parametrize("fault", [None, "delayed_reference"])

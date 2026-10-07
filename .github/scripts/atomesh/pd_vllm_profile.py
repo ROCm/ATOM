@@ -167,6 +167,13 @@ async def run(args):
                         + "\n"
                     )
                 raise
+            if params is None:
+                # Save validated ordinary references before any reset, PD, or metrics failure.
+                with (args.output / "direct-references.jsonl").open("a") as output:
+                    output.write(
+                        json.dumps({"url": url, "request": body, "response": result})
+                        + "\n"
+                    )
             return result
 
         async def pd(prompt, count, tag):

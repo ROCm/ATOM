@@ -99,6 +99,38 @@ def run_survey(tmp_path, mutate=None, mode="smoke"):
     return calls
 
 
+@pytest.mark.parametrize(
+    "mode,length,count", [("smoke", 127, 16), ("profile", 32767, 1)]
+)
+def test_direct_reference_is_durable_before_decode_failure(
+    tmp_path, mode, length, count
+):
+    def fail_decode(role, body, choice):
+        if role != "decode":
+            return
+        evidence = json.loads((tmp_path / "direct-references.jsonl").read_text())
+        assert evidence["url"] == "http://prefill"
+        assert evidence["request"]["prompt"] == list(range(length))
+        assert evidence["request"]["max_tokens"] == count
+        assert "kv_transfer_params" not in evidence["request"]
+        assert evidence["response"] == {
+            "choices": [
+                {
+                    "text": "same decoded text",
+                    "finish_reason": "length",
+                    "prompt_token_ids": list(range(length)),
+                    "token_ids": list(range(100, 100 + count)),
+                }
+            ]
+        }
+        raise httpx.ReadError("decode failed")
+
+    with pytest.raises(httpx.ReadError, match="decode failed"):
+        run_survey(tmp_path, fail_decode, mode)
+    assert not (tmp_path / "complete.json").exists()
+    assert len((tmp_path / "direct-references.jsonl").read_text().splitlines()) == 1
+
+
 def test_text_only_response_fails_closed(tmp_path):
     def omit_ids(role, body, choice):
         choice.pop("token_ids")
