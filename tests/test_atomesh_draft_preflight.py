@@ -255,7 +255,10 @@ def resolve_machine_paths(cell, monkeypatch, hostname="other-runner"):
         return json.loads(output.read_text().split("=", 1)[1])
 
 
-def test_only_survey_dspark_cell_gates_actual_speculative_paths(monkeypatch):
+@pytest.mark.parametrize("composition", [False, True])
+def test_only_survey_dspark_cells_gate_actual_speculative_paths(
+    monkeypatch, composition
+):
     import re
     import shlex
 
@@ -281,10 +284,18 @@ def test_only_survey_dspark_cell_gates_actual_speculative_paths(monkeypatch):
         override_eval_concurrency=None,
     )
     gated = [cell for cell in cells if cell.get("vllm", {}).get("draft_model_path")]
-    assert len(gated) == 1
-    cell = gated[0]
-    cell = resolve_machine_paths(cell, monkeypatch)
-    assert cell["name"] == "survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager"
+    names = {
+        "survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager",
+        "survey-k3-main-read-dspark3-apc-1p1d-tp8-dcp8-eager",
+    }
+    assert {cell["name"] for cell in gated} == names
+    original = next(
+        cell
+        for cell in gated
+        if bool(cell["vllm"].get("cache_composition")) == composition
+    )
+    cell = resolve_machine_paths(original, monkeypatch)
+    assert cell["name"] in names
     path = cell["vllm"]["draft_model_path"]
     assert path == "/models with spaces/Inferact/Kimi-K3-DSpark"
     for role in ("prefill", "decode"):
@@ -294,7 +305,7 @@ def test_only_survey_dspark_cell_gates_actual_speculative_paths(monkeypatch):
         assert speculative["method"] == "dspark"
         assert not speculative.get("use_heterogeneous_vocab", False)
         assert "quantization" not in speculative
-    remapped = resolve_machine_paths(gated[0], monkeypatch, "pit2-vm-amd-xl-02")
+    remapped = resolve_machine_paths(original, monkeypatch, "pit2-vm-amd-xl-02")
     assert (
         remapped["vllm"]["draft_model_path"]
         == "/share_nfs/models/Inferact/Kimi-K3-DSpark"

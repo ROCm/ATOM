@@ -975,9 +975,10 @@ models:
             wait_server_timeout: 10800
           run_eval: false
         # Follow-up only; not selected by the first dispatch inputs.
-        - <<: *survey_k3_read
+        - &survey_k3_read_dspark
+          <<: *survey_k3_read
           name: survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager
-          vllm:
+          vllm: &survey_k3_draft_visibility
             draft_model_path: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
           prefill:
             workers: 1
@@ -990,6 +991,15 @@ models:
             tp: 8
             dcp: 8
             extra_args: *survey_k3_draft
+        - <<: *survey_k3_read
+          name: survey-k3-main-read-apc-1p1d-tp8-dcp8-eager
+          vllm:
+            cache_composition: 1
+        - <<: *survey_k3_read_dspark
+          name: survey-k3-main-read-dspark3-apc-1p1d-tp8-dcp8-eager
+          vllm:
+            <<: *survey_k3_draft_visibility
+            cache_composition: 1
 
   # Dense control does not require the K3 FP4/Triton feature gate.
   Qwen3-0.6B-vLLM-Survey:

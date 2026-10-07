@@ -674,7 +674,7 @@ class SurveyConfigurationTest(unittest.TestCase):
                 override_benchmark_concurrency=None,
                 override_eval_concurrency=None,
             )
-        self.assertEqual(len(cells), 4)
+        self.assertEqual(len(cells), 6)
         launcher = root / ".github/scripts/atomesh/pd_server_vllm.sh"
         # Load the actual shell function definitions but never execute installation.
         functions = launcher.read_text().split(
