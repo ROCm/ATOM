@@ -6,6 +6,7 @@ The historical module name remains for existing harness/import compatibility.
 import argparse
 import asyncio
 import json
+import time
 import uuid
 from pathlib import Path
 
@@ -116,7 +117,374 @@ def check_token_ids(response, prompt, count):
     ), "Generated IDs must be nonnegative integers"
 
 
+def composition_accounting_ready(deltas, length, kind, cold_roles):
+    """Validate complete isolated windows without assuming cache hit geometry."""
+    ready = True
+    for role, values in deltas.items():
+        assert all(v is None or v >= 0 for v in values.values()), "Metric counter reset"
+        failures = [total(values, name) for name in FAILURES]
+        assert all(v is None or v == 0 for v in failures), "NIXL failure counter"
+        expected = int(kind == "target" or (kind == "reference" and role == "prefill"))
+        success = total(values, "vllm:request_success_total")
+        assert success is None or success <= expected, "Non-isolated request counters"
+        for name, value in values.items():
+            if name.startswith("vllm:request_success_total") and any(
+                f'finished_reason="{reason}"' in name for reason in ("error", "abort")
+            ):
+                assert value is None or value == 0, "Failed request counter"
+        sources = [
+            total(values, "vllm:prompt_tokens_by_source_total", f'source="{s}"')
+            for s in SOURCES
+        ]
+        byte_sum = total(values, "vllm:nixl_bytes_transferred_sum")
+        byte_count = total(values, "vllm:nixl_bytes_transferred_count")
+        if any(v is None for v in [success, byte_sum, byte_count, *sources, *failures]):
+            ready = False
+            continue
+        if any(v is None for v in values.values()):
+            ready = False
+            continue
+        local, cache, external = sources
+        assert sum(sources) <= length * expected, "Prompt token accounting exceeds N"
+        if success != expected or sum(sources) != length * expected:
+            ready = False
+            continue
+        if role == "prefill":
+            assert external == 0, "Producer external tokens must be zero"
+        if role in cold_roles:
+            assert cache == 0, "Cold role reported APC hit"
+        if kind == "target" and role == "decode":
+            if role in cold_roles:
+                assert external > 0 and local < length, "No external KV consumption"
+            # Frozen M3/V4 pull path: no Mamba/MTP prefill backoff or V4.1
+            # bounded replay. It loads N minus the observed local prefix hit.
+            # The hit is capped at N-1; logits tail replay does not change the
+            # first-prefill source stats. Do not invent an exact cache-hit size.
+            assert (
+                0 <= cache < length and local == 0 and external == length - cache
+            ), "Decoder NIXL source accounting requires external=N-cache and local=0"
+            ready &= byte_sum > 0 and byte_count > 0
+        else:
+            # This unidirectional pull workload has no producer-side READs.
+            assert byte_sum == 0 and byte_count == 0, "Unattributed NIXL transfer"
+    return ready
+
+
+async def run_composition(args):
+    """Seven serial APC phases; raw evidence only, never automatic acceptance."""
+    profile = getattr(args, "model_profile", "m3")
+    boundary = {"m3": 128, "v4": 256}[profile]
+    args.output.mkdir(parents=True, exist_ok=True)
+    path = args.output / "composition.json"
+    report = {
+        "status": "PENDING_REVIEW",
+        "model_profile": profile,
+        "requests": [],
+        "resets": [],
+        "scrapes": [],
+        "runtime_audit": {
+            "cudagraph_metrics_requested": getattr(args, "cudagraph_metrics", False),
+            "graph_execution": "NOT_VERIFIED",
+            "review_required": "Correlate request timestamps with server runtime logs; no graph or performance claim",
+        },
+    }
+
+    def save():
+        path.write_text(json.dumps(report, indent=2) + "\n")
+
+    async with httpx.AsyncClient(timeout=600, trust_env=False) as client:
+
+        async def post(role, endpoint, body, request_id):
+            response = await client.post(
+                getattr(args, role) + endpoint,
+                json=body,
+                headers={"X-Request-Id": request_id},
+            )
+            response.raise_for_status()
+            return response.json()
+
+        async def snapshot(tag):
+            result = {}
+            for role in ("prefill", "decode"):
+                response = await client.get(getattr(args, role) + "/metrics")
+                response.raise_for_status()
+                filename = f"composition-{len(report['scrapes']):04d}-{tag}-{role}.prom"
+                (args.output / filename).write_text(response.text)
+                scrape = {
+                    "tag": tag,
+                    "role": role,
+                    "path": filename,
+                    "sampled_at": time.time(),
+                }
+                if report["runtime_audit"]["cudagraph_metrics_requested"]:
+                    scrape["runtime_metric_lines"] = [
+                        line
+                        for line in response.text.splitlines()
+                        if line.startswith(("vllm:cudagraph", "vllm:iteration_"))
+                    ]
+                report["scrapes"].append(scrape)
+                result[role] = metrics(response.text)
+            return result
+
+        async def settle(
+            tag, before=None, record=None, length=0, kind="idle", cold_roles=()
+        ):
+            last, equal = None, 0
+            for attempt in range(16):
+                current = await snapshot(f"{tag}-{attempt}")
+                if before is None:
+                    before = current
+                deltas = metric_deltas(before, current)
+                if record is not None:
+                    record["labeled_metric_deltas"] = deltas
+                    record["unknown_series"] = {
+                        role: [k for k, v in values.items() if v is None]
+                        for role, values in deltas.items()
+                    }
+                equal = equal + 1 if current == last else 0
+                if (
+                    attempt >= 6
+                    and equal >= 2
+                    and composition_accounting_ready(deltas, length, kind, cold_roles)
+                ):
+                    return current
+                last = current
+                await asyncio.sleep(1)
+            raise TimeoutError(
+                f"{tag}: missing/delayed/unstable metrics; stopped subsequent requests"
+            )
+
+        async def reset(roles, tag):
+            before = await settle(tag + "-before-reset")
+            record = {"tag": tag, "roles": list(roles), "responses": []}
+            report["resets"].append(record)
+            for role in roles:
+                response = await post(
+                    role,
+                    "/reset_prefix_cache?reset_external=false&reset_running_requests=false",
+                    {},
+                    uuid.uuid4().hex,
+                )
+                record["responses"].append(
+                    {"role": role, "response": response, "sampled_at": time.time()}
+                )
+                save()
+                assert response.get("success") is True, "Prefix cache reset failed"
+            return await settle(tag + "-after-reset", before, record)
+
+        async def request(tag, key, kind, cold_roles, references):
+            prompt = report["prompts"][key]
+            record = {
+                "tag": tag,
+                "kind": kind,
+                "prompt_tokens": len(prompt),
+                "status": "PENDING_REVIEW",
+                "accounting_checked": False,
+            }
+            report["requests"].append(record)
+            try:
+                before = (
+                    await reset(cold_roles, tag)
+                    if cold_roles
+                    else await settle(tag + "-before")
+                )
+                request_id = f"{profile}-composition-{tag}-" + uuid.uuid4().hex
+                record.update(request_id=request_id, started_at=time.time())
+                body = {
+                    "model": args.model,
+                    "prompt": prompt,
+                    "max_tokens": 16,
+                    "temperature": 0,
+                    "seed": 42,
+                    "ignore_eos": True,
+                    "stream": False,
+                    "return_token_ids": True,
+                }
+                if kind == "reference":
+                    response = await post(
+                        "prefill", "/v1/completions", body, request_id
+                    )
+                else:
+                    prefill = await post(
+                        "prefill",
+                        "/v1/completions",
+                        {
+                            **body,
+                            "max_tokens": 1,
+                            "kv_transfer_params": {
+                                "do_remote_decode": True,
+                                "do_remote_prefill": False,
+                                "remote_engine_id": None,
+                                "remote_block_ids": None,
+                                "remote_host": None,
+                                "remote_port": None,
+                            },
+                        },
+                        request_id,
+                    )
+                    record["prefill"] = prefill
+                    save()
+                    check_usage(prefill, len(prompt), 1)
+                    check_token_ids(prefill, prompt, 1)
+                    transfer = prefill["kv_transfer_params"]
+                    assert transfer.get("do_remote_prefill") is True, transfer
+                    assert all(
+                        transfer.get(k)
+                        for k in (
+                            "remote_engine_id",
+                            "remote_block_ids",
+                            "remote_host",
+                            "remote_port",
+                        )
+                    ), transfer
+                    response = await post(
+                        "decode",
+                        "/v1/completions",
+                        {**body, "kv_transfer_params": transfer},
+                        request_id,
+                    )
+                record.update(response=response, response_completed_at=time.time())
+                save()
+                check_usage(response, len(prompt), 16)
+                check_token_ids(response, prompt, 16)
+                if kind == "target":
+                    record["generated_token_ids_equal"] = (
+                        response["choices"][0]["token_ids"]
+                        == references[key]["choices"][0]["token_ids"]
+                    )
+                    record["direct_pd_text_equal"] = (
+                        response["choices"][0]["text"]
+                        == references[key]["choices"][0]["text"]
+                    )
+                    assert record[
+                        "generated_token_ids_equal"
+                    ], "Direct/PD token ID mismatch"
+                    assert record["direct_pd_text_equal"], "Direct/PD text mismatch"
+                await settle(
+                    tag + "-after", before, record, len(prompt), kind, cold_roles
+                )
+                record.update(
+                    accounting_checked=True, accounting_completed_at=time.time()
+                )
+                if kind == "target":
+                    deltas = record["labeled_metric_deltas"]
+                    hits = {
+                        role: total(
+                            values,
+                            "vllm:prompt_tokens_by_source_total",
+                            'source="local_cache_hit"',
+                        )
+                        for role, values in deltas.items()
+                    }
+                    warm_roles = {"prefill", "decode"} - set(cold_roles)
+                    record["cache_hits"] = hits
+                    record["apc_status"] = (
+                        "NOT_REQUESTED"
+                        if not warm_roles
+                        else (
+                            "APC_EXERCISED"
+                            if all(hits[r] > 0 for r in warm_roles)
+                            else "APC_NOT_EXERCISED"
+                        )
+                    )
+                    # Complete source/byte accounting above proves the pull;
+                    # no-transfer is not legal for these frozen M3/V4 targets.
+                    record["transfer_status"] = "REMOTE_TRANSFER_OBSERVED"
+                return response
+            except Exception as exc:
+                record["status"] = (
+                    "PENDING_REVIEW_INCOMPLETE"
+                    if isinstance(exc, TimeoutError)
+                    else "FAIL"
+                )
+                record["error"] = repr(exc)
+                try:
+                    record["failure_metrics"] = await snapshot(tag + "-failure")
+                except (httpx.HTTPError, OSError, ValueError) as metric_exc:
+                    record["metrics_error"] = repr(metric_exc)
+                raise
+            finally:
+                save()
+
+        try:
+            tokenized = await post(
+                "prefill",
+                "/tokenize",
+                {
+                    "model": args.model,
+                    "prompt": f"Engineering record {uuid.uuid4().hex}.\n"
+                    + "\n".join(
+                        f"Record {i}: The service reads a buffer and computes a result."
+                        for i in range(300)
+                    ),
+                },
+                uuid.uuid4().hex,
+            )
+            primary = tokenized["tokens"][:513]
+            alternate = (
+                await post(
+                    "prefill",
+                    "/tokenize",
+                    {
+                        "model": args.model,
+                        "prompt": "A different engineering question about cache measurements. "
+                        * 300,
+                    },
+                    uuid.uuid4().hex,
+                )
+            )["tokens"]
+            assert (
+                len(primary) == 513 and len(alternate) >= 257
+            ), "Insufficient prompt IDs"
+            offset = next(
+                i for i in range(len(alternate) - 256) if alternate[i] != primary[256]
+            )
+            branch = primary[:256] + alternate[offset : offset + 257]
+            report["prompts"] = {
+                "primary": primary,
+                "branch": branch,
+                **{str(n): primary[:n] for n in (boundary - 1, boundary, boundary + 1)},
+            }
+            references = {}
+            for key in report["prompts"]:
+                references[key] = await request(
+                    "reference-" + key,
+                    key,
+                    "reference",
+                    ("prefill", "decode"),
+                    references,
+                )
+            phases = [
+                ("cold", "primary", ("prefill", "decode")),
+                ("P-warm-D-cold", "primary", ("decode",)),
+                ("both-warm", "primary", ()),
+                ("partial-prefix", "branch", ()),
+                ("boundary-minus", str(boundary - 1), ("prefill", "decode")),
+                ("boundary", str(boundary), ("prefill", "decode")),
+                ("boundary-plus", str(boundary + 1), ("prefill", "decode")),
+            ]
+            for tag, key, cold_roles in phases:
+                await request(tag, key, "target", cold_roles, references)
+            report["apc_status"] = (
+                "APC_NOT_EXERCISED"
+                if any(
+                    r.get("apc_status") == "APC_NOT_EXERCISED"
+                    for r in report["requests"]
+                )
+                else "APC_EXERCISED"
+            )
+        except TimeoutError as exc:
+            report.update(status="PENDING_REVIEW_INCOMPLETE", error=repr(exc))
+        except Exception as exc:
+            report.update(status="FAIL", error=repr(exc))
+            raise
+        finally:
+            save()
+
+
 async def run(args):
+    if getattr(args, "cache_composition", False):
+        return await run_composition(args)
     profile = getattr(args, "model_profile", "m3")
     lengths = {"m3": (127, 129, 513), "v4": (255, 257, 513)}[profile]
     args.output.mkdir(parents=True, exist_ok=True)
@@ -314,6 +682,12 @@ if __name__ == "__main__":
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-profile", choices=("m3", "v4"), default="m3")
+    parser.add_argument("--cache-composition", action="store_true")
+    parser.add_argument(
+        "--cudagraph-metrics",
+        action="store_true",
+        help="Archive composition runtime metric lines for later audit; does not enable server graphs",
+    )
     args = parser.parse_args()
     try:
         asyncio.run(run(args))
