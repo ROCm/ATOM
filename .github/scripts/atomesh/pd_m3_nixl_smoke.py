@@ -174,11 +174,13 @@ async def run_composition(args):
     """Seven serial APC phases; raw evidence only, never automatic acceptance."""
     profile = getattr(args, "model_profile", "m3")
     boundary = {"m3": 128, "v4": 256}[profile]
+    prompt_seed = getattr(args, "prompt_seed", None)
     args.output.mkdir(parents=True, exist_ok=True)
     path = args.output / "composition.json"
     report = {
         "status": "PENDING_REVIEW",
         "model_profile": profile,
+        "prompt_seed": prompt_seed,
         "requests": [],
         "resets": [],
         "scrapes": [],
@@ -407,12 +409,15 @@ async def run_composition(args):
                 save()
 
         try:
+            # Reproducible inputs are opt-in; request IDs remain unique and the
+            # default composition workload keeps its original random prefix.
+            prompt_prefix = prompt_seed if prompt_seed is not None else uuid.uuid4().hex
             tokenized = await post(
                 "prefill",
                 "/tokenize",
                 {
                     "model": args.model,
-                    "prompt": f"Engineering record {uuid.uuid4().hex}.\n"
+                    "prompt": f"Engineering record {prompt_prefix}.\n"
                     + "\n".join(
                         f"Record {i}: The service reads a buffer and computes a result."
                         for i in range(300)
@@ -683,6 +688,10 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model-profile", choices=("m3", "v4"), default="m3")
     parser.add_argument("--cache-composition", action="store_true")
+    parser.add_argument(
+        "--prompt-seed",
+        help="Optional composition prompt prefix for paired inputs; default is random",
+    )
     parser.add_argument(
         "--cudagraph-metrics",
         action="store_true",

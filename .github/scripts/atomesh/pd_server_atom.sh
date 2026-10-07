@@ -1367,12 +1367,23 @@ run_workload_phase() {
       --model "${SERVED_MODEL_NAME}" \
       --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}"
   elif [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
+    local -a nixl_client_args=()
+    if [[ "${ATOMESH_VLLM_CACHE_COMPOSITION:-0}" == "1" ]]; then
+      nixl_client_args+=(--cache-composition)
+    fi
+    if [[ "${ATOMESH_VLLM_CUDAGRAPH_METRICS:-0}" == "1" ]]; then
+      nixl_client_args+=(--cudagraph-metrics)
+    fi
+    if [[ -n "${ATOMESH_VLLM_PROMPT_SEED:-}" ]]; then
+      nixl_client_args+=(--prompt-seed "${ATOMESH_VLLM_PROMPT_SEED}")
+    fi
     python3 "${ATOMESH_SCRIPT_DIR}/pd_m3_nixl_smoke.py" \
       --model-profile "${ATOMESH_VLLM_NIXL_MODEL_PROFILE:-m3}" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
       --model "${SERVED_MODEL_NAME}" \
-      --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}"
+      --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}" \
+      "${nixl_client_args[@]}"
   elif [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_profile.py" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \

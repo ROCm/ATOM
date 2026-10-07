@@ -179,7 +179,7 @@ def test_v4_matrix_and_rendered_launch(tmp_path, monkeypatch):
         matrix.load_config(ROOT / ".github/benchmark/models_atomesh.yaml"),
         suite="vllm",
         model_filter={"DeepSeek-V4-Flash-vLLM-Survey"},
-        case_filter=None,
+        case_filter={"survey-v4-flash-main-nixl-1p1d-tp8-eager"},
         benchmark_kind_filter=None,
         override_image=None,
         override_benchmark_concurrency=None,

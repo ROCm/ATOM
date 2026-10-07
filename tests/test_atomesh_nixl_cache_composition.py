@@ -183,6 +183,35 @@ def test_warm_missing_transfer_fails_closed(
     assert report["requests"][-1]["status"] == "FAIL"
 
 
+@pytest.mark.parametrize("profile", ["m3", "v4"])
+def test_optional_prompt_seed_pairs_inputs_without_claiming_cross_arm_match(
+    tmp_path, monkeypatch, profile
+):
+    observations = []
+    for index, seed in enumerate(
+        ("rocm-pd-apc-20261007", "rocm-pd-apc-20261007", "other-seed", None, None)
+    ):
+        with monkeypatch.context() as patch:
+            output = tmp_path / str(index)
+            smoke, args, calls = setup_run(output, patch, profile, "text_tokenizer")
+            if seed is not None:
+                args.prompt_seed = seed
+            asyncio.run(smoke.run(args))
+            report = json.loads((output / "composition.json").read_text())
+            text = next(
+                body["prompt"] for _, path, body in calls if path == "/tokenize"
+            )
+            observations.append((text, report["prompts"]))
+            assert report["prompt_seed"] == seed
+            assert report["runtime_audit"]["graph_execution"] == "NOT_VERIFIED"
+            assert report["status"] == "PENDING_REVIEW"
+    assert observations[0] == observations[1]
+    assert observations[0][0].startswith("Engineering record rocm-pd-apc-20261007.\n")
+    assert observations[0][1] != observations[2][1]
+    assert observations[3][0] != observations[4][0]
+    assert observations[3][1] != observations[4][1]
+
+
 def setup_run(tmp_path, monkeypatch, profile="m3", fault=None):
     spec = importlib.util.spec_from_file_location("composition_smoke", SCRIPT)
     smoke = importlib.util.module_from_spec(spec)
@@ -219,6 +248,10 @@ def setup_run(tmp_path, monkeypatch, profile="m3", fault=None):
         body = json.loads(request.content) if request.content else None
         calls.append((role, request.url.path, body))
         if request.url.path == "/tokenize":
+            if fault == "text_tokenizer":
+                return httpx.Response(
+                    200, json={"tokens": list(body["prompt"].encode())}
+                )
             tokenizations += 1
             offset = 0 if tokenizations == 1 else 1000
             return httpx.Response(
