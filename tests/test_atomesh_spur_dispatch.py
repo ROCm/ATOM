@@ -26,9 +26,8 @@ class SpurDispatchTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / JOB_SCRIPT.name
         shutil.copyfile(JOB_SCRIPT, self.script)
-        shutil.copyfile(
-            JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py"
-        )
+        for helper in ("pd_job_result.py", "pd_cleanup_state.py"):
+            shutil.copyfile(JOB_SCRIPT.with_name(helper), scripts / helper)
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
