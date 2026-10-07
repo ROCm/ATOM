@@ -16,6 +16,41 @@ VLLM_DISCOVERY_PORT=$((${ATOMESH_VLLM_ROUTER_DISCOVERY_PORT:?vllm.router.discove
 VLLM_SITE_DIR="/tmp/atomesh-vllm-site"
 LMCACHE_ROOT="/tmp/atomesh-lmcache"
 
+if [[ "${ATOMESH_VLLM_NIXL_PUSH:-0}" == "1" ]]; then
+  if [[ "${ATOMESH_VLLM_CONNECTOR:-}" != "nixl" || "${ATOMESH_VLLM_CLEAN_MAIN:-0}" != "1" \
+    || -n "${ATOMESH_VLLM_NATIVE_CPU_BYTES:-}${ATOMESH_VLLM_LMCACHE_WHEEL:-}" \
+    || "${ATOMESH_PD_WORKER_LAYOUT:-}" != "multi_node" \
+    || "${#IP_ARRAY[@]}" != "2" || "${IP_ARRAY[0]}" == "${IP_ARRAY[1]}" \
+    || "${xP}:${yD}:${PREFILL_TP_SIZE}:${DECODE_TP_SIZE}:${PREFILL_DCP_SIZE}:${DECODE_DCP_SIZE}" != "1:1:1:1:1:1" \
+    || "${host_ip}" != "${IP_ARRAY[${NODE_RANK}]}" || "${NODE0_ADDR}" != "${IP_ARRAY[0]}" ]]; then
+    printf '%s\n' '[push][FAIL] requires clean NIXL, no offload, and cross-node 1P1D TP1/DCP1 with matching IPs' >&2
+    exit 2
+  fi
+  export ATOMESH_NIXL_PUSH_PREFILL_ENGINE_ID="${ATOMESH_RUN_TOKEN:?push requires run token}-${ATOMESH_EXECUTION_PHASE:?}-prefill"
+  export ATOMESH_NIXL_PUSH_DECODE_ENGINE_ID="${ATOMESH_RUN_TOKEN}-${ATOMESH_EXECUTION_PHASE}-decode"
+  ATOMESH_NIXL_PUSH_PREFILL_KV_HOST="${NODE0_ADDR}"
+  ATOMESH_NIXL_PUSH_PREFILL_SIDE_CHANNEL_PORT=$((15559 + ATOMESH_SERVICE_PORT_OFFSET))
+  ROUTER_READY_PATH="/status"
+  ROUTER_ALIVE_PATH="/status"
+  # Reject overrides that would invalidate this deliberately narrow diagnostic.
+  python3 - "${PREFILL_SERVER_ARGS}" "${DECODE_SERVER_ARGS}" <<'PY'
+import shlex
+import sys
+
+for raw in sys.argv[1:]:
+    args = shlex.split(raw)
+    flags = {arg.split('=', 1)[0] for arg in args if arg.startswith('-')}
+    forbidden = {
+        '--enable-prefix-caching', '--speculative-config', '--compilation-config',
+        '--pipeline-parallel-size', '-pp', '--tensor-parallel-size', '-tp',
+        '--decode-context-parallel-size', '-dcp', '--data-parallel-size', '-dp',
+        '--kv-transfer-config', '--quantization', '-q', '--hf-overrides',
+    }
+    assert not flags & forbidden, f'Unsupported push survey overrides: {flags & forbidden}'
+    assert '--no-enable-prefix-caching' in args and '--enforce-eager' in args
+PY
+fi
+
 export VLLM_HOST_IP="${host_ip}"
 if [[ -n "${MORI_SOCKET_IFNAME:-}" ]]; then
   export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${MORI_SOCKET_IFNAME}}"
@@ -316,6 +351,10 @@ if os.environ.get("ATOMESH_VLLM_CONNECTOR") == "nixl":
         "kv_load_failure_policy": "fail",
         "kv_connector_extra_config": {"backends": ["UCX"]},
     }
+    if os.environ.get("ATOMESH_VLLM_NIXL_PUSH") == "1":
+        config["kv_connector"] = "NixlPushConnector"
+        assert not os.environ.get("ATOMESH_VLLM_NATIVE_CPU_BYTES"), "push forbids native offload"
+        config["engine_id"] = os.environ[f"ATOMESH_NIXL_PUSH_{role.upper()}_ENGINE_ID"]
     native_cpu_bytes = os.environ.get("ATOMESH_VLLM_NATIVE_CPU_BYTES")
     if native_cpu_bytes:
         assert int(native_cpu_bytes) == 2147483648, "Survey requires exactly 2 GiB native CPU cache"
@@ -450,6 +489,31 @@ start_decode() {
 
 start_router() {
   router_pid=""
+  if [[ "${ATOMESH_VLLM_NIXL_PUSH:-0}" == "1" ]]; then
+    # Frozen demo has /status but no --host flag. Bind its unchanged router
+    # externally so D can use the existing wait/cleanup lifecycle. Diagnostic
+    # requests still go directly to P/D; this is not routed-transfer evidence.
+    start_logged_process router_pid "${RUNTIME_LOG_DIR}/nixl-push-proxy.log" \
+      python3 -c '
+import runpy
+import uvicorn
+from fastapi import FastAPI
+
+module = runpy.run_path("/tmp/atomesh-native-vllm/examples/disaggregated/disaggregated_serving/disagg_proxy_pushconnector_demo.py")
+server = module["PushProxyServer"](module["parse_args"]())
+app = FastAPI()
+app.include_router(server.proxy_instance.router)
+uvicorn.run(app, host="0.0.0.0", port=server.port, loop="uvloop")
+' \
+      --model "${SERVED_MODEL_NAME}" \
+      --prefill "${NODE0_ADDR}:${PREFILL_PORT}" \
+      --decode "${IP_ARRAY[1]}:${DECODE_PORT}" --port "${ROUTER_PORT}" \
+      --prefill-engine-id "${ATOMESH_NIXL_PUSH_PREFILL_ENGINE_ID}" \
+      --prefill-kv-host "${ATOMESH_NIXL_PUSH_PREFILL_KV_HOST}" \
+      --prefill-side-channel-port "${ATOMESH_NIXL_PUSH_PREFILL_SIDE_CHANNEL_PORT}" \
+      --prefill-tp-size 1 --prefill-pp-size 1
+    return
+  fi
   if [[ "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
     start_logged_process router_pid "${RUNTIME_LOG_DIR}/nixl-proxy.log" \
       python3 /tmp/atomesh-native-vllm/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \

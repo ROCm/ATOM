@@ -1360,7 +1360,16 @@ PY
 }
 
 run_workload_phase() {
-  if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" && -n "${ATOMESH_VLLM_NATIVE_CPU_BYTES:-}" ]]; then
+  if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_NIXL_PUSH:-0}" == "1" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_nixl_push_survey.py" \
+      --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
+      --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
+      --model "${SERVED_MODEL_NAME}" \
+      --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}" \
+      --prefill-engine-id "${ATOMESH_NIXL_PUSH_PREFILL_ENGINE_ID}" \
+      --prefill-kv-host "${ATOMESH_NIXL_PUSH_PREFILL_KV_HOST}" \
+      --prefill-side-channel-port "${ATOMESH_NIXL_PUSH_PREFILL_SIDE_CHANNEL_PORT}"
+  elif [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" && -n "${ATOMESH_VLLM_NATIVE_CPU_BYTES:-}" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/pd_native_nixl_survey.py" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
