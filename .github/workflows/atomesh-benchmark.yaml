@@ -27,6 +27,11 @@ on:
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
+      survey_preflight_only:
+        description: 'Validate only the original V4 Flash checkpoint on the submit runner; no allocation or GPU execution'
+        required: false
+        default: false
+        type: boolean
       inspect_run_id:
         description: 'Collect existing Slurm logs for this GitHub run ID without allocating GPUs'
         required: false
@@ -228,7 +233,7 @@ permissions:
 
 jobs:
   inspect-run:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_run_id != '' }}
+    if: ${{ !inputs.survey_preflight_only && github.event_name == 'workflow_dispatch' && inputs.inspect_run_id != '' }}
     name: Inspect existing Slurm logs
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
     timeout-minutes: 10
@@ -321,7 +326,7 @@ jobs:
           retention-days: 7
 
   load-config:
-    if: ${{ inputs.inspect_run_id == '' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    if: ${{ (inputs.survey_preflight_only || inputs.inspect_run_id == '') && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: Load ATOMesh benchmark config
     runs-on: ubuntu-latest
     outputs:
@@ -332,10 +337,32 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Validate runner-only survey request
+        if: ${{ inputs.survey_preflight_only }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INSPECT_RUN_ID: ${{ inputs.inspect_run_id }}
+          INSPECT_PROCESSES: ${{ inputs.inspect_processes }}
+          SUITE: ${{ inputs.suite }}
+          CASE_NAMES: ${{ inputs.case_names }}
+          RUN_ALL_MODELS: ${{ inputs.run_all_models }}
+        run: |
+          python3 - <<'PY'
+          import os
+          if (os.environ['EVENT_NAME'] != 'workflow_dispatch'
+                  or os.environ['INSPECT_RUN_ID']
+                  or os.environ['INSPECT_PROCESSES'] == 'true'
+                  or os.environ['SUITE'] != 'vllm'
+                  or os.environ['CASE_NAMES'] != 'survey-v4-flash-main-nixl-1p1d-tp8-eager'
+                  or os.environ['RUN_ALL_MODELS'] != 'false'):
+              raise SystemExit('Runner-only preflight requires only the original V4 Flash survey case, without inspection')
+          PY
+
       - name: Install YAML parser
         run: python3 -m pip install pyyaml
 
       - name: Find ATOMesh latest nightly image
+        if: ${{ !inputs.survey_preflight_only }}
         id: image
         env:
           INPUT_ATOMESH_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_image || '' }}
@@ -522,8 +549,29 @@ jobs:
           fi
           cat atomesh-matrix.json
 
+      - name: Validate runner-only survey matrix
+        if: ${{ inputs.survey_preflight_only }}
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          cells = json.loads(Path('atomesh-matrix.json').read_text())['include']
+          if len(cells) != 1:
+              raise SystemExit('Runner-only preflight requires exactly one V4 Flash cell')
+          cell = cells[0]
+          vllm = cell.get('vllm', {})
+          if (cell.get('model') != 'DeepSeek-V4-Flash-vLLM-Survey'
+                  or cell.get('name') != 'survey-v4-flash-main-nixl-1p1d-tp8-eager'
+                  or cell.get('backend') != 'vllm'
+                  or cell.get('model_path') != '/share_nfs/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1'
+                  or vllm.get('clean_main') != 1
+                  or vllm.get('nixl_model_profile') != 'v4'
+                  or vllm.get('checkpoint_manifest') != 'v4-checkpoint-identity.json'):
+              raise SystemExit('Runner-only preflight requires the original V4 snapshot and mandatory identity manifest')
+          PY
+
       - name: Validate ATOMesh P/D matrix
-        if: ${{ steps.matrix.outputs.has_matrix == 'true' }}
+        if: ${{ !inputs.survey_preflight_only && steps.matrix.outputs.has_matrix == 'true' }}
         env:
           RESULT_DIR: atomesh-dry-run-results
         run: |
@@ -561,7 +609,7 @@ jobs:
   rdma-smoke-test:
     name: Mooncake RDMA smoke test
     needs: [load-config]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
+    if: ${{ !inputs.survey_preflight_only && github.event_name == 'workflow_dispatch' && inputs.suite == 'smoke' }}
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
     timeout-minutes: 75
     env:
@@ -1566,7 +1614,8 @@ jobs:
     name: ${{ matrix.id }}
     needs: [load-config]
     if: >-
-      needs.load-config.outputs.has_matrix == 'true'
+      !inputs.survey_preflight_only
+      && needs.load-config.outputs.has_matrix == 'true'
       && (
         github.event_name == 'schedule'
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
@@ -1639,7 +1688,8 @@ jobs:
             fi
           done
 
-      - name: Resolve machine-specific benchmark paths
+      - &survey-machine-paths
+        name: Resolve machine-specific benchmark paths
         id: machine-paths
         env:
           CELL_JSON: ${{ toJson(matrix) }}
@@ -1745,7 +1795,8 @@ jobs:
           print(json.dumps(cell, indent=2, sort_keys=True))
           PY
 
-      - name: Survey pre-submit visibility and queue check
+      - &survey-visibility-check
+        name: Survey pre-submit visibility and queue check
         if: ${{ matrix.vllm.clean_main == 1 }}
         env:
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
@@ -1780,7 +1831,8 @@ jobs:
                           'survey-preflight/weights.json', '--model-root', root, *extra], check=True)
           PY
 
-      - name: Archive survey pre-submit checks
+      - &survey-visibility-artifact
+        name: Archive survey pre-submit checks
         if: ${{ always() && matrix.vllm.clean_main == 1 }}
         uses: actions/upload-artifact@v7
         with:
@@ -1977,10 +2029,43 @@ jobs:
             atomesh-results/
           if-no-files-found: ignore
 
+  survey-runner-preflight:
+    name: Runner checkpoint only - ${{ matrix.id }}
+    needs: [load-config]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.survey_preflight_only && needs.load-config.outputs.has_matrix == 'true' }}
+    runs-on: ${{ matrix.runner.slurm_submit_runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      HIP_VISIBLE_DEVICES: ''
+      ROCR_VISIBLE_DEVICES: ''
+    steps:
+      - uses: actions/checkout@v6
+      - *survey-machine-paths
+      - *survey-visibility-check
+      - *survey-visibility-artifact
+      - name: Summarize runner checkpoint validation only
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          path = Path('survey-preflight/weights.json')
+          report = json.loads(path.read_text()) if path.exists() else {'status': 'NO_REPORT'}
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              summary.write('## Runner checkpoint validation only\n')
+              summary.write(f"Preflight status: {report['status']}\n\n")
+              summary.write('No Slurm allocation, GPU execution, containers, model loading, or NIXL validation.\n')
+              summary.write('FILES_VISIBLE means metadata/index hashes and shard names/sizes matched the mandatory manifest; not full weight-content hashes or model compatibility.\n')
+          PY
+
   summarize-results:
     name: Summarize ATOMesh benchmark results
     needs: [run-model-benchmark]
-    if: ${{ always() && !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
+    if: ${{ always() && !inputs.survey_preflight_only && !cancelled() && needs.run-model-benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
     outputs:
       has_results: ${{ steps.summary.outputs.has_results }}
@@ -2117,7 +2202,8 @@ jobs:
     name: Update ATOMesh Benchmark Dashboard
     needs: [summarize-results]
     if: >-
-      !cancelled()
+      !inputs.survey_preflight_only
+      && !cancelled()
       && needs.summarize-results.result == 'success'
       && needs.summarize-results.outputs.has_results == 'true'
       && (
