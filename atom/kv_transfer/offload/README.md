@@ -537,7 +537,10 @@ it starts anything.
   those whose ranks held prefixes of different lengths (`uneven_lookups`),
   and the rank objects they found past the shared prefix
   (`stranded_objects`), present but unusable while another rank lacks the
-  chunk.
+  chunk. With chunk groups these are saves a slower stage is still writing:
+  each stage puts a prompt's chunks tail first, and its prefix grows only
+  when its head window lands. At c112, 13 of a run's 22 uneven lookups came
+  before the master's first eviction.
 
 ### Not supported in phase 1
 
