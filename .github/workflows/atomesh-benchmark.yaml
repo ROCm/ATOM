@@ -1652,6 +1652,12 @@ jobs:
           from pathlib import Path
 
           cell = json.loads(os.environ["CELL_JSON"])
+          # Resolve only the survey draft and its matching role arguments together.
+          if cell.get("vllm", {}).get("draft_model_path"):
+              root = os.environ["ATOMESH_MODEL_ROOT"].rstrip("/")
+              cell["vllm"]["draft_model_path"] = cell["vllm"]["draft_model_path"].replace("${ATOMESH_MODEL_ROOT}", root)
+              for role in ("prefill", "decode"):
+                  cell["service"][role]["extra_args"] = cell["service"][role]["extra_args"].replace("${ATOMESH_MODEL_ROOT}", root)
           # The matrix is expanded on ubuntu-latest, before the submit machine is known.
           machine_name = socket.gethostname().split(".", 1)[0]
           if machine_name == "pit2-vm-amd-xl-02":
@@ -1760,6 +1766,9 @@ jobs:
           root = '/share_nfs/models' if model.startswith('/share_nfs/models/') else os.environ['ATOMESH_MODEL_ROOT']
           manifest = cell.get('vllm', {}).get('checkpoint_manifest')
           extra = ['--manifest', str(Path('.github/scripts/atomesh') / manifest)] if manifest else []
+          draft = cell.get('vllm', {}).get('draft_model_path')
+          if draft:
+              extra += ['--draft-model', draft]
           # V4 may never silently fall back to visibility-only or alternate weights.
           if cell.get('vllm', {}).get('nixl_model_profile') == 'v4' and not manifest:
               raise SystemExit('V4 requires a checkpoint identity manifest before allocation')

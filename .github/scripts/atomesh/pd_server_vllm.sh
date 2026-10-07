@@ -45,6 +45,9 @@ install_native_vllm() {
     if [[ -n "${ATOMESH_VLLM_CHECKPOINT_MANIFEST:-}" ]]; then
       identity_args=(--manifest "${ATOMESH_SCRIPT_DIR}/${ATOMESH_VLLM_CHECKPOINT_MANIFEST}")
     fi
+    if [[ -n "${ATOMESH_VLLM_DRAFT_MODEL_PATH:-}" ]]; then
+      identity_args+=(--draft-model "${ATOMESH_VLLM_DRAFT_MODEL_PATH}")
+    fi
     python3 "${ATOMESH_SCRIPT_DIR}/pd_survey_preflight.py" "${MODEL_PATH}" \
       "${RUNTIME_LOG_DIR}/weights-preflight-rank-${NODE_RANK}.json" "${identity_args[@]}" || return $?
   fi

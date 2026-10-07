@@ -68,6 +68,7 @@ async def run(args):
                 "seed": 42,
                 "ignore_eos": True,
                 "stream": False,
+                "return_token_ids": True,
             }
             if params is not None:
                 body["kv_transfer_params"] = params
@@ -78,7 +79,32 @@ async def run(args):
                 {"X-Request-Id": request_id or uuid.uuid4().hex},
             )
             result = response.json()
-            assert result.get("choices"), result
+            try:
+                assert result.get("choices"), result
+                choice = result["choices"][0]
+                # API echo is the original prompt, not the hybrid producer's N-1
+                # effective prompt used only for source accounting.
+                prompt_ids = choice.get("prompt_token_ids")
+                assert (
+                    isinstance(prompt_ids, list)
+                    and all(type(token) is int for token in prompt_ids)
+                    and prompt_ids == prompt
+                ), f"Invalid prompt_token_ids: {choice}"
+                output_ids = choice.get("token_ids")
+                assert (
+                    isinstance(output_ids, list)
+                    and all(type(token) is int and token >= 0 for token in output_ids)
+                    and len(output_ids) == count
+                ), f"Invalid token_ids for max_tokens={count}: {choice}"
+            except (AssertionError, AttributeError, KeyError, TypeError):
+                with (args.output / "completion-validation-failures.jsonl").open(
+                    "a"
+                ) as output:
+                    output.write(
+                        json.dumps({"url": url, "request": body, "response": result})
+                        + "\n"
+                    )
+                raise
             return result
 
         async def pd(prompt, count, tag):
@@ -258,13 +284,18 @@ async def run(args):
                     json.dumps(records, indent=2)
                 )
                 equal = split["choices"][0]["text"] == direct["choices"][0]["text"]
+                ids_equal = (
+                    split["choices"][0]["token_ids"]
+                    == direct["choices"][0]["token_ids"]
+                )
                 evidence_path = args.output / f"correctness-{length}-evidence.json"
                 evidence = json.loads(evidence_path.read_text())
                 evidence["direct_pd_text_equal"] = equal
-                if not equal:
+                evidence["direct_pd_token_ids_equal"] = ids_equal
+                if not equal or not ids_equal:
                     evidence["status"] = "FAIL"
                 evidence_path.write_text(json.dumps(evidence, indent=2) + "\n")
-                assert equal, (length, direct, split)
+                assert equal and ids_equal, (length, direct, split)
             await reset()
             await measured_pd(tokens[:1025], 16, "warm-prime", "cold-reset-both")
             await measured_pd(tokens[:1025], 16, "warm-replay", "warm-no-reset")
@@ -275,6 +306,7 @@ async def run(args):
                         "status": "PENDING_REVIEW",
                         "requests": len(records),
                         "direct_pd_text_checks": len(lengths),
+                        "direct_pd_token_id_checks": len(lengths),
                         "output_tokens": 16,
                         "natural_accuracy_evaluated": False,
                         "full_c16_evaluated": False,
@@ -314,11 +346,13 @@ async def run(args):
             direct = await complete(args.prefill, tokens[:length], 1)
             await reset()
             split = await pd(tokens[:length], 1, f"correctness-{length}")
-            assert split["choices"][0]["text"] == direct["choices"][0]["text"], (
-                length,
-                direct,
-                split,
-            )
+            records[-1]["direct"] = direct
+            (args.output / "requests.json").write_text(json.dumps(records, indent=2))
+            assert (
+                split["choices"][0]["text"] == direct["choices"][0]["text"]
+                and split["choices"][0]["token_ids"]
+                == direct["choices"][0]["token_ids"]
+            ), (length, direct, split)
         await snapshot("correctness")
         for concurrency in (1, 16):
             prompts = [tokens[i * 16 : i * 16 + 1024] for i in range(concurrency)]

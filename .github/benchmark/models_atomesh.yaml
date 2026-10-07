@@ -977,6 +977,8 @@ models:
         # Follow-up only; not selected by the first dispatch inputs.
         - <<: *survey_k3_read
           name: survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager
+          vllm:
+            draft_model_path: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
           prefill:
             workers: 1
             tp: 8
