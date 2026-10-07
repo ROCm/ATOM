@@ -100,6 +100,8 @@ class FakeCluster:
 
     def __init__(self) -> None:
         self.objects: dict[str, dict[str, bytes]] = {}
+        # Per master: the Mooncake group each grouped key was put in.
+        self.groups: dict[str, dict[str, str]] = {}
         self.stores: list[FakeStore] = []
         self.setup_rc = 0
         # A get that reports success but never writes: the probe must notice.
@@ -122,6 +124,9 @@ class FakeStore:
     def __init__(self, cluster: FakeCluster) -> None:
         self.cluster = cluster
         self.objects: dict[str, bytes] = {}
+        self.groups: dict[str, str] = {}
+        # Each put's group ids; None for a put without a ReplicateConfig.
+        self.put_group_ids: list[list[str] | None] = []
         self.setup_args: tuple | None = None
         self.registered: dict[int, int] = {}
         self.calls: list[tuple] = []
@@ -137,6 +142,7 @@ class FakeStore:
         if self.cluster.setup_rc:
             return self.cluster.setup_rc
         self.objects = self.cluster.objects.setdefault(args[6], {})
+        self.groups = self.cluster.groups.setdefault(args[6], {})
         return 0
 
     def register_buffer(self, ptr, size):
@@ -165,18 +171,25 @@ class FakeStore:
         self._maybe_raise("exists")
         return [self.exist_codes.get(k, int(k in self.objects)) for k in keys]
 
-    def batch_put_from(self, keys, ptrs, sizes):
+    def batch_put_from(self, keys, ptrs, sizes, config=None):
         self.calls.append(("put", list(keys)))
+        group_ids = None if config is None else list(config.group_ids)
+        self.put_group_ids.append(group_ids)
         self._maybe_raise("put")
+        if group_ids is not None and len(group_ids) != len(keys):
+            return [store_client.INVALID_PARAMS] * len(keys)
         codes = []
-        for key, ptr, size in zip(keys, ptrs, sizes, strict=True):
+        for index, (key, ptr, size) in enumerate(zip(keys, ptrs, sizes, strict=True)):
             code = self.put_codes.get(key)
             if code is None:
                 if not self._is_registered(ptr, size):
                     code = store_client.TRANSFER_FAIL
                 else:
-                    # An existing key is a success and keeps its bytes.
-                    self.objects.setdefault(key, ctypes.string_at(ptr, size))
+                    # An existing key is a success and keeps its bytes and group.
+                    if key not in self.objects:
+                        self.objects[key] = ctypes.string_at(ptr, size)
+                        if group_ids and group_ids[index]:
+                            self.groups[key] = group_ids[index]
                     code = 0
             codes.append(code)
         return codes
@@ -284,6 +297,11 @@ class FakeGPUConnector:
 def cluster(monkeypatch):
     cluster = FakeCluster()
     monkeypatch.setattr(store_client, "_new_distributed_store", cluster.new_store)
+    monkeypatch.setattr(
+        store_client,
+        "_new_replicate_config",
+        lambda group_ids: SimpleNamespace(group_ids=list(group_ids)),
+    )
     # Pinned host memory needs a GPU runtime; plain host memory holds the same
     # bytes and has an address the fake Store reads and writes.
     monkeypatch.setattr(
@@ -487,7 +505,7 @@ def test_config_defaults_and_shared_master():
     assert cfg.chunk_tokens == 256 and cfg.lookup_batch_keys == 8192
     assert (cfg.load_pool_bytes, cfg.save_pool_bytes) == (1024 << 20, 256 << 20)
     assert cfg.save_abandon_timeout_s == 300.0
-    assert cfg.startup_probe and cfg.direct_copy
+    assert cfg.startup_probe and cfg.direct_copy and cfg.chunk_groups
     assert cfg.owner_rdma_devices == cfg.rdma_devices == ()
     assert cfg.store_masters() == [nic.StorePool(MASTER, METADATA)]
 
@@ -574,6 +592,7 @@ def test_config_takes_the_launcher_worker_config(launcher_json):
         ({"publish_loaded_prefix": False}, "unknown Mooncake Store offload"),
         ({"startup_probe": 1}, "true or false"),
         ({"direct_copy": "false"}, "true or false"),
+        ({"chunk_groups": "yes"}, "true or false"),
         ({"rdma_devices": ["rdma0"]}, "comma-separated string"),
     ],
 )
@@ -1179,6 +1198,38 @@ def test_lookup_is_the_prefix_every_rank_holds(cluster):
     assert [len(batch) for batch in asked] == [12, 12, 12]
 
 
+def test_lookup_counts_rank_objects_past_the_shared_prefix(
+    cluster, scheduler_clock, caplog
+):
+    scheduler = MooncakeStoreOffloadScheduler(_config(pp=2))
+    lookup = scheduler._lookup_client
+    hashes = _hashes(48)
+    _store_chunks(cluster, hashes, range(6), rank=0, world=2)
+    _store_chunks(cluster, hashes, [0, 1, 3, 4, 5], rank=1, world=2)  # hole at 2
+    assert lookup.lookup(list(range(48))) == 2 * CHUNK
+    # Rank 0's chunks 2-5 are stranded: stored, unusable while rank 1 lacks 2.
+    assert (lookup.lookups, lookup.uneven_lookups, lookup.stranded_objects) == (
+        1,
+        1,
+        4,
+    )
+    _store_chunks(cluster, hashes, [2], rank=1, world=2)
+    assert lookup.lookup(list(range(48))) == 6 * CHUNK
+    assert (lookup.lookups, lookup.uneven_lookups, lookup.stranded_objects) == (
+        2,
+        1,
+        4,
+    )
+    with caplog.at_level(logging.INFO, logger="atom"):
+        lookup.lookup(list(range(48)))
+        assert not any("LOOKUP-STATS" in r.getMessage() for r in caplog.records)
+        scheduler_clock.now += scheduler_mod._LOOKUP_STATS_INTERVAL_S
+        lookup.lookup(list(range(48)))
+    assert [
+        r.getMessage() for r in caplog.records if "LOOKUP-STATS" in r.getMessage()
+    ] == ["[OFFLOAD-LOOKUP-STATS] lookups=4 uneven_lookups=1 stranded_objects=4"]
+
+
 def test_lookup_answers_nothing_on_any_store_error(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     hashes = _hashes(24)
@@ -1682,6 +1733,48 @@ def test_save_puts_every_chunk_tail_first_with_one_terminal(cluster, make_worker
     }
     pool = worker._pool
     assert pool.quarantined("save") == 0 and len(pool.acquire("save", 2)) == 2
+
+
+def test_every_stage_puts_a_chunk_in_the_same_group(cluster, make_worker):
+    stages = [make_worker(rank=rank, world=2, save_slots=8)[0] for rank in range(2)]
+    request = _save_req(51, 40)
+    for stage in stages:
+        stage._do_save_req(copy.deepcopy(request))
+    groups = cluster.groups[MASTER]
+    for index in range(5):
+        digest = keys.chunk_digest(request.chunk_hashes, index)
+        group = keys.chunk_group_id(NAMESPACE, digest)
+        assert group == f"{NAMESPACE}/group/{digest.hex()}"
+        for rank in range(2):
+            assert (
+                groups[_key(request.chunk_hashes, index, rank=rank, world=2)] == group
+            )
+    assert len(groups) == 10 and len(set(groups.values())) == 5
+
+
+def test_chunk_groups_can_be_turned_off(cluster, make_worker):
+    worker, _ = make_worker(config=_config(extra=_extra(chunk_groups=False)))
+    worker._do_save_req(_save_req(52, 40))
+    [store] = cluster.stores
+    assert store.put_group_ids and all(ids is None for ids in store.put_group_ids)
+    assert cluster.groups[MASTER] == {}
+
+
+def test_put_refuses_group_ids_that_do_not_match_its_keys(cluster):
+    client = store_client.MooncakeStoreClient(
+        local_hostname="10.0.0.2",
+        metadata_server=METADATA,
+        master_server_addr=MASTER,
+        protocol="tcp",
+        rdma_devices="",
+    )
+    try:
+        with pytest.raises(ValueError, match="one per key"):
+            client.put(["a", "b"], [1, 2], [8, 8], group_ids=["g"])
+        [store] = cluster.stores
+        assert store.put_group_ids == []
+    finally:
+        client.close()
 
 
 def test_save_skips_what_is_already_stored(cluster, make_worker):
@@ -2239,6 +2332,7 @@ def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
         assert (pool.capacity("save"), pool.capacity("load")) == (256, 256)
         puts = [call for call in store.calls if call[0] == "put"]
         assert len(puts) == 1 and "/probe/w0/" in puts[0][1][0]
+        assert store.put_group_ids == [None]  # the probe's key is not grouped
         assert store.objects == {}  # the probe removed its key
         assert ("remove", puts[0][1][0], True) in store.calls
         assert worker._namespace == keys.store_namespace(worker._config, CHUNK)

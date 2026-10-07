@@ -1191,6 +1191,10 @@ settings = {
         "true or false",
         lambda value: isinstance(value, bool),
     ),
+    "mooncake_store.chunk_groups": (
+        "true or false",
+        lambda value: isinstance(value, bool),
+    ),
     "mooncake_store.direct_copy": (
         "true or false",
         lambda value: isinstance(value, bool),

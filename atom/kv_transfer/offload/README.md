@@ -379,6 +379,13 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   `cache_seed`). No `PYTHONHASHSEED` dependence. The scheduler hashes each
   prompt once (kept on the `Sequence`) and ships the digests in the request
   metadata (`LMCacheReqMeta.chunk_hashes`) instead of the prompt's token ids.
+- Every rank's object of a chunk is put in one Mooncake group,
+  `{namespace}/group/{digest}` (`ReplicateConfig.group_ids`). The master
+  evicts a group whole, by the lease its members share, so one PP stage's
+  object of a chunk is not evicted while the others stay: a chunk any rank
+  lacks is a miss, and the rest would only hold memory. A key that already
+  exists keeps its group, so a rank that re-puts a chunk joins the group the
+  others are in while any of them lives.
 - Lookup runs in the scheduler process over its own tcp Store client, opened on
   the first lookup (every PP stage builds a scheduler; only the head asks):
   one `batch_is_exist` for every rank x chunk key (split at
@@ -462,6 +469,7 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.lookup_batch_keys` | 8192 | Most keys per `batch_is_exist`. |
 | `mooncake_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source; must be > 0. |
 | `mooncake_store.startup_probe` | true | One-chunk round trip per worker at startup. |
+| `mooncake_store.chunk_groups` | true | Put every rank's object of a chunk in one Mooncake group, evicted whole. |
 | `mooncake_store.direct_copy` | true | With the pool on the GPU, pack and unpack each window in place in its slots (one kernel per window) instead of through the block GPU connector's staging buffer. |
 | `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way). |
 
@@ -524,7 +532,12 @@ it starts anything.
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with Mooncake result codes in `errors=`.
   Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, failures by
-  code, quarantined slots) at most once a minute while it transfers.
+  code, quarantined slots) at most once a minute while it transfers. The
+  scheduler logs `[OFFLOAD-LOOKUP-STATS]` once a minute: answered lookups,
+  those whose ranks held prefixes of different lengths (`uneven_lookups`),
+  and the rank objects they found past the shared prefix
+  (`stranded_objects`), present but unusable while another rank lacks the
+  chunk.
 
 ### Not supported in phase 1
 
