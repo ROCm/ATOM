@@ -56,6 +56,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
+    chunk_group_ids,
     chunk_keys,
     probe_key,
     store_namespace,
@@ -251,7 +252,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             "Mooncake Store offload worker rank=%d world=%d: namespace=%s nic=%s "
             "master=%s bytes_per_block=%d chunk=%d chunk_bytes=%d "
             "pool=%s save_slots=%d load_slots=%d gpu_staging_buffer_bytes=%d "
-            "save=%s load=%s save_workers=%d load_workers=%d",
+            "save=%s load=%s save_workers=%d load_workers=%d chunk_groups=%s",
             rank,
             world,
             namespace,
@@ -268,6 +269,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             self._do_load,
             self.save_workers,
             self.load_workers,
+            cfg.chunk_groups,
         )
 
     def _probe_store(
@@ -484,6 +486,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 window.start,
                 window.stop,
             )
+            group_ids = None
+            if self._store_cfg.chunk_groups:
+                group_ids = chunk_group_ids(
+                    self._namespace, req.chunk_hashes, window.start, window.stop
+                )
             t_put0 = time.perf_counter()
             clock = store_client.CallClock()
             try:
@@ -491,6 +498,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     keys,
                     [slot.ptr for slot in slots],
                     [self._chunk_bytes] * len(slots),
+                    group_ids=group_ids,
                 )
             except Exception as exc:  # noqa: BLE001  # reported below
                 pool.quarantine(

@@ -16,6 +16,11 @@ a prompt, exactly as the dense codec packs them. Its key is
 * ``digest`` is the chunk's link in a prefix chain over the prompt's tokens, so
   a chunk's key names the whole prefix up to and including it.
 
+Every rank's object of a chunk is put in one Mooncake group,
+``{namespace}/group/{digest}``. The master evicts a group whole, so the ranks
+of a chunk do not outlive each other: a chunk any rank lacks is a miss, and
+the others' objects would only hold memory.
+
 The scheduler (which has no GPU and no KV tensors) and every worker compute the
 namespace from the same ``Config``; only the scheduler hashes tokens, and the
 digests travel to the workers in the request metadata.
@@ -224,6 +229,19 @@ def chunk_keys(
     """Keys of one rank's chunks ``[start, end)`` of a concatenated chain."""
     prefix = rank_key_prefix(namespace, rank, world)
     return [prefix + chunk_digest(hashes, index).hex() for index in range(start, end)]
+
+
+def chunk_group_id(namespace: str, digest: bytes) -> str:
+    """Mooncake group of every rank's object of the chunk ``digest`` names."""
+    return f"{namespace}/group/{bytes(digest).hex()}"
+
+
+def chunk_group_ids(namespace: str, hashes: bytes, start: int, end: int) -> list[str]:
+    """Groups of chunks ``[start, end)`` of a concatenated chain, one per chunk."""
+    return [
+        chunk_group_id(namespace, chunk_digest(hashes, index))
+        for index in range(start, end)
+    ]
 
 
 def probe_key(namespace: str, rank: int, nonce: str) -> str:
