@@ -3,6 +3,8 @@
 Run only via ATOMESH_TRANSPORT_ONLY=1 in the normal P/D harness. No package
 installation, scheduler operation, network mutation or TCP payload fallback.
 GPU work is opt-in (ATOMESH_TRANSPORT_GPU=1); imports stay in supervised children.
+ATOMESH_TRANSPORT_NIXL_READ_ONLY=1 additionally requires an explicit locally
+validated UCX selection and agreeing peers; it skips all MoRI work and size parsing.
 Results describe pinned-image transport, NOT fixed-main vLLM or model PD support.
 Exit 0 means collection completed, not that transport passed; inspect summary.json.
 
@@ -425,10 +427,21 @@ def main():
         raise ValueError("transport survey must retain fixed-main source identity")
     if IMAGE_DIGEST not in os.environ.get("DOCKER_IMAGE", ""):
         raise ValueError("transport survey requires the recorded digest-pinned image")
-    sizes = parse_sizes(os.environ.get("ATOMESH_TRANSPORT_MORI_BYTES", "4096"))
+    read_only = os.environ.get("ATOMESH_TRANSPORT_NIXL_READ_ONLY", "0")
+    if read_only not in ("0", "1"):
+        raise ValueError("ATOMESH_TRANSPORT_NIXL_READ_ONLY must be 0 or 1")
+    sizes = (
+        []
+        if read_only == "1"
+        else parse_sizes(os.environ.get("ATOMESH_TRANSPORT_MORI_BYTES", "4096"))
+    )
     gpu = os.environ.get("ATOMESH_TRANSPORT_GPU", "0")
     if gpu not in ("0", "1"):
         raise ValueError("ATOMESH_TRANSPORT_GPU must be 0 or 1")
+    if read_only == "1" and (
+        gpu != "1" or not os.environ.get("ATOMESH_TRANSPORT_UCX_SELECTION", "")
+    ):
+        raise ValueError("NIXL READ-only requires GPU=1 and an explicit UCX selection")
     root = (
         Path(os.environ["RUN_DIR"])
         / "transport-diagnostic"
@@ -526,6 +539,7 @@ def main():
                 "eligible": eligible,
                 "gpu": gpu,
                 "selection": selection,
+                **({"nixl_read_only": read_only} if read_only == "1" else {}),
             },
         )
         try:
@@ -540,6 +554,7 @@ def main():
             and peer["eligible"]
             and peer["hostname"] != socket.gethostname()
             and peer["selection"] == selection
+            and peer.get("nixl_read_only", "0") == read_only
         ):
             # Force an RDMA payload path; unlike original create this is diagnostic.
             # UCX rc may use UD for wireup. No tcp, self or shared-memory payload.
@@ -554,7 +569,13 @@ def main():
                 "classification": "NOT_TESTED",
                 "reason": "GPU opt-in, both backend creates and distinct hosts required",
             }
-        if gpu == "1":
+        if read_only == "1":
+            summary["stages"]["mori-register"] = {
+                "status": "UNKNOWN",
+                "classification": "NOT_TESTED",
+                "reason": "NIXL READ-only control",
+            }
+        elif gpu == "1":
             for size in sizes:
                 run(f"mori-register-{size}", "mori-register", size=size)
         else:
