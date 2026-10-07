@@ -144,7 +144,8 @@ class _StoreLookup:
         self._next_warning_at = 0.0
         # Answered lookups; those where the ranks held prefixes of different
         # lengths; and the rank objects past the shared prefix they found,
-        # present but unusable while another rank lacks the chunk.
+        # present but unusable while another rank lacks the chunk -- evicted,
+        # failed, or still being written by a slower stage.
         self.lookups = 0
         self.uneven_lookups = 0
         self.stranded_objects = 0
