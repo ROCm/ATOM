@@ -281,7 +281,14 @@ class SurveyConfigurationTest(unittest.TestCase):
                     bool(body.get("kv_transfer_params"))
                 )
             result = {
-                "choices": [{"text": "consistent output", "finish_reason": "length"}]
+                "choices": [
+                    {
+                        "text": "consistent output",
+                        "finish_reason": "length",
+                        "prompt_token_ids": body["prompt"],
+                        "token_ids": [7] * body["max_tokens"],
+                    }
+                ]
             }
             if body.get("kv_transfer_params", {}).get("do_remote_decode"):
                 result["kv_transfer_params"] = {
@@ -463,8 +470,16 @@ class SurveyConfigurationTest(unittest.TestCase):
                     body = json.loads(request.content)
                     calls.append((role, body))
                     n = len(body["prompt"])
+                    self.assertTrue(body["return_token_ids"])
                     result = {
-                        "choices": [{"text": "same", "finish_reason": "length"}],
+                        "choices": [
+                            {
+                                "text": "same",
+                                "finish_reason": "length",
+                                "prompt_token_ids": body["prompt"],
+                                "token_ids": [7] * body["max_tokens"],
+                            }
+                        ],
                         "usage": {
                             "prompt_tokens": n,
                             "completion_tokens": body["max_tokens"],

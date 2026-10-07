@@ -1,4 +1,4 @@
-"""CPU-only public-contract tests for the frozen V4 survey harness."""
+"""CPU-only public-contract tests for V4 and shared NIXL survey harnesses."""
 
 import argparse
 import asyncio
@@ -128,10 +128,32 @@ def test_v4_matrix_and_rendered_launch(tmp_path, monkeypatch):
         )
 
 
-@pytest.mark.parametrize("fault", [None, "ids_missing", "ids_mismatch"])
-def test_v4_requests_preserve_handoff_and_require_exact_ids(
-    tmp_path, monkeypatch, fault
+@pytest.mark.parametrize(
+    "profile,lengths", [("m3", [127, 129, 513]), ("v4", [255, 257, 513])]
+)
+@pytest.mark.parametrize("stage", ["reference", "prefill", "decode"])
+@pytest.mark.parametrize(
+    "fault,error",
+    [
+        (None, None),
+        ("ids_missing", "Generated IDs missing/invalid"),
+        ("ids_null", "Generated IDs missing/invalid"),
+        ("ids_length", "Generated IDs missing/invalid"),
+        ("ids_string", "Generated IDs must be"),
+        ("ids_bool", "Generated IDs must be"),
+        ("ids_negative", "Generated IDs must be"),
+        ("ids_mismatch", "Direct/PD token ID mismatch"),
+        ("prompt_missing", "Prompt IDs changed or missing"),
+        ("prompt_mismatch", "Prompt IDs changed or missing"),
+        ("prompt_float", "Prompt IDs must be"),
+        ("text_mismatch", "Direct/PD text mismatch"),
+    ],
+)
+def test_requests_preserve_handoff_and_require_exact_ids(
+    tmp_path, monkeypatch, profile, lengths, stage, fault, error
 ):
+    if fault in ("ids_mismatch", "text_mismatch") and stage == "prefill":
+        pytest.skip("One-token producer is validated but not compared to reference")
     smoke = load_script("pd_m3_nixl_smoke")
     counters = {
         role: {
@@ -172,14 +194,22 @@ def test_v4_requests_preserve_handoff_and_require_exact_ids(
         body = json.loads(request.content)
         calls.append((role, body))
         assert body["return_token_ids"] is True
+        assert body["temperature"] == 0
+        assert body["seed"] == 42
+        assert body["ignore_eos"] is True
+        assert body["stream"] is False
         n = len(body["prompt"])
+        assert body["prompt"] == list(range(n))
         c["success"] += 1
         c["external_kv_transfer" if role == "decode" else "local_compute"] += n
         c["bytes"] += 4096 if role == "decode" else 0
         c["count"] += int(role == "decode")
+        request_stage = (
+            "decode"
+            if role == "decode"
+            else "prefill" if "kv_transfer_params" in body else "reference"
+        )
         ids = [7] * body["max_tokens"]
-        if role == "decode" and fault == "ids_mismatch":
-            ids[-1] = 8
         result = {
             "choices": [
                 {
@@ -193,10 +223,32 @@ def test_v4_requests_preserve_handoff_and_require_exact_ids(
         }
         if role == "decode":
             assert body["kv_transfer_params"] == handoff
-            if fault == "ids_missing":
-                result["choices"][0].pop("token_ids")
         elif "kv_transfer_params" in body:
             result["kv_transfer_params"] = handoff
+        if request_stage == stage:
+            choice = result["choices"][0]
+            if fault == "ids_missing":
+                choice.pop("token_ids")
+            elif fault == "ids_null":
+                choice["token_ids"] = None
+            elif fault == "ids_length":
+                choice["token_ids"] = ids[:-1]
+            elif fault == "ids_string":
+                ids[0] = "7"
+            elif fault == "ids_bool":
+                ids[0] = True
+            elif fault == "ids_negative":
+                ids[0] = -1
+            elif fault == "ids_mismatch":
+                ids[-1] = 8
+            elif fault == "prompt_missing":
+                choice.pop("prompt_token_ids")
+            elif fault == "prompt_mismatch":
+                choice["prompt_token_ids"] = body["prompt"][:-1]
+            elif fault == "prompt_float":
+                choice["prompt_token_ids"] = [float(t) for t in body["prompt"]]
+            elif fault == "text_mismatch":
+                choice["text"] = "different text despite identical IDs"
         return httpx.Response(200, json=result)
 
     original_client = httpx.AsyncClient
@@ -208,31 +260,31 @@ def test_v4_requests_preserve_handoff_and_require_exact_ids(
     args = argparse.Namespace(
         prefill="http://prefill",
         decode="http://decode",
-        model="DeepSeek-V4-Flash",
+        model="MiniMax-M3" if profile == "m3" else "DeepSeek-V4-Flash",
         output=tmp_path,
-        model_profile="v4",
+        model_profile=profile,
     )
     if fault:
-        with pytest.raises(AssertionError):
+        with pytest.raises(AssertionError, match=error):
             asyncio.run(smoke.run(args))
         assert not (tmp_path / "complete.json").exists()
+        evidence = json.loads((tmp_path / f"request-{lengths[0]}.json").read_text())
+        assert evidence["status"] == "FAIL"
+        assert error in evidence["error"]
     else:
         asyncio.run(smoke.run(args))
-        assert [len(body["prompt"]) for role, body in calls if role == "decode"] == [
-            255,
-            257,
-            513,
-        ]
+        assert [
+            len(body["prompt"]) for role, body in calls if role == "decode"
+        ] == lengths
         complete = json.loads((tmp_path / "complete.json").read_text())
-        assert complete["lengths"] == [255, 257, 513]
+        assert complete["lengths"] == lengths
         assert complete["status"] == "PENDING_REVIEW"
+        assert [body["max_tokens"] for _, body in calls] == [16, 1, 16] * 3
         for n in complete["lengths"]:
-            assert (
-                json.loads((tmp_path / f"request-{n}.json").read_text())[
-                    "generated_token_ids_equal"
-                ]
-                is True
-            )
+            evidence = json.loads((tmp_path / f"request-{n}.json").read_text())
+            assert evidence["generated_token_ids_equal"] is True
+            assert evidence["direct_pd_text_equal"] is True
+            assert evidence["accounting_checked"] is True
 
 
 def test_checkpoint_preflight_manifest_cli(tmp_path):
