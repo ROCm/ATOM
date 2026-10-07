@@ -44,6 +44,7 @@ _FIELDS = (
     "save_abandon_timeout_s",
     "startup_probe",
     "direct_copy",
+    "chunk_groups",
 )
 
 
@@ -77,6 +78,9 @@ class MooncakeStoreOffloadConfig:
     # Pack and unpack a window in place in the GPU pool, without the staging
     # copy, whenever its slots are one run.
     direct_copy: bool
+    # Put every rank's object of a chunk in one Mooncake group, which the
+    # master evicts whole.
+    chunk_groups: bool
 
     @property
     def load_pool_bytes(self) -> int:
@@ -188,6 +192,9 @@ def parse_mooncake_store_config(
         ),
         startup_probe=_flag(
             "mooncake_store.startup_probe", values.get("startup_probe", True)
+        ),
+        chunk_groups=_flag(
+            "mooncake_store.chunk_groups", values.get("chunk_groups", True)
         ),
         direct_copy=_flag(
             "mooncake_store.direct_copy", values.get("direct_copy", True)
