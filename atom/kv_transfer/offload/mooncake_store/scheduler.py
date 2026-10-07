@@ -58,6 +58,8 @@ _LOOKUP_BACKOFF_S = 10.0
 _LOOKUP_BACKOFF_FACTOR = 10.0
 # Seconds between two warnings about failing lookups.
 _LOOKUP_WARNING_INTERVAL_S = 60.0
+# Seconds between two `[OFFLOAD-LOOKUP-STATS]` lines.
+_LOOKUP_STATS_INTERVAL_S = 60.0
 # A hit older than this is looked up again right before its load is
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
@@ -140,6 +142,13 @@ class _StoreLookup:
         self._retry_connect_at = 0.0
         self._retry_lookup_at = 0.0
         self._next_warning_at = 0.0
+        # Answered lookups; those where the ranks held prefixes of different
+        # lengths; and the rank objects past the shared prefix they found,
+        # present but unusable while another rank lacks the chunk.
+        self.lookups = 0
+        self.uneven_lookups = 0
+        self.stranded_objects = 0
+        self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
 
     def lookup(self, token_ids: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of the prompt's prefix the Store holds on every rank.
@@ -193,13 +202,14 @@ class _StoreLookup:
                 self._back_off(asked_at),
             )
             return None
-        hit_chunks = chunks
+        presents = []
         for rank in range(self._world):
             shard = codes[rank * chunks : (rank + 1) * chunks]
-            present = next(
-                (index for index, code in enumerate(shard) if code != 1), chunks
+            presents.append(
+                next((index for index, code in enumerate(shard) if code != 1), chunks)
             )
-            hit_chunks = min(hit_chunks, present)
+        hit_chunks = min(presents)
+        self._count_lookup(sum(present - hit_chunks for present in presents))
         hit = hit_chunks * self._chunk_tokens
         logger.debug(
             "[OFFLOAD-LOOKUP] lookup_id=%s chunks=%d keys=%d hit=%d elapsed_ms=%.2f",
@@ -293,6 +303,23 @@ class _StoreLookup:
             ", ".join(pool.master for pool in self._masters),
         )
         return clients
+
+    def _count_lookup(self, stranded: int) -> None:
+        """Count an answered lookup, logging the totals once a minute."""
+        self.lookups += 1
+        if stranded:
+            self.uneven_lookups += 1
+            self.stranded_objects += stranded
+        now = time.monotonic()
+        if now < self._next_stats_at:
+            return
+        self._next_stats_at = now + _LOOKUP_STATS_INTERVAL_S
+        logger.info(
+            "[OFFLOAD-LOOKUP-STATS] lookups=%d uneven_lookups=%d stranded_objects=%d",
+            self.lookups,
+            self.uneven_lookups,
+            self.stranded_objects,
+        )
 
     def _warn(self, message: str, *args: Any, exc_info: bool = False) -> None:
         now = time.monotonic()

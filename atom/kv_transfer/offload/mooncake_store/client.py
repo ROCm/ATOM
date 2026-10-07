@@ -134,6 +134,15 @@ def _new_distributed_store() -> Any:
     return MooncakeDistributedStore()
 
 
+def _new_replicate_config(group_ids: list[str]) -> Any:
+    """A default ``ReplicateConfig`` (one replica) that groups each key."""
+    from mooncake.store import ReplicateConfig
+
+    config = ReplicateConfig()
+    config.group_ids = list(group_ids)
+    return config
+
+
 class MooncakeStoreClient:
     """One ``MooncakeDistributedStore`` set up as a pure, zero-copy client."""
 
@@ -223,15 +232,28 @@ class MooncakeStoreClient:
             self._count("exists", batch, None, codes, failed=lambda code: code < 0)
         return results
 
-    def put(self, keys: list[str], ptrs: list[int], sizes: list[int]) -> list[int]:
-        """Store each buffer under its key; per key 0 or a negative code."""
+    def put(
+        self,
+        keys: list[str],
+        ptrs: list[int],
+        sizes: list[int],
+        *,
+        group_ids: list[str] | None = None,
+    ) -> list[int]:
+        """Store each buffer under its key; per key 0 or a negative code.
+
+        ``group_ids`` puts each key in that Mooncake group, which the master
+        evicts whole. A key that already exists keeps the group it was put in.
+        """
         self._check_unique(keys)
-        codes = [
-            int(code)
-            for code in self._store.batch_put_from(
-                list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]
-            )
-        ]
+        args: list[Any] = [list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]]
+        if group_ids is not None:
+            if len(group_ids) != len(keys):
+                raise ValueError(
+                    f"{len(group_ids)} group ids for {len(keys)} keys; one per key"
+                )
+            args.append(_new_replicate_config(group_ids))
+        codes = [int(code) for code in self._store.batch_put_from(*args)]
         self._check_length("batch_put_from", codes, keys)
         stored = sum(int(s) for s, code in zip(sizes, codes) if code == 0)
         self._count("put", keys, stored, codes, failed=lambda code: code != 0)
