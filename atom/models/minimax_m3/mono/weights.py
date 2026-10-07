@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Zero-copy views of one sparse MoE layer, checked against what the kernels read.
+"""Zero-copy views of one sparse MoE layer (``SparseMoeLayer``) or dense layer
+(``DenseLayer``), checked against what the kernels read.
 
 The mono kernels read the tensors the original path already loaded, quantized
 and shuffled. Every layout assumption is asserted here once, so a model loaded
@@ -14,6 +15,7 @@ from aiter import QuantType, dtypes
 
 from atom.model_ops.linear import weight_is_stored_preshuffled
 from atom.models.minimax_m3.mono.config import (
+    DENSE_INTER,
     HEAD_DIM,
     HIDDEN,
     INTER,
@@ -24,8 +26,8 @@ from atom.models.minimax_m3.mono.config import (
     TOP_K,
     TOPK_BLOCKS,
     IndexHeads,
-    MonoUnsupported,
 )
+from atom.mono.runtime.consensus import MonoUnsupported
 
 
 def _need(ok: bool, what: str) -> None:
@@ -87,6 +89,9 @@ class SparseMoeLayer:
 
     layer_id: int
     attn_impl: object  # SparseMHAPagedAttentionImpl: index cache + page-16 KV views
+    # the layer selects its blocks; else it reuses the step's last selecting
+    # layer's (the original path's ``skip_index_topk``)
+    index_topk: bool
     g_in: torch.Tensor
     w_qkv: torch.Tensor
     s_qkv: torch.Tensor
@@ -120,13 +125,8 @@ class SparseMoeLayer:
         )
         _need(attn.rotary_emb.rotary_dim == ROTARY_DIM, f"layer {layer_id}: rotary_dim")
         _need(
-            (
-                attn.topk_blocks,
-                attn.init_blocks,
-                attn.local_blocks,
-                attn.skip_index_topk,
-            )
-            == (TOPK_BLOCKS, 0, 1, False),
+            (attn.topk_blocks, attn.init_blocks, attn.local_blocks)
+            == (TOPK_BLOCKS, 0, 1),
             f"layer {layer_id}: sparse selection config",
         )
         impl = attn.attn.impl
@@ -191,6 +191,7 @@ class SparseMoeLayer:
         return SparseMoeLayer(
             layer_id=layer_id,
             attn_impl=impl,
+            index_topk=not attn.skip_index_topk,
             g_in=_bf16_vec(layer.input_layernorm.weight, HIDDEN, "input_layernorm"),
             w_qkv=w_qkv,
             s_qkv=s_qkv,
@@ -212,4 +213,86 @@ class SparseMoeLayer:
             s13=s13.data,
             w2=w2.data,
             s2=s2.data,
+        )
+
+
+@dataclass(frozen=True)
+class DenseLayer:
+    """Everything dense_pre / dense_post read for one dense layer, and the original
+    attention its decode step calls between them."""
+
+    layer_id: int
+    attn_impl: object  # the MHA impl: its decode kernel and the page-128 caches
+    g_in: torch.Tensor
+    w_qkv: torch.Tensor
+    s_qkv: torch.Tensor
+    g_q: torch.Tensor
+    g_k: torch.Tensor
+    cos_sin: torch.Tensor
+    w_o: torch.Tensor
+    s_o: torch.Tensor
+    g_post: torch.Tensor
+    w_gu: torch.Tensor
+    s_gu: torch.Tensor
+    w_dn: torch.Tensor
+    s_dn: torch.Tensor
+    swiglu_alpha: float
+    swiglu_beta: float
+    swiglu_limit: float
+
+    @staticmethod
+    def from_layer(layer, layer_id: int) -> "DenseLayer":
+        attn = layer.self_attn
+        _need(
+            not getattr(attn, "is_indexed_sparse_attention", False)
+            and not layer.is_moe_layer,
+            f"layer {layer_id}: not dense",
+        )
+        _need(
+            (attn.num_heads, attn.num_kv_heads, attn.head_dim)
+            == (LOCAL_Q_HEADS, 1, HEAD_DIM),
+            f"layer {layer_id}: heads {attn.num_heads}/{attn.num_kv_heads}",
+        )
+        _need(attn.rotary_emb.rotary_dim == ROTARY_DIM, f"layer {layer_id}: rotary_dim")
+        impl = attn.attn.impl
+        _need(
+            impl.kv_cache_dtype == "fp8" and getattr(impl, "sliding_window", -1) == -1,
+            f"layer {layer_id}: cache dtype / window",
+        )
+        rows = (LOCAL_Q_HEADS + 2) * HEAD_DIM
+        w_qkv, s_qkv = _ptpc_fp8(
+            attn.qkv_proj, rows, HIDDEN, f"layer {layer_id} qkv_proj"
+        )
+        w_o, s_o = _ptpc_fp8(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
+        mlp = layer.mlp
+        w_gu, s_gu = _ptpc_fp8(
+            mlp.gate_up_proj, 2 * DENSE_INTER, HIDDEN, f"layer {layer_id} gate_up_proj"
+        )
+        w_dn, s_dn = _ptpc_fp8(
+            mlp.down_proj, HIDDEN, DENSE_INTER, f"layer {layer_id} down_proj"
+        )
+        _need(mlp.swiglu_limit is not None, f"layer {layer_id}: swiglu limit")
+        return DenseLayer(
+            layer_id=layer_id,
+            attn_impl=impl,
+            g_in=_bf16_vec(layer.input_layernorm.weight, HIDDEN, "input_layernorm"),
+            w_qkv=w_qkv,
+            s_qkv=s_qkv,
+            g_q=_bf16_vec(attn.q_norm.weight, HEAD_DIM, "q_norm"),
+            g_k=_bf16_vec(attn.k_norm.weight, HEAD_DIM, "k_norm"),
+            cos_sin=_cos_sin(attn, layer_id),
+            w_o=w_o,
+            s_o=s_o,
+            g_post=_bf16_vec(
+                layer.post_attention_layernorm.weight,
+                HIDDEN,
+                "post_attention_layernorm",
+            ),
+            w_gu=w_gu,
+            s_gu=s_gu,
+            w_dn=w_dn,
+            s_dn=s_dn,
+            swiglu_alpha=float(mlp.swiglu_alpha),
+            swiglu_beta=float(mlp.swiglu_beta),
+            swiglu_limit=float(mlp.swiglu_limit),
         )

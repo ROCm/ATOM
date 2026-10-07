@@ -53,8 +53,6 @@ from atom.model_ops.glm5_next.geometry import (
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
-    fp4_decode_parallel_units,
-    fp4_decode_schedule,
     fp4_index_scale_rows,
     fp4_prefill_schedule,
     sparse_indexer_fp4_enabled,
@@ -542,6 +540,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["dcp_local_context_lens"] = CpuGpuBuffer(
                 self.max_bs * max_seqlen_qo, publication_group="mla_csr", **i32_kwargs
             )
+        if self._indexer_fp4:
+            # The FP4 indexer's key bound for each query token (its position +
+            # 1), derived once per step and read by every full layer.
+            mla_metadata["index_row_ends"] = CpuGpuBuffer(
+                self.max_bs * max_seqlen_qo, publication_group="mla_csr", **i32_kwargs
+            )
         mla_metadata["kv_last_page_lens"].cpu.fill_(1)
         mla_metadata["kv_last_page_lens"].copy_to_gpu()
         if self.is_sparse:
@@ -589,23 +593,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
                 device=self.device,
-            )
-            # `[P, 4]` int32 read by the mqa-logits kernel during a CUDAGraph
-            # replay, so it has to be a fixed address refreshed in place, and
-            # one per ubatch since TBO has two in flight.
-            self._indexer_fp4_cta_info = (
-                [
-                    torch.zeros(
-                        fp4_decode_parallel_units(self.max_bs, max_seqlen_qo),
-                        4,
-                        **i32_kwargs,
-                    )
-                    for _ in range(
-                        self._NUM_TBO_UBATCHES + 1 if config.enable_tbo else 1
-                    )
-                ]
-                if self._indexer_fp4
-                else []
             )
             # One block-table row per query token; only MTP verify needs a
             # copy. Built once per step, not in the indexer, where every
@@ -1200,6 +1187,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sparse_decode=True,
             )
             result["sparse_kv_indptr"] = sparse_kv_indptr
+            if self._indexer_fp4:
+                # one query row a sequence: its key bound is its context
+                result["index_row_ends"] = var["context_lens"].gpu[:running_bs]
         else:
             # `bs`, not `running_bs`, and paired with `num_reject_tokens`: this count
             # becomes `cu_num`, and the update kernel loads
@@ -2375,67 +2365,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows.view(running_bs, max_seqlen_q, -1).copy_(block_tables.unsqueeze(1))
         attn_metadata.dcp_token_block_tables = rows
 
-    def _publish_indexer_fp4_decode_schedule(
-        self, attn_metadata: AttentionMetaData, bs: int, next_n: int, ubatch: int = 0
-    ) -> None:
-        """Refresh the FP4 decode CTA schedule; the captured kernel replays off
-        it, and every indexer layer of a step shares the one answer.
-
-        A replay reads the buffer's CONTENTS, so every decode forward has to
-        call this -- including the MTP draft's, whose rows are its own. The
-        lengths come from the published buffer rather than the metadata's view
-        of it, because a draft following a prefill carries prefill metadata.
-        """
-        if not self._indexer_fp4:
-            return
-        parallel_units = fp4_decode_parallel_units(bs, next_n)
-        cta_info = self._indexer_fp4_cta_info[ubatch][:parallel_units]
-        # `[:n]` past the end truncates rather than raising, while
-        # `indexer_fp4_n_ctas` still hands the kernel `n`. The rows past the end
-        # would then go unscheduled, and the logits buffer they should have
-        # written is `torch.empty` -- aiter only sentinels it when it builds the
-        # schedule itself, which it never does here.
-        assert cta_info.shape[0] == parallel_units
-        if self.dcp_world_size > 1:
-            # DCP scores this rank's shard. Its rows are query tokens carrying
-            # their own local window, so next_n is already flattened out of the
-            # row axis and the width is the sharded one -- `parallel_units`
-            # stays the non-DCP count, which keeps the captured grid identical.
-            from atom.model_ops.dcp_ops import dcp_local_logits_width
-            from atom.utils.forward_context import (
-                get_published_dcp_local_context_lens,
-            )
-
-            # A TBO ubatch owns rows from its own offset, not the batch's first
-            # `bs`, and it already publishes that slice on its metadata -- the
-            # same tensor the scorer reads. The global buffer stays the fallback
-            # so callers that publish nothing keep the prefix they had.
-            context_lens = get_published_dcp_local_context_lens(
-                attn_metadata, bs * next_n
-            )
-            if context_lens is None:
-                context_lens = self.model_runner.forward_vars[
-                    "dcp_local_context_lens"
-                ].gpu[: bs * next_n]
-            schedule_next_n = 1
-            width = dcp_local_logits_width(
-                self.model_runner.config.max_model_len, self.dcp_world_size
-            )
-        else:
-            context_lens = attn_metadata.context_lens[:bs]
-            schedule_next_n = next_n
-            width = self.model_runner.config.max_model_len
-        fp4_decode_schedule(
-            context_lens,
-            FP4_MQA_BLOCK_K,
-            parallel_units,
-            width,
-            schedule_next_n,
-            cta_info,
-        )
-        attn_metadata.indexer_fp4_cta_info = cta_info
-        attn_metadata.indexer_fp4_n_ctas = parallel_units
-
     def _publish_indexer_fp4_prefill_schedule(
         self, attn_metadata: AttentionMetaData, local_ends_np: np.ndarray, total_kv: int
     ) -> None:
@@ -2661,6 +2590,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append(("sparse_kv_indptr", running_bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
+        if self._indexer_fp4:
+            var["index_row_ends"].np[:scheduled_tokens] = positions + 1
+            var["index_row_ends"].np[scheduled_tokens:running_tokens] = 0
+            vars_used.append(("index_row_ends", running_tokens))
+
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
         vars_remaining = [
             (el, num)
@@ -2740,10 +2674,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_metadata, k, v)
 
-        if is_sparse_mtp:
+        if is_sparse_mtp or self._indexer_fp4:
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : running_tokens + 1
             ]
+        if is_sparse_mtp:
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:running_tokens]
@@ -2762,9 +2697,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:running_bs]
         self._publish_dcp_token_block_tables(attn_metadata, running_bs, max_seqlen_q)
-        self._publish_indexer_fp4_decode_schedule(
-            attn_metadata, running_bs, max_seqlen_q
-        )
 
         # running_bs, not scheduled_bs: the padded rows have to be split into the
         # ubatches too, or accuracy drifts.
@@ -3049,10 +2981,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_matadata, k, v)
-        if is_sparse_mtp:
+        if is_sparse_mtp or self._indexer_fp4:
             attn_matadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : scheduled_tokens + 1
             ]
+        if self._indexer_fp4:
+            attn_matadata.index_row_ends = var["index_row_ends"].gpu[:scheduled_tokens]
+        if is_sparse_mtp:
             attn_matadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : scheduled_tokens + 1
             ]
@@ -3069,7 +3004,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
         self._publish_dcp_token_block_tables(attn_matadata, bs, max_q_len)
-        self._publish_indexer_fp4_decode_schedule(attn_matadata, bs, max_q_len)
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
         context = Context(
             positions=positions,
@@ -3091,10 +3025,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         p = f"ub{ubatch_idx}_"
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
+        requests_per_ubatch = self._tbo_full_running_bs // self._NUM_TBO_UBATCHES
+        request_start = ubatch_idx * requests_per_ubatch
         dcp_local_context_lens = None
         if self._publishes_dcp_local_lens:
-            requests_per_ubatch = self._tbo_full_running_bs // self._NUM_TBO_UBATCHES
-            request_start = ubatch_idx * requests_per_ubatch
             dcp_local_context_lens = var["dcp_local_context_lens"].gpu[
                 request_start : request_start + running_bs
             ]
@@ -3147,11 +3081,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # DCP, so a ubatch always runs one query per sequence.
             assert max_q_len == 1
             attn.dcp_token_block_tables = attn.block_tables
-        # Slot 0 stays the full-batch schedule, so a ubatch never overwrites
-        # one the other's kernels still read.
-        self._publish_indexer_fp4_decode_schedule(
-            attn, running_bs, max_q_len, ubatch=ubatch_idx + 1
-        )
+        if self._indexer_fp4:
+            attn.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
+                : running_bs * max_q_len + 1
+            ]
+            attn.index_row_ends = var["index_row_ends"].gpu[
+                request_start * max_q_len : (request_start + running_bs) * max_q_len
+            ]
         return attn
 
     def build_ubatch_prefill_metadata(

@@ -40,7 +40,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1. The FP4 sparse indexer requires exactly 64 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
-| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`, the only format its paged index scorer reads; anything else is refused by the V4.1 runtime gate before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`; its runtime also takes `"fp4"` (the official E2M1 + E8M0 arithmetic in the row-group scorer's page-8 layout, values and scales in two planes, which needs `candidate_block_size` 8) and refuses any other format before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
@@ -93,7 +93,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `level` | `int` | `0` | Compilation level (see table above); must be 0 — 3 |
 | `use_cudagraph` | `bool` | `True` | Whether to use CUDA graphs |
 | `cudagraph_capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; overrides `cuda_graph_sizes` when set |
-| `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1,2,4,8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
+| `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1..8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
@@ -366,7 +366,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
 | `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`); the FP4 sparse indexer requires exactly 64 |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
-| `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |
+| `--cudagraph-capture-sizes` | | `str` | `"[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"` (every batch of 1..8: a padded one runs the next size's step) | CUDA graph capture sizes as a Python list string |
 | `--level` | | `int` | `3` | Compilation level (0 — 3) |
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |

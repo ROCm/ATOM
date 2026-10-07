@@ -3,22 +3,48 @@
 
 A private collective instance isolates side-stream synchronization/scratch
 from model collectives. Storage and IPC registration precede graph capture.
-Every forward (including warmup) records the same fork and per-layer joins.
+Every forward (including warmup) records the same kernels, fork and joins on
+fixed addresses (`EngramStep`): a replay reads its own step.
 """
 
 import logging
 import os
+from dataclasses import dataclass
 from unittest.mock import patch
 
 import torch
 
 from atom.model_ops.engram.device.hashing import (
+    EngramBatch,
+    engram_compress,
+    engram_cursor_rows,
     engram_snapshot,
     engram_snapshot_indices,
 )
 from atom.model_ops.engram.device.uva import uva_gather_into
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EngramStep:
+    """One forward's Engram inputs at fixed addresses, its full width.
+
+    `live`: the live leading tokens, on the device (0: nothing is read or
+    written). `dead`: a token's no-own-id flag. `candidates`: a verify step's
+    every accepted prefix (`commit_tentative` picks one); None advances
+    `cursor` in place.
+    """
+
+    input_ids: torch.Tensor
+    live: torch.Tensor
+    dead: torch.Tensor
+    batch_ids: torch.Tensor
+    cu_seqlens: torch.Tensor
+    positions: torch.Tensor
+    cursor: torch.Tensor
+    history_index: torch.Tensor
+    candidates: torch.Tensor | None
 
 
 class EngramStaging:
@@ -33,6 +59,10 @@ class EngramStaging:
             dtype=torch.int64,
             device=host.device,
         )
+        self.compressed = torch.empty(
+            host.max_num_tokens, dtype=torch.int32, device=host.device
+        )
+        self.step = None
         self.flat = {
             layer: torch.empty(
                 host.max_num_tokens,
@@ -95,29 +125,65 @@ class EngramStaging:
             "engram: hash/UVA/TP gather on one side stream with private IPC state"
         )
 
-    def prepare(self, batch, width, *, cursor_positions=None, cursor_out=None):
+    def prepare(self, step, width):
+        """Name the forward's inputs (`EngramStep`); `start` launches on them."""
         if not 0 <= width <= self.host.max_num_tokens:
             raise ValueError("Engram staging exceeds capacity")
-        snapshot = self.snapshot[:width]
-        if batch is None:
-            # Capture uses serving's kernels without accessing synthetic state.
-            snapshot.fill_(-2)
-        else:
-            engram_snapshot(
-                self.uva.hash_tables,
-                batch,
-                snapshot,
-                cursor_positions=cursor_positions,
-                cursor_out=cursor_out,
-            )
+        self.step = step
         return EngramStagedRows(self, width)
+
+    def _snapshot(self, width):
+        """Compressed ids, then the lookbacks the hashes read (and a verify
+        step's cursor candidates): before the cursor advance, they alias."""
+        step, tables = self.step, self.uva.hash_tables
+        compressed = self.compressed[:width]
+        engram_compress(
+            tables,
+            step.input_ids[:width],
+            dead_mask=step.dead[:width],
+            out=compressed,
+            live=step.live,
+        )
+        batch = EngramBatch(
+            compressed=compressed,
+            batch_ids=step.batch_ids[:width],
+            cu_seqlens=step.cu_seqlens,
+            history=step.cursor[:, 1:],
+            history_index=step.history_index,
+        )
+        engram_snapshot(
+            tables,
+            batch,
+            self.snapshot[:width],
+            cursor_positions=step.positions,
+            cursor_out=step.candidates,
+            live=step.live,
+        )
+
+    def _advance_cursor(self, width):
+        """A non-verify step's cursor, committed in place."""
+        step = self.step
+        if step.candidates is None:
+            engram_cursor_rows(
+                self.uva.hash_tables,
+                self.compressed[:width],
+                step.cu_seqlens,
+                step.positions,
+                step.cursor[:, 1:],
+                step.history_index,
+                step.cursor,
+                live=step.live,
+            )
 
     def start(self, width):
         host = self.host
+        self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
         # Get the parent BEFORE entering the guard: waiting on ourselves
         # would neither order the inputs nor join the graph capture.
         self.stream.wait_stream(compute)
+        # past the fork: the side stream reads the snapshot, not the cursor
+        self._advance_cursor(width)
         with torch.cuda.stream(self.stream):
             for layer in host.layer_ids:
                 ids = engram_snapshot_indices(
@@ -172,7 +238,7 @@ class EngramStagedRows(dict):
     """A width-bound view, not a consumable pending queue.
 
     Capture calls stage/get/join after warmup without another prepare.
-    Replay uses the frozen addresses; prepare updates their contents.
+    Replay uses the frozen addresses; the step's own metadata fills them.
     """
 
     def __init__(self, staging, width):

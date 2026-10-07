@@ -4,11 +4,82 @@
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 from aiter import mhc_post
 
-from atom.model_ops.deepseek_v41.mhc_pre_delayed import collapse_streams
 from atom.model_ops.deepseek_v41.projections import hc_projection
 from atom.model_ops.sparse_attn_v4 import hc_split_sinkhorn
+
+
+@triton.jit
+def _collapse_kernel(
+    pre_ptr,
+    x_ptr,
+    out_ptr,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    pre_stride_t: tl.constexpr,
+    pre_stride_m: tl.constexpr,
+    x_stride_t: tl.constexpr,
+    x_stride_m: tl.constexpr,
+    x_stride_h: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    token_idx = tl.program_id(0).to(tl.int64)
+    offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offsets < hidden_size
+
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for mix_idx in tl.static_range(0, hc_mult):
+        pre = tl.load(pre_ptr + token_idx * pre_stride_t + mix_idx * pre_stride_m).to(
+            tl.float32
+        )
+        x = tl.load(
+            x_ptr
+            + token_idx * x_stride_t
+            + mix_idx * x_stride_m
+            + offsets * x_stride_h,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc += pre * x
+
+    tl.store(
+        out_ptr + token_idx * out_stride_t + offsets * out_stride_h, acc, mask=mask
+    )
+
+
+def collapse_streams(residual, pre_mix):
+    """BF16 residual streams weighted by FP32 pre-mix, as `collapse()` does."""
+    num_tokens, hc_mult, hidden_size = residual.shape
+    out = torch.empty(
+        num_tokens, hidden_size, dtype=residual.dtype, device=residual.device
+    )
+    if num_tokens == 0:
+        return out
+    block_h = 1024
+    _collapse_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+        pre_mix,
+        residual,
+        out,
+        hidden_size,
+        hc_mult,
+        pre_mix.stride(0),
+        pre_mix.stride(1),
+        residual.stride(0),
+        residual.stride(1),
+        residual.stride(2),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_H=block_h,
+        num_warps=4,
+        # Keep the multiply and the sum separate, as the torch body has them.
+        enable_fp_fusion=False,
+    )
+    return out
 
 
 @dataclass(frozen=True)

@@ -57,6 +57,10 @@ MAIN_FP4 = {"group_size": 16, "scale_dtype": torch.float8_e4m3fn}
 # which one meant what.
 INDEX_FP8_SCALE_FMT = "ue8m0"
 
+# The rows one page of the FP4 index plane holds: the row-group scorer's page-8
+# layout, a page being a candidate block so a kept list is its block table.
+FP4_INDEX_PAGE_ROWS = 8
+
 
 @dataclass(frozen=True)
 class V41PoolGeometry:
@@ -82,6 +86,10 @@ class V41PoolGeometry:
     # plane passes. A layout choice and not the kernel's tile -- 8 is what lets
     # a candidate list be a block table, the length candidates are picked in.
     index_block_rows: int = MQA_LOGITS_PRESHUFFLE_ROWS
+    # The index plane's format: FP8 rows with their scales inside each block,
+    # or the FP4 page-8 layout the row-group scorer reads, values and E8M0
+    # scales in two planes (`index_planes`).
+    index_fp4: bool = False
 
     def __post_init__(self):
         if self.speculative_tokens < 0:
@@ -105,6 +113,11 @@ class V41PoolGeometry:
         if len({owner for owner, _ in self.owners}) != len(self.owners):
             raise ValueError("Each global owner must be declared once")
         rows = self.index_block_rows
+        if self.index_fp4 and (rows != FP4_INDEX_PAGE_ROWS or self.index_dim % 128):
+            raise ValueError(
+                f"The FP4 index plane is paged at {FP4_INDEX_PAGE_ROWS} rows of "
+                f"whole 128-dim K tiles; got {rows} rows of {self.index_dim}"
+            )
         if rows % MQA_LOGITS_PRESHUFFLE_ROWS and rows != 8:
             raise ValueError(
                 f"An index block holds whole {MQA_LOGITS_PRESHUFFLE_ROWS}-row MFMA "
@@ -120,7 +133,7 @@ class V41PoolGeometry:
             # that a statement about twice the PAGE.
             if self.rows_per_page(ratio) % rows:
                 raise ValueError(
-                    f"An FP8 index plane needs whole {rows}-row blocks: "
+                    f"An index plane needs whole {rows}-row blocks: "
                     f"ratio {ratio} gives a PAGE {self.rows_per_page(ratio)} rows, "
                     f"so raise the PAGE token count to a multiple of "
                     f"{rows * max(r for _, r in self.owners)}"
@@ -141,20 +154,33 @@ class V41PoolGeometry:
         return self.head_dim // 2 + self.head_dim // MAIN_FP4["group_size"]
 
     @property
-    def index_row_bytes(self):
-        """What one index row costs, which is not what one row *is*.
+    def index_planes(self):
+        """`(name, bytes one row costs in it)` of each plane an owner's index
+        rows take, in layout order.
 
-        Under preshuffle a row's bytes are interleaved across its tile, so this
-        is the block over its rows -- the same convention
+        FP8 is one plane: under preshuffle a row's bytes are interleaved across
+        its tile, so a row's cost is the block over its rows -- the convention
         `fp8_indexer_block_fields` states, and the reason a scale sits past the
-        block's data rather than beside its own row.
+        block's data rather than beside its own row. FP4 is two, the packed
+        E2M1 values and their E8M0 scales, each dense in pages: the row-group
+        scorer addresses page `i` of either at `i *` its page bytes.
         """
+        if self.index_fp4:
+            return (
+                ("index", self.index_dim // 2),
+                ("index_scale", self.index_dim // 32),
+            )
         block = indexer_block_regions(
             fp8_indexer_block_fields(
                 self.index_block_rows, self.index_dim, torch.float8_e4m3fn
             )
         )[1]
-        return block // self.index_block_rows
+        return (("index", block // self.index_block_rows),)
+
+    @property
+    def index_row_bytes(self):
+        """What one index row costs over all of its owner's index planes."""
+        return sum(width for _, width in self.index_planes)
 
     @property
     def window_row_bytes(self):
@@ -222,6 +248,11 @@ class V41PoolGeometry:
         """Rows one PAGE holds for an owner at this ratio, main and index alike."""
         return self.block_size // ratio
 
+    def index_blocks_per_page(self, ratio):
+        """Index blocks one PAGE holds at this ratio: a block id is block
+        `id % this` of the PAGE its request's column `id // this` names."""
+        return self.rows_per_page(ratio) // self.index_block_rows
+
     @property
     def paged_bytes(self):
         """One PAGE's whole cost: its main rows and its index rows.
@@ -234,13 +265,14 @@ class V41PoolGeometry:
         )
 
     def paged_extents(self, pages):
-        """`({owner: index plane offset}, bytes the PAGE currency spans)`.
+        """`({owner: offset of each of its index_planes}, bytes the PAGE
+        currency spans)`.
 
-        The offset is from the pool's first PAGE and the total is where STATE
+        An offset is from the pool's first PAGE and the total is where STATE
         begins, so this is the one walk that places everything scaling with
-        history. Within a plane the pages are dense -- `index_rows *
-        index_row_bytes` apart -- which is the stride a paged reader is handed;
-        only the plane's own start is aligned.
+        history. Within a plane the pages are dense -- `index_rows *` its row
+        bytes apart -- which is the stride a paged reader is handed; only the
+        plane's own start is aligned.
 
         The total is rounded to `alignment` rather than to `plan_regions`' own,
         because the window ring behind it is addressed in whole rows.
@@ -248,12 +280,18 @@ class V41PoolGeometry:
         offsets, total = plan_regions(
             [pages * self.page_bytes]
             + [
-                pages * self.rows_per_page(ratio) * self.index_row_bytes
+                pages * self.rows_per_page(ratio) * width
                 for _, ratio in self.owners
+                for _, width in self.index_planes
             ]
         )
+        per_owner = len(self.index_planes)
+        planes = offsets[1:]
         return (
-            dict(zip(self.compress_owners, offsets[1:])),
+            {
+                owner: tuple(planes[i * per_owner : (i + 1) * per_owner])
+                for i, owner in enumerate(self.compress_owners)
+            },
             -(-total // self.alignment) * self.alignment,
         )
 
