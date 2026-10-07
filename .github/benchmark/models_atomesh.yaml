@@ -1043,6 +1043,64 @@ models:
             wait_server_timeout: 1800
           run_eval: false
 
+  # Bounded native CPU restore on P followed by NIXL delivery to plain D.
+  Qwen3-0.6B-Native-NIXL-vLLM-Survey:
+    backend: vllm
+    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    model_path: "${ATOMESH_MODEL_ROOT}/Qwen/Qwen3-0.6B"
+    precision: BF16
+    env:
+      common:
+        ATOMESH_PRE_CLEAN_GPU: "1"
+        AITER_LOG_LEVEL: WARNING
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_KV_CACHE_LAYOUT: HND
+        VLLM_SERVER_DEV_MODE: "1"
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: "1"
+        VLLM_PLUGINS: ""
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+    vllm:
+      served_model_name: Qwen3-0.6B
+      source:
+        repo: https://github.com/vllm-project/vllm
+        sha: b22494cc0cb4bd9db4a62fb107d92429a4a3249d
+      clean_main: 1
+      diagnostic: 1
+      diagnostic_mode: smoke
+      connector: nixl
+      native_cpu_bytes: 2147483648
+    server:
+      common_args:
+        extra_args: >-
+          --load-format safetensors --dtype bfloat16 --gpu-memory-utilization 0.2
+          --distributed-executor-backend mp
+          --max-num-seqs 1 --max-model-len 4096 --max-num-batched-tokens 1024
+          --enable-prefix-caching --kv-cache-dtype auto --block-size 128
+          --kv-cache-memory-bytes 1073741824
+          --attention-backend ROCM_AITER_UNIFIED_ATTN --enforce-eager
+    suites:
+      vllm:
+        - name: survey-qwen3-main-native-nixl-1p1d-tp1-eager
+          topology: 1p1d
+          display_topology: 1P1D-TP1
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1025]
+          osl: 32
+          concurrency: [1]
+          prefill:
+            workers: 1
+            tp: 1
+            dcp: 1
+          decode:
+            workers: 1
+            tp: 1
+            dcp: 1
+          benchmark:
+            wait_server_timeout: 1800
+          run_eval: false
+
   # Image-only transport diagnostics; Qwen files retain the existing submit gate.
   # No model is loaded and rc=0 means collection completed, not PD passed.
   Transport-vLLM-Survey:

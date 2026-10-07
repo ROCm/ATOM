@@ -310,12 +310,37 @@ import sys
 role, proxy_ip, ping_port, http_port, lmcache_port, mq_timeout, clean_main = sys.argv[1:]
 if os.environ.get("ATOMESH_VLLM_CONNECTOR") == "nixl":
     assert clean_main == "1" and not lmcache_port
-    print(json.dumps({
+    config = {
         "kv_connector": "NixlConnector",
         "kv_role": "kv_producer" if role == "prefill" else "kv_consumer",
         "kv_load_failure_policy": "fail",
         "kv_connector_extra_config": {"backends": ["UCX"]},
-    }))
+    }
+    native_cpu_bytes = os.environ.get("ATOMESH_VLLM_NATIVE_CPU_BYTES")
+    if native_cpu_bytes:
+        assert int(native_cpu_bytes) == 2147483648, "Survey requires exactly 2 GiB native CPU cache"
+        if role == "prefill":
+            config = {
+                "kv_connector": "MultiConnector",
+                "kv_role": "kv_both",
+                "kv_load_failure_policy": "fail",
+                "kv_connector_extra_config": {"connectors": [
+                    config,
+                    {
+                        "kv_connector": "OffloadingConnector",
+                        "kv_role": "kv_both",
+                        "kv_load_failure_policy": "fail",
+                        "kv_connector_extra_config": {
+                            "spec_name": "CPUOffloadingSpec",
+                            "block_size": 128,
+                            "cpu_bytes_to_use": int(native_cpu_bytes),
+                            "store_threshold": 0,
+                            "offload_prompt_only": True,
+                        },
+                    },
+                ]},
+            }
+    print(json.dumps(config))
     raise SystemExit(0)
 moriio = {
     "kv_connector": "MoRIIOConnector",
