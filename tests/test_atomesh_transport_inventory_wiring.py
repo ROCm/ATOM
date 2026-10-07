@@ -48,7 +48,7 @@ def cells(monkeypatch):
             matrix.load_config(ROOT / ".github/benchmark/models_atomesh.yaml"),
             suite="vllm",
             model_filter={"Transport-vLLM-Survey"},
-            case_filter=None,
+            case_filter={BASE, CASE},
             benchmark_kind_filter=None,
             override_image=None,
             override_benchmark_concurrency=None,
