@@ -1087,6 +1087,68 @@ models:
             wait_server_timeout: 900
           run_eval: false
 
+  # Candidate only; exact local metadata/index/shard structure required before allocation.
+  # No alternate checkpoint/download; original FP4 experts + FP8 checkpoint metadata.
+  DeepSeek-V4-Flash-vLLM-Survey:
+    backend: vllm
+    image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
+    model_path: "${ATOMESH_MODEL_ROOT}/deepseek-ai/DeepSeek-V4-Flash"
+    precision: checkpoint
+    env:
+      common:
+        ATOMESH_PRE_CLEAN_GPU: "1"
+        AITER_LOG_LEVEL: WARNING
+        VLLM_SERVER_DEV_MODE: "1"
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: "1"
+        VLLM_PLUGINS: ""
+        PYTHONNOUSERSITE: "1"
+        PYTHONDONTWRITEBYTECODE: "1"
+        VLLM_WORKER_MULTIPROC_METHOD: spawn
+        VLLM_USE_V2_MODEL_RUNNER: "1"
+        VLLM_ROCM_USE_AITER: "1"
+        VLLM_ROCM_USE_AITER_MOE: "1"
+        VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "0"
+        VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4: "0"
+        VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: "0"
+        HF_HUB_OFFLINE: "1"
+        HF_DATASETS_OFFLINE: "1"
+        VLLM_NO_USAGE_STATS: "1"
+    vllm:
+      served_model_name: DeepSeek-V4-Flash
+      source:
+        repo: https://github.com/vllm-project/vllm
+        sha: b22494cc0cb4bd9db4a62fb107d92429a4a3249d
+      clean_main: 1
+      diagnostic: 1
+      diagnostic_mode: smoke
+      connector: nixl
+      checkpoint_manifest: v4-checkpoint-identity.json
+      nixl_model_profile: v4
+    server:
+      common_args:
+        extra_args: >-
+          --tokenizer-mode deepseek_v4 --dtype bfloat16 --enforce-eager
+          --distributed-executor-backend mp --block-size 256 --kv-cache-dtype fp8
+          --attention_config.indexer_kv_dtype=fp8 --moe-backend aiter
+          --max-model-len 2048 --max-num-batched-tokens 256 --max-num-seqs 1
+          --gpu-memory-utilization 0.5 --kv-cache-memory-bytes 4294967296
+          --no-enable-prefix-caching
+    suites:
+      vllm:
+        - name: survey-v4-flash-main-nixl-1p1d-tp8-eager
+          topology: 1p1d
+          display_topology: 1P1D-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [255, 257, 513]
+          osl: 16
+          concurrency: [1]
+          prefill: {workers: 1, tp: 8, dcp: 1}
+          decode: {workers: 1, tp: 8, dcp: 1}
+          benchmark:
+            wait_server_timeout: 10800
+          run_eval: false
+
   # Candidate shared path only: runner visibility preflight remains authoritative.
   MiniMax-M3-MXFP8-vLLM-Survey:
     backend: vllm

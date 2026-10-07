@@ -1,4 +1,7 @@
-"""Three cold M3 NIXL pull requests; evidence only, never automatic PD PASS."""
+"""Cold NIXL pull evidence; default M3 or explicit V4 profile, never automatic PASS.
+
+The historical module name remains for existing harness/import compatibility.
+"""
 
 import argparse
 import asyncio
@@ -100,7 +103,18 @@ def check_usage(response, length, count):
     assert response["usage"]["completion_tokens"] == count, response
 
 
+def check_token_ids(response, prompt, count):
+    choice = response["choices"][0]
+    assert choice.get("prompt_token_ids") == prompt, "Prompt IDs changed or missing"
+    ids = choice.get("token_ids")
+    assert isinstance(ids, list) and len(ids) == count, "Generated IDs missing/invalid"
+    assert all(type(token) is int for token in ids), "Generated IDs must be integers"
+
+
 async def run(args):
+    profile = getattr(args, "model_profile", "m3")
+    lengths = {"m3": (127, 129, 513), "v4": (255, 257, 513)}[profile]
+    exact_ids = profile == "v4"
     args.output.mkdir(parents=True, exist_ok=True)
     async with httpx.AsyncClient(timeout=600, trust_env=False) as client:
 
@@ -149,8 +163,8 @@ async def run(args):
         )
         tokens = tokenized["tokens"]
         assert len(tokens) >= 513
-        for length in (127, 129, 513):
-            request_id = "m3-nixl-" + uuid.uuid4().hex
+        for length in lengths:
+            request_id = f"{profile}-nixl-" + uuid.uuid4().hex
             evidence = {
                 "status": "PENDING_REVIEW",
                 "request_id": request_id,
@@ -170,6 +184,8 @@ async def run(args):
                 "ignore_eos": True,
                 "stream": False,
             }
+            if exact_ids:
+                body["return_token_ids"] = True
             before = None
             try:
                 # Flush reference metrics before measuring PD, or stop the sequence.
@@ -178,6 +194,8 @@ async def run(args):
                     args.prefill, "/v1/completions", body, request_id + "-reference"
                 )
                 check_usage(evidence["reference"], length, 16)
+                if exact_ids:
+                    check_token_ids(evidence["reference"], body["prompt"], 16)
                 before = await await_accounting(
                     before,
                     f"{length}-reference-after",
@@ -228,6 +246,16 @@ async def run(args):
                 evidence["decode"] = decode
                 check_usage(prefill, length, 1)
                 check_usage(decode, length, 16)
+                if exact_ids:
+                    check_token_ids(prefill, body["prompt"], 1)
+                    check_token_ids(decode, body["prompt"], 16)
+                    evidence["generated_token_ids_equal"] = (
+                        decode["choices"][0]["token_ids"]
+                        == evidence["reference"]["choices"][0]["token_ids"]
+                    )
+                    assert evidence[
+                        "generated_token_ids_equal"
+                    ], "Direct/PD token ID mismatch"
                 after = await await_accounting(
                     before,
                     f"{length}-after",
@@ -269,7 +297,7 @@ async def run(args):
                 {
                     "status": "PENDING_REVIEW",
                     "requests": 3,
-                    "lengths": [127, 129, 513],
+                    "lengths": list(lengths),
                     "output_tokens": 16,
                     "review_required": "Audit all cache groups, bytes, completion, failures and delayed P counters; no accuracy claim",
                 },
@@ -284,6 +312,7 @@ if __name__ == "__main__":
     for name in ("prefill", "decode", "model"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--model-profile", choices=("m3", "v4"), default="m3")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))

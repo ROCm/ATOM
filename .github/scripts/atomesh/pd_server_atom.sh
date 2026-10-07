@@ -1362,6 +1362,7 @@ PY
 run_workload_phase() {
   if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_CONNECTOR:-moriio}" == "nixl" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/pd_m3_nixl_smoke.py" \
+      --model-profile "${ATOMESH_VLLM_NIXL_MODEL_PROFILE:-m3}" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
       --model "${SERVED_MODEL_NAME}" \

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 
-def check_weights(model, model_root=None):
+def check_weights(model, model_root=None, manifest=None):
     report = {"model_path": str(model), "status": "BLOCKED_ENV"}
     if model_root is not None and not model_root.is_dir():
         return {
@@ -57,6 +57,16 @@ def check_weights(model, model_root=None):
             with (model / name).open("rb") as tokenizer_file:
                 assert tokenizer_file.read(8), f"Empty tokenizer file: {name}"
         report["tokenizer_files"] = tokenizer_names
+        if manifest is not None:
+            report["identity_manifest"] = str(manifest)
+            expected = json.loads(manifest.read_text())
+            report["index_sha256"] = hashlib.sha256(index.read_bytes()).hexdigest()
+            for key in ("config_sha256", "index_sha256"):
+                if report[key] != expected[key]:
+                    raise ValueError(f"Checkpoint {key} mismatch")
+            if report["weights"] != expected["shards"]:
+                raise ValueError("Checkpoint shard names/sizes mismatch")
+            report["checkpoint_identity"] = "STRUCTURE_MATCH_NOT_FULL_WEIGHT_HASH"
         report["status"] = "FILES_VISIBLE"
     except (OSError, ValueError, KeyError, AssertionError) as exc:
         report["error"] = repr(exc)
@@ -68,8 +78,13 @@ if __name__ == "__main__":
     parser.add_argument("model", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--model-root", type=Path)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="Require exact metadata/index hashes and shard sizes",
+    )
     args = parser.parse_args()
-    report = check_weights(args.model, args.model_root)
+    report = check_weights(args.model, args.model_root, args.manifest)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)

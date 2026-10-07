@@ -1758,8 +1758,13 @@ jobs:
           model = cell['model_path']
           # The existing machine-paths contract maps the shared model root here.
           root = '/share_nfs/models' if model.startswith('/share_nfs/models/') else os.environ['ATOMESH_MODEL_ROOT']
+          manifest = cell.get('vllm', {}).get('checkpoint_manifest')
+          extra = ['--manifest', str(Path('.github/scripts/atomesh') / manifest)] if manifest else []
+          # V4 may never silently fall back to visibility-only or alternate weights.
+          if cell.get('vllm', {}).get('nixl_model_profile') == 'v4' and not manifest:
+              raise SystemExit('V4 requires a checkpoint identity manifest before allocation')
           subprocess.run(['python3', '.github/scripts/atomesh/pd_survey_preflight.py', model,
-                          'survey-preflight/weights.json', '--model-root', root], check=True)
+                          'survey-preflight/weights.json', '--model-root', root, *extra], check=True)
           PY
 
       - name: Archive survey pre-submit checks

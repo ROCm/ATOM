@@ -37,8 +37,16 @@ install_native_vllm() {
     unset VLLM_PRECOMPILED_WHEEL_LOCATION
   fi
   if [[ "${ATOMESH_VLLM_CLEAN_MAIN:-0}" == "1" ]]; then
+    local -a identity_args=()
+    if [[ "${ATOMESH_VLLM_NIXL_MODEL_PROFILE:-m3}" == "v4" && -z "${ATOMESH_VLLM_CHECKPOINT_MANIFEST:-}" ]]; then
+      echo "V4 requires a checkpoint identity manifest on every node" >&2
+      return 2
+    fi
+    if [[ -n "${ATOMESH_VLLM_CHECKPOINT_MANIFEST:-}" ]]; then
+      identity_args=(--manifest "${ATOMESH_SCRIPT_DIR}/${ATOMESH_VLLM_CHECKPOINT_MANIFEST}")
+    fi
     python3 "${ATOMESH_SCRIPT_DIR}/pd_survey_preflight.py" "${MODEL_PATH}" \
-      "${RUNTIME_LOG_DIR}/weights-preflight-rank-${NODE_RANK}.json"
+      "${RUNTIME_LOG_DIR}/weights-preflight-rank-${NODE_RANK}.json" "${identity_args[@]}" || return $?
   fi
   local src="/tmp/atomesh-native-vllm" venv="/tmp/atomesh-native-venv"
   git init -q "${src}"
