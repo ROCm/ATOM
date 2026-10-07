@@ -163,8 +163,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
-    # When this file exists, EPLB stops rebalancing (placement stays fixed).
-    "ATOM_EPLB_FREEZE_FILE": lambda: os.getenv("ATOM_EPLB_FREEZE_FILE", ""),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force

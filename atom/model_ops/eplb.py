@@ -10,8 +10,6 @@ from typing import Any
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.utils import envs
-
 try:
     import triton
     import triton.language as tl
@@ -21,7 +19,6 @@ except ImportError:
     _EPLB_HAS_TRITON = False
 
 import logging
-import os
 
 logger = logging.getLogger("atom")
 
@@ -1660,7 +1657,6 @@ class EPLBManager:
         # SGLang avoids this by issuing migration P2P on a separate (default) group;
         # we mirror that with an EP-membership subgroup used only for migration.
         self._migration_group: Any | None = None
-        self._frozen_latched = False
         self._ep_rank: int = 0
         self._nnodes: int = 1
         self._rebalance_layers_per_chunk: int = 64
@@ -2118,43 +2114,12 @@ class EPLBManager:
                 yield
                 migrate_and_commit(new_meta, layer_ids=chunk)
         """
-        if self._frozen():
-            return
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
             return
         if not self._need_rebalance(physical_load):
             return
         yield from self._execute_rebalance()
-
-    def _frozen(self) -> bool:
-        """True once ATOM_EPLB_FREEZE_FILE exists on any rank of the group.
-
-        Lets a benchmark balance experts during warmup and then hold the
-        placement fixed for the measured window. The flag is MAX-reduced over
-        the migration group: every rank reaches this check at the same step,
-        and they must agree, since the rebalance below is collective.
-        """
-        if self._frozen_latched:
-            return True
-        path = envs.ATOM_EPLB_FREEZE_FILE
-        if not path:
-            return False
-        frozen = os.path.exists(path)
-        if self._migration_group is not None:
-            flag = torch.tensor([int(frozen)], device="cuda", dtype=torch.int32)
-            torch.distributed.all_reduce(
-                flag, op=torch.distributed.ReduceOp.MAX, group=self._migration_group
-            )
-            frozen = bool(flag.item())
-        if frozen:
-            self._frozen_latched = True
-            logger.info(
-                "EPLB frozen after %d rebalances (%s exists)",
-                self._rebalance_count,
-                path,
-            )
-        return self._frozen_latched
 
     def _execute_rebalance(self):
         """Generator: run one rebalance (rearrange + chunked migrate/commit),
