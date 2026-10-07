@@ -2647,8 +2647,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         var["context_lens"].np[:scheduled_bs] = context_lens_np
 
-        # Fill block tables before their current-stream publication.
-        self.prepare_block_tables(batch)
+        # Fill block tables before their current-stream publication, zero rows
+        # out to the padded `running_bs` the forward runs (see the publish below).
+        self.prepare_block_tables(batch, running_bs)
 
         pool_np = np.asarray(batch.state_slots_committed[:scheduled_bs], dtype=np.int32)
         if len(pool_np) < scheduled_bs:
@@ -2674,7 +2675,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Uploaded once by `publish_cu_seqlens_q`; this is a view.
         cu_seqlens_q_gpu = var["cu_seqlens_q"].gpu[: running_bs + 1]
         context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
-        block_tables_gpu = block_table_state(var["block_tables"]).publish(scheduled_bs)
+        # As many rows as `cu_seqlens_q` has sequences: the FP4 indexer's ragged
+        # scorer takes its batch from `query_start_loc` and asserts the table
+        # covers it, so a DP-padded eager step (running_bs > scheduled_bs) with
+        # `scheduled_bs` rows trips it. Pad rows are zero; their row ends are 0.
+        block_tables_gpu = block_table_state(var["block_tables"]).publish(running_bs)
         state_slot_gpu = ss_buf.copy_to_gpu(running_bs)
         state_slot_in_gpu = si_buf.copy_to_gpu(running_bs)
 
