@@ -289,6 +289,13 @@ def ld_i32(ptr, i):
     return fx.Int32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.i32))
 
 
+def row_live(batch_ids, k):
+    """Whether row k of the step is a request's: its ``batch_id_per_q_token``
+    entry, -1 on a CUDA-graph pad row (wave-uniform for a uniform k). A pad row
+    runs like any other but joins no decision another row's work depends on."""
+    return uniform(ld_i32(batch_ids, k)) >= 0
+
+
 def ld_dev(ptr, i, words=1):
     """``words`` i32 (1, 2 or 4) of a buffer from word ``i``, at device scope
     (past the per-XCD L2)."""

@@ -136,7 +136,7 @@ K4_ABI = KernelAbi(
         "h_in", "q", "block_table", "seq_lens", "k_cache", "v_cache", "k_scale",
         "v_scale", "w_o", "s_o", "g_post", "w_gate", "bias", "w13", "s13", "w2", "s2",
         "h_mid", "ar_out", "scratch", "sym", "peers", "rank", "layer", "bt_width",
-        "q_len", "tl", "k1_args", "positions", "slot_mapping", "res",
+        "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids",
     )
 )  # fmt: skip
 
@@ -289,6 +289,7 @@ def build_post_attn_kernel(
         positions: Int64,
         slot_mapping: Int64,
         res: Int64,
+        batch_ids: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -534,7 +535,9 @@ def build_post_attn_kernel(
         # up / gate tasks go in pairs, a CTA runs both: an MXFP8 block is 32 rows
         UG_PAIRS = UG_PER_SLOT // 2
         UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)  # up / gate tasks a CTA runs
-        DN_WITERS = (U_MAX * DN_KC + 3) // 4  # (expert, chunk) units a wave runs
+        # a wave takes chunks q and q + 4 of an expert (``wide_down``)
+        assert 4 < DN_KC <= 8
+        DN_WITERS = 2 * U_MAX  # (expert, chunk) units a wave runs, at most
         DN_DEPTH = 12  # units whose weights are in flight
         ROUTE_ITERS = (tokens + WAVES - 1) // WAVES  # tokens a wave routes
 
@@ -585,6 +588,7 @@ def build_post_attn_kernel(
         positions: Int64,
         slot_mapping: Int64,
         res: Int64,
+        batch_ids: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):
         _ = build_key  # every build parameter in the JIT cache key
@@ -620,6 +624,7 @@ def build_post_attn_kernel(
             positions,
             slot_mapping,
             res,
+            batch_ids,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     K4_ABI.check(post_attn_kernel, launch_post_attn)

@@ -44,6 +44,7 @@ from atom.mono.device.ops import (
     bf16_round,
     lanes_below,
     popcount,
+    row_live,
     row_sum,
     rows_to_lds,
     rsrc,
@@ -79,6 +80,7 @@ def moe_wide_defs(k4ctx):
     XSC_LDS = k4ctx["XSC_LDS"]
     XSC_WORDS = k4ctx["XSC_WORDS"]
     acquire = k4ctx["acquire"]
+    batch_ids = k4ctx["batch_ids"]
     bid = k4ctx["bid"]
     e8m0_load = k4ctx["e8m0_load"]
     ffn_finish = k4ctx["ffn_finish"]
@@ -312,6 +314,9 @@ def moe_wide_defs(k4ctx):
                     sg[2 * j + 1][1].bitcast(fx.Float32),
                     fpool + W_SIG,
                     wave_mask,
+                    row_live(batch_ids, wave_toks[j]).select(
+                        fx.Int32(1) << wave_toks[j], fx.Int32(0)
+                    ),
                 )
         stamp(2)
         gpu.barrier()
@@ -389,17 +394,21 @@ def moe_wide_defs(k4ctx):
         there), route-weighted per column -> ffn_finish."""
         nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
         rg_d = td * 2 + wave // 4
-        n_units = (nu + 1) * DN_KC
+        # wave q of the row group takes chunks q and q + 4 of every expert, unit i
+        # being expert i // 2 for all 4: which wave adds a chunk, and in what
+        # order, follows from the expert alone, not its rank in the step's union,
+        # so another row's experts cannot regroup this row's sums
+        q = wave % 4
 
         def unit_load(i):
             """(weights, scale, unit) of this wave's i-th (expert, 128-k chunk)
             unit, zero-sized reads past the last."""
-            j = wave % 4 + 4 * i
-            ok = j < n_units
+            dkc = q + 4 * (i % 2)
+            ok = (dkc < DN_KC) & (fx.Int32(i // 2) <= nu)
             # clamped into the table: a unit past the last reads a real or zero
             # row, never past urow (a garbage row is garbage B, and 0 * NaN)
-            du = fx.min(j // DN_KC, U_MAX - 1)
-            dkc = j % DN_KC
+            du = fx.Int32(min(i // 2, U_MAX - 1))
+            dkc = fx.min(dkc, DN_KC - 1)
             de = fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT)
             dwv = fp4_tile_load(
                 rsrc(
@@ -466,7 +475,8 @@ def moe_wide_defs(k4ctx):
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
                 a_fmt=FP4,
             )
-            # a unit past the last adds nothing, whatever its MFMA gave
+            # a unit past the last (or a wave's missing second chunk) adds
+            # nothing, whatever its MFMA gave
             acc = [acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)]
         a0, a1, a2, a3 = acc
         fx.ptr_store(

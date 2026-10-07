@@ -89,16 +89,17 @@ def router_defs(k4ctx):
         base = (expert * (rows // 32) + rg // 2) * (cols // 8) + kc // 2
         return (base * 64 + lane) * 4 + (kc % 2) * 2 + rg % 2
 
-    def route_top4(k, k0, sc0, k1, sc1, sig, wave_mask=None):
+    def route_top4(k, k0, sc0, k1, sc1, sig, wave_mask=None, mask_bit=0):
         """route[8k : 8k+4] / rwt[..] := token k's sigmoid top-k gating from the
         router tasks' routing keys ``k0`` / ``k1`` (experts ``lane`` / ``lane +
         64``, sigmoid + bias, see route_key) and unbiased sigmoids (wave k % WAVES
         computes it, looking the sigmoids up in LDS at ``sig``): a pick is one
         wave max; the weights are the picks' sigmoids renormalized and scaled by
         route_scale. Slot 4 is the fused shared expert. ``wave_mask``: this
-        wave's expert -> token mask, the picks' bit k set (the picks are
-        distinct, and the wave's tokens run in program order). The caller
-        syncs."""
+        wave's expert -> token mask, ``mask_bit`` or-ed in at the picks (they
+        are distinct, and the wave's tokens run in program order): bit k, or 0
+        for a pad row (``row_live``), whose experts then join no token's work.
+        The caller syncs."""
         if wave == k % WAVES:
             # the unbiased weights, looked up by expert once the picks are known
             fx.ptr_store(sc0, sig + (k * N_ROUTED + lane))
@@ -119,7 +120,7 @@ def router_defs(k4ctx):
                 )
                 if const_expr(wave_mask is not None):
                     was = fx.Int32(fx.ptr_load(wave_mask + pid))
-                    fx.ptr_store(was | (fx.Int32(1) << k), wave_mask + pid)
+                    fx.ptr_store(was | mask_bit, wave_mask + pid)
             if lane == 0:
                 fx.ptr_store(fx.Int32(SHARED_EXPERT), route + (8 * k + TOP_K))
                 fx.ptr_store(fx.Float32(shared_weight), rwt + (8 * k + TOP_K))

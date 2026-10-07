@@ -469,6 +469,7 @@ class MonoDecodeRunner:
             "tl": self.timeline.ptr(i) if self.timeline else 0,
             "k1_args": _ptr(self.k1_args[i]), "positions": _ptr(positions),
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
+            "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
         }  # fmt: skip
         self.k4[n][lw.index_topk](*K4_ABI.pack(args), stream=stream)
         return self.h_mids[(i + 1) % 2][:n]

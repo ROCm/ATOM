@@ -96,7 +96,10 @@ def test_plugin_mode_is_refused(native, monkeypatch):
 # ---------------------------------------------------------------- per-step predicate
 
 
-def _decode_md(rows=4, slots=None, **overrides):
+_PER_SLOT = object()  # a batch id a slot row, the step's own
+
+
+def _decode_md(rows=4, slots=None, batch_ids=_PER_SLOT, **overrides):
     """Sparse decode metadata with ``rows`` table rows (a size-``rows`` graph)."""
     decode = {
         "max_query_len": 1,
@@ -104,14 +107,16 @@ def _decode_md(rows=4, slots=None, **overrides):
         "seq_lens": torch.ones(rows, dtype=torch.int32),
     }
     decode.update(overrides)
+    slots = slots if slots is not None else torch.zeros(rows, dtype=torch.int64)
     return SimpleNamespace(
         sparse_attention_metadata=SimpleNamespace(
-            decode=SimpleNamespace(**decode),
-            num_prefills=0,
-            slot_mapping=(
-                slots if slots is not None else torch.zeros(rows, dtype=torch.int64)
-            ),
-        )
+            decode=SimpleNamespace(**decode), num_prefills=0, slot_mapping=slots
+        ),
+        batch_id_per_q_token=(
+            torch.zeros(slots.numel(), dtype=torch.int32)
+            if batch_ids is _PER_SLOT
+            else batch_ids
+        ),
     )
 
 
@@ -180,6 +185,9 @@ def test_check_mode_takes_the_same_steps(monkeypatch):
         ),
         _forward_context(_decode_md(slots=torch.zeros(4, dtype=torch.int32))),
         _forward_context(_decode_md(slots=torch.zeros(2, dtype=torch.int64))),
+        _forward_context(_decode_md(batch_ids=None)),
+        _forward_context(_decode_md(batch_ids=torch.zeros(4, dtype=torch.int64))),
+        _forward_context(_decode_md(batch_ids=torch.zeros(2, dtype=torch.int32))),
     ],
     ids=[
         "prefill",
@@ -193,6 +201,9 @@ def test_check_mode_takes_the_same_steps(monkeypatch):
         "strided_table_rows",
         "slots_int32",
         "fewer_slots",
+        "no_batch_ids",
+        "batch_ids_int64",
+        "fewer_batch_ids",
     ],
 )
 def test_other_steps_take_the_original_path(monkeypatch, fwd):

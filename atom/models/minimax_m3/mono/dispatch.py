@@ -119,6 +119,10 @@ class MonoDecode:
         slots = sparse_md.slot_mapping
         if slots.dtype != torch.int64 or slots.numel() < n:
             return False
+        # which rows are a request's, -1 on the graph's pad rows (``row_live``)
+        ids = md.batch_id_per_q_token
+        if ids is None or ids.dtype != torch.int32 or ids.numel() < n:
+            return False
         # the runner and its n-token kernel, both collective: n is TP-uniform
         return self._mono.ready(n)
 
