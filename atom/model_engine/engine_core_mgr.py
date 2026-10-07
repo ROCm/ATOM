@@ -809,7 +809,7 @@ class CoreManager:
         # processes' HeartbeatMonitor threads still depend on it.
         import time
 
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + envs.ATOM_SHUTDOWN_TIMEOUT_S
         for proc in self.engine_core_processes:
             if proc is not None and proc.is_alive():
                 remaining = max(deadline - time.monotonic(), 0)

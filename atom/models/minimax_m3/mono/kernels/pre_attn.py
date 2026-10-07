@@ -20,6 +20,8 @@ layer. The numerical contracts (reduction orders, where values round to bf16)
 follow the aiter kernels the original path uses; see each stage.
 """
 
+from dataclasses import dataclass, field
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
@@ -28,7 +30,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.mono.config import (
-    BLOCKS,
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
@@ -37,17 +38,26 @@ from atom.models.minimax_m3.mono.config import (
     ONE_INDEX_HEAD,
     PAGE16,
     ROTARY_DIM,
-    THREADS,
     TP,
-    WAVES,
     IndexHeads,
     qkv_rows,
 )
 from atom.models.minimax_m3.mono.kernels.common import (
-    CM_DEV,
-    Mailbox,
     ar_block_sums,
     ar_pack_sumsq,
+    ld_bf16x4,
+    per_token_fp8_scale,
+)
+from atom.models.minimax_m3.mono.kernels.index_score import (
+    emit_index_scores,
+    index_scale_log2e,
+    step_rows,
+)
+from atom.models.minimax_m3.mono.sources import SOURCES
+from atom.mono.device.mx import FP8_MAX
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_NT,
     bf16_pair,
     bf16_round,
     butterfly,
@@ -55,28 +65,33 @@ from atom.models.minimax_m3.mono.kernels.common import (
     fp8_pack4,
     hw_rsq,
     kernel_symbol,
-    memrealtime,
+    lane_gather,
+    mfma_fp8,
+    rows_to_lds,
     rsrc,
     traced,
     uniform,
     wave_max,
 )
-from atom.models.minimax_m3.mono.kernels.index_score import (
-    emit_index_scores,
-    index_scale_log2e,
-    step_rows,
-)
+from atom.mono.device.stamps import stamp as stamp_point
+from atom.mono.device.stamps import stamp_begin, stamp_flush
+from atom.mono.device.sync import Addr, Mailbox, publish, sreg
+from atom.mono.plan.build_key import key_tuple, symbol_params
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
+from atom.mono.plan.trace import Space, enter_stage
+from atom.mono.runtime.abi import KernelAbi
 
-FP8_MAX = 448.0
 ROWS_PER_TASK = 16
 K_CHUNKS = HIDDEN // 64  # 64-k chunks: one dwordx4 of weight per lane
 CHUNKS_PER_WAVE = K_CHUNKS // WAVES
 Q_OFF, K_OFF, V_OFF = 0, LOCAL_Q_HEADS * HEAD_DIM, (LOCAL_Q_HEADS + 1) * HEAD_DIM
 N_HEAD_TASKS = LOCAL_Q_HEADS + 4  # q heads, k, v, the rank's index_q, index_k
-IK_TASK = LOCAL_Q_HEADS + 3
+IQ_TASK, IK_TASK = LOCAL_Q_HEADS + 2, LOCAL_Q_HEADS + 3
 HEAD_ROW_GROUPS = HEAD_DIM // ROWS_PER_TASK  # GEMV tasks a head
 ELEMS = 4  # per lane in a head task: 32 lanes x 4 = 128, the aiter kernel's split
 PAGE_BYTES = PAGE16 * HEAD_DIM  # one page-16 of one kv head (fp8)
+# the KV cache block (dispatch requires 128): a dense layer's K is addressed by it
+DENSE_PAGE = 128
 # GEMV tasks, head tasks (every token of a head on one CTA) and the tokens' norm
 # tasks each own a CTA, in this order; a head CTA's half waves hold the tokens.
 # The rank's own rows (q | k | v | its index q | index k) are the first ONE_GEMV
@@ -104,12 +119,6 @@ SCRATCH_RDONE = SCRATCH_HDONE + MAX_TOKENS * N_HEAD_TASKS * 8
 SCRATCH_BYTES = SCRATCH_RDONE + MAX_TOKENS * 8
 
 
-def _ld_bf16x4(r, k):
-    w = fx.Vector(bo.buffer_load(r, k // 2, vec_width=2, dtype=T.i32))
-    v = w.bitcast(fx.BFloat16).to(fx.Float32)
-    return [v[j] for j in range(4)]
-
-
 def ld_raw8(r, lt):
     """Logical thread lt's 8 bf16 of a row, as loaded (for ``bf16x8_f32``)."""
     return fx.Vector(bo.buffer_load(r, lt * 4, vec_width=4, dtype=T.i32))
@@ -128,9 +137,9 @@ def head_rope_inputs(tk, gamma, d0, cos_sin, positions):
     ib = (d0 < half).select(d0, d0 - half)
     r_cs = rsrc(cos_sin)
     return (
-        _ld_bf16x4(rsrc(gamma), d0),
-        _ld_bf16x4(r_cs, pos * ROTARY_DIM + fx.min(ib, half - ELEMS)),
-        _ld_bf16x4(r_cs, pos * ROTARY_DIM + half + fx.min(ib, half - ELEMS)),
+        ld_bf16x4(rsrc(gamma), d0),
+        ld_bf16x4(r_cs, pos * ROTARY_DIM + fx.min(ib, half - ELEMS)),
+        ld_bf16x4(r_cs, pos * ROTARY_DIM + half + fx.min(ib, half - ELEMS)),
     )
 
 
@@ -151,12 +160,8 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
     partner_lane = first.select(lane + half // ELEMS, lane - half // ELEMS)
     out = []
     for j in range_constexpr(ELEMS):
-        p = fx.Int32(
-            rocdl.ds_bpermute(
-                T.i32,
-                (fx.min(fx.max(partner_lane, 0), 63) * 4).ir_value(),
-                n[j].bitcast(fx.Int32).ir_value(),
-            )
+        p = lane_gather(
+            n[j].bitcast(fx.Int32), fx.min(fx.max(partner_lane, 0), 63)
         ).bitcast(fx.Float32)
         # hipcc contracts ``x*c - p*s`` into fma(x, c, -(p*s)); match it
         ps = p * sn[j]
@@ -169,12 +174,18 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
+    index_topk=True, dense=False, plain_norm=False,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
     XT0 .., in a step where ``long_step()``), the head tasks (CTAs HT0 .., a token
     per half wave) and, with S > 2, one norm task per token (CTAs NT0 ..) feeding
-    the GEMV tasks."""
+    the GEMV tasks. Without ``index_topk`` (a layer reusing a selection) no index
+    q / k rows are made: the original path's skip layer inserts K / V only.
+    ``dense`` (a dense layer, no index heads, ``index_topk`` off): K inserted as
+    the dense path's Triton rope-cache does -- quantized from f32, page-128.
+    ``plain_norm`` (layer 0: no all-reduce in front): the norm's output rounded
+    to bf16, then the linear's own per-token quant, as the original layer does."""
     rows = heads.rows
     (
         ar,
@@ -191,12 +202,9 @@ def emit_pre_attn(
         """The CTA's stores done, then flag idx of ``mb_addr`` (from thread 0, or
         from every thread where ``who``)."""
         if const_expr(signal is not None):
-            fx.memory_fence(
-                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
+            publish(
+                mb_put, mb_addr, idx, fx.Int32(1), (tid == 0) if who is None else who
             )
-            gpu.barrier()
-            if (tid == 0) if who is None else who:
-                mb_put(mb_addr, idx, fx.Int32(1))
 
     # acc = bf16(sum of partials) + residual, f32; the norm reads acc unrounded.
     # Elements are laid out as the fused all-reduce's logical threads (8 each): this
@@ -262,12 +270,13 @@ def emit_pre_attn(
         normed = []
         for j in range_constexpr(len(toks)):
             rstd = hw_rsq(tots[j] / float(HIDDEN) + eps)
-            normed.append(
-                [
-                    [accs[j][i][e] * rstd * (gs[i][e] + 1.0) for e in range(8)]
-                    for i in range(2)
-                ]
-            )
+            nj = [
+                [accs[j][i][e] * rstd * (gs[i][e] + 1.0) for e in range(8)]
+                for i in range(2)
+            ]
+            if const_expr(plain_norm):  # the norm's bf16 output is the linear's input
+                nj = [[bf16_round(x) for x in row] for row in nj]
+            normed.append(nj)
         for j in range_constexpr(len(toks)):
             amax = fx.Float32(0.0)
             for e in range_constexpr(8):
@@ -285,11 +294,18 @@ def emit_pre_attn(
             amax = fx.ptr_load(red + j * WAVES)
             for w in range_constexpr(1, WAVES):
                 amax = fx.max(amax, fx.ptr_load(red + (j * WAVES + w)))
-            x_scale = (amax == 0.0).select(fx.Float32(1.0), amax / FP8_MAX)
+            if const_expr(plain_norm):
+                # the linear's own quant (dynamic_per_token_scaled_quant)
+                x_scale, x_inv = per_token_fp8_scale(amax)
+            else:  # the fused all-reduce + norm + quant's
+                x_scale = (amax == 0.0).select(fx.Float32(1.0), amax / FP8_MAX)
+                x_rcp = 1.0 / x_scale
             x_scales.append(x_scale)
-            x_rcp = 1.0 / x_scale
             for i in range_constexpr(2):
-                q = [div_rn(normed[j][i][e], x_scale, x_rcp) for e in range(8)]
+                if const_expr(plain_norm):
+                    q = [normed[j][i][e] * x_inv for e in range(8)]
+                else:
+                    q = [div_rn(normed[j][i][e], x_scale, x_rcp) for e in range(8)]
                 w01 = [
                     fp8_pack4(q[0], q[1], q[2], q[3]),
                     fp8_pack4(q[4], q[5], q[6], q[7]),
@@ -303,6 +319,7 @@ def emit_pre_attn(
         return x_scales
 
     # ============================================ norm tasks (S > 2)
+    enter_stage("k1.norm")
     # (S <= 2 the GEMV tasks normalize every token themselves: S = 2 fused layer
     # 43.8 -> 43.6 us; S = 4 57.5 -> 59.4 us the other way round)
     if const_expr(tokens > 2):  # noqa: SIM102
@@ -326,14 +343,10 @@ def emit_pre_attn(
                         tk * (HIDDEN // 4) + lts[i] * 2,
                         cache_modifier=CM_DEV,
                     )
-            fx.memory_fence(
-                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Release
-            )
-            gpu.barrier()
-            if tid == 0:
-                mb_put(x8s_mb, tk, x_scale)
+            publish(mb_put, x8s_mb, tk, x_scale, tid == 0)
 
     # ============================================ GEMV tasks (one per CTA)
+    enter_stage("k1.gemv")
     # CTA bid < ONE_GEMV: row group bid of q | k | v, then the own index q head's
     # and index k's (the identity in the one-head build)
     own_q = (LOCAL_Q_HEADS + 2) * HEAD_ROW_GROUPS
@@ -344,8 +357,8 @@ def emit_pre_attn(
             heads.ik_off // ROWS_PER_TASK + bid - own_q - HEAD_ROW_GROUPS,
         ),
     )
-    gemv = bid < ONE_GEMV
-    if const_expr(heads.count > 1):
+    gemv = bid < (ONE_GEMV if index_topk else own_q)
+    if const_expr(heads.count > 1 and index_topk):
         xt = bid - XT0
         if (xt >= 0) & (xt < OTHER_GEMV):
             other = xt // HEAD_ROW_GROUPS  # the other heads in head order, own skipped
@@ -373,6 +386,7 @@ def emit_pre_attn(
                         ((rg * (HIDDEN // 32) + kc * 2) * 512 + lane * 16) // 4,
                         vec_width=4,
                         dtype=T.i32,
+                        cache_modifier=CM_NT,
                     )
                 )
             )
@@ -399,22 +413,7 @@ def emit_pre_attn(
             fx.memory_fence(
                 syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
             )
-            n_v = tokens * HIDDEN // 16  # 16 B loads
-            for i in range_constexpr((n_v + THREADS - 1) // THREADS):
-                v = tid + THREADS * i
-                if v < n_v:
-                    fx.ptr_store(
-                        fx.Vector(
-                            bo.buffer_load(
-                                rsrc(x8_mb),
-                                v * 4,
-                                vec_width=4,
-                                dtype=T.i32,
-                                cache_modifier=CM_DEV,
-                            )
-                        ),
-                        x8 + v * 4,
-                    )
+            rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
             gpu.barrier()
             stamp(2)
         # 12 chunks per wave: two 16x16x32 FP8 MFMAs each (k halves of 8 bytes).
@@ -432,11 +431,7 @@ def emit_pre_attn(
             ).bitcast(fx.Int64)
             wa = wts[cc].bitcast(fx.Int64)
             for h in range_constexpr(2):
-                c = fx.Vector(
-                    rocdl.mfma_f32_16x16x32_fp8_fp8(
-                        T.vec(4, T.f32), [wa[h], xb[h], c, 0, 0, 0]
-                    )
-                )
+                c = mfma_fp8(wa[h], xb[h], c)
         fx.ptr_store(c, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         # sample column t of C: lanes t, 16 + t, 32 + t, 48 + t hold rows 4 (l/16) + e
@@ -460,6 +455,7 @@ def emit_pre_attn(
         stamp(3)
 
     # ======================================= head tasks: norm / rope / cache
+    enter_stage("k1.head")
     # one CTA per head, token k on the half wave of threads 32 k .. 32 k + 31
     if (bid >= HT0) & (bid < HT0 + N_HEAD_TASKS):
         ht = bid - HT0
@@ -475,14 +471,20 @@ def emit_pre_attn(
                 K_OFF, is_v.select(V_OFF, is_iq.select(heads.iq_off, heads.ik_off))
             ),
         )
-        if tk < tokens:
+        # without index_topk the index heads' rows are not made: their tasks
+        # only publish their flags
+        live = (tk < tokens) if index_topk else (tk < tokens) & (ht < IQ_TASK)
+        if live:
             d0 = l32 * ELEMS
             # slot_mapping is int64: this token's low word
             slot = fx.Int32(
                 bo.buffer_load(rsrc(slot_mapping), 2 * tk, vec_width=1, dtype=T.i32)
             )
             # gamma and this position's cos / sin go out before the wait
-            gw = is_q.select(g_q, is_k.select(g_k, is_iq.select(g_iq, g_ik)))
+            if const_expr(index_topk):
+                gw = is_q.select(g_q, is_k.select(g_k, is_iq.select(g_iq, g_ik)))
+            else:  # no index heads (g_iq / g_ik may be 0): V's unused gamma is k's
+                gw = is_q.select(g_q, g_k)
             gw4, cs, sn = head_rope_inputs(tk, gw, d0, cos_sin, positions)
             got = mb_poll([(qkv_mb, base + d0, 2), (qkv_mb, base + d0 + 2, 2)])
             stamp(4)
@@ -546,17 +548,28 @@ def emit_pre_attn(
                                 b * PAGE16 + t,
                                 cache_modifier=cm_out,
                             )
-                        qk = [bf16_round(out[j]) / ksc for j in range(ELEMS)]
-                        bo.buffer_store(
-                            fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
-                            rsrc(k_cache),
-                            (
+                        if const_expr(dense):
+                            # the dense path's Triton rope-cache: K quantized
+                            # from f32, page-128 SHUFFLE [b128][d / 16][t][16]
+                            qk = [out[j] / ksc for j in range(ELEMS)]
+                            k_off = (
+                                slot // DENSE_PAGE * (DENSE_PAGE * HEAD_DIM)
+                                + (d0 // 16) * (DENSE_PAGE * 16)
+                                + slot % DENSE_PAGE * 16
+                                + d0 % 16
+                            )
+                        else:
+                            qk = [bf16_round(out[j]) / ksc for j in range(ELEMS)]
+                            k_off = (
                                 b * PAGE_BYTES
                                 + (d0 // 16) * (PAGE16 * 16)
                                 + t * 16
                                 + d0 % 16
                             )
-                            // 4,
+                        bo.buffer_store(
+                            fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
+                            rsrc(k_cache),
+                            k_off // 4,
                             cache_modifier=cm_out,
                         )
                 if (ht == IK_TASK) & (slot >= 0):
@@ -583,24 +596,29 @@ K1_ARGS = (
 
 @traced
 def emit_k1(
-    tid, bid, lane, wave, x8, red, qs, stamp, step, layer, eps, index_scale, tokens,
-    q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False,
+    tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
+    q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
+    region_ids=None, index_topk=True, dense=False, plain_norm=False,
 ):  # fmt: skip
-    """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores.
+    """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
+    (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
     ``x8``: tokens * HIDDEN / 4 words of LDS, ``red``: WAVES * 256 floats, ``qs``:
     tokens * heads.count * HEAD_DIM / 2 floats. ``q_len``: tokens per request (speculative
     verify rows). ``heads``: the index q heads of the fused projection
     (``IndexHeads``). ``signal`` (the fused layer kernel): the head tasks and
-    residual writers publish done flags (SCRATCH_HDONE / SCRATCH_RDONE)."""
+    residual writers publish done flags (SCRATCH_HDONE / SCRATCH_RDONE). ``diag``,
+    ``region_ids``: a debug build's bounded waits (``Mailbox``)."""
     (
         ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
-    mbox = Mailbox(scratch, step, layer)
-    qkv_mb = mbox.addr(SCRATCH_QKV)
-    x8_mb = mbox.addr(SCRATCH_X8)
-    x8s_mb = mbox.addr(SCRATCH_X8S)
+    mbox = Mailbox(layer, diag, region_ids)
+    qkv_mb = sreg(scratch, SCRATCH_QKV, "k1.qkv")
+    x8_mb = scratch + fx.Int64(SCRATCH_X8)  # plain words, behind x8s's tags
+    x8s_mb = sreg(scratch, SCRATCH_X8S, "k1.x8s")
+    hdone_mb = sreg(scratch, SCRATCH_HDONE, "k1.hdone")
+    rdone_mb = sreg(scratch, SCRATCH_RDONE, "k1.rdone")
     # Plain names, not method calls: flydsl's AST rewriter carries every local whose
     # method is called inside a dynamic if/for as loop state.
     mb_put = mbox.put
@@ -667,14 +685,13 @@ def emit_k1(
             ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
             slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         ),
-        (mbox.addr(SCRATCH_HDONE), mbox.addr(SCRATCH_RDONE)) if signal else None,
+        (hdone_mb, rdone_mb) if signal else None,
         long_step,
+        index_topk,
+        dense,
+        plain_norm,
     )  # fmt: skip
     stamp(5)
-    # the scorers: the idle CTAs first (the norm tasks' come first but finish
-    # early), then the GEMV CTAs, the head CTAs last
-    score_base = ONE_GEMV + N_HEAD_TASKS
-    hdone_mb = mbox.addr(SCRATCH_HDONE)
 
     def wait_new_keys():
         """Every token's index_k head task done, its key visible to this wave."""
@@ -683,16 +700,48 @@ def emit_k1(
             syncscope=rocdl.SyncScope.Agent, ordering=fx.AtomicOrdering.Acquire
         )
 
-    emit_index_scores(
-        (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put, iscore,
-        q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
-        block_table, seq_lens, bt_width, wait_new_keys if signal else None,
-        make_index_q, heads, q_frag_head, make_index_q_heads,
-    )  # fmt: skip
+    if const_expr(index_topk):
+        # the scorers: the idle CTAs first (the norm tasks' come first but finish
+        # early), then the GEMV CTAs, the head CTAs last
+        score_base = ONE_GEMV + N_HEAD_TASKS
+        enter_stage("k1.score")
+        emit_index_scores(
+            (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put,
+            Addr("iscore", Space.SCRATCH, iscore),
+            q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
+            block_table, seq_lens, bt_width, wait_new_keys if signal else None,
+            make_index_q, heads, q_frag_head, make_index_q_heads,
+        )  # fmt: skip
     stamp(6)
 
 
 TL_POINTS = 8  # timeline stamps per CTA
+
+# the standalone K1's arguments, in order (checked at build time, packed by name)
+K1_ABI = KernelAbi(
+    (
+        "ar", "res", "h_out", "g_in", "w_qkv", "s_qkv", "g_q", "g_k", "g_iq", "g_ik",
+        "cos_sin", "positions", "slot_mapping", "k_cache", "v_cache", "k_scale",
+        "v_scale", "index_cache", "q_out", "iq_out", "block_table", "seq_lens",
+        "bt_width", "q_len", "iscore", "scratch", "layer", "tl",
+    )
+)  # fmt: skip
+
+
+@dataclass(frozen=True)
+class K1Build:
+    """Every parameter of a standalone K1 build (``atom.mono.plan.build_key``)."""
+
+    tokens: int = field(metadata={"sym": "s"})
+    init_blocks: int = field(metadata={"sym": "ib"})
+    local_blocks: int = field(metadata={"sym": "lb"})
+    index_heads: int = field(metadata={"sym": "ih"})
+    index_own: int = field(metadata={"sym": "io"})
+    timeline: bool = field(metadata={"sym": "tl"})
+    dense: bool = field(metadata={"sym": "dn"})
+    plain_norm: bool = field(metadata={"sym": "pn"})
+    eps: float
+    sm_scale: float
 
 
 def build_pre_attn_kernel(
@@ -703,11 +752,22 @@ def build_pre_attn_kernel(
     tokens: int = 1,
     timeline: bool = False,
     heads: IndexHeads = ONE_INDEX_HEAD,
+    dense: bool = False,
+    plain_norm: bool = False,
 ):
     """``@flyc.jit`` launcher of K1 for this model's RMSNorm epsilon, attention
     scale and sparse pinned blocks, a decode batch of ``tokens`` (<= MAX_TOKENS)
-    rows and the fused projection's index q ``heads``."""
+    rows and the fused projection's index q ``heads``. ``dense``: a dense layer's
+    (``dense_pre``): q | k | v rows only, no indexer, K inserted as the dense
+    path's rope-cache does; ``plain_norm``: layer 0's input norm
+    (``emit_pre_attn``)."""
     assert 1 <= tokens <= MAX_TOKENS
+    key = K1Build(
+        tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
+        index_heads=heads.count, index_own=heads.own, timeline=timeline,
+        dense=dense, plain_norm=plain_norm, eps=eps, sm_scale=sm_scale,
+    )  # fmt: skip
+    build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     index_scale = index_scale_log2e(sm_scale)
 
     @fx.struct
@@ -719,19 +779,10 @@ def build_pre_attn_kernel(
         # every token's index q for the scorers, bf16 pairs
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens * heads.count, 16]
 
-    kernel_name = kernel_symbol(
-        "minimax_m3_pre_attn",
-        s=tokens,
-        ib=init_blocks,
-        lb=local_blocks,
-        ih=heads.count,
-        io=heads.own,
-        tl=timeline,
-    )
+    kernel_name = kernel_symbol("minimax_m3_pre_attn", **symbol_params(key))
 
-    # the JIT cache key holds the kernel's scalar closure values, not objects: the
-    # index heads go in as ints (a shared cache otherwise serves one rank's build
-    # to every rank)
+    # the kernel body rebuilds IndexHeads from ints: an object in a closure is not
+    # a cache-key value (``build_key`` keys them anyway)
     ih_count, ih_own = heads.count, heads.own
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
@@ -762,7 +813,6 @@ def build_pre_attn_kernel(
         q_len: Int32,
         iscore: Int64,
         scratch: Int64,
-        step: Int64,
         layer: Int32,
         tl: Int64,
     ):
@@ -777,19 +827,12 @@ def build_pre_attn_kernel(
         qs = lds.qs.ptr
 
         def stamp(k):
-            """``timeline``: s_memrealtime (100 MHz) of this CTA passing point k, kept
-            in LDS until the kernel ends."""
-            # compile-time gate outside, traced condition inside: they cannot be one `and`
-            if const_expr(timeline):  # noqa: SIM102
-                if tid == 0:
-                    fx.ptr_store(memrealtime(), tls + k)
+            """``timeline``: this CTA passing point k (``atom.mono.device.stamps``)."""
+            stamp_point(timeline, tls, tid, k)
 
-        if const_expr(timeline):  # noqa: SIM102
-            if tid < TL_POINTS:  # same wave as the stamping thread: ordered
-                fx.ptr_store(fx.Int64(0), tls + tid)
-        stamp(0)
+        stamp_begin(timeline, tls, tid, TL_POINTS)
         emit_k1(
-            tid, bid, lane, wave, x8, red, qs, stamp, step, layer, eps, index_scale,
+            tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale,
             tokens, q_len, init_blocks, local_blocks, IndexHeads(ih_count, ih_own),
             (
                 ar, res, h_out, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, positions,
@@ -797,16 +840,11 @@ def build_pre_attn_kernel(
                 iq_out, block_table, seq_lens, iscore, scratch,
             ),
             bt_width,
+            index_topk=not dense,
+            dense=dense,
+            plain_norm=plain_norm,
         )  # fmt: skip
-        if const_expr(timeline):  # noqa: SIM102
-            if tid < TL_POINTS:
-                fx.generic_store(
-                    fx.inttoptr(
-                        fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8),
-                        tl + fx.Int64((bid * TL_POINTS + tid) * 8),
-                    ),
-                    fx.ptr_load(tls + tid),
-                )
+        stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
     @flyc.jit
     def launch_pre_attn(
@@ -836,11 +874,11 @@ def build_pre_attn_kernel(
         q_len: Int32,
         iscore: Int64,
         scratch: Int64,
-        step: Int64,
         layer: Int32,
         tl: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
     ):
+        _ = build_key  # every build parameter in the JIT cache key
         pre_attn_kernel(
             ar,
             res,
@@ -868,9 +906,9 @@ def build_pre_attn_kernel(
             q_len,
             iscore,
             scratch,
-            step,
             layer,
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
+    K1_ABI.check(pre_attn_kernel, launch_pre_attn)
     return launch_pre_attn

@@ -154,7 +154,6 @@ class CompilationConfig:
     use_cudagraph: bool = True
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
-    # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
     cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
@@ -970,6 +969,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None and text_config is not hf_config:
+        # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
+        # replaces the text config's own, then is checked like any other.
+        for attr_name in ("mlp_layer_types", "moe_layer_freq"):
+            attr_value = getattr(hf_config, attr_name, None)
+            if attr_value is not None:
+                setattr(text_config, attr_name, attr_value)
     _normalize_minimax_m3_mlp_layer_types(
         text_config if text_config is not None else hf_config
     )
@@ -2105,7 +2111,7 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
-            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+            return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
     def __post_init__(self):

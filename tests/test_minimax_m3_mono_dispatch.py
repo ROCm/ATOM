@@ -10,6 +10,8 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.minimax_m3.mono import dispatch, runner
+from atom.mono.runtime import deployment
+from atom.mono.runtime.route import LazyRunner
 
 
 class _Mode:
@@ -25,6 +27,9 @@ def _atom_config(**overrides):
         "tensor_parallel_size": 4,
         "parallel_config": SimpleNamespace(data_parallel_size=1),
         "pipeline_parallel_size": 1,
+        "enable_expert_parallel": False,
+        "decode_context_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
         "kv_cache_dtype": "fp8",
         "index_cache_dtype": "fp8",
         "kv_cache_block_size": 128,
@@ -40,20 +45,24 @@ def _atom_config(**overrides):
 
 @pytest.fixture
 def native(monkeypatch):
-    monkeypatch.setattr(dispatch, "is_vllm", lambda: False)
-    monkeypatch.setattr(dispatch, "is_sglang", lambda: False)
+    monkeypatch.setattr(deployment, "is_vllm", lambda: False)
+    monkeypatch.setattr(deployment, "is_sglang", lambda: False)
 
 
 def test_supported_deployment_has_no_refusal(native):
-    assert dispatch._config_refusal(_atom_config(), SimpleNamespace()) is None
+    assert dispatch._config_refusal(_atom_config()) is None
 
 
 @pytest.mark.parametrize(
     "overrides, reason",
     [
-        ({"tensor_parallel_size": 8}, "TP 8"),
+        ({"tensor_parallel_size": 8}, "kv heads 4 is not divisible by TP 8"),
+        ({"tensor_parallel_size": 2}, "2 kv heads a rank at TP 2"),
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
+        ({"enable_expert_parallel": True}, "expert parallel"),
+        ({"decode_context_parallel_size": 2}, "decode CP"),
+        ({"prefill_context_parallel_size": 2}, "prefill CP"),
         ({"kv_cache_dtype": "bf16"}, "kv cache"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
         ({"kv_cache_block_size": 16}, "block size"),
@@ -66,31 +75,22 @@ def test_supported_deployment_has_no_refusal(native):
     ],
 )
 def test_each_unsupported_setting_is_refused(native, overrides, reason):
-    assert reason in dispatch._config_refusal(
-        _atom_config(**overrides), SimpleNamespace()
-    )
+    assert reason in dispatch._config_refusal(_atom_config(**overrides))
 
 
 def test_the_model_s_full_context_is_served(native):
     cfg = _atom_config(max_model_len=1 << 20)
-    assert dispatch._config_refusal(cfg, SimpleNamespace()) is None
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_index_cache_dtype_falls_back_to_kv_cache_dtype(native):
     cfg = _atom_config(index_cache_dtype=None)
-    assert dispatch._config_refusal(cfg, SimpleNamespace()) is None
-
-
-def test_use_index_cache_is_refused(native):
-    why = dispatch._config_refusal(
-        _atom_config(), SimpleNamespace(use_index_cache=True)
-    )
-    assert why == "use_index_cache"
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_plugin_mode_is_refused(native, monkeypatch):
-    monkeypatch.setattr(dispatch, "is_sglang", lambda: True)
-    assert dispatch._config_refusal(_atom_config(), SimpleNamespace()) == "plugin mode"
+    monkeypatch.setattr(deployment, "is_sglang", lambda: True)
+    assert dispatch._config_refusal(_atom_config()) == "plugin mode"
 
 
 # ---------------------------------------------------------------- per-step predicate
@@ -123,12 +123,13 @@ def _forward_context(md=None, is_prefill=False, ubatch_slices=None):
     )
 
 
-def _mono(monkeypatch, fwd):
-    """An enabled MonoDecode whose runner already exists (no GPU work)."""
+def _mono(monkeypatch, fwd, builds=True):
+    """An enabled MonoDecode whose runner already exists (no GPU work); its kernels
+    build on every rank when ``builds``."""
     mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
-    mono._runner = object()
-    mono._enabled = True
+    mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
+    mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
     return mono
 
@@ -142,6 +143,14 @@ def _step(n, pos_dtype=torch.int64):
 def test_decode_steps_of_up_to_max_tokens_are_taken(monkeypatch, n):
     md = _forward_context(_decode_md(rows=16))
     assert _mono(monkeypatch, md).supports(*_step(n), None, None)
+
+
+def test_a_kernel_no_rank_could_build_turns_mono_off(monkeypatch):
+    """``prepare`` is the TP-wide verdict: false on every rank, so every rank falls
+    back, now and for the steps after."""
+    mono = _mono(monkeypatch, _forward_context(_decode_md(rows=16)), builds=False)
+    assert not mono.supports(*_step(4), None, None)
+    assert not mono._mono.enabled
 
 
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
@@ -199,7 +208,7 @@ def test_batches_and_foreign_inputs_take_the_original_path(monkeypatch):
 
 def test_speculative_decoding_is_not_refused(native):
     cfg = _atom_config(speculative_config=object())
-    assert dispatch._config_refusal(cfg, SimpleNamespace()) is None
+    assert dispatch._config_refusal(cfg) is None
 
 
 @pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1)])
@@ -243,5 +252,5 @@ def test_token_rows_pass_plain_decode_tables_through():
 
 def test_disabled_mono_never_takes_a_step(monkeypatch):
     mono = _mono(monkeypatch, _forward_context())
-    mono._enabled = False
+    mono._mono.enabled = False
     assert not mono.supports(*_step(1), None, None)

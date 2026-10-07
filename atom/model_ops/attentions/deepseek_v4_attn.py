@@ -48,6 +48,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 from aiter import dtypes
+from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.chip_info import get_gfx
 
 from atom.distributed.pcp_utils import (
@@ -119,7 +120,10 @@ from atom.model_ops.v4_kernels import (
     FP4_MQA_PARALLEL_UNIT_NUM,
     build_v4_paged_decode_indptr,
     fp4_indexer_enabled,
+    hca_persist,
     plan_context_lens,
+    v4_decode_split_plan,
+    v4_uniform_split_table,
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
@@ -297,6 +301,13 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[padded_T+1] int32 GPU — packed cumsum of per-token HCA kv_len
     (= `min(positions[t]+1, win) + (positions[t]+1)//128`). Padded tail = last
     value."""
+    split_plan_swa: tuple[int, torch.Tensor] | None = None
+    """Split plan `(num_kv_splits, split_indptr)` (see `v4_decode_split_plan`)
+    for the fp8 decode ASM kernel on SWA layers. None: aiter picks."""
+    split_plan_csa: tuple[int, torch.Tensor] | None = None
+    """Same for CSA layers."""
+    split_plan_hca: tuple[int, torch.Tensor] | None = None
+    """Same for HCA layers (unused by calls the persistent kernel takes)."""
     envelope_rows: int = 0
     """Rows one V4 block takes across every layer of the pool — the stride from
     one block's compressed rows to the next in a layer's view of a plane. What
@@ -711,6 +722,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Worst-case HCA per-token committed compress count
         # (= max_model_len // 128 for V4-Pro = 8192 at 1M context).
         self.max_committed_hca = model_runner.config.max_model_len // 128
+        # Heads per rank the fp8 decode ASM kernel runs; sizes its split plans.
+        self._local_heads = (
+            model_runner.config.hf_config.num_attention_heads
+            // get_tensor_model_parallel_world_size()
+        )
+        self._prepare_hca_persist()
 
         # Sparse-attn + per-fwd metadata buffers (CG-A: pre-allocate for fixed
         # GPU pointers, prerequisite for CUDAGraph capture). All H2D copies in
@@ -2196,60 +2213,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         meta["fp4_prefill_max_seq_len"] = max_seq_len
         meta["fp4_opus_prefill_chunks"] = plans
 
-    def _refresh_fp4_windows(
-        self,
-        attn_metadata: AttentionMetaData_DSV4,
-        positions_gpu,
-        meta: dict[str, Any],
-        buf_prefix_ubatch: str = "",
-    ) -> None:
-        """Build the FP4 decode CTA schedule into a fixed-address buffer.
-
-        The scorer's mqa kernel reads `cta_info` during a CUDAGraph replay, so it
-        has to be one buffer at one address per ubatch, refreshed here in
-        `build()` -- outside the graph -- before the replay that reads it.
-
-        The three per-row windows are NOT built here: they already exist. Row `r`
-        is token `r` on this layout, so the row-to-sequence map IS
-        `batch_id_per_q_token`; the starts are all zero; and the ends are the
-        per-token CSA visibility. aiter's `compute_varqlen_windows` would rebuild
-        the first from a binary search over `cu_seqlens_q`, store zeros into the
-        second, and derive a per-SEQUENCE end for the third that this file then
-        overwrote -- three answers to questions already answered.
-
-        CONSTRAINT: passing `batch_id_per_q_token` straight through is safe only
-        because a pad row (`batch_id < 0`) always has `csa_n_committed_per_token
-        == 0`; both come from the one `live` mask in `build_v4_paged_decode_indptr`.
-        A zero end contributes no CTA, so a negative id never reaches the
-        schedule's `batch_id` except on slots past `total_splits`, where it is
-        multiplied by zero. Give visibility a different source than liveness and
-        this becomes an out-of-bounds `block_tables` read.
-        """
-        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
-            compute_prefill_schedule,
-        )
-
-        _padded = int(positions_gpu.shape[0])
-        _bid = attn_metadata.batch_id_per_q_token[:_padded]
-        _ls = self._v4_fp4_local_starts[:_padded]
-        _le = attn_metadata.csa_n_committed_per_token[:_padded]
-        cta_info = self.model_runner.forward_vars[f"{buf_prefix_ubatch}v4_fp4_cta_info"]
-        # Fixed logits width (max_model_len_idx) → the scorer's [padded, W] buffer
-        # is a static shape (CG-capturable).
-        compute_prefill_schedule(
-            _bid,
-            _ls,
-            _le,
-            self._fp4_block_k,
-            self._fp4_parallel_unit_num,
-            self.max_model_len_idx,
-            cta_info_out=cta_info,
-        )
-        meta["fp4_local_starts"] = _ls
-        meta["fp4_local_ends"] = _le
-        meta["fp4_cta_info"] = cta_info
-        meta["fp4_n_ctas"] = self._fp4_parallel_unit_num
-
     def _build_v4_indexer_meta(
         self,
         *,
@@ -2276,8 +2239,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Reuses `attn_metadata.batch_id_per_q_token` ([padded_T] int32), also set
         by `_attach_v4_per_fwd_meta`.
 
-        DECODE fast path: returns an empty dict, plus the FP4 schedule below
-        when that indexer is on. Everything else here is prefill-only —
+        DECODE fast path: returns an empty dict, plus the OPUS FP4 decode plan
+        below on gfx1250. Everything else here is prefill-only —
         `deepgemm_fp8_paged_mqa_logits` and `top_k_per_row_decode` read paged KV
         through `attn_metadata.csa_n_committed_per_token`, never the
         packed-cumsum / per-token `cu_starts/cu_ends` layout this builds.
@@ -2293,27 +2256,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bs = scheduled_bs
 
         # DECODE short-circuit: the decode scorers take no field from this dict
-        # except the FP4 schedule added below. The prefill-only derivations
+        # except the OPUS FP4 plan added below. The prefill-only derivations
         # further down (CPU cumsum + H2D for `cu_committed_gpu`; GPU launches
         # for `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill`
         # only (cp_gather + fp8_mqa_logits + per-row prefill top-k), so they are
         # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
         if attn_metadata.state is AttnState.DECODE:
             meta = {}
-            # Per-row windows, once per fwd rather than per CSA layer. Equal
-            # spans are not a separate case: every window is its own row's bound.
-            if self._indexer_fp4:
-                if self.indexer_layout == FP4_GFX1250_NATURAL:
-                    self._refresh_fp4_opus_decode_plan(
-                        attn_metadata,
-                        positions_gpu,
-                        meta,
-                        buf_prefix_ubatch=buf_prefix_ubatch,
-                    )
-                else:
-                    self._refresh_fp4_windows(
-                        attn_metadata, positions_gpu, meta, buf_prefix_ubatch
-                    )
+            # The OPUS decode plan, once per fwd rather than per CSA layer. The
+            # gfx950 FP4 scorer needs none: it reads the per-row bounds and
+            # shares its work out itself.
+            if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
+                self._refresh_fp4_opus_decode_plan(
+                    attn_metadata,
+                    positions_gpu,
+                    meta,
+                    buf_prefix_ubatch=buf_prefix_ubatch,
+                )
             return meta
 
         n_committed_per_seq = attn_metadata.n_committed_csa_per_seq_cpu[:bs]
@@ -2589,6 +2548,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.max_seqlen_q = 1
         attn_metadata.kv_indices_swa = swa_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr
+        attn_metadata.split_plan_swa = self._decode_split_plan(
+            running_bs, self.window_size
+        )
         attn_metadata.batch_id_per_q_token = batch_id_per_q_token
 
         # fp8 asm decode per-token index tensors. MTP draft step is 1-token-per-
@@ -3659,6 +3621,31 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
+    def _prepare_hca_persist(self) -> None:
+        """Allocate the persistent HCA decode workspace here, at init: before
+        warmup, before KV sizing (so it is accounted for) and before any
+        CUDA-graph capture, which may be the first forward to reach it."""
+        if envs.ATOM_V4_HCA_PERSIST and self.hca_layers:
+            hca_persist.prepare_if_usable(
+                kv_fp8=self._kv_fp8,
+                heads=self._local_heads,
+                gfx=get_gfx(),
+                device=self.device,
+            )
+
+    def _decode_split_plan(
+        self, rows: int, kv_len: int
+    ) -> tuple[int, torch.Tensor] | None:
+        """Split plan for the fp8 decode ASM kernel (see `v4_decode_split_plan`).
+
+        Host only: `rows` and `kv_len` are fixed for a captured graph, so capture
+        and every replay pick the same split count, and the plan's
+        `split_indptr` is a slice of the constant `_split_table`.
+        """
+        if not self._kv_fp8:
+            return None
+        return v4_decode_split_plan(rows, self._local_heads, kv_len, self._split_table)
+
     def _attach_v4_paged_decode_meta(
         self,
         attn_metadata,
@@ -3780,6 +3767,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             T_pad=T_pad,
             win=win,
             index_topk=index_topk,
+        )
+        # aiter decode split plans: sized by the rows this forward runs and the
+        # longest kv_len a token of each layer type can see.
+        attn_metadata.split_plan_swa = self._decode_split_plan(T_pad, win)
+        attn_metadata.split_plan_csa = self._decode_split_plan(T_pad, win + index_topk)
+        attn_metadata.split_plan_hca = self._decode_split_plan(
+            T_pad, win + self.max_committed_hca
         )
 
         # Expand block tables per query row so the unchanged aiter paged-MQA
@@ -4604,6 +4598,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         bufs["v4_kv_indptr_swa"] = torch.zeros(T_dec + 1, **i32)
         bufs["v4_kv_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
         bufs["v4_kv_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
+        # Every decode split plan (verify, MTP draft, TBO ubatches) is a slice
+        # of this constant table; read-only, so all of them share it.
+        self._split_table = v4_uniform_split_table(T_dec, self.device)
         bufs["v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
         # Device-only, and as wide as the `block_tables` it gathers from: a host
         # mirror would be `T_dec * cols * 4` of pinned memory nothing writes.
@@ -4681,24 +4678,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     }
                 }
             else:
-                # P = persistent-grid CTA-count CAP, bounding two axes (see the
-                # prefill build for the full note):
-                #   - rows: a decode fwd has one row per decode token
-                #     (= bs*next_n), so P must be >= max_decode_tokens (T_dec)
-                #     or surplus rows are silently dropped.
-                #   - chunks: the `FP4_MQA_PARALLEL_UNIT_NUM` floor (4096)
-                #     keeps enough CTAs to split a long context across the GPU.
-                # The fixed CG cta_info buffer below is sized to this same P.
+                # The prefill scorer's persistent-grid CTA-count floor (see the
+                # prefill build for the full note). T_dec is from when the
+                # decode scorer shared this grid; dropping it changes prefill's
+                # grid past 4096 decode rows, which has not been measured.
                 self._fp4_parallel_unit_num = max(FP4_MQA_PARALLEL_UNIT_NUM, T_dec)
                 self._fp4_block_k = FP4_MQA_BLOCK_K
-                # Write-once zeros: every row's window starts at 0 on this
-                # layout. Sized to T_dec, the max padded row count.
-                self._v4_fp4_local_starts = torch.zeros(T_dec, **i32)
-                # Each TBO ubatch gets its own cta_info because both schedules
-                # are live at once.
-                bufs["v4_fp4_cta_info"] = torch.zeros(
-                    (self._fp4_parallel_unit_num, 6), **i32
-                )
         # NOTE: decode-path `logits` ([T, max_model_len_idx] fp32) and
         # `topk_indices` ([T, index_topk] int32) are NOT pre-allocated —
         # they are write-once GPU scratch with no CPU mirror, allocated
@@ -4814,28 +4799,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 mnbt, publication_group=f"{p}v4_indexer", **i32
             )
             bufs.update(self._indexer_staging_buffers(bs, mnbt, prefix=p))
-            if self._indexer_fp4:
-                if self.indexer_layout == FP4_GFX1250_NATURAL:
-                    from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-                        pa_mqa_logits_mxfp4_plan_buffers,
-                    )
+            if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
+                from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
+                    pa_mqa_logits_mxfp4_plan_buffers,
+                )
 
-                    self._v4_fp4_opus_plan_buffers[p] = {
-                        variant: pa_mqa_logits_mxfp4_plan_buffers(
-                            self.device,
-                            T_dec,
-                            bs,
-                            variant=variant,
-                        )
-                        for variant in (
-                            _FP4_OPUS_DECODE_Q1_VARIANT,
-                            _FP4_OPUS_DECODE_Q4_VARIANT,
-                        )
-                    }
-                else:
-                    bufs[f"{p}v4_fp4_cta_info"] = torch.zeros(
-                        (self._fp4_parallel_unit_num, 6), **i32
+                self._v4_fp4_opus_plan_buffers[p] = {
+                    variant: pa_mqa_logits_mxfp4_plan_buffers(
+                        self.device,
+                        T_dec,
+                        bs,
+                        variant=variant,
                     )
+                    for variant in (
+                        _FP4_OPUS_DECODE_Q1_VARIANT,
+                        _FP4_OPUS_DECODE_Q4_VARIANT,
+                    )
+                }
 
             for ratio, is_overlap in self._unique_compress_ratios_overlap:
                 K_pool = (2 if is_overlap else 1) * ratio

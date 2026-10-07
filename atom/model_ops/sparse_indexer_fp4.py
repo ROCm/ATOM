@@ -18,33 +18,27 @@ import torch
 
 logger = logging.getLogger("atom")
 
-# Persistent-grid schedule params for the `pa_mqa_logits_fp4*` kernels, which
-# decode and prefill both score through. A metadata builder precomputes each
-# path's cta_info with these and the scorer passes the matching block_k, so
-# layout and grid agree. DeepSeek-V4 drives the same two kernels and carries its
-# own copy of this pair in `v4_kernels`; the two must be changed together until
-# something merges them, which is not this module's to do.
+# Persistent-grid schedule params for `pa_mqa_logits_fp4_prefill`. A metadata
+# builder precomputes its cta_info with these and the scorer passes the
+# matching block_k, so layout and grid agree. DeepSeek-V4 drives the same kernel
+# and carries its own copy of this pair in `v4_kernels`; the two must be
+# changed together until something merges them, which is not this module's to
+# do. (Decode scores ragged rows through `Fp4MqaRaggedMetadata`, whose kernel
+# shares its work out by length itself.)
 #
-# Both floors are CTA-count targets, not kernel defaults: every consumer takes
-# `max(floor, rows)`, so a floor only adds split-K to grids too small to fill
-# the GPU and is an identity for the wide ones. Splits are numerically inert --
+# The floor is a CTA-count target, not a kernel default: the consumer takes
+# `max(floor, rows)`, so it only adds split-K to grids too small to fill the
+# GPU and is an identity for the wide ones. Splits are numerically inert --
 # each CTA gets a disjoint KV-column range, no cross-CTA partial sums.
 #
-# Neither can be fitted to the work. A CUDAGraph bakes the grid at capture,
+# It cannot be fitted to the work. A CUDAGraph bakes the grid at capture,
 # while the work is `rows * ceil(ctx / block_k)` and the context term is only
 # known per replay; of what capture does know, the batch size measures flat, so
-# there is nothing to derive one from. Both are therefore the smallest
+# there is nothing to derive one from. It is therefore the smallest
 # worst-case regret over the served context range rather than any shape's
 # optimum -- re-tune against a real workload mix. At prefill rows=1024 and
 # W~32768, 4096 measured 206.2us a call against 512's 224.6us.
 FP4_MQA_PARALLEL_UNIT_NUM = 4096
-# The varctx scorer takes a lower floor than the prefill one. Its rows are
-# sequences rather than query tokens, so `max(floor, rows)` never lifts off the
-# floor and every CTA past the work is pure setup: 8.75us a layer at 4096
-# against 2.99 at 512, flat in context. Going lower still gives back more at
-# 131k+ than it wins at 4k. This is not "the decode floor" -- DeepSeek-V4's
-# decode scores through the prefill kernel and keeps 4096.
-FP4_MQA_VARCTX_PARALLEL_UNIT_NUM = 512
 FP4_MQA_BLOCK_K = 256
 
 # The fused writer's FP4 group width, against 128 on the FP8 path.
@@ -141,20 +135,6 @@ def assert_fp4_indexer_supported(
         )
 
 
-def fp4_decode_parallel_units(max_bs: int, next_n: int) -> int:
-    """CTAs the varctx schedule is built for -- the grid a CUDAGraph captures.
-
-    `compute_varctx_schedule` needs a multiple of `next_n` leaving at least one
-    slot per sequence, so the floor rounds up to both. Not monotonic in `next_n`
-    -- at 512 units `f(3)` is 513 against `f(4)`'s 512. What lets one buffer
-    serve every width is the weaker `f(next_n) >= f(1)`, which holds because
-    both arms of the max scale with `next_n`: the buffer is sized at
-    `max_seqlen_qo` and the draft, the only caller asking for a different width,
-    asks for 1.
-    """
-    return next_n * max(-(-FP4_MQA_VARCTX_PARALLEL_UNIT_NUM // next_n), max_bs)
-
-
 def fp4_q_scale_shape(tokens: int, heads: int, head_dim: int) -> tuple:
     """`q_scale_out`'s shape: `[T, k_tiles, 4, 16, round_up(H // 16, 4)]`.
 
@@ -234,31 +214,3 @@ def fp4_prefill_schedule(
         max_seq_len,
     )
     return cta_info, n_ctas, local_starts
-
-
-def fp4_decode_schedule(
-    context_lens: torch.Tensor,
-    block_k: int,
-    parallel_units: int,
-    max_seq_len: int,
-    next_n: int,
-    cta_info_out: torch.Tensor,
-) -> None:
-    """Refresh a decode step's schedule in place, at a CUDAGraph-stable address.
-
-    `cta_info_out` has to be the buffer the captured kernel was handed and
-    `parallel_units` its row count: the grid is baked at capture, so only the
-    contents may change between replays.
-    """
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
-        compute_varctx_schedule,
-    )
-
-    compute_varctx_schedule(
-        context_lens,
-        block_k,
-        parallel_units,
-        max_seq_len,
-        next_n=next_n,
-        cta_info_out=cta_info_out,
-    )

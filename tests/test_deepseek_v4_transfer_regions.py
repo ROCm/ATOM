@@ -126,6 +126,12 @@ def _stub_v4_runtime_imports():
     aiter_jit_utils.__path__ = []
     chip_info = types.ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = lambda: "gfx950"
+    # Replaced, not reused: other test modules leave their own, narrower
+    # parallel_state stub in sys.modules.
+    aiter_dist = types.ModuleType("aiter.dist")
+    aiter_dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 1
 
     pcp_utils = types.ModuleType("atom.distributed.pcp_utils")
     for name in (
@@ -155,16 +161,25 @@ def _stub_v4_runtime_imports():
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
         "plan_context_lens",
+        "v4_decode_split_plan",
+        "v4_uniform_split_table",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):
         setattr(kernels, name, lambda *args, **kwargs: None)
+    # No aiter here, so the persistent HCA decode is never usable.
+    kernels.hca_persist = SimpleNamespace(
+        unusable_reason=lambda **kwargs: "no aiter in this test",
+        prepare=lambda *args, **kwargs: None,
+    )
 
     replacements = {
         "aiter": aiter,
         "aiter.jit": aiter_jit,
         "aiter.jit.utils": aiter_jit_utils,
         "aiter.jit.utils.chip_info": chip_info,
+        "aiter.dist": aiter_dist,
+        "aiter.dist.parallel_state": parallel_state,
         "atom.distributed.pcp_utils": pcp_utils,
         "atom.model_ops.attentions.backends": backends,
         "atom.model_ops.v4_kernels": kernels,
