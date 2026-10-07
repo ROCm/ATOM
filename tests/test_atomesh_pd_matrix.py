@@ -620,7 +620,7 @@ class SurveyConfigurationTest(unittest.TestCase):
                 config,
                 suite="vllm",
                 model_filter={"Transport-vLLM-Survey"},
-                case_filter=None,
+                case_filter={"survey-transport-image-only-2node"},
                 benchmark_kind_filter=None,
                 override_image=None,
                 override_benchmark_concurrency=None,

@@ -1196,7 +1196,8 @@ models:
         extra_args: --enforce-eager
     suites:
       vllm:
-        - name: survey-transport-image-only-2node
+        - &survey_transport_image_only
+          name: survey-transport-image-only-2node
           topology: 1p1d
           display_topology: TRANSPORT-ONLY-2NODE
           pd_worker_layout: multi_node
@@ -1209,6 +1210,13 @@ models:
           benchmark:
             wait_server_timeout: 900
           run_eval: false
+
+        # Read-only inventory and original NIXL backend creation, no GPU stages.
+        - <<: *survey_transport_image_only
+          name: survey-transport-inventory-only-2node
+          env:
+            common:
+              ATOMESH_TRANSPORT_GPU: "0"
 
   # Candidate only; exact local metadata/index/shard structure required before allocation.
   # No alternate checkpoint/download; original FP4 experts + FP8 checkpoint metadata.
