@@ -387,10 +387,18 @@ def snapshot_v41_batch(common_attn_metadata):
         try:
             req_ids = list(input_batch.req_ids)[:num_reqs]
             block_table_np = input_batch.block_table[0].block_table.np
-            _check_row_alignment(input_batch, num_computed, num_reqs)
         except Exception:  # noqa: BLE001
+            # The accessor is an ATOM patch over another engine's internals;
+            # absent is the caller's ordinary "fall back" case.
             req_ids = None
             block_table_np = None
+        else:
+            # Outside the fallback, deliberately. A row divergence is not a
+            # missing accessor: falling back on it would key state slots on
+            # first-block ids -- `-1` for every block-less row, so two such
+            # requests share one slot -- which is the wrong output this check
+            # exists to name. It has to reach the caller.
+            _check_row_alignment(input_batch, num_computed, num_reqs)
     if block_table_np is None:
         block_table_np = common_attn_metadata.block_table_tensor.cpu().numpy()
 
@@ -608,7 +616,7 @@ def _dump_v41_state_rows(snapshot, batch, builder, exc) -> None:
         used = [int(s) for s in slots[: len(snapshot.req_ids)]]
         if len(set(used)) != len(used):
             logger.error("  SLOT COLLISION: %s", used)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.exception("DeepSeek-V4.1: could not dump state rows")
 
 

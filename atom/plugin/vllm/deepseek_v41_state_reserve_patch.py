@@ -56,6 +56,7 @@ The install is idempotent, so both call sites is fine.
 
 from __future__ import annotations
 
+import functools
 import logging
 
 logger = logging.getLogger("atom")
@@ -143,8 +144,17 @@ def apply_vllm_v41_state_reserve_patch() -> bool:
     if getattr(original, "_atom_v41_state_reserve_patched", False):
         return False
 
-    def patched(vllm_config, kv_cache_specs, available_memory):
-        configs = original(vllm_config, kv_cache_specs, available_memory)
+    @functools.wraps(original)
+    def patched(*args, **kwargs):
+        # Pass through rather than re-declaring the signature: this wraps a
+        # vLLM function installed for every model, so a keyword call site --
+        # or an argument a later release adds -- would otherwise raise
+        # TypeError from inside KV-cache sizing, with the traceback pointing
+        # here.
+        configs = original(*args, **kwargs)
+        vllm_config = kwargs.get("vllm_config") or (args[0] if args else None)
+        if vllm_config is None:
+            return configs
         reserve = deepseek_v41_state_reserve_blocks(vllm_config)
         if reserve:
             _reserve_state_tail(configs, reserve, vllm_config)
