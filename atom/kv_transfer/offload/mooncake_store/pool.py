@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections import deque
 from itertools import pairwise
 from typing import Any
@@ -36,23 +35,28 @@ REGIONS = ("save", "load")
 _SLOT_ALIGN = 4096
 _BASE_ALIGN = 2 << 20
 # A region's usable slots make at least this many windows, however few threads
-# share it: when one transfer never settles and its slots are held back, the
+# share it: when one transfer never settles and its slots are quarantined, the
 # rest of the region keeps working.
 _MIN_WINDOWS_PER_REGION = 4
+
+# Backing memory of closed pools with a quarantined or still-leased slot. Kept
+# registered and referenced for the life of the process: a late RDMA transfer
+# or GPU copy then lands in memory nothing else is given. Each closed pool adds
+# at most one entry; a healthy device and fabric add none.
+_UNSETTLED_ALLOCATIONS: list[torch.Tensor] = []
 
 
 class SlotPoolExhausted(RuntimeError):
     """A region has fewer usable slots than a request needs.
 
-    Not worth waiting for: slots held back by ``quarantine`` return minutes
-    later at the earliest, and retired ones never do.
+    Not worth waiting for: a quarantined slot never returns.
     """
 
 
 class Slot:
     """One chunk-sized piece of the registered pool."""
 
-    __slots__ = ("held_until", "index", "leased", "ptr", "region", "tensor")
+    __slots__ = ("index", "leased", "ptr", "region", "tensor")
 
     def __init__(self, region: str, index: int, tensor: torch.Tensor) -> None:
         self.region = region
@@ -61,8 +65,6 @@ class Slot:
         self.tensor = tensor
         self.ptr = int(tensor.data_ptr())
         self.leased = False
-        # time.monotonic() at which a held slot returns to its region.
-        self.held_until = 0.0
 
     def __repr__(self) -> str:
         return f"Slot({self.region}#{self.index}@{self.ptr:#x})"
@@ -137,10 +139,9 @@ class TransferSlotPool:
                 position += self.slot_stride
             self._slots[region] = slots
         self._free = {region: deque(self._slots[region]) for region in REGIONS}
-        # Out of use: held back until `Slot.held_until`, or retired for good.
-        self._held: dict[str, list[Slot]] = {region: [] for region in REGIONS}
-        self._retired = dict.fromkeys(REGIONS, 0)
-        # Regions whose every slot is out of use, reported once until one returns.
+        # Slots out of use for good, per region; see `quarantine`.
+        self._quarantined = dict.fromkeys(REGIONS, 0)
+        # Regions whose every slot is quarantined, reported once.
         self._exhausted: set[str] = set()
         self._cond = threading.Condition()
         self._closed = False
@@ -151,18 +152,16 @@ class TransferSlotPool:
         return self._capacity[self._region(region)]
 
     def usable(self, region: str) -> int:
-        """Slots the region can hand out now: capacity minus quarantined."""
+        """Slots the region can hand out: capacity minus quarantined."""
         region = self._region(region)
         with self._cond:
-            self._readmit_locked()
-            return self._capacity[region] - self._quarantined_locked(region)
+            return self._capacity[region] - self._quarantined[region]
 
     def quarantined(self, region: str) -> int:
-        """Slots of the region out of use now, held back or retired."""
+        """Slots of the region out of use for good."""
         region = self._region(region)
         with self._cond:
-            self._readmit_locked()
-            return self._quarantined_locked(region)
+            return self._quarantined[region]
 
     def window(self, region: str, n_threads: int) -> int:
         """Slots one of ``n_threads`` threads may hold at once in ``region``.
@@ -193,8 +192,7 @@ class TransferSlotPool:
             while True:
                 if self._closed:
                     raise RuntimeError("the transfer pool is closed")
-                self._readmit_locked()
-                quarantined = self._quarantined_locked(region)
+                quarantined = self._quarantined[region]
                 usable = self._capacity[region] - quarantined
                 if n > usable:
                     raise SlotPoolExhausted(
@@ -207,8 +205,9 @@ class TransferSlotPool:
                     for slot in slots:
                         slot.leased = True
                     return slots
-                # A release wakes this; so must a held slot coming back.
-                self._cond.wait(self._seconds_to_readmit_locked(region))
+                # A release wakes this, and so does a quarantine, which can
+                # leave the region too small for `n`.
+                self._cond.wait()
 
     def contiguous_view(self, slots: list[Slot]) -> torch.Tensor | None:
         """``slots`` as one chunk-major buffer, or None when they are not one.
@@ -239,65 +238,62 @@ class TransferSlotPool:
             self._cond.notify_all()
 
     def quarantine(
-        self,
-        slots: list[Slot],
-        *,
-        reason: str = "last access unconfirmed",
-        hold_s: float | None = None,
+        self, slots: list[Slot], *, reason: str = "last access unconfirmed"
     ) -> None:
-        """Take slots out of use: their last GPU or NIC access is unconfirmed.
+        """Take slots out of use for good: their last GPU or NIC access is unconfirmed.
 
         Reusing one could let a late copy or RDMA transfer of the old chunk
-        land in, or read from, the next chunk's bytes. With ``hold_s`` the
-        slots return to their region that many seconds from now, which must
-        bound how late such an access can come; without it they are retired
-        for good. A healthy device and fabric never get here; an unhealthy one
-        shrinks the pool instead of corrupting what passes through it.
+        land in, or read from, the next chunk's bytes. Nothing bounds how late
+        that can come: Mooncake gives up on a transfer without cancelling its
+        RDMA work, and a NIC whose completion queue stalls holds that work
+        indefinitely. A healthy device and fabric never get here; an unhealthy
+        one shrinks the pool instead of corrupting what passes through it, and
+        `close` keeps the memory of a pool with quarantined slots.
         """
         if not slots:
             return
-        now = time.monotonic()
         with self._cond:
             for slot in slots:
                 self._require_leased(slot)
                 slot.leased = False
-                if hold_s is None:
-                    self._retired[slot.region] += 1
-                else:
-                    slot.held_until = now + float(hold_s)
-                    self._held[slot.region].append(slot)
-            counts = {region: self._quarantined_locked(region) for region in REGIONS}
-            # Region -> whether a held slot will come back to it.
-            exhausted = {
-                region: bool(self._held[region])
+                self._quarantined[slot.region] += 1
+            counts = dict(self._quarantined)
+            exhausted = [
+                region
                 for region in REGIONS
                 if counts[region] == self._capacity[region]
                 and region not in self._exhausted
-            }
+            ]
             self._exhausted.update(exhausted)
             self._cond.notify_all()
         logger.warning(
-            "Mooncake Store offload: quarantined %d transfer slot(s) %s (%s); "
-            "out of use now: save %d/%d, load %d/%d",
+            "Mooncake Store offload: quarantined %d transfer slot(s) for good "
+            "(%s); out of use now: save %d/%d, load %d/%d",
             len(slots),
-            "for good" if hold_s is None else f"for {float(hold_s):.0f}s",
             reason,
             counts["save"],
             self._capacity["save"],
             counts["load"],
             self._capacity["load"],
         )
-        for region, returning in exhausted.items():
+        for region in exhausted:
             logger.error(
                 "Mooncake Store offload: every %s slot of this worker is out of "
-                "use; its %ss fail at once %s",
+                "use; its %ss fail at once for good",
                 region,
                 region,
-                "until a held slot returns" if returning else "for good",
             )
 
     def close(self) -> None:
-        """Unregister the pool from the Store client and drop its memory."""
+        """Unregister the pool and drop its memory, if no access can still reach it.
+
+        A quarantined slot, or one still leased, may yet be read or written by
+        the NIC or by a GPU copy. Unregistering or freeing the memory under it
+        would let that access reach memory the process hands out again, so
+        such a pool stays registered and allocated for the life of the
+        process (``_UNSETTLED_ALLOCATIONS``); the Store client's own teardown
+        then ends its RDMA work.
+        """
         with self._cond:
             if self._closed:
                 return
@@ -305,15 +301,21 @@ class TransferSlotPool:
             leased = sum(
                 1 for slots in self._slots.values() for slot in slots if slot.leased
             )
+            quarantined = sum(self._quarantined.values())
             self._cond.notify_all()
-        if leased:
-            logger.warning(
-                "Mooncake Store offload: closing the transfer pool with %d slot(s) "
-                "still in use",
-                leased,
-            )
         try:
-            self._client.unregister(self.base_ptr)
+            if leased or quarantined:
+                _UNSETTLED_ALLOCATIONS.append(self._backing)
+                logger.warning(
+                    "Mooncake Store offload: closing the transfer pool with %d "
+                    "quarantined and %d leased slot(s); its %d bytes stay "
+                    "registered and allocated for the life of the process",
+                    quarantined,
+                    leased,
+                    self.nbytes,
+                )
+            else:
+                self._client.unregister(self.base_ptr)
         finally:
             self._slots = {region: [] for region in REGIONS}
             self._free = {region: deque() for region in REGIONS}
@@ -349,37 +351,6 @@ class TransferSlotPool:
         taken = {slot.index for slot in chosen}
         self._free[region] = deque(slot for slot in free if slot.index not in taken)
         return chosen
-
-    def _quarantined_locked(self, region: str) -> int:
-        return self._retired[region] + len(self._held[region])
-
-    def _readmit_locked(self) -> None:
-        """Return every held slot whose hold is over to its region's free list."""
-        now = time.monotonic()
-        for region in REGIONS:
-            held = self._held[region]
-            if not held or min(slot.held_until for slot in held) > now:
-                continue
-            back = [slot for slot in held if slot.held_until <= now]
-            self._held[region] = [slot for slot in held if slot.held_until > now]
-            self._free[region].extend(back)
-            self._exhausted.discard(region)
-            self._cond.notify_all()
-            logger.info(
-                "Mooncake Store offload: %d held %s slot(s) back in use; out of "
-                "use now: %d/%d",
-                len(back),
-                region,
-                self._quarantined_locked(region),
-                self._capacity[region],
-            )
-
-    def _seconds_to_readmit_locked(self, region: str) -> float | None:
-        """Until the region's next held slot returns; None if none is held."""
-        held = self._held[region]
-        if not held:
-            return None
-        return max(0.0, min(slot.held_until for slot in held) - time.monotonic())
 
     @staticmethod
     def _require_leased(slot: Slot) -> None:
