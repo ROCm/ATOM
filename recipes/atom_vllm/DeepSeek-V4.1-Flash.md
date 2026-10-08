@@ -145,7 +145,8 @@ naming both numbers — raise `--gpu-memory-utilization`, or lower
 | Image requests | Refused — text only |
 | DSpark speculative decoding | Refused — needs ATOM's tentative staging, which the proxy bridge does not drive |
 | Prefix caching | Refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
-| CUDA graphs | Forced off — a V4.1 step does host-side Engram staging, state reset and cursor advance every forward that no captured graph replays |
+| KV transfer / offload connectors | Refused — V4.1's cached prefix is PAGE bytes *and* a per-request STATE image, and no connector on this path carries the second; a PAGE prefix restored without its STATE is a dead engine, not a degraded answer |
+| CUDA graphs | Forced off — a V4.1 step does host-side Engram staging, state reset and cursor advance every forward that no captured graph replays. See [CUDA graphs: what blocks them](#cuda-graphs-what-blocks-them) |
 
 Each of these is refused by `enforce_deepseek_v41_constraints` -- which the
 worker applies to the config it is about to run, ahead of cudagraph capture and
@@ -153,3 +154,68 @@ the first forward -- or by
 `atom.models.deepseek_v41.config.validate_runtime_config`, with a message
 naming the flag to drop. Use the
 [native ATOM engine](../DeepSeek-V4.1-Flash.md) for any of them.
+
+## CUDA graphs: what blocks them
+
+Graphs were attempted, measured and stood down. The record, so the next
+attempt does not start from the beginning:
+
+**What was removed.** The stated reason V4.1 ran eager was that ATOM's plugin
+models are not fx-split, so vLLM's PIECEWISE mode had nothing to split on and
+would swallow the backbone whole. `VLLM_USE_BREAKABLE_CUDAGRAPH=1` ends the
+stream capture at runtime instead of splitting an fx graph, so that reason
+does not survive it. With it:
+
+- `v41_stage_step` (`deepseek_v41_bridge.py`) carries the break around the
+  step's host work -- `_prepare` *and* `prepare_model_inputs` in one break,
+  because `_prepare` stages the step's index/indptr/slot tensors with kernels
+  of its own.
+- `cudagraph_mode` must be **PIECEWISE exactly**, not merely non-NONE:
+  `eager_break_during_capture` *skips the break* when the forward context
+  reports a FULL runtime mode. Under FULL the step work is recorded into the
+  graph and never runs again -- a frozen cursor, every replayed step
+  re-answering the first, with nothing raised.
+- The proxy builder's `AttentionCGSupport.NEVER` needs no change: vLLM's three
+  NEVER gates in `resolve_cudagraph_mode_and_sizes` all test FULL
+  (`mixed_mode`, `decode_mode`, `has_full_cudagraphs`), so PIECEWISE passes
+  them untouched and the honest declaration stays.
+- The dummy-batch cache must be reused, not rebuilt per call. `_prepare`'s
+  dummy branch allocated a scratch `PagedAttentionCache` each time; captured
+  kernels hold its addresses, it is freed when the capture returns, and the
+  first replay reads freed memory. Symptom: `illegal memory access`, reported
+  asynchronously inside an unrelated `copy_to_gpu`. Fixed by `_dummy_cache`.
+
+**What still blocks it.** With all of the above, V4.1 captures and serves
+without raising, and the answers degenerate into noise after the first few
+tokens (measured: 8/8 prompts, greedy, against an eager arm that answers all 8
+correctly). The attention is what stays behind: its kernels are launched with
+per-step host values -- the batch's longest KV extent among them -- which a
+capture freezes at whatever length it recorded while every decode step grows
+past it.
+
+The ordinary remedy, an eager break on the attention op the way vLLM does for
+`unified_attention_with_output`, **does not apply as a decoration**: the
+decorator requires an in-place output buffer ("a fresh tensor returned by `fn`
+would change address each replay"), and V4.1's `Attention.forward` returns a
+fresh tensor. Applied anyway, it faults *inside capture*, not at replay.
+
+So capturing V4.1 is attention-level work -- a persistent per-layer output
+buffer plus a device-side length bound -- not configuration. Two routes, both
+real:
+
+1. V4's road: hoist every per-step host value into fixed-address buffers and
+   declare `UNIFORM_BATCH` (see `deepseek_v4_bridge.py`). Large, and V4.1's
+   step work is the thing its own builder docstring says must run inside the
+   forward.
+2. Give attention a persistent output buffer so it can legally carry the
+   break, and move the KV length bound to device memory. Costs one buffer per
+   layer at the captured width.
+
+**The gate is closed by default and deliberately.** `_breakable_cudagraph_available`
+returns False unless `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` is set, *in addition*
+to vLLM's own flag. vLLM auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH` for some
+architectures; without the second condition, a vLLM upgrade that adds V4.1 to
+that list would turn correct answers into noise with nothing in the log.
+`tests/plugin/test_vllm_deepseek_v41_cudagraph_mode.py` holds that shut. The
+numbers in this recipe are therefore all eager, and must not be extrapolated
+to a graph deployment.
