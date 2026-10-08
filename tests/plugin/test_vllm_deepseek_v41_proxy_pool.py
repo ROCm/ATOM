@@ -317,3 +317,46 @@ class TestDummyBatch:
         assert batch.state_slots_committed == ()
         assert batch.block_tables == ()
         assert batch.total_seqs_num == len(batch.req_ids)
+
+
+def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
+    """V4.1 has V4's global-arena property and must get V4's reuse patch.
+
+    The markers are matched as substrings, and `".atom_deepseek_v4_proxy"` is
+    NOT a substring of `"...atom_deepseek_v41_proxy"` -- so V4.1 silently went
+    without it. Its PAGE and STATE share one address space (a slot's ring is
+    an offset past the absolute end of the paged region), which is exactly the
+    layout the patch exists to stop vLLM from recycling out from under.
+    """
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _V4_PROXY_LAYER_MARKERS
+
+    assert any(
+        marker in ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+        for marker in _V4_PROXY_LAYER_MARKERS
+    )
+
+
+def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
+    """These two must be changed together or the pool is sized short.
+
+    `v41_proxy_geometry` passes `speculative_tokens=0`, which is only correct
+    while speculative decoding is refused -- the slack it leaves out is real
+    pool bytes (`ring_slots` and `compress_ring_slots` both carry it). Whoever
+    lifts the refusal has to lift this too, and this test is what says so.
+    """
+    import re
+
+    src = open("atom/plugin/vllm/deepseek_v41_bridge.py").read()
+    assert re.search(r"speculative_tokens=0", src), (
+        "v41_proxy_geometry no longer hardcodes speculative_tokens=0 -- if "
+        "speculative decoding is now supported, drop this test; if not, the "
+        "pool is being sized from an unverified source"
+    )
+    platform = open("atom/plugin/vllm/platform.py").read()
+    assert "does not support speculative" in platform, (
+        "the hardcoded speculative_tokens=0 is only safe while the platform "
+        "refuses speculative decoding, and that refusal is gone"
+    )
