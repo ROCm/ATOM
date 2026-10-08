@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -423,39 +424,52 @@ class TBOContext:
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-        self.maybe_run_recv_hook()
-        # Leave on the compute stream, with the comm stream ordered ahead of
-        # it. A forward that raises mid-communication unwinds from
-        # `comm_stream`, and the parent fences this ubatch's storage by
-        # recording an event on the compute stream -- which says nothing about
-        # comm kernels still reading those buffers. Without this edge that
-        # fence reports complete while they run, and the next forward
-        # overwrites what they are reading.
-        if self.current_stream is not self.compute_stream:
-            try:
-                self.switch_to_compute_sync()
-            except Exception:
-                # Whatever broke CUDA is likely why we are unwinding; losing
-                # the edge must not replace the error that caused it.
-                if exc_type is None:
-                    raise
-                logger.exception(
-                    "[TBO] ubatch %d could not rejoin the compute stream",
-                    self.ubatch_id,
-                )
-        # Mark this ubatch done BEFORE the final signal so that if the partner
-        # is racing into its next `_cpu_yield` between our signal and its wait,
-        # it observes `partner.done == True` and skips the wait instead of
-        # sleeping forever. Without this, any asymmetry (e.g. partner exits
-        # mid-forward via exception) leaves the survivor wedged on the next
-        # yield: the dead partner only signals exactly once from __exit__,
-        # but the survivor still has ≥1 yield left to do.
-        self.done = True
-        # No CPU-blocking synchronize — GPU ordering is handled by
-        # torch.Event record/wait in switch_to_comm_sync / switch_to_compute_sync.
-        self.cpu_signal_event.set()
-        self.cpu_wait_event.clear()
+        try:
+            self.maybe_run_recv_hook()
+        finally:
+            # The partner's wakeup and the parent's fence both hang off this
+            # cleanup, so a receive hook that raises — an async MoE receive
+            # failing, say — must not skip it: that would wedge the partner on
+            # its next yield and leave the comm stream unordered.
+            self._leave_stream(exc_type is not None or sys.exc_info()[0] is not None)
+            # Mark this ubatch done BEFORE the final signal so that if the
+            # partner is racing into its next `_cpu_yield` between our signal
+            # and its wait, it observes `partner.done == True` and skips the
+            # wait instead of sleeping forever. Without this, any asymmetry
+            # (e.g. partner exits mid-forward via exception) leaves the
+            # survivor wedged on the next yield: the dead partner only signals
+            # exactly once from __exit__, but the survivor still has ≥1 yield
+            # left to do.
+            self.done = True
+            # No CPU-blocking synchronize — GPU ordering is handled by
+            # torch.Event record/wait in switch_to_comm_sync /
+            # switch_to_compute_sync.
+            self.cpu_signal_event.set()
+            self.cpu_wait_event.clear()
         return False
+
+    def _leave_stream(self, unwinding: bool):
+        """Leave on the compute stream, with the comm stream ordered ahead.
+
+        A forward that raises mid-communication unwinds from `comm_stream`,
+        and the parent fences this ubatch's storage by recording an event on
+        the compute stream — which says nothing about comm kernels still
+        reading those buffers. Without this edge that fence reports complete
+        while they run, and the next forward overwrites what they are reading.
+        """
+        if self.current_stream is self.compute_stream:
+            return
+        try:
+            self.switch_to_compute_sync()
+        except Exception:
+            # Whatever broke CUDA is usually why we are unwinding; losing the
+            # edge must not replace the error that brought us here.
+            if not unwinding:
+                raise
+            logger.exception(
+                "[TBO] ubatch %d could not rejoin the compute stream",
+                self.ubatch_id,
+            )
 
     # -- stream management ------------------------------------------------
 

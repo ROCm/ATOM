@@ -187,6 +187,66 @@ def test_exceptional_exit_orders_comm_stream_before_compute(monkeypatch):
     assert ctx.current_stream is compute
 
 
+def test_failing_recv_hook_still_signals_partner_and_fences(monkeypatch):
+    """A receive hook that raises must not skip the exit's cleanup.
+
+    The partner wakes on `cpu_signal_event`/`done` and the parent fences this
+    ubatch's storage against the comm stream. Both hang off the same exit, so
+    an async receive failure that skipped them would wedge the partner and
+    leave comm kernels racing the next forward's writes.
+    """
+    import threading
+
+    from atom.utils.tbo import ubatching
+
+    calls = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", self.name, event.name))
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name, stream.name))
+
+    compute, comm = FakeStream("compute"), FakeStream("comm")
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
+    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
+    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [None])
+
+    signal = threading.Event()
+    ctx = ubatching.TBOContext(
+        ubatch_id=0,
+        compute_stream=compute,
+        comm_stream=comm,
+        forward_context=None,
+        ready_barrier=None,
+        cpu_wait_event=threading.Event(),
+        cpu_signal_event=signal,
+        gpu_comm_done_event=FakeEvent("comm_done"),
+        gpu_compute_done_event=FakeEvent("compute_done"),
+    )
+    ctx.current_stream = comm
+    ctx.recv_hook = lambda: (_ for _ in ()).throw(RuntimeError("recv failed"))
+
+    # The hook's failure surfaces rather than being swallowed...
+    with pytest.raises(RuntimeError, match="recv failed"):
+        ctx.__exit__(None, None, None)
+
+    # ...and every piece of cleanup still ran.
+    assert ("record", "comm_done", "comm") in calls
+    assert ("wait", "compute", "comm_done") in calls
+    assert ctx.current_stream is compute
+    assert ctx.done is True
+    assert signal.is_set()
+
+
 def test_clean_exit_on_compute_adds_no_redundant_ordering(monkeypatch):
     """Already on the compute stream, the exit records nothing of its own."""
     import threading
