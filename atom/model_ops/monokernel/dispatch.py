@@ -6,10 +6,7 @@
 from __future__ import annotations
 
 from atom.model_ops.monokernel.config import GLM5_GRAPH_BATCHES, glm5_tp_config
-
-
-class MonoUnsupported(Exception):
-    """The loaded model or runtime state cannot use the native path."""
+from atom.mono.runtime.consensus import MonoUnsupported
 
 
 def tp_uniform_local_validation(
