@@ -163,6 +163,7 @@ def make_sparse_decode_metadata(
     index_score_max_block: int = 0,
     index_score_cp_world: int = 1,
     index_score_cp_rank: int = 0,
+    index_score_num_idx_heads: int = 0,
 ) -> MiniMaxM3SparseMetadata:
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
@@ -175,6 +176,11 @@ def make_sparse_decode_metadata(
     index_score_max_block = index_score_max_block or triton.cdiv(
         triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE), index_score_cp_world
     )
+    # Separate from `num_idx_heads` because under indexer CP they differ: the
+    # column counts are built for the TP-local KV heads, while the score -- and
+    # so its dispatch map -- is built for one head per CP rank. 0 means "no CP
+    # in play", where the two are the same number.
+    index_score_num_idx_heads = index_score_num_idx_heads or num_idx_heads
     return MiniMaxM3SparseMetadata(
         seq_lens=seq_lens,
         max_seq_len=max_seq_len,
@@ -197,7 +203,7 @@ def make_sparse_decode_metadata(
             seq_lens,
             max_block=index_score_max_block,
             max_query_len=max_query_len,
-            num_idx_heads=num_idx_heads,
+            num_idx_heads=index_score_num_idx_heads,
             out=index_score_work_map_out,
             cp_world=index_score_cp_world,
             cp_rank=index_score_cp_rank,

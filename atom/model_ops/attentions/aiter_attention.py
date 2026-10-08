@@ -327,11 +327,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 triton.cdiv(config.max_model_len, _M3_SPARSE_BLOCK_SIZE),
                 self._index_score_cp_world,
             )
+            # NOT `_num_idx_heads`. Under indexer CP the sparse layer widens
+            # decode `index_q` to one head per CP rank and scores the whole
+            # width (`attention_mha.py`: `num_idx_heads = indexer_cp_world`),
+            # so the map the scorer consumes has that geometry, not the
+            # TP-local KV head count. aiter's row count happens not to depend
+            # on the head count today, so the two agree by coincidence and the
+            # row-count assert in `decode_index_score` -- which compares that
+            # same head-independent number -- would not catch a divergence.
+            # Pass what the scorer actually uses and the question stops being
+            # about aiter's internals.
+            self._index_score_num_idx_heads = (
+                self._index_score_cp_world if indexer_cp_enabled() else num_head_k
+            )
             rows = index_score_work_map_size(
                 self.max_bs,
                 self._index_score_max_block,
                 max_qlen,
-                num_head_k,
+                self._index_score_num_idx_heads,
                 self._index_score_cp_world,
                 self._index_score_cp_rank,
             )
@@ -341,6 +354,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         else:
             self._index_score_max_block = 0
             self._index_score_cp_world, self._index_score_cp_rank = 1, 0
+            self._index_score_num_idx_heads = 0
         self._pa_decode_bf16_asm_enabled = (
             use_pa_decode_bf16_asm() and model_runner.block_size == 256
         )
@@ -478,7 +492,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     ub_max_bs,
                     self._index_score_max_block,
                     max_seqlen_qo,
-                    self._num_idx_heads,
+                    self._index_score_num_idx_heads,
                     self._index_score_cp_world,
                     self._index_score_cp_rank,
                 )
@@ -1039,6 +1053,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
                 index_score_work_map_out=self._index_score_work_map_buffer(),
                 index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
                 index_score_cp_world=self._index_score_cp_world,
                 index_score_cp_rank=self._index_score_cp_rank,
             )
@@ -1379,6 +1394,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
                 index_score_work_map_out=self._index_score_work_map_buffer(),
                 index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
                 index_score_cp_world=self._index_score_cp_world,
                 index_score_cp_rank=self._index_score_cp_rank,
             )
@@ -1578,6 +1594,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
                 index_score_work_map_out=self._index_score_work_map_buffer(p),
                 index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
                 index_score_cp_world=self._index_score_cp_world,
                 index_score_cp_rank=self._index_score_cp_rank,
             )
@@ -1632,6 +1649,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
                 index_score_work_map_out=self._index_score_work_map_buffer(),
                 index_score_max_block=self._index_score_max_block,
+                index_score_num_idx_heads=self._index_score_num_idx_heads,
                 index_score_cp_world=self._index_score_cp_world,
                 index_score_cp_rank=self._index_score_cp_rank,
             )

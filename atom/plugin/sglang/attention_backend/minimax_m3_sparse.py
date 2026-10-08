@@ -870,6 +870,7 @@ def minimax_m3_sparse_attention_for_sglang(
     output = torch.empty_like(q)
 
     from atom.model_ops.minimax_m3.index_topk import (
+        index_score_work_map_for_forward,
         minimax_m3_index_topk,
         minimax_m3_index_topk_decode,
         n_valid_column_per_row_for_forward,
@@ -902,6 +903,26 @@ def minimax_m3_sparse_attention_for_sglang(
                 num_idx_heads=layer.num_idx_heads,
                 decode_max_q=1,
             ),
+            # Same owner, same reason, and more urgently: the FlyDSL scorer
+            # builds its own dispatch map when none arrives, at ~120us of
+            # launch floor -- most of the score kernel itself, paid once per
+            # sparse layer. Hoisting it to the forward makes it once per step.
+            #
+            # The bound is `block_table.shape[1]`, not `ceil(max_seq_len/128)`:
+            # the map's row count IS the kernel's grid and so has to be stable
+            # across a cudagraph replay, which this step's longest request is
+            # not. `build_minimax_m3_block_table` already slices to the static
+            # token-table width while capturing, so this width is
+            # capture-stable for free.
+            index_score_work_map=index_score_work_map_for_forward(
+                forward_batch,
+                "decode",
+                metadata.seq_lens,
+                max_block=metadata.block_table.shape[1],
+                max_query_len=1,
+                num_idx_heads=layer.num_idx_heads,
+            ),
+            index_score_max_block=metadata.block_table.shape[1],
         )
         minimax_m3_sparse_attn_decode_split_kv(
             q[:batch_size],
