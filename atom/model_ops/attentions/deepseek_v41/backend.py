@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
-from types import SimpleNamespace
-
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -51,12 +50,21 @@ ENGRAM_ROWS = "v41_engram_rows"
 # So the default is the blocking path, and the deferred one is opt-in until
 # the register slip is understood. A check that fails closed on correct state
 # is worse than the microsecond it saves.
-_BLOCKING_STATE_PROBE = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE", "1") not in (
-    "0",
-    "",
-    "false",
-    "False",
-)
+def _blocking_state_probe(config) -> bool:
+    """Whether to render the stale-slot verdict in the step that asks for it.
+
+    Default on for the plugin path and off for the native one, because that is
+    where the fault was observed and where the cost is justified. The native
+    engine keeps the deferred probe's ~58 us per decode step; it drives its own
+    scheduler and has not been seen to produce the register slip.
+
+    `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way: 1 to buy the check on
+    the native path too, 0 to take the risk on the plugin path.
+    """
+    override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+    if override is not None and override != "":
+        return override not in ("0", "false", "False")
+    return getattr(config, "plugin_config", None) is not None
 
 
 def build_v41_pool_geometry(
@@ -172,6 +180,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         for name in ("positions", "batch_id_per_q_token"):
             model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
+        self._blocking_state_probe = _blocking_state_probe(model_runner.config)
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         self.geometry = build_v41_pool_geometry(
@@ -682,7 +691,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
             else cache.prepare_state(
-                step, histories=not on_device or _BLOCKING_STATE_PROBE
+                step, histories=not on_device or self._blocking_state_probe
             )
         )
         if self.engram is not None:
