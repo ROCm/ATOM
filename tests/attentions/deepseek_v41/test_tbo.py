@@ -321,7 +321,6 @@ def test_narrowed_tile_rows_stay_compact_and_within_their_microbatch():
     """
     from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
     from atom.model_ops.deepseek_v41.unit_table import unit_table
-
     from tests.models.deepseek_v41.reference_unit_table import unit_table_reference
 
     units, alloc_columns, max_tokens = 2, 8, 8
