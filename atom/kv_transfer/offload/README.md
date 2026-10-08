@@ -353,8 +353,8 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   measured 45-49 GB/s per NIC into HBM); slots hold bytes only while a
   transfer is in flight -- nothing is cached on the worker.
 - Transfers move in windows of `usable region slots / max(threads, 4)`
-  chunks -- at most a quarter of a region, so a transfer whose slots are held
-  back (below) leaves the rest working. A save packs a window (highest chunks
+  chunks -- at most a quarter of a region, so a transfer whose slots are
+  quarantined (below) leaves the rest working. A save packs a window (highest chunks
   first, like the dense tail-to-head order), then puts it; a load gets a
   window (lowest first), then unpacks it.
 - `mooncake_store.pool_device: cpu` puts the pool in pinned host memory instead
@@ -370,9 +370,16 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   Store that outlives the server also needs: every PP stage's layer span
   (`VLLM_PP_LAYER_PARTITION` included), the online quantization, the KV byte
   layout the environment selects (`ATOM_MLA_PAGE_SIZE`, `ATOM_USE_TRITON_MLA`,
-  `ATOM_USE_TRITON_MLA_SHUFFLE_KV`, `ATOM_USE_UNIFIED_ATTN`: same block size,
-  bytes arranged differently), and the codec version. Scheduler and workers
-  derive it from the same `Config` and environment.
+  `ATOM_USE_TRITON_MLA_SHUFFLE_KV`, `ATOM_USE_UNIFIED_ATTN`,
+  `ATOM_FORCE_ATTN_TRITON`: same block size, bytes arranged differently), the
+  GPU arch and the torch dtypes AITER stores the KV and index caches in (`fp8`
+  is e4m3fnuz on gfx942 and e4m3fn on gfx950, one byte each; a DSA index cache
+  is fp8 under a bf16 KV cache too), the RoPE settings, every `--hf-overrides`
+  field, the checkpoint revision when the HF config names one
+  (`_commit_hash`), and the codec version. Scheduler and workers derive it
+  from the same `Config` and environment; the RoPE settings, like the HF
+  geometry, from a snapshot `Config` takes before either process gets it,
+  since a worker changes the live `hf_config` while it builds the model.
 - `digest` is a 16-byte prefix chain over the prompt's full chunks:
   `h_i = blake2b(h_{i-1} || int32-LE tokens of chunk i, person="atom-kv-chain-v1")`
   from 16 zero bytes (a multimodal prompt starts from its media's
@@ -397,7 +404,16 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   answer `None` without asking for 10 s, or ten times as long as the failed
   call blocked if that is longer.
 - With per-NIC pools the scheduler cannot tell which pool a rank writes to, so
-  it asks every pool for every key, concurrently, and ORs the answers.
+  it asks every pool for every key, concurrently, and ORs the answers. That is
+  exact while every server on the pools puts each rank on the same NIC (one
+  prefill server per node, as the launcher runs). Servers that place a rank
+  on different NICs -- two on one node, or DP ranks -- see each other's
+  objects as hits their workers then miss: the load fails, the request
+  recomputes and saves the chunks into its own pool, once per prefix, never
+  with another layout's bytes; and a pool that fails a lookup makes every
+  lookup with an absent key answer "no answer" for each of them. Asking each
+  rank's own pool needs the workers' NIC placement in the scheduler (a
+  follow-up).
 - `batch_is_exist` gives each present key a 10 s read lease (master default),
   and only the lease keeps it from eviction. A request that waits for KV
   blocks after its lookup outlives it, so a hit more than a second old is
@@ -446,6 +462,11 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   receives a save only after the forwards queued ahead of it): it would
   otherwise pack another request's KV into this prompt's keys.
 - A put of a key that already exists succeeds (Mooncake reports 0).
+- After a failed save no save is emitted for 1 s, doubled for each further
+  failure in a row up to 30 s, and reset by a stored save. The base retries a
+  failed save on the next step; a failure that repeats (a full Store, a master
+  that is down, a stage whose save slots are all quarantined) would otherwise
+  re-pack the request's unsaved range on every PP stage every step.
 - At startup every worker sends one chunk of random bytes through the Store and
   compares it back (`startup_probe`): an unregistered pool, an unreachable
   owner or a misrouted NIC fails startup instead of turning every lookup into a
@@ -530,10 +551,11 @@ it starts anything.
   cache and is not held back from the KV budget: it comes out of the headroom
   `--gpu-memory-utilization` leaves. `MC_MAX_MR_SIZE=1 GiB` splits its
   registration into 1 GiB regions.
-- **Store contents outlive the server.** The namespace covers the layout, not
-  the weights' revision: restart the Store (or `remove_all`) after changing
-  weights under the same model path, or any other setting that rearranges the
-  KV bytes without being named above.
+- **Store contents outlive the server.** The namespace covers the layout and
+  the revision an HF config names, not the bytes of local weights: restart
+  the Store (or `remove_all`) after changing weights under the same model
+  path, or any other setting that rearranges the KV bytes without being named
+  above.
 - **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with Mooncake result codes in `errors=`.

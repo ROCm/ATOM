@@ -289,6 +289,39 @@ def snapshot_page_hf_geometry(hf: object) -> dict[str, Any]:
     return _stable_hf_geometry(hf)
 
 
+# hf_config fields that set the rotary embedding K is cached with: the same
+# tokens' KV bytes differ when any of them does, at the same geometry.
+_HF_ROPE_FIELDS = (
+    "rope_parameters",
+    "rope_scaling",
+    "rope_theta",
+    "partial_rotary_factor",
+    "rotary_dim",
+    "rope_interleave",
+    "indexer_rope_interleave",
+    "max_position_embeddings",
+    "original_max_position_embeddings",
+)
+
+
+def snapshot_rope_config(hf: object) -> str:
+    """The RoPE settings of ``hf`` (and its text config) as canonical JSON.
+
+    Taken once at config time, as the geometry is: a worker changes them while
+    it builds the model (``llama.py`` adds ``original_max_position_embeddings``
+    to ``rope_parameters``), which would give it another namespace than its
+    scheduler's. Never raises, since `Config` takes it for every KV transfer
+    config: a value JSON cannot hold is spelled by ``str``.
+    """
+    fields: dict[str, Any] = {name: getattr(hf, name, None) for name in _HF_ROPE_FIELDS}
+    text = getattr(hf, "text_config", None)
+    if text is not None and text is not hf:
+        fields["text_config"] = {
+            name: getattr(text, name, None) for name in _HF_ROPE_FIELDS
+        }
+    return json.dumps(fields, sort_keys=True, default=str)
+
+
 def build_page_namespace(
     config,
     cfg,

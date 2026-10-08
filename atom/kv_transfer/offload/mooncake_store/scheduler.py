@@ -64,6 +64,14 @@ _LOOKUP_STATS_INTERVAL_S = 60.0
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
+# After a failed save, no save is emitted for this long, doubled for each
+# further failure in a row up to `_SAVE_RETRY_MAX_S`; a stored save resets it.
+# The base retries a failed save on the next step, and a failure that repeats
+# -- a full Store, a master that is down, a stage whose save slots are all
+# quarantined -- would otherwise re-pack the request's unsaved range on every
+# PP stage every step.
+_SAVE_RETRY_BASE_S = 1.0
+_SAVE_RETRY_MAX_S = 30.0
 
 
 class _PromptView:
@@ -135,7 +143,9 @@ class _StoreLookup:
         self._world = int(world)
         self._chunk_tokens = int(chunk_tokens)
         # Per-NIC pools: a rank's chunks live in the pool of its NIC, which the
-        # scheduler cannot see, so every pool is asked for every key.
+        # scheduler cannot see, so every pool is asked for every key. Exact
+        # while every server on these pools puts each rank on the same NIC;
+        # see the offload README for what a different placement costs.
         self._masters = cfg.store_masters()
         self._clients: list[store_client.MooncakeStoreClient] | None = None
         self._executor: ThreadPoolExecutor | None = None
@@ -360,6 +370,9 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         self._namespace = namespace
         # time.monotonic() of each request's last lookup; see `_ensure_lookup_pin`.
         self._looked_up_at: dict[str, float] = {}
+        # Failed saves since the last stored one, and when saves may resume.
+        self._failed_saves_in_a_row = 0
+        self._saves_paused_until = 0.0
         super().__init__(
             config,
             chunk_size=cfg.chunk_tokens,
@@ -438,8 +451,27 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         self._looked_up_at.pop(str(seq.id), None)
 
     def _may_emit_save(self) -> bool:
+        if time.monotonic() < self._saves_paused_until:
+            return False
         cap = self._max_pending_saves
         return cap is None or len(self._save_inflight) < cap
+
+    def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
+        if succeeded:
+            self._failed_saves_in_a_row = 0
+        super()._store_finished(operation, succeeded=succeeded)
+
+    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> None:
+        """Pace the retry the base sets up; see `_SAVE_RETRY_BASE_S`."""
+        super()._retry_or_retire_failed_save(operation)
+        self._failed_saves_in_a_row += 1
+        pause = min(
+            _SAVE_RETRY_MAX_S,
+            _SAVE_RETRY_BASE_S * 2 ** min(self._failed_saves_in_a_row - 1, 16),
+        )
+        self._saves_paused_until = max(
+            self._saves_paused_until, time.monotonic() + pause
+        )
 
     def _build_save_request(
         self,

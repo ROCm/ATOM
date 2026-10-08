@@ -18,8 +18,10 @@ import copy
 import ctypes
 import json
 import logging
+import sys
 import threading
 import time
+import types
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -295,6 +297,42 @@ class FakeGPUConnector:
 
     def close(self):
         self.closed = True
+
+
+_AITER_FP8 = {"gfx942": torch.float8_e4m3fnuz, "gfx950": torch.float8_e4m3fn}
+
+
+class _FakeAiterDtypes:
+    """``aiter.dtypes`` as the arch in ``state`` resolves it."""
+
+    def __init__(self, state) -> None:
+        self._state = state
+
+    @property
+    def d_dtypes(self):
+        return {"fp8": _AITER_FP8[self._state.gfx], "bf16": torch.bfloat16}
+
+
+@pytest.fixture(autouse=True)
+def aiter_arch(monkeypatch):
+    """AITER's dtype table and arch detection, as on gfx950 to start.
+
+    The namespace asks AITER what ``fp8`` is stored as; CPU runners have no
+    AITER. Setting ``aiter_arch.gfx = "gfx942"`` makes it an MI300X.
+    """
+    state = SimpleNamespace(gfx="gfx950")
+    package = types.ModuleType("aiter")
+    package.dtypes = _FakeAiterDtypes(state)
+    chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+    chip_info.get_gfx = lambda: state.gfx
+    for name, module in (
+        ("aiter", package),
+        ("aiter.jit", types.ModuleType("aiter.jit")),
+        ("aiter.jit.utils", types.ModuleType("aiter.jit.utils")),
+        ("aiter.jit.utils.chip_info", chip_info),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return state
 
 
 @pytest.fixture
@@ -717,11 +755,72 @@ def test_namespace_fingerprints_the_layout(monkeypatch):
     ]
 
 
+def test_namespace_fingerprints_the_formats_the_gpu_stores(aiter_arch):
+    mi355 = keys.store_namespace(_config(), CHUNK)
+    assert keys.kv_storage_formats(_config()) == {
+        "gfx": "gfx950",
+        "kv_cache": "torch.float8_e4m3fn",
+        "index_cache": "torch.float8_e4m3fn",
+    }
+    assert keys.kv_storage_formats(_config(index_cache_dtype="fp4"))["index_cache"] == (
+        "fp4"
+    )
+    bf16_mi355 = keys.store_namespace(_config(kv_cache_dtype="bf16"), CHUNK)
+    aiter_arch.gfx = "gfx942"
+    # "fp8" is e4m3fnuz here: one byte either way, so only the namespace
+    # keeps an MI300X from loading an MI355X's chunk.
+    assert keys.kv_storage_formats(_config())["kv_cache"] == "torch.float8_e4m3fnuz"
+    assert keys.store_namespace(_config(), CHUNK) != mi355
+    # A DSA index cache is fp8 under a bf16 KV cache too.
+    assert keys.store_namespace(_config(kv_cache_dtype="bf16"), CHUNK) != bf16_mi355
+
+
+def test_namespace_fingerprints_rope_overrides_and_revision():
+    base = keys.store_namespace(_config(), CHUNK)
+    assert keys.store_namespace(_config(), CHUNK) == base
+    yarn = _config()
+    yarn.hf_config.rope_parameters = {"rope_type": "yarn", "factor": 4.0}
+    assert keys.store_namespace(yarn, CHUNK) != base
+    theta = _config()
+    theta.hf_config.rope_theta = 1_000_000.0
+    assert keys.store_namespace(theta, CHUNK) != base
+    # Any --hf-overrides field, e.g. DeepSeek-V3.2's index sharing.
+    overridden = _config(hf_overrides={"use_index_cache": True, "index_topk_freq": 4})
+    assert keys.store_namespace(overridden, CHUNK) != base
+    revised = _config()
+    revised.hf_config._commit_hash = "0123abcd"
+    assert keys.store_namespace(revised, CHUNK) != base
+
+
+def test_namespace_hashes_the_rope_the_config_snapshotted():
+    shipped = _config()
+    shipped.hf_config.rope_parameters = {"rope_type": "default", "rope_theta": 1e4}
+    shipped.offload_rope_config = offcfg.snapshot_rope_config(shipped.hf_config)
+    scheduler, worker = copy.deepcopy(shipped), copy.deepcopy(shipped)
+    # What llama.py writes into the live config while a worker builds it.
+    worker.hf_config.rope_parameters["original_max_position_embeddings"] = 8192
+    assert keys.store_namespace(scheduler, CHUNK) == keys.store_namespace(worker, CHUNK)
+    # Without the snapshot the two diverge and every lookup would miss.
+    del scheduler.offload_rope_config, worker.offload_rope_config
+    assert keys.store_namespace(scheduler, CHUNK) != keys.store_namespace(worker, CHUNK)
+
+
+def test_the_rope_snapshot_never_raises():
+    hf = SimpleNamespace(
+        rope_scaling={"factor": float("nan"), "type": object()},
+        text_config=SimpleNamespace(rope_theta=5e5),
+    )
+    snapshot = json.loads(offcfg.snapshot_rope_config(hf))
+    assert snapshot["text_config"]["rope_theta"] == 5e5
+    assert snapshot["rope_scaling"]["factor"] != snapshot["rope_scaling"]["factor"]
+
+
 _KV_LAYOUT_ENV = (
     "ATOM_MLA_PAGE_SIZE",
     "ATOM_USE_TRITON_MLA",
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV",
     "ATOM_USE_UNIFIED_ATTN",
+    "ATOM_FORCE_ATTN_TRITON",
 )
 
 
@@ -734,6 +833,8 @@ _KV_LAYOUT_ENV = (
         {"ATOM_USE_TRITON_MLA": "1", "ATOM_USE_TRITON_MLA_SHUFFLE_KV": "1"},
         # The MHA kernels' block becomes the scheduler's.
         {"ATOM_USE_UNIFIED_ATTN": "1"},
+        # fp8 MHA KV under one fixed scale instead of per-token scales.
+        {"ATOM_FORCE_ATTN_TRITON": "1"},
     ],
 )
 def test_namespace_fingerprints_the_kv_layout_the_environment_selects(monkeypatch, env):
@@ -2247,6 +2348,47 @@ def test_the_scheduler_finds_what_the_worker_stored(cluster, make_worker):
     assert scheduler.get_num_new_matched_tokens(turn) == (40, True)
 
 
+def test_a_failing_save_is_retried_after_a_pause_that_grows(
+    cluster, make_worker, scheduler_clock
+):
+    config = _config()
+    scheduler = MooncakeStoreOffloadScheduler(config)
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    seq = _seq(43, 44)
+    scheduler.update_state_after_alloc(seq)
+    seq.num_cached_tokens = 44
+
+    def step():
+        requests = scheduler.build_connector_meta().requests
+        for request in requests:
+            worker._do_save_req(request)
+        scheduler.process_completions(worker.get_finished())
+        return len(requests)
+
+    # A full Store fails every put at once, and the base retries a failed
+    # save on the next step: without a pause every PP stage would re-pack it
+    # every step.
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+    assert step() == 1
+    assert step() == 0
+    scheduler_clock.now += 1.0
+    assert step() == 1  # failed again: the next pause is 2 s
+    scheduler_clock.now += 1.0
+    assert step() == 0
+    scheduler_clock.now += 1.0
+    cluster.put_code = None
+    assert step() == 1
+    assert scheduler._save_inflight == {}
+    # Stored: the next save goes out at once.
+    assert scheduler._failed_saves_in_a_row == 0
+    later = _seq(44, 20)
+    scheduler.update_state_after_alloc(later)
+    later.num_cached_tokens = 20
+    assert step() == 1
+
+
 def test_a_stage_that_stops_early_still_completes_every_quorum(cluster, make_worker):
     stages = [make_worker(rank=rank, world=2, save_slots=8)[0] for rank in range(2)]
     request = _save_req(42, 40)
@@ -2648,16 +2790,19 @@ def test_in_place_save_packs_each_window_once(cluster, make_in_place_worker):
 
 
 def test_in_place_load_unpacks_each_window_once(cluster, make_in_place_worker):
-    worker, gpu, codec, _stream = make_in_place_worker(save_slots=8, load_slots=8)
+    worker, gpu, codec, stream = make_in_place_worker(save_slots=8, load_slots=8)
     worker._do_save_req(_save_req(42, 40))
     codec.calls.clear()
     destination = list(range(100, 110))
     load = _load_req(42, hbm=8, lmc=40, block_ids=destination)
+    synced = stream.synchronized
     worker._do_load_req(load)
 
     assert gpu.calls == []
     unpacks = [call[1] for call in codec.calls if call[0] == "unpack"]
     assert unpacks == [[102, 103, 104, 105], [106, 107, 108, 109]]
+    # Each window's unpack is waited for before its slots return to the pool.
+    assert stream.synchronized - synced == 2
     for chunk in range(1, 5):
         for half in range(2):
             source = 2 * chunk + half

@@ -9,10 +9,11 @@ a prompt, exactly as the dense codec packs them. Its key is
     ``{namespace}/w{rank}of{world}/{digest}``
 
 * ``namespace`` fingerprints everything that changes those bytes -- model,
-  dtypes, block and chunk size, world, the HF geometry, the speculative config,
-  each PP stage's layer span and the environment switches that pick the
-  attention backend's KV layout -- so a Store shared by differently configured
-  servers never serves one of them another's layout.
+  dtypes and the formats this GPU stores them in, block and chunk size, world,
+  the HF geometry, RoPE settings and overrides, the speculative config, each
+  PP stage's layer span and the environment switches that pick the attention
+  backend's KV layout -- so a Store shared by differently configured servers
+  never serves one of them another's layout.
 * ``digest`` is the chunk's link in a prefix chain over the prompt's tokens, so
   a chunk's key names the whole prefix up to and including it.
 
@@ -72,10 +73,12 @@ def kv_layout_selectors() -> dict[str, Any]:
     Each picks a layout the attention backend writes at the same block size --
     the segmented MLA cache (``ATOM_MLA_PAGE_SIZE``), the Triton MLA backend's
     shuffled one (``ATOM_USE_TRITON_MLA`` with
-    ``ATOM_USE_TRITON_MLA_SHUFFLE_KV``) and the MHA kernels' block
-    (``ATOM_USE_UNIFIED_ATTN``) -- so neither the codec's opaque bytes nor the
-    size a load checks tell them apart. The scheduler and the workers it
-    spawns read the same environment. A switch a model does not use costs a
+    ``ATOM_USE_TRITON_MLA_SHUFFLE_KV``), the MHA kernels' block
+    (``ATOM_USE_UNIFIED_ATTN``) and the Triton MHA path's fp8 KV, quantized
+    with one fixed scale instead of the per-token scales the default path
+    writes (``ATOM_FORCE_ATTN_TRITON``) -- so neither the codec's opaque bytes
+    nor the size a load checks tell them apart. The scheduler and the workers
+    it spawns read the same environment. A switch a model does not use costs a
     miss across servers that differ in it, never another layout's KV.
     """
     return {
@@ -83,20 +86,59 @@ def kv_layout_selectors() -> dict[str, Any]:
         "triton_mla": bool(envs.ATOM_USE_TRITON_MLA),
         "triton_mla_shuffle_kv": bool(envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV),
         "unified_attn": bool(envs.ATOM_USE_UNIFIED_ATTN),
+        "force_attn_triton": bool(envs.ATOM_FORCE_ATTN_TRITON),
+    }
+
+
+def kv_storage_formats(config: Any) -> dict[str, str]:
+    """The GPU arch and the torch dtypes the KV and index caches are stored in.
+
+    The configured names do not say which bytes a block holds: AITER stores
+    ``fp8`` as e4m3fnuz on gfx942 and e4m3fn on gfx950, one byte each, so a
+    load's size check cannot tell a chunk saved on one from the other. A DSA
+    index cache is fp8 even under a bf16 KV cache, and other arch-dependent
+    choices (the MHA kernels' fixed fp8 scale) follow the arch too, so it is
+    named as well. The scheduler resolves them as its workers do, with the
+    same AITER on the same node, as the dense LMCache scheduler already does.
+    A name AITER does not know (``fp4``) stands as it is.
+    """
+    from aiter import dtypes
+    from aiter.jit.utils.chip_info import get_gfx
+
+    def resolve(name: Any) -> str:
+        return str(dtypes.d_dtypes.get(str(name), name))
+
+    kv_cache_dtype = getattr(config, "kv_cache_dtype", "auto")
+    index_cache_dtype = getattr(config, "index_cache_dtype", None)
+    return {
+        "gfx": str(get_gfx()),
+        "kv_cache": resolve(kv_cache_dtype),
+        "index_cache": resolve(
+            kv_cache_dtype if index_cache_dtype is None else index_cache_dtype
+        ),
     }
 
 
 def store_namespace(config: Any, chunk_tokens: int) -> str:
     """The key prefix every chunk of this server's KV layout is stored under.
 
-    Built on the offload page namespace, which already covers the model,
-    dtypes, block/chunk size, world (PP x TP), HF geometry and speculative
-    config, plus what it lacks for a Store that outlives the server: the PP
-    layer split -- PP4 x TP1 and PP1 x TP4 have the same world -- the online
-    quantization, the KV layout the environment selects
-    (`kv_layout_selectors`), and the codec's byte layout.
+    Built on the offload page namespace, which already covers the model path,
+    the configured dtypes, block/chunk size, world (PP x TP), HF geometry and
+    speculative config, plus what it lacks for a Store that outlives the
+    server and is shared by others: the PP layer split -- PP4 x TP1 and
+    PP1 x TP4 have the same world -- the online quantization, the KV layout
+    the environment selects (`kv_layout_selectors`), the storage formats the
+    GPU resolves them to (`kv_storage_formats`), the RoPE settings K is cached
+    with, every ``--hf-overrides`` field, the checkpoint revision when the
+    config names one, and the codec's byte layout.
     """
     world = offcfg.lmcache_replica_world_size(config)
+    hf = config.hf_config
+    # Taken when the Config was built: a worker changes the live hf_config
+    # while it builds the model (`snapshot_rope_config`).
+    rope = getattr(config, "offload_rope_config", None)
+    if rope is None:
+        rope = offcfg.snapshot_rope_config(hf)
     document = {
         "page": offcfg.build_page_namespace(
             config, SimpleNamespace(chunk_size=int(chunk_tokens)), world
@@ -106,6 +148,12 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
             getattr(config, "online_quant_config", None), sort_keys=True, default=str
         ),
         "kv_layout": kv_layout_selectors(),
+        "storage": kv_storage_formats(config),
+        "rope": rope,
+        "hf_overrides": json.dumps(
+            getattr(config, "hf_overrides", None), sort_keys=True, default=str
+        ),
+        "revision": str(getattr(hf, "_commit_hash", None)),
         "codec": CODEC_ID,
     }
     canonical = json.dumps(
