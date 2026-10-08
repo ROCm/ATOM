@@ -227,6 +227,194 @@ async fn result(task: JoinHandle<Response>) -> Response {
         .unwrap()
 }
 
+struct IngressBackend {
+    worker: Arc<dyn Worker>,
+    requests: mpsc::UnboundedReceiver<(Value, oneshot::Sender<Response>)>,
+    task: JoinHandle<()>,
+}
+
+impl IngressBackend {
+    async fn start(role: WorkerType) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (capture, requests) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let capture = capture.clone();
+                async move {
+                    let (reply, response) = oneshot::channel();
+                    capture
+                        .send((serde_json::from_slice::<Value>(&body).unwrap(), reply))
+                        .unwrap();
+                    response.await.unwrap()
+                }
+            }),
+        );
+        Self {
+            worker: Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .model_id("budget-test")
+                    .build(),
+            ),
+            requests,
+            task: tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+        }
+    }
+
+    async fn next_request(&mut self) -> (Value, oneshot::Sender<Response>) {
+        timeout(Duration::from_secs(5), self.requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+impl Drop for IngressBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
+    use crate::{
+        app_context::AppContext,
+        config::{PolicyConfig, PreparePoolConfig, RouterConfig, RoutingMode},
+        core::prepare_pool::PreparePoolRuntime,
+        routers::ingress::InferenceEnvelope,
+    };
+
+    let mut prefill = IngressBackend::start(WorkerType::Prefill {
+        bootstrap_port: None,
+    })
+    .await;
+    let mut decode = IngressBackend::start(WorkerType::Decode).await;
+    let raw = Bytes::from_static(
+        br#"{"model":"budget-test","messages":[{"role":"user","content":"hello"}],"vendor":{"keep":[1,2]}}"#,
+    );
+    let config = RouterConfig {
+        mode: RoutingMode::PrefillDecode {
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            prefill_policy: None,
+            decode_policy: None,
+        },
+        policy: PolicyConfig::RoundRobin,
+        backend: BackendType::Sglang,
+        disable_retries: true,
+        prepare_pool: PreparePoolConfig {
+            workers: Some(1),
+            max_retained_input_bytes: raw.len(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut pool = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let handle = pool.handle();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, handle.clone())
+            .await
+            .unwrap(),
+    );
+    app.worker_registry.register(prefill.worker.clone());
+    app.worker_registry.register(decode.worker.clone());
+    let router = Arc::new(PDRouter::new(&app).await.unwrap());
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let parse = || {
+        InferenceEnvelope::parse(
+            "/v1/chat/completions".parse().unwrap(),
+            headers.clone(),
+            raw.clone(),
+            &app,
+        )
+    };
+    let dispatch = |request| {
+        let app = app.clone();
+        let router = router.clone();
+        tokio::spawn(async move { router.route_inference(request, &app).await })
+    };
+    let first = parse().await.unwrap();
+    assert_eq!(handle.stats().retained_input_bytes, raw.len());
+    let first = dispatch(first);
+    let (first_prefill, prefill_reply) = prefill.next_request().await;
+    let (first_decode, decode_reply) = decode.next_request().await;
+    assert_eq!(first_prefill["vendor"], json!({"keep":[1,2]}));
+    assert_eq!(first_decode["vendor"], first_prefill["vendor"]);
+
+    let (body_started, started) = oneshot::channel();
+    let (release_body, body_gate) = oneshot::channel();
+    let gated_body = futures_util::stream::once(async move {
+        body_started.send(()).unwrap();
+        body_gate.await.unwrap();
+        Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+    });
+    prefill_reply
+        .send(
+            Response::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(gated_body))
+                .unwrap(),
+        )
+        .unwrap();
+    let (decode_sent, decode_done) = oneshot::channel();
+    let decode_body = futures_util::stream::once(async move {
+        decode_sent.send(()).unwrap();
+        Ok::<_, std::io::Error>(Bytes::from_static(br#"{"choices":[]}"#))
+    });
+    decode_reply
+        .send(
+            Response::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(decode_body))
+                .unwrap(),
+        )
+        .unwrap();
+    timeout(Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(5), decode_done)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !first.is_finished(),
+        "prefill body must still block the first request"
+    );
+    assert_eq!(
+        handle.stats().retained_input_bytes,
+        0,
+        "backend response latency must not retain the preparation input budget"
+    );
+
+    // This identical input exhausts the entire configured budget on its own.
+    // It must reach both workers while the first prefill body is still gated.
+    let second = dispatch(parse().await.unwrap());
+    let (second_prefill, prefill_reply) = prefill.next_request().await;
+    let (second_decode, decode_reply) = decode.next_request().await;
+    assert_eq!(second_prefill["vendor"], first_prefill["vendor"]);
+    assert_eq!(second_decode["vendor"], first_decode["vendor"]);
+    prefill_reply.send(prefill_response()).unwrap();
+    decode_reply
+        .send(axum::Json(json!({"choices":[]})).into_response())
+        .unwrap();
+    let second = result(second).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    second.into_body().collect().await.unwrap();
+    assert!(!first.is_finished());
+    assert_eq!(handle.stats().retained_input_bytes, 0);
+
+    release_body.send(()).unwrap();
+    let first = result(first).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    first.into_body().collect().await.unwrap();
+    assert_eq!((prefill.worker.load(), decode.worker.load()), (0, 0));
+    assert_eq!(pool.shutdown().await.remaining_workers, 0);
+}
+
 #[tokio::test]
 async fn pd_dispatch_uses_each_workers_credentials_without_leaking_client_keys() {
     for kind in KINDS {

@@ -217,15 +217,12 @@ impl EndpointSpec {
     }
 }
 
-struct RetainedInput {
-    body: Bytes,
-    _lease: InputLease,
-}
-
-impl AsRef<[u8]> for RetainedInput {
-    fn as_ref(&self) -> &[u8] {
-        &self.body
-    }
+/// The regular HTTP forwarding phase no longer owns preparation state.
+pub(crate) struct HttpInferenceRequest {
+    pub uri: Uri,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub metadata: InferenceMetadata,
 }
 
 pub struct InferenceEnvelope {
@@ -234,8 +231,12 @@ pub struct InferenceEnvelope {
     pub body: Bytes,
     pub parsed: ParsedInference,
     pub metadata: InferenceMetadata,
+    // PD needs a mutable JSON body while preserving backend-specific fields.
+    pd_body: Option<serde_json::Value>,
     /// Shared by JSON parsing and every subsequent prepare submission.
     pub(crate) prepare_deadline: Instant,
+    // Remains with the envelope through queued/running jobs and returned results.
+    _input_lease: InputLease,
 }
 impl InferenceEnvelope {
     pub async fn parse(
@@ -247,17 +248,24 @@ impl InferenceEnvelope {
         Self::validate_headers(&headers)?;
         let deadline = app.prepare_pool.prepare_deadline();
         let lease = app.prepare_pool.retain_input(body.len())?;
-        // Raw Bytes clones keep the budget charged through upstream sends.
-        let body = Bytes::from_owner(RetainedInput {
-            body,
-            _lease: lease,
-        });
         let inline_limit = app.router_config.prepare_pool.parse_inline_max_bytes;
         let inline = inline_limit != 0 && body.len() <= inline_limit;
+        let pd = app.router_config.mode.is_pd_mode();
         let parse = move || -> Result<Self, IngressError> {
             let started = Instant::now();
             let parsed =
                 ParsedInference::parse(uri.path(), &body).map_err(IngressError::invalid)?;
+            // Build the PD forwarding body during the first CPU job. Serializing
+            // the typed routing view would discard backend-specific fields.
+            let pd_body = if pd {
+                Some(
+                    serde_json::from_slice(&body).map_err(|error: serde_json::Error| {
+                        IngressError::invalid(error.to_string())
+                    })?,
+                )
+            } else {
+                None
+            };
             metrics::histogram!("mesh_prepare_stage_seconds", "stage" => "json_parse")
                 .record(started.elapsed().as_secs_f64());
             let metadata = parsed.metadata_with_text(false);
@@ -274,7 +282,9 @@ impl InferenceEnvelope {
                 body,
                 parsed,
                 metadata,
+                pd_body,
                 prepare_deadline: deadline,
+                _input_lease: lease,
             })
         };
         if inline {
@@ -285,12 +295,13 @@ impl InferenceEnvelope {
             return Ok(request);
         }
         app.prepare_pool
-            .try_submit(deadline, move |ctx| -> Result<Self, IngressError> {
+            .submit(deadline, move |ctx| -> Result<Self, IngressError> {
                 ctx.check()?;
                 let request = parse()?;
                 ctx.check()?;
                 Ok(request)
-            })?
+            })
+            .await?
             .wait()
             .await?
     }
@@ -301,7 +312,7 @@ impl InferenceEnvelope {
         pool: &PrepareHandle,
         work: impl FnOnce(&Self, &JobContext) -> Result<T, IngressError> + Send + 'static,
     ) -> Result<(Self, T), IngressError> {
-        pool.try_submit(
+        pool.submit(
             self.prepare_deadline,
             move |ctx| -> Result<_, IngressError> {
                 ctx.check()?;
@@ -309,9 +320,72 @@ impl InferenceEnvelope {
                 ctx.check()?;
                 Ok((self, value))
             },
-        )?
+        )
+        .await?
         .wait()
         .await?
+    }
+
+    pub(crate) async fn prepare_routing(
+        self,
+        pool: &PrepareHandle,
+        routing: &IngressRouting,
+    ) -> Result<(Self, (InferenceMetadata, Option<Vec<u32>>)), IngressError> {
+        self.check_deadline()?;
+        routing.validate_metadata(&self.metadata)?;
+        let (needs_text, needs_tokens) = routing.requirements(self.metadata.model.as_deref());
+        if !needs_text && !needs_tokens {
+            let metadata = self.metadata.execution_metadata();
+            self.check_deadline()?;
+            return Ok((self, (metadata, None)));
+        }
+        let routing = routing.clone();
+        self.prepare(pool, move |request, ctx| {
+            routing.prepare(&request.parsed, ctx)
+        })
+        .await
+    }
+
+    fn check_deadline(&self) -> Result<(), IngressError> {
+        if Instant::now() >= self.prepare_deadline {
+            return Err(PrepareError::Timeout.into());
+        }
+        Ok(())
+    }
+
+    /// Consume only after the final preparation result has been received.
+    /// The parsed views and preparation lease are dropped before forwarding.
+    pub(crate) fn into_http_request(self) -> Result<HttpInferenceRequest, IngressError> {
+        self.check_deadline()?;
+        Ok(HttpInferenceRequest {
+            uri: self.uri,
+            headers: self.headers,
+            body: self.body,
+            metadata: self.metadata,
+        })
+    }
+
+    /// PD forwards its mutable JSON body, so its duplicate raw and typed bodies
+    /// and preparation lease can be released before either backend executes.
+    pub(crate) fn into_pd_parts(self) -> Result<(Uri, HeaderMap, serde_json::Value), IngressError> {
+        self.check_deadline()?;
+        let body = self.pd_body.ok_or_else(|| {
+            IngressError::new(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing_pd_body",
+                "PD request body was not prepared",
+            )
+        })?;
+        Ok((self.uri, self.headers, body))
+    }
+
+    /// Native backends consume typed requests; release raw JSON and preparation
+    /// accounting before awaiting their own request handling.
+    pub(crate) fn into_native_parts(
+        self,
+    ) -> Result<(Uri, HeaderMap, ParsedInference, InferenceMetadata), IngressError> {
+        self.check_deadline()?;
+        Ok((self.uri, self.headers, self.parsed, self.metadata))
     }
 
     pub(crate) fn validate_headers(headers: &HeaderMap) -> Result<(), IngressError> {
@@ -397,16 +471,7 @@ impl IngressRouting {
     ) -> Result<(InferenceMetadata, Option<Vec<u32>>), IngressError> {
         ctx.check()?;
         let mut metadata = parsed.metadata_with_text(false);
-        if metadata
-            .model
-            .as_deref()
-            .is_some_and(|model| model.trim().is_empty())
-        {
-            return Err(IngressError::invalid("model is required"));
-        }
-        let endpoint = EndpointSpec::find(metadata.route)
-            .ok_or_else(|| IngressError::invalid("unsupported inference API"))?;
-        endpoint.validate_topology(self.pd)?;
+        self.validate_metadata(&metadata)?;
         let (needs_text, needs_tokens) = self.requirements(metadata.model.as_deref());
         if needs_text || needs_tokens {
             metadata = parsed.metadata();
@@ -419,6 +484,19 @@ impl IngressRouting {
         };
         ctx.check()?;
         Ok((metadata, tokens))
+    }
+
+    fn validate_metadata(&self, metadata: &InferenceMetadata) -> Result<(), IngressError> {
+        if metadata
+            .model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(IngressError::invalid("model is required"));
+        }
+        let endpoint = EndpointSpec::find(metadata.route)
+            .ok_or_else(|| IngressError::invalid("unsupported inference API"))?;
+        endpoint.validate_topology(self.pd)
     }
 
     pub(crate) fn candidates(

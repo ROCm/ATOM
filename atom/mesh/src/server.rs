@@ -518,7 +518,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     info!(
         workers = config.router_config.resolved_prepare_workers(),
         source = config.router_config.prepare_workers_source(),
-        queue_capacity = config.router_config.prepare_pool.queue_capacity,
+        queue_capacity = config.router_config.resolved_prepare_pool().queue_capacity,
         max_retained_input_bytes = config.router_config.prepare_pool.max_retained_input_bytes,
         max_tokenize_bytes = config.router_config.resolved_max_tokenize_bytes(),
         "Request preparation pool started"

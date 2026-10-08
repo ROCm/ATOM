@@ -51,26 +51,32 @@ pub trait RouterTrait: Send + Sync + Debug {
         _app: &std::sync::Arc<crate::app_context::AppContext>,
     ) -> Response {
         use prepare::inference::ParsedInference;
-        let headers = Some(&request.headers);
-        let model = request.metadata.model.as_deref();
-        match &request.parsed {
-            ParsedInference::Chat(body) => self.route_chat(headers, body, model).await,
-            ParsedInference::Completion(body) => self.route_completion(headers, body, model).await,
-            ParsedInference::Generate(body) => self.route_generate(headers, body, model).await,
+        let route = request.metadata.route;
+        let (uri, headers, parsed, metadata) = match request.into_native_parts() {
+            Ok(parts) => parts,
+            Err(err) => return err.response(route),
+        };
+        let headers = Some(&headers);
+        let model = metadata.model.as_deref();
+        match parsed {
+            ParsedInference::Chat(body) => self.route_chat(headers, &body, model).await,
+            ParsedInference::Completion(body) => self.route_completion(headers, &body, model).await,
+            ParsedInference::Generate(body) => self.route_generate(headers, &body, model).await,
             ParsedInference::Responses(body) => {
                 use crate::protocols::validated::Normalizable;
                 use validator::Validate;
-                match serde_json::from_value::<ResponsesRequest>(body.clone()) {
+                match serde_json::from_value::<ResponsesRequest>(body) {
                     Ok(mut body) => {
                         body.normalize();
                         if let Err(err) = body.validate() {
                             return comm::error::IngressError::invalid(err.to_string())
-                                .response(request.uri.path());
+                                .response(uri.path());
                         }
                         self.route_responses(headers, &body, model).await
                     }
-                    Err(err) => comm::error::IngressError::invalid(err.to_string())
-                        .response(request.uri.path()),
+                    Err(err) => {
+                        comm::error::IngressError::invalid(err.to_string()).response(uri.path())
+                    }
                 }
             }
             ParsedInference::Messages(_) => comm::error::IngressError::new(
@@ -78,7 +84,7 @@ pub trait RouterTrait: Send + Sync + Debug {
                 "unsupported_api",
                 "Messages requires an HTTP backend",
             )
-            .response(request.uri.path()),
+            .response(uri.path()),
         }
     }
 

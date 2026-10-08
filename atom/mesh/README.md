@@ -35,12 +35,13 @@ HTTP backends that support `/v1/responses`. A `mesh.apis` label restricts suppor
 APIs using comma-separated paths, such as `/v1/chat/completions,/v1/responses`;
 omitting the label preserves the default of accepting all supported API routes.
 
-When multiple eligible backend addresses exist, requests carrying `authorization`
-or `x-api-key` require a configured worker API key for every candidate. Otherwise,
-Mesh returns `503 ambiguous_response_credentials` before contacting any backend.
-A single backend can still receive client credentials when it has no worker key.
-If all probes fail, server errors take precedence over other errors, and a 404
-cannot replace a non-404 error.
+Resource operations use the same credential rules as inference: a configured
+worker API key overrides client credentials, and eligible backends without a
+worker key receive the client's `authorization` and `x-api-key` headers.
+Workers sharing one backend address must have matching credential configuration.
+The first successful probe is returned immediately. If all probes fail, non-404
+client errors take precedence over server or connection errors; 404 is the
+fallback. Errors with equal priority are selected by backend address order.
 
 DP-aware forwarding writes the selected worker's rank to `data_parallel_rank` in
 the request body, including Messages and Responses, overriding any client value.
@@ -240,6 +241,21 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 ## Reliability
 
+- **Request preparation**: Parsing and tokenization use `--prepare-workers` threads
+  (default: 10). The waiting queue defaults to 10 jobs per resolved preparation
+  thread: 100 jobs by default, or 20 with `--prepare-workers 2`.
+  `--prepare-queue-capacity` overrides that limit. Queued jobs still have a
+  `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
+  their slot immediately. An enabled ext-proc parser-concurrency setting determines
+  the thread count when `--prepare-workers` is omitted.
+  `--prepare-max-retained-input-bytes` (default: 32 MiB) caps the raw input bytes
+  held during preparation, including queueing and result handoff. The charge is
+  released before upstream dispatch; forwarding and retries do not hold it.
+  Canceled synchronous work retains its charge until it actually exits.
+  This byte limit can fill before the job queue for large prompts, so size it for
+  the expected concurrent preparation input. Ext-proc's separate
+  `--ext-proc-max-buffered-bytes` limit continues to cover its request buffers
+  through rewriting and dispatch.
 - **Retries**: Up to 5 attempts with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)
 - **Circuit breakers**: Per-worker failure/success thresholds (`--cb-failure-threshold`, `--cb-timeout-duration-secs`)
 - **Rate limiting**: Token bucket via `--max-concurrent-requests`, optional queue (`--queue-size`, `--queue-timeout-secs`)

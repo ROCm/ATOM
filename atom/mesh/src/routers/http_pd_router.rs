@@ -1963,25 +1963,19 @@ impl RouterTrait for PDRouter {
         app: &Arc<crate::app_context::AppContext>,
     ) -> Response {
         let routing = super::ingress::IngressRouting::new(app);
-        let resources = routing.clone();
         let route = request.metadata.route;
-        let (request, (metadata, tokens, body)) = match request
-            .prepare(&app.prepare_pool, move |request, ctx| {
-                let (metadata, tokens) = resources.prepare(&request.parsed, ctx)?;
-                ctx.check()?;
-                let body: Value = serde_json::from_slice(&request.body)
-                    .map_err(|err| error::IngressError::invalid(err.to_string()))?;
-                ctx.check()?;
-                Ok((metadata, tokens, body))
-            })
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(err) => return err.response(route),
-        };
+        let (request, (metadata, tokens)) =
+            match request.prepare_routing(&app.prepare_pool, &routing).await {
+                Ok(prepared) => prepared,
+                Err(err) => return err.response(route),
+            };
         let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
         {
             Ok(workers) => workers,
+            Err(err) => return err.response(metadata.route),
+        };
+        let (uri, headers, body) = match request.into_pd_parts() {
+            Ok(parts) => parts,
             Err(err) => return err.response(metadata.route),
         };
         let planner = DefaultPlanner::new(
@@ -1991,16 +1985,14 @@ impl RouterTrait for PDRouter {
             )),
             Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone())),
         );
-        let mut context = PDRequestContext::from_metadata(&metadata, Some(&request.headers), None);
+        let mut context = PDRequestContext::from_metadata(&metadata, Some(&headers), None);
         context.planner = Some(&planner);
-        context.route = request
-            .uri
+        context.route = uri
             .path_and_query()
             .map(|v| v.as_str())
-            .unwrap_or(request.metadata.route);
+            .unwrap_or(metadata.route);
         context.tokens = tokens.as_deref();
-        self.dispatch_pd(Some(&request.headers), &body, context)
-            .await
+        self.dispatch_pd(Some(&headers), &body, context).await
     }
 
     async fn route_generate(
