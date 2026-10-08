@@ -841,9 +841,18 @@ class TestPrefillScorersAgree:
         live = ~torch.isnan(want)
         assert torch.allclose(fly[live], tri[live], rtol=2e-2, atol=2e-2)
 
+    @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
-    def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes):
+    def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes, fp8):
         kw = _inputs(qlens, prefixes, 2, "cuda")
+        if fp8:
+            # The case `auto` actually dispatches. `k_lds` -- and with it any
+            # reason to run the flydsl prefill scorer at all -- is legal only
+            # on an fp8 cache, so a bf16-only selection check covers everything
+            # except the configuration this dispatch exists to reach. The score
+            # comparison above runs both dtypes; this is the exact one, which
+            # is the only test that can see a tie resolve to a different block.
+            kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
         picked = []
         for backend in ("flydsl", "triton"):
             monkeypatch.setenv("ATOM_M3_PREFILL_INDEX_SCORE", backend)

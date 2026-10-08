@@ -258,7 +258,14 @@ def test_m3_context_and_batch_reuse_kernels():
     from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
 
     cache = torch.zeros(64, 128, 128, device="cuda", dtype=torch.bfloat16)
-    with one_variant(cp._context_score, ex._local_topk, ex._merge_topk):
+    # The context scorer is no longer in this list because it is no longer a
+    # Triton kernel: `indexer_context_scores` now dispatches to aiter's FlyDSL
+    # scorer, which `one_variant` cannot instrument and which does not
+    # specialize on shape the way a `tl.constexpr` does. The call below still
+    # runs it at every shape -- what is dropped is the single-variant
+    # assertion, not the coverage. The two selector kernels after it are still
+    # Triton and still the ones this test exists to pin.
+    with one_variant(ex._local_topk, ex._merge_topk):
         for n, blocks in ((1, 33), (15, 35), (16, 37), (17, 39), (31, 41)):
             q = torch.ones(n, 4, 128, device="cuda", dtype=torch.bfloat16)
             table = torch.arange(64, device="cuda", dtype=torch.int32).repeat(n, 1)
