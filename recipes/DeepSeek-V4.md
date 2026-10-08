@@ -118,10 +118,11 @@ python -m atom.entrypoints.openai_server \
 ```
 
 Notes:
-- The log line `[MORI-V2] Created MegaMoE ... dispatch=flydsl wire=fp4 ...
+- The log line `[MegaMoEGfx1250] Created: ... dispatch=flydsl wire=fp4 ...
   stage1_fused=True` confirms the compact stage-1 path is active.
 - Compact stage 1 cannot run with the Triton experts (`ATOM_USE_TRITON_MOE*`);
-  set `ATOM_MEGA_STAGE1_FUSED=0` to use them.
+  set `ATOM_MEGA_STAGE1_FUSED=0` to fall back to mori dispatch, which they can
+  run on.
 - `ATOM_DP_LM_HEAD_MODE=allgather` avoids RCCL `all_to_all_single`, which
   cannot be captured into a hipGraph on gfx1250.
 
