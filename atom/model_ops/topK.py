@@ -488,3 +488,40 @@ def rocm_aiter_grouped_topk(
             routed_scaling_factor,
             num_fused_shared_experts,
         )
+
+
+def mm_topk(
+    ids: torch.Tensor | None,
+    gating_output: torch.Tensor,
+    bias: torch.Tensor,
+    bias_alt: torch.Tensor,
+    hash_table: torch.Tensor | None,
+    vocab_size: int,
+    renormalize: bool,
+    scaling: float,
+    out_ids: torch.Tensor,
+    out_weights: torch.Tensor,
+    *,
+    image_mask: torch.Tensor | None = None,
+) -> None:
+    """Fused two-bias routing from #2149, with an optional explicit image mask.
+
+    V4 uses above-vocabulary IDs and may supply a text hash table. An explicit
+    mask replaces sentinel detection; without hashing, IDs/vocabulary are unused.
+    Output views may have a wider row stride for fused shared-expert columns.
+    """
+    from atom.model_ops.triton_mm_topk import mm_topk_triton
+
+    mm_topk_triton(
+        ids,
+        gating_output,
+        bias,
+        bias_alt,
+        hash_table,
+        vocab_size,
+        renormalize,
+        scaling,
+        out_ids,
+        out_weights,
+        image_mask=image_mask,
+    )

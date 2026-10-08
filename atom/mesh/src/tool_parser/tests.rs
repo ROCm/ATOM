@@ -41,6 +41,7 @@ fn test_supported_tool_parser_registrations_and_model_mappings() {
         "qwen_json",
         "qwen_xml",
         "dsml",
+        "dsml_v41",
         "glm45_moe",
         "glm47_moe",
         "kimi_k3",
@@ -900,6 +901,17 @@ mod qwen_coder_tests {
         assert!(
             params_str.contains("nested"),
             "Should contain nested parameter"
+        );
+    }
+}
+
+#[test]
+fn v41_mapping_precedes_v4_family() {
+    let factory = ParserFactory::new();
+    for model in ["deepseek-v4.1-flash", "deepseek-ai/DeepSeek-V4.1-Flash"] {
+        assert_eq!(
+            factory.registry().resolve_model_to_parser(model).as_deref(),
+            Some("dsml_v41")
         );
     }
 }

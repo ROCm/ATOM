@@ -552,13 +552,11 @@ mod tests {
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
                     .build(),
             ),
         ];
@@ -713,7 +711,6 @@ mod tests {
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
                 .worker_type(WorkerType::Regular)
-                .api_key("test_api_key")
                 .build(),
         )];
 

@@ -1,6 +1,8 @@
 import logging
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from torch.profiler import record_function
 
@@ -13,6 +15,25 @@ from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+@triton.jit(do_not_specialize=["scheduled_bs", "vocab_max"])
+def _stage_anchors_kernel(
+    ids_out,
+    positions_out,
+    next_token_ids,
+    positions,
+    rows,
+    scheduled_bs,
+    vocab_max,
+):
+    """One row of the padded batch; a pad row repeats the last real one."""
+    i = tl.program_id(0)
+    src = tl.minimum(i, scheduled_bs - 1)
+    # Seatbelt: markov_w1 is a raw nn.Embedding, so a -1 anchor traps it.
+    token = tl.load(next_token_ids + src)
+    tl.store(ids_out + i, tl.minimum(tl.maximum(token, 0), vocab_max))
+    tl.store(positions_out + i, tl.load(positions + tl.load(rows + src)))
 
 
 class DSparkProposer(Drafter):
@@ -71,6 +92,7 @@ class DSparkProposer(Drafter):
             forward=self._block_backbone,
             epilogue=self._block_head,
             capture_epilogue=True,
+            capture_supported=self.model.supports_block_graph,
             inputs={
                 "anchor_ids": StagedInput(dtype=torch.int32),
                 "anchor_positions": StagedInput(dtype=torch.int64),
@@ -94,7 +116,7 @@ class DSparkProposer(Drafter):
         argued, and asserted, in `_init_block_persistent_buffers`.
         """
         fc = get_forward_context()
-        assert not fc.context.is_dummy_run, (
+        assert not fc.context.is_dummy_run or not self.model.supports_block_graph, (
             "warmup needs a real forward context; a dummy one has neither a "
             "populated rolling window nor any paged state"
         )
@@ -141,6 +163,32 @@ class DSparkProposer(Drafter):
             anchor_ids,
             self._block_positions(running_bs, anchor_positions),
             self.draft_tokens_per_seq,
+        )
+
+    def _stage_anchors(self, running_bs, next_token_ids, positions, rows):
+        """Each request's anchor token and position, written straight into the
+        block's fixed inputs at the padded batch, so `stage` copies nothing."""
+        ids = self.block.buffer("anchor_ids", running_bs)
+        anchor_positions = self.block.buffer("anchor_positions", running_bs)
+        scheduled_bs = next_token_ids.shape[0]
+        vocab_max = int(self.model.vocab_size) - 1
+        if ids.is_cuda:
+            _stage_anchors_kernel[(running_bs,)](
+                ids,
+                anchor_positions,
+                next_token_ids,
+                positions,
+                rows,
+                scheduled_bs,
+                vocab_max,
+                num_warps=1,
+            )
+        else:
+            src = torch.arange(running_bs).clamp_(max=scheduled_bs - 1)
+            ids.copy_(next_token_ids[src].clamp(0, vocab_max))
+            anchor_positions.copy_(positions[rows[src]])
+        return self.block.stage(
+            running_bs, {"anchor_ids": ids, "anchor_positions": anchor_positions}
         )
 
     def _block_positions(self, running_bs, anchor_positions):
@@ -309,7 +357,12 @@ class DSparkProposer(Drafter):
             # V4: the draft is part of the target checkpoint and shares its
             # config wholesale, so it inherits the target's compilation level
             # and its `_DSparkInner` is compiled (see deepseek_v4_dspark.py).
-            model = model_class(self.config)
+            # The backbone's side stream, not one of the draft's own: the two
+            # never run at once, so a second handle would buy nothing. A draft
+            # whose layers do not fork simply ignores it.
+            model = model_class(
+                self.config, alt_stream=getattr(self.runner.model, "alt_stream", None)
+            )
             if envs.ATOM_DSPARK_DISABLE_COMPILE:
                 # Flip the decorator's own bypass rather than handing the draft a
                 # cloned config with NO_COMPILATION (what the with-draft branch
@@ -318,7 +371,7 @@ class DSparkProposer(Drafter):
                 # static_forward_context registry. This flag is read at the top of
                 # the decorator's __call__ (decorators.py:505), so it degrades to
                 # a plain self.forward(...) with no other side effects.
-                model.model.do_not_compile = True
+                getattr(model, "model", model).do_not_compile = True
                 logger.info("DSpark draft: torch.compile disabled by env.")
             return model
 
@@ -425,6 +478,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
+            layer_num = self.model.layers[0].self_attn.mla_attn.layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -455,8 +509,7 @@ class DSparkProposer(Drafter):
 
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
-        """DSpark taps the configured target layers and reconstructs each one's
-        post-layer hidden state. The base registers the forward hooks."""
+        """Resolve the draft's feature contract; the base owns capture buffers."""
         draft_cfg = self.speculative_config.draft_model_hf_config
         layer_ids = tuple(
             int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
@@ -465,6 +518,9 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
+        own = getattr(self.model, "target_aux_capture_spec", None)
+        if own is not None:
+            return own(layer_ids, self.config.hf_config.hidden_size)
         return AuxCaptureSpec(
             layer_ids=layer_ids,
             hidden_size=self.config.hf_config.hidden_size,
@@ -475,7 +531,7 @@ class DSparkProposer(Drafter):
     def _extract_layer_hidden(output, block: nn.Module):
         """Reconstruct a target layer's post-layer hidden state ``[N, dim]``.
 
-        Every DSpark draft is trained on the reference HF model's
+        Drafters using output capture are trained on the reference HF model's
         ``output.hidden_states[layer_id + 1]`` -- the plain residual stream after
         layer ``layer_id``. ATOM's targets do not hand that tensor back directly:
         each optimizes its residual bookkeeping differently, so the layer's
@@ -606,18 +662,32 @@ class DSparkProposer(Drafter):
         # after the target forward, uniformly for every flavor. propose() only
         # needs the anchor to seed the block.
 
-        # Anchor token x0 per request = the just-verified target token, located
-        # at last_token_indices in the flat batch.
-        # Seatbelt: markov_w1 is a raw nn.Embedding, so a -1 anchor traps it.
-        anchor_ids = next_token_ids.clamp(0, int(self.model.vocab_size) - 1)
-        anchor_positions = torch.index_select(target_positions, 0, last_token_indices)
+        # The block is sized off the anchors. context.scheduled_bs counts only
+        # one half of a mixed prefill+decode step, so it is not that B.
+        scheduled_bs = next_token_ids.shape[0]
+        # Agreed first, and on EVERY step. The batch a pass runs at has to be
+        # one number for the whole DP group, or half of it replays a recorded
+        # collective while the rest issue a differently sized one. Not
+        # conditioned on prefill-vs-decode either: which of the two a rank is
+        # doing is its own business, so a rank that skipped this would leave
+        # the others waiting in the exchange.
+        running_bs = context.running_bs
+        # The target's own padding does not reach here: its pad rows end at the
+        # graph boundary, and the anchors come from the sampler, which runs
+        # after the graph over real rows only. So the block pads its own inputs.
+        # `state_slot_out` needs no help though: `prepare_decode` and
+        # `prepare_prefill` publish it at this same number, so the block's
+        # `[:B]` covers every row it runs. It stopped covering them the moment
+        # the draft ran at a batch the target had not published to -- a Python
+        # slice past the end truncates rather than raising, so the kernels got
+        # a slot table shorter than their own grid and read past it.
+        staged = self._stage_anchors(
+            running_bs, next_token_ids, target_positions, last_token_indices
+        )
 
         if self._with_draft:
             return self._propose_with_draft(
-                forward_context,
-                attn_metadata,
-                anchor_ids,
-                anchor_positions,
+                forward_context, attn_metadata, staged, scheduled_bs
             )
 
         # The rolling target-KV window is filled by `compute_draft_kv`,
@@ -632,38 +702,14 @@ class DSparkProposer(Drafter):
         # Width-agnostic in the WEIGHTS, not in the OUTPUT: block attention is
         # bidirectional, so every draft token depends on T. Acceptance rates and
         # confidence calibration are not comparable across K.
-        window = int(self.model.window_size)
         num_draft = self.draft_tokens_per_seq
-        # forward_spec sizes the block off anchor_ids. context.scheduled_bs counts
-        # only one half of a mixed prefill+decode step, so it is not that B.
-        scheduled_bs = anchor_ids.shape[0]
-        # Agreed first, and on EVERY step. The batch a pass runs at has to be
-        # one number for the whole DP group, or half of it replays a recorded
-        # collective while the rest issue a differently sized one. Not
-        # conditioned on prefill-vs-decode either: which of the two a rank is
-        # doing is its own business, so a rank that skipped this would leave
-        # the others waiting in the exchange.
-        running_bs = context.running_bs
-        # The target's own padding does not reach here: its pad rows end at the
-        # graph boundary, and `anchor_ids` comes from the sampler, which runs
-        # after the graph over real rows only. So the block pads its own inputs.
-        # `state_slot_out` needs no help though: `prepare_decode` and
-        # `prepare_prefill` publish it at this same number, so the block's
-        # `[:B]` covers every row it runs. It stopped covering them the moment
-        # the draft ran at a batch the target had not published to -- a Python
-        # slice past the end truncates rather than raising, so the kernels got
-        # a slot table shorter than their own grid and read past it.
-        staged = self.block.stage(
-            running_bs,
-            {"anchor_ids": anchor_ids, "anchor_positions": anchor_positions},
-        )
-        # ...and the fabricated rows must not scatter their draft KV. Their ring
+        # The fabricated pad rows must not scatter their draft KV. Their ring
         # slot is the 0 `prepare_decode` fills that tail with, which is a real
         # position, so the write would land in another request's window. Here
         # and not inside the block: `run` may REPLAY, and then nothing in the
         # block's Python runs at all.
-        self.model.model.index_buffers(num_draft, window, self.device).mask_pad_tail(
-            self.runner.attn_metadata_builder.row_ids, scheduled_bs, running_bs
+        self.model.prepare_block(
+            self.runner.attn_metadata_builder, num_draft, scheduled_bs, running_bs
         )
         # The block pass is `[bs, T]` however the target ran, and
         # `pad_for_all_gather` reads `is_prefill` to pick which count below to
@@ -990,8 +1036,8 @@ class DSparkProposer(Drafter):
         self,
         forward_context,
         attn_metadata,
-        anchor_ids: torch.Tensor,  # [scheduled_bs]
-        anchor_positions: torch.Tensor,  # [scheduled_bs]
+        staged: dict[str, torch.Tensor],  # the anchors, at `running_bs`
+        scheduled_bs: int,
     ) -> torch.Tensor:
         """Kimi-K3 DSpark: one non-causal block pass over the paged latent cache.
 
@@ -1003,14 +1049,7 @@ class DSparkProposer(Drafter):
         """
         T = self.draft_tokens_per_seq
         context = forward_context.context
-        # The block is sized off anchor_ids. context.scheduled_bs counts only one
-        # half of a mixed prefill+decode step, so it is not that B.
-        scheduled_bs = anchor_ids.shape[0]
         running_bs = context.running_bs
-        staged = self.block.stage(
-            running_bs,
-            {"anchor_ids": anchor_ids, "anchor_positions": anchor_positions},
-        )
         # A DP-alignment dummy (`dummy_execution`) arrives with the pool bound
         # but not one row that owns a page: its sequence is fabricated and its
         # block table is [0]. It still has to run -- the peers mirror the

@@ -156,20 +156,25 @@ class DSparkMarkovHead(nn.Module):
         )
         return logits_bias, markov_embed
 
-    def sample_next(self, token_ids: torch.Tensor, base_logits: torch.Tensor):
-        """One greedy block position: the argmax of the biased logits, and W1[x].
+    def sample_next(
+        self, token_ids: torch.Tensor, base_logits: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """One greedy block position: the argmax of the biased logits into `out`.
 
         Same contract as the Kimi-K3 head's ``sample_next``; the fused path
         never materializes the ``[*, V]`` bias, keeping ``W2`` bf16 and reducing
         straight to ids with an fp32 accumulator (see the op's module docstring
-        for the numerics). ``markov_embed`` is still returned because the
-        confidence head consumes it.
+        for the numerics). ``markov_embed`` is the return because the confidence
+        head consumes it; the ids are not, so that `out` stays the only place
+        to read them whether or not the caller is compiled.
 
         Args:
             token_ids:   [B]     ids of the previously sampled token x_{k-1}.
             base_logits: [B, V]  this position's base logits.
+            out:         [B]     where the ids land; a strided view is fine,
+                                 which is how the caller's own block becomes
+                                 the destination instead of a copy's source.
         Returns:
-            next_ids:     [B]     argmax over the biased logits.
             markov_embed: [B, r]  W1[x_{k-1}].
         """
         if self.fused_sample:
@@ -178,15 +183,18 @@ class DSparkMarkovHead(nn.Module):
             # head stays constructible on a runner with no AITER build.
             from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 
-            markov_embed = self.markov_w1(token_ids)
-            next_ids = dspark_markov_argmax(
-                base_logits, markov_embed, self.markov_w2.weight
+            return dspark_markov_argmax(
+                base_logits,
+                token_ids,
+                self.markov_w1.weight,
+                self.markov_w2.weight,
+                out,
             )
-            return next_ids, markov_embed
         bias, markov_embed = self(token_ids)
         # bf16 + fp32 promotes the slice to fp32 before the add, so an explicit
         # .float() would only materialize it twice for the same sum.
-        return (base_logits + bias).argmax(dim=-1), markov_embed
+        out.copy_((base_logits + bias).argmax(dim=-1))
+        return markov_embed
 
 
 class DSparkConfidenceHead(nn.Module):
@@ -836,7 +844,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # accessor (lazy); `bufs.views` raises if stage 0 did not fill first.
             bufs = self.index_buffers(T, W, x.device)
             if self.stage_id == 0:
-                bufs.build(a.swa_window, slots, positions)
+                bufs.build(a.swa_window, slots, positions, a.n_local_heads)
             kv_indices, kv_indptr, draft_rows = bufs.views(B)
             batch_ids = bufs.batch_ids[: B * T]
 
@@ -887,6 +895,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 q_rope_in=qkn.q_rope,
                 qo_indptr=bufs.qo_indptr[: B * T + 1],
                 prefix=f"{a.layer_name}.dspark_attn_fp8",
+                split_plan=bufs.split_plan,
             )  # [B*T, n_heads, head_dim]
             out = out.view(B, T, a.n_local_heads, a.head_dim)
         else:
@@ -1026,7 +1035,9 @@ class DeepseekV4DSpark(DSparkDraftModel):
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
 
-    def __init__(self, config: "Config", prefix: str = "") -> None:
+    def __init__(self, config: "Config", prefix: str = "", *, alt_stream=None) -> None:
+        # `alt_stream` is the drafter's uniform contract; V4's DSpark layers
+        # keep their shared expert on the one stream, so it goes unused here.
         super().__init__()
         self.atom_config = config
         self.hf_config = config.hf_config
@@ -1124,6 +1135,11 @@ class DeepseekV4DSpark(DSparkDraftModel):
     def reset_kv_cache(self, max_num_seqs: int, device, dtype) -> None:
         for layer in self.model.layers:
             layer.reset_kv_cache(max_num_seqs, device, dtype)
+
+    def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
+        self.model.index_buffers(
+            num_draft, int(self.window_size), metadata_builder.row_ids.device
+        ).mask_pad_tail(metadata_builder.row_ids, scheduled_bs, running_bs)
 
     # ---- drafting entry points (called by the proposer) --------------------
 
@@ -1380,11 +1396,13 @@ class _DSparkInner(nn.Module):
         out_ids[:, 0] = anchor_ids
         markov_embeds = []
         for k in range(T):
-            # Greedy (temperature handled upstream).
-            out_ids[:, k + 1], m_embed = last.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k]
+            # Greedy (temperature handled upstream). The column is the op's
+            # destination, so no id is written twice.
+            markov_embeds.append(
+                last.markov_head.sample_next(
+                    out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+                )
             )
-            markov_embeds.append(m_embed)
         confidence = last.confidence_head(
             hc_hidden, torch.stack(markov_embeds, dim=1)
         )  # [B, T]

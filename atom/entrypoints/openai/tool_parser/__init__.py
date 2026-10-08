@@ -3,7 +3,7 @@
 
 """Tool call parsing for models that emit tool calls in their text output.
 
-Six on-the-wire formats, normalized into the OpenAI ``tool_calls`` structure.
+Model-specific wire formats, normalized into the OpenAI ``tool_calls`` structure.
 Which one a model uses is resolved once at startup from its chat template
 (:func:`~.registry.resolve_tool_call_parser`) or set explicitly with
 ``--tool-call-parser``; it is not inferred from the output, because inferring
@@ -47,6 +47,7 @@ reader, and it is the only reader for both delivery modes.
 """
 
 from .deepseekv4_tool_parser import DsmlParser
+from .deepseekv41_tool_parser import DsmlV41Parser
 from .glm_tool_parser import GlmParser
 from .kimi_k3_tool_parser import KimiK3Parser
 from .kimi_tool_parser import KimiParser
@@ -63,6 +64,7 @@ from .tool_parser import RegionParse, ToolCall, ToolCallParser
 
 __all__ = [
     "DsmlParser",
+    "DsmlV41Parser",
     "GlmParser",
     "KimiK3Parser",
     "KimiParser",

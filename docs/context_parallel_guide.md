@@ -263,9 +263,12 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 > the ATOM server path is validated; the **vllm-atom plugin path is not yet
 > verified**.
 >
-> **Not yet supported: DSA + DCP + MTP.** Speculative decode (MTP, `q > 1`) is
-> only available for dense MLA (gfx950); combining it with sparse attention under
-> DCP is rejected at runtime — see the DCP Constraints & Compatibility table below.
+> **DSA + DCP + MTP.** Speculative decode (MTP, `q > 1`) works with sparse
+> attention under DCP as well as dense MLA (gfx950) — see the DCP Constraints &
+> Compatibility table below. Validated on GLM-5.2-FP8, fp8 KV,
+> `num_speculative_tokens=3`, dcp8; other `num_speculative_tokens` values, KV
+> dtypes, and DCP sizes follow the same dense-MLA support matrix but have not
+> been independently re-checked on sparse.
 
 ## When to use DCP
 
@@ -277,7 +280,8 @@ existing TP ranks, so `world = tp` and `tp` must be divisible by `dcp`.
 - **Composes with**: prefix caching and chunked prefill (both supported under
   DCP); `--kv-cache-dtype fp8` (per-tensor scale); **speculative decode** —
   **MTP** (`--method mtp`, `num_speculative_tokens` 1–3; **gfx950 only**) on
-  dense MLA, and **DSpark** (`--method dspark`) on Kimi-K3.
+  both dense MLA and sparse / DSA, and **DSpark** (`--method dspark`) on
+  Kimi-K3.
 - **Little benefit / avoid**: short-context, KV-memory-plentiful workloads —
   DCP adds per-step decode communication (Q all-gather + output reduce-scatter)
   that isn't worth it when KV memory isn't the constraint.
@@ -351,14 +355,45 @@ wired, so it can default on without breaking mixed runs:
 | Condition | Reason logged |
 |-----------|---------------|
 | `-dcp 1` | `decode_context_parallel_size <= 1 (no DCP group)` — no AllGather Q to remove |
-| speculative decode (MTP / eagle3 / DSpark) | `speculative decode (qlen>1 cprr path)` |
 | fp4 (`ATOM_USE_TRITON_MXFP4_BMM=1`) | `fp4 (mxfp4) BMM weights` — different scale structure |
 
-Check the server log for `query_replication disabled: ...` to see whether it
-actually took effect; the flag being `true` is not the same as QREP running.
+QREP composes with **MTP** (dense MLA and sparse / DSA): it only changes how
+`q_out` is produced, and the verify path's mask keys off the KV side, not
+`q_out`'s provenance — the two are independent. Validated both ways: GLM-5.2-FP8
+sparse, dcp8, MTP=3 (gsm8k, QREP on/off agree within stderr) covers the sparse
+indexer's verify path; Kimi-K3 + DSpark, dcp8 (gsm8k 0.98/200, nshot=5) covers
+dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
+the removed `speculative_config` gate used to block.
 
-Note it costs KV budget: replicating the query heads shrinks the KV pool by
-roughly 5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks).
+A layer falls back to AllGather automatically, instead of enabling QREP
+incorrectly, for either of two reasons: `q_proj` was never built with the QREP
+override (target models, MTP, eagle3, and DSpark are all wired today, so this
+is a safety net for a future model that isn't), or it was, but its on-disk
+quant type is one `_local_q_proj`'s row view cannot narrow (e.g. mxfp4).
+
+To confirm QREP actually took effect (the config flag being `true` is not the
+same as it running): a wired layer logs `enable_query_replication is on and
+active ...` once per process; an unwired one logs `... layer N's <reason> --
+falling back to AllGather Q for it` once per layer, naming whichever of the
+two reasons above applies. The positive line only says QREP is on
+*somewhere* — on a fully wired model, check for the **absence of any
+fallback line** to confirm every layer got it.
+
+Costs KV budget: replicating the query heads shrinks the KV pool by roughly
+5% (measured on DeepSeek-R1 tp8/dcp8: 235 016 → 221 020 blocks). Before this
+change, `speculative_config` unconditionally disabled QREP, so upgrading an
+existing MTP/eagle3/DSpark + DCP deployment now applies this cost where it
+didn't before, with no config change on your part — check KV capacity at
+startup if tuned tightly, or pass
+`--dcp-config '{"enable_query_replication": false}'` to opt back out.
+
+**No effect under the vLLM plugin** (confirmed harmless, not just
+unverified): ATOM's global config always reports `decode_context_parallel_size
+= 1` in vLLM-plugin mode, deliberately, so QREP never activates there and
+`q_proj` stays plain per-rank width. This can't surface as a bug — the
+plugin's `AttentionForVllmMLA` has its own, separately-named forward
+implementation that never touches any QREP-aware code path in `MLAAttention`
+— just a missed optimization, not a correctness risk.
 
 ### `enable_project_before_merge` (PBM)
 
@@ -539,6 +574,14 @@ virtual q_len=1 rows. Unsupported paths (including gfx942 and plugin or
 speculative sparse DCP paths without the per-layer rebuild) remain
 non-persistent and round a gathered 64 up to **128**.
 
+**Sparse prefill's persistent path is not fp8-only.** Unlike the fp8-and-fp8
+requirement above (which is specifically about decode's gqa=64 kernel), sparse
+*prefill*'s persistent mode has no KV-dtype gate at all:
+`mla_dcp_sparse_prefill_is_persistent()` only checks DCP world size, per-layer
+metadata rebuild, and page size. A bf16-KV sparse DCP prefill that satisfies
+those reaches gqa=64 directly the same as fp8 does; only a prefill that fails
+one of those (e.g. gfx942, or DCP≤1) still pads to 128.
+
 **GLM-5.2 is the model that benefits**: 64 query heads at `-tp 8` is 8 per
 rank, so `-dcp 8` gathers exactly 64 and now dispatches the native persistent
 gqa64 kernel instead of padding to 128. `-tp 4 -dcp 4` has the same gathered
@@ -561,33 +604,34 @@ validated configuration.
 
 ## DCP + Speculative Decode (MTP / DSpark)
 
-DCP composes with two drafters: **MTP** (`--method mtp`) on dense MLA, and
-**DSpark** (`--method dspark`) on Kimi-K3. Both verify several draft tokens per
+DCP composes with two drafters: **MTP** (`--method mtp`) on both dense MLA and
+sparse / DSA, and **DSpark** (`--method dspark`) on Kimi-K3. Both verify several draft tokens per
 step, so decode runs with query length `q > 1`. That is where DCP's round-robin
 sharding starts to matter: whenever such a decode is **causal**, its mask has to
 be expressed on **global** token positions rather than the rank-local ones the
 kernel sees. MTP is causal and needs that treatment; DSpark's draft block is
 bidirectional and skips it.
 
-### MTP (dense MLA)
+### MTP (dense MLA and sparse / DSA)
 
 MTP verifies `q = num_speculative_tokens + 1` tokens per step under a causal
 mask, so the intra-block mask has to be applied on global positions. This is
 handled by a dedicated **round-robin CP (`cprr`) MLA kernel**, selected
-automatically when DCP is on, `q > 1`, and the decode is causal.
-
-> **Dense MLA only.** This applies to dense MLA (V3 / R1). **DSA / sparse MLA
-> (V3.2-Exp) does not support MTP under DCP yet** — sparse decode with `q > 1` is
-> rejected by an assert. Serve DSA + DCP without `--method mtp`.
+automatically when DCP is on, `q > 1`, and the decode is causal — that is the
+**dense MLA** (V3 / R1) path. **Sparse / DSA** (V3.2-Exp, GLM's sparse
+attention) reaches the same result by a different route and never selects
+`cprr`: MTP verify is flattened to a per-token `q_len = 1` layout over the
+sharded index cache, so there is no intra-block mask to place.
 
 **Support matrix:**
 
 | | Supported |
 |---|---|
 | GPU arch | **gfx950 only** (the `cprr` kernel is persistent-only and ships for gfx950; gfx942 has no such kernel) |
-| Method | `--method mtp` (`num_speculative_tokens` = 1, 2, or 3) |
-| KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 |
-| DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`) |
+| Method | `--method mtp` (dense MLA: `num_speculative_tokens` 1, 2, or 3 validated above; sparse / DSA has no runtime bound and the [GLM-5.2 recipe](../recipes/Agentic-GLM-5.2.md) runs it at 4 and 5 — see the Model row) |
+| KV cache dtype | **bf16 and fp8** both work for all of `num_speculative_tokens` 1/2/3 (dense MLA) |
+| DCP size | dcp2 / dcp4 / dcp8 all validated (`tp8`, dense MLA) |
+| Model | Dense MLA (V3 / R1): full matrix above (exercises the `cprr` kernel). Sparse / DSA (GLM-5.2-FP8): validated at fp8 KV, `num_speculative_tokens=3`, dcp8 — QREP-on and QREP-off agree within combined stderr on gsm8k nshot=20 (0.9469/0.9477 vs. 0.9492/0.9492). The mechanism this section argues (sparse never selects `cprr`, so QREP's provenance is irrelevant to it) does not itself depend on the draft depth, KV dtype, or DCP size, but only `num_speculative_tokens=3`/fp8/dcp8 got this A/B; the recipe's `num_speculative_tokens=4`/`5` points run on the same mechanism without their own accuracy re-check |
 
 **Usage** (add MTP flags to any DCP command):
 
@@ -652,10 +696,10 @@ contributing under DCP rather than collapsing back to single-token decode.
 | prefix caching / chunked prefill | Supported (dense and sparse / DSA). On **Kimi-K3** the validated configuration has prefix caching **off**, per its recipe |
 | Kimi-K3 KDA layers | Not sharded — the KDA recurrent state is per-request, not paged, so DCP frees only the MLA share of attention memory |
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
-| gathered head width 64 + fp8 KV | Native sparse / DSA prefill and q_len=1 decode on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
+| gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
 | speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
-| speculative decode (MTP), sparse / DSA | **Not supported** — sparse decode with `q > 1` under DCP is rejected by an assert |
+| speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |
 
@@ -664,11 +708,11 @@ contributing under DCP rather than collapsing back to single-token decode.
 | File | Description |
 |------|-------------|
 | `atom/model_engine/arg_utils.py` | `--decode-context-parallel-size` / `-dcp` CLI |
-| `atom/config.py` | `DCPConfig` (the four `--dcp-config` knobs) + their validation; `qrep_unsupported_reason` auto-gating; DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950) |
+| `atom/config.py` | `DCPConfig` (the four `--dcp-config` knobs) + their validation; `qrep_unsupported_reason` auto-gating; DCP validation (`tp % dcp == 0`); spec-decode + DCP arch gate (gfx950); per-layer QREP eligibility -- `q_proj_is_qrep_widened`, `q_proj_has_row_sliceable_scale`, `qrep_enabled_for_layer` |
 | `atom/model_engine/block_manager.py` | Interleaved block allocation; prefix-cache virtual-block accounting |
-| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank` |
+| `atom/distributed/dcp_utils.py` | DCP distributed-access layer: `get_dcp_world_size` / `dcp_is_enabled` / `get_dcp_group` / `get_dcp_rank`; platform-capability queries `dcp_persistent_supported` / `dcp_prefill_merge_bf16_ok`; `mla_dcp_decode_is_persistent` / `mla_dcp_sparse_prefill_is_persistent` |
 | `atom/model_ops/dcp_ops.py` | Both merge backends -- `cp_lse_ag_out_rs` (AG+RS LSE-combine) and `cp_lse_a2a` (all-to-all pack / unpack-combine kernels); `reorg_kvcache`, local compressed-KV gather, `dcp_all_gather` / `dcp_all_gather_query_heads` (custom-collective AllGather) |
-| `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context; `mla_dcp_kernel_num_heads` / `mla_dcp_decode_is_persistent` gathered-head-width padding |
+| `atom/model_ops/attention_mla.py` | Server-mode DCP decode + prefix-cache / chunked-prefill context; `mla_dcp_kernel_num_heads` gathered-head-width padding; `qrep_tp_override`; the per-layer QREP decision at `MLAAttention.__init__` |
 | `atom/model_ops/attentions/aiter_mla.py`, `attentions/backends.py` | DCP decode / prefill metadata (interleaved slot_mapping, local seq lens) |
 | `atom/plugin/vllm/attention/layer_mla.py`, `attention/metadata.py` | vllm-atom plugin DCP decode + prefill context; persistent-metadata head sizing |
 | `atom/models/kimi_k3.py` | Kimi-K3 hybrid backbone (KDA + MLA) served under DCP |

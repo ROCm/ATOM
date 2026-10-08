@@ -1,0 +1,81 @@
+{
+  "schema_version": "atom-benchmark/v1",
+  "source": {
+    "repository": "ROCm/ATOM",
+    "run_id": "fixture",
+    "attempt": 1,
+    "job": "benchmark",
+    "cell_id": "fixture-tp2-c2",
+    "workflow_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "software": {
+    "atom_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aiter_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "image": "fixture-only",
+    "image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "harness_version": "0.12.0",
+    "harness_sha": "dddddddddddddddddddddddddddddddddddddddd"
+  },
+  "model": {
+    "name": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "key": "dsv41flash",
+    "revision": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "precision": "fp8"
+  },
+  "hardware": {
+    "key": "mi355x",
+    "name": "MI355X fixture",
+    "gpu_count": 2,
+    "devices": [
+      {
+        "pci_bus_id": "0000:01:00.0",
+        "uuid": "fixture-0000:01:00.0",
+        "sysfs_path": "/fixture/0000:01:00.0"
+      },
+      {
+        "pci_bus_id": "0000:02:00.0",
+        "uuid": "fixture-0000:02:00.0",
+        "sysfs_path": "/fixture/0000:02:00.0"
+      }
+    ]
+  },
+  "parallelism": {
+    "tp": 2,
+    "pp": 1,
+    "dp": 1,
+    "ep": 1,
+    "dp_attention": false
+  },
+  "workload": {
+    "kind": "agentic",
+    "concurrency": 2,
+    "dataset": "fixture-only",
+    "dataset_revision": "fixture-v1",
+    "duration_s": 20
+  },
+  "recipe": {
+    "server_argv": [
+      "--model",
+      "fixture",
+      "-tp",
+      "2",
+      "--method",
+      "dspark",
+      "--num-speculative-tokens",
+      "5"
+    ],
+    "client_argv": [
+      "aiperf",
+      "profile",
+      "--concurrency",
+      "2"
+    ],
+    "environment": {},
+    "spec_method": "dspark"
+  },
+  "validity": {
+    "synthetic": false,
+    "unsafe_override": false
+  },
+  "fixture": true
+}

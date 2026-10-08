@@ -10,11 +10,15 @@ whole request, but only once every stage has reached a terminal state.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     ConnectorCompletionKey,
     KVConnectorOutput,
     ReqId,
+    SaveOperationId,
+    SaveSourceGroupId,
 )
 
 
@@ -38,10 +42,18 @@ class PPKVAggregator:
     side-channel and must NOT flow through this aggregator.
     """
 
-    def __init__(self, pp_size: int) -> None:
+    def __init__(self, pp_size: int, terminal_tombstone_limit: int = 4096) -> None:
         if pp_size <= 0:
             raise ValueError(f"pp_size must be positive, got {pp_size}")
+        if terminal_tombstone_limit <= 0:
+            raise ValueError("terminal_tombstone_limit must be positive")
         self._pp_size = pp_size
+        self._terminal_tombstone_limit = terminal_tombstone_limit
+        # Native request IDs are unique for the scheduler lifetime. Abandoning
+        # one retires all its save generations, including channels/source groups
+        # no stage has reported yet. Bound duplicate memory as the TP aggregator
+        # does; terminal records do not count as pending work.
+        self._abandoned_saves: OrderedDict[str, None] = OrderedDict()
         self._loading: dict[ReqId, set[int]] = {}
         self._saving: dict[ReqId, set[int]] = {}
         self._failed_loading: dict[ReqId, set[int]] = {}
@@ -59,8 +71,13 @@ class PPKVAggregator:
         for rid in output.failed_loading:
             self._failed_loading.setdefault(rid, set()).add(pp_rank)
         for rid in output.finished_saving:
-            self._saving.setdefault(rid, set()).add(pp_rank)
+            if not self._save_is_abandoned(rid):
+                self._saving.setdefault(rid, set()).add(pp_rank)
         for completion in output.connector_completions:
+            if isinstance(
+                completion.operation_id, (SaveOperationId, SaveSourceGroupId)
+            ) and self._save_is_abandoned(completion.operation_id):
+                continue
             self._connector.setdefault(completion.key, set()).add(pp_rank)
             if not completion.succeeded:
                 self._connector_failed.add(completion.key)
@@ -114,6 +131,41 @@ class PPKVAggregator:
             connector_completions=connector_completions,
         )
 
+    def _save_is_abandoned(self, operation) -> bool:
+        return str(getattr(operation, "req_id", operation)) in self._abandoned_saves
+
+    def forget(self, rid: ReqId) -> None:
+        """Retire a request's saves after the scheduler abandons them.
+
+        A timeout does not cancel the workers: a late stage report must not
+        recreate a partial tally after earlier reports have been discarded.
+        Remember the request even when none of its reports has arrived yet.
+        Load tallies and independent state-store channels retain their quorum;
+        save abandonment is not a terminal for either operation.
+
+        Request IDs are normalized because the scheduler uses ints while some
+        connectors report strings. Only typed save/source-group channel events
+        identify a request's save; an untyped channel key may be a state hash.
+        """
+        sid = str(rid)
+        self._abandoned_saves.setdefault(sid, None)
+        while len(self._abandoned_saves) > self._terminal_tombstone_limit:
+            self._abandoned_saves.popitem(last=False)
+
+        def _owned_by(completion) -> bool:
+            return str(getattr(completion, "req_id", completion)) == sid
+
+        for key in [k for k in self._saving if _owned_by(k)]:
+            self._saving.pop(key, None)
+        for key in [
+            k
+            for k in self._connector
+            if isinstance(k[1], (SaveOperationId, SaveSourceGroupId))
+            and _owned_by(k[1])
+        ]:
+            self._connector.pop(key, None)
+            self._connector_failed.discard(key)
+
     def has_pending(self) -> bool:
         """True while any request is still short of its per-stage quorum.
 
@@ -130,3 +182,4 @@ class PPKVAggregator:
         self._failed_loading.clear()
         self._connector.clear()
         self._connector_failed.clear()
+        self._abandoned_saves.clear()

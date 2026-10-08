@@ -22,6 +22,11 @@ from the same `cu` the rest of the step uses, so per-request length is whatever
 that says -- uniform `q` for a rectangular MTP step, per-request lengths under
 DSpark's ragged buckets, no separate copy of "how long is each one" to drift.
 
+Past `cu[bs]` come the graph's padded rows, zeroed by programs of the same
+launch. Nobody else writes them and the MoE path does consume them, so they
+would otherwise carry the previous forward's ids; zero is a legal vocab id. One
+launch and not two, because the two regions are disjoint by construction.
+
 The predecessor of this kernel placed the two kinds as two contiguous BLOCKS
 (`[deferred | new]`, or `[new | deferred]` when the previous forward was a
 prefill). The scheduler does not order the batch that way -- the two interleave
@@ -45,19 +50,33 @@ Triton cannot read a module-level global from inside a `@jit`ed function, and a
 `constexpr` copy would be a second place for the sentinel to be defined."""
 
 
-@triton.jit
+BLOCK_PAD = 1024
+"""Tokens one padding program zeroes. One value, so the tail costs one JIT
+specialization rather than one per capture bucket -- those leak into serving."""
+
+
+@triton.jit(do_not_specialize=["num_requests", "width"])
 def _fill_deferred_decode_ids_kernel(
-    out_ptr,  # [>=cu[bs]] int32 — staged with the scheduler's ids
+    out_ptr,  # [>=width] int32 — staged with the scheduler's ids
     cu_ptr,  # [bs+1] int32 — exclusive prefix sum of per-request token counts
     src_ptr,  # [bs] int32 — row in prev/draft, or NEW_SEQUENCE
     prev_ptr,  # [num_prev] — last step's sampled id per row
     draft_ptr,  # [num_prev, k] — last step's drafts per row
     draft_row_stride,
+    num_requests,  # programs below this fill a span, the rest zero the tail
+    width,  # tokens the forward reads
     HAS_DRAFT: tl.constexpr,
     BLOCK_Q: tl.constexpr,  # >= the longest per-request token count
+    BLOCK_PAD: tl.constexpr,
 ):
-    """One program per request; writes only that request's own span."""
+    """One program per request, then one per block of the graph's padded tail."""
     i = tl.program_id(0)
+    if i >= num_requests:
+        col = (i - num_requests) * BLOCK_PAD + tl.arange(0, BLOCK_PAD)
+        end = tl.load(cu_ptr + num_requests)  # `cu` says where requests end
+        tl.store(out_ptr + col, 0, mask=(col >= end) & (col < width))
+        return
+
     src = tl.load(src_ptr + i)
     if src < 0:  # NEW_SEQUENCE — the host already staged this request's span
         return
@@ -92,11 +111,12 @@ def fill_deferred_decode_ids(
     draft_token_ids: torch.Tensor | None,
     *,
     max_tokens_per_seq: int,
+    width: int,
 ) -> None:
-    """Overwrite the deferred requests' spans of `out`, in place.
+    """Overwrite the deferred requests' spans of `out`, and zero the tail.
 
     Args:
-      out:             `[>= cu[bs]]` int32 — the decode region of `input_ids`,
+      out:             `[>= width]` int32 — the decode region of `input_ids`,
                        already staged from `batch.scheduled_tokens`.
       cu:              `[bs+1]` int32 — exclusive prefix sum of per-request
                        token counts. The ONLY statement of how long each
@@ -109,9 +129,13 @@ def fill_deferred_decode_ids(
                        (then every span must be one token long).
       max_tokens_per_seq: an upper bound on `cu[i+1] - cu[i]`; sizes the
                        kernel's column vector.
+      width:           tokens the forward will read; `[cu[bs], width)` is
+                       zeroed. Required, because a caller that forgets it
+                       leaves the graph's padded rows on the last step's ids.
     """
     bs = int(src.shape[0])
-    if bs == 0:
+    tail = -(-int(width) // BLOCK_PAD)
+    if bs + tail == 0:
         return
     assert cu.shape[0] == bs + 1, f"cu must be [bs+1]={bs + 1}, got {tuple(cu.shape)}"
     has_draft = draft_token_ids is not None
@@ -119,15 +143,18 @@ def fill_deferred_decode_ids(
         "a step with no draft ids must feed exactly one token per request, "
         f"got max_tokens_per_seq={max_tokens_per_seq}"
     )
-    _fill_deferred_decode_ids_kernel[(bs,)](
+    _fill_deferred_decode_ids_kernel[(bs + tail,)](
         out,
         cu,
         src,
         prev_token_ids,
         draft_token_ids if has_draft else prev_token_ids,
         draft_token_ids.stride(0) if has_draft else 0,
+        bs,
+        int(width),
         HAS_DRAFT=has_draft,
         BLOCK_Q=triton.next_power_of_2(max(int(max_tokens_per_seq), 1)),
+        BLOCK_PAD=BLOCK_PAD,
     )
 
 
@@ -139,6 +166,7 @@ def fill_deferred_decode_ids_reference(
     draft_token_ids: torch.Tensor | None,
     *,
     max_tokens_per_seq: int,
+    width: int,
 ) -> None:
     """Pure-torch twin of the kernel, runnable on CPU.
 
@@ -150,6 +178,7 @@ def fill_deferred_decode_ids_reference(
     """
     del max_tokens_per_seq  # only the kernel needs a static column bound
     cu_l = cu.tolist()
+    out[cu_l[-1] : width] = 0
     for i, row in enumerate(src.tolist()):
         if row < 0:  # NEW_SEQUENCE, same test the kernel makes
             continue

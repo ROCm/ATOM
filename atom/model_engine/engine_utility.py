@@ -218,16 +218,19 @@ class EngineUtilityHandler:
         )
 
     def _handle_abort_request(self, args: dict):
-        """Mark a sequence ABORTED (client disconnected) so the scheduler finishes
-        it at the next step via the normal stop path (frees KV, drops it)."""
+        """Cancel queued work promptly; running forwards finish via postprocess."""
         req_id = args.get("req_id") if isinstance(args, dict) else None
         if req_id is None or self.scheduler is None:
             return
-        found = False
-        for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
-            if seq.id == req_id:
-                seq.status = SequenceStatus.ABORTED
-                found = True
+        abort = getattr(self.scheduler, "abort_request", None)
+        if callable(abort):
+            found = abort(req_id)
+        else:
+            found = False
+            for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+                if seq.id == req_id:
+                    seq.status = SequenceStatus.ABORTED
+                    found = True
         logger.info(f"{self.label}: abort_request req_id={req_id} found={found}")
 
     def _handle_configure_hidden_states(self, args: dict):

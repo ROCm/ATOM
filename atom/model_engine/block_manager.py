@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from math import inf, isinf
 from time import monotonic
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import xxhash
@@ -131,6 +132,11 @@ class BlockManager:
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.enable_prefix_caching = config.enable_prefix_caching
+        # Content hashes only: pool hits and resource fit are always rechecked.
+        # Weak keys keep this scheduler-side cache out of request serialization.
+        self._prefill_probe_hashes: WeakKeyDictionary[
+            Sequence, tuple[int, list[int]]
+        ] = WeakKeyDictionary()
         self.total_evicted_blocks: int = 0
 
         kv_events = getattr(config, "kv_events_config", None)
@@ -855,23 +861,35 @@ class BlockManager:
         caller's loop variable holds a hash that is not in the chain.
         """
         chain = list(block_hashes)
-        h = chain[-1] if chain else -1
+        h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
             h = self.compute_hash(self._hash_block_tokens(seq, i), h)
             chain.append(h)
         return chain
 
-    def can_allocate(self, seq: Sequence, record: bool = True) -> int:
+    def prefix_hash_chain(
+        self, seq: Sequence, block_hashes: list[int], blocks: int
+    ) -> list[int]:
+        """`block_hashes` continued to `blocks` entries, for callers outside
+        the manager. Seeded from `seq.cache_seed` like every chain it mints."""
+        return self._chain_to(seq, block_hashes, blocks)
+
+    def can_allocate(
+        self,
+        seq: Sequence,
+        record: bool = True,
+        *,
+        block_hashes: list[int] | None = None,
+        reuse_hashes: bool = False,
+    ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
-        `record=False` marks a fit probe -- asking only whether the seq *could*
-        be admitted. The fit answer is identical, but the probe is not
-        side-effect-free: the instrumentation and checkpoint-demand/-end writes
-        below run before the `record` gate. That is safe -- the sole probe caller
-        reads only the `>= 0` return, and the next real `can_allocate` overwrites
-        those fields first. `record` gates only the joint-boundary commit (seq
-        joint fields + funnel counters), so a probe cannot inflate the
-        operator-visible funnel (see `_commit_joint_boundary`).
+        `record=False` returns the same fit and HBM hit without committing
+        joint-load fields or joint-boundary counters. Checkpoint demand/end
+        and hit instrumentation still refresh; demand counters deduplicate per
+        request. An optional `block_hashes` output
+        lets the scheduler defer `record_allocation` until after its wait and
+        token-budget checks, reusing this probe's chain without another walk.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -888,6 +906,10 @@ class BlockManager:
         # The full per-request width, because that is what `allocate` will take:
         # gating on one slot would admit a request the pool cannot give a
         # rollback set to.
+        if block_hashes is None:
+            block_hashes = []
+        else:
+            block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
@@ -897,12 +919,23 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = -1
+        h = seq.cache_seed
         compressed_hit = 0
-        block_hashes: list[int] = []
+        cached_hashes = None
+        if reuse_hashes:
+            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
+            if seed != h:
+                cached_hashes = []
+            self._prefill_probe_hashes[seq] = (h, cached_hashes)
+        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
         for i in range(self._n_hash_blocks(seq) - 1):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            if cached_hashes is not None and i < len(cached_hashes):
+                h = cached_hashes[i]
+            else:
+                h = self.compute_hash(token_ids, h)
+                if cached_hashes is not None and i < immutable_blocks:
+                    cached_hashes.append(h)
             block_id = self.kv.lookup(h)
             if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
                 break
@@ -949,25 +982,11 @@ class BlockManager:
         self._record_checkpoint_end(seq)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
-        # A boundary LMCache and the tier can jointly reach, above this hit.
-        # Committed to the seq rather than returned: what `allocate` claims from
-        # HBM is still `num_cached_blocks`, and the joint boundary only decides
-        # where the two loads are aimed. `record` is the probe/admission split:
-        # a real admission computes the boundary and commits it (seq fields +
-        # funnel counters); a fit probe skips it entirely. The `num_cached_blocks`
-        # returned below does not depend on the decision, so gating the
-        # computation -- not just the commit -- spares a probe the O(prompt) work
-        # for a value it would only discard: `_joint_kv_boundary` walks a chained
-        # xxhash up to the LMCache-only cap (`_chain_to`) plus a `_gated_hit`
-        # rescan. A 128k prompt at the front of a KV-pressured queue paid that
-        # full chain on every scheduling pass (`is_mixed_batch` peeks up to four
-        # waiting seqs with `record=False`) for a decision nothing read. Placed
-        # below the refusal, not above it, for the same reason `_extend_hash_chain`
-        # is: a refused admission would discard it, and nothing between here and
-        # the refusal reads the seq's joint fields -- this is that move's twin.
+        # A direct admission commits its joint boundary here. The scheduler
+        # probes first and calls record_allocation only after dependency and
+        # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
-            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
-            self._commit_joint_boundary(seq, decision)
+            self.record_allocation(seq, num_cached_blocks, block_hashes)
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
         # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
@@ -982,6 +1001,14 @@ class BlockManager:
         # place, because that is a policy decision and this is not.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
+
+    def record_allocation(
+        self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
+    ) -> None:
+        """Commit the fit probe before any allocation changes the pool."""
+        if self.enable_prefix_caching:
+            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+            self._commit_joint_boundary(seq, decision)
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
@@ -1015,7 +1042,7 @@ class BlockManager:
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
-        h = -1
+        h = seq.cache_seed
         hit_hash = -1
         for i in range(claim_blocks):
             token_ids = self._hash_block_tokens(seq, i)
@@ -1561,7 +1588,7 @@ class BlockManager:
         source-level bug; callers skip the range rather than mint false hashes.
         """
         if start <= 0:
-            return -1
+            return seq.cache_seed
         h = self.kv.block(seq.block_table[start - 1]).hash
         if h != -1:
             return h
@@ -2060,7 +2087,9 @@ class BlockManager:
         self.state.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
 
-    def checkpoint_cut(self, seq: Sequence, start: int, end: int) -> int:
+    def checkpoint_cut(
+        self, seq: Sequence, start: int, end: int, *, record: bool = True
+    ) -> int:
         """Earliest ladder position in `(start, end]`, or 0 if there is none.
 
         What a prefill chunk is cut at so its forward lands exactly on a rung.
@@ -2133,7 +2162,7 @@ class BlockManager:
         # `chunks_cut_for_demand` would swamp the convergence signal that
         # counter exists to expose. The demand is checked first because when
         # the two coincide it is the demand that evidenced the position.
-        if target != rung and target < end:
+        if record and target != rung and target < end:
             if target == demand:
                 self.chunks_cut_for_demand += 1
             else:
@@ -2477,7 +2506,11 @@ class BlockManager:
         return num_full - start
 
     def deallocate_partial(
-        self, seq: Sequence, protected_block_ids: frozenset[int]
+        self,
+        seq: Sequence,
+        protected_block_ids: frozenset[int],
+        *,
+        per_request_state_safe: bool = False,
     ) -> None:
         """Deallocate `seq` now, except block IDs a pending offload save reads.
 
@@ -2495,20 +2528,15 @@ class BlockManager:
         request is deallocated normally. This makes ownership explicit: shared
         prefix blocks retain their other owners, while the save owns exactly
         one refcount share until ``free_leased_blocks`` releases it.
+
+        Per-request recurrent state is fail-closed: its active slots may be
+        released here only when the connector explicitly confirms that every
+        state source needed after request teardown has an independent lease.
         """
-        if seq.has_per_req_cache:
-            # Per-request recurrent state (GDN/hybrid checkpoints) has release
-            # ordering this simplified path never replicates (orphan load
-            # slots, `state_offload.abandon_load`, fork-source pins -- see
-            # `deallocate` below). Not reachable today: every offload connector
-            # that can drive early release sets `_permit_per_request_state =
-            # False` and rejects such a model at `register_kv_caches`. Kept as
-            # an explicit guard rather than a silent skip, so a future
-            # hybrid connector that both permits per-request state and enables
-            # early release fails loudly here instead of freeing a leased PAGE
-            # or leaking a state slot.
+        if seq.has_per_req_cache and not per_request_state_safe:
             raise RuntimeError(
-                "partial PAGE deallocation is unsupported for per-request state"
+                "partial PAGE deallocation is unsupported for per-request "
+                "state without an explicit connector safety capability"
             )
         table = set(seq.block_table)
         unknown = set(protected_block_ids) - table
@@ -2519,6 +2547,57 @@ class BlockManager:
         for block_id in protected_block_ids:
             self.kv.claim(block_id)
         self.deallocate(seq)
+
+    def acquire_offload_prefix(
+        self,
+        seq: Sequence,
+        start_tokens: int,
+        end_tokens: int,
+    ) -> tuple[list[int], int, tuple[int, ...]]:
+        """Claim the still-resident contiguous prefix used by a late save.
+
+        A finished request no longer owns its old physical block table. Each
+        block is therefore resolved again through the content hash index and
+        token-checked before it is claimed. The scan stops at the first gap so
+        the returned range can never describe a cache object with a hole.
+        """
+        hbs = self._hash_block_size()
+        if (
+            start_tokens < 0
+            or end_tokens < start_tokens
+            or start_tokens % hbs
+            or end_tokens % hbs
+        ):
+            raise ValueError(
+                f"offload source range [{start_tokens}, {end_tokens}) must "
+                f"align to hash block size {hbs}"
+            )
+        end_block = end_tokens // hbs
+        start_block = start_tokens // hbs
+        block_ids = [-1] * end_block
+        claimed: list[int] = []
+        parent_hash = seq.cache_seed
+        available_end = start_tokens
+        for index in range(end_block):
+            token_ids = self._hash_block_tokens(seq, index)
+            block_hash = self.compute_hash(token_ids, parent_hash)
+            parent_hash = block_hash
+            if index < start_block:
+                continue
+            block_id = self.kv.lookup(block_hash)
+            if block_id < 0:
+                break
+            block = self.kv.block(block_id)
+            if block.hash != block_hash or block.token_ids != token_ids:
+                break
+            self.kv.claim(block_id)
+            claimed.append(block_id)
+            block_ids[index] = block_id
+            available_end = (index + 1) * hbs
+        # The caller may have to trim a partial LMCache chunk from the tail.
+        # Preserve token order until that trim is complete; a set is suitable
+        # only after the exact ordered prefix has been selected.
+        return block_ids, available_end, tuple(claimed)
 
     def free_leased_blocks(self, block_ids) -> None:
         """Return block IDs a `deallocate_partial` lease held back, to the pool.
@@ -2607,6 +2686,7 @@ class BlockManager:
             seq.state_fork_src = -1
 
         seq.offload_joint.load_hash = -1
+        seq.offload_joint.reset_joint()
 
     def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         seq_len = len(seq)

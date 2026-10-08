@@ -4,13 +4,13 @@
       "cadence": "weekly",
       "isl": 1024,
       "osl": 1024,
-      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512],
+      "concurrency": [1, 4, 8, 16, 32, 64, 128, 256, 512],
       "random_range_ratio": 0.8
     },
     {
       "isl": 8192,
       "osl": 1024,
-      "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+      "concurrency": [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
       "random_range_ratio": 0.8
     }
   ],
@@ -33,7 +33,7 @@
           "suffix": "-mtp3",
           "extra_args": "--method mtp --num-speculative-tokens 3",
           "bench_args": "--use-chat-template",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         },
         {
@@ -116,6 +116,28 @@
       ]
     },
     {
+      "display": "DeepSeek-V4.1-Flash",
+      "path": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "prefix": "deepseek-v41-flash",
+      "runner": "atom-mi355-8gpu.predownload",
+      "env_vars": "",
+      "config": {
+        "tp": 4,
+        "kv_cache_dtype": "bf16",
+        "extra_args": "--index_cache_dtype fp4"
+      },
+      "variants": [
+        {
+          "label": "DSpark",
+          "suffix": "-dspark",
+          "extra_args": "--method dspark --num-speculative-tokens 5",
+          "bench_args": "--use-chat-template",
+          "conc_min": 1,
+          "conc_max": 256
+        }
+      ]
+    },
+    {
       "display": "DeepSeek-R1-0528-MXFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "prefix": "deepseek-r1-0528-mxfp4",
@@ -129,7 +151,7 @@
           "suffix": "-mtp3",
           "extra_args": "--method mtp --num-speculative-tokens 3",
           "bench_args": "--use-chat-template",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         }
       ]
@@ -152,7 +174,7 @@
           "suffix": "-mtp3",
           "extra_args": "--method mtp --num-speculative-tokens 3",
           "bench_args": "--use-chat-template",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         }
       ]
@@ -180,7 +202,7 @@
           "suffix": "-mtp3",
           "extra_args": "--online_quant_config '{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*.mlp.gate\", \"model.layers.[0-9].mlp.*expert*\",\"model.layers.[1-6][0-9].mlp.*expert*\",\"model.layers.7[0-7].mlp.*expert*\"]}' --method mtp --num-speculative-tokens 3",
           "bench_args": "--use-chat-template",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         }
       ]
@@ -253,7 +275,7 @@
           "suffix": "-eagle3",
           "extra_args": "--max-num-seqs 256 --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
           "bench_args": "--use-chat-template",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         }
       ]
@@ -277,7 +299,7 @@
           "suffix": "-eagle3",
           "extra_args": "--max-num-seqs 256 --method eagle3 --draft-model Inferact/MiniMax-M3-EAGLE3 --num-speculative-tokens 3",
           "bench_args": "--use-chat-template",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         }
       ]
@@ -300,7 +322,7 @@
           "suffix": "-mtp3",
           "extra_args": "--method mtp --num-speculative-tokens 3",
           "bench_args": "",
-          "conc_min": 4,
+          "conc_min": 1,
           "conc_max": 256
         }
       ]

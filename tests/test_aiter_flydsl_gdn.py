@@ -239,9 +239,12 @@ def test_triton_decode_vk_fallback():
     writes = reads + 3
     expected = baseline_decode(q, k, v, a, b, state, log, bias, reads, writes)
     actual = baseline_decode(q, k, v, a, b, vk, log, bias, reads, writes)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    # Different memory layouts compile independently; near-zero state values
-    # may differ by a BF16 rounding unit even when output tokens are identical.
+    # Different memory layouts compile independently, so near-zero values may
+    # differ by a BF16 rounding unit. That goes for the output as well as the
+    # state: on gfx950 two of 9216 output elements land 1.5e-5 apart, at a
+    # magnitude of 2e-3. A fallback reading the WRONG values is not what this
+    # admits -- it would be wrong by its own magnitude, not by an ulp.
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-6)
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
@@ -286,6 +289,27 @@ def test_qwen_backend_binds_zero_copy_vk_state(
         assert result.v_cache is raw
 
 
+@requires_gfx942
+def test_align_flydsl_decode_accepts_strided_and_padded_indices():
+    q, k, v, a, b, log, bias = inputs(4)
+    state = torch.randn(8, 24, 128, 128, device="cuda", dtype=torch.float32)
+    state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
+    wide = torch.arange(16, device="cuda", dtype=torch.int32)
+    strided = wide[::2][:4]
+    padded = torch.arange(7, device="cuda", dtype=torch.int32)
+    assert not fly.decode_supported(q, k, v, a, b, state, log, bias, strided, strided)
+    assert not fly.decode_supported(q, k, v, a, b, state, log, bias, padded, padded)
+    from atom.plugin.sglang.attention_backend.attention_gdn import (
+        _align_flydsl_decode_slots,
+    )
+
+    reads = _align_flydsl_decode_slots(strided, 4)
+    writes = _align_flydsl_decode_slots(padded, 4)
+    assert fly.decode_supported(q, k, v, a, b, state, log, bias, reads, writes)
+    assert reads.tolist() == [0, 2, 4, 6]
+    assert writes.tolist() == [0, 1, 2, 3]
+
+
 def test_unsupported_device_decode_fallback(monkeypatch):
     from types import SimpleNamespace
 
@@ -308,7 +332,9 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     monkeypatch.undo()
     expected = baseline_decode(q, k, v, a, b, state, log, bias, reads, writes)
     actual = baseline_decode(q, k, v, a, b, vk, log, bias, reads, writes)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    # Same BF16 rounding-unit allowance as `test_triton_decode_vk_fallback`,
+    # for the same reason: the two layouts compile independently.
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=2e-6)
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 

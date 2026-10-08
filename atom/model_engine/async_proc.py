@@ -30,7 +30,12 @@ import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
+from atom.model_engine.block_table_codec import (
+    BlockTableDeltaDecoder,
+    BlockTableDeltaEncoder,
+)
 from atom.utils import (
+    envs,
     get_mp_context,
     get_open_zmq_ipc_path,
     init_exit_handler,
@@ -183,6 +188,7 @@ class AsyncIOProc:
             self.io_threads.append(t)
 
         self.all_ranks_barrier = all_ranks_barrier
+        self._block_table_decoder = BlockTableDeltaDecoder()
 
         runner_class = resolve_obj_by_qualname(runner_qualname)
         self.runners: list[object] = []
@@ -275,7 +281,7 @@ class AsyncIOProc:
 
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()
-        return method_name, args
+        return method_name, self._block_table_decoder.decode_rpc(method_name, args)
 
 
 class AsyncIOProcManager:
@@ -309,6 +315,7 @@ class AsyncIOProcManager:
         self.rpc_broadcast_mq = MessageQueue(
             proc_num, proc_num, max_chunk_bytes=16 * 1024 * 1024
         )
+        self._block_table_encoder = BlockTableDeltaEncoder()
         scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
         self.still_running = True
         # Register atexit to clean up shared memory even if exit() doesn't complete
@@ -380,9 +387,10 @@ class AsyncIOProcManager:
         self.still_running = False
         self._cleanup_shared_memory()
         logger.info(f"{self.label}: shutdown all runners...")
+        deadline = time.monotonic() + envs.ATOM_SHUTDOWN_TIMEOUT_S
         for proc in self.procs:
             if proc.is_alive():
-                proc.join(timeout=5)
+                proc.join(timeout=max(deadline - time.monotonic(), 0))
         shutdown_all_processes(self.procs, allowed_seconds=1)
         self.procs = []
         self.output_thread.join(timeout=1)
@@ -447,6 +455,7 @@ class AsyncIOProcManager:
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""
         logger.debug(f"{self.label}: call_func {func_name} {args}")
+        args = self._block_table_encoder.encode_rpc(func_name, args)
         msg = (func_name, *args)
         self.rpc_broadcast_mq.enqueue(msg)
         if wait_out:

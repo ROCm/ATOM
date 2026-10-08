@@ -52,12 +52,13 @@ class _Buf:
         return self._t if n is None else self._t[:n]
 
 
-def _plan(extend, context, ratio, overlap, rows=4096):
+def _plan(extend, context, ratio, overlap, rows=4096, extra_write=0):
     plans = make_compress_plans(
         np.asarray(extend, dtype=np.int32),
         np.asarray(context, dtype=np.int32),
         [(ratio, overlap)],
         plan_buffers={ratio: {"compress": _Buf(rows), "write": _Buf(rows)}},
+        extra_write=extra_write,
     )
     return plans[ratio]
 

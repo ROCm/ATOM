@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """CPU unit tests for `make_compress_plans` write/compress slice capacities.
 
 Covers the three slicing modes (eager / decode-CUDAGraph / extend-shaped verify)
@@ -68,7 +67,9 @@ def _uniform_decode(bs, qlen, ctx=100):
 def test_eager_compress_tight_write_full_buffer():
     extend, context = _uniform_decode(bs=5, qlen=4)
     bufs = _buffers(write_rows=200)
-    plans = make_compress_plans(extend, context, RATIOS_OVERLAP, plan_buffers=bufs)
+    plans = make_compress_plans(
+        extend, context, RATIOS_OVERLAP, plan_buffers=bufs, extra_write=0
+    )
     for ratio, _ in RATIOS_OVERLAP:
         p = plans[ratio]
         # compress slice is tight; write slice is the full buffer (legacy).
@@ -90,6 +91,7 @@ def test_decode_cg_slice_equals_graph_bs_times_bound():
         plan_buffers=bufs,
         running_bs=running_bs,
         max_q_len=qlen,
+        extra_write=0,
     )
     for ratio, is_overlap in RATIOS_OVERLAP:
         p = plans[ratio]
@@ -111,6 +113,7 @@ def test_decode_write_count_is_bs_times_bound():
         plan_buffers=_buffers(),
         running_bs=running_bs,
         max_q_len=qlen,
+        extra_write=0,
     )
     for ratio, is_overlap in RATIOS_OVERLAP:
         assert plans[ratio].num_write == bs * min(qlen, _k_pool(ratio, is_overlap))
@@ -127,6 +130,7 @@ def test_decode_padding_region_is_sentinel():
         plan_buffers=_buffers(),
         running_bs=running_bs,
         max_q_len=qlen,
+        extra_write=0,
     )
     for ratio, _ in RATIOS_OVERLAP:
         p = plans[ratio]
@@ -151,6 +155,7 @@ def test_decode_cg_invariant_across_real_bs():
             plan_buffers=_buffers(),
             running_bs=running_bs,
             max_q_len=qlen,
+            extra_write=0,
         )
         shapes[bs] = {
             r: (plans[r].compress_plan_gpu.shape[0], plans[r].write_plan_gpu.shape[0])
@@ -173,6 +178,7 @@ def test_empty_fwd_decode_cg_matches_caps_all_sentinel():
         plan_buffers=_buffers(),
         running_bs=running_bs,
         max_q_len=qlen,
+        extra_write=0,
     )
     for ratio, is_overlap in RATIOS_OVERLAP:
         p = plans[ratio]
@@ -187,7 +193,9 @@ def test_empty_fwd_eager_compress_zero_write_full():
     extend = np.zeros(4, dtype=np.int32)
     context = np.zeros(4, dtype=np.int32)
     bufs = _buffers(write_rows=50)
-    plans = make_compress_plans(extend, context, RATIOS_OVERLAP, plan_buffers=bufs)
+    plans = make_compress_plans(
+        extend, context, RATIOS_OVERLAP, plan_buffers=bufs, extra_write=0
+    )
     for ratio, _ in RATIOS_OVERLAP:
         assert plans[ratio].compress_plan_gpu.shape[0] == 0
         assert plans[ratio].write_plan_gpu.shape[0] == 50
@@ -206,6 +214,7 @@ def test_verify_explicit_compress_cap_write_full_buffer():
         RATIOS_OVERLAP,
         plan_buffers=bufs,
         decode_capacity_per_ratio=cap,
+        extra_write=0,
     )
     for ratio, _ in RATIOS_OVERLAP:
         p = plans[ratio]
@@ -246,7 +255,9 @@ def test_each_ratio_publishes_its_own_window_len():
     extend = np.array([6, 3, 5, 1], dtype=np.int32)
     context = np.array([600, 40, 271, 9], dtype=np.int32)
     bufs = _buffers(compress_rows=512, write_rows=512)
-    plans = make_compress_plans(extend, context, RATIOS_OVERLAP, plan_buffers=bufs)
+    plans = make_compress_plans(
+        extend, context, RATIOS_OVERLAP, plan_buffers=bufs, extra_write=0
+    )
     checked = 0
     for ratio, is_overlap in RATIOS_OVERLAP:
         p = plans[ratio]
@@ -261,6 +272,35 @@ def test_each_ratio_publishes_its_own_window_len():
     assert _window_len(0, _k_pool(4, True)) != _window_len(0, _k_pool(128, False))
 
 
+def test_extra_write_is_what_keeps_a_fwd_wider_than_its_pool_window():
+    """A fwd must be able to retain every position it computed.
+
+    `K_pool` is the read window, so retaining only that drops a fwd's own
+    tokens the moment it is wider -- and it is the rejected drafts of a
+    speculative round that go missing, exactly the ones the next round reads
+    back into. Ratio 1 stands in for CSA2, whose `K_pool` is 1: V4's own 8 and
+    128 are wider than any draft span, which is why this is invisible there.
+    """
+    qlen, ratio = 6, 1
+    extend, context = _uniform_decode(bs=1, qlen=qlen, ctx=100)
+    kept = {}
+    for extra_write in (0, qlen - 1):
+        bufs = {ratio: {"compress": _FakeBuf(64), "write": _FakeBuf(64)}}
+        plan = make_compress_plans(
+            extend,
+            context,
+            [(ratio, False)],
+            plan_buffers=bufs,
+            extra_write=extra_write,
+        )[ratio]
+        kept[extra_write] = sorted(
+            int(p) for p in bufs[ratio]["write"].np[: plan.num_write, POSITION_COL]
+        )
+    # Without the slack only the pool window survives; with it, the whole fwd.
+    assert kept[0] == [99]
+    assert kept[qlen - 1] == [94, 95, 96, 97, 98, 99]
+
+
 def test_graph_bs_and_decode_cap_mutually_exclusive():
     extend, context = _uniform_decode(bs=2, qlen=2)
     with pytest.raises(AssertionError):
@@ -272,4 +312,5 @@ def test_graph_bs_and_decode_cap_mutually_exclusive():
             running_bs=4,
             max_q_len=2,
             decode_capacity_per_ratio={4: 8, 128: 8},
+            extra_write=0,
         )

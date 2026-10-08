@@ -132,6 +132,9 @@ def _linear_double(quant_type, params_dtype, needs_preshuffled_weight, *, dim=2)
         need_normalize_e4m3fn_to_e4m3fnuz=False,
         output_partition_sizes=[32],
         needs_preshuffled_weight=needs_preshuffled_weight,
+        # `None` = not the native group32 path, which returns before settling
+        # any layout at all and so would answer every case below the same way.
+        native_a8_group_rows=None,
         _maybe_pad_a8w8_preshuffle_output=lambda: False,
         prefix="test",
     )

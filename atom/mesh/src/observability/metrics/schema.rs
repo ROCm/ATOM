@@ -377,7 +377,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::ROUTER_TOKENS_TOTAL,
         kind: MetricKind::Counter,
-        help: "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only)",
+        help: "Total observed tokens by router_type, backend_type, model, endpoint, token_type",
         status: MetricStatus::Active,
     },
     MetricSpec {

@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _MQA_LOGITS_PRESHUFFLE_ROWS
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
+from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
+    MQA_LOGITS_PRESHUFFLE_ROWS,
+)
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
@@ -61,6 +62,43 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         if hasattr(module, "base_attention") and getattr(module, "use_mla", False):
             return (MLA_ROWS,)
         return ()
+
+    def get_kv_transfer_tensors(self):
+        """MLA PAGE regions plus the native checkpoint contract, for `lmcache_mp`.
+
+        K3 keeps its KDA checkpoint images in ordinary MLA PAGE units, laid out
+        by `_page_unit_regions` -- one region per MLA row, then each index
+        layer. Those are exactly the leading regions the MLA builder publishes,
+        in the same order and per-unit size, so publishing the checkpoint spec
+        and copy callback over them lets `lmcache_mp` store and restore the KDA
+        state with the KV. Without them the MP worker refuses K3 rather than
+        restoring KV under stale recurrent state.
+
+        KDA heads are TP-sharded, so every rank's image differs: STATE is never
+        TP-replicated even though the MLA KV beside it is.
+        """
+        transfer = super().get_kv_transfer_tensors()
+        if transfer is None or not self._uses_paged_checkpoints():
+            return transfer
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return transfer
+        bases, sizes = self._page_unit_regions()
+        count = len(bases)
+        published = [
+            (page.region.base_addr, page.region.unit_bytes)
+            for page in transfer.pages[:count]
+        ]
+        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+            raise RuntimeError(
+                "Kimi-K3 transfer regions do not match its checkpoint PAGE unit: "
+                f"{len(transfer.pages)} published, {count} in a unit"
+            )
+        transfer.paged_state_checkpoint_spec = spec
+        transfer.execute_paged_state_copies = self.execute_paged_state_copies
+        transfer.paged_state_region_count = count
+        transfer.native_state_tp_replication_factor = 1
+        return transfer
 
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
@@ -189,10 +227,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"index_kpool={kpool}; Config sets the block size for exactly this"
             )
         rows = runner.block_size // kpool
-        if rows % _MQA_LOGITS_PRESHUFFLE_ROWS:
+        if rows % MQA_LOGITS_PRESHUFFLE_ROWS:
             raise ValueError(
                 f"{rows} pooled rows per block is not a multiple of "
-                f"{_MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
+                f"{MQA_LOGITS_PRESHUFFLE_ROWS}, so deepgemm_fp8_paged_mqa_logits "
                 "cannot stay in the preshuffled layout -- the only one it computes "
                 "correctly. Raise kv_cache_block_size."
             )
@@ -426,14 +464,12 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         return attn_metadata, positions
 
-    def build_for_cudagraph_capture(self, bs: int):
-        if self.block_size == 1:
-            var = self.model_runner.forward_vars
-            var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-            var["kv_indptr"].copy_to_gpu(bs + 1)
-            var["kv_indices"].gpu[:bs].zero_()
-            var["kv_last_page_lens"].gpu[:bs].fill_(1)
+    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
+        # Kimi's dense MLA warmup needs a page even with page_size=1.
+        # The parent owns the single upload, including DCP + MTP capture.
+        return True
 
+    def build_for_cudagraph_capture(self, bs: int):
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
         return attn_metadata, context

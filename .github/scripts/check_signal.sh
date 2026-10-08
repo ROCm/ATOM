@@ -88,16 +88,15 @@ find_checks_run_id() {
     return 1
   fi
 
-  local -a gh_args=(
-    run list
-    --repo "${REPO}"
-    --workflow "${CHECKS_WORKFLOW_NAME}"
-    --limit 20
-    --json databaseId,headSha,headBranch,event,createdAt,status
-  )
+  # Only the commit is filtered server-side. The branch/event filters of the
+  # runs list API have returned stale pages for minutes at a time (newest run
+  # days old), which made this gate time out on a run that had already passed;
+  # the head_sha filter kept returning the run, so branch and event are
+  # matched locally instead.
+  local select_expr=".headSha == \"${target_head_sha}\""
 
   if [ -n "${target_branch}" ]; then
-    gh_args+=(--branch "${target_branch}")
+    select_expr+=" and .headBranch == \"${target_branch}\""
   fi
 
   # Nightly and reusable workflows reuse the Pre Checkin result from the
@@ -105,11 +104,15 @@ find_checks_run_id() {
   if [ -n "${SIGNAL_EVENT_NAME}" ] \
     && [ "${SIGNAL_EVENT_NAME}" != "schedule" ] \
     && [ "${SIGNAL_EVENT_NAME}" != "workflow_call" ]; then
-    gh_args+=(--event "${SIGNAL_EVENT_NAME}")
+    select_expr+=" and .event == \"${SIGNAL_EVENT_NAME}\""
   fi
 
-  gh "${gh_args[@]}" \
-    --jq "(map(select(.headSha == \"${target_head_sha}\")) | first | .databaseId) // empty"
+  gh run list \
+    --repo "${REPO}" \
+    --workflow "${CHECKS_WORKFLOW_NAME}" \
+    --commit "${target_head_sha}" \
+    --json databaseId,headSha,headBranch,event,createdAt,status \
+    --jq "(map(select(${select_expr})) | first | .databaseId) // empty"
 }
 
 # Echoes "<status>\t<conclusion>" for the given run.

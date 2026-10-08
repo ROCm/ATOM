@@ -103,10 +103,13 @@ def _make_sglang_sys_modules(
     mock_load_config_mod=None,
 ):
     """Build the sys.modules dict needed to mock sglang imports."""
+    mock_runtime_context = MagicMock()
+    mock_runtime_context.get_server_args = mock_server_args_mod.get_global_server_args
     mods = {
         "sglang": MagicMock(),
         "sglang.srt": MagicMock(),
         "sglang.srt.server_args": mock_server_args_mod,
+        "sglang.srt.runtime_context": mock_runtime_context,
     }
     if mock_distributed_mod is not None:
         mods["sglang.srt.distributed"] = mock_distributed_mod
@@ -226,7 +229,7 @@ def test_generate_sglang_config_raises_on_none_server_args(monkeypatch):
 
 
 def test_generate_sglang_config_raises_on_server_args_exception(monkeypatch):
-    """Verify clear error when get_global_server_args() raises."""
+    """Verify clear error when SGLang ServerArgs lookup raises."""
     import atom.config as atom_config_module
 
     monkeypatch.setattr(atom_config_module, "Config", _FakeConfig, raising=False)

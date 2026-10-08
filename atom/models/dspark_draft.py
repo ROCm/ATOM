@@ -32,6 +32,12 @@ from torch import nn
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
+    supports_block_graph = True
+
+    def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
+        """Mask padded writes for models whose draft pass mutates private KV."""
+        return
+
     def write_context_kv(
         self,
         aux_concat: torch.Tensor,  # [N, target_hidden * num_target_layers]

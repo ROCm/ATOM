@@ -73,7 +73,11 @@ def merge_attn_states(
     )
 
 
-@triton.jit
+# prefill_tokens_with_context is a per-batch runtime count (every MLA caller
+# leaves it at the num_tokens default), so it must stay a plain int and must
+# not be value-specialized: as a constexpr it cost one JIT compile per distinct
+# batch size, which landed inside serving windows and stalled every TP rank.
+@triton.jit(do_not_specialize=["prefill_tokens_with_context"])
 def merge_attn_states_kernel(
     output,  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
     output_lse,  # [NUM_HEADS, NUM_TOKENS]
@@ -90,7 +94,7 @@ def merge_attn_states_kernel(
     PADDED_HEAD_SIZE: tl.constexpr,
     BLOCK_H: tl.constexpr,
     OUTPUT_LSE: tl.constexpr,
-    prefill_tokens_with_context: tl.constexpr,
+    prefill_tokens_with_context,
     USE_FP8: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,

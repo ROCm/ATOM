@@ -25,14 +25,13 @@ import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
 from atom.kv_transfer.offload.atom_lmcache_staging import (
-    _env_flag,
-    _env_optional_int,
     _PipelineStage,
     _StagingBuffer,
     _ThreadTransferState,
     memory_object_as_uint8,
     run_staged_pipeline,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -46,7 +45,7 @@ logger = logging.getLogger("atom")
 # handoff a no-op of in-order execution and gives up an overlap that does not
 # exist. Correctness is unaffected -- one stream is strictly more ordered than
 # two, and the terminal synchronize is unchanged.
-_SINGLE_STREAM = _env_flag("OFFLOAD_SINGLE_STREAM")
+_SINGLE_STREAM = envs.OFFLOAD_SINGLE_STREAM
 
 # The default staging buffer is denominated in bytes, not in LMCache chunks --
 # see `_default_staging_buffer_chunks` for why. 48 MiB: on GLM-5.2, whose chunk
@@ -260,10 +259,10 @@ class BlockGPUConnector:
         self._quarantined_staging_tensors: list[torch.Tensor] = []
         self._quarantined_block_id_owners: list[Any] = []
         self._quarantined_staging_lock = threading.Lock()
-        requested_buffer_chunks = _env_optional_int("OFFLOAD_GPU_STAGING_CHUNKS")
+        requested_buffer_chunks = envs.OFFLOAD_GPU_STAGING_CHUNKS
         if requested_buffer_chunks is None:
             requested_buffer_chunks = self._default_staging_buffer_chunks()
-        max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
+        max_staging_bytes = envs.OFFLOAD_GPU_STAGING_MAX_BYTES
         if max_staging_bytes is not None:
             if max_staging_bytes < self._gpu_staging_chunk_bytes:
                 raise ValueError(
@@ -280,8 +279,8 @@ class BlockGPUConnector:
         self._gpu_staging_buffer_bytes = (
             self._staging_buffer_chunks * self._gpu_staging_chunk_bytes
         )
-        self._release_gpu_staging_after_transfer = _env_flag(
-            "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
+        self._release_gpu_staging_after_transfer = (
+            envs.OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER
         )
 
     def _default_staging_buffer_chunks(self) -> int:
@@ -334,6 +333,7 @@ class BlockGPUConnector:
             "transfer_succeeded": -1,
             "async_host_copy_enabled": 0,
             "batch_block_ids_enabled": 0,
+            "producer_fenced": 0,
             "chunks": -1,
             "groups": -1,
             "max_chunk_bytes": -1,
@@ -433,6 +433,25 @@ class BlockGPUConnector:
             )
             states[key] = state
         return state
+
+    @staticmethod
+    def _wait_for_save_source(state, producer_event) -> None:
+        """Order the actual pack stream after the KV producer stream.
+
+        Must run before this call enqueues anything on ``state.pack_stream``:
+        the block-ID upload and every stage-A pack are ordered behind the
+        producer only because they are enqueued after this wait. A staging
+        state without a pack stream cannot honor the dependency; the fused
+        staging pipeline rejects that device anyway, so refuse loudly instead of
+        host-synchronizing on the save thread.
+        """
+
+        if state.pack_stream is None:
+            raise RuntimeError(
+                "ATOM LMCache connector: producer fence requires a CUDA/HIP "
+                "pack stream"
+            )
+        state.pack_stream.wait_event(producer_event)
 
     def _ensure_staging_buffer(
         self,
@@ -885,9 +904,19 @@ class BlockGPUConnector:
         memory_objs: list[Any],
         starts: list[int],
         ends: list[int],
+        *,
+        producer_event=None,
         **kwargs,
     ) -> None:
-        """Pack ATOM KV blocks tail-to-head into LMCache MemoryObjs."""
+        """Pack ATOM KV blocks tail-to-head into LMCache MemoryObjs.
+
+        ``producer_event`` is an event recorded on the stream that produced the
+        source KV. LMCache forwards ``store(**kwargs)`` to this call, so the
+        dense connector uses it to order this thread's pack stream after the
+        producer without host-synchronizing. It is keyword-only so a wrapper
+        that passes extra positionals cannot bind one to it. ``stats``
+        reports ``producer_fenced=1`` when the dependency was enqueued.
+        """
         with self._capture_transfer_stats() as stats:
             prepared = self._prepare_transfer(
                 memory_objs, starts, ends, tail_to_head=True, **kwargs
@@ -897,6 +926,11 @@ class BlockGPUConnector:
                 return
             state, groups = prepared
             self._record_transfer_shape(stats, groups)
+            if producer_event is not None:
+                # First pack-stream work of this transfer: the block-ID upload
+                # below and every stage-A pack inherit the dependency.
+                self._wait_for_save_source(state, producer_event)
+                stats["producer_fenced"] = 1
             pack_stage, block_id_owner, prepared_ids_active = (
                 self._prepare_block_id_stage(
                     state, groups, "gpu_to_chunk_major_device_buffer"

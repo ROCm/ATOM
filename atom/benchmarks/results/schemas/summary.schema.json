@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "aggregation_version",
+    "point_id",
+    "recipe_fingerprint",
+    "curve_group_id",
+    "requests_sha256",
+    "accounting",
+    "window",
+    "request_metrics",
+    "capabilities"
+  ],
+  "properties": {
+    "request_metrics": {
+      "type": "object",
+      "required": [
+        "latency",
+        "tokens",
+        "throughput"
+      ]
+    },
+    "accounting": {
+      "type": "object",
+      "required": [
+        "counts",
+        "phases",
+        "invalid_reasons"
+      ]
+    },
+    "requests_sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

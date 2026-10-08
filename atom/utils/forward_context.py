@@ -168,7 +168,11 @@ class DPMetadata:
 
 @dataclass
 class SpecDecodeMetadata:
-    draft_token_ids: torch.Tensor
+    # The step's input ids. Draft r is input_ids[target_logits_indices[r] + 1]:
+    # logits row t verifies the token that follows it. Read in place by the
+    # rejection sampler, on the forward stream the next step publishes its
+    # input ids on, so they cannot be overwritten under it.
+    input_ids: torch.Tensor
     num_spec_steps: int
     num_draft_tokens_np: np.ndarray
     cu_num_draft_tokens: torch.Tensor
@@ -423,8 +427,9 @@ class ForwardMode:
             t = getattr(attn_metadata, name, None)
             return None if t is None else int(t.shape[0])
 
-        # `input_ids` is the argument, this rank's own rows -- the cudagraph
-        # branch re-slices the buffer to `running_tokens` itself.
+        # `input_ids` is the scheduled prefix at the runner boundary. Uniform
+        # decode exposes `running_tokens` to the model in both eager and graph
+        # execution; a mixed prefill/decode step keeps its local token count.
         assert input_ids.shape[0] == self.scheduled_tokens, (
             f"input_ids length {input_ids.shape[0]} != scheduled_tokens="
             f"{self.scheduled_tokens} ({self})"
@@ -480,8 +485,7 @@ class Context:
     is_prefill: bool = False
     is_dummy_run: bool = False
     # What this rank was handed. Duplicated from `forward_mode` because a
-    # capture context has none; `scheduled_tokens` is what an eager forward
-    # actually runs.
+    # capture context has none; `scheduled_tokens` counts this rank's real rows.
     scheduled_bs: int = 0
     scheduled_tokens: int = 0
     # The step's DP-unified padded shape. `running_bs` counts SEQUENCES (graph
@@ -596,6 +600,10 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # The FP4 sparse indexer's key bound for each query token (its position +
+    # 1), published once per decode step for every full layer; a draft step's
+    # aliases context_lens.
+    index_row_ends: torch.Tensor | None = None
     # Block-table row per query token, for the same indexer -- both aiter ops
     # address the table by row. Aliases block_tables at one query per sequence.
     # Every producer that rewrites block_tables must rewrite this too: a stale
@@ -638,6 +646,7 @@ class AttentionMetaData:
         sparse_kv_indptr: torch.Tensor | None = None,
         sparse_kv_last_page_lens: torch.Tensor | None = None,
         dcp_local_context_lens: torch.Tensor | None = None,
+        index_row_ends: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -678,6 +687,7 @@ class AttentionMetaData:
         self.sparse_kv_indptr = sparse_kv_indptr
         self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
         self.dcp_local_context_lens = dcp_local_context_lens
+        self.index_row_ends = index_row_ends
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set
@@ -812,6 +822,9 @@ class ForwardContext:
     cudagraph_runtime_mode: Any = None
     batch_descriptor: Any | None = None
 
+    # The DP pad-row work this forward already did (see `step_pad_rows`).
+    pad_rows_done: set = field(default_factory=set)
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
@@ -825,6 +838,88 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # Cached once at module import — CUDA availability does not change at
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
+
+# DP pad-row mask for consumers recorded into CUDA graphs (MegaMoE). A replay
+# runs no Python, so each pass derives its mask on the device, on its first call,
+# from buffers every step already refreshes -- never from a host count:
+#   target pass: rows at or past `cu_seqlens_q[running_bs]` (padded requests
+#     have length 0, so that entry is this rank's real token count);
+#   draft pass (`[running_bs, q]` rows): rows at or past q times the real request
+#     count the step's target pass recorded.
+# A target pass records that count first thing, whatever else it decides, so a
+# draft never reads an older step's; one that cannot tell (no cu_seqlens_q, a TBO
+# micro-batch) records "no padding". The buffers are persistent because graphs,
+# and the pieces of a piecewise graph, record their addresses.
+_NO_PADDING = 1 << 30
+_row_index_device: torch.Tensor | None = None
+_pad_rows_device: torch.Tensor | None = None
+_real_requests_device: torch.Tensor | None = None
+
+
+def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
+    """Allocate (or grow) the mask buffers. Call before any capture."""
+    global _row_index_device, _pad_rows_device, _real_requests_device
+    if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
+        # int64: the draft threshold (requests x q, or _NO_PADDING x q) is a 0-d
+        # int64 tensor, which would be cast to the row index's dtype.
+        _row_index_device = torch.arange(
+            num_rows, dtype=torch.int64, device=device
+        ).unsqueeze(1)
+        _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
+        _logger.info("DP pad-row mask enabled for %d rows", num_rows)
+    if _real_requests_device is None:
+        _real_requests_device = torch.full(
+            (), _NO_PADDING, dtype=torch.int64, device=device
+        )
+
+
+def step_pad_rows(num_rows: int) -> torch.Tensor | None:
+    """The `[num_rows, 1]` DP pad-row mask for this pass, or None when no row can
+    be padding: masking is off, a TBO micro-batch, the rows are not the pass's
+    `running_tokens` (a PCP shard, a sub-slice), or an eager pass has no padding.
+    While capturing it always returns the mask, so each replay follows its step."""
+    from atom.utils.tbo.ubatching import tbo_active
+
+    forward_context = get_forward_context()
+    context = forward_context.context
+    if context is None or _pad_rows_device is None:
+        return None
+    capturing = torch.cuda.is_current_stream_capturing()
+    done = forward_context.pad_rows_done
+    cu = getattr(forward_context.attn_metadata, "cu_seqlens_q", None)
+    running_bs = context.running_bs
+    tbo = tbo_active()
+    if not context.is_draft and ("requests", capturing) not in done:
+        done.add(("requests", capturing))
+        if tbo or cu is None or not 0 < running_bs < cu.shape[0]:
+            _real_requests_device.fill_(_NO_PADDING)
+        else:
+            _real_requests_device.copy_(
+                (cu[1 : running_bs + 1] > cu[:running_bs]).sum()
+            )
+    if tbo or num_rows != context.running_tokens:
+        return None
+    if not capturing and context.scheduled_tokens >= num_rows:
+        return None
+    if _pad_rows_device.shape[0] < num_rows:
+        return None
+    pad_rows = _pad_rows_device[:num_rows]
+    key = ("mask", context.is_draft, num_rows, capturing)
+    if key not in done:
+        rows = _row_index_device[:num_rows]
+        if context.is_draft:
+            if running_bs <= 0 or num_rows % running_bs:
+                return None
+            torch.ge(
+                rows, _real_requests_device * (num_rows // running_bs), out=pad_rows
+            )
+        else:
+            if cu is None or not 0 < running_bs < cu.shape[0]:
+                return None
+            torch.ge(rows, cu[running_bs], out=pad_rows)
+        done.add(key)
+    return pad_rows
+
 
 # Thread-local storage for TBO dual-thread execution
 
@@ -843,6 +938,34 @@ def get_forward_context() -> ForwardContext:
         "Please use `set_forward_context` to set the forward context."
     )
     return _forward_context
+
+
+@contextmanager
+def side_stream(stream: torch.cuda.Stream | None):
+    """Issue the block beside the main stream instead of on it.
+
+    Yields `(issuing, joining)`: the stream the block runs on, and the one to
+    wait on it afterwards, `None` when nothing forked.
+
+    Forks only inside the capture loop, the one window where a side stream is
+    both safe and useful: eager launches pile up across layers with nothing to
+    drain them, and a replay runs no Python, inheriting the recorded layout.
+    `in_hipgraph` covers that loop's warmup forward too, which matters because
+    AITER caches a kernel's scratch per `(device, stream)` and rejects a first
+    allocation made during capture.
+
+    The gate lives here rather than at each caller so that two branches of one
+    layer cannot drift into disagreeing about when forking is allowed. A caller
+    whose feature is switched off hands `None` and takes the same path, so the
+    switch needs no second branch anywhere.
+    """
+    context = get_forward_context()
+    if stream is None or not context.in_hipgraph:
+        yield context.main_stream, None
+        return
+    stream.wait_stream(context.main_stream)
+    with torch.cuda.stream(stream):
+        yield stream, context.main_stream
 
 
 def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:

@@ -125,7 +125,7 @@ capture_cudagraph()
   |
   +-- Determine capture_sizes list
   |     |-- If cudagraph_capture_sizes is set: use directly
-  |     |-- If cuda_graph_sizes has 1 value N: [1, 2, 4, 8, 16, 32, ..., N]
+  |     |-- If cuda_graph_sizes has 1 value N: [1, 2, ..., 8, 16, 32, ..., N]
   |     +-- If cuda_graph_sizes has >1 values: use the provided list
   |
   +-- Sort capture_sizes in descending order (largest batch first)
@@ -177,9 +177,9 @@ if self.graph_pool is None:
 When `cuda_graph_sizes` has a single value (e.g., `[512]`, the default), the capture sizes follow this pattern:
 
 ```python
-[1, 2, 4, 8] + [i for i in range(16, cuda_graph_sizes[0] + 1, 16)]
+list(range(1, 9)) + [i for i in range(16, cuda_graph_sizes[0] + 1, 16)]
 # Example with default 512:
-# [1, 2, 4, 8, 16, 32, 48, 64, ..., 496, 512]
+# [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, ..., 496, 512]
 ```
 
 ### Graph replay in run_model()
@@ -462,7 +462,7 @@ CompilationConfig(level=3)
 #   splitting_ops = ["aiter.unified_attention_with_output", "aiter.mla_attention"]
 #   cudagraph_mode = CUDAGraphMode.PIECEWISE
 #   cuda_graph_sizes = [512]
-#   capture_sizes = [1, 2, 4, 8, 16, 32, ..., 512]
+#   capture_sizes = [1, 2, ..., 8, 16, 32, ..., 512]
 ```
 
 **Custom capture sizes**:

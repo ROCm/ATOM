@@ -1363,7 +1363,7 @@ def _sparse_pa_per_row(
     """
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
-    from atom.model_ops.base_attention import run_pa_decode_gluon
+    from atom.model_ops.base_attention import run_pa_decode
 
     assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
     # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1.
@@ -1418,7 +1418,7 @@ def _sparse_pa_per_row(
         gluon_v_scale = v_scale.view(nph16 * _hkv, 1, pbs).unsqueeze(-1)
     else:
         gluon_k_scale = gluon_v_scale = None
-    run_pa_decode_gluon(
+    run_pa_decode(
         output=out_view,
         q=q_view,
         k_cache=k_cache_view,

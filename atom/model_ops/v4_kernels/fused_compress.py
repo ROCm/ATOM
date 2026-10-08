@@ -68,7 +68,10 @@ try:
     from aiter.ops.flydsl.kernels.fused_compress_attn_hca import (
         flydsl_hca_compress_attn,
     )
-except Exception:
+except Exception:  # noqa: BLE001 - an optional kernel probe, not an error path
+    # Deliberately wider than ImportError: on an unsupported arch the flydsl
+    # module imports and then raises while building, and the Triton fallback
+    # below is correct for every one of those failures.
     flydsl_fused_compress_attn = None
     flydsl_hca_compress_attn = None
 
@@ -109,6 +112,11 @@ def _fused_compress_attn_kernel(
     cos_cache_ptr,  # [max_seq, rope_head_dim/2] bf16 (after .squeeze)
     sin_cache_ptr,
     cos_sin_pos_stride,  # = rope_head_dim // 2
+    # ── Optional latent echoes, before and after the rotation ───────────
+    latent_out_ptr,  # [plan_capacity, head_dim]; dummy ptr when LATENT_OUT=0
+    latent_out_row_stride,
+    rotated_out_ptr,  # same shape; dummy ptr when ROTATED_OUT=0
+    rotated_out_row_stride,
     # ── KV cache scatter (paged) ────────────────────────────────────────
     kv_cache_ptr,  # bf16: [NB, k_per_block, head_dim] / fp8: [NB, k_per_block, head_dim]
     kv_cache_block_stride,
@@ -132,6 +140,8 @@ def _fused_compress_attn_kernel(
     K: tl.constexpr,  # pool-window reduce dim (= 2*RATIO if OVERLAP else RATIO);
     #   ≤ STATE_SIZE; used for `s = position - K + 1 + k_static` loop bound
     HAS_BLOCK_TABLE: tl.constexpr,
+    LATENT_OUT: tl.constexpr,  # echo the post-norm pre-RoPE latent (CSA2 index key)
+    ROTATED_OUT: tl.constexpr,  # echo the rotated latent (CSA2 packed main)
     QUANT: tl.constexpr,  # 0 = raw BF16 (CSA/HCA Main), 1 = FP8 e4m3 + ue8m0 scale (Indexer)
     USE_UE8M0: tl.constexpr,  # round scale to power-of-2 (only when QUANT == 1)
     PRESHUFFLE: tl.constexpr,  # MFMA 16x16 preshuffled FP8 layout (only when QUANT == 1)
@@ -272,6 +282,17 @@ def _fused_compress_attn_kernel(
     rrms = tl.rsqrt(var + rms_eps)
     normed = compressed_masked * rrms * rms_w  # [BLOCK_D] fp32
 
+    # CSA2 derives its index key from this value, before the rotation: the
+    # main latent is rotated in place and the key projects the unrotated one.
+    # Echoed per plan row rather than per compressed slot so the consumer needs
+    # only the plan it already has to know which row is whose.
+    if LATENT_OUT:
+        tl.store(
+            latent_out_ptr + pid * latent_out_row_stride + d,
+            normed.to(latent_out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
+
     # ── 3. RoPE on rope_head_dim segment (GPT-J interleaved, fp32) ────
     comp_pos = (position // RATIO) * RATIO
     NUM_PAIRS: tl.constexpr = BLOCK_D // 2
@@ -299,6 +320,17 @@ def _fused_compress_attn_kernel(
     new_even = even_v * cos_per_pair - odd_v * sin_per_pair
     new_odd = odd_v * cos_per_pair + even_v * sin_per_pair
     rotated = tl.interleave(new_even, new_odd)  # [BLOCK_D] fp32
+
+    # A pool this kernel cannot scatter into still wants the value it would
+    # have written -- packed CSA2 quantizes and interleaves it host-side, and
+    # rotating a second time in torch would put a different BF16 rounding on
+    # the two paths, which the FP4 grid then turns into whole-level flips.
+    if ROTATED_OUT:
+        tl.store(
+            rotated_out_ptr + pid * rotated_out_row_stride + d,
+            rotated.to(rotated_out_ptr.dtype.element_ty),
+            mask=d_mask,
+        )
 
     # ── 4. Cache scatter (paged) ───────────────────────────────────────
     # The Compressor's BF16 return value was historically consumed by sparse
@@ -419,6 +451,13 @@ def fused_compress_attn(
     # rope into `kv_cache_rope` (bf16 [NB,k,64]) via the flydsl group_fp8 scatter.
     main_2buff_fp8: bool = False,
     kv_cache_rope: torch.Tensor | None = None,  # bf16 [NB,k_per_block,64]
+    # CSA2 index key source: the post-norm PRE-RoPE latent, one row per plan
+    # row. V4 has no use for it -- its indexer compresses its own projection --
+    # so this stays None on every V4 call and the store is constexpr'd away.
+    latent_out: torch.Tensor | None = None,  # [plan_capacity, head_dim]
+    # The same echo after the rotation, for a pool whose layout this kernel
+    # cannot scatter into. Also V4.1-only.
+    rotated_out: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """Batched fused per-source-position pool + RMSNorm + RoPE + cache scatter,
@@ -470,15 +509,25 @@ def fused_compress_attn(
     _flydsl_mode = envs.ATOM_FUSED_COMPRESS_USE_FLYDSL
     _shape_key = (head_dim, rope_head_dim, ratio, overlap)
     _flydsl_shape_ok = _shape_key in _FLYDSL_SUPPORTED
+    # The flydsl kernel has no latent echo, and a caller that asked for one
+    # needs it: dropping to Triton is the only correct answer, and saying so
+    # under `always` beats returning a buffer nobody wrote.
     _flydsl_use = (
         flydsl_fused_compress_attn is not None
         and _flydsl_mode in ("auto", "always")
         and _flydsl_shape_ok
+        and latent_out is None
+        and rotated_out is None
     )
     if _flydsl_mode == "always" and not _flydsl_shape_ok:
         raise RuntimeError(
             f"ATOM_FUSED_COMPRESS_USE_FLYDSL=always but shape "
             f"{_shape_key} is not in supported set {_FLYDSL_SUPPORTED}"
+        )
+    if _flydsl_mode == "always" and (latent_out is not None or rotated_out is not None):
+        raise RuntimeError(
+            "ATOM_FUSED_COMPRESS_USE_FLYDSL=always but this call wants a latent "
+            "echo, which only the Triton path writes"
         )
     # HCA 2-kernel-split: BF16-only on V4-Pro HCA Main shape
     # (D=512 ratio=128 overlap=False). HCA wins single-kernel at all N
@@ -665,6 +714,10 @@ def fused_compress_attn(
         cos_cache,
         sin_cache,
         cos_cache.stride(0),
+        latent_out if latent_out is not None else cos_cache,  # placeholder
+        latent_out.stride(0) if latent_out is not None else 0,
+        rotated_out if rotated_out is not None else cos_cache,  # placeholder
+        rotated_out.stride(0) if rotated_out is not None else 0,
         kv_cache if has_bt else cos_cache,  # placeholder when no scatter
         kv_cache.stride(0) if has_bt else 0,
         kv_cache.stride(1) if has_bt else 0,
@@ -682,6 +735,8 @@ def fused_compress_attn(
         STATE_SIZE=state_size,
         K=K,
         HAS_BLOCK_TABLE=int(has_bt),
+        LATENT_OUT=int(latent_out is not None),
+        ROTATED_OUT=int(rotated_out is not None),
         QUANT=int(quant),
         FP8_MAX=fp8_max_arg,
         USE_UE8M0=int(use_ue8m0),

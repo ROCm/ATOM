@@ -14,6 +14,7 @@ rounding. The FP8 default has to come out of all of it untouched.
 import importlib
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -24,13 +25,17 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
-    fp4_decode_parallel_units,
-    fp4_decode_schedule,
     fp4_index_scale_rows,
     fp4_prefill_schedule,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
 )
+
+
+def _expect_scale_row(rows, block):
+    """The e8m0 row swizzle, written out so tests don't ask the code under test."""
+    return (rows % 16) * (block // 16) + rows // 16
+
 
 # The DSA indexer geometry GLM-5.2 and DeepSeek-V3.2 share.
 DSA = SimpleNamespace(index_topk=2048, index_n_heads=32, index_head_dim=128)
@@ -131,37 +136,6 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
         check(prefill_ubatching=True)
 
 
-def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
-    """`EagleProposer` refreshes this on whatever builder the target uses, and
-    only the MLA one has an FP4 indexer to refresh. Every other backend has to
-    answer it anyway: EAGLE3 on Llama-3, MTP on Qwen3-Next and on DeepSeek-V4
-    (whose builder is a `CommonAttentionBuilder` sibling, not an MLA subclass)
-    all reach that line with FP4 nowhere in the picture."""
-    backends = _import_or_skip("atom.model_ops.attentions.backends")
-    base = backends.CommonAttentionBuilder._publish_indexer_fp4_decode_schedule
-
-    mla = _import_or_skip("atom.model_ops.attentions.aiter_mla")
-    assert mla.AiterMLAMetadataBuilder._publish_indexer_fp4_decode_schedule is not base
-
-    for module, name in (
-        ("atom.model_ops.attentions.aiter_attention", "AiterAttentionMetadataBuilder"),
-        (
-            "atom.model_ops.attentions.deepseek_v4_attn",
-            "DeepseekV4AttentionMetadataBuilder",
-        ),
-        ("atom.model_ops.attentions.gdn_attn", "GDNAttentionMetadataBuilder"),
-        ("atom.model_ops.attentions.triton_mha", "TritonMHAMetadataBuilder"),
-    ):
-        builder = getattr(_import_or_skip(module), name)
-        assert builder._publish_indexer_fp4_decode_schedule is base, name
-
-    # Inert, not merely present: the draft reuses the target's metadata object,
-    # so anything written here would reach the verify step.
-    metadata = SimpleNamespace()
-    base(object(), metadata, 4, 1)
-    assert not vars(metadata)
-
-
 def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
     """The builder and `Indexer.__init__` answer the same predicate from the
     same two inputs, and the Indexer has already built `k_cache` from its answer
@@ -185,24 +159,6 @@ def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
         and target.value.attr == "indexer"
     ]
     assert not overwrites, f"builder overwrites the Indexer's verdict at {overwrites}"
-
-
-def test_decode_parallel_units_cover_the_batch_at_every_speculation_width():
-    """Everything the one captured buffer rests on: a slot per sequence per
-    step, the varctx floor, and `f(n) >= f(1)` -- the buffer is sized at
-    `max_seqlen_qo` and the draft then asks at 1. That last one is the weakest
-    true statement, not the obvious one: `f` is NOT monotonic in `next_n`."""
-    for max_bs in (1, 7, 16, 64, 128, 300, 512, 8192):
-        floor = fp4_decode_parallel_units(max_bs, 1)
-        for next_n in range(1, 17):
-            units = fp4_decode_parallel_units(max_bs, next_n)
-            assert units % next_n == 0
-            assert units // next_n >= max_bs
-            assert units >= sparse_indexer_fp4.FP4_MQA_VARCTX_PARALLEL_UNIT_NUM
-            assert units >= floor
-
-    # The counterexample the docstring names, so it cannot rot back.
-    assert fp4_decode_parallel_units(1, 3) > fp4_decode_parallel_units(1, 4)
 
 
 def test_q_scale_shape_pads_the_m_tile_axis_to_one_dword():
@@ -354,7 +310,7 @@ def _oracle(q_fp4, q_scale, kv_cache, kv_scale, table, ctx_len, weights, rows_of
     pos = (token % _BLOCK).expand(batch, ctx_len).unsqueeze(-1)
     group = torch.arange(4, device=kv_cache.device)
     packed = kv_cache[phys, 0, group, pos].reshape(batch, ctx_len, HEAD_DIM // 2)
-    keys = _dequant(packed, kv_scale[phys, 0, group, fp4_index_scale_rows(pos, _BLOCK)])
+    keys = _dequant(packed, kv_scale[phys, 0, group, _expect_scale_row(pos, _BLOCK)])
     # `[T, k_tiles, 4, 16, qs_pad]` -> the dense `[T, H, D // 32]` a reader sees.
     dense = (
         q_scale[..., : HEADS // 16]
@@ -387,40 +343,50 @@ def _assert_agrees(got, want, visible, topk):
     assert overlap > 0.99, overlap
 
 
+def test_scale_row_swizzle_matches_its_oracle():
+    """The e8m0 row swizzle on CPU: a wrong one is silent, every index in bounds."""
+    rows = torch.arange(_BLOCK)
+    want = _expect_scale_row(rows, _BLOCK)
+    assert torch.equal(fp4_index_scale_rows(rows, _BLOCK), want)
+    assert sorted(want.tolist()) == list(range(_BLOCK))
+
+    with pytest.raises(ValueError, match="64-row blocks"):
+        fp4_index_scale_rows(rows, 16)
+
+
 def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
-    """The rectangular kernel at a speculation width: one row per (seq, step),
-    each seeing one token less than the step after it. `next_n=1` is the DCP
-    test's shape, so what this one holds down is the `next_n > 1` reshape."""
+    """A speculation width's rows, a request's one sequence
+    (`Fp4MqaRaggedMetadata`, as the decode scorer passes them): one row per
+    (seq, step), each seeing one token less than the step after it. `next_n=1`
+    is the DCP test's shape, so what this one holds down is a sequence's rows
+    sharing its block table."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
-        compute_varctx_schedule,
-    )
+
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 
     batch, next_n, ctx_len = 2, 4, 768
     table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows = (
         _written_cache_and_queries(batch, next_n, ctx_len, seed=0)
     )
     ctx_lens = torch.full((batch,), ctx_len, dtype=torch.int32, device="cuda")
-    _, cta_info, n_ctas = compute_varctx_schedule(
-        ctx_lens, FP4_MQA_BLOCK_K, None, ctx_len, next_n=next_n
-    )
+    # Each of a request's next_n rows sees one token less than the one after it.
+    row = torch.arange(rows, device="cuda")
+    visible = (ctx_lens.repeat_interleave(next_n) - (next_n - 1 - row % next_n)).int()
+    starts = torch.arange(0, (batch + 1) * next_n, next_n, device="cuda").int()
     logits = torch.empty(rows, ctx_len, dtype=torch.float32, device="cuda")
     flydsl_pa_mqa_logits_fp4(
         q_fp4.reshape(batch, next_n, HEADS, HEAD_DIM // 2),
-        q_scale.reshape(batch, next_n, *q_scale.shape[1:]),
+        q_scale,
         kv_cache,
         kv_scale,
-        table,
-        weights_out,
-        ctx_lens,
-        ctx_len,
+        weights=weights_out,
+        max_seq_len=ctx_len,
         weight_scale=WEIGHTS_SCALE,
-        next_n=next_n,
-        block_k=FP4_MQA_BLOCK_K,
         kv_block_size=_BLOCK,
         out=logits,
-        cta_info=cta_info,
-        total_ctas=n_ctas,
+        **Fp4MqaRaggedMetadata(starts, next_n, table).kernel_args(
+            visible, heads=HEADS, page_size=_BLOCK, max_seq_len=ctx_len
+        ),
     )
 
     want = _oracle(
@@ -433,17 +399,67 @@ def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
         weights_out,
         lambda keys: keys.repeat_interleave(next_n, dim=0),
     )
-    # Each of a request's next_n rows sees one token less than the one after it.
-    row = torch.arange(rows, device="cuda")
-    visible = ctx_lens.repeat_interleave(next_n) - (next_n - 1 - row % next_n)
     _assert_agrees(logits, want, visible, topk=512)
+
+
+def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypatch):
+    """`Indexer._score_topk_decode_fp4_flydsl` at a ragged MTP step: requests
+    of 4, 1 and 3 rows (each row of a c-row request one token behind the
+    next), an empty padding request and two padding rows, read off the step's
+    metadata alone. Every real row picks the cache's top-k within its own
+    bound; a padding row picks nothing."""
+    from atom.models import deepseek_v4
+
+    batch, next_n, ctx_len, topk = 3, 4, 768, 512
+    table, kv_cache, kv_scale, q_fp4, q_scale, weights, _ = _written_cache_and_queries(
+        batch, next_n, ctx_len, seed=1
+    )
+    counts = [4, 1, 3]
+    seq = [b for b, c in enumerate(counts) for _ in range(c)]
+    ends = [ctx_len - c + n + 1 for c in counts for n in range(c)]
+    picks = [b * next_n + n for b, c in enumerate(counts) for n in range(c)]
+    pad = 2
+    rows = torch.tensor(picks + picks[:pad], device="cuda")
+    starts = [0, *np.cumsum(counts).tolist(), sum(counts)]
+    metadata = SimpleNamespace(
+        csa_n_committed_per_token=torch.tensor(
+            ends + [0] * pad, dtype=torch.int32, device="cuda"
+        ),
+        cu_seqlens_q=torch.tensor(starts, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=next_n,
+    )
+    monkeypatch.setattr(
+        deepseek_v4,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer.kv_cache, indexer.kv_scale = kv_cache, kv_scale
+    indexer._max_model_len_idx, indexer._weights_scale = ctx_len, WEIGHTS_SCALE
+    padded_table = torch.cat([table, table[:1]])  # the padding request's row
+    got = indexer._score_topk_decode_fp4_flydsl(
+        q_fp4[rows], q_scale[rows], padded_table, weights[rows], topk
+    )
+
+    want = _oracle(
+        q_fp4[rows[: len(picks)]], q_scale[rows[: len(picks)]], kv_cache, kv_scale,
+        table, ctx_len, weights[rows[: len(picks)]], lambda keys: keys[seq],
+    )  # fmt: skip
+    for r, end in enumerate(ends):
+        chosen = set(got[r][got[r] >= 0].tolist())
+        assert len(chosen) == min(topk, end) and max(chosen) < end, r
+        best = set(want[r, :end].topk(min(topk, end)).indices.tolist())
+        assert len(chosen & best) / len(best) > 0.99, r
+    assert (got[len(picks) :] == -1).all()
 
 
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
     """The geometry `dcp_decode_candidate_exchange_fused` hands the scorer: one
-    row per query token over this rank's shard, so the windows are ragged and
-    the schedule is built at next_n=1 whatever the speculation width."""
+    row per query token over this rank's shard, each its own sequence, so the
+    windows are ragged whatever the speculation width."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 
     batch, next_n, width = 3, 4, 1024
     table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows = (
@@ -455,9 +471,6 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
     local_ctx = torch.tensor(
         [width - (r % 7) * 37 for r in range(rows)], dtype=torch.int32, device="cuda"
     )
-    units = fp4_decode_parallel_units(batch, next_n)
-    cta_info = torch.zeros(units, 4, dtype=torch.int32, device="cuda")
-    fp4_decode_schedule(local_ctx, FP4_MQA_BLOCK_K, units, width, 1, cta_info)
 
     logits = torch.empty(rows, width, dtype=torch.float32, device="cuda")
     flydsl_pa_mqa_logits_fp4(
@@ -465,17 +478,16 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
         q_scale.reshape(rows, 1, *q_scale.shape[1:]),
         kv_cache,
         kv_scale,
-        table.repeat_interleave(next_n, dim=0),
-        weights_out,
-        local_ctx,
-        width,
+        weights=weights_out,
+        max_seq_len=width,
         weight_scale=WEIGHTS_SCALE,
-        next_n=1,
-        block_k=FP4_MQA_BLOCK_K,
         kv_block_size=_BLOCK,
         out=logits,
-        cta_info=cta_info,
-        total_ctas=units,
+        **Fp4MqaRaggedMetadata(
+            torch.arange(rows + 1, dtype=torch.int32, device="cuda"),
+            1,
+            table.repeat_interleave(next_n, dim=0),
+        ).kernel_args(local_ctx, heads=HEADS, page_size=_BLOCK, max_seq_len=width),
     )
 
     want = _oracle(
@@ -511,10 +523,23 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     data_src = torch.randint(0, 256, (src_pages, 1, 4, block, 16), **shape)
     scale_src = torch.randint(0, 256, (src_pages, 1, 4, block), **shape)
 
-    # This rank's slots, spread over pages and rows so no source row equals the
-    # destination row it lands on; the gather then reorders them again.
-    slots = torch.randperm(src_pages * block)[:local].to(torch.int32)
-    gather_index = torch.randperm(total_kv).to(torch.int32)
+    # No source row may land on its own row, or a missing swizzle goes unseen.
+    # Built by rotation, not randperm, so it holds on any box and RNG stream.
+    g = torch.Generator().manual_seed(0)
+    src_row = (torch.arange(local) + 1) % block
+    src_page = torch.randperm(src_pages, generator=g).repeat(-(-local // src_pages))[
+        :local
+    ]
+    slots = (src_page * block + src_row).to(torch.int32)
+
+    tok = torch.arange(total_kv)
+    gather_index = ((tok + 1) % local + local * (tok // local)).to(torch.int32)
+
+    _src = slots[gather_index.long() % local].long()
+    assert not torch.any(_src % block == tok % block), (
+        "some source row lands on its own row; those positions cannot tell a "
+        "correct swizzle from a missing one"
+    )
     monkeypatch.setattr(
         dsv2,
         "get_dcp_group",
@@ -529,6 +554,15 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
         SimpleNamespace(
             dcp_indexer_fp4_local_slots=slots,
             dcp_indexer_gather_index=gather_index,
+            # What the builder publishes, written out.
+            dcp_indexer_fp4_read_page=slots.long() // block,
+            dcp_indexer_fp4_read_row=slots.long() % block,
+            dcp_indexer_fp4_read_scale_row=_expect_scale_row(
+                slots.long() % block, block
+            ),
+            dcp_indexer_fp4_stage_page=tok // block,
+            dcp_indexer_fp4_stage_row=tok % block,
+            dcp_indexer_fp4_stage_scale_row=_expect_scale_row(tok % block, block),
         ),
         total_kv,
         block,
@@ -536,8 +570,8 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
 
     src = slots[gather_index.long() % local].long()
     got_rows = torch.arange(total_kv)
-    q_dst = fp4_index_scale_rows(got_rows % block, block)
-    q_src = fp4_index_scale_rows(src % block, block)
+    q_dst = _expect_scale_row(got_rows % block, block)
+    q_src = _expect_scale_row(src % block, block)
     assert torch.equal(
         staged[got_rows // block, 0, :, got_rows % block, :],
         data_src[src // block, 0, :, src % block, :],
@@ -555,8 +589,6 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
     allowance the table would turn a legal schedule into a mid-serving raise,
     so it spans a full batch; the tail the scorer never reads stays zero rather
     than aliasing a real page."""
-    import numpy as np
-
     aiter_mla = _import_or_skip(
         "atom.model_ops.attentions.aiter_mla",
         reason="the MLA builder imports triton at module scope",
@@ -587,6 +619,86 @@ def test_staged_page_table_spans_a_whole_batch_not_one_sequence():
         want = torch.arange(pages, dtype=torch.int32).expand(bs, pages)
         assert torch.equal(staged[:, :pages], want), pages
         assert not staged[:, pages:].any(), pages
+
+
+@pytest.mark.parametrize(
+    "n_slots, n_iota",
+    [(0, 0), (1, 1), (7, 5), (300, 100), (1023, 1024), (1025, 4000), (60_000, 232_003)],
+)
+def test_decompose_slots_matches_torch(n_slots, n_iota):
+    """decompose_slots_triton vs torch: tile tails, either input longer, negative slots."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a ROCm GPU")
+    block_convert = _import_or_skip("atom.utils.block_convert")
+
+    g = torch.Generator().manual_seed(0)
+    slots = torch.randint(-5 * _BLOCK, 40_000 * _BLOCK, (n_slots,), generator=g)
+    slots = slots.to(torch.int32).cuda()
+    lut = fp4_index_scale_rows(torch.arange(_BLOCK, dtype=torch.int32), _BLOCK).cuda()
+    got = block_convert.decompose_slots_triton(slots, n_iota, _BLOCK, lut)
+
+    token = torch.arange(n_iota, dtype=torch.int32, device="cuda")
+    want = []
+    for src in (slots, token):
+        page, row = src // _BLOCK, src % _BLOCK
+        want += [page, row, fp4_index_scale_rows(row, _BLOCK)]
+    for i, (a, b) in enumerate(zip(got, want)):
+        assert a.dtype == torch.int32 and torch.equal(a, b), i
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_builder_publishes_the_staging_indices_it_derives(device):
+    """The builder's six staging index tensors, on the kernel and torch paths.
+
+    Non-trivial block tables and mid-block sequence ends, so page, row and
+    swizzled row all differ; on GPU this also pins outputs to their names.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a ROCm GPU")
+    aiter_mla = _import_or_skip(
+        "atom.model_ops.attentions.aiter_mla",
+        reason="the MLA builder imports triton at module scope",
+    )
+
+    build = aiter_mla.AiterMLAMetadataBuilder._build_dcp_indexer_fp4_prefill_meta
+    block, bs, per_seq = 64, 2, 6
+    builder = SimpleNamespace(
+        model_runner=SimpleNamespace(block_size=block),
+        device=torch.device(device),
+        max_bs=4,
+        block_table_cols=per_seq,
+    )
+    if device == "cuda":
+        rows = torch.arange(block, dtype=torch.int32, device=device)
+        builder._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
+    lpad = np.array([block + 5, 2 * block + 3], dtype=np.int64)
+    cu_pad = np.concatenate([[0], np.cumsum(lpad)]).astype(np.int64)
+    table = np.array([[7, 3, 0, 0], [11, 2, 9, 0]], dtype=np.int32)
+    var = {"block_tables": SimpleNamespace(np=table)}
+    total_kv = 3 * block + 7
+    meta = SimpleNamespace()
+    build(builder, meta, bs, lpad, cu_pad, total_kv, var)
+
+    want_slots = torch.tensor(
+        [7 * block + j for j in range(block)]
+        + [3 * block + j for j in range(5)]
+        + [11 * block + j for j in range(block)]
+        + [2 * block + j for j in range(block)]
+        + [9 * block + j for j in range(3)]
+    )
+    assert torch.equal(meta.dcp_indexer_fp4_local_slots.long().cpu(), want_slots)
+
+    tok = torch.arange(total_kv)
+    for side, src in (("read", want_slots), ("stage", tok)):
+        page = getattr(meta, f"dcp_indexer_fp4_{side}_page").cpu()
+        row = getattr(meta, f"dcp_indexer_fp4_{side}_row").cpu()
+        scale_row = getattr(meta, f"dcp_indexer_fp4_{side}_scale_row").cpu()
+        assert page.dtype == row.dtype == scale_row.dtype == torch.int32, side
+        assert torch.equal(page.long(), src // block), side
+        assert torch.equal(row.long(), src % block), side
+        assert torch.equal(
+            scale_row.long(), _expect_scale_row(src % block, block)
+        ), side
 
 
 @pytest.mark.parametrize("whole_batch", [True, False])

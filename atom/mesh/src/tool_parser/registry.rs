@@ -186,6 +186,7 @@ impl ParserFactory {
         registry.register_parser("qwen_xml", || Box::new(QwenCoderParser::new()));
         registry.register_parser("qwen_coder", || Box::new(QwenCoderParser::new()));
         registry.register_parser("dsml", || Box::new(DsmlParser::new()));
+        registry.register_parser("dsml_v41", || Box::new(DsmlParser::v41()));
         registry.register_parser("glm", || Box::new(Glm4MoeParser::glm45()));
         registry.register_parser("glm45_moe", || Box::new(Glm4MoeParser::glm45()));
         registry.register_parser("glm47_moe", || Box::new(Glm4MoeParser::glm47()));
@@ -227,6 +228,9 @@ impl ParserFactory {
         registry.map_model("qwen*", "qwen");
         registry.map_model("Qwen*", "qwen");
 
+        // The more specific V4.1 names take precedence over the V4 family.
+        registry.map_model("deepseek-v4.1*", "dsml_v41");
+        registry.map_model("deepseek-ai/DeepSeek-V4.1*", "dsml_v41");
         // DeepSeek models
         registry.map_model("deepseek-v4*", "dsml");
         registry.map_model("deepseek-ai/DeepSeek-V4*", "dsml");

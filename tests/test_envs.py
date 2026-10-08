@@ -28,7 +28,11 @@ _ATOM_ENV_VARS = [
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
+    "ATOM_SHUTDOWN_TIMEOUT_S",
     "ATOM_PROFILER_MORE",
+    "ATOM_PROFILER_RECORD_SHAPES",
+    "ATOM_PROFILER_WITH_STACK",
+    "ATOM_PROFILER_PROFILE_MEMORY",
     "ATOM_PROFILER_TIMEOUT",
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
@@ -37,6 +41,13 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
+    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+]
+
+_PROFILER_DETAIL_VARS = [
+    "ATOM_PROFILER_RECORD_SHAPES",
+    "ATOM_PROFILER_WITH_STACK",
+    "ATOM_PROFILER_PROFILE_MEMORY",
 ]
 
 
@@ -103,8 +114,16 @@ class TestEnvsDefaults:
     def test_profiler_more_default(self):
         assert _get_envs().ATOM_PROFILER_MORE is False
 
+    @pytest.mark.parametrize("name", _PROFILER_DETAIL_VARS)
+    def test_profiler_detail_default(self, name):
+        assert getattr(_get_envs(), name) is False
+
     def test_profiler_timeout_default(self):
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 300.0
+
+    def test_shutdown_timeout_default(self, caplog):
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
+        assert not caplog.records
 
     def test_log_more_default(self):
         assert _get_envs().ATOM_LOG_MORE is False
@@ -126,6 +145,9 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_gather_kv_b_proj_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is True
+
+    def test_use_flydsl_fp8_prefill_attn_default(self):
+        assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -166,6 +188,25 @@ class TestEnvsOverrides:
         monkeypatch.setenv("ATOM_PROFILER_MORE", "1")
         assert _get_envs().ATOM_PROFILER_MORE is True
 
+    @pytest.mark.parametrize("name", _PROFILER_DETAIL_VARS)
+    @pytest.mark.parametrize("more", [None, "", "0", "1"])
+    def test_profiler_detail_falls_back_to_profiler_more(self, monkeypatch, name, more):
+        if more is not None:
+            monkeypatch.setenv("ATOM_PROFILER_MORE", more)
+        monkeypatch.setenv(name, "")
+        assert getattr(_get_envs(), name) is (more == "1")
+
+    @pytest.mark.parametrize("name", _PROFILER_DETAIL_VARS)
+    @pytest.mark.parametrize("value, more", [("1", "0"), ("0", "1")])
+    def test_profiler_detail_overrides_profiler_more(
+        self, monkeypatch, name, value, more
+    ):
+        monkeypatch.setenv("ATOM_PROFILER_MORE", more)
+        monkeypatch.setenv(name, value)
+        assert getattr(_get_envs(), name) is (value == "1")
+        others = [n for n in _PROFILER_DETAIL_VARS if n != name]
+        assert [getattr(_get_envs(), n) for n in others] == [more == "1"] * 2
+
     def test_metrics_device_timer_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is True
@@ -191,6 +232,19 @@ class TestEnvsOverrides:
     def test_profiler_timeout_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_PROFILER_TIMEOUT", "900")
         assert _get_envs().ATOM_PROFILER_TIMEOUT == 900.0
+
+    @pytest.mark.parametrize("value", ["0.5", "1800"])
+    def test_shutdown_timeout_override(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", value)
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == float(value)
+        assert not caplog.records
+
+    @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "", "bad"])
+    def test_shutdown_timeout_warns_and_defaults(self, monkeypatch, caplog, value):
+        monkeypatch.setenv("ATOM_SHUTDOWN_TIMEOUT_S", value)
+        assert _get_envs().ATOM_SHUTDOWN_TIMEOUT_S == 5.0
+        assert len(caplog.records) == 1
+        assert f"ATOM_SHUTDOWN_TIMEOUT_S={value!r}" in caplog.records[0].getMessage()
 
     def test_model_sensitive_rmsnorm_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_MODEL_SENSITIVE_RMSNORM", "1")
@@ -265,3 +319,59 @@ def test_parallel_config_applies_explicit_dp_endpoint_env(monkeypatch):
     assert config.data_parallel_master_ip == "127.0.0.2"
     assert config.data_parallel_master_port == 29700
     assert config.data_parallel_base_port == 29800
+
+
+def test_mla_fp8_prefill_flag(monkeypatch):
+    name = "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN"
+    assert getattr(_get_envs(), name) is False
+    for value, expected in [("0", False), ("1", True), ("true", False)]:
+        monkeypatch.setenv(name, value)
+        assert getattr(_get_envs(), name) is expected
+
+
+def test_offload_env_vars_are_documented():
+    """Every offload knob registered in envs.py appears in the central env
+    reference, so a new one cannot land undocumented."""
+    import pathlib
+
+    from atom.utils import envs
+
+    doc = (
+        pathlib.Path(__file__).parents[1] / "docs" / "environment_variables.md"
+    ).read_text()
+    offload = [
+        name
+        for name in envs.environment_variables
+        if name.startswith(("OFFLOAD_", "LMCACHE_"))
+    ]
+    assert offload
+    assert [name for name in offload if f"**{name}**" not in doc] == []
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [
+        ("OFFLOAD_PUBLICATION_TIMEOUT_S", 5.0),
+        ("OFFLOAD_PUBLICATION_POLL_INTERVAL_S", 0.01),
+        ("OFFLOAD_COPY_WORKERS", 1),
+        ("OFFLOAD_LOAD_WORKERS", 1),
+        ("OFFLOAD_MIN_SAVE_TOKENS", 8192),
+    ],
+)
+def test_empty_offload_knob_reads_as_its_default(monkeypatch, name, default):
+    """`VAR=` is how a knob is cleared inline; it must never crash startup."""
+    monkeypatch.setenv(name, "")
+    assert getattr(_get_envs(), name) == default
+
+
+@pytest.mark.parametrize("name", ["OFFLOAD_COPY_WORKERS", "OFFLOAD_LOAD_WORKERS"])
+def test_malformed_offload_worker_width_names_the_variable(monkeypatch, name):
+    monkeypatch.setenv(name, "two")
+    with pytest.raises(ValueError, match=f"{name} must be an integer"):
+        getattr(_get_envs(), name)
+
+
+def test_malformed_offload_timeout_names_the_variable(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
+    with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
+        _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S

@@ -202,6 +202,101 @@ def test_manager_trigger_offline_rebalance(monkeypatch):
     assert mgr.rebalance_count == 1
 
 
+def test_manager_stops_after_max_rebalances(monkeypatch):
+    # ATOM_EPLB_MAX_REBALANCES=2: two periodic rebalances run, then the schedule
+    # stops for good -- no more gate evaluations, no per-step prefill reduction.
+    monkeypatch.setenv("ATOM_EPLB_MAX_REBALANCES", "2")
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    _record_single_pass(monitor, counts=[4, 0])
+
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=8,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+    )
+    _spy_rebalance(manager, fired)
+
+    for _ in range(3):  # first window (interval//4 = 2) + the first rebalance
+        _step(manager)
+    assert fired == [1]
+    assert not manager.rebalancing_stopped
+    for _ in range(8):  # one full interval -> the second rebalance, then stop
+        _step(manager)
+    assert fired == [1, 1]
+    assert manager.rebalance_count == 2
+    assert manager.rebalancing_stopped
+
+    dumps = []
+    monkeypatch.setattr(monitor, "dump_global_physical_load", lambda: dumps.append(1))
+    for _ in range(100):
+        _step(manager)
+    assert fired == [1, 1]
+    assert dumps == []
+
+    def _no_reduce(*args, **kwargs):
+        raise AssertionError("a stopped manager must not reduce the prefill flag")
+
+    # With a migration group other than the DP group every step would otherwise
+    # all_reduce the has-prefill flag.
+    monkeypatch.setattr(torch.distributed, "all_reduce", _no_reduce)
+    manager._dp_is_migration_group = False
+    manager.on_forward_pass_end(local_has_prefill=True, dp_any_has_prefill=None)
+
+
+def test_manager_max_rebalances_ignores_gate_skips(monkeypatch):
+    # Only rebalances that actually run count toward the limit.
+    monkeypatch.setenv("ATOM_EPLB_MAX_REBALANCES", "1")
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    _record_single_pass(monitor, counts=[3, 3])  # balanced -> the gate skips
+
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=1,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+    )
+    _spy_rebalance(manager, fired)
+    manager.live_metadata = types.SimpleNamespace(ep_size=2)
+    for _ in range(10):
+        _step(manager)
+    assert fired == []
+    assert manager.rebalance_count == 0
+    assert not manager.rebalancing_stopped
+
+
+@pytest.mark.parametrize("value", [None, "0", "-3"])
+def test_manager_max_rebalances_unset_or_nonpositive_is_unlimited(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("ATOM_EPLB_MAX_REBALANCES", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_EPLB_MAX_REBALANCES", value)
+    monkeypatch.setattr(eplb, "get_tp_group", lambda: _FakeTPGroup(world_size=1))
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=1)
+    _record_single_pass(monitor, counts=[4, 0])
+
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=1,
+        rebalance_min_balancedness=0.8,
+        rebalance_balancedness_agg="min",
+    )
+    _spy_rebalance(manager, fired)
+    for _ in range(21):  # first window (1) + 20 one-step intervals
+        _step(manager)
+    assert manager.max_rebalances == 0
+    assert len(fired) == 20
+    assert not manager.rebalancing_stopped
+
+
 def test_with_eplb_forward_monitor_passthrough_when_disabled(monkeypatch):
     # When no manager is configured (EPLB off), the decorator is a transparent
     # pass-through and must not touch the monitor/scheduler.

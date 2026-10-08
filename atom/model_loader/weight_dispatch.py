@@ -285,10 +285,17 @@ class WeightDispatcher:
 
     def _parameter(self, orig_ckpt_name: str, param_name: str) -> nn.Parameter | None:
         try:
-            return self.model.get_parameter(param_name)
+            param = self.model.get_parameter(param_name)
         except AttributeError:
             self.dropped_ckpt_keys.append((orig_ckpt_name, param_name))
             return None
+        # Loaders are handed `(param, tensor)` and nothing else, so a failure
+        # inside one can only report shapes, leaving the weight to be identified
+        # by arithmetic. Carry both names on the parameter instead. Each
+        # parameter is dispatched by a single task, so this is safe to write
+        # here and read from the worker.
+        param._atom_load_names = (param_name, orig_ckpt_name)
+        return param
 
     def _record(self, param_name: str) -> None:
         self.loaded_weights_record.add(self.prefix + param_name)

@@ -308,3 +308,5 @@ fn resolve_generate_input(
 
     Err("Either `text` or `input_ids` must be provided".to_string())
 }
+
+pub mod inference;

@@ -42,7 +42,7 @@ from typing import Any, ClassVar
 # namespace theirs `server.tool`; prose is still rejected because a space
 # cannot appear anywhere. `\Z` and not `$`, which also matches before a
 # trailing newline and would admit a name with one.
-_TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*\Z")
+_TOOL_NAME_RE = re.compile(r"^\w[\w.\-]*(?:::\w[\w.\-]*)?\Z")
 
 
 def continues_a_call(rest: str, tokens: tuple[str, ...], *, arrived: bool) -> bool:
@@ -108,6 +108,45 @@ def usable_tool_name(name: str | None) -> bool:
     refutes nothing.
     """
     return bool(name) and _TOOL_NAME_RE.match(name) is not None
+
+
+def qualified_tool_name(tool: dict) -> str:
+    """Resolve an optional namespace to the OpenAI function-name identity.
+
+    Accept one namespace, either beside or inside function, and reject a
+    conflicting qualified name. This identity is shared by request validation
+    and schema lookup; the prompt encoder still receives the original schema.
+    """
+    fn = tool.get("function", tool)
+    name = fn.get("name")
+    namespace = tool.get("namespace")
+    if namespace is None:
+        namespace = fn.get("namespace")
+    if isinstance(namespace, dict):
+        if not isinstance(namespace.get("name"), str):
+            raise ValueError("tool namespace must have a string name")  # noqa: TRY004
+        namespace = namespace["name"]
+    if namespace is not None:
+        if (
+            not isinstance(namespace, str)
+            or not usable_tool_name(namespace)
+            or "::" in namespace
+        ):
+            raise ValueError(
+                "tool namespace must be a nonempty identifier without '::'"
+            )
+        if isinstance(name, str) and "::" in name:
+            prefix, _, _ = name.partition("::")
+            if prefix != namespace:
+                raise ValueError("conflicting tool namespaces")
+        else:
+            name = f"{namespace}::{name}" if isinstance(name, str) else None
+    if not isinstance(name, str) or not usable_tool_name(name):
+        raise ValueError(
+            "function.name must be a dispatchable name: word characters, dots "
+            "or dashes, optionally qualified by one namespace with '::'"
+        )
+    return name
 
 
 def unique_tool_call_id() -> str:

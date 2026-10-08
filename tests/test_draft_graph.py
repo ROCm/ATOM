@@ -406,3 +406,17 @@ def test_the_capture_gate_reaches_the_env_that_names_it(monkeypatch):
     assert not g.will_capture
     monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
     assert g.will_capture
+
+
+def test_unsupported_capture_still_warms_both_halves(monkeypatch):
+    monkeypatch.setenv("ATOM_DRAFT_CUDAGRAPH", "1")
+    calls = []
+    g = _graph(
+        forward=lambda running_bs, **_: calls.append("backbone"),
+        epilogue=lambda out, running_bs, **_: calls.append("head"),
+        capture_supported=False,
+    )
+    assert not g.will_capture
+    assert g.warmup(2, pool=None, stream=None) is None
+    assert calls == ["backbone", "head"]
+    assert not g.is_captured(2)

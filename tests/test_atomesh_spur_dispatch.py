@@ -83,6 +83,11 @@ class SpurDispatchTest(unittest.TestCase):
             rank = os.environ["SPUR_TASK_OFFSET"]
             with (Path(os.environ["TEST_ROOT"]) / ("docker-" + rank + ".jsonl")).open("a") as stream:
                 stream.write(json.dumps(sys.argv[1:]) + "\\n")
+            if sys.argv[1] == "run" and os.environ.get("CONTAINER_LOG_BYTES"):
+                size = int(os.environ["CONTAINER_LOG_BYTES"])
+                sys.stdout.write("container stdout start\\n" + "x" * size)
+                sys.stdout.flush()
+                sys.stderr.write("container stderr end\\n")
             if sys.argv[1] == "run" and rank == os.environ.get("FAIL_RANK"):
                 sys.exit(7)
             phase = os.environ.get("FAIL_PHASE")
@@ -138,6 +143,29 @@ class SpurDispatchTest(unittest.TestCase):
             for line in (self.root / f"docker-{rank}.jsonl").read_text().splitlines()
         ]
 
+    def test_eval_only_pulls_image_and_runs_only_eval_on_both_workers(self):
+        self.run_job(EVAL_ONLY="true", RUN_EVAL="true", EVAL_TASK="gsm8k")
+        for rank in range(2):
+            calls = self.docker_calls(rank)
+            self.assertEqual(calls.count(["pull", "test-image"]), 1)
+            runs = [call for call in calls if call[0] == "run"]
+            self.assertEqual(len(runs), 1)
+            self.assertIn("ATOMESH_EXECUTION_PHASE=eval", runs[0])
+            self.assertIn("ATOMESH_SERVICE_PORT_OFFSET=1000", runs[0])
+
+    def test_eval_only_rejects_disabled_eval(self):
+        self.run_job(EVAL_ONLY="true", RUN_EVAL="false", expected_rc=2)
+        self.assertFalse((self.root / "dispatch.json").exists())
+
+    def test_eval_only_rejects_invalid_port_offset(self):
+        self.run_job(
+            EVAL_ONLY="1",
+            RUN_EVAL="1",
+            ATOMESH_RESTART_PORT_OFFSET="invalid",
+            expected_rc=2,
+        )
+        self.assertFalse((self.root / "dispatch.json").exists())
+
     def test_batch_dispatches_both_workers_and_preserves_topology(self):
         self.run_job()
         dispatch = json.loads((self.root / "dispatch.json").read_text())
@@ -177,6 +205,44 @@ class SpurDispatchTest(unittest.TestCase):
     def test_dispatch_failure_is_not_reported_as_success(self):
         self.run_job(expected_rc=9, DISPATCH_RC="9")
         self.assertFalse((self.root / "docker-0.jsonl").exists())
+
+    def test_large_container_output_stays_in_shared_log(self):
+        size = 33 * 1024 * 1024
+        result = self.run_job("--spur-worker", CONTAINER_LOG_BYTES=str(size))
+        log = self.run_dir / "rank-0/container.log"
+        self.assertEqual(
+            log.read_bytes(),
+            b"container stdout start\n" + b"x" * size + b"container stderr end\n",
+        )
+        output = result.stdout + result.stderr
+        self.assertLess(len(output.encode()), 4096)
+        self.assertIn(str(log), output)
+        self.assertIn("phase=combined exited rc=0", output)
+        self.assertNotIn("container stdout start", output)
+        self.assertNotIn("container stderr end", output)
+
+    def test_large_failure_output_is_bounded_and_preserves_exit_code(self):
+        size = 33 * 1024 * 1024
+        result = self.run_job(
+            "--spur-worker", CONTAINER_LOG_BYTES=str(size), FAIL_RANK="0", expected_rc=7
+        )
+        log = self.run_dir / "rank-0/container.log"
+        content = log.read_bytes()
+        self.assertEqual(
+            content,
+            b"container stdout start\n" + b"x" * size + b"container stderr end\n",
+        )
+        self.assertIn(content[-16384:].decode(), result.stderr)
+        self.assertLess(len((result.stdout + result.stderr).encode()), 20 * 1024)
+        self.assertNotIn("container stdout start", result.stdout + result.stderr)
+        self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "7\n")
+        status = json.loads((self.run_dir / "rank-workload-0.json").read_text())
+        self.assertEqual(status["status"], "running")
+
+    def test_log_summary_failure_does_not_replace_container_exit_code(self):
+        self.write_tool("tail", "raise SystemExit(23)")
+        self.run_job("--spur-worker", FAIL_RANK="0", expected_rc=7)
+        self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "7\n")
 
     def test_invalid_worker_context_fails_before_docker(self):
         for env in (

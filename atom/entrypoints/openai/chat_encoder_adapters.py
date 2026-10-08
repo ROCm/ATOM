@@ -9,10 +9,17 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import deepseek_v41_encoder
+
 logger = logging.getLogger("atom")
 
 MessageEncoder = Callable[..., str]
 MessagePreparer = Callable[[list[dict], list[dict] | None], list[dict]]
+KwargsPreparer = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def _identity_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return kwargs
 
 
 def _copy_messages(
@@ -57,6 +64,8 @@ class MessageEncoderAdapter:
     # after the filter and subject to it, so a default the encoder cannot take
     # is dropped like any other kwarg rather than raising.
     defaults: dict[str, Any] = field(default_factory=dict, compare=False)
+    prepare_kwargs: KwargsPreparer = _identity_kwargs
+    preserve_content: bool = False
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Render, passing on only the kwargs this encoder can take.
@@ -77,6 +86,7 @@ class MessageEncoderAdapter:
         """
         for name, value in self.defaults.items():
             kwargs.setdefault(name, value)
+        kwargs = self.prepare_kwargs(kwargs)
         if self.accepts is not None:
             unread = [name for name in kwargs if name not in self.accepts]
             for name in unread:
@@ -87,9 +97,29 @@ class MessageEncoderAdapter:
         return self.encode(messages, **kwargs)
 
 
-_PREPARERS: dict[str, tuple[MessagePreparer, bool]] = {
-    "encoding_dsv4": (_prepare_deepseek_v4_messages, True),
+@dataclass(frozen=True)
+class _EncoderPreparation:
+    messages: MessagePreparer = _copy_messages
+    kwargs: KwargsPreparer = _identity_kwargs
+    supports_tools: bool = False
+    preserve_content: bool = False
+
+
+_PREPARERS = {
+    "encoding_dsv4": _EncoderPreparation(
+        messages=_prepare_deepseek_v4_messages, supports_tools=True
+    ),
+    "encoding_dsv41": _EncoderPreparation(
+        messages=deepseek_v41_encoder.prepare_messages,
+        kwargs=deepseek_v41_encoder.prepare_kwargs,
+        supports_tools=True,
+        preserve_content=True,
+    ),
 }
+
+# A generic filename does not identify a protocol. Only the checkpoint's
+# explicit model_type selects the V4.1 hooks.
+_MODEL_ENCODERS = {"deepseek_v41": "encoding_dsv41"}
 
 
 def _accepted_kwargs(encoder: MessageEncoder) -> frozenset[str] | None:
@@ -120,6 +150,7 @@ def build_message_encoder_adapter(
     source_path: str = "",
     accepts_from: MessageEncoder | None = None,
     defaults: dict[str, Any] | None = None,
+    model_type: str | None = None,
 ) -> MessageEncoderAdapter:
     """Build an adapter registered for ``module_name`` or an identity adapter.
 
@@ -128,14 +159,16 @@ def build_message_encoder_adapter(
     in a closure taking ``**kwargs``, and reading the *wrapper* would answer
     "anything" for every encoder there is.
     """
-    prepare_messages, supports_tools = _PREPARERS.get(
-        module_name, (_copy_messages, False)
-    )
+    if module_name == "encoding":
+        module_name = _MODEL_ENCODERS.get(model_type, module_name)
+    preparation = _PREPARERS.get(module_name, _EncoderPreparation())
     return MessageEncoderAdapter(
         name=module_name,
         encode=encoder,
-        prepare_messages=prepare_messages,
-        supports_tools=supports_tools,
+        prepare_messages=preparation.messages,
+        prepare_kwargs=preparation.kwargs,
+        supports_tools=preparation.supports_tools,
+        preserve_content=preparation.preserve_content,
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),
         defaults=dict(defaults or {}),

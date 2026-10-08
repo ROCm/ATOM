@@ -20,18 +20,32 @@ class SeqView:
     """One vLLM request, shaped like an ATOM ``Sequence`` for offload."""
 
     __slots__ = (
+        # Stamped by the shared offload scheduler when it refreshes a parked
+        # deferred save; read back with ``getattr(seq, ..., None)``, so an
+        # unset slot reads as "not parked".
+        "_deferred_save_at",
         "_load_operation",
         "_num_cached_tokens",
         # Written by the chunked scheduler's early-block-release path, which
-        # freezes a finished request's placement so a final save can still be
-        # dispatched after vLLM has handed the blocks back. Deliberately left
-        # unset in ``__init__``: that path tests for them with ``hasattr``, and
-        # an unset slot is absent the same way a missing attribute is.
+        # marks a finished request and freezes its computed prefix (and, with no
+        # BlockManager to reacquire through, its block table) so a final
+        # save can still be dispatched after vLLM has handed the blocks back.
+        # Deliberately left unset in ``__init__``: an unset slot reads as absent
+        # the same way a missing attribute does.
+        "_offload_finished",
         "_offload_finished_block_ids",
         "_offload_finished_cached_tokens",
+        "_offload_released",
         "_request",
         "block_table",
         "offload_handoff_boundary_tokens",
+        # The physical load floor, written by the chunked scheduler when it
+        # emits a load and read back by the scheduler to decide where to resume
+        # suffix prefill. ATOM's own ``Sequence`` initialises it to ``None``;
+        # this mirrors that rather than leaving the slot unset, because the
+        # reader uses ``getattr(seq, ..., None)`` and an unset slot would make
+        # "no load emitted" and "slot never declared" the same observation.
+        "offload_load_start_tokens",
         "offload_loaded_tokens",
         "prefix_hashes_published",
     )
@@ -42,6 +56,7 @@ class SeqView:
         self.block_table: list[int] = []
         # Offload's own state, mirroring the fields on ATOM's Sequence.
         self.offload_loaded_tokens = 0
+        self.offload_load_start_tokens = None
         self.offload_handoff_boundary_tokens = 0
         self.prefix_hashes_published = False
         self._load_operation = None
@@ -98,14 +113,17 @@ class SeqView:
         self._num_cached_tokens = 0
         self.block_table = []
         self.offload_loaded_tokens = 0
+        self.offload_load_start_tokens = None
         self.offload_handoff_boundary_tokens = 0
         self.prefix_hashes_published = False
         self._load_operation = None
         # Frozen placement from a previous finish is placement too, and a
         # preempted request's is as stale as the live block table.
         for frozen in (
+            "_offload_finished",
             "_offload_finished_block_ids",
             "_offload_finished_cached_tokens",
+            "_offload_released",
         ):
             if hasattr(self, frozen):
                 delattr(self, frozen)

@@ -51,7 +51,9 @@ def _make_method(
         quant_method=None,
         is_dynamic=True,
     )
-    moe_config = SimpleNamespace(a_quant_dtype=None, use_ep=use_ep)
+    moe_config = SimpleNamespace(
+        a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=use_ep
+    )
     return moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
 
@@ -143,7 +145,7 @@ def test_mega_backend_keeps_decode_triton_off(monkeypatch):
             quant_method=None,
             is_dynamic=True,
         ),
-        SimpleNamespace(a_quant_dtype=None, use_ep=True),
+        SimpleNamespace(a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=True),
     )
 
     assert method.use_triton_decode is False
@@ -325,6 +327,7 @@ def _apply_dispatch_probe(monkeypatch, *, use_triton_decode, is_prefill):
     method.use_triton_decode = use_triton_decode
     method.is_gfx1250 = True
     method.is_guinterleave = True
+    method.fp8_activations = False
     method.act_quant = None
     method.quant_type = "mxfp4"
     method.hidden_pad = 0
