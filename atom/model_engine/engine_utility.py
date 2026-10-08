@@ -15,7 +15,7 @@ logger = logging.getLogger("atom")
 # Commands whose senders never wait, so their handlers answer nothing and a
 # synchronous caller could only wait out its timeout on them.
 FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
-_WEIGHT_UPDATE_CMDS = frozenset(
+WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
 
@@ -68,6 +68,7 @@ class EngineUtilityHandler:
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",
+        "discard_failed_weight_sync": "_handle_discard_failed_weight_sync",
         "release_memory": "_handle_release_memory",
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
@@ -125,7 +126,7 @@ class EngineUtilityHandler:
                         else:
                             engine._is_rl_weights_offloaded = False
                             logger.info(f"{self.label}: engine exited sleep mode")
-                elif cmd in _WEIGHT_UPDATE_CMDS:
+                elif cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     failed = isinstance(reply, dict) and bool(reply.get("error"))
                     is_complete = cmd == "update_weights" or (
                         args.get("is_last", True) if isinstance(args, dict) else True
@@ -301,7 +302,7 @@ class EngineUtilityHandler:
         )
         timeout = args.get("timeout", _DIRECT_UPDATE_TIMEOUT_S)
         try:
-            replies = self.runner_mgr.collective_rpc(method, payload, timeout=timeout)
+            replies = self.runner_mgr.utility_rpc(method, payload, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
             self._discard_failed_update_on_every_rank(cmd, timeout)
             return self._error_reply(cmd, exc)
@@ -322,21 +323,34 @@ class EngineUtilityHandler:
         logger.error(f"{self.label}: {cmd} failed: {error}")
         return {"cmd": cmd, "error": error}
 
-    def _discard_failed_update_on_every_rank(self, cmd: str, timeout: float) -> None:
+    def _discard_failed_update_on_every_rank(self, cmd: str, timeout: float) -> dict:
         """Keep no rank's scratch after this engine's update failed."""
         payload = RpcPayload(request_id=f"{cmd}-discard-{uuid.uuid4().hex}")
         try:
-            replies = self.runner_mgr.collective_rpc(
+            replies = self.runner_mgr.utility_rpc(
                 "discard_failed_weight_sync", payload, timeout=timeout
             )
             failed = [r for r in replies if not r.ok]
             if failed:
-                logger.error(
-                    f"{self.label}: {cmd} cleanup failed on "
-                    f"{len(failed)}/{len(replies)} TP rank(s)"
+                error = (
+                    f"{cmd} cleanup failed on {len(failed)}/{len(replies)} "
+                    f"TP rank(s)"
                 )
-        except Exception:
+                logger.error(f"{self.label}: {error}")
+                return {"cmd": "discard_failed_weight_sync", "error": error}
+        except Exception as exc:
             logger.exception(f"{self.label}: {cmd} cleanup could not be broadcast")
+            return self._error_reply("discard_failed_weight_sync", exc)
+        return {"cmd": "discard_failed_weight_sync", "result": True}
+
+    def _handle_discard_failed_weight_sync(self, args: dict) -> dict:
+        """Clear abandoned update scratch on every TP rank of this engine."""
+        reply = self._discard_failed_update_on_every_rank(
+            args.get("failed_cmd", "weight update"),
+            args.get("timeout", _DIRECT_UPDATE_TIMEOUT_S),
+        )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
 
     def _handle_update_weights(self, args: dict) -> dict:
         """Handle direct weight update command."""

@@ -266,6 +266,21 @@ def test_the_barrier_is_driven_by_the_payload_not_the_name():
     assert barrier.waits == 0
 
 
+def test_the_legacy_shared_buffer_methods_keep_their_barrier():
+    """Existing call_func users do not carry a payload flag, so their method
+    names remain the compatibility contract."""
+
+    class _W:
+        def update_weights_from_ipc(self, *args):
+            return "done"
+
+    barrier = _Barrier()
+    proc = _proc(runners=[_W()], barrier=barrier)
+    primary, _ = _drive(proc, [("update_weights_from_ipc", [None, {}, True, None])])
+    assert primary == ["done"]
+    assert barrier.waits == 1
+
+
 # ── the untouched path ─────────────────────────────────────────────────────
 
 
@@ -399,6 +414,7 @@ def test_forward_cannot_go_around_the_block_table_encoder():
         "update_weights",
         "update_weights_from_shm",
         "update_weights_from_ipc",
+        "discard_failed_weight_sync",
         "release_memory",
         "resume_memory",
         "clear_kv_cache",
@@ -411,6 +427,18 @@ def test_names_the_engine_protocol_owns_are_refused(name):
     with pytest.raises(ValueError, match="reserved"):
         mgr.collective_rpc(name, RpcPayload(request_id="x1"))
     assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["update_weights", "update_weights_from_shm", "update_weights_from_ipc"],
+)
+def test_the_utility_handler_can_use_the_reserved_all_rank_transport(name):
+    mgr = _mgr(1)
+    _reply(mgr, 0, "utility", value=1)
+    results = mgr.utility_rpc(name, RpcPayload("utility"), timeout=5)
+    assert results[0].value == 1
+    assert mgr.rpc_broadcast_mq.sent[0][0] == name
 
 
 def test_the_reserved_names_track_the_worker_loop():

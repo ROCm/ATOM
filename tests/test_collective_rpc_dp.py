@@ -1,17 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The DP half: ``CoreManager.collective_rpc`` and request-id routing.
+"""The DP half: request-id routing for collective and ordinary utility calls."""
 
-``broadcast_utility_command_sync`` reads a fixed count of replies off one shared
-queue, so it matches by position. Two overlapping callers take each other's
-replies, and a late reply from an abandoned call becomes the next caller's --
-upstream's own ``push_metrics`` docstring records that biting the old pull-based
-metrics. These tests pin the correlated replacement, and pin that every other
-utility command still uses the legacy queue.
-"""
-
-import queue
 import threading
 import time
 from contextlib import ExitStack
@@ -381,6 +372,8 @@ def _answering(mgr, replies, ranks=None):
 
     def broadcast(cmd, **kw):
         mgr.sent.append((cmd, kw))
+        if "request_id" not in kw:  # a fire-and-forget cleanup broadcast
+            return
         for dp_rank, body in zip(ranks or range(len(replies)), replies):
             mgr._route_utility_response(
                 dp_rank, {**body, "request_id": kw["request_id"]}
@@ -414,6 +407,17 @@ def test_sync_raises_the_cause_when_an_engine_reports_an_error():
     )
     with pytest.raises(RuntimeError, match="1 of 2 engine.*loader rejected"):
         mgr.broadcast_utility_command_sync("update_weights", named_tensors=[])
+    assert mgr.sent[-1][0] == "discard_failed_weight_sync"
+
+
+def test_a_timeout_cleans_update_scratch_on_every_dp_engine_too():
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "update_weights_ipc", "result": 3}], ranks=[0]
+    )
+    with pytest.raises(TimeoutError, match=r"DP rank\(s\) \[1\]"):
+        mgr.broadcast_utility_command_sync("update_weights_ipc", timeout=0.2)
+    assert mgr.sent[-1][0] == "discard_failed_weight_sync"
 
 
 def test_sync_still_returns_every_reply_when_all_succeed():

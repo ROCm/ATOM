@@ -276,6 +276,12 @@ class AsyncIOProc:
                 serialized_obj = pickle.dumps(result)
                 socket.send(serialized_obj)
 
+    # Legacy call_func users still need the same shared-buffer barrier. The
+    # generic path carries this decision explicitly in RpcPayload.barrier.
+    _BARRIER_FUNCS: ClassVar[frozenset[str]] = frozenset(
+        {"update_weights_from_ipc", "update_weights_from_shm"}
+    )
+
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
@@ -285,7 +291,7 @@ class AsyncIOProc:
             )
             if payload is None:
                 call_args, call_kwargs = args, {}
-                need_barrier = False
+                need_barrier = func_name in self._BARRIER_FUNCS
             else:
                 call_args = payload.args
                 call_kwargs = payload.call_kwargs()
@@ -427,13 +433,11 @@ class AsyncIOProcManager:
     # Names that collective_rpc refuses. Some belong to the engine's wire
     # protocol; the utility-managed ones need EngineUtilityHandler to maintain
     # engine state around their worker call.
+    _PROTOCOL_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {FORWARD_RPC, "exit", *AsyncIOProc._KV_FUNC_NAMES}
+    )
     _RESERVED_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
-        {
-            FORWARD_RPC,
-            "exit",
-            *AsyncIOProc._KV_FUNC_NAMES,
-            *UTILITY_MANAGED_RUNNER_METHODS,
-        }
+        {*_PROTOCOL_RPC_NAMES, *UTILITY_MANAGED_RUNNER_METHODS}
     )
 
     def __init__(self, finalizer, proc_num: int, runner: str, *args):
@@ -642,6 +646,30 @@ class AsyncIOProcManager:
         payload: RpcPayload,
         timeout: float = 300.0,
     ) -> list[RpcResult]:
+        """Public worker RPC: utility-managed methods are not callable here."""
+        return self._collective_rpc(
+            func_name, payload, timeout, allow_utility_managed=False
+        )
+
+    def utility_rpc(
+        self,
+        func_name: str,
+        payload: RpcPayload,
+        timeout: float = 300.0,
+    ) -> list[RpcResult]:
+        """All-rank transport for EngineUtilityHandler-owned methods."""
+        return self._collective_rpc(
+            func_name, payload, timeout, allow_utility_managed=True
+        )
+
+    def _collective_rpc(
+        self,
+        func_name: str,
+        payload: RpcPayload,
+        timeout: float,
+        *,
+        allow_utility_managed: bool,
+    ) -> list[RpcResult]:
         """Run *func_name* on every TP runner and return one reply per rank.
 
         Unlike :meth:`call_func`, which surfaces only rank 0's return, this
@@ -667,7 +695,10 @@ class AsyncIOProcManager:
         # Reached from the utility handler too, with whatever timeout the
         # utility command carried.
         timeout = checked_timeout(timeout)
-        if func_name in self._RESERVED_RPC_NAMES:
+        is_reserved = func_name in self._PROTOCOL_RPC_NAMES or (
+            func_name in UTILITY_MANAGED_RUNNER_METHODS and not allow_utility_managed
+        )
+        if is_reserved:
             # Each would break the protocol this path goes around. The workers'
             # decoder resets its cached rows on a forward the encoder never saw,
             # failing the next scheduled one. Exit tears down every worker's

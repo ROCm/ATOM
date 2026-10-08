@@ -45,6 +45,17 @@ class _RunnerMgr:
 
     def collective_rpc(self, method, payload, timeout=300.0):
         self.calls.append((method, payload, timeout))
+        if self._raises is not None:
+            raise self._raises
+        if self._replies is not None:
+            return self._replies
+        return [
+            RpcResult(payload.request_id, r, value=f"rank{r}")
+            for r in range(self.proc_num)
+        ]
+
+    def utility_rpc(self, method, payload, timeout=300.0):
+        self.calls.append((method, payload, timeout))
         if method == "discard_failed_weight_sync":
             return [
                 RpcResult(payload.request_id, r, value=True)

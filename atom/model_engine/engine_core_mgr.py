@@ -27,7 +27,10 @@ from atom.model_engine.collective_rpc import (
     engine_budget,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.engine_utility import FIRE_AND_FORGET_UTILITY_CMDS
+from atom.model_engine.engine_utility import (
+    FIRE_AND_FORGET_UTILITY_CMDS,
+    WEIGHT_UPDATE_UTILITY_CMDS,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
@@ -1542,12 +1545,23 @@ class CoreManager:
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
         missing = sorted(set(range(engine_count)) - set(by_dp_rank))
         if missing:
+            if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                self.broadcast_utility_command(
+                    "discard_failed_weight_sync", failed_cmd=cmd
+                )
             raise TimeoutError(
                 f"{self.label}: no reply to utility command {cmd!r} from DP "
                 f"rank(s) {missing} within {timeout}s"
             )
         failed = [r for r in responses if isinstance(r, dict) and r.get("error")]
         if failed:
+            if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                # An engine whose local TP ranks all succeeded has no local
+                # reason to discard its packed/expert/IPC scratch. Once any DP
+                # engine failed, every engine belongs to the abandoned sync.
+                self.broadcast_utility_command(
+                    "discard_failed_weight_sync", failed_cmd=cmd
+                )
             # Callers read r["result"]; an error reply has none, and handing it
             # back would turn a named failure into a KeyError somewhere else.
             raise RuntimeError(

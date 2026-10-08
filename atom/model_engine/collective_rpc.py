@@ -28,6 +28,7 @@ UTILITY_MANAGED_RUNNER_METHODS = frozenset(
         "update_weights",
         "update_weights_from_shm",
         "update_weights_from_ipc",
+        "discard_failed_weight_sync",
         "release_memory",
         "resume_memory",
         "clear_kv_cache",
