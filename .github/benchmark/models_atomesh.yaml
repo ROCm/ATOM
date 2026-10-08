@@ -1227,6 +1227,15 @@ models:
               ATOMESH_TRANSPORT_NIXL_READ_ONLY: "1"
               ATOMESH_TRANSPORT_UCX_SELECTION: "rdma0:1@1"
 
+        # One mutually justified candidate from this allocation; never sweep tuples.
+        - <<: *survey_transport_image_only
+          name: survey-transport-nixl-auto-single-read-only-2node
+          env:
+            common:
+              ATOMESH_TRANSPORT_GPU: "1"
+              ATOMESH_TRANSPORT_NIXL_READ_ONLY: "1"
+              ATOMESH_TRANSPORT_UCX_AUTO_SINGLE: "1"
+
   # Candidate only; exact local metadata/index/shard structure required before allocation.
   # No alternate checkpoint/download; original FP4 experts + FP8 checkpoint metadata.
   DeepSeek-V4-Flash-vLLM-Survey:

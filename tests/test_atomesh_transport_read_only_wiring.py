@@ -39,7 +39,7 @@ def cells(monkeypatch):
             matrix.load_config(ROOT / ".github/benchmark/models_atomesh.yaml"),
             suite="vllm",
             model_filter={"Transport-vLLM-Survey"},
-            case_filter=None,
+            case_filter={BASE, INVENTORY, CASE},
             benchmark_kind_filter=None,
             override_image=None,
             override_benchmark_concurrency=None,
@@ -67,7 +67,7 @@ def test_original_default_and_inventory_semantics_remain_unchanged(cells):
         (ROOT / ".github/benchmark/models_atomesh.yaml").read_text()
     )["models"]["Transport-vLLM-Survey"]
     original["suites"]["vllm"] = [
-        cell for cell in original["suites"]["vllm"] if cell["name"] != CASE
+        cell for cell in original["suites"]["vllm"] if cell["name"] in (BASE, INVENTORY)
     ]
     assert hashlib.sha256(
         json.dumps(original, sort_keys=True).encode()

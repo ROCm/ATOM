@@ -5,6 +5,8 @@ installation, scheduler operation, network mutation or TCP payload fallback.
 GPU work is opt-in (ATOMESH_TRANSPORT_GPU=1); imports stay in supervised children.
 ATOMESH_TRANSPORT_NIXL_READ_ONLY=1 additionally requires an explicit locally
 validated UCX selection and agreeing peers; it skips all MoRI work and size parsing.
+ATOMESH_TRANSPORT_UCX_AUTO_SINGLE=1 instead agrees on one fresh peer-inventory
+candidate, only with GPU=1 and READ_ONLY=1, without an explicit selection.
 Results describe pinned-image transport, NOT fixed-main vLLM or model PD support.
 Exit 0 means collection completed, not that transport passed; inspect summary.json.
 
@@ -51,6 +53,22 @@ def write_json(path, value):
     tmp.replace(path)
 
 
+def publish_once(path, value):
+    """Atomically create protocol evidence without replacing a previous run."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        with tmp.open("x") as stream:
+            stream.write(json.dumps(value, indent=2) + "\n")
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            raise Unknown(f"conflicting protocol evidence: {path.name}") from None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def read_text(path):
     try:
         return Path(path).read_text().strip()
@@ -90,13 +108,20 @@ def inventory():
             }
         )
     commands = []
-    for argv in (
+    inventory_commands = [
         ["ip", "-j", "address", "show"],
         ["rdma", "link", "show"],
         ["ibv_devinfo"],
         ["ucx_info", "-v"],
         ["ucx_info", "-d"],
-    ):
+    ]
+    if os.environ.get("ATOMESH_TRANSPORT_UCX_AUTO_SINGLE") == "1":
+        # Build-stage path is evidence-backed, not guaranteed in the runtime image.
+        inventory_commands += [
+            ["/usr/local/ucx/bin/ucx_info", "-v"],
+            ["/usr/local/ucx/bin/ucx_info", "-d"],
+        ]
+    for argv in inventory_commands:
         try:
             p = subprocess.run(
                 argv, capture_output=True, text=True, timeout=6, check=False
@@ -166,6 +191,175 @@ def validated_selection(spec, inv):
     raise Unknown("requested NIC/port/GID is absent from readonly inventory")
 
 
+def current_selection(spec):
+    """Re-read only the chosen sysfs tuple; never search for a replacement."""
+    device_port, index = spec.split("@")
+    device, port = device_port.split(":")
+    path = Path("/sys/class/infiniband") / device / "ports" / port
+    return {
+        "device": device,
+        "port": port,
+        "state": read_text(path / "state"),
+        "link_layer": read_text(path / "link_layer"),
+        "gid": {
+            "index": index,
+            "gid": read_text(path / "gids" / index),
+            "type": read_text(path / "gid_attrs/types" / index),
+            "ndev": read_text(path / "gid_attrs/ndevs" / index),
+        },
+    }
+
+
+def auto_candidates(inv):
+    candidates = {}
+    for port in inv["ports"]:
+        for gid in port["gids"]:
+            spec = f"{port['device']}:{port['port']}@{gid['index']}"
+            if port["link_layer"] != "Ethernet" or gid["type"] != "RoCE v2":
+                continue
+            try:
+                validated_selection(spec, {"ports": [{**port, "gids": [gid]}]})
+            except Unknown:
+                continue
+            if spec in candidates:
+                raise Unknown("duplicate inventory tuple")
+            candidates[spec] = {
+                **{key: value for key, value in port.items() if key != "gids"},
+                "gid": gid,
+            }
+    return candidates
+
+
+def evidence_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def auto_single_probe(inv, root, out, rank, run, summary):
+    """Agree on one fresh sysfs candidate, then validate it without retries."""
+    context = {
+        "job_id": os.environ["SLURM_JOB_ID"],
+        "run_token": os.environ["ATOMESH_RUN_TOKEN"],
+        "image": os.environ["DOCKER_IMAGE"],
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "source_sha": FIXED_SHA,
+        "allocation_ips": os.environ["IPADDRS"].split(","),
+        "phase": os.environ.get("ATOMESH_EXECUTION_PHASE", "benchmark"),
+        "gpu": "1",
+        "nixl_read_only": "1",
+        "auto_single": "1",
+    }
+    identity = {
+        **context,
+        "rank": rank,
+        "hostname": socket.gethostname(),
+        "node_ip": context["allocation_ips"][rank],
+        "nonce": os.urandom(16).hex(),
+    }
+
+    def publish(stage, **payload):
+        document = {**identity, "created_at": time.time(), **payload}
+        publish_once(root / f"auto-{stage}-{rank}.json", document)
+        return document
+
+    def receive(stage):
+        peer = wait_json(root / f"auto-{stage}-{1-rank}.json", timeout=45)
+        if (
+            any(peer.get(key) != value for key, value in context.items())
+            or peer.get("rank") != 1 - rank
+            or peer.get("node_ip") != context["allocation_ips"][1 - rank]
+            or not isinstance(peer.get("hostname"), str)
+            or not peer["hostname"]
+            or peer["hostname"] == identity["hostname"]
+            or not isinstance(peer.get("nonce"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", peer["nonce"]) is None
+            or not isinstance(peer.get("created_at"), (int, float))
+            or not -5 <= time.time() - peer["created_at"] <= 45
+        ):
+            raise Unknown(f"stale or mismatched auto-{stage} peer")
+        return peer
+
+    summary["stages"]["mori-register"] = {
+        "status": "UNKNOWN",
+        "classification": "NOT_TESTED",
+        "reason": "NIXL READ-only control",
+    }
+    summary["stages"]["nixl-rdma-gpu-read"] = {
+        "status": "UNKNOWN",
+        "classification": "NOT_TESTED",
+        "reason": "single-candidate agreement and both selected backends required",
+    }
+    local = publish("inventory", inventory=inv)
+    peer = receive("inventory")
+    candidates, remote_candidates = auto_candidates(inv), auto_candidates(
+        peer["inventory"]
+    )
+    common = candidates.keys() & remote_candidates.keys()
+
+    def order(spec):
+        device_port, gid = spec.split("@")
+        device, port = device_port.split(":")
+        return device, int(port), int(gid)
+
+    evidence = {
+        "rule": "lexicographic device, numeric port, numeric GID index; one attempt",
+        "inventory_digests": {
+            str(rank): evidence_digest(local),
+            str(1 - rank): evidence_digest(peer),
+        },
+        "nonces": {str(rank): identity["nonce"], str(1 - rank): peer["nonce"]},
+        "local_candidates": sorted(candidates, key=order),
+        "peer_candidates": sorted(remote_candidates, key=order),
+        "selection": min(common, key=order) if common else None,
+    }
+    write_json(out / "auto-selection.json", evidence)
+    # Retain original settings as separately labelled evidence, never selected proof.
+    run("nixl-original-create", "nixl-create")
+    if not common:
+        raise Unknown("no common ACTIVE RoCE v2 nonzero-GID tuple")
+    selection = evidence["selection"]
+    evidence.update(
+        local_entry=candidates[selection], peer_entry=remote_candidates[selection]
+    )
+    write_json(out / "auto-selection.json", evidence)
+    agreement = {
+        key: evidence[key] for key in ("selection", "inventory_digests", "nonces")
+    }
+    publish("selection", agreement=agreement)
+    remote = receive("selection")
+    if remote["nonce"] != peer["nonce"] or remote.get("agreement") != agreement:
+        raise Unknown("peer did not confirm fresh single-candidate agreement")
+    refreshed = current_selection(selection)
+    write_json(out / "auto-selection-recheck.json", refreshed)
+    if refreshed != candidates[selection]:
+        raise Unknown("selected tuple changed; no replacement attempted")
+    overrides = validated_selection(selection, inv)
+    selected = run("nixl-selected-create", "nixl-create", overrides)
+    publish("ready", agreement=agreement, eligible=selected["status"] == "PASS")
+    remote = receive("ready")
+    if (
+        remote["nonce"] != peer["nonce"]
+        or remote.get("agreement") != agreement
+        or remote.get("eligible") is not True
+        or selected["status"] != "PASS"
+    ):
+        raise Unknown("selected backend failed or peer readiness disagreed; no retry")
+    session = {
+        **context,
+        "agreement": agreement,
+        "hosts": {str(rank): identity["hostname"], str(1 - rank): peer["hostname"]},
+    }
+    run(
+        "nixl-rdma-gpu-read",
+        "nixl-transfer",
+        {
+            **overrides,
+            "UCX_TLS": "rc,rocm_copy,rocm_ipc",
+            "ATOMESH_TRANSPORT_READ_SESSION": json.dumps(session, sort_keys=True),
+        },
+        exchange=root / f"auto-read-{evidence_digest(session)}",
+    )
+
+
 def wait_json(path, timeout=45):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -220,11 +414,16 @@ def nixl_probe(args):
         checkpoint(args.result, "gpu_register")
         registration = agent.register_memory(tensor, backends=["UCX"])
         exchange = Path(args.exchange)
-        write_json(
+        session = json.loads(os.environ.get("ATOMESH_TRANSPORT_READ_SESSION", "null"))
+        protocol_write = publish_once if session is not None else write_json
+        binding = {"session": session} if session is not None else {}
+        protocol_write(
             exchange / f"metadata-{args.rank}.json",
             {
+                **binding,
                 "hostname": socket.gethostname(),
                 "rank": args.rank,
+                "node_ip": os.environ["IPADDRS"].split(",")[args.rank],
                 "metadata": base64.b64encode(agent.get_agent_metadata()).decode(),
                 "pointer": tensor.data_ptr(),
                 "bytes": TINY_BYTES,
@@ -234,6 +433,13 @@ def nixl_probe(args):
         peer = wait_json(exchange / f"metadata-{1 - args.rank}.json")
         if peer["hostname"] == socket.gethostname() or peer["rank"] == args.rank:
             raise Unknown("distinct-node identity not established")
+        if session is not None and (
+            peer.get("session") != session
+            or peer.get("rank") != 1 - args.rank
+            or peer.get("hostname") != session["hosts"][str(1 - args.rank)]
+            or peer.get("node_ip") != session["allocation_ips"][1 - args.rank]
+        ):
+            raise Unknown("READ metadata identity mismatch")
         if peer["bytes"] != TINY_BYTES:
             raise Unknown("peer payload size differs")
         remote = agent.add_remote_agent(base64.b64decode(peer["metadata"]))
@@ -259,9 +465,10 @@ def nixl_probe(args):
             expected = torch.arange(TINY_BYTES, dtype=torch.int32).to(torch.uint8)
             if not torch.equal(tensor.cpu(), expected):
                 raise RuntimeError("GPU destination payload mismatch")
-            write_json(
+            protocol_write(
                 exchange / "verified.json",
                 {
+                    **binding,
                     "status": "PASS",
                     "bytes": TINY_BYTES,
                     "operation": "READ",
@@ -275,6 +482,16 @@ def nixl_probe(args):
                 },
             )
         receipt = wait_json(exchange / "verified.json")
+        if session is not None and (
+            receipt.get("session") != session
+            or receipt.get("source") != session["hosts"]["0"]
+            or receipt.get("destination") != session["hosts"]["1"]
+            or receipt.get("status") != "PASS"
+            or receipt.get("bytes") != TINY_BYTES
+            or receipt.get("operation") != "READ"
+            or receipt.get("payload_verified") is not True
+        ):
+            raise Unknown("READ receipt identity or payload evidence mismatch")
         return {
             "status": "PASS",
             "meaning": "TINY_GPU_READ_NOT_MODEL_PD",
@@ -427,6 +644,18 @@ def main():
         raise ValueError("transport survey must retain fixed-main source identity")
     if IMAGE_DIGEST not in os.environ.get("DOCKER_IMAGE", ""):
         raise ValueError("transport survey requires the recorded digest-pinned image")
+    auto_single = os.environ.get("ATOMESH_TRANSPORT_UCX_AUTO_SINGLE", "0")
+    if auto_single not in ("0", "1"):
+        raise ValueError("ATOMESH_TRANSPORT_UCX_AUTO_SINGLE must be 0 or 1")
+    if auto_single == "1" and (
+        os.environ.get("ATOMESH_TRANSPORT_GPU") != "1"
+        or os.environ.get("ATOMESH_TRANSPORT_NIXL_READ_ONLY") != "1"
+        or os.environ.get("ATOMESH_TRANSPORT_UCX_SELECTION", "")
+        or not os.environ.get("ATOMESH_RUN_TOKEN", "").strip()
+    ):
+        raise ValueError(
+            "AUTO_SINGLE requires GPU=1, READ_ONLY=1, run token, no explicit selection"
+        )
     read_only = os.environ.get("ATOMESH_TRANSPORT_NIXL_READ_ONLY", "0")
     if read_only not in ("0", "1"):
         raise ValueError("ATOMESH_TRANSPORT_NIXL_READ_ONLY must be 0 or 1")
@@ -439,7 +668,11 @@ def main():
     if gpu not in ("0", "1"):
         raise ValueError("ATOMESH_TRANSPORT_GPU must be 0 or 1")
     if read_only == "1" and (
-        gpu != "1" or not os.environ.get("ATOMESH_TRANSPORT_UCX_SELECTION", "")
+        gpu != "1"
+        or (
+            auto_single != "1"
+            and not os.environ.get("ATOMESH_TRANSPORT_UCX_SELECTION", "")
+        )
     ):
         raise ValueError("NIXL READ-only requires GPU=1 and an explicit UCX selection")
     root = (
@@ -469,7 +702,7 @@ def main():
         inv = inventory()
         write_json(out / "inventory.json", inv)
 
-        def run(name, kind, overrides=None, size=4096):
+        def run(name, kind, overrides=None, size=4096, exchange=None):
             result_path = out / f"{name}.json"
             argv = [
                 sys.executable,
@@ -481,7 +714,7 @@ def main():
                 "--result",
                 str(result_path),
                 "--exchange",
-                str(root / name),
+                str(exchange if exchange is not None else root / name),
                 "--size",
                 str(size),
             ]
@@ -514,6 +747,11 @@ def main():
             summary["stages"][name] = result
             write_json(out / "summary.json", summary)
             return result
+
+        if auto_single == "1":
+            auto_single_probe(inv, root, out, rank, run, summary)
+            summary["collection"] = "COMPLETED"
+            return 0
 
         original = run("nixl-original-create", "nixl-create")
         selection = os.environ.get("ATOMESH_TRANSPORT_UCX_SELECTION", "")
