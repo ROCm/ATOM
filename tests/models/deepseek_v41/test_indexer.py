@@ -4,6 +4,8 @@
 import pytest
 import torch
 
+from atom.model_ops.deepseek_v41.index_plane import IndexUnits
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("score", [float("nan"), float("inf"), float("-inf"), 1.0])
@@ -21,12 +23,13 @@ def test_nonfinite_scores_keep_candidate_context_inside_allocation(score):
     visible = torch.tensor([42497, 42498, 42499], dtype=torch.int32, device="cuda")
     logits = torch.full((rows, width), score, device="cuda")
     candidates = torch.empty(rows, kept, dtype=torch.int32, device="cuda")
-    tiles = torch.arange(width // block_size, dtype=torch.int32, device="cuda").repeat(
-        rows, 1
-    )
+    # every row its own request, its PAGEs one block each, in order
+    pages = torch.arange(width // block_size, dtype=torch.int32, device="cuda")
+    pages = pages.repeat(rows, 1)
+    batch_ids = torch.arange(rows, dtype=torch.int32, device="cuda")
     pick_candidate_blocks(logits, visible, block_size, candidates)
     table, bound = candidate_block_table(
-        candidates, tiles, visible, rows_per_block=block_size
+        candidates, pages, batch_ids, 1, visible, rows_per_block=block_size
     )
 
     torch.testing.assert_close(candidates[:, -1], (visible - 1) // block_size)
@@ -196,6 +199,7 @@ def test_unit_table_expands_the_page_table_in_place(units):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
     from atom.model_ops.deepseek_v41.index_write import write_index_rows
     from atom.model_ops.deepseek_v41.unit_table import unit_table
 
@@ -227,10 +231,17 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     visible = torch.tensor(
         [0, 1, 33, 64, 129, 511, 512], device="cuda", dtype=torch.int32
     )
-    args = (query, weights, plane.view(-1, block, dim + 4), tiles, visible)
+    args = (query, weights, IndexUnits(plane.view(-1, block, dim + 4)), tiles, visible)
     kwargs = {"topk": 64, "weights_scale": (heads * dim) ** -0.5}
+
+    def bind(ids):
+        batch = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        return bind_candidates(
+            ids, table, batch, per_page // block, visible, rows_per_block=block
+        )
+
     full, candidates = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
-    reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=candidates)
+    reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=bind(candidates))
     real_score = scoring.deepgemm_fp8_paged_mqa_logits
     sizes = []
 
@@ -245,7 +256,9 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     monkeypatch.setattr(scoring, "plane_rows", lambda width: 3)
     monkeypatch.setattr(scoring, "deepgemm_fp8_paged_mqa_logits", observe)
     actual, chosen = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
-    actual_reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=chosen)
+    actual_reindex, _ = scoring.score_topk_paged(
+        *args, **kwargs, candidates=bind(chosen)
+    )
     torch.testing.assert_close(actual, full, rtol=0, atol=0)
     torch.testing.assert_close(chosen, candidates, rtol=0, atol=0)
     torch.testing.assert_close(actual_reindex, reindex, rtol=0, atol=0)
@@ -258,7 +271,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
             *args, **kwargs, candidate_count=16
         )
         replay_reindex, _ = scoring.score_topk_paged(
-            *args, **kwargs, candidates=replay_candidates
+            *args, **kwargs, candidates=bind(replay_candidates)
         )
     visible.copy_(visible.flip(0))
     graph.replay()
@@ -269,7 +282,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
         *args, **kwargs, candidate_count=16
     )
     expected_reindex, _ = scoring.score_topk_paged(
-        *args, **kwargs, candidates=expected_candidates
+        *args, **kwargs, candidates=bind(expected_candidates)
     )
     torch.testing.assert_close(replay_full, expected, rtol=0, atol=0)
     torch.testing.assert_close(replay_candidates, expected_candidates, rtol=0, atol=0)
@@ -288,7 +301,10 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     score comparison would let through as "close enough".
     """
     from atom.model_ops.deepseek_v41 import paged_scoring as scoring
-    from atom.model_ops.deepseek_v41.candidate_table import lift_candidate_selection
+    from atom.model_ops.deepseek_v41.candidate_table import (
+        bind_candidates,
+        lift_candidate_selection,
+    )
     from atom.model_ops.deepseek_v41.index_write import write_index_rows
     from atom.model_ops.deepseek_v41.indexer import restrict_to_candidates_reference
     from atom.model_ops.deepseek_v41.unit_table import unit_table
@@ -320,12 +336,16 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     # bound has to get right, and it is only partial off the boundary.
     visible = torch.tensor([0, 1, 33, 64, 129, 511, 512], device="cuda")
     visible = visible.to(torch.int32)
-    args = (query, weights, plane.view(-1, block, dim + 4), tiles, visible)
+    args = (query, weights, IndexUnits(plane.view(-1, block, dim + 4)), tiles, visible)
     # The model's candidate length, fixed; `block` is the plane's.
     kwargs = {"topk": 64, "weights_scale": (heads * dim) ** -0.5, "block_size": 8}
 
     _, candidates = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
-    actual, _ = scoring.score_topk_paged(*args, **kwargs, candidates=candidates)
+    batch = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    kept = bind_candidates(
+        candidates, table, batch, per_page // block, visible, rows_per_block=block
+    )
+    actual, _ = scoring.score_topk_paged(*args, **kwargs, candidates=kept)
 
     # The path this replaces, assembled from the same pieces: full width, the
     # mask, then the same selector.
@@ -365,7 +385,7 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     # Armed: the ids leaving the selector are columns of the narrow width, so a
     # missing lift would agree with the real rows only where a row kept its very
     # first blocks.
-    raw, _ = scoring.score_topk_paged(*args, **kwargs, candidates=candidates)
+    raw, _ = scoring.score_topk_paged(*args, **kwargs, candidates=kept)
     twice = raw.clone()
     lift_candidate_selection(twice, candidates, rows_per_block=block)
     assert not torch.equal(twice, raw)
@@ -373,9 +393,15 @@ def test_scoring_inside_the_candidates_picks_what_masking_the_full_width_picked(
     # A plane paged at anything but the candidate length says so rather than
     # scoring the wrong rows: the ids would be read at one length and the
     # blocks addressed at another, which is a wrong answer and not a fault.
-    mismatched = (query, weights, plane.view(-1, 16, dim + 4), tiles, visible)
+    mismatched = (
+        query,
+        weights,
+        IndexUnits(plane.view(-1, 16, dim + 4)),
+        tiles,
+        visible,
+    )
     with pytest.raises(AssertionError, match="cannot be a block table"):
-        scoring.score_topk_paged(*mismatched, **kwargs, candidates=candidates)
+        scoring.score_topk_paged(*mismatched, **kwargs, candidates=kept)
 
 
 def _picked_blocks_reference(logits, visible, block_size, keep):
@@ -439,19 +465,24 @@ def test_candidate_blocks_come_from_the_visible_prefix_alone(rows):
 
 
 def _candidate_fixture(rows_per_block, seed=7):
-    """Ragged kept-lists over a shared plane, including a row that kept none.
+    """Ragged kept-lists over two requests' PAGE tables (16 blocks a PAGE), a
+    padding token (batch -1) that kept none.
 
     `visible` is chosen so the newest block is partial on some rows and exact
     on others: the compacted bound is a single scalar only because the partial
     block is always the last kept one, and a row whose newest block is full
     would not tell those two apart.
+
+    -> (candidates, block_tables, batch_ids, blocks a PAGE, visible)
     """
     torch.manual_seed(seed)
-    topk_blocks, tokens, units = 16, 6, 160
-    tiles = torch.randperm(4096, device="cuda")[:units].to(torch.int32)
-    tiles = tiles.unsqueeze(0).repeat(tokens, 1)
+    topk_blocks, tokens, per_page, columns = 16, 6, 16, 10
+    blocks = per_page * columns
+    pages = torch.randperm(256, device="cuda")[: 2 * columns].to(torch.int32)
+    pages = pages.view(2, columns)
+    batch_ids = torch.tensor([0, 1, 0, 1, 0, -1], dtype=torch.int32, device="cuda")
     visible = torch.tensor(
-        [1, 37, 8, 256, units * rows_per_block, 0], dtype=torch.int32, device="cuda"
+        [1, 37, 8, 256, blocks * rows_per_block, 0], dtype=torch.int32, device="cuda"
     )
     cand = torch.full((tokens, topk_blocks), -1, dtype=torch.int32, device="cuda")
     for token in range(tokens):
@@ -462,7 +493,7 @@ def _candidate_fixture(rows_per_block, seed=7):
         pool = torch.randperm(newest + 1)[: topk_blocks - 1].tolist()
         keep = sorted(set(pool) | {newest})[:topk_blocks]
         cand[token, : len(keep)] = torch.tensor(keep, dtype=torch.int32, device="cuda")
-    return cand, tiles, visible
+    return cand, pages, batch_ids, per_page, visible
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -480,16 +511,15 @@ def test_candidate_block_table_matches_its_reference_and_covers_what_it_claims()
     )
 
     rows_per_block = 8
-    cand, tiles, visible = _candidate_fixture(rows_per_block)
+    cand, pages, batch_ids, per_page, visible = _candidate_fixture(rows_per_block)
     # Armed: a fixture where every row keeps every block, or none is partial,
     # would pass a bound that ignored either term.
     assert (cand < 0).any() and (cand >= 0).any()
 
-    table, context = candidate_block_table(
-        cand, tiles, visible, rows_per_block=rows_per_block
-    )
+    args = (cand, pages, batch_ids, per_page, visible)
+    table, context = candidate_block_table(*args, rows_per_block=rows_per_block)
     expected_table, expected_context = candidate_block_table_reference(
-        cand, tiles, visible, rows_per_block=rows_per_block
+        *args, rows_per_block=rows_per_block
     )
     assert torch.equal(table, expected_table)
     assert torch.equal(context, expected_context)
@@ -532,20 +562,21 @@ def test_candidate_context_counts_only_kept_rows_when_newest_block_is_absent(
         candidates[row, : len(kept)] = torch.tensor(
             kept, dtype=torch.int32, device="cuda"
         )
-    tiles = torch.arange(8192, dtype=torch.int32, device="cuda").flip(0)
-    tiles = tiles.repeat(len(selections), 1)
-    candidate_block_table(candidates, tiles, visible, rows_per_block=block)
+    # every row its own request, its PAGEs one block each, in reverse
+    pages = torch.arange(8192, dtype=torch.int32, device="cuda").flip(0)
+    pages = pages.repeat(len(selections), 1)
+    batch_ids = torch.arange(len(selections), dtype=torch.int32, device="cuda")
+    args = (candidates, pages, batch_ids, 1, visible)
+    candidate_block_table(*args, rows_per_block=block)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        table, context = candidate_block_table(
-            candidates, tiles, visible, rows_per_block=block
-        )
+        table, context = candidate_block_table(*args, rows_per_block=block)
     for advance in (0, 8192):
         visible.add_(advance)
         graph.replay()
         expected_table, expected_context = candidate_block_table_reference(
-            candidates, tiles, visible, rows_per_block=block
+            *args, rows_per_block=block
         )
         torch.testing.assert_close(table, expected_table)
         torch.testing.assert_close(context, expected_context)
@@ -575,7 +606,7 @@ def test_lifting_a_selection_restores_real_rows_and_keeps_them_ascending():
     )
 
     rows_per_block, topk = 8, 24
-    cand, _, _ = _candidate_fixture(rows_per_block)
+    cand = _candidate_fixture(rows_per_block)[0]
     tokens = cand.shape[0]
     selected = torch.full((tokens, topk), -1, dtype=torch.int32, device="cuda")
     for token in range(tokens):
@@ -599,3 +630,137 @@ def test_lifting_a_selection_restores_real_rows_and_keeps_them_ascending():
         live = [v for v in lifted[token].tolist() if v >= 0]
         assert live == sorted(live), (token, live)
         assert all(v >= 0 for v in live)
+
+
+def _workspace_geometry():
+    """Two index ratios with different PAGE widths, so a table sized for one
+    ratio would be too small or too large for the other."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        owners=((0, 1), (1, 2), (2, 2)),
+        rows_per_page=lambda ratio: 64 // ratio,
+        index_block_rows=8,
+        index_blocks_per_page=lambda ratio: 64 // ratio // 8,
+        index_fp4=False,
+    )
+
+
+def test_score_workspace_holds_no_tile_tables_for_the_fp4_plane():
+    """The FP4 plane's scorers read the PAGE table itself, so the workspace
+    reserves no tile table, and asking for one is refused rather than met."""
+    from types import SimpleNamespace
+
+    import atom.model_ops.deepseek_v41.score_workspace as ws
+
+    fp8 = ws.ScoreWorkspace(_workspace_geometry(), 40, 9, "cpu")
+    fp4_geometry = SimpleNamespace(**{**vars(_workspace_geometry()), "index_fp4": True})
+    fp4 = ws.ScoreWorkspace(fp4_geometry, 40, 9, "cpu")
+    assert fp8.unit_table(1, 40, 9 * 8).numel() == 40 * 9 * 8
+    assert not fp4._tiles
+    with pytest.raises(ValueError, match="FP4"):
+        fp4.unit_table(1, 1, 1)
+
+
+@pytest.mark.parametrize("max_tokens,columns", [(5, 3), (40, 9)])
+def test_score_workspace_holds_every_view_the_scorer_asks_for(max_tokens, columns):
+    """The largest view of each kind fits and one element more is refused.
+
+    The workspace is sized once, before the memory profile; a request past it
+    would otherwise read beyond the allocation or need a fresh one mid-serving.
+    """
+    from atom.model_ops.deepseek_v41 import score_workspace as ws
+
+    geometry = _workspace_geometry()
+    space = ws.ScoreWorkspace(geometry, max_tokens, columns, "cpu")
+    for ratio in (1, 2):
+        width = columns * geometry.rows_per_page(ratio) // geometry.index_block_rows
+        assert space.unit_table(ratio, max_tokens, width).shape == (max_tokens, width)
+        with pytest.raises(ValueError):
+            space.unit_table(ratio, max_tokens, width + 1)
+        plane = columns * geometry.rows_per_page(ratio)
+        band = min(max_tokens, ws.plane_rows(plane))
+        assert space.logits(band, plane).shape == (band, plane)
+    widest = columns * geometry.rows_per_page(1)
+    with pytest.raises(ValueError):
+        space.logits(min(max_tokens, ws.plane_rows(widest)) + 1, widest)
+
+
+def test_score_workspace_band_stops_at_the_int32_reach(monkeypatch):
+    """A long-context width bounds the band by `plane_rows`, not by the tokens."""
+    from atom.model_ops.deepseek_v41 import score_workspace as ws
+
+    monkeypatch.setattr(ws, "plane_rows", lambda width: 2)
+    space = ws.ScoreWorkspace(_workspace_geometry(), 40, 3, "cpu")
+    assert space.logits(2, 3 * 64).shape == (2, 3 * 64)
+    with pytest.raises(ValueError):
+        space.logits(3, 3 * 64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_scorer_runs_in_its_workspace_and_selects_the_same_rows():
+    """A workspace changes where the logits band and the tile table live, not
+    what is selected; and both are written in the workspace itself."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41.index_write import write_index_rows
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+    from atom.model_ops.deepseek_v41.unit_table import unit_table
+
+    torch.manual_seed(2207)
+    rows, heads, dim, per_page, block = 7, 32, 128, 128, 8
+    table = torch.tensor([[2, 0, 3, 1]], dtype=torch.int32, device="cuda")
+    width = table.shape[1] * per_page
+    plane = torch.empty(4, per_page, dim + 4, dtype=torch.uint8, device="cuda")
+    plan = torch.zeros(width, 4, dtype=torch.int32, device="cuda")
+    plan[:, 2] = torch.arange(width, device="cuda")
+    keys = torch.randn(width, dim, dtype=torch.bfloat16, device="cuda")
+    write_index_rows(
+        keys,
+        plane,
+        plan,
+        table,
+        per_page,
+        ratio=1,
+        rows_per_block=block,
+        scale_fmt="fp32",
+    )
+    geometry = SimpleNamespace(
+        owners=((0, 1),),
+        rows_per_page=lambda ratio: per_page,
+        index_block_rows=block,
+        index_blocks_per_page=lambda ratio: per_page // block,
+        index_fp4=False,
+    )
+    space = ScoreWorkspace(geometry, rows, table.shape[1], "cuda")
+    batch = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    tiles = unit_table(table, batch, per_page // block)
+    in_space = unit_table(table, batch, per_page // block, workspace=space, ratio=1)
+    assert torch.equal(in_space, tiles)
+    assert in_space.data_ptr() == space.unit_table(1, 1, 1).data_ptr()
+
+    query = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
+    weights = torch.rand(rows, heads, dtype=torch.float32, device="cuda")
+    visible = torch.tensor(
+        [0, 1, 33, 64, 129, 511, 512], dtype=torch.int32, device="cuda"
+    )
+    args = (query, weights, IndexUnits(plane.view(-1, block, dim + 4)), tiles, visible)
+    kwargs = {"topk": 64, "weights_scale": (heads * dim) ** -0.5, "candidate_count": 16}
+    expected = scoring.score_topk_paged(*args, **kwargs)
+
+    observed = []
+    real_score = scoring.deepgemm_fp8_paged_mqa_logits
+
+    def observe(*a, **k):
+        observed.append(a[3].data_ptr())
+        return real_score(*a, **k)
+
+    scoring.deepgemm_fp8_paged_mqa_logits = observe
+    try:
+        actual = scoring.score_topk_paged(*args, **kwargs, workspace=space)
+    finally:
+        scoring.deepgemm_fp8_paged_mqa_logits = real_score
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert observed == [space.logits(1, 1).data_ptr()]

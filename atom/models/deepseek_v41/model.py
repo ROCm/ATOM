@@ -60,19 +60,8 @@ class Block(nn.Module):
             quant_config=moe_quant_config,
             alt_stream=alt_stream,
         )
-        # Where `wqkv_a` is the norm's only reader, the norm emits the
-        # `(e4m3, e8m0 group-32)` pair that GEMM would otherwise have made for
-        # itself -- one launch instead of two. A layer whose compressor or
-        # indexer also projects this tensor keeps the BF16 it needs.
-        self.attn_norm = RMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            **(
-                {}
-                if spec.shares_attention_input
-                else {"fused_quant": True, "quant_config": native_quant_config()}
-            ),
-        )
+        # Weights only: each norm runs inside its seam (`pre_delayed`).
+        self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # `post_mult` is the 2.0 in the post gate's `2 * sigmoid(...)`, which
         # the AITER stages take as a parameter where the torch body has it
@@ -110,17 +99,8 @@ class Block(nn.Module):
                 quant_config=native_quant_config(),
             )
 
-    def attention_forward(self, hidden, cache, step, rope):
-        """Norm this sublayer's input, then run it.
-
-        The norm stays on this side of the guarded op rather than in
-        `prepare_attention` so its quantized pair never has to cross one: the
-        op is declared over a single BF16 tensor, and what leaves it is the
-        attention output rather than anything shaped like its input.
-        """
-        normed = self.attn_norm(hidden)
-        if isinstance(normed, tuple):
-            return self.attn(*normed, cache, step, rope)
+    def attention_forward(self, normed, cache, step, rope):
+        """Run attention on its seam's normed BF16 input."""
         return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
@@ -140,35 +120,38 @@ class Block(nn.Module):
                 state,
                 residual=self.engram_forward(state.residual, embeddings, image_mask),
             )
-        residual, hidden, pre, post, comb = pre_delayed(
+        residual, normed, pre, post, comb = pre_delayed(
             state.residual,
             state.pre_mix,
             self.hc_attn_fn,
             self.hc_attn_scale,
             self.hc_attn_base,
+            self.attn_norm.weight,
             **self.hc_options,
+            norm_eps=self.attn_norm.eps,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,
         )
-        return hidden, residual, pre, post, comb
+        return normed, residual, pre, post, comb
 
     def prepare_ffn(self, output, residual, pre, post, comb):
-        # The attention post folds into this pre, which is the shape the seam
-        # has: AITER computes the new residual and projects it in one kernel,
-        # and drops back to the two when its own heuristic says to.
-        residual, hidden, pre, post, comb = pre_delayed(
+        # The attention post folds into this seam: one kernel pair computes the
+        # new residual, the gates and the normed FFN input.
+        residual, normed, pre, post, comb = pre_delayed(
             residual,
             pre,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            self.ffn_norm.weight,
             **self.hc_options,
+            norm_eps=self.ffn_norm.eps,
             sublayer_output=output,
             post_mix=post,
             combination=comb,
         )
-        return self.ffn_norm(hidden), residual, pre, post, comb
+        return normed, residual, pre, post, comb
 
     def finish_ffn(self, output, residual, pre, post, comb):
         # Owed, not applied: the next block's pre folds this post into its own
@@ -176,14 +159,14 @@ class Block(nn.Module):
         return SinglePassHCState(residual, pre, output, post, comb)
 
     def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
-        hidden, residual, pre, post, comb = self.prepare_attention(
+        normed, residual, pre, post, comb = self.prepare_attention(
             state, embeddings, image_mask
         )
-        output = self.attention_forward(hidden, cache, step, rope)
-        hidden, residual, pre, post, comb = self.prepare_ffn(
+        output = self.attention_forward(normed, cache, step, rope)
+        normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        output = self.ffn(hidden)
+        output = self.ffn(normed)
         return self.finish_ffn(output, residual, pre, post, comb)
 
 

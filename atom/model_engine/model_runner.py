@@ -140,9 +140,16 @@ support_model_arch_dict = {
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
 }
-# seed = 34567
-# np.random.seed(seed)
-# torch.cuda.manual_seed_all(seed)
+# Mono decode for an architecture whose registered class is itself the compiled
+# model, so the routing cannot sit in its forward: the installer wraps the
+# loaded model (after the drafter armed its hooks on the unwrapped layers), and
+# may add per-step buffers to the metadata builder before they are bound.
+# Architectures with an uncompiled outer class route inside it instead.
+mono_decode_installers = {
+    "DeepseekV41ForCausalLM": (
+        "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
+    ),
+}
 
 
 def max_schedulable_decode_bs(
@@ -845,6 +852,14 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
+        installer = mono_decode_installers.get(hf_config.architectures[0])
+        if installer is not None:
+            self.model = resolve_obj_by_qualname(installer)(
+                self.model,
+                config,
+                getattr(self, "drafter", None),
+                self.attn_metadata_builder,
+            )
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
@@ -1095,12 +1110,15 @@ class ModelRunner:
         """
         Start profiling for this rank.
 
-        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
-        - Set to "1" to enable record_shapes, with_stack, and profile_memory.
-        - Set to "0" or unset to disable these features (default).
+        Set ATOM_PROFILER_RECORD_SHAPES, ATOM_PROFILER_WITH_STACK, or
+        ATOM_PROFILER_PROFILE_MEMORY to "1"/"0" to enable/disable the matching
+        profiler option. Any left unset falls back to ATOM_PROFILER_MORE, which
+        enables all three when "1" (default: all disabled).
         """
         if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            record_shapes = envs.ATOM_PROFILER_RECORD_SHAPES
+            with_stack = envs.ATOM_PROFILER_WITH_STACK
+            profile_memory = envs.ATOM_PROFILER_PROFILE_MEMORY
             model_name = os.path.basename(self.config.model.rstrip("/"))
             safe_model_name = "".join(
                 c if c.isalnum() or c in ("_", "-", ".") else "_" for c in model_name
@@ -1158,16 +1176,19 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+                profile_memory=profile_memory,
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
             logger.info(
-                "Rank %d: profiler started (detailed=%s, dir=%s)",
+                "Rank %d: profiler started "
+                "(record_shapes=%s, with_stack=%s, profile_memory=%s, dir=%s)",
                 self.rank,
-                enable_detailed_profiling,
+                record_shapes,
+                with_stack,
+                profile_memory,
                 self.profiler_dir,
             )
         return True
@@ -2522,8 +2543,8 @@ class ModelRunner:
         spec_decode_metadata = None
         if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
             _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
-            # Gather after token assembly, before attention/Engram's final
-            # consumers. Packed indices already share the token input upload.
+            # Inside the staging window: without the token group it publishes
+            # the indices itself. Packed indices already share the token upload.
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
                 lens, cu[1:], input_ids, prepared_indices=spec_decode_indices
             )
@@ -3237,9 +3258,9 @@ class ModelRunner:
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
-            # No drafts scored -> no accept count; anchor on the segment's last
-            # row. NOT `mtp_k - num_reject_tokens`, which is a zero buffer here.
-            num_bonus_tokens = None
+            # No drafts scored -> no verdict; the drafter anchors on each
+            # segment's last row.
+            anchors = None
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3266,16 +3287,7 @@ class ModelRunner:
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
             )
-            # Validate shapes match expectations
-            if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
-                raise ValueError(
-                    f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
-                    f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
-                    f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
-                    f"logits.shape[0]={logits.shape[0]}"
-                )
-
-            sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
+            sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
@@ -3285,15 +3297,12 @@ class ModelRunner:
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
             # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
             # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and how many.
+            # decision instead: the ids and the verdict.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
                 _g = get_pcp_group()
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                if torch.is_tensor(num_bonus_tokens):
-                    num_bonus_tokens = _g.broadcast(
-                        num_bonus_tokens.contiguous(), src=0
-                    )
-            num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
+                verdict = _g.broadcast(verdict, src=0)
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
 
         # Drafter input must agree across TP ranks.
@@ -3344,9 +3353,8 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
-                    num_bonus_tokens,
+                    anchors,
                 )
-                # self.debug(f"{num_bonus_tokens=}")
 
             elif prev_batch is not None:
                 prev_rejected_num = np.zeros(prev_batch.total_seqs_num, dtype=np.int32)
@@ -3373,7 +3381,7 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
-                    num_bonus_tokens,
+                    anchors,
                 )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
@@ -3569,13 +3577,11 @@ class ModelRunner:
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
-        # Complements today but against DIFFERENT baselines, which ragged
-        # verify pulls apart -- neither can be dropped for the other.
         # num_reject_tokens: KV rows to release, against the `mtp_k` RESERVATION.
-        # num_bonus_tokens: anchor row within the SEGMENT (`len_i`); None when
-        # nothing was verified.
+        # anchors: each request's flat row of its last emitted token, from the
+        # rejection verdict; None when nothing was verified.
         num_reject_tokens: torch.Tensor,
-        num_bonus_tokens: torch.Tensor | None,
+        anchors: torch.Tensor | None,
         align_only: bool = False,
     ):
         """`align_only` runs the draft purely for its DP collectives.
@@ -3607,11 +3613,10 @@ class ModelRunner:
 
         assert isinstance(self.drafter, Drafter)
 
-        # The sampler's own count, not `mtp_k - num_reject_tokens`: that
-        # identity holds only where `num_reject_tokens` was defined as its
-        # complement, and is a zero buffer on a step that scored no drafts.
-        last_token_indices = self.drafter.prepare_inputs(
-            batch.total_seqs_num, anchor_in_seq=num_bonus_tokens
+        last_token_indices = (
+            self.drafter.prepare_inputs(batch.total_seqs_num)
+            if anchors is None
+            else anchors
         )
         self.attn_metadata_builder.commit_speculative_state(
             forward_context.attn_metadata, last_token_indices
@@ -3653,14 +3658,19 @@ class ModelRunner:
             self.profiler_dir is not None and self.mark_trace
         )
         if self._capture_profile_enabled:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            record_shapes = envs.ATOM_PROFILER_RECORD_SHAPES
+            with_stack = envs.ATOM_PROFILER_WITH_STACK
+            profile_memory = envs.ATOM_PROFILER_PROFILE_MEMORY
             self._capture_trace_tag = None
             self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
             os.makedirs(self.capture_traces_dir, exist_ok=True)
             logger.info(
-                "%s: Starting CUDA graph capture profiler (detailed=%s)...",
+                "%s: Starting CUDA graph capture profiler "
+                "(record_shapes=%s, with_stack=%s, profile_memory=%s)...",
                 self.label,
-                enable_detailed_profiling,
+                record_shapes,
+                with_stack,
+                profile_memory,
             )
 
             def on_trace_ready(prof):
@@ -3692,9 +3702,9 @@ class ModelRunner:
                 # capture loop lands in its own file with nothing dropped between
                 # them (wait>0 would silently skip alternate batch sizes).
                 schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+                profile_memory=profile_memory,
                 on_trace_ready=on_trace_ready,
             )
         else:
@@ -4365,6 +4375,11 @@ class ModelRunner:
             if graph is None:
                 continue
             B = bs * max_q_len
+            # Every row of the recording is real here: time the whole of it
+            # (the DP pad-row mask reads the real token count from here).
+            cu = self.forward_vars["cu_seqlens_q"]
+            cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
+            cu.copy_to_gpu(bs + 1)
             # Warm replay, then timed replays (median for robustness to jitter).
             graph.replay()
             torch.cuda.synchronize()

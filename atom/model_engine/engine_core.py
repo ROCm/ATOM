@@ -290,13 +290,17 @@ class EngineCore:
                 "runner exit call failed; shared memory may already be freed",
                 exc_info=True,
             )
+        # One deadline for all workers, so a long ATOM_SHUTDOWN_TIMEOUT_S is not
+        # paid once per worker.
+        timeout = envs.ATOM_SHUTDOWN_TIMEOUT_S
+        deadline = time.monotonic() + timeout
         for proc in self.runner_mgr.procs:
             try:
                 alive = proc.is_alive()
             except ValueError:
                 continue  # process object already closed by CoreManager
             if alive:
-                proc.join(timeout=5)
+                proc.join(timeout=max(deadline - time.monotonic(), 0))
                 # The join above has a timeout; nothing after it did. A worker
                 # that outlives it keeps its VRAM slice and its all-reduce IPC
                 # handles, and `multiprocessing`'s atexit handler then joins the
@@ -310,9 +314,11 @@ class EngineCore:
                 try:
                     if proc.is_alive():
                         logger.warning(
-                            "%s: worker pid=%s still alive after 5s; terminating",
+                            "%s: worker pid=%s still alive after %gs "
+                            "(ATOM_SHUTDOWN_TIMEOUT_S); terminating",
                             self.label,
                             getattr(proc, "pid", "?"),
+                            timeout,
                         )
                         proc.terminate()
                         proc.join(timeout=5)

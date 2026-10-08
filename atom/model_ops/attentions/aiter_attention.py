@@ -1284,6 +1284,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.context_lens[:scheduled_bs],
                 scheduled_bs,
             )
+            # token -> request, -1 on the graph's pad tail: the mono kernels keep
+            # a pad row out of every cross-row decision (``row_live``)
+            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                pad_to=running_tokens,
+            )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
                 seq_lens=attn_metadata.context_lens[:scheduled_bs],
                 block_table=sparse_block_tables,
@@ -1525,6 +1531,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 seq_lens,
                 bs,
             )
+            # the buffer every replay's prepare_decode publishes into
+            attn_metadata.batch_id_per_q_token = var["batch_id_per_q_token"].gpu[
+                :scheduled_tokens
+            ]
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
                 seq_lens=seq_lens,
                 block_table=sparse_block_tables,

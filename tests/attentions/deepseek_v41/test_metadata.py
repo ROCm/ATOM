@@ -132,6 +132,8 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
     staged = {}
     builder.engram = (
         SimpleNamespace(
+            # no side-stream overlap: the rows are staged here, not in the forward
+            host=SimpleNamespace(overlap=None, uva=False),
             prepare=lambda spans, tokens, histories, **kwargs: (
                 staged.update(tokens=tokens.numel(), **kwargs)
                 or SimpleNamespace(
@@ -139,7 +141,7 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
                     histories=histories,
                     compressed_rows=(),
                 )
-            )
+            ),
         )
         if engram
         else None
@@ -158,8 +160,8 @@ def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
             # A synthetic batch hashes on the host: the cursor the device path
             # would read belongs to whoever owns these slots, not to this one.
             "batch": None,
-            "cursor_positions": None,
-            "cursor_out": None,
+            # nor does a forward run Engram on it without the side-stream overlap
+            "staged": None,
         }
 
 
@@ -310,3 +312,31 @@ def test_block_table_upload_only_when_mapping_changes(device, monkeypatch):
     publish_tables(tables, (a, b), 4)
     assert len(uploads) == sum(c[2] for c in cases) + 1
     assert tables.gpu[0, :2].tolist() == [3, 5]
+
+
+def test_a_step_planner_reads_the_staged_rows_and_publishes_with_them():
+    geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    buffers = metadata_buffers(4, 8, 4, "cpu", geo)
+    buffers["plan"] = CpuGpuBuffer(3, dtype=torch.int32, device="cpu")
+    seen = []
+
+    def planner(staged, rows):
+        visible = staged[visible_buffer_name(2)].np[:rows]
+        owners = staged["batch_id_per_q_token"].np[:rows]
+        seen.append((visible.tolist(), owners.tolist()))
+        staged["plan"].np[:] = (rows, visible.sum(), owners.max())
+        return {"plan": 3}
+
+    requests = (
+        PagedRequest(17, 1, 0, 3, 3, (5, 1)),
+        PagedRequest(24, 4, 3, 1, 1, (2,)),
+    )
+    step = begin_step(
+        cache, requests, buffers=buffers, running_bs=4, running_tokens=6,
+        planners=(planner,),
+    )  # fmt: skip
+    # positions 1..3 and 4, then two pad rows at position 0
+    assert seen == [([1, 1, 2, 2, 0, 0], [0, 0, 0, 1, -1, -1])]
+    assert step.planned["plan"].tolist() == [6, 6, 1]
+    assert begin_step(cache, requests, buffers=buffers).planned == {}

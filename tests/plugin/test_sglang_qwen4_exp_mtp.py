@@ -10,11 +10,18 @@ from atom.plugin.sglang.models.qwen4_exp import (
     flatten_qwen4_exp_hc,
     reshape_qwen4_exp_hc,
 )
+from atom.plugin.sglang.patches import qwen4_exp_rocm_patch as rocm_patch
 from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
     QWEN4_EXP_NEXTN_ARCH,
     apply_qwen4_exp_hc_hidden_size,
     is_qwen4_exp_nextn_arch,
+    promote_flash_draft_text_config,
     rewrite_qwen4_exp_draft_hf_config,
+)
+from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
+    _hip_topk1_tree_builder,
+    _hip_verify_tree_greedy,
+    note_qwen4_exp_from_identity,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
     _query_start_loc,
@@ -59,6 +66,49 @@ def test_rewrite_qwen4_exp_draft_hf_config_shrinks_to_one_qsa_layer():
     assert text.layer_types == ["full_attention"]
     assert text.ple_layer_ids == []
     assert is_qwen4_exp_nextn_arch(hf)
+
+
+def test_rewrite_accepts_upstream_mtp_entryclass():
+    """0.5.20 rewrites the draft to Qwen4ExpForCausalLMMTP before ATOM."""
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        num_hidden_layers=1,
+        mtp={"layer_types": ["full_attention"], "num_hidden_layers": 1},
+        mtp_num_hidden_layers=1,
+        layer_types=["full_attention"],
+        ple_layer_ids=[],
+        architectures=["Qwen4ExpForCausalLMMTP"],
+        full_attention_interval=1,
+    )
+    hf = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=["Qwen4ExpForCausalLMMTP"],
+        text_config=text,
+        num_hidden_layers=1,
+    )
+    assert rewrite_qwen4_exp_draft_hf_config(hf, text)
+    assert hf.architectures == [QWEN4_EXP_NEXTN_ARCH]
+    assert hf.num_hidden_layers == 1
+    assert text.layer_types == ["full_attention"]
+
+
+def test_promote_draft_uses_text_config_when_vl_has_no_vocab():
+    text = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        architectures=[QWEN4_EXP_NEXTN_ARCH],
+        vocab_size=248320,
+        hidden_size=2560,
+        num_hidden_layers=1,
+    )
+    hf = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=[QWEN4_EXP_NEXTN_ARCH],
+        text_config=text,
+    )
+    model_config = SimpleNamespace(hf_config=hf, hf_text_config=text)
+    assert promote_flash_draft_text_config(model_config)
+    assert model_config.hf_config is text
+    assert model_config.hf_text_config is text
 
 
 def test_rewrite_ignores_non_flash_arch():
@@ -285,3 +335,91 @@ def test_draft_rewrite_rejects_unsupported_native_layout(layers, types):
     with pytest.raises(ValueError, match="exactly one QSA"):
         rewrite_qwen4_exp_draft_hf_config(hf)
     assert hf.num_hidden_layers == 48
+
+
+def test_qwen4_exp_identity_arms_hip_divert_without_is_qwen_qsa():
+    """#2427 returns before the is_qwen_qsa hook, so prepare_model arms this."""
+    rocm_patch._qwen4_exp_hip = False
+    note_qwen4_exp_from_identity("DeepseekV4ForCausalLM", "deepseek_v4")
+    assert rocm_patch._qwen4_exp_hip is False
+    note_qwen4_exp_from_identity("Qwen4ExpForConditionalGeneration")
+    assert rocm_patch._qwen4_exp_hip is True
+    rocm_patch._qwen4_exp_hip = False
+    note_qwen4_exp_from_identity("", "qwen4_exp")
+    assert rocm_patch._qwen4_exp_hip is True
+    rocm_patch._qwen4_exp_hip = False
+
+
+def test_hip_topk1_tree_build_uses_triton_only_for_qwen4_exp():
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append(("kernel", args[8], int(args[11])))
+
+    def triton_impl(*args, **kwargs):
+        topk = kwargs["topk"] if "topk" in kwargs else args[8]
+        calls.append(("triton", topk))
+
+    wrapped = _hip_topk1_tree_builder(original, triton_impl, bitpack_mode=2)
+    args = (None,) * 8
+    previous = rocm_patch._qwen4_exp_hip
+    try:
+        rocm_patch._qwen4_exp_hip = False
+        wrapped(*args, 1, 2, 3, 0)
+        rocm_patch._qwen4_exp_hip = True
+        wrapped(*args, 1, 2, 3, 0)
+        wrapped(*args, topk=1, tree_mask_mode=1)
+        wrapped(*args, 4, 3, 8, 0)
+        wrapped(*args, 1, 2, 3, 2)
+    finally:
+        rocm_patch._qwen4_exp_hip = previous
+    assert calls == [
+        ("kernel", 1, 0),
+        ("triton", 1),
+        ("triton", 1),
+        ("kernel", 4, 0),
+        ("kernel", 1, 2),
+    ]
+
+
+def test_hip_verify_tree_greedy_uses_triton_only_for_qwen4_exp():
+    seen = {}
+    original_calls = []
+
+    def original(*args, **kwargs):
+        original_calls.append(kwargs.get("topk", args[8] if len(args) > 8 else None))
+        return args[0], args[1], args[2]
+
+    def triton_impl(**kwargs):
+        seen.update(kwargs)
+        kwargs["predicts"][:] = 7
+
+    wrapped = _hip_verify_tree_greedy(original, triton_impl)
+    predicts = torch.zeros(3, dtype=torch.int32)
+    accept_index = torch.full((1, 3), -1, dtype=torch.int32)
+    accept_num = torch.empty(1, dtype=torch.int32)
+    tensors = (
+        predicts,
+        accept_index,
+        accept_num,
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+        torch.zeros(1, 3, dtype=torch.long),
+    )
+    previous = rocm_patch._qwen4_exp_hip
+    try:
+        rocm_patch._qwen4_exp_hip = False
+        stayed = wrapped(*tensors, topk=1)
+        rocm_patch._qwen4_exp_hip = True
+        out = wrapped(*tensors, topk=1)
+    finally:
+        rocm_patch._qwen4_exp_hip = previous
+    assert original_calls == [1]
+    assert stayed[0] is predicts
+    assert seen["predicts"] is predicts
+    assert seen["retrieve_index"].shape == (1, 3)
+    assert out[0][0].item() == 7
+    assert out[1] is accept_index
+    assert out[2] is accept_num

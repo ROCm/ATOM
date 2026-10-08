@@ -30,17 +30,6 @@ class LayerAttentionSpec:
     index_group_size: int = 1
 
     @property
-    def shares_attention_input(self):
-        """Whether anything but `wqkv_a` reads this layer's normed input.
-
-        A compressor and an indexer both project the same tensor in BF16, and
-        only a FULL layer builds the first or a FULL/REINDEX layer the second
-        -- so everywhere else the norm has exactly one reader and can hand it
-        the quantized pair instead of a tensor to quantize again.
-        """
-        return self.mode in (AttentionMode.FULL, AttentionMode.REINDEX)
-
-    @property
     def produces_candidates(self):
         return self.candidate_owner == self.layer_id
 
@@ -390,11 +379,11 @@ def validate_runtime_config(config):
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
-            # The plane a paged scorer reads. Only that scorer is left, so the
-            # format is the runtime's rather than a choice; the main pool stays
+            # The plane the paged scorer reads: FP8, or FP4 in the row-group
+            # scorer's page-8 layout (`index_plane`). The main pool stays
             # independent of it and takes bf16 or fp4 either way.
-            "an index plane other than fp8",
-            config.index_cache_dtype != "fp8",
+            "an index plane other than fp8 or fp4",
+            config.index_cache_dtype not in ("fp8", "fp4"),
         ),
         (
             "a KV cache other than bf16 or fp4",

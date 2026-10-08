@@ -63,7 +63,7 @@
   {
     "model_name": "DeepSeek-V4.1-Flash DSpark",
     "model_path": "deepseek-ai/DeepSeek-V4.1-Flash",
-    "extraArgs": "--kv_cache_dtype bf16 --index_cache_dtype fp8 -tp 4 --method dspark --num-speculative-tokens 5",
+    "extraArgs": "--kv_cache_dtype bf16 --index_cache_dtype fp4 -tp 4 --method dspark --num-speculative-tokens 5",
     "env_vars": "",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",

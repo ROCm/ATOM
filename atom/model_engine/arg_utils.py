@@ -139,7 +139,7 @@ class EngineArgs:
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
+    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
@@ -315,7 +315,7 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default="[1,2,4,8,16,32,48,64,128,256,512]",
+            default=EngineArgs.cudagraph_capture_sizes,
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
         parser.add_argument(

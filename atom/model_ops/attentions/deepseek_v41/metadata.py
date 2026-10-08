@@ -62,6 +62,9 @@ class BatchStep:
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
+    # candidate source layer -> its `CandidateBlocks`, bound for every layer
+    # its candidates bound
+    candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
     group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
@@ -80,6 +83,9 @@ class BatchStep:
     request_positions: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.int32)
     )
+    # buffer name -> GPU view of what a step planner (`add_step_planner`)
+    # laid out for this step; absent when it planned nothing
+    planned: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -91,6 +97,7 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.tiles.clear()
+        self.candidate_blocks.clear()
         self.group_indices.clear()
 
     @property
@@ -129,6 +136,7 @@ def prepare_batch_step(
     publication_group=None,
     query_prefix_ready=False,
     query_prefix_republish_reason=None,
+    planners=(),
 ):
     """Stage request metadata using the same persistent buffers/layout as V4.
 
@@ -137,6 +145,9 @@ def prepare_batch_step(
     The published views span the forward's full width, padding included, since
     that is the width its kernels run; the backing token map uses V4's -1
     padding sentinel and block-table stride stays fixed across steps.
+    `planners` are called as `planner(buffers, running_tokens)` once the rows
+    are staged, return their buffers' published rows by name, and need the
+    serving buffers.
     """
     scheduled_bs = len(requests)
     lengths = np.asarray([span.length for span in requests], dtype=np.int32)
@@ -211,6 +222,11 @@ def prepare_batch_step(
         np.floor_divide(visible, ratio, out=visible)
     batches = buffers["batch_id_per_q_token"]
     build_batch_ids(lengths, pad_to=running_tokens, out=batches.np)
+    # Planners read the rows staged above and publish with them.
+    planned = {}
+    for planner in planners:
+        planned.update(planner(buffers, running_tokens))
+    required.update(planned)
     if state_slot_out is None:
         # Isolated eager cache callers have no metadata builder. Serving passes
         # the already-published V4 state_slot_out view; it is never restaged here.
@@ -228,7 +244,7 @@ def prepare_batch_step(
                 publication_group.counts[i] = running_bs
             elif member.name in required:
                 publication_group.counts[i] = required[member.name]
-            # Plans and state slots were staged by the builder. Preserve
+            # Builder-staged members (plans, state slots, Engram rows) keep
             # their counts in this combined publication, before indptrs run.
         tables.publish(running_bs if grouped_tables else None, group=publication_group)
         published = {
@@ -267,4 +283,5 @@ def prepare_batch_step(
         tentative=tentative,
         visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
         request_positions=starts,
+        planned={name: published[name] for name in planned},
     )

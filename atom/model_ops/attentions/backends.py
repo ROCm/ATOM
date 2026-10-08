@@ -589,24 +589,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def _publish_indexer_fp4_decode_schedule(
-        self, attn_metadata, bs: int, next_n: int, ubatch: int = 0
-    ) -> None:
-        """Nothing to refresh: this backend has no FP4 sparse indexer.
-
-        `EagleProposer` publishes on whatever builder the target uses, so every
-        backend a draft can run against has to answer. Only the MLA one
-        overrides. Inert by contract, not just by accident -- the draft reuses
-        the target's metadata, so a write here would reach the verify step.
-        """
-
     def _publish_dcp_token_block_tables(
         self, attn_metadata, running_bs: int, max_seqlen_q: int
     ) -> None:
         """Nothing to publish: this backend has no DCP sparse indexer.
 
-        Answered for the same reason as `_publish_indexer_fp4_decode_schedule`:
-        `EagleProposer` calls it on whatever builder the target uses.
+        `EagleProposer` publishes on whatever builder the target uses, so every
+        backend a draft can run against has to answer. Only the MLA one
+        overrides.
         """
 
     def prepare_block_tables(self, batch: ScheduledBatch, running_bs=None):
