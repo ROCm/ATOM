@@ -902,6 +902,20 @@ models:
             benchmark_duration: 3600
             warmup_requests_per_lane: 10
           run_eval: true
+        - <<: *kimi_k3_vllm_dspark_dcp8
+          name: kimi-k3-agentic-c16-torch-profile
+          env:
+            common:
+              ATOMESH_AGENTIC_TORCH_PROFILE: "1"
+              ATOMESH_PRE_CLEAN_GPU: "0"
+              VLLM_SERVER_DEV_MODE: "1"
+          benchmark:
+            <<: *kimi_k3_vllm_aiperf
+            apply_chat_template: true
+            benchmark_duration: 600
+            warmup_requests_per_lane: 10
+            wait_server_timeout: 7200
+          run_eval: false
     accuracy:
       task: gsm8k
       fewshot: 5

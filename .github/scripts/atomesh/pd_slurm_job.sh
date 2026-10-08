@@ -34,6 +34,9 @@ if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
+if [[ "${ATOMESH_ENV_ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
+  EXECUTION_PHASES=(benchmark)
+fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
 if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: ATOMESH_RESTART_PORT_OFFSET must be a positive integer" >&2

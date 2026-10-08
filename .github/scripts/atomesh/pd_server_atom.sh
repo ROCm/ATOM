@@ -1089,12 +1089,25 @@ run_aiperf_agentic_benchmark() {
 
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
+    local -a torch_profile_wrapper=()
+    if [[ "${BACKEND}" == "vllm" && "${ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
+      torch_profile_wrapper=(
+        python3 "${ATOMESH_SCRIPT_DIR}/pd_agentic_profile.py"
+        --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}"
+        --decode "http://${decode_ips[0]}:${decode_ports[0]}"
+        --output "${RUN_DIR}/torch-profile"
+        --traces "${RUN_DIR}/traces"
+        --aiperf-log "${out_dir}/logs/aiperf.log"
+        --seconds 10 --offsets 60 240 --
+      )
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+      "${torch_profile_wrapper[@]}" \
       "${metrics_wrapper[@]}" \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \

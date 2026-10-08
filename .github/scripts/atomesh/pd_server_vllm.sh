@@ -263,6 +263,9 @@ start_vllm_server() {
     cmd+=(--decode-context-parallel-size "${!dcp_var}")
   fi
   cmd+=("${role_args[@]}")
+  if [[ "${ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
+    cmd+=(--profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${RUN_DIR}/traces/${role}\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":false,\"torch_profiler_with_memory\":false,\"torch_profiler_use_gzip\":true,\"ignore_frontend\":true}")
+  fi
   echo "[${role}] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} discovery=${NODE0_ADDR}:${VLLM_DISCOVERY_PORT}"
   dump_launch_info "${prefix}" "${cmd[@]}"
   python3 - "${RUNTIME_LOG_DIR}/${log_name}.launch.json" "${role}" \
@@ -275,6 +278,36 @@ Path(sys.argv[1]).write_text(json.dumps({
     "role": sys.argv[2], "phase": sys.argv[3], "argv": sys.argv[4:]
 }, indent=2) + "\n")
 PY
+  if [[ "${ATOMESH_AGENTIC_TORCH_PROFILE:-0}" == "1" ]]; then
+    env "${server_env[@]}" python3 - "${RUNTIME_LOG_DIR}/${log_name}.runtime.json" <<'PY'
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+package = Path(importlib.util.find_spec("vllm").origin).parent
+versions = {}
+for name in ("vllm", "torch", "triton", "aiter", "mori", "lmcache"):
+    try:
+        versions[name] = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        versions[name] = None
+files = {}
+for relative in ("profiler/wrapper.py", "config/profiler.py", "v1/worker/gpu_model_runner.py",
+                 "distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py"):
+    path = package / relative
+    if path.exists():
+        files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+Path(sys.argv[1]).write_text(json.dumps({
+    "python": sys.executable, "package_path": str(package), "distribution_versions": versions,
+    "source_hashes_after_overlay_and_patches": files,
+    "compiled_extensions": [{"path": str(p), "bytes": p.stat().st_size} for p in package.glob("*.so")],
+    "note": "Python source overlay on pinned image extensions; distribution version alone is not source provenance.",
+}, indent=2) + "\n")
+PY
+  fi
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" \
     env "${cache_env[@]}" "${server_env[@]}" "${cmd[@]}"
 }

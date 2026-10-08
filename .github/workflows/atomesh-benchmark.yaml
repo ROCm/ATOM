@@ -1881,6 +1881,18 @@ jobs:
             cat "${AIPERF_RAW_PATH}"
           fi
 
+      - name: Upload P/D PyTorch execution traces
+        if: ${{ always() && matrix.name == 'kimi-k3-agentic-c16-torch-profile' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytorch-pd-agentic-c16-${{ github.run_id }}
+          path: |
+            atomesh-results/${{ matrix.id }}/**/traces/**
+            atomesh-results/${{ matrix.id }}/**/torch-profile/**
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 14
+
       - name: Upload AIPerf Perfetto traces
         if: ${{ always() && matrix.benchmark.kind == 'aiperf_agentic' }}
         uses: ./.github/actions/upload-aiperf-traces
