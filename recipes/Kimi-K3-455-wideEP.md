@@ -1,5 +1,12 @@
 # Kimi-K3 Wide-EP on gfx1250 (MI455) — 4 nodes, dp16ep16
 
+> **Current optimized source recipe:** use
+> [Kimi-K3-455-wideEP-optimized.md](Kimi-K3-455-wideEP-optimized.md) for the
+> exact 2026-10-08 ATOM/AITER bases, patch bundles, ptpc policy, launch, and
+> accuracy gates. This page remains the historical bring-up/baseline record.
+> Its PR #2380 unfused-gather instructions apply to the older image path, not
+> the optimized #6120/#6121 source stack.
+
 Full-size **Kimi-K3** (2.78T, 93 layers: 24 full-attention MLA + 69 KDA linear,
 896 routed experts top-16, MXFP4 routed experts / BF16 everything else) served
 across **four gfx1250 nodes, 4 GPUs each, in SPX** — 16 ranks total, `-tp 1`
@@ -812,6 +819,17 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | Log appears frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
 
 ---
+
+## Optimized stack
+
+The maintained optimization instructions are in
+[Kimi-K3-455-wideEP-optimized.md](Kimi-K3-455-wideEP-optimized.md). In
+particular, ptpc is not globally enabled: convolution, `f_b_proj`, and
+routed/grouped MoE stay excluded, while attention, dense, and shared-expert
+layers are enabled. `kv_b_proj` is allowed only with AITER #6121. The optional
+MegaMoE TDM/direct-route overlay is not part of the default or correctness
+stack, and stock `ATOM_MORI_V2_FUSED=1` is existing infrastructure rather than
+a claimed optimization.
 
 ## Throughput
 
