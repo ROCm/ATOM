@@ -59,6 +59,44 @@ def use_dcp_local_indexer_prefill(dcp_world_size: int | None = None) -> bool:
     return world > 1 and envs.ATOM_DCP_INDEXER_PREFILL_LOCAL and not pcp_is_enabled()
 
 
+@triton.jit
+def _row_bracket_stats_kernel(
+    local_val,  # fp32 [rows, K]
+    out,  # fp32 [rows, 4] -- max, kth, min_valid, valid_count
+    K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    lv_stride0: tl.int64,
+    o_stride0: tl.int64,
+):
+    """All four bracket scalars in ONE pass over the row.
+
+    The torch spelling was six passes over ``[rows, K]`` (isfinite, two
+    ``where``, ``amax``, ``amin``, ``sum``) plus their temporaries -- 0.129 ms
+    at rows=4096, K=2048, against a 0.092 ms scorer. Every reduction here is
+    order-independent, so one fused pass is the same answer.
+    """
+    row = tl.program_id(0)
+    vmax = float("-inf")
+    vmin = float("inf")
+    count = 0
+    for tile in range(0, K, BLOCK_N):
+        col = tile + tl.arange(0, BLOCK_N)
+        col_valid = col < K
+        val = tl.load(local_val + row * lv_stride0 + col, mask=col_valid, other=0.0)
+        finite = (val == val) & (tl.abs(val) < float("inf"))  # noqa: PLR0124
+        keep = col_valid & finite
+        vmax = tl.maximum(vmax, tl.max(tl.where(keep, val, float("-inf")), axis=0))
+        vmin = tl.minimum(vmin, tl.min(tl.where(keep, val, float("inf")), axis=0))
+        count += tl.sum(keep.to(tl.int32), axis=0)
+    # A full row's K entries ARE its top-K, so their minimum is the K-th
+    # largest; a short row proves nothing about the global K-th, hence -inf.
+    kth = tl.where(count == K, vmin, float("-inf"))
+    tl.store(out + row * o_stride0 + 0, vmax)
+    tl.store(out + row * o_stride0 + 1, kth)
+    tl.store(out + row * o_stride0 + 2, vmin)
+    tl.store(out + row * o_stride0 + 3, count.to(tl.float32))
+
+
 def row_bracket_stats(local_val: torch.Tensor) -> torch.Tensor:
     """Per-row bracket scalars for one rank's local top-k values.
 
@@ -83,17 +121,48 @@ def row_bracket_stats(local_val: torch.Tensor) -> torch.Tensor:
     """
     assert local_val.dtype == torch.float32, local_val.dtype
     assert local_val.dim() == 2, local_val.shape
-    valid = torch.isfinite(local_val)
     rows, k = local_val.shape
     out = local_val.new_empty((rows, 4))
-    neg_inf = local_val.new_full((), NEG_INF)
-    out[:, _MAX] = torch.where(valid, local_val, neg_inf).amax(1)
-    min_valid = torch.where(valid, local_val, local_val.new_full((), POS_INF)).amin(1)
-    count = valid.sum(1, dtype=torch.float32)
-    out[:, _MIN] = min_valid
-    out[:, _CNT] = count
-    out[:, _KTH] = torch.where(count == k, min_valid, neg_inf)
+    local_val_c = local_val.contiguous()
+    _row_bracket_stats_kernel[(rows,)](
+        local_val_c,
+        out,
+        k,
+        min(1024, triton.next_power_of_2(k)),
+        local_val_c.stride(0),
+        out.stride(0),
+    )
     return out
+
+
+@triton.jit
+def _reduce_bracket_kernel(
+    gathered,  # fp32 [W, rows, 4]
+    lo,  # fp32 [rows]
+    hi,  # fp32 [rows]
+    W,
+    g_stride0: tl.int64,
+    g_stride1: tl.int64,
+    W_POW2: tl.constexpr,
+):
+    """``(lo, hi)`` for one row, in one launch.
+
+    Three torch reductions over a 256 KB tensor cost 0.022 ms -- all launch
+    overhead, and by then the second-largest step of the whole exchange. Max and
+    min are exact and order-independent, so fusing them changes nothing about
+    the bit-identical result every rank must agree on.
+    """
+    row = tl.program_id(0)
+    # tl.arange needs a power-of-2 extent; the DCP world size need not be one
+    # (and the unit tests deliberately use 3), so pad and mask.
+    r = tl.arange(0, W_POW2)
+    m = r < W
+    base = gathered + r * g_stride0 + row * g_stride1
+    row_hi = tl.max(tl.load(base + 0, mask=m, other=float("-inf")), axis=0)
+    row_kth = tl.max(tl.load(base + 1, mask=m, other=float("-inf")), axis=0)
+    row_min = tl.min(tl.load(base + 2, mask=m, other=float("inf")), axis=0)
+    tl.store(hi + row, row_hi)
+    tl.store(lo + row, tl.maximum(row_kth, row_min))
 
 
 def reduce_bracket(gathered: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -115,8 +184,13 @@ def reduce_bracket(gathered: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     fixed-order torch reduce over the same bytes guarantees that.
     """
     assert gathered.dim() == 3 and gathered.shape[-1] == 4, gathered.shape
-    hi = gathered[:, :, _MAX].amax(0)
-    lo = torch.maximum(gathered[:, :, _KTH].amax(0), gathered[:, :, _MIN].amin(0))
+    world, rows, _ = gathered.shape
+    lo = gathered.new_empty(rows)
+    hi = gathered.new_empty(rows)
+    g = gathered.contiguous()
+    _reduce_bracket_kernel[(rows,)](
+        g, lo, hi, world, g.stride(0), g.stride(1), triton.next_power_of_2(world)
+    )
     return lo, hi
 
 
@@ -150,18 +224,28 @@ def _local_histogram_kernel(
     lv_stride0: tl.int64,
     h_stride0: tl.int64,
 ):
-    """One program per row; atomics into that row's bins. No [rows, K] scratch.
+    """One program per row, accumulating that row's bins in registers.
 
-    Deliberately a kernel rather than the obvious ``scatter_add_``: torch's
-    scatter index must be int64, so the elementwise version materialized two
-    int64 ``[rows, K]`` temporaries plus three fp32 ones -- ~200 MiB for an 8 MiB
-    histogram at rows=4096, and this step runs OUTSIDE
+    Two things this deliberately does NOT do:
+
+    ``scatter_add_`` -- torch's scatter index must be int64, so the elementwise
+    version materialized two int64 ``[rows, K]`` temporaries plus three fp32
+    ones (~200 MiB for an 8 MiB histogram at rows=4096). This step runs OUTSIDE
     ``sparse_indexer_row_chunk``'s budget loop, which is the unbounded prefill
     allocation #1376 is about.
+
+    ``tl.atomic_add`` per candidate -- that was the first version of this
+    kernel, and it was the single most expensive kernel in the whole prefill:
+    2048 candidates landing in 512 bins means most lanes of a wave collide on
+    the same address, and it measured 0.59 ms for a 32 MiB read (57 GB/s, ~80x
+    off HBM) against the 0.09 ms scorer this whole exchange exists to shrink.
+    ``tl.histogram`` reduces within the tile first, so the only traffic is the
+    read and one ``[NBINS]`` store per row.
     """
     row = tl.program_id(0)
     row_lo = tl.load(lo + row)
     row_scale = tl.load(scale + row)
+    acc = tl.zeros([NBINS], dtype=tl.int32)
     for tile in range(0, K, BLOCK_N):
         col = tile + tl.arange(0, BLOCK_N)
         col_valid = col < K
@@ -173,7 +257,8 @@ def _local_histogram_kernel(
         keep = col_valid & finite & (val >= row_lo)
         b = ((val - row_lo) * row_scale).to(tl.int32)
         b = tl.minimum(tl.maximum(b, 0), NBINS - 1)
-        tl.atomic_add(hist + row * h_stride0 + b, 1, mask=keep)
+        acc += tl.histogram(b, NBINS, mask=keep)
+    tl.store(hist + row * h_stride0 + tl.arange(0, NBINS), acc)
 
 
 def local_histogram(
@@ -208,6 +293,48 @@ def local_histogram(
     return hist
 
 
+@triton.jit
+def _threshold_kernel(
+    hist,  # int32 [rows, NBINS] -- already all-reduced across the DCP group
+    lo,  # fp32 [rows]
+    hi,  # fp32 [rows]
+    thr,  # fp32 [rows]
+    TOPK: tl.constexpr,
+    NBINS: tl.constexpr,
+    h_stride0: tl.int64,
+):
+    """Per-row cut, in ONE pass over that row's bins.
+
+    The torch spelling was a flip / cumsum / flip / compare / where / amax chain
+    over ``[rows, NBINS]`` with a temporary per step -- 0.119 ms for an 8 MiB
+    input (67 GB/s) at rows=4096. The whole row's bins fit in registers, so the
+    reverse cumulative count is a single ``tl.cumsum`` on a reversed tile.
+    """
+    row = tl.program_id(0)
+    b = tl.arange(0, NBINS)
+    counts = tl.load(hist + row * h_stride0 + b)
+    # Inclusive running count from the TOP bin down: reverse, scan, reverse.
+    rev = tl.flip(counts, 0)
+    from_top = tl.flip(tl.cumsum(rev, axis=0), 0)
+    reached = from_top >= TOPK
+    # `from_top` is non-increasing in the bin index, so the last True is the bin
+    # the global k-th falls in. A row that never reaches TOPK takes bin 0, i.e.
+    # `lo`, and therefore selects everything.
+    b_star = tl.max(tl.where(reached, b, 0), axis=0)
+
+    row_lo = tl.load(lo + row)
+    row_hi = tl.load(hi + row)
+    span = row_hi - row_lo
+    ok = (span == span) & (tl.abs(span) < float("inf")) & (span > 0)  # noqa: PLR0124
+    span = tl.where(ok, span, 0.0)
+    cut = row_lo + b_star.to(tl.float32) * (span / NBINS)
+    # An empty row has lo = +inf (no valid candidate on any rank); hand the emit
+    # kernel a number rather than an inf so its `>=` compare is well defined.
+    # Nothing is admitted either way -- every candidate in such a row is -inf.
+    finite = (cut == cut) & (tl.abs(cut) < float("inf"))  # noqa: PLR0124
+    tl.store(thr + row, tl.where(finite, cut, float("-inf")))
+
+
 def threshold_from_histogram(
     hist: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor, topk: int
 ) -> torch.Tensor:
@@ -220,22 +347,19 @@ def threshold_from_histogram(
     selects everything -- the common case for query tokens in the first ``topk``
     positions of a prefill.
     """
-    nbins = hist.shape[1]
-    # Inclusive running count from the top bin down.
-    from_top = torch.cumsum(hist.flip(1).to(torch.int64), dim=1).flip(1)
-    reached = from_top >= topk
-    bins = torch.arange(nbins, device=hist.device, dtype=torch.int32)
-    # The highest bin index whose inclusive-from-top count already reaches topk.
-    # `reached` is monotone non-increasing in the bin index, so its last True is
-    # that bin; rows that never reach topk take bin 0 and therefore `lo`.
-    b_star = torch.where(reached, bins, torch.zeros_like(bins)).amax(1)
-    span = hi - lo
-    span = torch.where(torch.isfinite(span) & (span > 0), span, torch.zeros_like(span))
-    thr = lo + b_star.to(lo.dtype) * (span / nbins)
-    # An empty row has lo = +inf (no valid candidate on any rank); hand the emit
-    # kernel a number rather than an inf so its `>=` compare is well defined.
-    # Nothing is admitted either way -- every candidate in such a row is -inf.
-    return torch.where(torch.isfinite(thr), thr, torch.full_like(thr, NEG_INF))
+    rows, nbins = hist.shape
+    thr = lo.new_empty(rows)
+    hist_c = hist.contiguous()
+    _threshold_kernel[(rows,)](
+        hist_c,
+        lo.contiguous(),
+        hi.contiguous(),
+        thr,
+        topk,
+        nbins,
+        hist_c.stride(0),
+    )
+    return thr
 
 
 @triton.jit
