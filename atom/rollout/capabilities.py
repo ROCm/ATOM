@@ -20,19 +20,6 @@ logger = logging.getLogger("atom")
 # turn any refactor into a capability change, and it would leak methods that are
 # not safe to call from outside.
 _ADVERTISED_METHODS = (
-    # weight sync
-    "update_weights",
-    "update_weights_from_shm",
-    "update_weights_from_ipc",
-    # direct trainer-to-rollout transfer, and the state it leaves behind
-    "init_rdma_weight_group",
-    "receive_weights_rdma",
-    "destroy_rdma_weight_group",
-    "get_weight_update_status",
-    # memory lifecycle
-    "release_memory",
-    "resume_memory",
-    "clear_kv_cache",
     # hidden-state extraction
     "configure_hidden_states",
     # capability discovery itself
@@ -62,7 +49,7 @@ class CapabilityProviderMixin:
             features.add("vocab_masking")
         if self._holds_fp8_weights():
             features.add("fp8_weight_update")
-        if callable(getattr(self, "receive_weights_rdma", None)):
+        if "receive_weights_rdma" in methods:
             features.add("rdma_weight_receive")
 
         config = getattr(self, "config", None)

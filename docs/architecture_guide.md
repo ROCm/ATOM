@@ -155,7 +155,9 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 | Socket | Type | Direction | Purpose |
 |---|---|---|---|
 | Input | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Send requests and control commands |
+| Control | `ROUTER` (CoreManager) / `DEALER` (EngineCore) | CoreManager → EngineCore | Serialized utility and collective-RPC commands |
 | Output | `PUSH` (EngineCore) / `PULL` (CoreManager) | EngineCore → CoreManager | Return finished sequences and stream outputs |
+| Worker RPC output | one `PUSH` / `PULL` pair per TP rank | ModelRunner → AsyncIOProcManager | One correlated collective-RPC reply per worker |
 
 **Process hierarchy:**
 
@@ -166,6 +168,28 @@ ATOM uses a multi-process design with ZMQ sockets for inter-process communicatio
 **Data-parallel variant** (`DPEngineCoreProc`):
 
 When `data_parallel_size > 1`, each EngineCore process is a `DPEngineCoreProc` that synchronizes with other DP ranks via `torch.distributed.all_reduce` on a Gloo process group. The `busy_loop()` override ensures all DP ranks stay in lockstep: if one rank has a prefill batch while another does not, the idle rank executes a dummy prefill (`dummy_prefill_execution()`) to keep NCCL collectives synchronized.
+
+### Collective worker RPC
+
+`AsyncLLMEngine.collective_rpc()` sends a small control call to every DP
+engine and every TP worker, returning `RpcResult` entries in DP-major,
+TP-rank order. The wire types and request-id router live in
+`atom/model_engine/collective_rpc.py`; worker dispatch and per-rank reply
+sockets live in `atom/model_engine/async_proc.py`; capability aggregation is
+split between `atom/model_engine/capabilities.py` and
+`atom/rollout/capabilities.py`.
+
+Every call carries a request id and a finite deadline. Both ordinary utility
+replies and collective replies are routed to the caller holding that id; a
+late reply is dropped rather than becoming the next utility caller's answer.
+Worker exceptions are returned as `RpcResult.error`, preserving successful
+rank results as well.
+
+The API is synchronous and intended for control messages, not bulk tensor
+transfer. Methods whose utility handlers own EngineCore state -- weight
+updates, memory release/resume and KV-cache clearing -- are rejected on this
+generic path. Pipeline-parallel and prefill/decode-disaggregated engines are
+also rejected because their engine processes are not one-to-one DP ranks.
 
 ## Sequence lifecycle
 

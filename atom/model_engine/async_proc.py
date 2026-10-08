@@ -35,7 +35,12 @@ from atom.model_engine.block_table_codec import (
     BlockTableDeltaDecoder,
     BlockTableDeltaEncoder,
 )
-from atom.model_engine.collective_rpc import RpcPayload, RpcResult, checked_timeout
+from atom.model_engine.collective_rpc import (
+    UTILITY_MANAGED_RUNNER_METHODS,
+    RpcPayload,
+    RpcResult,
+    checked_timeout,
+)
 from atom.utils import (
     envs,
     get_mp_context,
@@ -271,13 +276,6 @@ class AsyncIOProc:
                 serialized_obj = pickle.dumps(result)
                 socket.send(serialized_obj)
 
-    # Functions that require all TP ranks to synchronize via barrier before
-    # rank 0 returns, so the caller can safely reuse/overwrite shared buffers.
-    _BARRIER_FUNCS: ClassVar[set[str]] = {
-        "update_weights_from_ipc",
-        "update_weights_from_shm",
-    }
-
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
@@ -287,7 +285,7 @@ class AsyncIOProc:
             )
             if payload is None:
                 call_args, call_kwargs = args, {}
-                need_barrier = func_name in self._BARRIER_FUNCS
+                need_barrier = False
             else:
                 call_args = payload.args
                 call_kwargs = payload.call_kwargs()
@@ -403,6 +401,11 @@ def _alive(proc) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class _RpcReceiveError:
+    error: str
+
+
 class AsyncIOProcManager:
     """Manages a pool of :class:`AsyncIOProc` workers.
 
@@ -421,11 +424,16 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
-    # Names the engine's own protocol owns, which collective_rpc refuses: a
-    # forward has to pass the block-table encoder, exit ends every worker's
-    # loop, and a KV aggregation's output belongs to the KV aggregator.
+    # Names that collective_rpc refuses. Some belong to the engine's wire
+    # protocol; the utility-managed ones need EngineUtilityHandler to maintain
+    # engine state around their worker call.
     _RESERVED_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
-        {FORWARD_RPC, "exit", *AsyncIOProc._KV_FUNC_NAMES}
+        {
+            FORWARD_RPC,
+            "exit",
+            *AsyncIOProc._KV_FUNC_NAMES,
+            *UTILITY_MANAGED_RUNNER_METHODS,
+        }
     )
 
     def __init__(self, finalizer, proc_num: int, runner: str, *args):
@@ -615,7 +623,14 @@ class AsyncIOProcManager:
                 socks = poller.poll(timeout=1000)
                 if not socks:
                     continue
-                obj = pickle.loads(output_socket.recv(copy=False))
+                try:
+                    obj = pickle.loads(output_socket.recv(copy=False))
+                except Exception as exc:
+                    obj = _RpcReceiveError(
+                        f"could not decode RPC reply from TP rank {worker_id}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.exception(obj.error)
                 self.rpc_outputs_queues[worker_id].put_nowait(obj)
         finally:
             output_socket.close(linger=0)
@@ -668,6 +683,16 @@ class AsyncIOProcManager:
             f"{self.label}: collective_rpc {func_name} id={payload.request_id}"
         )
         with self._rpc_lock:
+            barrier = getattr(self, "all_ranks_barrier", None)
+            if payload.barrier and barrier is not None and barrier.broken:
+                error = (
+                    f"cannot run barrier RPC {func_name!r}: the TP barrier is "
+                    f"broken; restart the runner manager"
+                )
+                return [
+                    RpcResult(payload.request_id, rank, error=error)
+                    for rank in range(self.proc_num)
+                ]
             self.rpc_broadcast_mq.enqueue((func_name, payload))
 
             # This call's own copy: a worker's death makes the monitor run
@@ -727,7 +752,9 @@ class AsyncIOProcManager:
                 else:
                     continue
             else:
-                if not isinstance(reply, RpcResult):
+                if isinstance(reply, _RpcReceiveError):
+                    error = reply.error
+                elif not isinstance(reply, RpcResult):
                     error = (
                         f"unexpected reply type {type(reply).__name__} from rank {rank}"
                     )

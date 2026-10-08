@@ -77,6 +77,9 @@ class EngineCore:
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
+        # A weight update that partly wrote the model is also an offloaded
+        # state operationally: do not schedule it until a complete sync lands.
+        self._rl_weights_inconsistent = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the

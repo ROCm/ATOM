@@ -48,9 +48,11 @@ class AsyncLLMEngine(LLMEngine):
         raising, so a partial failure still reports the ranks that succeeded --
         which is what a caller verifying weight coverage needs.
 
-        The signature mirrors vLLM's ``collective_rpc`` so the same caller can
-        drive either engine. Intended for small control messages: bulk tensors
-        belong on the weight-sync data plane.
+        This is synchronous and returns one ``RpcResult`` per DP/TP rank,
+        including failed ranks; vLLM's similarly named coroutine raises on a
+        worker failure. An adapter must flatten and raise if it wants that
+        interface. Intended for small control messages: bulk tensors belong on
+        the weight-sync data plane.
 
         Note this stalls the affected DP rank's scheduling for the call's
         duration, since the handler runs in the EngineCore busy loop. That is

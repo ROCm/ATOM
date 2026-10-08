@@ -33,6 +33,8 @@ class _Parallel:
 
 class _Config:
     tp_world_size = 4
+    pipeline_parallel_size = 3
+    prefill_context_parallel_size = 2
     kv_cache_dtype = "fp8"
     parallel_config = _Parallel()
 
@@ -87,15 +89,19 @@ def test_a_worker_reports_its_version_and_position():
     assert report["dp_rank_local"] == 1  # from parallel_config, not guessed
 
 
-def test_it_reports_only_methods_that_actually_exist():
+def test_it_reports_only_safe_methods_that_actually_exist():
     report = _Runner(
-        methods=("clear_kv_cache", "release_memory")
+        methods=(
+            "configure_hidden_states",
+            "clear_kv_cache",
+            "release_memory",
+            "update_weights_from_ipc",
+        )
     ).get_worker_capabilities()
-    # get_worker_capabilities is the mixin's own method, so it is always there --
-    # a consumer can test for discovery support the same way as anything else.
+    # The other methods need EngineUtilityHandler to maintain engine state
+    # around them, so offering them through collective_rpc would bypass it.
     assert set(report["methods"]) == {
-        "clear_kv_cache",
-        "release_memory",
+        "configure_hidden_states",
         "get_worker_capabilities",
     }
     assert "update_weights" not in report["methods"]
@@ -118,10 +124,9 @@ def test_features_are_reported_separately_from_methods():
     assert "fp8_weight_update" not in plain["features"]
     assert "vocab_masking" not in plain["features"]
 
-    rich = _Runner(fp8=True, vocab=151936, rdma=True).get_worker_capabilities()
+    rich = _Runner(fp8=True, vocab=151936).get_worker_capabilities()
     assert "fp8_weight_update" in rich["features"]
     assert "vocab_masking" in rich["features"]
-    assert "rdma_weight_receive" in rich["features"]
 
 
 def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
@@ -133,21 +138,6 @@ def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
 
     bf16.model = None  # nothing loaded: nothing claimed, and no raise
     assert "fp8_weight_update" not in bf16.get_worker_capabilities()["features"]
-
-
-def test_the_rdma_lifecycle_is_advertised_alongside_the_feature():
-    """The feature was reported with none of the methods that drive it, so a
-    caller negotiating by capability could not find how to join, receive or
-    tear down the group."""
-    lifecycle = (
-        "init_rdma_weight_group",
-        "receive_weights_rdma",
-        "destroy_rdma_weight_group",
-        "get_weight_update_status",
-    )
-    report = _Runner(methods=lifecycle, rdma=True).get_worker_capabilities()
-    assert "rdma_weight_receive" in report["features"]
-    assert set(lifecycle) <= set(report["methods"])
 
 
 def test_rdma_is_absent_until_the_receiver_exists():
@@ -243,7 +233,8 @@ def test_topology_comes_from_config_not_from_the_workers():
     )
     assert caps.tp_world_size == 4  # config says 4 even though 2 workers replied
     assert caps.data_parallel_size == 2
-    assert caps.pipeline_parallel_size == 1
+    assert caps.pipeline_parallel_size == 3  # on Config, not parallel_config
+    assert caps.prefill_context_parallel_size == 2
     assert caps.kv_cache_dtype == "fp8"
 
 

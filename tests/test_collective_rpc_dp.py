@@ -22,6 +22,7 @@ from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     RpcResponseRouter,
     RpcResult,
+    engine_budget,
 )
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 
@@ -41,7 +42,6 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr = object.__new__(cls)
     mgr.label = "test-mgr"
     mgr.control_sockets = [_Socket() for _ in range(engine_count)]
-    mgr.utility_response_queue = queue.Queue()
     mgr._rpc_router = RpcResponseRouter()
     mgr._rpc_ranks_per_engine = tp
     mgr.sent = []
@@ -114,49 +114,27 @@ def test_the_router_unregisters_even_when_the_body_raises():
 # ── routing at the manager ─────────────────────────────────────────────────
 
 
-def test_non_rpc_responses_still_use_the_legacy_queue():
-    """Every pre-existing utility command must be unaffected."""
-    mgr = _mgr()
-    for body in (
-        {"cmd": "clear_kv_cache", "result": True},
-        {"cmd": "release_memory", "result": None},
-        "not even a dict",
-    ):
-        mgr._route_utility_response(0, body)
-
-    drained = []
-    while not mgr.utility_response_queue.empty():
-        drained.append(mgr.utility_response_queue.get_nowait())
-    assert len(drained) == 3
-
-
-def test_an_rpc_response_does_not_touch_the_legacy_queue():
+def test_a_reply_reaches_the_caller_holding_its_id():
     mgr = _mgr(1)
     with mgr._rpc_router.register("r1") as replies:
         mgr._route_utility_response(0, _tp_body("r1", results=[_tp(0, "v")]))
         assert replies.get_nowait()[0] == 0
-    assert mgr.utility_response_queue.empty()
 
 
-def test_a_late_rpc_response_is_dropped_not_queued():
-    mgr = _mgr(1)
-    mgr._route_utility_response(0, _tp_body("nobody-waiting", results=[_tp(0)]))
-    assert mgr.utility_response_queue.empty(), (
-        "a late correlated reply must not fall through to the shared queue, "
-        "or the next caller inherits it"
-    )
-
-
-def test_a_reply_without_a_usable_id_is_dropped_not_routed_or_queued():
+def test_a_reply_nobody_waits_for_is_dropped_without_raising():
     """Routing runs on the output thread, which a raise would end, and an
-    unhashable id made the router's dict lookup raise. An id-less reply on the
-    shared queue would become the next synchronous caller's instead."""
+    unhashable id made the router's dict lookup raise. A reply with no id comes
+    from a sender that never waits; one with an unknown id is late."""
     mgr = _mgr(1)
-    for request_id in (["not", "hashable"], None, "", 7):
-        mgr._route_utility_response(
-            0, {"cmd": COLLECTIVE_RPC_CMD, "request_id": request_id, "error": "x"}
-        )
-    assert mgr.utility_response_queue.empty()
+    for body in (
+        {"cmd": "clear_kv_cache", "result": True},
+        {"cmd": COLLECTIVE_RPC_CMD, "request_id": ["not", "hashable"]},
+        {"cmd": "update_weights", "request_id": "", "error": "x"},
+        {"cmd": "update_weights", "request_id": "nobody-waiting", "error": "x"},
+        "not even a dict",
+    ):
+        mgr._route_utility_response(0, body)
+    assert mgr._rpc_router.in_flight() == 0
 
 
 # ── collective_rpc ─────────────────────────────────────────────────────────
@@ -203,7 +181,7 @@ def test_the_broadcast_carries_the_full_request():
     assert kw["args"] == (1, 2)
     assert kw["kwargs"] == {"k": "v"}
     assert kw["barrier"] is True
-    assert kw["timeout"] == 9
+    assert kw["timeout"] == engine_budget(9)
     assert kw["request_id"]
 
 
@@ -394,18 +372,25 @@ def test_a_timeout_no_deadline_can_be_built_from_is_refused(timeout):
     assert mgr.sent == [], "nothing may be broadcast for a refused call"
 
 
-# ── the legacy synchronous path ────────────────────────────────────────────
+# ── the synchronous utility path ───────────────────────────────────────────
 
 
-def _answering(mgr, replies):
-    """A broadcast that delivers one reply per DP rank, as the output thread does."""
+def _answering(mgr, replies, ranks=None):
+    """A broadcast whose engines answer with *replies*, each stamped with the
+    request id it was sent, as EngineUtilityHandler does."""
 
     def broadcast(cmd, **kw):
         mgr.sent.append((cmd, kw))
-        for dp_rank, body in enumerate(replies):
-            mgr._route_utility_response(dp_rank, body)
+        for dp_rank, body in zip(ranks or range(len(replies)), replies):
+            mgr._route_utility_response(
+                dp_rank, {**body, "request_id": kw["request_id"]}
+            )
 
     return broadcast
+
+
+def _bodies(responses):
+    return [{k: v for k, v in r.items() if k != "request_id"} for r in responses]
 
 
 def test_sync_refuses_a_fire_and_forget_command_up_front():
@@ -435,4 +420,88 @@ def test_sync_still_returns_every_reply_when_all_succeed():
     mgr = _mgr(2)
     replies = [{"cmd": "clear_kv_cache", "result": True}] * 2
     mgr.broadcast_utility_command = _answering(mgr, replies)
-    assert mgr.broadcast_utility_command_sync("clear_kv_cache") == replies
+    assert _bodies(mgr.broadcast_utility_command_sync("clear_kv_cache")) == replies
+
+
+def test_sync_takes_only_replies_carrying_its_own_id():
+    """Replies were taken by position off one shared queue, so a stray one --
+    a fire-and-forget clear_kv_cache's answer, or a call's that gave up --
+    became the next caller's, and every later reply shifted by one."""
+    mgr = _mgr(1)
+
+    def broadcast(cmd, **kw):
+        mgr.sent.append((cmd, kw))
+        mgr._route_utility_response(0, {"cmd": "clear_kv_cache", "result": True})
+        mgr._route_utility_response(
+            0, {"cmd": "update_weights", "request_id": "an-earlier-call", "error": "x"}
+        )
+        mgr._route_utility_response(
+            0,
+            {"cmd": "release_memory", "result": "mine", "request_id": kw["request_id"]},
+        )
+
+    mgr.broadcast_utility_command = broadcast
+    (reply,) = mgr.broadcast_utility_command_sync("release_memory", timeout=5)
+    assert reply["result"] == "mine"
+
+
+def test_a_late_error_from_a_call_that_gave_up_does_not_fail_the_next():
+    mgr = _mgr(1)
+    first = {}
+
+    def silent(cmd, **kw):
+        first.update(kw)
+
+    mgr.broadcast_utility_command = silent
+    with pytest.raises(TimeoutError):
+        mgr.broadcast_utility_command_sync("update_weights_shm", timeout=0.2)
+
+    mgr._route_utility_response(
+        0,
+        {
+            "cmd": "update_weights_shm",
+            "request_id": first["request_id"],
+            "error": "late",
+        },
+    )
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "clear_kv_cache", "result": 1}]
+    )
+    assert _bodies(mgr.broadcast_utility_command_sync("clear_kv_cache", timeout=5)) == [
+        {"cmd": "clear_kv_cache", "result": 1}
+    ]
+
+
+def test_sync_names_the_engines_that_did_not_answer():
+    mgr = _mgr(3)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "clear_kv_cache", "result": 1}], ranks=[1]
+    )
+    with pytest.raises(TimeoutError, match=r"DP rank\(s\) \[0, 2\]"):
+        mgr.broadcast_utility_command_sync("clear_kv_cache", timeout=0.3)
+
+
+def test_sync_returns_replies_in_dp_order():
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(
+        mgr,
+        [
+            {"cmd": "clear_kv_cache", "result": "dp1"},
+            {"cmd": "clear_kv_cache", "result": "dp0"},
+        ],
+        ranks=[1, 0],
+    )
+    replies = mgr.broadcast_utility_command_sync("clear_kv_cache", timeout=5)
+    assert [r["result"] for r in replies] == ["dp0", "dp1"]
+
+
+def test_engines_get_a_shorter_deadline_than_their_caller():
+    """The engine's per-rank account of a timeout arrived as the caller gave
+    up, so it was dropped and the caller learned only that it had waited."""
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "clear_kv_cache", "result": 1}]
+    )
+    mgr.broadcast_utility_command_sync("clear_kv_cache", timeout=60)
+    ((_, kw),) = mgr.sent
+    assert 0 < kw["timeout"] < 60

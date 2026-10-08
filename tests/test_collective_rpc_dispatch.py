@@ -45,6 +45,11 @@ class _RunnerMgr:
 
     def collective_rpc(self, method, payload, timeout=300.0):
         self.calls.append((method, payload, timeout))
+        if method == "discard_failed_weight_sync":
+            return [
+                RpcResult(payload.request_id, r, value=True)
+                for r in range(self.proc_num)
+            ]
         if self._raises is not None:
             raise self._raises
         if self._replies is not None:
@@ -62,6 +67,7 @@ class _RunnerMgr:
 class _Engine:
     _has_pending_utility = True
     _is_rl_weights_offloaded = False
+    _rl_weights_inconsistent = False
 
 
 def _handler(**kw):
@@ -284,6 +290,7 @@ def test_ranks_that_updated_different_counts_are_an_error(cmd, args):
             "rank 0 updated 4, rank 1 updated 3",
         }
     ]
+    assert h.runner_mgr.calls[-1][0] == "discard_failed_weight_sync"
 
 
 @pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
@@ -301,6 +308,7 @@ def test_a_direct_update_that_fails_on_a_nonzero_rank_is_an_error(cmd, args):
     assert _responses(out) == [
         {"cmd": cmd, "error": "TP rank 1: ValueError: rejected q_proj"}
     ]
+    assert h.runner_mgr.calls[-1][0] == "discard_failed_weight_sync"
 
 
 @pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
@@ -348,6 +356,55 @@ def test_a_failed_last_bucket_leaves_the_engine_asleep(cmd, outcome):
     assert _asleep_after(cmd, True, **outcome)
 
 
+def _process_one(handler, out, engine, cmd, args):
+    engine._has_pending_utility = True
+    pending = queue.Queue()
+    pending.put_nowait((cmd, args))
+    handler.process_queue(pending, engine)
+    return _responses(out)
+
+
+def test_any_failed_bucket_fences_an_engine_that_was_awake():
+    h, _, out = _handler(
+        replies=[RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]
+    )
+    engine = _Engine()
+    engine._is_rl_weights_offloaded = False
+    engine._rl_weights_inconsistent = False
+
+    _process_one(h, out, engine, "update_weights_ipc", {"is_last": False})
+
+    assert engine._rl_weights_inconsistent
+    assert engine._is_rl_weights_offloaded
+
+
+def test_wake_up_cannot_unfence_a_failed_update_but_a_complete_sync_can():
+    h, mgr, out = _handler(
+        replies=[RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]
+    )
+    engine = _Engine()
+    engine._is_rl_weights_offloaded = False
+    engine._rl_weights_inconsistent = False
+    _process_one(h, out, engine, "update_weights_shm", {"is_last": False})
+
+    _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
+    assert engine._is_rl_weights_offloaded
+    assert engine._rl_weights_inconsistent
+
+    mgr._replies = _counts(4, 4)
+    _process_one(h, out, engine, "update_weights_shm", {"is_last": True})
+    assert not engine._is_rl_weights_offloaded
+    assert not engine._rl_weights_inconsistent
+
+
+def test_every_answered_utility_command_stamps_the_callers_request_id():
+    h, _, out = _handler()
+    h._execute_utility_command("clear_kv_cache", {"request_id": "utility-1"})
+    assert _responses(out) == [
+        {"cmd": "clear_kv_cache", "result": 7, "request_id": "utility-1"}
+    ]
+
+
 def _raise(exc):
     def fail(*args, **kwargs):
         raise exc
@@ -369,21 +426,18 @@ def test_a_raising_handler_answers_before_the_engine_goes_down():
     ]
 
 
-def test_a_collective_rpc_that_raises_early_still_reaches_its_caller():
-    """Without its request id the error reply would land on the shared queue,
-    while the caller actually waiting on that id timed out."""
-    h, _, out = _handler()
-
-    with pytest.raises(TypeError):
-        # ``args`` is not iterable, so the handler raises before its own
-        # try/except around the fan-out.
-        h._execute_utility_command(
-            "collective_rpc", {"method": "m", "request_id": "x7", "args": 5}
-        )
-
+@pytest.mark.parametrize("field", ["args", "kwargs"])
+def test_a_malformed_collective_rpc_payload_is_answered_without_ending_the_loop(field):
+    """Payload conversion itself must sit inside the handler's guard: a scalar
+    args or kwargs value used to raise before it and end the EngineCore loop."""
+    h, mgr, out = _handler()
+    h._execute_utility_command(
+        "collective_rpc", {"method": "m", "request_id": "x7", field: 5}
+    )
     (body,) = _responses(out)
     assert body["request_id"] == "x7"
     assert body["error"].startswith("TypeError")
+    assert mgr.calls == []
 
 
 @pytest.mark.parametrize(

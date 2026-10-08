@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+from functools import wraps
 
 import torch
 
@@ -28,6 +29,20 @@ _FUSED_EXPERT_LEAVES = {
 }
 
 _EXPERTS_PREFIX_SUFFIX = ".experts"
+
+
+def _discard_sync_state_on_error(method):
+    """A failed bucket may leave no scratch for the next sync to inherit."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            self._discard_failed_weight_sync()
+            raise
+
+    return guarded
 
 
 def _unwrap_once(module) -> torch.nn.Module | None:
@@ -109,6 +124,26 @@ class WeightUpdaterMixin:
                 f"sender's names against the model's own "
                 f"(`model.named_parameters()`)."
             )
+
+    def _discard_failed_weight_sync(self) -> None:
+        """Drop transport and cross-bucket scratch after a failed update.
+
+        The generic RPC path reports an exception without killing the worker,
+        so this state now outlives a failed call unless it is explicitly
+        cleared. Parameters already written cannot be rolled back; the
+        EngineCore fences serving until a later complete sync succeeds.
+        """
+        if hasattr(self, "_ipc_buffer"):
+            self._ipc_buffer = None
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        if hasattr(self, "_expert_relayout_pending"):
+            self._expert_relayout_pending.clear()
+
+    def discard_failed_weight_sync(self) -> bool:
+        """Worker RPC used to clear every peer after any one rank failed."""
+        self._discard_failed_weight_sync()
+        return True
 
     def _get_param_to_module_mapping(self) -> dict[str, tuple]:
         """
@@ -890,6 +925,7 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+    @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
     ) -> int:
@@ -989,6 +1025,7 @@ class WeightUpdaterMixin:
         self._warn_if_nothing_matched(updated, skipped)
         return updated
 
+    @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
         shm_name: str,
@@ -1120,6 +1157,7 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
+    @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,
         ipc_handle,

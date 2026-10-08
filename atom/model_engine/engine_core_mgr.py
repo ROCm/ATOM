@@ -24,6 +24,7 @@ from atom.model_engine.collective_rpc import (
     RpcResponseRouter,
     RpcResult,
     checked_timeout,
+    engine_budget,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import FIRE_AND_FORGET_UTILITY_CMDS
@@ -193,10 +194,9 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
-        self.utility_response_queue = queue.Queue()
-        # Generic collective RPCs are correlated by request id instead of by
-        # queue position, so several may be outstanding. Every other utility
-        # command keeps using utility_response_queue above.
+        # Utility replies are matched to their caller by request id, not by
+        # position on a shared queue, where a late or unasked-for reply became
+        # the next caller's answer.
         self._rpc_router = RpcResponseRouter()
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
@@ -1366,29 +1366,23 @@ class CoreManager:
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
     def _route_utility_response(self, dp_rank: int, data):
-        """Send a correlated reply to its own caller; everything else as before.
+        """Hand a utility reply to the caller waiting on its request id.
 
-        Only ``collective_rpc`` replies carry a request id, so every existing
-        utility command keeps the legacy shared-queue path untouched.
+        A reply nobody waits for is dropped: one with no usable id was asked
+        for by a sender that never waits, and one with an id nobody holds is
+        late, its caller having given up.
         """
-        if not (isinstance(data, dict) and data.get("cmd") == COLLECTIVE_RPC_CMD):
-            self.utility_response_queue.put_nowait(data)
-            return
-        request_id = data.get("request_id")
+        request_id = data.get("request_id") if isinstance(data, dict) else None
         if not isinstance(request_id, str) or not request_id:
-            # Nobody can be waiting on it. Routing an unhashable id raises on
-            # this thread, which ends it, and on the shared queue the reply
-            # would become the next synchronous caller's.
-            logger.warning(
-                f"{self.label}: dropping collective_rpc reply with no usable "
-                f"request id from DP rank {dp_rank}"
+            # Routing an unhashable id would raise on this thread and end it.
+            logger.debug(
+                f"{self.label}: dropping a utility reply no caller can be "
+                f"waiting for, from DP rank {dp_rank}"
             )
             return
         if not self._rpc_router.route(request_id, (dp_rank, data)):
-            # The caller timed out and unregistered. Dropping is the point: on
-            # the shared queue this reply would have become the next caller's.
             logger.warning(
-                f"{self.label}: dropping late collective_rpc reply {request_id} "
+                f"{self.label}: dropping late utility reply {request_id} "
                 f"from DP rank {dp_rank}"
             )
 
@@ -1433,7 +1427,7 @@ class CoreManager:
                 args=tuple(args),
                 kwargs=dict(kwargs or {}),
                 barrier=bool(barrier),
-                timeout=timeout,
+                timeout=engine_budget(timeout),
             )
             by_dp_rank: dict[int, dict] = {}
             while len(by_dp_rank) < engine_count:
@@ -1515,33 +1509,43 @@ class CoreManager:
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
     ):
+        """Run *cmd* on every engine and return their replies in DP order.
+
+        Raises if an engine reports an error or does not answer in time.
+        """
         if cmd in FIRE_AND_FORGET_UTILITY_CMDS:
             raise ValueError(
                 f"{self.label}: {cmd!r} is fire-and-forget; its handler never "
                 f"answers, so waiting on it could only time out. Send it with "
                 f"broadcast_utility_command instead."
             )
-        # Drain any stale responses that might be left over
-        while not self.utility_response_queue.empty():
-            try:
-                self.utility_response_queue.get_nowait()
-            except queue.Empty:
-                break
+        timeout = checked_timeout(timeout)
+        request_id = uuid.uuid4().hex
+        # The global engine count on a coordinator, as the broadcast reaches.
+        engine_count = len(self.control_sockets)
+        deadline = time.monotonic() + timeout
+        by_dp_rank: dict[int, object] = {}
+        with self._rpc_router.register(request_id) as replies:
+            self.broadcast_utility_command(
+                cmd, request_id=request_id, timeout=engine_budget(timeout), **kwargs
+            )
+            while len(by_dp_rank) < engine_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+                by_dp_rank.setdefault(dp_rank, body)
 
-        self.broadcast_utility_command(cmd, **kwargs)
-
-        # Collect one response per routable engine (must match the broadcast count
-        # len(self.control_sockets), which is the global engine count on a coordinator).
-        responses = []
-        for _ in range(len(self.control_sockets)):
-            try:
-                resp = self.utility_response_queue.get(timeout=timeout)
-                responses.append(resp)
-            except queue.Empty:
-                raise TimeoutError(
-                    f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
-                    f"for command '{cmd}' (timeout={timeout}s)"
-                )
+        responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
+        missing = sorted(set(range(engine_count)) - set(by_dp_rank))
+        if missing:
+            raise TimeoutError(
+                f"{self.label}: no reply to utility command {cmd!r} from DP "
+                f"rank(s) {missing} within {timeout}s"
+            )
         failed = [r for r in responses if isinstance(r, dict) and r.get("error")]
         if failed:
             # Callers read r["result"]; an error reply has none, and handing it

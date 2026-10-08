@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
+    import atom.model_engine.async_proc as async_proc_module
     from atom.model_engine.async_proc import (
         AsyncIOProc,
         AsyncIOProcManager,
@@ -253,7 +254,7 @@ def test_kwargs_default_to_empty_when_omitted():
 
 def test_the_barrier_is_driven_by_the_payload_not_the_name():
     """A generic RPC reusing the IPC buffers needs the barrier too, and its
-    method name is not in ``_BARRIER_FUNCS``."""
+    method name alone must not make an ordinary call wait."""
     barrier = _Barrier()
     proc = _proc(barrier=barrier)
     _drive(proc, [("returns_value", [RpcPayload("r7", args=(1,), barrier=True)])])
@@ -263,22 +264,6 @@ def test_the_barrier_is_driven_by_the_payload_not_the_name():
     proc = _proc(barrier=barrier)
     _drive(proc, [("returns_value", [RpcPayload("r8", args=(1,), barrier=False)])])
     assert barrier.waits == 0
-
-
-def test_the_legacy_barrier_names_still_barrier():
-    """The non-payload path must keep using ``_BARRIER_FUNCS``."""
-    assert "update_weights_from_ipc" in AsyncIOProc._BARRIER_FUNCS
-    assert "update_weights_from_shm" in AsyncIOProc._BARRIER_FUNCS
-
-    class _W:
-        def update_weights_from_ipc(self, *a):
-            return "done"
-
-    barrier = _Barrier()
-    proc = _proc(runners=[_W()], barrier=barrier)
-    primary, _ = _drive(proc, [("update_weights_from_ipc", [None, {}, True, None])])
-    assert primary == ["done"]
-    assert barrier.waits == 1
 
 
 # ── the untouched path ─────────────────────────────────────────────────────
@@ -406,11 +391,22 @@ def test_forward_cannot_go_around_the_block_table_encoder():
     assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
 
 
-@pytest.mark.parametrize("name", ["exit", "async_proc_aggregation"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "exit",
+        "async_proc_aggregation",
+        "update_weights",
+        "update_weights_from_shm",
+        "update_weights_from_ipc",
+        "release_memory",
+        "resume_memory",
+        "clear_kv_cache",
+    ],
+)
 def test_names_the_engine_protocol_owns_are_refused(name):
-    """Exit tore down every worker's runner and ended its loop behind a reply
-    that read as success. A KV aggregation drained transfer completions the
-    scheduler then never saw."""
+    """Protocol names and methods whose utility handlers own engine state
+    cannot be driven around those owners."""
     mgr = _mgr(1)
     with pytest.raises(ValueError, match="reserved"):
         mgr.collective_rpc(name, RpcPayload(request_id="x1"))
@@ -421,6 +417,52 @@ def test_the_reserved_names_track_the_worker_loop():
     """Built from the loop's own KV names, so a new one cannot be missed."""
     assert AsyncIOProc._KV_FUNC_NAMES <= AsyncIOProcManager._RESERVED_RPC_NAMES
     assert {"forward", "exit"} <= AsyncIOProcManager._RESERVED_RPC_NAMES
+
+
+def test_a_broken_barrier_is_not_reused_or_unsafely_reset():
+    """A barrier breaks because a rank died. Resetting it around that missing
+    process makes the next call hang; sending into it makes every rank report
+    another BrokenBarrierError."""
+    mgr = _mgr(2)
+    mgr.all_ranks_barrier = SimpleNamespace(broken=True)
+
+    results = mgr.collective_rpc("m", RpcPayload("br", barrier=True), timeout=5)
+
+    assert all("restart the runner manager" in r.error for r in results)
+    assert mgr.rpc_broadcast_mq.sent == []
+
+
+def test_an_unreadable_reply_fails_one_call_without_ending_its_thread(monkeypatch):
+    """A CUDA tensor or corrupt frame that pickle cannot load used to escape
+    the socket loop and permanently end that rank's reply thread."""
+    mgr = _mgr(1)
+
+    class _Socket:
+        def recv(self, copy=False):
+            mgr.still_running = False
+            return b"not a pickle"
+
+        def close(self, linger=0):
+            pass
+
+    socket = _Socket()
+
+    class _Poller:
+        def register(self, *args):
+            pass
+
+        def poll(self, timeout=0):
+            return [(socket, 1)]
+
+    monkeypatch.setattr(async_proc_module, "make_zmq_socket", lambda *a, **k: socket)
+    monkeypatch.setattr(async_proc_module.zmq, "Poller", _Poller)
+    mgr.zmq_ctx = object()
+    mgr.rpc_output_threads = []
+    mgr.process_rpc_output_sockets("ipc:///test", 0)
+
+    mgr.still_running = True
+    (result,) = mgr.collective_rpc("m", RpcPayload("bad"), timeout=5)
+    assert "could not decode RPC reply from TP rank 0" in result.error
 
 
 class _AnsweringMq:

@@ -12,15 +12,34 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Commands whose senders never wait, so their handlers must never answer.
-# CoreManager keeps one shared response queue that
-# broadcast_utility_command_sync reads by position, so an unrequested reply left
-# there is taken by the next synchronous caller as its own.
+# Commands whose senders never wait, so their handlers answer nothing and a
+# synchronous caller could only wait out its timeout on them.
 FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
+_WEIGHT_UPDATE_CMDS = frozenset(
+    {"update_weights", "update_weights_shm", "update_weights_ipc"}
+)
 
-# As long as broadcast_utility_command_sync waits on each engine by default:
-# a rank still busy past that is answering a caller who has gone.
+# For a direct weight update whose sender gives no deadline of its own;
+# broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
+
+
+class _ReplyQueue:
+    """The EngineCore output queue, as the utility handlers see it.
+
+    Stamps every ``UTILITY_RESPONSE`` with the request id of the command it
+    answers, so CoreManager matches replies to callers by id rather than by
+    position, where a late or unasked-for reply became the next caller's.
+    """
+
+    def __init__(self, output_queue):
+        self._queue = output_queue
+        self.request_id = None
+
+    def put_nowait(self, item) -> None:
+        if self.request_id is not None and item[0] == "UTILITY_RESPONSE":
+            item = ("UTILITY_RESPONSE", {**item[1], "request_id": self.request_id})
+        self._queue.put_nowait(item)
 
 
 class EngineUtilityHandler:
@@ -66,7 +85,7 @@ class EngineUtilityHandler:
         self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
     ):
         self.runner_mgr = runner_mgr
-        self.output_queue = output_queue
+        self.output_queue = _ReplyQueue(output_queue)
         self.label = label
         self.scheduler = scheduler
 
@@ -94,33 +113,36 @@ class EngineUtilityHandler:
                     if "weights" in tags:
                         engine._is_rl_weights_offloaded = True
                         logger.info(f"{self.label}: engine entered sleep mode")
-                elif cmd in (
-                    "resume_memory",
-                    "update_weights_shm",
-                    "update_weights_ipc",
-                ):
+                elif cmd == "resume_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
-                    if cmd == "resume_memory" and "weights" in tags:
-                        engine._is_rl_weights_offloaded = False
-                        logger.info(f"{self.label}: engine exited sleep mode")
-                    elif cmd in ("update_weights_shm", "update_weights_ipc"):
-                        is_last = (
-                            args.get("is_last", True)
-                            if isinstance(args, dict)
-                            else True
-                        )
-                        if is_last and "error" not in reply:
-                            engine._is_rl_weights_offloaded = False
-                            logger.info(
-                                f"{self.label}: engine exited sleep mode (weights updated)"
-                            )
-                        elif is_last and engine._is_rl_weights_offloaded:
-                            # Waking would schedule onto weights this sync did
-                            # not finish writing.
+                    if "weights" in tags:
+                        if getattr(engine, "_rl_weights_inconsistent", False):
+                            engine._is_rl_weights_offloaded = True
                             logger.error(
-                                f"{self.label}: the weight update failed, so the "
-                                f"engine stays in sleep mode: {reply['error']}"
+                                f"{self.label}: refusing to resume inconsistent "
+                                f"weights; a complete weight sync must succeed first"
                             )
+                        else:
+                            engine._is_rl_weights_offloaded = False
+                            logger.info(f"{self.label}: engine exited sleep mode")
+                elif cmd in _WEIGHT_UPDATE_CMDS:
+                    failed = isinstance(reply, dict) and bool(reply.get("error"))
+                    is_complete = cmd == "update_weights" or (
+                        args.get("is_last", True) if isinstance(args, dict) else True
+                    )
+                    if failed:
+                        engine._rl_weights_inconsistent = True
+                        engine._is_rl_weights_offloaded = True
+                        logger.error(
+                            f"{self.label}: weight update failed; serving stays "
+                            f"fenced until a complete sync succeeds: {reply['error']}"
+                        )
+                    elif is_complete:
+                        engine._rl_weights_inconsistent = False
+                        engine._is_rl_weights_offloaded = False
+                        logger.info(
+                            f"{self.label}: engine exited sleep mode (weights updated)"
+                        )
             except queue.Empty:
                 engine._has_pending_utility = False
                 break
@@ -136,43 +158,42 @@ class EngineUtilityHandler:
 
         reply = None
         handler_name = self._UTILITY_HANDLERS.get(cmd)
-        if handler_name:
-            handler = getattr(self, handler_name)
-            try:
-                reply = handler(args)
-            except Exception as exc:
-                # Still fatal to the engine, as before; but a synchronous
-                # caller now hears why instead of waiting out its timeout.
-                if cmd not in FIRE_AND_FORGET_UTILITY_CMDS:
-                    self.output_queue.put_nowait(
-                        ("UTILITY_RESPONSE", self._error_reply(cmd, args, exc))
+        self.output_queue.request_id = (
+            args.get("request_id") if isinstance(args, dict) else None
+        )
+        try:
+            if handler_name:
+                handler = getattr(self, handler_name)
+                try:
+                    reply = handler(args)
+                except Exception as exc:
+                    # Still fatal to the engine, as before; but a synchronous
+                    # caller now hears why instead of waiting out its timeout.
+                    if cmd not in FIRE_AND_FORGET_UTILITY_CMDS:
+                        self.output_queue.put_nowait(
+                            ("UTILITY_RESPONSE", self._error_reply(cmd, exc))
+                        )
+                    raise
+            else:
+                # Answer, do not just log: a synchronous caller would otherwise
+                # wait out its timeout and learn only that, not the misspelling.
+                logger.warning(f"{self.label}: Unknown utility command: {cmd}")
+                self.output_queue.put_nowait(
+                    (
+                        "UTILITY_RESPONSE",
+                        {"cmd": cmd, "error": f"unknown utility command {cmd!r}"},
                     )
-                raise
-        else:
-            # Answer, do not just log. `broadcast_utility_command_sync` blocks
-            # for 300s on a response that a dropped command never produces, so
-            # a misspelled command used to cost five minutes and then report a
-            # timeout naming the command but not the cause.
-            logger.warning(f"{self.label}: Unknown utility command: {cmd}")
-            self.output_queue.put_nowait(
-                (
-                    "UTILITY_RESPONSE",
-                    {"cmd": cmd, "error": f"unknown utility command {cmd!r}"},
                 )
-            )
+        finally:
+            self.output_queue.request_id = None
 
         elapsed = _time.monotonic() - t0
         log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
         return reply
 
     @staticmethod
-    def _error_reply(cmd: str, args, exc: Exception) -> dict:
-        reply = {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
-        if cmd == COLLECTIVE_RPC_CMD and isinstance(args, dict):
-            # Without its id the reply falls through to the shared queue,
-            # while the caller that is actually waiting times out.
-            reply["request_id"] = args.get("request_id")
-        return reply
+    def _error_reply(cmd: str, exc: Exception) -> dict:
+        return {"cmd": cmd, "error": f"{type(exc).__name__}: {exc}"}
 
     def _handle_collective_rpc(self, args: dict):
         """Invoke an arbitrary ModelRunner method on every TP rank.
@@ -205,13 +226,13 @@ class EngineUtilityHandler:
             )
             return
 
-        payload = RpcPayload(
-            request_id=request_id,
-            args=tuple(args.get("args", ())),
-            kwargs=dict(args.get("kwargs") or {}),
-            barrier=bool(args.get("barrier", False)),
-        )
         try:
+            payload = RpcPayload(
+                request_id=request_id,
+                args=tuple(args.get("args", ())),
+                kwargs=dict(args.get("kwargs") or {}),
+                barrier=bool(args.get("barrier", False)),
+            )
             replies = self.runner_mgr.collective_rpc(
                 method, payload, timeout=float(args.get("timeout", 300.0))
             )
@@ -257,7 +278,7 @@ class EngineUtilityHandler:
         )
 
     def _update_on_every_rank(
-        self, cmd: str, method: str, *call_args, barrier: bool = False
+        self, cmd: str, method: str, args: dict, *call_args, barrier: bool = False
     ) -> dict:
         """Run a direct weight update on every TP rank; the reply for all.
 
@@ -272,18 +293,18 @@ class EngineUtilityHandler:
         peers wrote, and the shards no longer belong to one model.
 
         *barrier* holds each rank at the worker barrier until every rank has
-        finished, as ``AsyncIOProc._BARRIER_FUNCS`` does for the shared-buffer
-        updates on the ``call_func`` path.
+        finished, so none moves on while another still reads the caller's
+        shared buffer.
         """
         payload = RpcPayload(
             request_id=f"{cmd}-{uuid.uuid4().hex}", args=call_args, barrier=barrier
         )
+        timeout = args.get("timeout", _DIRECT_UPDATE_TIMEOUT_S)
         try:
-            replies = self.runner_mgr.collective_rpc(
-                method, payload, timeout=_DIRECT_UPDATE_TIMEOUT_S
-            )
+            replies = self.runner_mgr.collective_rpc(method, payload, timeout=timeout)
         except Exception as exc:  # noqa: BLE001 - answered, never raised at the loop
-            return self._error_reply(cmd, None, exc)
+            self._discard_failed_update_on_every_rank(cmd, timeout)
+            return self._error_reply(cmd, exc)
         failed = [r for r in replies if not r.ok]
         if failed:
             error = "; ".join(f"TP rank {r.tp_rank}: {r.error}" for r in failed)
@@ -297,14 +318,32 @@ class EngineUtilityHandler:
                 f"{self.label}: {cmd} completed on every TP rank, updated={result}"
             )
             return {"cmd": cmd, "result": result}
+        self._discard_failed_update_on_every_rank(cmd, timeout)
         logger.error(f"{self.label}: {cmd} failed: {error}")
         return {"cmd": cmd, "error": error}
+
+    def _discard_failed_update_on_every_rank(self, cmd: str, timeout: float) -> None:
+        """Keep no rank's scratch after this engine's update failed."""
+        payload = RpcPayload(request_id=f"{cmd}-discard-{uuid.uuid4().hex}")
+        try:
+            replies = self.runner_mgr.collective_rpc(
+                "discard_failed_weight_sync", payload, timeout=timeout
+            )
+            failed = [r for r in replies if not r.ok]
+            if failed:
+                logger.error(
+                    f"{self.label}: {cmd} cleanup failed on "
+                    f"{len(failed)}/{len(replies)} TP rank(s)"
+                )
+        except Exception:
+            logger.exception(f"{self.label}: {cmd} cleanup could not be broadcast")
 
     def _handle_update_weights(self, args: dict) -> dict:
         """Handle direct weight update command."""
         reply = self._update_on_every_rank(
             "update_weights",
             "update_weights",
+            args,
             args.get("named_tensors", []),
             args.get("flush_cache", True),
         )
@@ -327,6 +366,7 @@ class EngineUtilityHandler:
         reply = self._update_on_every_rank(
             "update_weights_shm",
             "update_weights_from_shm",
+            args,
             args.get("shm_name", ""),
             args.get("bucket_meta", {}),
             args.get("is_last", True),
@@ -349,6 +389,7 @@ class EngineUtilityHandler:
         reply = self._update_on_every_rank(
             "update_weights_ipc",
             "update_weights_from_ipc",
+            args,
             args.get("ipc_handle"),
             args.get("bucket_meta", {}),
             args.get("is_last", True),

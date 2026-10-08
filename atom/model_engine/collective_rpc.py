@@ -20,6 +20,20 @@ from dataclasses import dataclass
 # that sends it and the handler that receives it cannot drift apart.
 COLLECTIVE_RPC_CMD = "collective_rpc"
 
+# These methods have an EngineUtilityHandler command that owns engine state
+# around the worker call. Driving the worker method directly would bypass that
+# state -- sleeping/offload flags and all-rank update checks included.
+UTILITY_MANAGED_RUNNER_METHODS = frozenset(
+    {
+        "update_weights",
+        "update_weights_from_shm",
+        "update_weights_from_ipc",
+        "release_memory",
+        "resume_memory",
+        "clear_kv_cache",
+    }
+)
+
 
 def checked_timeout(timeout) -> float:
     """*timeout* in seconds, refusing one no deadline can be built from.
@@ -39,6 +53,16 @@ def checked_timeout(timeout) -> float:
             f"got {timeout!r}"
         )
     return seconds
+
+
+def engine_budget(timeout: float) -> float:
+    """How long an engine may spend on a call its caller waits *timeout* for.
+
+    Short of the caller's own wait, so the engine's account of what went wrong
+    -- which rank timed out, which one died -- reaches a caller still waiting,
+    instead of arriving after it has given up as a reply nobody takes.
+    """
+    return max(0.0, timeout - min(5.0, 0.1 * timeout))
 
 
 @dataclass(frozen=True)
