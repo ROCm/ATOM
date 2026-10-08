@@ -1,0 +1,518 @@
+diff --git a/aiter/configs/tuned_grouped_fmoe.csv b/aiter/configs/tuned_grouped_fmoe.csv
+index e1ae0eb783c2afb453f3653363f2e2618d20fe74..102ce045daef75d4795f990108af04c991bef41f 100644
+--- a/aiter/configs/tuned_grouped_fmoe.csv
++++ b/aiter/configs/tuned_grouped_fmoe.csv
+@@ -1,4 +1,10 @@
+ gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,ep_fused,q_type,use_g1u1,doweight_stage1,max_m,tile_m,tile_n,tile_k,tile_m2,tile_n2,tile_k2,m_warp,n_warp,m_warp2,n_warp2,num_buffers,num_buffer_stage2,split_k1,split_k2,grouped_persistent_m,persistent_workers,wave_specialized_tdm,tdm_as_in_prologue,cluster_m,cluster_n,cluster_m2,cluster_n2,waves_per_tensor_tdm,waves_per_tensor_tdm2,next_stage_prefetch,tdm_b_th,lds_soa_load_interleave,kernelName1,kernelName2,us,tflops,bw
++gfx1250,256,4,3584,3072,56,-1,ActivationType.Situv2,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,1,QuantType.per_1x32,1,0,944,16,256,128,16,256,128,1,4,1,4,3,3,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,0,0,0
++gfx1250,256,8,3584,3072,56,-1,ActivationType.Situv2,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,1,QuantType.per_1x32,1,0,1008,16,256,128,16,256,128,1,4,1,4,3,3,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,0,0,0
++gfx1250,256,16,3584,3072,56,-1,ActivationType.Situv2,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,1,QuantType.per_1x32,1,0,1136,16,256,128,16,256,128,1,4,1,4,3,3,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,0,0,0
++gfx1250,256,32,3584,3072,56,-1,ActivationType.Situv2,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,1,QuantType.per_1x32,1,0,1392,16,256,128,16,256,128,1,4,1,4,3,3,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,0,0,0
++gfx1250,256,64,3584,3072,56,-1,ActivationType.Situv2,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,1,QuantType.per_1x32,1,0,1904,16,256,128,16,256,128,1,4,1,4,3,3,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,0,0,0
++gfx1250,256,128,3584,3072,56,-1,ActivationType.Situv2,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,1,QuantType.per_1x32,1,0,2928,16,256,128,16,256,128,1,4,1,4,3,3,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,0,0,0
+ gfx1250,256,64,4096,2048,256,6,ActivationType.Swiglu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0,384,16,512,128,16,512,128,1,4,1,4,2,2,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,468.0528,0,0
+ gfx1250,256,64,4096,2048,256,6,ActivationType.Swiglu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0,384,16,512,128,16,512,128,1,4,1,4,2,2,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,468.0528,0,0
+ gfx1250,256,64,4096,2048,256,6,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0,384,16,512,128,16,512,128,1,4,1,4,2,2,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,468.0528,0,0
+diff --git a/aiter/ops/flydsl/grouped_moe_gfx1250.py b/aiter/ops/flydsl/grouped_moe_gfx1250.py
+index 203041e7f51a2d8a8f8eaca7389d0b8a06342ca9..16f97c507be1f2bbbbb11ef427295e5c2bf18713 100644
+--- a/aiter/ops/flydsl/grouped_moe_gfx1250.py
++++ b/aiter/ops/flydsl/grouped_moe_gfx1250.py
+@@ -695,6 +695,7 @@ def _grouped_a8w4_tdm_moe(
+     _ep_nvr = None
+     _ep_nvt = None
+     _fuse_ep_route_quant = False
++    _dispatch_ctx = _flydsl_dispatch_context()
+     ep_rowmap = None
+     if _compact:
+         _masked_m = stage2_scatter.compact_masked_m
+@@ -712,12 +713,15 @@ def _grouped_a8w4_tdm_moe(
+             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
+             # capture rejects unless pinned.
+             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
+-        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
+-            "AITER_TDM_DIRECT_EP_MASK", "1"
+-        ) in (
+-            "1",
+-            "true",
+-            "True",
++        _direct_ep_mask = (
++            _dispatch_ctx is not None
++            and _dispatch_ctx.direct_ep_route
++            and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
++            in (
++                "1",
++                "true",
++                "True",
++            )
+         )
+         _fuse_ep_route_quant = (
+             _direct_ep_mask
+@@ -805,7 +809,8 @@ def _grouped_a8w4_tdm_moe(
+         and not _fuse_ep_route_quant
+         and int(E) <= 256
+         and dtype in (torch.bfloat16, dtypes.bf16)
+-        and _flydsl_dispatch_context() is not None
++        and _dispatch_ctx is not None
++        and _dispatch_ctx.fuse_psum_quant
+         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
+     )
+     ep_psum_params = None
+diff --git a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py
+index 4bdfa22ec333654a8e75aaf6cdf7d088d8dad876..9188d155f7fed48b1d0f46d30d232ebb527ce631 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py
++++ b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py
+@@ -818,9 +818,7 @@ class MegaMoEGfx1250:
+             set_flydsl_dispatch_context,
+         )
+ 
+-        set_flydsl_dispatch_context(
+-            scatter if self._config.dispatch_backend == "flydsl" else None
+-        )
++        set_flydsl_dispatch_context(scatter)
+         moe_ids = self._compact_dummy_ids if self._compact_plan else recv_ids
+         moe_wts = self._compact_dummy_wts if self._compact_plan else recv_weights
+         if (
+@@ -1424,6 +1422,10 @@ class MegaMoEGfx1250:
+ 
+             return launch
+ 
++        self._direct_ep_route_capable = (
++            os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1") in ("1", "true", "True")
++            and not self._compact_plan
++        )
+         built = {}
+         variants = {}
+         for spec in self._dispatch_specs:
+@@ -1465,9 +1467,7 @@ class MegaMoEGfx1250:
+                     scale_stride=config.dispatch_scale_dst_nbytes,
+                     block_num=geom[0],
+                     warp_num_per_block=geom[1],
+-                    clear_route_counter=os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
+-                    in ("1", "true", "True")
+-                    and not self._compact_plan,
++                    clear_route_counter=self._direct_ep_route_capable,
+                     compact_plan=self._compact_plan,
+                     off_ep_rowmap=(
+                         self._arena.offset("ep_rowmap") if self._compact_plan else 0
+@@ -1508,6 +1508,7 @@ class MegaMoEGfx1250:
+             if config.is_quant_dispatch_wire
+             else {}
+         )
++        self._direct_ep_route_capable = not self._compact_plan
+         plans = {}
+         for spec in self._dispatch_specs:
+             plan = EpDispatchPlan(
+@@ -1565,9 +1566,10 @@ class MegaMoEGfx1250:
+                 inp_cur_tok,
+                 stream,
+             ):
+-                # mori's dispatch only accumulates into total_recv (this package's
+-                # zeroes it in Phase 2), so without this it grows every forward.
+-                self._total_recv.zero_()
++                # Mori accumulates into total_recv and does not know AITER's
++                # route counter. Clear both in one foreach launch so the direct
++                # contiguous-EP route path is safe across repeated forwards.
++                torch._foreach_zero_((self._total_recv, self._route_counter))
+                 plan.launch(
+                     stream=torch.cuda.current_stream().cuda_stream,
+                     token_indices=addr_inp_idx,
+@@ -1747,6 +1749,8 @@ class MegaMoEGfx1250:
+             max_tokens_per_rank=self._config.max_tokens_per_rank,
+             world_size=self._config.world_size,
+             source_token_map=routing.source_token_map,
++            direct_ep_route=self._direct_ep_route_capable,
++            fuse_psum_quant=self._config.dispatch_backend == "flydsl",
+             compact_layout=self._compact_plan,
+             compact_masked_m=self._compact_masked_m,
+             compact_psum=self._compact_psum,
+diff --git a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py
+index 4bf74280dedefa784ecdf101a8a3784fa57d4794..d26393730e7cc3e595254f4429ec4f5bf6b7d364 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py
++++ b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py
+@@ -93,6 +93,11 @@ class Stage2ScatterContext:
+     # gemm2 epilogue quantize per 1x32 e8m0 before the P2P write and have
+     # ep_combine_fused dequantize on the way out.
+     combine_quant_bits: int = 0
++    # Live MegaMoE-only backend capabilities. The custom-op reconstruction
++    # intentionally leaves both false; grouped_moe consumes them only from the
++    # thread-local context surrounding MegaMoE's fused_moe call.
++    direct_ep_route: bool = False
++    fuse_psum_quant: bool = False
+ 
+     def __post_init__(self):
+         if self.combine_quant_bits not in (0, 8, 4):
+diff --git a/op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py b/op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0327c735c42e3f43a389695b47881f67d3053891
+--- /dev/null
++++ b/op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py
+@@ -0,0 +1,369 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++"""Focused EP4 regression for Kimi-K3's Mori GEMM2-scatter A4W4 tile.
++
++Launch with::
++
++    torchrun --standalone --nproc_per_node=4 \
++      op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py
++
++The test requires four gfx1250 GPUs and a Mori version that exposes
++``TokOffExt``. It uses the production Mori dispatch, Stage2ScatterContext,
++GEMM2 CCO scatter and fused combine; no transport stage is simulated.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++from bench_mega_moe import (
++    Dist,
++    RefModel,
++    make_routings,
++    make_shared_weights,
++    raw_quant_weights,
++    shuffle_group,
++)
++
++from aiter import ActivationType, QuantType, dtypes, get_torch_quant
++from aiter.fused_moe import situv2
++from aiter.ops.flydsl.kernels import mega_moe_gfx1250 as mega_package
++from aiter.ops.flydsl.moe_common import GateMode
++from aiter.utility import fp4_utils
++
++WORLD = 4
++EXPERTS = 224
++LOCAL_EXPERTS = 56
++TOPK = 16
++HIDDEN = 3584
++INTER = 3072
++MAX_TOKENS = 2
++
++
++def _activation_dequant(x):
++    quant = get_torch_quant(QuantType.per_1x32)
++    packed, scale = quant(x, quant_dtype=dtypes.fp4x2)
++    values = fp4_utils.mxfp4_to_f32(packed).view_as(x)
++    scales = fp4_utils.e8m0_to_f32(scale).view(x.shape[0], HIDDEN // 32)
++    return values.float() * scales.unsqueeze(-1).expand(-1, -1, 32).reshape_as(x)
++
++
++class KimiReference(RefModel):
++    @staticmethod
++    def _ffn(x, w1, w2):
++        gate, up = (x @ w1.t()).chunk(2, dim=-1)
++        return situv2(gate, up, beta=4.0, linear_beta=25.0) @ w2.t()
++
++    def layer(self, x, ids, weights):
++        x = _activation_dequant(x.to(torch.bfloat16))
++        out = torch.zeros_like(x)
++        ids64 = ids.long()
++        for expert in torch.unique(ids64).tolist():
++            selected = ids64 == expert
++            rows = selected.any(dim=1)
++            route_weight = (weights * selected).sum(dim=1)
++            w1, w2 = self._expert(int(expert))
++            out[rows] += route_weight[rows, None] * self._ffn(x[rows], w1, w2)
++        return out
++
++    def run(self, x, routings):
++        for ids, weights in routings:
++            x = self.layer(x.float(), ids, weights)
++        return x.to(torch.bfloat16)
++
++
++class ObservedMegaMoE(mega_package.MegaMoEGfx1250):
++    def _scatter_context(self, routing, combine_quant_bits):
++        context = super()._scatter_context(routing, combine_quant_bits)
++        assert context.world_size == WORLD
++        assert context.max_tokens_per_rank == MAX_TOKENS
++        assert context.source_token_map.dtype == torch.int32
++        assert context.source_token_map.is_contiguous()
++        assert context.direct_ep_route
++        assert not context.fuse_psum_quant
++        self.last_scatter = context
++        return context
++
++
++def _routes(pattern, tokens, rank, device):
++    if pattern in ("random", "extreme"):
++        return make_routings(1, tokens, EXPERTS, TOPK, device, 4242 + 100 * rank)[0]
++    if pattern == "empty":
++        row = torch.arange(TOPK, dtype=torch.int32, device=device)
++    elif pattern == "duplicate":
++        row = torch.full((TOPK,), LOCAL_EXPERTS - 1, dtype=torch.int32, device=device)
++    elif pattern == "tail":
++        row = torch.tensor(
++            [
++                peer * LOCAL_EXPERTS + expert
++                for peer in range(WORLD)
++                for expert in range(LOCAL_EXPERTS - 4, LOCAL_EXPERTS)
++            ],
++            dtype=torch.int32,
++            device=device,
++        )
++    else:
++        raise ValueError(pattern)
++    ids = row.expand(tokens, -1).clone()
++    generator = torch.Generator(device=device).manual_seed(9000 + rank)
++    weights = torch.rand(
++        (tokens, TOPK), dtype=torch.float32, generator=generator, device=device
++    )
++    weights /= weights.sum(dim=-1, keepdim=True)
++    return ids, weights.contiguous()
++
++
++def _logits_diff(reference, actual):
++    reference = reference.double()
++    actual = actual.double()
++    denominator = (reference.square() + actual.square()).sum()
++    if not denominator:
++        return 0.0 if torch.equal(reference, actual) else float("inf")
++    return float(1 - 2 * (reference * actual).sum() / denominator)
++
++
++def _check_config_rows():
++    from aiter.ops.flydsl.grouped_moe_gfx1250 import _find_grouped_config
++
++    _find_grouped_config.cache_clear()
++    for token in (4, 8, 16, 32, 64, 128):
++        row = _find_grouped_config(
++            token_num=token,
++            model_dim=HIDDEN,
++            inter_dim=INTER,
++            experts=LOCAL_EXPERTS,
++            topk=-1,
++            activation=ActivationType.Situv2,
++            dtype=dtypes.bf16,
++            q_dtype_a=dtypes.fp4x2,
++            q_dtype_w=dtypes.fp4x2,
++            quant_type=QuantType.per_1x32,
++            ep_fused=True,
++        )
++        assert row is not None
++        assert tuple(int(row[name]) for name in ("tile_m", "tile_n", "tile_k")) == (
++            16,
++            256,
++            128,
++        )
++        assert tuple(int(row[name]) for name in ("tile_m2", "tile_n2", "tile_k2")) == (
++            16,
++            256,
++            128,
++        )
++
++
++def main():
++    if torch.cuda.device_count() != WORLD:
++        print(f"SKIP: requires {WORLD} visible GPUs")
++        return
++    for name in (
++        "AITER_TDM_TILE_M",
++        "AITER_TDM_TILE_N",
++        "AITER_TDM_TILE_K",
++        "AITER_TDM_TILE_M2",
++        "AITER_TDM_TILE_N2",
++        "AITER_TDM_TILE_K2",
++    ):
++        assert name not in os.environ, f"production config test forbids {name}"
++
++    dist_ctx = Dist()
++    device = torch.device("cuda", dist_ctx.local_rank)
++    _check_config_rows()
++    w1, w2, _, _ = make_shared_weights(
++        EXPERTS,
++        HIDDEN,
++        INTER,
++        dtypes.bf16,
++        device,
++        seed=70000,
++    )
++    begin = dist_ctx.rank * LOCAL_EXPERTS
++    local_w1 = w1[begin : begin + LOCAL_EXPERTS].contiguous()
++    local_w2 = w2[begin : begin + LOCAL_EXPERTS].contiguous()
++    q1, s1, q2, s2 = raw_quant_weights(local_w1, local_w2)
++    spec = {
++        "key": "a4w4_mxfp4",
++        "aiter_qtype": QuantType.per_1x32,
++        "gate_mode": GateMode.INTERLEAVE,
++        "activation": ActivationType.Situv2,
++    }
++    w1_kernel, w2_kernel, s1_kernel, s2_kernel = shuffle_group(
++        q1, s1, q2, s2, spec, LOCAL_EXPERTS
++    )
++
++    from mori.cco import Communicator
++    from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt  # noqa: F401
++
++    uid = Communicator.get_unique_id() if dist_ctx.rank == 0 else None
++    uid = dist_ctx.bcast_uid(uid)
++    communicator = Communicator.init(
++        WORLD, dist_ctx.rank, uid, per_rank_vmm=16 * 1024**3
++    )
++    mega = ObservedMegaMoE(
++        communicator=communicator,
++        rank=dist_ctx.rank,
++        world_size=WORLD,
++        model_dim=HIDDEN,
++        inter_dim=INTER,
++        experts=EXPERTS,
++        topk=TOPK,
++        max_tokens_per_rank=MAX_TOKENS,
++        activation=ActivationType.Situv2,
++        gate_mode=GateMode.INTERLEAVE.value,
++        quant_type=QuantType.per_1x32,
++        situ_beta=4.0,
++        situ_linear_beta=25.0,
++        dispatch_backend="mori",
++        dispatch_wire="fp4",
++    )
++    reference = KimiReference(w1, w2, None, None, spec, device)
++
++    import aiter.ops.flydsl.grouped_gemm_mxfp4 as grouped_gemm
++
++    original = grouped_gemm.flydsl_grouped_gemm_a8w4_masked
++    rowmaps = []
++
++    def observe(*args, **kwargs):
++        if kwargs.get("stage2_scatter") is not None:
++            rowmap = kwargs["ep_row_map"]
++            assert rowmap.dtype == torch.int32 and rowmap.shape[1] == 2
++            rowmaps.append(rowmap)
++        return original(*args, **kwargs)
++
++    grouped_gemm.flydsl_grouped_gemm_a8w4_masked = observe
++    try:
++        for pattern, tokens in (
++            ("random", 1),
++            ("empty", 2),
++            ("tail", 1),
++            ("duplicate", 2),
++            ("extreme", 2),
++        ):
++            storage = torch.empty(
++                (tokens + 2, HIDDEN), dtype=torch.bfloat16, device=device
++            )
++            storage[0].fill_(113.0)
++            storage[-1].fill_(-117.0)
++            generator = torch.Generator(device=device).manual_seed(1000 + dist_ctx.rank)
++            storage[1:-1].normal_(generator=generator)
++            hidden = storage[1:-1]
++            if pattern == "extreme":
++                values = torch.tensor(
++                    [-512.0, -1.0, -0.0, 0.0, 1.0, 512.0],
++                    dtype=torch.bfloat16,
++                    device=device,
++                )
++                hidden.view(-1).copy_(
++                    values.repeat(
++                        (hidden.numel() + values.numel() - 1) // values.numel()
++                    )[: hidden.numel()]
++                )
++            guards = storage[[0, -1]].clone()
++            ids, weights = _routes(pattern, tokens, dist_ctx.rank, device)
++            all_ids = [torch.empty_like(ids) for _ in range(WORLD)]
++            torch.distributed.all_gather(all_ids, ids)
++            global_ids = torch.cat(all_ids).reshape(-1)
++            local = global_ids[
++                (global_ids >= begin) & (global_ids < begin + LOCAL_EXPERTS)
++            ]
++            expected_counter = torch.bincount(
++                local.to(torch.int64) - begin, minlength=LOCAL_EXPERTS
++            ).to(torch.int32)
++
++            args = {
++                "w1": w1_kernel,
++                "w2": w2_kernel,
++                "w1_scale": s1_kernel,
++                "w2_scale": s2_kernel,
++            }
++            os.environ["AITER_TDM_DIRECT_EP_MASK"] = "0"
++            baseline = mega(hidden, weights, ids, **args).clone()
++            os.environ["AITER_TDM_DIRECT_EP_MASK"] = "1"
++            actual = mega(hidden, weights, ids, **args).clone()
++            repeated = mega(hidden, weights, ids, **args).clone()
++            torch.cuda.synchronize()
++            assert torch.equal(actual, baseline)
++            assert torch.equal(actual, repeated)
++            assert torch.equal(storage[[0, -1]], guards)
++            assert torch.isfinite(actual).all()
++            expected = reference.run(hidden, [(ids, weights)]).float()
++            diff = _logits_diff(expected, actual.float())
++            assert diff < 0.02, f"{pattern}: logits_diff={diff}"
++
++            total_recv = int(mega._total_recv.item())
++            source = mega.last_scatter.source_token_map[:total_recv]
++            assert bool(((source >= 0) & (source < WORLD * MAX_TOKENS)).all())
++            assert torch.equal(mega._route_counter, expected_counter), (
++                pattern,
++                dist_ctx.rank,
++                mega._route_counter.tolist(),
++                expected_counter.tolist(),
++            )
++            if pattern in ("empty", "duplicate") and dist_ctx.rank != 0:
++                assert total_recv == 0
++
++        graph_hidden = torch.randn(
++            (MAX_TOKENS, HIDDEN), dtype=torch.bfloat16, device=device
++        )
++        graph_ids, graph_weights = _routes("random", MAX_TOKENS, dist_ctx.rank, device)
++        os.environ["AITER_TDM_DIRECT_EP_MASK"] = "1"
++        mega(graph_hidden, graph_weights, graph_ids, **args)
++        torch.cuda.synchronize()
++        torch.distributed.barrier()
++        graph = torch.cuda.CUDAGraph(keep_graph=True)
++        with torch.cuda.graph(graph):
++            graph_output = mega(graph_hidden, graph_weights, graph_ids, **args)
++        graph.instantiate()
++        static_addresses = (
++            mega._route_counter.data_ptr(),
++            mega._total_recv.data_ptr(),
++            mega.last_scatter.source_token_map.data_ptr(),
++            graph_output.data_ptr(),
++        )
++        for pattern in ("tail", "duplicate", "random", "empty", "tail"):
++            ids, weights = _routes(pattern, MAX_TOKENS, dist_ctx.rank, device)
++            graph_ids.copy_(ids)
++            graph_weights.copy_(weights)
++            all_ids = [torch.empty_like(ids) for _ in range(WORLD)]
++            torch.distributed.all_gather(all_ids, ids)
++            global_ids = torch.cat(all_ids).reshape(-1)
++            local = global_ids[
++                (global_ids >= begin) & (global_ids < begin + LOCAL_EXPERTS)
++            ]
++            expected_counter = torch.bincount(
++                local.to(torch.int64) - begin, minlength=LOCAL_EXPERTS
++            ).to(torch.int32)
++            torch.distributed.barrier()
++            graph.replay()
++            torch.cuda.synchronize()
++            actual = graph_output.clone()
++            assert torch.equal(mega._route_counter, expected_counter)
++
++            os.environ["AITER_TDM_DIRECT_EP_MASK"] = "0"
++            baseline = mega(graph_hidden, graph_weights, graph_ids, **args).clone()
++            os.environ["AITER_TDM_DIRECT_EP_MASK"] = "1"
++            torch.cuda.synchronize()
++            assert torch.equal(actual, baseline)
++            assert torch.isfinite(actual).all()
++            expected = reference.run(graph_hidden, [(graph_ids, graph_weights)]).float()
++            assert _logits_diff(expected, actual.float()) < 0.02
++            assert static_addresses == (
++                mega._route_counter.data_ptr(),
++                mega._total_recv.data_ptr(),
++                mega.last_scatter.source_token_map.data_ptr(),
++                graph_output.data_ptr(),
++            )
++        assert len(rowmaps) >= 21
++        if dist_ctx.rank == 0:
++            print("Kimi-K3 Mori EP-scatter tile regression: PASS", flush=True)
++    finally:
++        grouped_gemm.flydsl_grouped_gemm_a8w4_masked = original
++        mega.close()
++        communicator.destroy()
++        dist_ctx.shutdown()
++
++
++if __name__ == "__main__":
++    main()

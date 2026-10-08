@@ -1,0 +1,1511 @@
+diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
+index b013ea6b057d8ab8e2cf6f25c763b20f61f9ce65..2bd1c67439d0fa9466d5893422cd212b21035169 100644
+--- a/atom/model_ops/attention_mla.py
++++ b/atom/model_ops/attention_mla.py
+@@ -2539,6 +2539,10 @@ class MLAAttention(nn.Module):
+                 if q.dtype.is_floating_point and q.element_size() == 1
+                 else q
+             )
++            scratch_splits = attn_metadata.triton_attn_logits.shape[2]
++            # Context is replay-time data; batch width is graph-static. Wider
++            # batches keep split4 because split8 regresses at short tail lengths.
++            num_kv_splits = 8 if B <= 2 and scratch_splits >= 8 else 4
+ 
+             # Use pre-built dense block_table from prepare_decode()
+             decode_attention_fwd(
+@@ -2549,8 +2553,8 @@ class MLAAttention(nn.Module):
+                 attn_metadata.triton_lse,
+                 attn_metadata.triton_block_table,
+                 attn_metadata.context_lens,
+-                attn_metadata.triton_attn_logits,
+-                4,  # num_kv_splits
++                attn_metadata.triton_attn_logits[:, :, :num_kv_splits],
++                num_kv_splits,
+                 self.scale,
+                 page_size,
+                 k_scale=self._k_scale,
+diff --git a/atom/model_ops/attentions/gdn_attn.py b/atom/model_ops/attentions/gdn_attn.py
+index e350d4acc91b8919e271887bae668e0694254892..b5b4f65e95caff04c167ee8d4c0116964da21f01 100644
+--- a/atom/model_ops/attentions/gdn_attn.py
++++ b/atom/model_ops/attentions/gdn_attn.py
+@@ -88,6 +88,7 @@ class GDNAttentionMetadata:
+     # from `non_spec_state_indices_tensor`. Same tensor otherwise; None on the
+     # spec path, which never carries a fork.
+     non_spec_state_indices_in_tensor: torch.Tensor | None = None
++    has_state_fork: bool = False
+     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
+     spec_token_indx: torch.Tensor | None = None
+     non_spec_token_indx: torch.Tensor | None = None
+@@ -1122,6 +1123,10 @@ class GDNStateMixin(PoolRowsMixin):
+         num_decode_tokens = batch.total_tokens_num_decode
+         num_prefill_tokens = batch.total_tokens_num_prefill
+         num_reqs = batch.total_seqs_num
++        fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
++        has_state_fork = is_prefill and any(
++            source >= 0 for source in fork_srcs[:num_prefills]
++        )
+         if prepare_block_tables:
+             self.prepare_block_tables(batch)
+ 
+@@ -1221,6 +1226,7 @@ class GDNStateMixin(PoolRowsMixin):
+             spec_state_indices_tensor=spec_state_indices_tensor,
+             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+             non_spec_state_indices_in_tensor=non_spec_state_indices_in_tensor,
++            has_state_fork=has_state_fork,
+             spec_sequence_masks=spec_sequence_masks,
+             spec_token_indx=spec_token_indx,
+             non_spec_token_indx=non_spec_token_indx,
+diff --git a/atom/model_ops/attentions/triton_mla.py b/atom/model_ops/attentions/triton_mla.py
+index 78d0d4fc723ccd5e9c2025c59039e7ad270895da..08604be9e37361cdaf3e0ccd74ca9ffb1a3f3af6 100644
+--- a/atom/model_ops/attentions/triton_mla.py
++++ b/atom/model_ops/attentions/triton_mla.py
+@@ -17,6 +17,36 @@ from .backends import AttentionBackend
+ logger = logging.getLogger("atom")
+ 
+ 
++def _use_k3_split8(
++    hf,
++    *,
++    arch,
++    model_dtype,
++    kv_cache_dtype,
++    num_heads,
++    page_size,
++    max_batch_size,
++    shuffle_kv,
++):
++    return (
++        arch == "gfx1250"
++        and hf.model_type == "kimi_linear"
++        and model_dtype == torch.bfloat16
++        and kv_cache_dtype.startswith("fp8")
++        and (
++            num_heads,
++            hf.kv_lora_rank,
++            hf.qk_nope_head_dim,
++            hf.qk_rope_head_dim,
++            hf.v_head_dim,
++            page_size,
++        )
++        == (96, 512, 128, 64, 128, 1)
++        and max_batch_size <= 8
++        and not shuffle_kv
++    )
++
++
+ class TritonMLABackend(AttentionBackend):
+     @staticmethod
+     def get_name() -> str:
+@@ -32,13 +62,28 @@ class TritonMLABackend(AttentionBackend):
+ 
+ 
+ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
+-
+     def __init__(self, model_runner):
+         super().__init__(model_runner)
+ 
+         hf = model_runner.config.hf_config
+         kv_lora_rank = hf.kv_lora_rank
+-        num_kv_splits = 4
++        arch = getattr(
++            torch.cuda.get_device_properties(self.device), "gcnArchName", ""
++        ).split(":", 1)[0]
++        num_kv_splits = (
++            8
++            if _use_k3_split8(
++                hf,
++                arch=arch,
++                model_dtype=model_runner.config.torch_dtype,
++                kv_cache_dtype=model_runner.kv_cache_dtype,
++                num_heads=self.num_attention_heads,
++                page_size=self.block_size,
++                max_batch_size=self.max_bs,
++                shuffle_kv=envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV,
++            )
++            else 4
++        )
+         triton_mla_buffers = {
+             "triton_block_table": torch.zeros(
+                 self.max_bs,
+diff --git a/atom/model_ops/fla_ops/fused_sigmoid_gating.py b/atom/model_ops/fla_ops/fused_sigmoid_gating.py
+index 526c9dd0dd7f3f2a80ca6a583e5c78ed963c1d81..7888d432892e36ec1191c403c2971be7e209b3ed 100644
+--- a/atom/model_ops/fla_ops/fused_sigmoid_gating.py
++++ b/atom/model_ops/fla_ops/fused_sigmoid_gating.py
+@@ -238,7 +238,7 @@ def fused_sigmoid_gating_delta_rule_update(
+     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+     assert NK == 1, "NK > 1 is not supported yet"
+     num_stages = 3
+-    num_warps = 4
++    num_warps = 8
+ 
+     if cu_seqlens is not None and q.shape[0] != 1:
+         raise ValueError(
+diff --git a/atom/model_ops/kimi_k3/activations.py b/atom/model_ops/kimi_k3/activations.py
+index 442c3720db90f21705123f951c680cb25c7dc885..0c29bf5029e0b2bdbe23f1002bcc9dc4a06a48a2 100644
+--- a/atom/model_ops/kimi_k3/activations.py
++++ b/atom/model_ops/kimi_k3/activations.py
+@@ -19,6 +19,11 @@ try:
+ except ImportError:  # pragma: no cover
+     _HAS_TRITON = False
+ 
++_RMSNORM_MULTIROW_MIN_ROWS = 43_008
++_RMSNORM_MULTIROW_BLOCK_M = 8
++_RMSNORM_MULTIROW_LONG_ROWS = 900_000
++_RMSNORM_MULTIROW_LONG_BLOCK_M = 32
++
+ 
+ if _HAS_TRITON:
+ 
+@@ -85,6 +90,49 @@ if _HAS_TRITON:
+             y_ptr + row * stride_ym + cols, y.to(y_ptr.dtype.element_ty), mask=mask
+         )
+ 
++    @triton.jit
++    def _rmsnorm_gated_multirow_kernel(
++        x_ptr,
++        w_ptr,
++        g_ptr,
++        y_ptr,
++        M,
++        H,
++        eps,
++        stride_xm,
++        stride_ym,
++        stride_g_outer,
++        stride_g_head,
++        HEADS: tl.constexpr,
++        BLOCK: tl.constexpr,
++        BLOCK_M: tl.constexpr,
++    ):
++        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
++        cols = tl.arange(0, BLOCK)
++        row_mask = rows < M
++        mask = row_mask[:, None] & (cols[None, :] < H)
++        # A masked load/store may still form its pointer on ROCm. Clamp padded
++        # rows before any address arithmetic; `mask` remains based on the real
++        # row ids, so those lanes still perform no memory access.
++        safe_rows = tl.where(row_mask, rows, 0)
++        x_off = safe_rows[:, None] * stride_xm + cols[None, :]
++        g_off = (
++            (safe_rows[:, None] // HEADS) * stride_g_outer
++            + (safe_rows[:, None] % HEADS) * stride_g_head
++            + cols[None, :]
++        )
++        x = tl.load(x_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
++        var = tl.sum(x * x, axis=1) / H
++        rstd = tl.rsqrt(var + eps)
++        w = tl.load(w_ptr + cols, mask=cols < H, other=0.0).to(tl.float32)
++        gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
++        y = (x * rstd[:, None] * w[None, :]) * tl.sigmoid(gate)
++        tl.store(
++            y_ptr + safe_rows[:, None] * stride_ym + cols[None, :],
++            y.to(y_ptr.dtype.element_ty),
++            mask=mask,
++        )
++
+     @triton.jit
+     def _rmsnorm_gated_fp8_per_token_kernel(
+         x_ptr,
+@@ -245,6 +293,7 @@ def rmsnorm_gated(
+     eps: float,
+     quant_type: QuantType | None = None,
+     quant_dtype: torch.dtype | None = None,
++    is_prefill: bool = False,
+ ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+     """rmsnorm(x) over last dim * weight * sigmoid(gate).
+ 
+@@ -284,6 +333,32 @@ def rmsnorm_gated(
+     x2 = x2.contiguous()
+     y = torch.empty_like(x2)
+     BLOCK = triton.next_power_of_2(h)
++    # K3 prefill has many 128-wide rows; grouping them amortizes the otherwise
++    # oversized grid. Keep the one-row kernel below the measured crossover.
++    if is_prefill and h == 128 and m >= _RMSNORM_MULTIROW_MIN_ROWS:
++        is_long = m >= _RMSNORM_MULTIROW_LONG_ROWS
++        block_m = (
++            _RMSNORM_MULTIROW_LONG_BLOCK_M if is_long else _RMSNORM_MULTIROW_BLOCK_M
++        )
++        _rmsnorm_gated_multirow_kernel[(triton.cdiv(m, block_m),)](
++            x2,
++            weight,
++            gate,
++            y,
++            m,
++            h,
++            float(eps),
++            x2.stride(0),
++            y.stride(0),
++            stride_g_outer,
++            stride_g_head,
++            HEADS=heads,
++            BLOCK=BLOCK,
++            BLOCK_M=block_m,
++            num_warps=2 if is_long else 1,
++            waves_per_eu=4,
++        )
++        return y.reshape_as(x)
+     _rmsnorm_gated_kernel[(m,)](
+         x2,
+         weight,
+diff --git a/atom/model_ops/kimi_k3/attention_residual.py b/atom/model_ops/kimi_k3/attention_residual.py
+index c523382b2e36869283f76a778869ffbcc10f1024..2a3ce58b45e19ca57c1dcbe42de6b725a1c6a2f4 100644
+--- a/atom/model_ops/kimi_k3/attention_residual.py
++++ b/atom/model_ops/kimi_k3/attention_residual.py
+@@ -34,6 +34,8 @@ Four deliberate divergences from that reference:
+ 
+ from __future__ import annotations
+ 
++from functools import cache
++
+ import torch
+ 
+ from atom.utils.custom_register import direct_register_custom_op
+@@ -202,9 +204,18 @@ _ATTN_RES_CONFIGS = (
+     (2048, 4, 2, 2),
+ )
+ _ATTN_RES_CATCHALL = (4, 2, 2)  # T > largest bucket
++_ATTN_RES_GFX1250_LONG = (4, 2, 1)  # H=7168, T >= 2048
++
++
++@cache
++def _is_gfx1250(device_index: int) -> bool:
++    arch = getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
++    return arch.split(":", 1)[0] == "gfx1250"
+ 
+ 
+-def _pick_attn_res_config(tokens: int):
++def _pick_attn_res_config(tokens: int, hidden: int, device_index: int):
++    if hidden == 7168 and tokens >= 2048 and _is_gfx1250(device_index):
++        return _ATTN_RES_GFX1250_LONG
+     for max_tokens, nw, ns, bl in _ATTN_RES_CONFIGS:
+         if tokens <= max_tokens:
+             return nw, ns, bl
+@@ -279,7 +290,9 @@ def _apply_attn_res_impl(
+     hs2 = add_hidden2.contiguous() if do_add2 else ps
+     pref = torch.empty_like(ps) if do_add else ps
+ 
+-    nw, ns, bl = _pick_attn_res_config(T)
++    device_index = block_residual.device.index
++    assert device_index is not None
++    nw, ns, bl = _pick_attn_res_config(T, H, device_index)
+     _attn_res_fused_kernel[(T,)](
+         br,
+         ps,
+diff --git a/atom/model_ops/linear.py b/atom/model_ops/linear.py
+index 458f5db2ce48911ab76acb4cd72db2d6936a61ea..d8824cc69b021edd6e8a168db06c0d0f96d22b74 100644
+--- a/atom/model_ops/linear.py
++++ b/atom/model_ops/linear.py
+@@ -154,6 +154,61 @@ def per_1x128_e8m0_quant(
+     )
+ 
+ 
++def needs_compatible_mxfp4_preshuffle_backend(
++    params_dtype: torch.dtype,
++    weight_is_preshuffled: bool,
++    *,
++    arch: str | None = None,
++) -> bool:
++    """Whether the default GEMM cannot consume this stored MXFP4 layout.
++
++    gfx1250 Opus expects ``shuffle_scale_f4``, while ATOM stores preshuffled
++    weights with ``e8m0_shuffle``. The AITER preshuffle GEMM reads the latter.
++    """
++    if params_dtype != dtypes.fp4x2 or not weight_is_preshuffled:
++        return False
++    if arch is None:
++        from aiter.jit.utils.chip_info import get_gfx_runtime
++
++        arch = get_gfx_runtime()
++    return arch == "gfx1250"
++
++
++def can_fuse_mxfp4_activation_quant(
++    params_dtype: torch.dtype,
++    weight_is_preshuffled: bool,
++    *,
++    arch: str | None = None,
++) -> bool:
++    """Whether fused quant emits the activation-scale layout this GEMM reads."""
++    if params_dtype != dtypes.fp4x2 or not weight_is_preshuffled:
++        return False
++    if use_fp4_non_shuffle_triton_gemm() or use_triton_gemm():
++        return False
++    return not needs_compatible_mxfp4_preshuffle_backend(
++        params_dtype,
++        weight_is_preshuffled,
++        arch=arch,
++    )
++
++
++def _require_mxfp4_preshuffle_gemm() -> Callable:
++    global gemm_afp4wfp4_preshuffle
++
++    if gemm_afp4wfp4_preshuffle is None:
++        try:
++            from aiter.ops.triton.gemm_afp4wfp4 import (
++                gemm_afp4wfp4_preshuffle as preshuffle_gemm,
++            )
++        except ImportError as e:
++            raise RuntimeError(
++                "The stored MXFP4 layout requires "
++                "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
++            ) from e
++        gemm_afp4wfp4_preshuffle = preshuffle_gemm
++    return gemm_afp4wfp4_preshuffle
++
++
+ def gemm_a4w4_quant_fake(
+     x: torch.Tensor,
+     x_scale: torch.Tensor,
+@@ -163,6 +218,7 @@ def gemm_a4w4_quant_fake(
+     params_dtype: torch.dtype,
+     input_scale: torch.Tensor,
+     output_size: int,
++    needs_compatible_preshuffle_backend: bool,
+ ) -> torch.Tensor:
+     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
+ 
+@@ -178,6 +234,7 @@ def gemm_a4w4_quant(
+     params_dtype: torch.dtype,
+     input_scale: torch.Tensor,
+     output_size: int,
++    needs_compatible_preshuffle_backend: bool,
+ ) -> torch.Tensor:
+     # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
+     # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
+@@ -217,14 +274,17 @@ def gemm_a4w4_quant(
+             otype,
+             y,
+         )
+-    # Preshuffle FP4 Triton path: used when ATOM_USE_TRITON_GEMM is enabled
+-    # and the non-shuffle path is disabled. This expects preshuffled weights.
++    # Compatible preshuffle FP4 path: selected globally by ATOM_USE_TRITON_GEMM,
++    # or narrowly when the default backend cannot consume the stored layout.
+     elif (
+         params_dtype == dtypes.fp4x2
+-        and use_triton_gemm()
+         and not use_fp4_non_shuffle_triton_gemm()
+-        and gemm_afp4wfp4_preshuffle is not None
++        and (
++            needs_compatible_preshuffle_backend
++            or (use_triton_gemm() and gemm_afp4wfp4_preshuffle is not None)
++        )
+     ):
++        preshuffle_gemm = _require_mxfp4_preshuffle_gemm()
+         m, _ = x.view(-1, x.size(-1)).shape
+ 
+         y = torch.empty(
+@@ -255,7 +315,7 @@ def gemm_a4w4_quant(
+         else:
+             x_scale = x_scale[:m, ...].view(torch.uint8)
+ 
+-        y = gemm_afp4wfp4_preshuffle(
++        y = preshuffle_gemm(
+             x.view(torch.uint8),
+             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+             x_scale,
+@@ -806,6 +866,7 @@ class LinearBase(nn.Module):
+         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
+         self.quant_func = get_hip_quant(self.quant_type)
+         self.is_output_padded = False
++        self._needs_compatible_mxfp4_preshuffle_backend = False
+ 
+     @property
+     def weight_scale_row_group(self) -> int:
+@@ -1252,6 +1313,12 @@ class LinearBase(nn.Module):
+             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
+         ):
+             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
++        self._needs_compatible_mxfp4_preshuffle_backend = (
++            needs_compatible_mxfp4_preshuffle_backend(
++                self.params_dtype,
++                getattr(self.weight, "is_shuffled", False),
++            )
++        )
+ 
+     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
+         # The other half of the shuffle decision `process_weights_after_loading`
+@@ -1490,6 +1557,7 @@ class LinearBase(nn.Module):
+                     self.params_dtype,
+                     getattr(self, "input_scale", None),
+                     self.output_size,
++                    self._needs_compatible_mxfp4_preshuffle_backend,
+                 )
+                 if self.bias is not None:
+                     y += self.bias
+diff --git a/atom/model_ops/mamba_ops/causal_conv1d.py b/atom/model_ops/mamba_ops/causal_conv1d.py
+index 16df71bbdf618fbb2232eb68a832a9bbf55fd690..293762b03b0674159db1964bf35f321ad7acfc60 100644
+--- a/atom/model_ops/mamba_ops/causal_conv1d.py
++++ b/atom/model_ops/mamba_ops/causal_conv1d.py
+@@ -621,6 +621,70 @@ def causal_conv1d_fn(
+     state_len = width - 1
+     np2_statelen = triton.next_power_of_2(state_len)
+ 
++    # Kimi-K3 long prefill: vectorize the width-4 convolution across the eight
++    # token rows instead of carrying a serial rolling window through them.  The
++    # exact guards keep forks/APC, other layouts, and short calls on the generic
++    # kernel; BLOCK_M=8 also reuses the schedule already stored in metadata.
++    same_state_slots = (
++        cache_indices_in is None
++        or cache_indices_in is cache_indices
++        or (metadata is not None and getattr(metadata, "has_state_fork", True) is False)
++    )
++    use_k3_prefill_tile = (
++        cu_seqlen >= 2048
++        and dim == 36864
++        and k_dim_size == 12288
++        and v_dim_size == 12288
++        and width == 4
++        and original_x_dtype == torch.bfloat16
++        and x.dtype == torch.bfloat16
++        and weight.dtype == torch.bfloat16
++        and bias is None
++        and conv_states is not None
++        and conv_states.dtype == torch.bfloat16
++        and conv_states.shape[1:] == (dim, state_len)
++        and cache_indices is not None
++        and has_initial_state is not None
++        and same_state_slots
++        and activation in ("silu", "swish")
++        and pad_slot_id == PAD_SLOT_ID
++        and block_idx_first_scheduled_token is None
++        and block_idx_last_scheduled_token is None
++        and initial_state_idx is None
++        and num_computed_tokens is None
++        and block_size_to_align in (None, 0)
++        and metadata is not None
++        and metadata.nums_dict is not None
++        and 8 in metadata.nums_dict
++        and x.stride() == (1, 49376)
++        and weight.stride(1) == 1
++        and query_start_loc.dtype == torch.int32
++        and cache_indices.dtype == torch.int32
++    )
++    if use_k3_prefill_tile:
++        from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
++            causal_conv1d_split_qkv_triton_tile_fn,
++        )
++
++        return causal_conv1d_split_qkv_triton_tile_fn(
++            x,
++            weight,
++            bias,
++            conv_states,
++            query_start_loc,
++            k_dim_size,
++            v_dim_size,
++            cache_indices=cache_indices,
++            has_initial_state=has_initial_state,
++            activation=activation,
++            pad_slot_id=pad_slot_id,
++            block_m=8,
++            block_n=1024,
++            num_warps=4,
++            metadata=metadata,
++            preserve_input_dtype=True,
++        )
++
+     padded_batch = query_start_loc.size(0) - 1
+     stride_x_dim = x.stride(0)
+     stride_x_token = x.stride(1)
+@@ -873,6 +937,7 @@ def _causal_conv1d_update_kernel(
+     IS_VARLEN: tl.constexpr,
+     IS_APC_ENABLED: tl.constexpr,
+     IS_SPEC_DECODING: tl.constexpr,
++    IS_SINGLE_TOKEN_UPDATE: tl.constexpr,
+     NP2_STATELEN: tl.constexpr,
+     USE_PAD_SLOT: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -989,45 +1054,8 @@ def _causal_conv1d_update_kernel(
+         conv_states_ptrs = prior_tokens + 4 * stride_conv_state_tok  # [BLOCK_N]
+         col4 = tl.load(conv_states_ptrs, mask_w, 0.0)
+ 
+-    # STEP 2: assume state_len > seqlen
+-    idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
+-
+-    # With speculative decoding, the conv_state updates works in a sliding
+-    # window manner, at each forward pass, the tokens are shift by 1, so we
+-    # load since idx_tokens + 1.
+-    conv_state_ptrs_source = (
+-        conv_state_ptr
+-        + (conv_states_input_coord * stride_conv_state_seq)
+-        + conv_state_token_offset * stride_conv_state_tok
+-        + (idx_feats * stride_conv_state_dim)[None, :]
+-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+-            :, None
+-        ]
+-    )  # [BLOCK_M, BLOCK_N]
+-    mask = (
+-        (conv_states_input_coord < num_cache_lines)
+-        & ((idx_tokens + seqlen) < state_len)[:, None]
+-        & (idx_feats < dim)[None, :]
+-    )
+-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+-
+-    VAL = state_len - seqlen
+     x_base = x_ptr + x_offset + (idx_feats * stride_x_dim)  # [BLOCK_N]
+ 
+-    x_ptrs = (
+-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+-    )  # [BLOCK_M, BLOCK_N]
+-
+-    mask_x = (
+-        (idx_tokens - VAL >= 0)[:, None]
+-        & (idx_tokens - VAL < seqlen)[:, None]
+-        & (idx_feats < dim)[None, :]
+-    )  # token-index  # token-index  # feature-index
+-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+-    tl.debug_barrier()
+-
+-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+-
+     # Get the state from the initial_state_idx
+     # cache_idx
+     conv_states_offset = tl.load(
+@@ -1037,15 +1065,65 @@ def _causal_conv1d_update_kernel(
+         conv_state_ptr
+         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+         + (idx_feats * stride_conv_state_dim)
+-    )[
+-        None, :
+-    ] + (  # [BLOCK_N,]
+-        idx_tokens * stride_conv_state_tok
+-    )[
+-        :, None
+-    ]
+-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
++    )[None, :]
++
++    if IS_SINGLE_TOKEN_UPDATE and KERNEL_WIDTH == 4:
++        # Kimi-K3 normal decode is width-4 with one token per sequence. The
++        # source columns are already in registers, so write the shifted state
++        # directly instead of loading columns 1/2 again through a 2-D tile.
++        # This also handles checkpoint forks: all reads precede writes to the
++        # potentially different destination slot.
++        x_current = tl.load(x_base, mask=mask_w, other=0.0)
++        mask_store = (idx_feats < dim)[None, :]
++        tl.store(conv_state_ptrs_target, col1[None, :], mask=mask_store)
++        tl.store(
++            conv_state_ptrs_target + stride_conv_state_tok,
++            col2[None, :],
++            mask=mask_store,
++        )
++        tl.store(
++            conv_state_ptrs_target + 2 * stride_conv_state_tok,
++            x_current[None, :],
++            mask=mask_store,
++        )
++    else:
++        # Generic varlen/spec/APC update.
++        idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
++        conv_state_ptrs_source = (
++            conv_state_ptr
++            + (conv_states_input_coord * stride_conv_state_seq)
++            + conv_state_token_offset * stride_conv_state_tok
++            + (idx_feats * stride_conv_state_dim)[None, :]
++            + (
++                (idx_tokens + (1 if IS_SPEC_DECODING else seqlen))
++                * stride_conv_state_tok
++            )[:, None]
++        )  # [BLOCK_M, BLOCK_N]
++        mask = (
++            (conv_states_input_coord < num_cache_lines)
++            & ((idx_tokens + seqlen) < state_len)[:, None]
++            & (idx_feats < dim)[None, :]
++        )
++        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
++
++        VAL = state_len - seqlen
++        x_ptrs = (
++            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
++        )  # [BLOCK_M, BLOCK_N]
++        mask_x = (
++            (idx_tokens - VAL >= 0)[:, None]
++            & (idx_tokens - VAL < seqlen)[:, None]
++            & (idx_feats < dim)[None, :]
++        )
++        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
++        tl.debug_barrier()
++        new_conv_state = tl.where(mask, conv_state, loaded_x)
++
++        conv_state_ptrs_target = (
++            conv_state_ptrs_target + (idx_tokens * stride_conv_state_tok)[:, None]
++        )
++        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
++        tl.store(conv_state_ptrs_target, new_conv_state, mask)
+ 
+     # STEP 3: init accumulator
+     if HAS_BIAS:
+@@ -1112,8 +1190,11 @@ def _causal_conv1d_update_kernel(
+                     matrix_x = col2
+                 elif j == 3:
+                     matrix_w = w_col3
+-                    x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
++                    if IS_SINGLE_TOKEN_UPDATE:
++                        matrix_x = x_current
++                    else:
++                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
++                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+             elif KERNEL_WIDTH == 5:
+                 if j == 1:
+                     matrix_w = w_col1
+@@ -1342,6 +1423,13 @@ def causal_conv1d_update(
+     else:
+         state_len = width - 1
+     np2_statelen = triton.next_power_of_2(state_len)
++    is_single_token_update = (
++        width == 4
++        and query_start_loc is None
++        and seqlen == 1
++        and num_accepted_tokens is None
++        and block_idx_last_scheduled_token is None
++    )
+ 
+     def grid(META):
+         return (
+@@ -1400,9 +1488,12 @@ def causal_conv1d_update(
+         IS_VARLEN=query_start_loc is not None,
+         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
+         IS_SPEC_DECODING=num_accepted_tokens is not None,
++        IS_SINGLE_TOKEN_UPDATE=is_single_token_update,
+         NP2_STATELEN=np2_statelen,
+         USE_PAD_SLOT=pad_slot_id is not None,
+-        BLOCK_N=256,
++        BLOCK_N=512 if is_single_token_update and batch >= 8 else 256,
++        num_warps=4,
++        num_stages=2,
+     )
+     query = query.squeeze(-1)
+     key = key.squeeze(-1)
+diff --git a/atom/models/kimi_k3.py b/atom/models/kimi_k3.py
+index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a530977068622dccb 100644
+--- a/atom/models/kimi_k3.py
++++ b/atom/models/kimi_k3.py
+@@ -44,8 +44,8 @@ from atom.model_ops.linear import (
+     MergedReplicatedLinear,
+     ReplicatedLinear,
+     RowParallelLinear,
+-    use_fp4_non_shuffle_triton_gemm,
+-    use_triton_gemm,
++    can_fuse_mxfp4_activation_quant,
++    weight_is_stored_preshuffled,
+ )
+ from atom.model_ops.mamba_ops.causal_conv1d import (
+     causal_conv1d_fn,
+@@ -219,7 +219,7 @@ class KimiRMSNormGated(nn.Module):
+         self.quant_type = quant_type
+         self.quant_dtype = quant_dtype
+ 
+-    def forward(self, x: torch.Tensor, gate: torch.Tensor):
++    def forward(self, x: torch.Tensor, gate: torch.Tensor, *, is_prefill: bool = False):
+         from atom.model_ops.kimi_k3 import rmsnorm_gated
+ 
+         return rmsnorm_gated(
+@@ -229,6 +229,7 @@ class KimiRMSNormGated(nn.Module):
+             self.variance_epsilon,
+             quant_type=self.quant_type,
+             quant_dtype=self.quant_dtype,
++            is_prefill=is_prefill,
+         )
+ 
+ 
+@@ -400,18 +401,20 @@ class KimiSparseMoeBlock(nn.Module):
+                 quant_config, up_proj_prefix
+             )
+             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
+-            # AITER RMSNorm+quant emits the activation layout consumed directly by
+-            # the routed up-projection. FP4 Triton paths choose an M-dependent
+-            # shuffled/non-shuffled scale layout, so keep those on their existing
+-            # standalone quant path until the fused kernel supports both layouts.
+-            fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
+-                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
++            # Fused RMSNorm emits preshuffled MXFP4 scales, but the compatible
++            # backend needs row-major scales for routed M < 32.
++            fp4_fused_quant_compatible = can_fuse_mxfp4_activation_quant(
++                up_proj_quant_dtype,
++                weight_is_stored_preshuffled(
++                    up_proj_quant_type,
++                    up_proj_quant_dtype,
++                ),
+             )
+             self.fuse_routed_norm_quant = latent_moe_use_norm and (
+                 (
+                     up_proj_quant_type == QuantType.per_1x32
+                     and up_proj_quant_dtype == dtypes.fp4x2
+-                    and not fp4_triton_active
++                    and fp4_fused_quant_compatible
+                 )
+                 or (
+                     up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)
+@@ -1237,10 +1240,12 @@ class KimiKDAAttention(nn.Module):
+         else:
+             gate = self.f_b_proj(f_a_view.contiguous())
+         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
+-        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
+-        out = fused_in.new_empty(
+-            (num_actual_tokens, self.num_local_heads, self.head_dim)
+-        )
++        # Prefill returns its own contiguous output. Allocate this buffer only
++        # for decode/spec-decode, where the recurrence writes into it directly.
++        if kda_metadata.num_prefills <= 0:
++            out = fused_in.new_empty(
++                (num_actual_tokens, self.num_local_heads, self.head_dim)
++            )
+ 
+         conv_weights = self.conv_weight
+         state_indices = kda_metadata.non_spec_state_indices_tensor
+@@ -1298,7 +1303,9 @@ class KimiKDAAttention(nn.Module):
+             # initial_state dtype; the gathered initial is allocated as such),
+             # so no .to() cast is needed.
+             ssm_state[state_indices] = last_state
+-            out.copy_(kda_out.squeeze(0))
++            # o_norm only reads this tensor, so keep the contiguous KDA output
++            # instead of materializing an identical copy into `out`.
++            out = kda_out.squeeze(0)
+         elif kda_metadata.num_decodes > 0:
+             # Slice the per-token cache-slot indices once (used for both the
+             # conv update and the fused recurrence below).
+@@ -1452,7 +1459,9 @@ class KimiKDAAttention(nn.Module):
+             out.zero_()
+ 
+         normed = self.o_norm(
+-            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
++            out,
++            rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
++            is_prefill=kda_metadata.num_prefills > 0,
+         )
+         # A fused per-token quant makes o_norm return (quantized, scale); feed it
+         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+diff --git a/tests/model_ops/test_causal_conv1d_update.py b/tests/model_ops/test_causal_conv1d_update.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..51f1323631e20de24ed9d91dfff8471ec82ebb67
+--- /dev/null
++++ b/tests/model_ops/test_causal_conv1d_update.py
+@@ -0,0 +1,173 @@
++import pytest
++import torch
++from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_update
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="causal conv requires a GPU"
++)
++
++
++def _reference_one_token(
++    x, state, weight, read_slots, write_slots, bias=None, activation="silu"
++):
++    history = state[read_slots].float()
++    values = torch.cat((history, x.float().unsqueeze(-1)), dim=-1)
++    output = (values * weight.float().unsqueeze(0)).sum(-1)
++    if bias is not None:
++        output += bias.float()
++    if activation == "silu":
++        output = output / (1.0 + torch.exp(-output))
++    expected_state = state.clone()
++    expected_state[write_slots] = torch.cat(
++        (history[..., 1:], x.float().unsqueeze(-1)), dim=-1
++    ).to(state.dtype)
++    return output, expected_state
++
++
++@pytest.mark.parametrize("batch", [1, 2, 4, 8])
++def test_width4_single_token_update_matches_fp32_reference(batch):
++    torch.manual_seed(1701 + batch)
++    k_dim = 257  # Exercises both BLOCK_N and q/k/v tails.
++    dim = 3 * k_dim
++    slots = 2 * batch + 8
++    state = torch.randn(slots, 3, dim, device="cuda", dtype=torch.bfloat16).transpose(
++        1, 2
++    )
++    reference_state = state.clone(memory_format=torch.preserve_format)
++    weight = 0.1 * torch.randn(dim, 4, device="cuda", dtype=torch.bfloat16)
++    bias = 0.1 * torch.randn(dim, device="cuda", dtype=torch.bfloat16)
++
++    for step in range(32):
++        x_storage = torch.randn(batch, dim + 19, device="cuda", dtype=torch.bfloat16)
++        x = x_storage[:, :dim]
++        if step in (7, 19):
++            x[:, 0::3] = 100
++            x[:, 1::3] = -100
++
++        permutation = torch.randperm(slots, device="cuda")
++        if step % 7 == 3:
++            read_slots = permutation[:batch]
++            write_slots = permutation[batch : 2 * batch]
++        else:
++            read_slots = permutation[:batch]
++            write_slots = read_slots
++
++        expected_output, expected_state = _reference_one_token(
++            x,
++            reference_state,
++            weight,
++            read_slots,
++            write_slots,
++            bias,
++            activation=None,
++        )
++        query, key, value = causal_conv1d_update(
++            x,
++            state,
++            weight,
++            k_dim,
++            k_dim,
++            bias,
++            None,
++            conv_state_indices=write_slots.to(torch.int32),
++            conv_state_indices_in=read_slots.to(torch.int32),
++        )
++        output = torch.cat((query, key, value), dim=-1)
++
++        torch.testing.assert_close(output.float(), expected_output, rtol=0.02, atol=0.1)
++        assert torch.equal(state, expected_state)
++        reference_state.copy_(expected_state)
++
++
++@pytest.mark.parametrize("layout", ["logical", "physical", "strided"])
++def test_width4_single_token_update_layout_fork_and_pad(layout):
++    torch.manual_seed(1801)
++    k_dim = 129
++    dim = 3 * k_dim
++    if layout == "logical":
++        state = torch.randn(12, dim, 3, device="cuda", dtype=torch.bfloat16)
++    elif layout == "physical":
++        state = torch.randn(12, 3, dim, device="cuda", dtype=torch.bfloat16).transpose(
++            1, 2
++        )
++    else:
++        storage = torch.randn(12, 5, 2 * dim + 7, device="cuda", dtype=torch.bfloat16)
++        state = storage[:, :3, : 2 * dim : 2].transpose(1, 2)
++
++    before = state.clone()
++    weight = torch.randn(dim, 4, device="cuda", dtype=torch.bfloat16)
++    x = torch.randn(4, dim + 11, device="cuda", dtype=torch.bfloat16)[:, :dim]
++    read_slots = torch.tensor([1, -1, 3, 4], device="cuda", dtype=torch.int32)
++    write_slots = torch.tensor([7, -1, 8, 9], device="cuda", dtype=torch.int32)
++    query, key, value = causal_conv1d_update(
++        x,
++        state,
++        weight,
++        k_dim,
++        k_dim,
++        None,
++        "silu",
++        conv_state_indices=write_slots,
++        conv_state_indices_in=read_slots,
++    )
++
++    active = torch.tensor([0, 2, 3], device="cuda")
++    expected_output, expected_state = _reference_one_token(
++        x[active],
++        before,
++        weight,
++        read_slots[active].long(),
++        write_slots[active].long(),
++    )
++    output = torch.cat((query, key, value), dim=-1)
++    torch.testing.assert_close(
++        output[active].float(), expected_output, rtol=0.02, atol=0.05
++    )
++    assert torch.equal(state, expected_state)
++    assert torch.equal(state[1], before[1])
++
++
++def test_varlen_and_apc_keep_generic_update():
++    k_dim = 129
++    dim = 3 * k_dim
++    weight = torch.ones(dim, 4, device="cuda", dtype=torch.bfloat16)
++
++    state = torch.ones(12, dim, 3, device="cuda", dtype=torch.bfloat16)
++    slots = torch.tensor([2, 5], device="cuda", dtype=torch.int32)
++    query_start_loc = torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32)
++    x = torch.full((3, dim), 2, device="cuda", dtype=torch.bfloat16)
++    output = causal_conv1d_update(
++        x,
++        state,
++        weight,
++        k_dim,
++        k_dim,
++        None,
++        None,
++        conv_state_indices=slots,
++        query_start_loc=query_start_loc,
++        max_query_len=2,
++    )
++    assert torch.equal(
++        torch.cat(output, dim=-1), x.new_tensor([5, 5, 6])[:, None].expand(-1, dim)
++    )
++    assert torch.equal(state[2, :, :], x.new_tensor([1, 2, 1]).expand(dim, -1))
++    assert torch.equal(state[5, :, :], x.new_tensor([1, 2, 2]).expand(dim, -1))
++
++    state.fill_(1)
++    table = torch.tensor([[1, 6], [3, 8]], device="cuda", dtype=torch.int32)
++    output = causal_conv1d_update(
++        x[:2],
++        state,
++        weight,
++        k_dim,
++        k_dim,
++        None,
++        None,
++        conv_state_indices=table,
++        block_idx_last_scheduled_token=torch.ones(2, device="cuda", dtype=torch.int32),
++        initial_state_idx=torch.zeros(2, device="cuda", dtype=torch.int32),
++    )
++    assert torch.equal(torch.cat(output, dim=-1), x.new_full((2, dim), 5))
++    assert torch.equal(state[6], x.new_tensor([1, 1, 2]).expand(dim, -1))
++    assert torch.equal(state[8], x.new_tensor([1, 1, 2]).expand(dim, -1))
+diff --git a/tests/model_ops/test_k3_causal_conv1d_prefill.py b/tests/model_ops/test_k3_causal_conv1d_prefill.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e2850da1381649217e4fa99cfdcb084dca9a0b1
+--- /dev/null
++++ b/tests/model_ops/test_k3_causal_conv1d_prefill.py
+@@ -0,0 +1,147 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++from atom.model_ops.mamba_ops.causal_conv1d import causal_conv1d_fn
++
++DIM = 36864
++K_DIM = 12288
++ROW_STRIDE = 49376
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available()
++    or torch.cuda.get_device_properties(0).gcnArchName != "gfx1250",
++    reason="K3 long-prefill specialization requires gfx1250",
++)
++
++
++def _metadata(lengths):
++    counts = torch.tensor([(length + 7) // 8 for length in lengths])
++    sequence_ids = torch.repeat_interleave(
++        torch.arange(len(lengths), dtype=torch.int32), counts
++    )
++    starts = counts.cumsum(0) - counts
++    chunk_ids = (
++        torch.arange(int(counts.sum())) - torch.repeat_interleave(starts, counts)
++    ).to(torch.int32)
++    sequence_ids = sequence_ids.cuda()
++    chunk_ids = chunk_ids.cuda()
++    entry = {
++        "tot": int(counts.sum()),
++        "mlist": None,
++        "mlist_len": int(counts.sum()),
++        "offsetlist": None,
++        "batch_ptr": sequence_ids,
++        "token_chunk_offset_ptr": chunk_ids,
++    }
++    return SimpleNamespace(
++        nums_dict={8: entry},
++        batch_ptr=sequence_ids,
++        token_chunk_offset_ptr=chunk_ids,
++        has_state_fork=False,
++    )
++
++
++def _reference(x, weight, state, query_start_loc, slots, has_initial_state):
++    output = torch.empty((x.shape[1], DIM), device=x.device, dtype=torch.float32)
++    final_state = state.float().clone()
++    for sequence, (start, stop) in enumerate(
++        zip(query_start_loc[:-1].tolist(), query_start_loc[1:].tolist())
++    ):
++        slot = int(slots[sequence])
++        prefix = (
++            state[slot].transpose(0, 1).float()
++            if bool(has_initial_state[sequence])
++            else torch.zeros(3, DIM, device=x.device)
++        )
++        values = torch.cat((prefix, x[:, start:stop].transpose(0, 1).float()))
++        acc = torch.zeros((stop - start, DIM), device=x.device)
++        for tap in range(4):
++            acc.add_(values[tap : tap + stop - start] * weight[:, tap].float())
++        output[start:stop] = acc * torch.sigmoid(acc)
++        final_state[slot] = values[-3:].transpose(0, 1)
++    return output, final_state
++
++
++@pytest.mark.parametrize("lengths", [[2048], [1, 7, 249, 1791]])
++def test_k3_long_prefill_tile_matches_fp32_and_generic(lengths):
++    torch.manual_seed(7100 + len(lengths))
++    total = sum(lengths)
++    fused = torch.randn(total, ROW_STRIDE, device="cuda", dtype=torch.bfloat16) * 0.1
++    x = fused[:, :DIM].transpose(0, 1)
++    weight = torch.randn(DIM, 4, device="cuda", dtype=torch.bfloat16) * 0.1
++    state = (
++        torch.randn(
++            len(lengths), 3, DIM, device="cuda", dtype=torch.bfloat16
++        ).transpose(1, 2)
++        * 0.1
++    )
++    query_start_loc = torch.tensor(
++        [0, *torch.tensor(lengths).cumsum(0).tolist()],
++        device="cuda",
++        dtype=torch.int32,
++    )
++    slots = torch.roll(torch.arange(len(lengths), device="cuda", dtype=torch.int32), 1)
++    has_initial_state = torch.tensor(
++        [(index % 3) != 1 for index in range(len(lengths))],
++        device="cuda",
++        dtype=torch.bool,
++    )
++    metadata = _metadata(lengths)
++
++    candidate_state = state.clone()
++    candidate = torch.cat(
++        causal_conv1d_fn(
++            x,
++            weight,
++            None,
++            candidate_state,
++            query_start_loc,
++            K_DIM,
++            K_DIM,
++            slots,
++            slots.clone(),  # native metadata uses a distinct fixed-address buffer
++            has_initial_state,
++            "silu",
++            metadata=metadata,
++        ),
++        dim=1,
++    )
++
++    generic_state = state.clone()
++    generic_metadata = _metadata(lengths)
++    generic_metadata.has_state_fork = True
++    generic = torch.cat(
++        causal_conv1d_fn(
++            x,
++            weight,
++            None,
++            generic_state,
++            query_start_loc,
++            K_DIM,
++            K_DIM,
++            slots,
++            slots.clone(),  # equal values; fork flag below forces the fallback
++            has_initial_state,
++            "silu",
++            metadata=generic_metadata,
++        ),
++        dim=1,
++    )
++    reference, reference_state = _reference(
++        x, weight, state, query_start_loc, slots, has_initial_state
++    )
++
++    candidate_error = (candidate.float() - reference).abs()
++    generic_error = (generic.float() - reference).abs()
++    assert float(candidate_error.max()) <= float(generic_error.max()) + 1e-7
++    assert float(candidate_error.mean()) <= float(generic_error.mean()) + 1e-9
++    torch.testing.assert_close(
++        candidate.float(),
++        reference,
++        rtol=0,
++        atol=float(generic_error.max()),
++    )
++    assert not torch.equal(candidate, generic)
++    assert torch.equal(candidate_state, generic_state)
++    assert torch.equal(candidate_state, reference_state.to(torch.bfloat16))
+diff --git a/tests/model_ops/test_kimi_k3_activations.py b/tests/model_ops/test_kimi_k3_activations.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..add2362b48712e3c40ffad9d65fdcb135ee2070c
+--- /dev/null
++++ b/tests/model_ops/test_kimi_k3_activations.py
+@@ -0,0 +1,110 @@
++# SPDX-License-Identifier: MIT
++
++import pytest
++import torch
++
++pytest.importorskip("aiter")
++pytest.importorskip("triton")
++
++from atom.model_ops.kimi_k3.activations import rmsnorm_gated
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
++@pytest.mark.parametrize(
++    ("tokens", "heads", "is_prefill"),
++    [
++        (4, 96, False),
++        (342, 96, True),
++        (448, 96, False),
++        (448, 96, True),
++        (512, 96, True),
++        (601, 73, True),
++        (1024, 96, True),
++    ],
++)
++def test_rmsnorm_gated_matches_reference_with_strided_gate(tokens, heads, is_prefill):
++    torch.manual_seed(20261002)
++    dim = 128
++    x = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device="cuda")
++    gate_storage = torch.randn(
++        tokens, heads, 3 * dim, dtype=torch.bfloat16, device="cuda"
++    )
++    gate = gate_storage[..., 2 * dim :]
++    weight = torch.randn(dim, dtype=torch.bfloat16, device="cuda")
++    x_before = x.clone()
++    gate_before = gate.clone()
++
++    actual = rmsnorm_gated(x, weight, gate, 1e-6, is_prefill=is_prefill)
++    x_f32 = x.float()
++    expected = (
++        x_f32
++        * torch.rsqrt(x_f32.square().mean(dim=-1, keepdim=True) + 1e-6)
++        * weight.float()
++        * torch.sigmoid(gate.float())
++    ).to(torch.bfloat16)
++
++    assert not gate.is_contiguous()
++    assert actual.shape == x.shape
++    assert actual.dtype == x.dtype
++    assert torch.equal(x, x_before)
++    assert torch.equal(gate, gate_before)
++    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.05)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
++@pytest.mark.parametrize(
++    ("tokens", "heads"),
++    [
++        (4096, 96),
++        (8192, 96),
++        (16384, 96),
++        (9474, 95),
++    ],
++)
++def test_rmsnorm_gated_long_prefill_matches_reference(tokens, heads):
++    torch.manual_seed(20261003)
++    dim = 128
++    x = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device="cuda")
++    gate_storage = torch.randn(
++        tokens, heads, dim + 1, dtype=torch.bfloat16, device="cuda"
++    )
++    gate = gate_storage[..., 1:]
++    weight = torch.randn(dim, dtype=torch.bfloat16, device="cuda")
++
++    actual = rmsnorm_gated(x, weight, gate, 1e-6, is_prefill=True)
++
++    # Bound temporary fp32 memory while checking production 4K-16K prefills.
++    for start in range(0, tokens, 256):
++        stop = min(start + 256, tokens)
++        x_chunk = x[start:stop].float()
++        expected = (
++            x_chunk
++            * torch.rsqrt(x_chunk.square().mean(dim=-1, keepdim=True) + 1e-6)
++            * weight.float()
++            * torch.sigmoid(gate[start:stop].float())
++        ).to(torch.bfloat16)
++        torch.testing.assert_close(actual[start:stop], expected, rtol=0.02, atol=0.05)
++
++    assert not gate.is_contiguous()
++    assert actual.shape == x.shape
++    assert actual.dtype == x.dtype
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
++def test_rmsnorm_gated_accepts_kda_output_view_without_copy():
++    torch.manual_seed(20261004)
++    tokens, heads, dim = 448, 96, 128
++    kda_out = torch.randn(1, tokens, heads, dim, dtype=torch.bfloat16, device="cuda")
++    view = kda_out.squeeze(0)
++    copied = torch.empty_like(view).copy_(view)
++    gate_storage = torch.randn(
++        tokens, heads, 3 * dim, dtype=torch.bfloat16, device="cuda"
++    )
++    gate = gate_storage[..., 2 * dim :]
++    weight = torch.randn(dim, dtype=torch.bfloat16, device="cuda")
++
++    from_view = rmsnorm_gated(view, weight, gate, 1e-6, is_prefill=True)
++    from_copy = rmsnorm_gated(copied, weight, gate, 1e-6, is_prefill=True)
++
++    assert view.is_contiguous()
++    assert torch.equal(from_view, from_copy)
+diff --git a/tests/model_ops/test_kimi_k3_attention_residual.py b/tests/model_ops/test_kimi_k3_attention_residual.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8a96612f7deb6d67fa0272328611bec95542d7c
+--- /dev/null
++++ b/tests/model_ops/test_kimi_k3_attention_residual.py
+@@ -0,0 +1,59 @@
++from __future__ import annotations
++
++import pytest
++import torch
++
++from atom.model_ops.kimi_k3 import attention_residual
++from atom.model_ops.kimi_k3.attention_residual import _apply_attn_res_impl
++
++HIDDEN = 7168
++EPS = 1e-6
++
++
++def test_attn_res_gfx1250_long_prefill_config_guard(monkeypatch) -> None:
++    monkeypatch.setattr(attention_residual, "_is_gfx1250", lambda _device: True)
++    pick = attention_residual._pick_attn_res_config
++    assert pick(2047, HIDDEN, 0) == (4, 2, 2)
++    assert pick(2048, HIDDEN, 0) == (4, 2, 1)
++    assert pick(16384, HIDDEN, 0) == (4, 2, 1)
++    assert pick(2048, HIDDEN // 2, 0) == (4, 2, 2)
++
++    monkeypatch.setattr(attention_residual, "_is_gfx1250", lambda _device: False)
++    assert pick(2048, HIDDEN, 0) == (4, 2, 2)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
++def test_attn_res_gfx1250_long_prefill_matches_reference() -> None:
++    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
++    if arch.split(":", 1)[0] != "gfx1250":
++        pytest.skip("the production tuning target is gfx1250")
++
++    tokens = 2048
++    generator = torch.Generator(device="cuda").manual_seed(20261004)
++    prefix = torch.randn(
++        (tokens, HIDDEN), generator=generator, device="cuda", dtype=torch.bfloat16
++    )
++    block = torch.randn(
++        (tokens, 1, HIDDEN),
++        generator=generator,
++        device="cuda",
++        dtype=torch.bfloat16,
++    )
++    score_weight = (
++        torch.randn(HIDDEN, generator=generator, device="cuda", dtype=torch.float32)
++        / HIDDEN
++    )
++
++    candidates = torch.cat((block.float(), prefix[:, None].float()), dim=1)
++    rstd = torch.rsqrt(candidates.square().mean(dim=-1) + EPS)
++    scores = (candidates * score_weight).sum(dim=-1) * rstd
++    expected = (
++        (torch.softmax(scores, dim=1)[:, :, None] * candidates)
++        .sum(dim=1)
++        .to(torch.bfloat16)
++    )
++
++    actual, prefix_out = _apply_attn_res_impl(prefix, block, score_weight, EPS)
++
++    assert prefix_out is prefix
++    torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+diff --git a/tests/model_ops/test_triton_mla_splits.py b/tests/model_ops/test_triton_mla_splits.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..baa133578a4ce5f7c2c0a7b8541714e1012895a5
+--- /dev/null
++++ b/tests/model_ops/test_triton_mla_splits.py
+@@ -0,0 +1,115 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++try:
++    from aiter.ops.triton.attention import mla_decode
++
++    from atom.model_ops import attention_mla
++    from atom.model_ops.attention_mla import MLAAttention
++    from atom.model_ops.attentions.triton_mla import _use_k3_split8
++
++    _IMPORT_ERR = None
++except ImportError as error:
++    _IMPORT_ERR = str(error)
++
++pytestmark = pytest.mark.skipif(
++    _IMPORT_ERR is not None, reason=f"requires full atom import env: {_IMPORT_ERR}"
++)
++
++
++def _k3_contract(**overrides):
++    values = {
++        "arch": "gfx1250",
++        "model_dtype": torch.bfloat16,
++        "kv_cache_dtype": "fp8",
++        "num_heads": 96,
++        "page_size": 1,
++        "max_batch_size": 8,
++        "shuffle_kv": False,
++    }
++    values.update(overrides)
++    hf = SimpleNamespace(
++        model_type="kimi_linear",
++        kv_lora_rank=512,
++        qk_nope_head_dim=128,
++        qk_rope_head_dim=64,
++        v_head_dim=128,
++    )
++    return hf, values
++
++
++def test_split8_scratch_is_limited_to_the_measured_k3_contract():
++    hf, values = _k3_contract()
++    assert _use_k3_split8(hf, **values)
++
++    for field, other in (
++        ("arch", "gfx942"),
++        ("model_dtype", torch.float16),
++        ("kv_cache_dtype", "bf16"),
++        ("num_heads", 128),
++        ("page_size", 64),
++        ("max_batch_size", 16),
++        ("shuffle_kv", True),
++    ):
++        hf, values = _k3_contract(**{field: other})
++        assert not _use_k3_split8(hf, **values), field
++
++    for field, other in (
++        ("model_type", "deepseek_v3"),
++        ("kv_lora_rank", 256),
++        ("qk_nope_head_dim", 64),
++        ("qk_rope_head_dim", 32),
++        ("v_head_dim", 256),
++    ):
++        hf, values = _k3_contract()
++        setattr(hf, field, other)
++        assert not _use_k3_split8(hf, **values), field
++
++
++@pytest.mark.parametrize(
++    "batch_size,scratch_splits,expected",
++    [(1, 8, 8), (2, 8, 8), (4, 8, 4), (8, 8, 4), (1, 4, 4)],
++)
++def test_decode_split_selection_is_batch_static_and_capacity_safe(
++    monkeypatch, batch_size, scratch_splits, expected
++):
++    seen = {}
++
++    def fake_decode(*args, **kwargs):
++        seen["logits"] = args[7]
++        seen["splits"] = args[8]
++
++    monkeypatch.setattr(mla_decode, "decode_attention_fwd", fake_decode)
++    monkeypatch.setattr(attention_mla.envs, "ATOM_USE_TRITON_MLA", True)
++    monkeypatch.setattr(attention_mla.envs, "ATOM_USE_TRITON_MLA_SHUFFLE_KV", False)
++
++    attn = MLAAttention.__new__(MLAAttention)
++    attn.head_pad = 0
++    attn.dcp_world_size = 1
++    attn.use_seg_mla = False
++    attn.num_heads = 2
++    attn.kv_lora_rank = 8
++    attn.qk_rope_head_dim = 4
++    attn.dtype = torch.float32
++    attn.scale = 1.0
++    attn._k_scale = torch.ones((), dtype=torch.float32)
++    attn._v_up_proj_and_o_proj = lambda output: output
++
++    logits = torch.empty(batch_size, 2, scratch_splits, 9)
++    metadata = SimpleNamespace(
++        causal=True,
++        triton_block_table=torch.zeros(batch_size, 1, dtype=torch.int32),
++        context_lens=torch.ones(batch_size, dtype=torch.int32),
++        triton_attn_logits=logits,
++        triton_lse=torch.empty(batch_size, 2),
++    )
++    q = torch.empty(batch_size, 2, 12)
++    kv_cache = torch.empty(1, 1, 12)
++
++    attn._forward_decode(q, kv_cache, metadata)
++
++    assert seen["splits"] == expected
++    assert seen["logits"].shape[2] == expected
++    assert seen["logits"].data_ptr() == logits.data_ptr()
+diff --git a/tests/test_weight_sync_shuffle_layout.py b/tests/test_weight_sync_shuffle_layout.py
+index 88ea4c3733cc19dcf9bbfb8d992710edd6b99fae..ab63ff54d3b5456456baa572c4983c2dab2af71e 100644
+--- a/tests/test_weight_sync_shuffle_layout.py
++++ b/tests/test_weight_sync_shuffle_layout.py
+@@ -33,6 +33,8 @@ from aiter import QuantType, dtypes
+ from atom.model_ops import linear as linear_mod
+ from atom.model_ops.linear import (
+     LinearBase,
++    can_fuse_mxfp4_activation_quant,
++    needs_compatible_mxfp4_preshuffle_backend,
+     weight_is_stored_preshuffled,
+ )
+ from atom.rollout.weight_updater import WeightUpdaterMixin
+@@ -110,6 +112,47 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
+     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
+ 
+ 
++def test_gfx1250_mxfp4_preshuffle_requires_compatible_backend():
++    assert needs_compatible_mxfp4_preshuffle_backend(dtypes.fp4x2, True, arch="gfx1250")
++
++
++def test_mxfp4_backend_override_is_layout_and_arch_specific():
++    assert not needs_compatible_mxfp4_preshuffle_backend(
++        dtypes.fp4x2, True, arch="gfx950"
++    )
++    assert not needs_compatible_mxfp4_preshuffle_backend(
++        dtypes.fp4x2, False, arch="gfx1250"
++    )
++    assert not needs_compatible_mxfp4_preshuffle_backend(
++        dtypes.fp8, True, arch="gfx1250"
++    )
++
++
++def test_fused_mxfp4_quant_rejects_m_dependent_gfx1250_layout(monkeypatch):
++    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
++    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
++
++    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx1250")
++    assert can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx950")
++
++
++def test_fused_mxfp4_quant_rejects_triton_layouts(monkeypatch):
++    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: True)
++    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
++    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx950")
++
++    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
++    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
++    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, False, arch="gfx950")
++
++
++def test_fused_mxfp4_quant_is_dtype_and_layout_specific(monkeypatch):
++    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
++    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
++    assert not can_fuse_mxfp4_activation_quant(dtypes.fp8, True, arch="gfx950")
++    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, False, arch="gfx950")
++
++
+ # ── the property: load and sync agree ─────────────────────────────────────
+ 
+ 
+@@ -153,6 +196,11 @@ def _updater_double():
+ def _loader_shuffles(monkeypatch, case, *, dim=2):
+     calls = []
+     monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: calls.append(a))
++    monkeypatch.setattr(
++        linear_mod,
++        "needs_compatible_mxfp4_preshuffle_backend",
++        lambda *a, **k: False,
++    )
+     # per_1x32 shuffles its scale through aiter at the end of the method; that
+     # is not what is under test and it wants a real e8m0 tensor.
+     monkeypatch.setattr(
+@@ -162,6 +210,23 @@ def _loader_shuffles(monkeypatch, case, *, dim=2):
+     return bool(calls)
+ 
+ 
++def test_loader_caches_mxfp4_backend_capability(monkeypatch):
++    module = _linear_double(QuantType.per_1x32, dtypes.fp4x2, False)
++    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: None)
++    monkeypatch.setattr(
++        linear_mod.fp4_utils, "e8m0_shuffle", lambda scale: scale, raising=False
++    )
++    monkeypatch.setattr(
++        linear_mod,
++        "needs_compatible_mxfp4_preshuffle_backend",
++        lambda *a, **k: True,
++    )
++
++    LinearBase.process_weights_after_loading(module)
++
++    assert module._needs_compatible_mxfp4_preshuffle_backend is True
++
++
+ def _sync_shuffles(monkeypatch, case, *, dim=2):
+     import atom.model_ops.utils as utils_mod
+ 

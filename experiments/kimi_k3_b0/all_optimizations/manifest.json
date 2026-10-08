@@ -1,0 +1,149 @@
+{
+  "schema_version": 2,
+  "generated_utc": "2026-10-08T02:17:00Z",
+  "required": {
+    "atom": {
+      "repository": "https://github.com/ROCm/ATOM.git",
+      "base_sha": "a526f0d557eeed08396670249af58bd85fa57338",
+      "head_sha": "f07ccf50090f11b765e5e2473ea26a22423a1c6f",
+      "result_tree_sha": "bc9eb01762f6a46c0c9d43857c8352e90608221c",
+      "pull_requests": {
+        "2458": "9f20a70eae89c1e86126d6d9303dbbb93cd84bd7",
+        "2466": "b52cc831a1626c913c3dfb8435300cc32a795e9a"
+      },
+      "retained_local_candidates": [
+        "KDA W8 recurrence launch",
+        "causal-conv decode",
+        "causal-conv prefill",
+        "guarded MLA split8",
+        "AttentionResidual long-prefill BL1"
+      ],
+      "excluded": [
+        "ATOM PR #2447",
+        "closed ATOM grouped-top-k candidate"
+      ],
+      "patch": {
+        "path": "atom.patch",
+        "sha256": "2cc961463aca0396b4decca2b1ffb03410d988bc1a21e7dfa2066eae3c03193c",
+        "files": [
+          "atom/model_ops/attention_mla.py",
+          "atom/model_ops/attentions/gdn_attn.py",
+          "atom/model_ops/attentions/triton_mla.py",
+          "atom/model_ops/fla_ops/fused_sigmoid_gating.py",
+          "atom/model_ops/kimi_k3/activations.py",
+          "atom/model_ops/kimi_k3/attention_residual.py",
+          "atom/model_ops/linear.py",
+          "atom/model_ops/mamba_ops/causal_conv1d.py",
+          "atom/models/kimi_k3.py",
+          "tests/model_ops/test_causal_conv1d_update.py",
+          "tests/model_ops/test_k3_causal_conv1d_prefill.py",
+          "tests/model_ops/test_kimi_k3_activations.py",
+          "tests/model_ops/test_kimi_k3_attention_residual.py",
+          "tests/model_ops/test_triton_mla_splits.py",
+          "tests/test_weight_sync_shuffle_layout.py"
+        ]
+      }
+    },
+    "aiter": {
+      "repository": "https://github.com/ROCm/aiter.git",
+      "base_sha": "57b7cf03ad32f72247c151cff2933abd11ff77d1",
+      "head_sha": "9ada180562efaa44f5434380650f105a8ed51349",
+      "result_tree_sha": "379bc8bbfb307cede5d8c5e492b9b6b0e090c61d",
+      "base_includes": {
+        "6097_head_sha": "a9b4e38e6acc14ffb6a9629529c694d06cfe5a3a",
+        "6097_merge_sha": "c847570f0af101bef69de77d9f83e5fe2d06a8ee"
+      },
+      "pull_requests": {
+        "6078": "3e2807de1dcabbadb819ada9ca37df43d6dbd7f4",
+        "6115": "2ca6fff7e03254806201f8d1d57a4a1564b42ef6",
+        "6120": "0acb6d6b7b43b7c5ca0dfb041a18465e2635e77f",
+        "6121": "d6d87772477fb30fc96c424bf4bf9826f1058214",
+        "6130": "4fa13d4e155d7392dc2276686903c3353c3326d1",
+        "6131": "45a599ab569cbe96534b043f2c77178a87586b3c"
+      },
+      "patch": {
+        "path": "aiter.patch",
+        "sha256": "f05053b7d9453d5aa0c3030e12ae870a0ac127d1cb121985962baa278b7d0c88",
+        "files": [
+          "aiter/ops/flydsl/gather_kv_b_proj.py",
+          "aiter/ops/flydsl/gather_kv_b_proj_gfx1250.py",
+          "aiter/ops/flydsl/grouped_moe_gfx1250.py",
+          "aiter/ops/flydsl/kernels/gather_kv_b_proj_gfx1250.py",
+          "aiter/ops/flydsl/kernels/moe_g2l_lut.py",
+          "aiter/ops/topk.py",
+          "aiter/ops/triton/_triton_kernels/kimi_delta_attn/flash_kda.py",
+          "aiter/ops/triton/_triton_kernels/moe/moe_routing/exact_sigmoid_topk.py",
+          "aiter/ops/triton/configs/gfx1250/triton/attention/chunk_delta_attn/DEFAULT.json",
+          "aiter/ops/triton/gather_kv_b_proj.py",
+          "aiter/ops/triton/moe/moe_routing/exact_sigmoid_topk.py",
+          "csrc/include/aiter_hip_common.h",
+          "csrc/include/opus/opus.hpp",
+          "csrc/kernels/activation_kernels.cu",
+          "op_tests/test_flydsl_gather_kv_b_proj.py",
+          "op_tests/test_flydsl_moe_aux.py",
+          "op_tests/test_gfx1250_exact_sigmoid_topk.py",
+          "op_tests/test_situv2_and_mul_quant.py",
+          "op_tests/triton_tests/test_gather_kv_b_proj.py"
+        ]
+      }
+    },
+    "configs": {
+      "bf16_csv": {
+        "path": "k3_bf16_hot_gfx1250_production_safe.csv",
+        "sha256": "196fe1af733b2e62681c779b280829580de440c4917db3a86924bc7a8261ad9f"
+      },
+      "ptpc_online": {
+        "path": "ptpc_online_experimental.json",
+        "sha256": "29e81720ebead5001e22ad7de1ccf70eab3bdf3a5f61c8d006d92253d9a9e7cd"
+      }
+    }
+  },
+  "optional_experimental": {
+    "mega_moe_tdm_tile_direct_route_reset": {
+      "artifact": "experimental_mori_aiter.patch",
+      "base_head_sha": "9ada180562efaa44f5434380650f105a8ed51349",
+      "head_sha": "51c635d86622385e6889ff3efa8fd936368a300a",
+      "sha256": "31d6aa6e615007008692030ac3236055fec99427555a6ebf69e0f53571509d83",
+      "files": [
+        "aiter/configs/tuned_grouped_fmoe.csv",
+        "aiter/ops/flydsl/grouped_moe_gfx1250.py",
+        "aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py",
+        "aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py",
+        "op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py"
+      ],
+      "default_applied": false,
+      "apply_flag": "--experimental-mori",
+      "scope": "AITER MegaMoE TDM tile, direct-route, and counter-reset experiment; no Mori core changes",
+      "evidence": "provisional EP4/operator evidence only",
+      "risks": [
+        "no stable 16-GPU full-stack E2E result",
+        "page-fault history under overlapping/high-concurrency experiments"
+      ]
+    }
+  },
+  "integration": {
+    "conflicts": [],
+    "unable_to_integrate": [],
+    "note": "All required PR and ATOM candidate changes applied cleanly; the five-file MegaMoE experiment is separated and opt-in."
+  },
+  "artifacts": {
+    "atom.patch": {
+      "sha256": "2cc961463aca0396b4decca2b1ffb03410d988bc1a21e7dfa2066eae3c03193c"
+    },
+    "aiter.patch": {
+      "sha256": "f05053b7d9453d5aa0c3030e12ae870a0ac127d1cb121985962baa278b7d0c88"
+    },
+    "experimental_mori_aiter.patch": {
+      "sha256": "31d6aa6e615007008692030ac3236055fec99427555a6ebf69e0f53571509d83"
+    },
+    "k3_bf16_hot_gfx1250_production_safe.csv": {
+      "sha256": "196fe1af733b2e62681c779b280829580de440c4917db3a86924bc7a8261ad9f"
+    },
+    "ptpc_online_experimental.json": {
+      "sha256": "29e81720ebead5001e22ad7de1ccf70eab3bdf3a5f61c8d006d92253d9a9e7cd"
+    },
+    "apply.sh": {
+      "sha256": "25a1388450758d0a0c25e434dc3555310ffcec0ac546f5e3921f62c7f0d0b948"
+    }
+  }
+}

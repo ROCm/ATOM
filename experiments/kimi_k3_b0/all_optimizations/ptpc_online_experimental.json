@@ -1,0 +1,14 @@
+{
+  "global_quant_config": "ptpc_fp8",
+  "exclude_layer": [
+    "lm_head",
+    "model.embed_tokens",
+    "*.q_conv1d",
+    "*.k_conv1d",
+    "*.v_conv1d",
+    "*.f_b_proj",
+    "*.mlp.gate",
+    "*.mlp.experts",
+    "*.mlp.routed_expert_*"
+  ]
+}
