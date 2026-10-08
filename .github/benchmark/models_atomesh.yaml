@@ -999,6 +999,39 @@ models:
           vllm:
             <<: *survey_k3_draft_visibility
             diagnostic_mode: bounded-perf
+        - <<: *survey_k3_read_dspark
+          name: survey-k3-main-read-dspark3-d-graph-c1-1p1d-tp8-dcp8
+          isl: [1025]
+          osl: 16
+          concurrency: [1]
+          vllm:
+            <<: *survey_k3_draft_visibility
+            diagnostic_mode: graph-correctness
+          server:
+            common_args:
+              extra_args: >-
+                --moe-backend aiter --load-format safetensors --gpu-memory-utilization 0.88
+                --language-model-only --max-num-seqs 4 --max-model-len 4096
+                --enable-prefix-caching --prefix-match-unit 128
+                --kv-cache-dtype auto --block-size 128 --max-num-batched-tokens 2048
+                --attention-backend ROCM_AITER_MLA
+                --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: >-
+              --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":3,"method":"dspark","attention_backend":"ROCM_AITER_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+              --enforce-eager
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: >-
+              --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":3,"method":"dspark","attention_backend":"ROCM_AITER_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+              --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[3,4],"max_cudagraph_capture_size":4}'
+              --kernel-config '{"enable_jit_warmup":false}'
+              --cudagraph-metrics --enable-logging-iteration-details
         - <<: *survey_k3_read
           name: survey-k3-main-read-apc-1p1d-tp8-dcp8-eager
           vllm:

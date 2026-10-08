@@ -123,13 +123,11 @@ def require(condition, message="Invalid bounded-perf evidence"):
 
 
 async def run(args):
-    if (
-        args.mode == "bounded-perf"
-        and args.output.exists()
-        and any(args.output.iterdir())
-    ):
+    graph_mode = args.mode == "graph-correctness"
+    strict_mode = args.mode in ("bounded-perf", "graph-correctness")
+    if strict_mode and args.output.exists() and any(args.output.iterdir()):
         raise OutputNotFreshError(
-            "bounded-perf requires a fresh empty output directory"
+            f"{args.mode} requires a fresh empty output directory"
         )
     args.output.mkdir(parents=True, exist_ok=True)
     records = []
@@ -137,7 +135,7 @@ async def run(args):
     async with httpx.AsyncClient(timeout=600, trust_env=False) as client:
 
         async def post(url, path, body=None, headers=None):
-            if args.mode == "bounded-perf":
+            if strict_mode:
                 with (args.output / "http-requests.jsonl").open("a") as output:
                     output.write(
                         json.dumps(
@@ -148,8 +146,12 @@ async def run(args):
             if args.mode == "bounded-perf":
                 http_start = time.perf_counter()
             response = await client.post(url + path, json=body, headers=headers)
-            if args.mode == "bounded-perf":
-                http_ms = 1000 * (time.perf_counter() - http_start)
+            if strict_mode:
+                http_ms = (
+                    1000 * (time.perf_counter() - http_start)
+                    if not graph_mode
+                    else None
+                )
                 http_timings[url] = http_ms
                 with (args.output / "http-responses.jsonl").open("a") as output:
                     output.write(
@@ -208,7 +210,7 @@ async def run(args):
             )
             result = response.json()
             try:
-                if args.mode == "bounded-perf":
+                if strict_mode:
                     check_completion(result, prompt, count)
                 assert result.get("choices"), result
                 choice = result["choices"][0]
@@ -262,7 +264,7 @@ async def run(args):
             )
             after_prefill = time.perf_counter()
             transfer = prefill["kv_transfer_params"]
-            if args.mode == "bounded-perf":
+            if strict_mode:
                 require(
                     transfer.get("remote_block_ids") and transfer.get("remote_host"),
                     "Missing handoff",
@@ -278,10 +280,17 @@ async def run(args):
                 "prefill": prefill,
                 "prefill_ms": 1000 * (after_prefill - start),
             }
+            if graph_mode:
+                record.pop("prefill_ms")
             records.append(record)
-            if args.mode != "bounded-perf":
+            if not strict_mode:
                 (args.output / "requests.json").write_text(
                     json.dumps(records, indent=2)
+                )
+            if graph_mode:
+                graph_windows[tag] = start_graph_window()
+                (args.output / f"{tag}-graph-start.json").write_text(
+                    json.dumps(graph_windows[tag], indent=2)
                 )
             decode = await complete(
                 args.decode,
@@ -297,12 +306,16 @@ async def run(args):
                 request_id,
             )
             finished = time.perf_counter()
+            if graph_mode:
+                graph_windows[tag]["completion_offset"] = args.decode_log.stat().st_size
             record.update(
                 {
                     "decode_ms": 1000 * (finished - after_prefill),
                     "decode": decode,
                 }
             )
+            if graph_mode:
+                record.pop("decode_ms")
             if args.mode == "bounded-perf":
                 record["client_inclusive_elapsed_ms"] = 1000 * (finished - start)
                 record["p_http_ms"] = http_timings[args.prefill]
@@ -398,7 +411,7 @@ async def run(args):
                     json.dumps(evidence, indent=2) + "\n"
                 )
 
-        if args.mode == "bounded-perf":
+        if strict_mode:
             require(
                 args.hybrid and (not getattr(args, "cache_composition", False)),
                 "Invalid bounded-perf evidence",
@@ -427,10 +440,228 @@ async def run(args):
                 "speedup_evaluated": False,
             }
 
+            output_tokens = 16 if graph_mode else 128
+            graph_windows = {}
+            graph_log_identity = None
+            if graph_mode:
+                require(
+                    getattr(args, "decode_log", None) is not None,
+                    "--decode-log is required",
+                )
+                metadata = {
+                    "mode": args.mode,
+                    "concurrency": 1,
+                    "output_tokens": 16,
+                    "lengths": [1025],
+                    "decode_request_limit": 1,
+                    "complete_stats_drain_verified": False,
+                    "graph_observation_scope": "new target FULL dispatch from sole D request on fresh endpoint; not complete iteration accounting",
+                    "apc_effect_evaluated": False,
+                    "performance_evaluated": False,
+                    "draft_graph_replay_verified": False,
+                    "cache_policy": "parent APC retained; cold reset before direct and PD, never during handoff",
+                    "endpoint_requirement": "exclusive newly launched D process with no prior user workload; launch provenance required; success0 and isolated counters alone do not establish freshness",
+                    "decode_log": str(args.decode_log),
+                    "bytes": "UNKNOWN",
+                    "ack": "UNKNOWN",
+                }
+
             def save(tag, evidence):
+                if graph_mode:
+                    evidence.pop("timing", None)
+                    evidence.pop("timing_status", None)
                 (args.output / f"{tag}-evidence.json").write_text(
                     json.dumps(evidence, indent=2, allow_nan=False) + "\n"
                 )
+
+            def start_graph_window():
+                nonlocal graph_log_identity
+                stat = args.decode_log.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                require(
+                    graph_log_identity in (None, identity),
+                    "Decode log identity changed",
+                )
+                graph_log_identity = identity
+                return {
+                    "start_offset": stat.st_size,
+                    "end_offset": stat.st_size,
+                    "device": stat.st_dev,
+                    "inode": stat.st_ino,
+                    "status": "GRAPH_NOT_OBSERVED",
+                }
+
+            def parse_graph_window(raw):
+                if raw and not raw.endswith(b"\n"):
+                    raise ValueError("Incomplete final log line")
+                text = re.sub(
+                    r"\x1b\[[0-9;]*m", "", raw.decode("utf-8", errors="strict")
+                )
+                lines = text.splitlines()
+                tables, rows, emitter = [], [], None
+                state = None
+                expected = [
+                    "",
+                    "- Mode: FULL_DECODE_ONLY",
+                    "- Capture sizes: [3, 4]",
+                    "",
+                    "**CUDAGraph Stats:**",
+                    "",
+                ]
+                settings_index = 0
+                for line in lines:
+                    match = re.fullmatch(
+                        r"(\(APIServer(?:_[^ ]+)? pid=\d+\)) .*?\[cuda_graph\.py:123\] (.*)",
+                        line,
+                    )
+                    if not match:
+                        if state is not None:
+                            raise ValueError(
+                                "Interleaved or unrecognized graph table prefix"
+                            )
+                        continue
+                    who, content = match.groups()
+                    if emitter is None:
+                        emitter = who
+                    if who != emitter:
+                        raise ValueError("Ambiguous graph table emitters")
+                    if content == "**CUDAGraph Config Settings:**":
+                        if state is not None:
+                            raise ValueError("Incomplete graph table")
+                        state, settings_index, rows = "settings", 0, []
+                    elif state == "settings":
+                        if content != expected[settings_index]:
+                            raise ValueError("Unexpected target graph settings")
+                        settings_index += 1
+                        if settings_index == len(expected):
+                            state = "header"
+                    elif state == "header":
+                        if [x.strip() for x in content.strip("|").split("|")] != [
+                            "Unpadded Tokens",
+                            "Padded Tokens",
+                            "Num Paddings",
+                            "Runtime Mode",
+                            "Count",
+                        ]:
+                            raise ValueError("Malformed graph table header")
+                        state = "separator"
+                    elif state == "separator":
+                        if not re.fullmatch(r"\|(?:-+\|){5}", content):
+                            raise ValueError("Malformed graph table separator")
+                        state = "rows"
+                    elif state == "rows":
+                        if not content:
+                            if not rows:
+                                raise ValueError("Empty graph table")
+                            tables.extend(rows)
+                            state = None
+                            continue
+                        values = [x.strip() for x in content.strip("|").split("|")]
+                        if (
+                            len(values) != 5
+                            or values[3] not in ("FULL", "NONE")
+                            or not all(values[i].isdigit() for i in (0, 1, 2, 4))
+                        ):
+                            raise ValueError("Malformed graph runtime row")
+                        unpadded, padded, padding, count = (
+                            int(values[i]) for i in (0, 1, 2, 4)
+                        )
+                        if count <= 0 or padded - unpadded != padding or unpadded <= 0:
+                            raise ValueError("Invalid graph runtime row")
+                        rows.append(
+                            {
+                                "mode": values[3],
+                                "count": count,
+                                "unpadded": unpadded,
+                                "padded": padded,
+                            }
+                        )
+                    elif content.strip():
+                        raise ValueError("Unframed graph runtime line")
+                if state is not None:
+                    raise ValueError("Truncated graph table")
+                return emitter, tables
+
+            async def graph_receipt(tag, evidence, completed_metrics):
+                graph = graph_windows[tag]
+                evidence["graph"] = graph
+                save(tag, evidence)
+                raw = b""
+                last_size = graph["start_offset"]
+                try:
+                    for attempt in range(60):
+                        stat = args.decode_log.stat()
+                        require(
+                            (stat.st_dev, stat.st_ino) == graph_log_identity
+                            and stat.st_size >= last_size,
+                            "Decode log rotated/truncated",
+                        )
+                        with args.decode_log.open("rb") as handle:
+                            handle.seek(graph["start_offset"])
+                            raw = handle.read()
+                        graph["end_offset"] = graph["start_offset"] + len(raw)
+                        last_size = graph["end_offset"]
+                        (args.output / f"{tag}-decode-window.log").write_bytes(raw)
+                        metrics = await bounded_snapshot(
+                            f"{tag}-graph-wait-{attempt:02d}"
+                        )
+                        require(
+                            metrics == completed_metrics,
+                            "Ambiguous activity during graph observation",
+                        )
+                        save(tag, evidence)
+                        try:
+                            emitter, rows = parse_graph_window(raw)
+                            boundary = (
+                                graph["completion_offset"] - graph["start_offset"]
+                            )
+                            post_bytes = raw[boundary:]
+                            if boundary and raw[boundary - 1 : boundary] != b"\n":
+                                post_bytes = post_bytes.partition(b"\n")[2]
+                            post = post_bytes.decode("utf-8")
+                            post = re.sub(r"\x1b\[[0-9;]*m", "", post)
+                            summaries = list(
+                                re.finditer(
+                                    r"(?m)^(\(APIServer(?:_[^ ]+)? pid=\d+\)) .*?\[loggers\.py:320\] .*Avg prompt throughput:.*Running: 0 reqs, Waiting: 0 reqs[^\n]*\n",
+                                    post,
+                                )
+                            )
+                            post_completion_observed = False
+                            if summaries:
+                                require(
+                                    all(m[1] == emitter for m in summaries),
+                                    "Ambiguous idle-summary emitter",
+                                )
+                                suffix_emitter, suffix_rows = parse_graph_window(
+                                    post[summaries[0].end() :].encode()
+                                )
+                                post_completion_observed = (
+                                    bool(suffix_rows and suffix_emitter == emitter)
+                                    or len(summaries) >= 2
+                                )
+                            graph["rows"] = rows
+                            graph["full_count"] = sum(
+                                row["count"] for row in rows if row["mode"] == "FULL"
+                            )
+                            graph["post_completion_idle_summaries"] = len(summaries)
+                            if post_completion_observed and graph["full_count"] > 0:
+                                graph["emitter"] = emitter
+                                graph["status"] = "TARGET_FULL_OBSERVED"
+                                graph["observation"] = (
+                                    "post-completion logger evidence observed; pending tail statistics may remain"
+                                )
+                                save(tag, evidence)
+                                return
+                        except (ValueError, AssertionError) as exc:
+                            graph["parse_error"] = repr(exc)
+                        await asyncio.sleep(0.5)
+                    raise AssertionError(
+                        "GRAPH_NOT_OBSERVED: no unambiguous FULL and post-completion logger observation"
+                    )
+                except Exception as exc:
+                    graph["error"] = repr(exc)
+                    save(tag, evidence)
+                    raise
 
             pinned_series = {}
             last_scrape = {}
@@ -448,9 +679,14 @@ async def run(args):
                         match = re.fullmatch(
                             r"([^\s{]+)(\{.*\})?\s+(\S+)(?:\s+\S+)?", line
                         )
-                        if not match or match[1] not in (
-                            tpot_prefix + "sum",
-                            tpot_prefix + "count",
+                        if (
+                            graph_mode
+                            or not match
+                            or match[1]
+                            not in (
+                                tpot_prefix + "sum",
+                                tpot_prefix + "count",
+                            )
                         ):
                             continue
                         labels = sorted(
@@ -505,8 +741,11 @@ async def run(args):
                 require(len(groups) == 1, "Expected one fixed DP-engine label group")
                 for name in (
                     *spec_names.values(),
-                    tpot_prefix + "sum",
-                    tpot_prefix + "count",
+                    *(
+                        (tpot_prefix + "sum", tpot_prefix + "count")
+                        if not graph_mode
+                        else ()
+                    ),
                 ):
                     values = group_values(series, name)
                     require(set(values) == groups, f"Missing/misaligned metric: {name}")
@@ -580,18 +819,30 @@ async def run(args):
                     for series in before.values():
                         composition_totals(series, strict=True)
                         validate_groups(series)
+                    if graph_mode and not records:
+                        require(
+                            composition_totals(before["decode"], strict=True)[
+                                "request_success"
+                            ]
+                            == 0,
+                            "Graph mode requires fresh unused D endpoint",
+                        )
                     if reference is None:
-                        response = await complete(args.prefill, prompt, 128)
+                        response = await complete(args.prefill, prompt, output_tokens)
                         evidence["direct"] = response
                     else:
-                        response = await pd(prompt, 128, tag)
+                        response = await pd(prompt, output_tokens, tag)
                         evidence["direct"] = reference
                         evidence["pd"] = response
                         for key in (
-                            "client_inclusive_elapsed_ms",
-                            "p_http_ms",
-                            "d_http_ms",
-                            "client_http_total_ms",
+                            ()
+                            if graph_mode
+                            else (
+                                "client_inclusive_elapsed_ms",
+                                "p_http_ms",
+                                "d_http_ms",
+                                "client_http_total_ms",
+                            )
                         ):
                             evidence[key] = records[-1][key]
                         records[-1]["direct"] = reference
@@ -599,7 +850,7 @@ async def run(args):
                             json.dumps(records, indent=2)
                         )
                     save(tag, evidence)
-                    check_completion(response, prompt, 128)
+                    check_completion(response, prompt, output_tokens)
                     evidence["actual_completion_tokens"] = {
                         "prefill": (
                             1
@@ -680,25 +931,26 @@ async def run(args):
                                 ),
                                 "Non-isolated or incorrect source accounting",
                             )
-                            count = sum(
-                                group_values(series, tpot_prefix + "count").values()
-                            )
-                            total = sum(
-                                group_values(series, tpot_prefix + "sum").values()
-                            )
-                            require(
-                                count <= expected[role]["request_success"],
-                                "Non-isolated timing count",
-                            )
-                            require(
-                                count != 0 or total == 0,
-                                "Timing sum without observation",
-                            )
-                            timing[role] = {
-                                "count": count,
-                                "sum_seconds": total,
-                                "mean_tpot_seconds": total if count == 1 else None,
-                            }
+                            if not graph_mode:
+                                count = sum(
+                                    group_values(series, tpot_prefix + "count").values()
+                                )
+                                total = sum(
+                                    group_values(series, tpot_prefix + "sum").values()
+                                )
+                                require(
+                                    count <= expected[role]["request_success"],
+                                    "Non-isolated timing count",
+                                )
+                                require(
+                                    count != 0 or total == 0,
+                                    "Timing sum without observation",
+                                )
+                                timing[role] = {
+                                    "count": count,
+                                    "sum_seconds": total,
+                                    "mean_tpot_seconds": total if count == 1 else None,
+                                }
                             speculative[role] = {
                                 key: sum(group_values(series, name).values())
                                 for key, name in spec_names.items()
@@ -709,9 +961,12 @@ async def run(args):
                             speculative_counters=speculative,
                         )
                         save(tag, evidence)
-                        ready = totals == expected and all(
-                            timing[role]["count"] == values["request_success"]
-                            for role, values in expected.items()
+                        ready = totals == expected and (
+                            graph_mode
+                            or all(
+                                timing[role]["count"] == values["request_success"]
+                                for role, values in expected.items()
+                            )
                         )
                         if ready and labeled == previous and attempt >= 6:
                             for role, values in speculative.items():
@@ -734,7 +989,10 @@ async def run(args):
                                         "Unexpected speculative activity",
                                     )
                             evidence["accounting_checked"] = True
-                            evidence["timing_status"] = "OBSERVED_SINGLE_REQUEST"
+                            if not graph_mode:
+                                evidence["timing_status"] = "OBSERVED_SINGLE_REQUEST"
+                            if graph_mode and reference is not None:
+                                await graph_receipt(tag, evidence, after)
                             save(tag, evidence)
                             return response, evidence
                         previous = labeled if ready else None
@@ -742,24 +1000,40 @@ async def run(args):
                     raise AssertionError("Missing/delayed/non-isolated metrics")
                 except Exception as exc:
                     evidence.update(status="FAIL", error=repr(exc))
+                    if graph_mode and tag in graph_windows:
+                        graph = graph_windows[tag]
+                        evidence["graph"] = graph
+                        try:
+                            stat = args.decode_log.stat()
+                            require(
+                                (stat.st_dev, stat.st_ino) == graph_log_identity
+                                and stat.st_size >= graph["end_offset"],
+                                "Decode log rotated/truncated while preserving failure",
+                            )
+                            with args.decode_log.open("rb") as handle:
+                                handle.seek(graph["start_offset"])
+                                raw = handle.read()
+                            graph["end_offset"] = graph["start_offset"] + len(raw)
+                            (args.output / f"{tag}-decode-window.log").write_bytes(raw)
+                        except (OSError, AssertionError) as log_exc:
+                            graph["preservation_error"] = repr(log_exc)
                     save(tag, evidence)
                     raise
 
             try:
+                corpus = "\n".join(
+                    f"Record {i}: The service reads a buffer and computes a result."
+                    for i in range(300 if graph_mode else 600)
+                )
+                if graph_mode:
+                    corpus = "Explain this engineering record.\n" + corpus
                 response = await post(
-                    args.prefill,
-                    "/tokenize",
-                    {
-                        "model": args.model,
-                        "prompt": "\n".join(
-                            f"Record {i}: The service reads a buffer and computes a result."
-                            for i in range(600)
-                        ),
-                    },
+                    args.prefill, "/tokenize", {"model": args.model, "prompt": corpus}
                 )
                 tokens = response.json()["tokens"]
                 require(
-                    isinstance(tokens, list) and len(tokens) >= 3073,
+                    isinstance(tokens, list)
+                    and len(tokens) >= max(metadata["lengths"]),
                     "Invalid bounded-perf evidence",
                 )
                 require(
@@ -775,6 +1049,19 @@ async def run(args):
                     reference, _ = await bounded_request(f"reference-{length}", prompt)
                     references[length] = reference
                     await bounded_request(f"correctness-{length}", prompt, reference)
+                if graph_mode:
+                    (args.output / "complete.json").write_text(
+                        json.dumps(
+                            {
+                                **metadata,
+                                "status": "PENDING_REVIEW",
+                                "graph_status": "TARGET_FULL_OBSERVED",
+                                "direct_pd_token_id_checks": 1,
+                            },
+                            indent=2,
+                        )
+                    )
+                    return
                 await bounded_request("warmup", tokens[:1025], references[1025])
                 samples = []
                 for index in range(3):
@@ -1279,10 +1566,13 @@ if __name__ == "__main__":
     parser.add_argument("--phase", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--mode", choices=("profile", "smoke", "bounded-perf"), default="profile"
+        "--mode",
+        choices=("profile", "smoke", "bounded-perf", "graph-correctness"),
+        default="profile",
     )
     parser.add_argument("--tp", type=int, default=8)
     parser.add_argument("--dcp", type=int, default=8)
+    parser.add_argument("--decode-log", type=Path)
     parser.add_argument("--hybrid", action="store_true")
     parser.add_argument("--cache-composition", action="store_true")
     args = parser.parse_args()

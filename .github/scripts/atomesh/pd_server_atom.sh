@@ -1394,6 +1394,11 @@ run_workload_phase() {
       --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}" \
       "${nixl_client_args[@]}"
   elif [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+    local -a diagnostic_args=()
+    if [[ "${ATOMESH_VLLM_DIAGNOSTIC_MODE:-profile}" == "graph-correctness" ]]; then
+      # This diagnostic is the two-node 1P1D control; both ranks mount RUN_DIR.
+      diagnostic_args+=(--decode-log "${RUNTIME_LOG_DIR}/decode-rank-1.log")
+    fi
     python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_profile.py" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
@@ -1403,7 +1408,8 @@ run_workload_phase() {
       --mode "${ATOMESH_VLLM_DIAGNOSTIC_MODE:-profile}" \
       --tp "${PREFILL_TP_SIZE}" --dcp "${PREFILL_DCP_SIZE}" \
       $([[ "${ATOMESH_VLLM_HYBRID:-0}" == "1" ]] && printf '%s' --hybrid) \
-      $([[ "${ATOMESH_VLLM_CACHE_COMPOSITION:-0}" == "1" ]] && printf '%s' --cache-composition)
+      $([[ "${ATOMESH_VLLM_CACHE_COMPOSITION:-0}" == "1" ]] && printf '%s' --cache-composition) \
+      "${diagnostic_args[@]}"
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then

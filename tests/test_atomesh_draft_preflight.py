@@ -261,6 +261,7 @@ def resolve_machine_paths(cell, monkeypatch, hostname="other-runner"):
         "survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager",
         "survey-k3-main-read-dspark3-apc-1p1d-tp8-dcp8-eager",
         "survey-k3-main-read-dspark3-bounded-perf-c1-1p1d-tp8-dcp8-eager",
+        "survey-k3-main-read-dspark3-d-graph-c1-1p1d-tp8-dcp8",
     ],
 )
 def test_only_survey_dspark_cells_gate_actual_speculative_paths(monkeypatch, case_name):
@@ -293,6 +294,7 @@ def test_only_survey_dspark_cells_gate_actual_speculative_paths(monkeypatch, cas
         "survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager",
         "survey-k3-main-read-dspark3-apc-1p1d-tp8-dcp8-eager",
         "survey-k3-main-read-dspark3-bounded-perf-c1-1p1d-tp8-dcp8-eager",
+        "survey-k3-main-read-dspark3-d-graph-c1-1p1d-tp8-dcp8",
     }
     assert {cell["name"] for cell in gated} == names
     original = next(cell for cell in gated if cell["name"] == case_name)
