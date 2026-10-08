@@ -5,50 +5,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
+# The IQ2R config parser tests live in tests/test_quant_config.py, which runs
+# without AITER.
 try:
-    import aiter.iq2r_glm53  # noqa: F401
-
+    # aiter/triton absent under bare non-GPU pytest
     import atom.model_ops.moe as moe_mod
-    from atom.quant_spec import get_quant_parser
-except Exception as exc:  # noqa: BLE001
-    pytest.skip(
-        f"requires full ATOM/AITER import environment: {exc}", allow_module_level=True
-    )
+except ImportError as exc:
+    skip_if_dependency_missing(exc, "requires full atom import env")
 
 
-def test_iq2r_parser_preserves_base_quant_and_targets_routed_experts():
-    parsed = get_quant_parser("iq2r").parse(
-        {
-            "quant_method": "iq2r",
-            "iq2r_modules": ["model.layers.*.mlp.experts"],
-            "base_quantization_config": {
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-                "activation_scheme": "dynamic",
-                "modules_to_not_convert": ["model.layers.*.mlp.gate"],
-            },
-        }
-    )
-    assert parsed.global_spec.quant_dtype == moe_mod.dtypes.fp8
-    assert parsed.global_spec.quant_type == moe_mod.QuantType.per_1x128
-    assert parsed.layer_pattern_specs[0][0] == "model.layers.*.mlp.experts"
-    assert parsed.layer_pattern_specs[0][1].quant_method == "iq2r"
-    assert parsed.exclude_layers == ["model.layers.*.mlp.gate"]
-
-
-@pytest.mark.parametrize(
-    "config,error",
-    [
-        ({"base_quantization_config": {"quant_method": "iq2r"}}, ValueError),
-        ({}, TypeError),
-        ({"iq2r_modules": []}, TypeError),
-        ({"iq2r_modules": "model.layers.*.mlp.experts"}, TypeError),
-    ],
-)
-def test_iq2r_quant_parser_rejects_malformed_config(config, error):
-    with pytest.raises(error):
-        get_quant_parser("iq2r").parse({"quant_method": "iq2r", **config})
+@pytest.fixture
+def aiter_iq2r():
+    """AITER's GLM-5.3 IQ2R format code; older AITER builds lack it."""
+    return pytest.importorskip("aiter.iq2r_glm53")
 
 
 def test_iq2r_weight_loader_requires_exact_shapes():
@@ -64,6 +35,21 @@ def test_iq2r_weight_loader_requires_exact_shapes():
 
     with pytest.raises(ValueError, match="shape mismatch"):
         method.load_weight(parameter, loaded[:, :-1])
+
+
+def test_iq2r_weight_loader_checks_the_tile_n():
+    method = object.__new__(moe_mod.Iq2rMoEMethod)
+    method.tp_size = 4
+    parameter = torch.nn.Parameter(
+        torch.zeros(1, dtype=torch.int32), requires_grad=False
+    )
+    parameter.iq2r_name = "w2_iq2r_tile_n"
+    method.load_weight(parameter, torch.tensor([128], dtype=torch.int32))
+    assert parameter.item() == 128
+
+    for loaded in ([64], [128, 128]):
+        with pytest.raises(ValueError, match="kernels need 128"):
+            method.load_weight(parameter, torch.tensor(loaded, dtype=torch.int32))
 
 
 def _glm53_packed_method(tp_size: int, tp_rank: int, intermediate: int):
@@ -91,11 +77,7 @@ def test_iq2r_rejects_unknown_layout(layout):
         )
 
 
-def test_iq2r_glm53_packed_create_weights_at_tp4():
-    from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
-    from aiter.ops.iq2r_format import IQ2RMetadata
-
-    method = _glm53_packed_method(tp_size=4, tp_rank=1, intermediate=512)
+def _glm53_packed_layer(method):
     layer = torch.nn.Module()
     layer.has_bias = False
     layer.num_fused_shared_experts = 1
@@ -104,9 +86,18 @@ def test_iq2r_glm53_packed_create_weights_at_tp4():
             layer,
             num_experts=257,
             hidden_size=6144,
-            intermediate_size_per_partition=512,
+            intermediate_size_per_partition=method.intermediate_size,
             params_dtype=torch.bfloat16,
         )
+    return layer
+
+
+def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r):
+    from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes
+    from aiter.ops.iq2r_format import IQ2RMetadata
+
+    method = _glm53_packed_method(tp_size=4, tp_rank=1, intermediate=512)
+    layer = _glm53_packed_layer(method)
 
     gate = IQ2RMetadata(logical_n=1024, logical_k=6144)
     down = IQ2RMetadata(logical_n=6144, logical_k=512)
@@ -114,7 +105,29 @@ def test_iq2r_glm53_packed_create_weights_at_tp4():
     assert tuple(layer.w13_weight_scale.shape) == (257, gate.auxiliary_bytes)
     assert tuple(layer.w2_weight.shape) == (257, down.data_bytes)
     assert tuple(layer.w2_weight_scale.shape) == (257, down.auxiliary_bytes)
+    for name in ("w13_iq2r_tile_n", "w2_iq2r_tile_n"):
+        parameter = getattr(layer, name)
+        assert (tuple(parameter.shape), parameter.dtype) == ((1,), torch.int32)
     assert (method.tp_size, method.tp_rank) == (4, 1)
+
+
+def test_glm53_weights_mapping_targets_every_compiled_tensor(aiter_iq2r):
+    compiler = pytest.importorskip("aiter.iq2r_glm5_compile")
+    from atom.model_loader.weight_names import CheckpointNameRewriter
+    from atom.models.deepseek_v2 import GlmMoeDsaForCausalLM
+
+    layer = _glm53_packed_layer(_glm53_packed_method(4, 0, 512))
+    rewriter = CheckpointNameRewriter(
+        weights_mapping=GlmMoeDsaForCausalLM.weights_mapping
+    )
+    mapped = sorted(
+        rewriter.rewrite(key)
+        for projection in ("gate_up", "down")
+        for key in compiler.iq2r_compiled_tensor_keys(3, projection).values()
+    )
+    assert mapped == sorted(
+        f"model.layers.3.mlp.experts.{name}" for name, _ in layer.named_parameters()
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,7 +156,7 @@ def test_iq2r_glm53_packed_rejects_unsupported_parallelism(
 
 
 @pytest.mark.parametrize("tp_size,tp_rank", [(4, 3), (8, 5)])
-def test_iq2r_glm53_packed_loader_slices_the_rank_shard(tp_size, tp_rank):
+def test_iq2r_glm53_packed_loader_slices_the_rank_shard(aiter_iq2r, tp_size, tp_rank):
     from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_slice_gate
     from aiter.ops.iq2r_format import (
         IQ2RMetadata,
@@ -184,9 +197,7 @@ def test_iq2r_glm53_packed_loader_slices_the_rank_shard(tp_size, tp_rank):
         assert torch.equal(parameter, value), name
 
 
-def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(monkeypatch):
-    import aiter.iq2r_glm53 as aiter_glm53
-
+def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     method = _glm53_packed_method(tp_size=4, tp_rank=0, intermediate=512)
     layer = SimpleNamespace(
         num_fused_shared_experts=1,
@@ -210,7 +221,7 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(monkeypatch):
         method, "_glm53_workspace", lambda device: ("workspace", device)
     )
     monkeypatch.setattr(
-        aiter_glm53, "iq2r_glm53_moe_out", lambda *args: calls.append(args)
+        aiter_iq2r, "iq2r_glm53_moe_out", lambda *args: calls.append(args)
     )
     arguments = {
         "layer": layer,

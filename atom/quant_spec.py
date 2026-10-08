@@ -105,8 +105,13 @@ def should_skip_online_quant(cur_type, cur_dtype, online_cfg) -> bool:
     Shared by ``LinearBase.online_quantize_weight``, ``FusedMoE._online_quant``
     and ``RMSNorm.online_quantize_activation``: re-quantizing is a no-op (and may
     corrupt already-quantized weights) when the online target is ``No`` or the
-    layer already matches the target ``(quant_type, quant_dtype)``.
+    layer already matches the target ``(quant_type, quant_dtype)``. IQ2R weights
+    have no path back to a float weight, so they always keep their checkpoint
+    format.
     """
+    # getattr: AITER builds without IQ2R have no ``iq2r_2bit``.
+    if cur_type == getattr(QuantType, "iq2r_2bit", None):
+        return True
     return online_cfg.quant_type == QuantType.No or (
         cur_type == online_cfg.quant_type and cur_dtype == online_cfg.quant_dtype
     )

@@ -3608,4 +3608,6 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         ".mlp.up_gate_proj.0.iq2r_auxiliary": ".mlp.experts.w13_weight_scale",
         ".mlp.down_proj.0.iq2r_data": ".mlp.experts.w2_weight",
         ".mlp.down_proj.0.iq2r_auxiliary": ".mlp.experts.w2_weight_scale",
+        ".mlp.up_gate_proj.0.iq2r_tN": ".mlp.experts.w13_iq2r_tile_n",
+        ".mlp.down_proj.0.iq2r_tN": ".mlp.experts.w2_iq2r_tile_n",
     }

@@ -947,6 +947,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 # One GLM-5.3 IQ2R workspace per device and shape, shared by every MoE layer:
 # layers run serially on a rank, so a fixed buffer set is also graph-safe.
 _IQ2R_GLM53_WORKSPACES: dict[tuple[torch.device, int, int], object] = {}
+# The kernels' N tile; checkpoints record theirs as `iq2r_tN`.
+_IQ2R_GLM53_TILE_N = 128
 
 
 class Iq2rMoEMethod(FusedMoEMethodBase):
@@ -1017,10 +1019,15 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             "w2_weight": down_metadata.data_bytes,
             "w2_weight_scale": down_metadata.auxiliary_bytes,
         }
-        for name, nbytes in shapes.items():
-            parameter = atom_parameter(
-                torch.empty((num_experts, nbytes), dtype=torch.uint8)
-            )
+        tensors = {
+            name: torch.empty((num_experts, nbytes), dtype=torch.uint8)
+            for name, nbytes in shapes.items()
+        }
+        # The compiler also records the N tile it packed each projection for.
+        for name in ("w13_iq2r_tile_n", "w2_iq2r_tile_n"):
+            tensors[name] = torch.empty(1, dtype=torch.int32)
+        for name, tensor in tensors.items():
+            parameter = atom_parameter(tensor)
             layer.register_parameter(name, parameter)
             set_weight_attrs(parameter, extra_weight_attrs)
             parameter.iq2r_name = name
@@ -1031,7 +1038,13 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         loaded_weight: torch.Tensor,
     ) -> None:
         name = param.iq2r_name
-        if self.tp_size > 1:
+        if name.endswith("_iq2r_tile_n"):
+            if loaded_weight.tolist() != [_IQ2R_GLM53_TILE_N]:
+                raise ValueError(
+                    f"IQ2R {name} is {loaded_weight.tolist()}, but the "
+                    f"glm53-packed-v1 kernels need {_IQ2R_GLM53_TILE_N}"
+                )
+        elif self.tp_size > 1:
             loaded_weight = self._glm53_tp_slice(name, loaded_weight)
         if tuple(param.shape) != tuple(loaded_weight.shape):
             raise ValueError(

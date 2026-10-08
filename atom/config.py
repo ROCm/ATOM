@@ -352,8 +352,8 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time. For IQ2R only the non-IQ2R layers qualify, so the
-        # online config must exclude the IQ2R experts.
+        # models at load time. For IQ2R only the non-IQ2R layers qualify;
+        # should_skip_online_quant keeps the IQ2R experts as they are.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
