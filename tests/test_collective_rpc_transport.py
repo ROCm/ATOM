@@ -332,6 +332,19 @@ class _Dead:
         return False
 
 
+class _Closable:
+    """Alive until teardown closes it; then is_alive raises, as a closed
+    ``multiprocessing.Process`` does."""
+
+    def __init__(self):
+        self.closed = False
+
+    def is_alive(self):
+        if self.closed:
+            raise ValueError("process object is closed")
+        return True
+
+
 class _Mq:
     def __init__(self):
         self.sent = []
@@ -353,6 +366,8 @@ def _mgr(proc_num=4, *, procs=None):
     mgr.rpc_outputs_queues = [queue.Queue() for _ in range(proc_num)]
     mgr.procs = [_Alive() for _ in range(proc_num)] if procs is None else procs
     mgr._rpc_lock = threading.Lock()
+    mgr._dead_ranks = {}
+    mgr.still_running = True
     return mgr
 
 
@@ -531,6 +546,96 @@ def test_a_rank_that_died_is_named_even_after_the_deadline():
     results = mgr.collective_rpc("m", RpcPayload("d1"), timeout=0.3)
     assert "timed out" in results[0].error
     assert "died" in results[1].error
+
+
+def test_a_rank_that_died_is_named_even_once_teardown_has_begun():
+    """A worker's death makes the monitor run exit(), which emptied self.procs
+    and closed every process while the call was still waiting. The dead rank
+    could no longer be found, and every rank left was reported as a timeout,
+    at the deadline."""
+    procs = [_Closable() for _ in range(3)]
+    mgr = _mgr(3, procs=procs)
+    _reply(mgr, 0, "e1", value="ok")
+
+    def monitor_sees_rank_1_die():
+        mgr._dead_ranks[1] = -11
+        mgr.still_running = False
+        for proc in procs:
+            proc.closed = True
+        mgr.procs = []
+
+    threading.Timer(0.1, monitor_sees_rank_1_die).start()
+    started = time.monotonic()
+    results = mgr.collective_rpc("m", RpcPayload("e1"), timeout=30)
+
+    assert time.monotonic() - started < 10, "reported promptly, not at the deadline"
+    assert results[0].value == "ok"
+    assert results[1].error == "TP rank 1 died before answering 'm' (exitcode=-11)"
+    assert results[2].error == (
+        "TP rank 2 was shut down before answering 'm', after TP rank(s) [1] died"
+    )
+
+
+def test_teardown_neither_breaks_the_barrier_nor_trips_on_closed_processes():
+    """is_alive() on a closed process raises rather than answering, and with
+    every rank being stopped there is nobody left to release."""
+    procs = [_Closable(), _Closable()]
+    for proc in procs:
+        proc.closed = True
+    mgr = _mgr(2, procs=procs)
+    mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
+    mgr.still_running = False
+
+    results = mgr.collective_rpc("m", RpcPayload("e2", barrier=True), timeout=5)
+
+    assert not mgr.all_ranks_barrier.broken
+    assert [r.error for r in results] == [
+        "TP rank 0 was shut down before answering 'm'",
+        "TP rank 1 was shut down before answering 'm'",
+    ]
+
+
+def test_the_monitor_records_the_rank_that_died_before_tearing_down():
+    """exit() empties self.procs, so this record is all a call in flight has
+    left to name the rank that died."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    procs = [
+        ctx.Process(target=time.sleep, args=(60,)),
+        ctx.Process(target=sys.exit, args=(3,)),
+    ]
+    for proc in procs:
+        proc.start()
+    mgr = _mgr(2, procs=procs)
+    mgr.runner_label = "test"
+    seen = []
+    exited = threading.Event()
+
+    def exit_():
+        seen.append(dict(mgr._dead_ranks))
+        exited.set()
+
+    mgr.exit = exit_
+    try:
+        mgr.monitor_procs()
+        assert exited.wait(timeout=60), "the monitor never acted on the death"
+    finally:
+        procs[0].terminate()
+        for proc in procs:
+            proc.join(timeout=10)
+    assert seen == [{1: 3}]
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), "soon"])
+def test_a_timeout_no_deadline_can_be_built_from_is_refused(timeout):
+    """Every comparison with NaN is false, so its deadline never passed and
+    the call waited forever on any rank that stayed silent. The utility
+    handler hands this manager whatever timeout the command carried."""
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="finite"):
+        mgr.collective_rpc("m", RpcPayload("t1"), timeout=timeout)
+    assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
 
 
 def test_a_reply_that_arrived_is_taken_even_after_the_deadline():

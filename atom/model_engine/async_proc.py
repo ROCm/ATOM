@@ -35,7 +35,7 @@ from atom.model_engine.block_table_codec import (
     BlockTableDeltaDecoder,
     BlockTableDeltaEncoder,
 )
-from atom.model_engine.collective_rpc import RpcPayload, RpcResult
+from atom.model_engine.collective_rpc import RpcPayload, RpcResult, checked_timeout
 from atom.utils import (
     envs,
     get_mp_context,
@@ -400,6 +400,14 @@ class AsyncIOProc:
         return method_name, self._block_table_decoder.decode_rpc(method_name, args)
 
 
+def _alive(proc) -> bool:
+    """``is_alive()``, except that a process teardown has closed is not."""
+    try:
+        return proc.is_alive()
+    except ValueError:  # closed by shutdown_all_processes
+        return False
+
+
 class AsyncIOProcManager:
     """Manages a pool of :class:`AsyncIOProc` workers.
 
@@ -465,6 +473,8 @@ class AsyncIOProcManager:
         self.rpc_output_threads: list[threading.Thread] = []
         # Every call reads these same per-rank queues; see collective_rpc.
         self._rpc_lock = threading.Lock()
+        # rank -> exit code, written by the monitor before it tears down.
+        self._dead_ranks: dict[int, int | None] = {}
 
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
@@ -644,6 +654,9 @@ class AsyncIOProcManager:
             raise TypeError(
                 f"collective_rpc needs an RpcPayload, got {type(payload).__name__}"
             )
+        # Reached from the utility handler too, with whatever timeout the
+        # utility command carried.
+        timeout = checked_timeout(timeout)
         if func_name in self._RESERVED_RPC_NAMES:
             # Each would break the protocol this path goes around. The workers'
             # decoder resets its cached rows on a forward the encoder never saw,
@@ -662,12 +675,15 @@ class AsyncIOProcManager:
         with self._rpc_lock:
             self.rpc_broadcast_mq.enqueue((func_name, payload))
 
+            # This call's own copy: a worker's death makes the monitor run
+            # exit(), which empties self.procs while replies are still awaited.
+            procs = list(self.procs)
             deadline = time.monotonic() + timeout
             results: list[RpcResult] = []
             for rank, output_queue in enumerate(self.rpc_outputs_queues):
                 results.append(
                     self._await_rank_reply(
-                        rank, output_queue, func_name, payload, deadline
+                        rank, output_queue, func_name, payload, deadline, procs
                     )
                 )
         return results
@@ -679,6 +695,7 @@ class AsyncIOProcManager:
         func_name: str,
         payload: RpcPayload,
         deadline: float,
+        procs: list,
     ) -> RpcResult:
         """Wait for one rank's reply, or synthesise the reason there is none."""
         while True:
@@ -688,25 +705,33 @@ class AsyncIOProcManager:
                 # dies mid-call is reported promptly instead of at the deadline.
                 reply = output_queue.get(timeout=max(0.0, min(1.0, remaining)))
             except queue.Empty:
-                # Ahead of both returns below: once this call gives up, nothing
+                # Ahead of every return below: once this call gives up, nothing
                 # else would release ranks still waiting on a dead one.
-                self._break_barrier_for_dead_ranks()
+                self._break_barrier_for_dead_ranks(procs)
                 # Death before the deadline, even once it has passed: waiting on
                 # another rank can use up the budget, and a rank that died is
                 # still the reason this one never answered.
-                if rank < len(self.procs) and not self.procs[rank].is_alive():
-                    return RpcResult(
-                        payload.request_id,
-                        rank,
-                        error=f"TP rank {rank} died before answering {func_name!r}",
+                dead = dict(self._dead_ranks)
+                if rank in dead:
+                    error = (
+                        f"TP rank {rank} died before answering {func_name!r} "
+                        f"(exitcode={dead[rank]})"
                     )
-                if remaining <= 0:
-                    return RpcResult(
-                        payload.request_id,
-                        rank,
-                        error=f"timed out waiting for {func_name!r} on TP rank {rank}",
+                elif not self.still_running:
+                    # Teardown stops every rank and their reply threads with
+                    # them, so no answer can come any more.
+                    cause = f", after TP rank(s) {sorted(dead)} died" if dead else ""
+                    error = (
+                        f"TP rank {rank} was shut down before answering "
+                        f"{func_name!r}{cause}"
                     )
-                continue
+                elif rank < len(procs) and not _alive(procs[rank]):
+                    error = f"TP rank {rank} died before answering {func_name!r}"
+                elif remaining <= 0:
+                    error = f"timed out waiting for {func_name!r} on TP rank {rank}"
+                else:
+                    continue
+                return RpcResult(payload.request_id, rank, error=error)
 
             if not isinstance(reply, RpcResult):
                 return RpcResult(
@@ -733,7 +758,7 @@ class AsyncIOProcManager:
                 )
             return reply
 
-    def _break_barrier_for_dead_ranks(self) -> None:
+    def _break_barrier_for_dead_ranks(self, procs: list) -> None:
         """Release the ranks waiting at the barrier once one can never arrive.
 
         A dead rank never reaches it, so the rest would wait there forever and
@@ -744,12 +769,13 @@ class AsyncIOProcManager:
 
         Checked while waiting on any call, not only barrier ones: a barrier
         call that timed out on a slow rank leaves the rest waiting, and if that
-        rank dies afterwards, only a later call is there to notice.
+        rank dies afterwards, only a later call is there to notice. Not during
+        teardown, which stops every rank anyway.
         """
         barrier = getattr(self, "all_ranks_barrier", None)
-        if barrier is None or barrier.broken:
+        if barrier is None or barrier.broken or not self.still_running:
             return
-        dead = [rank for rank, proc in enumerate(self.procs) if not proc.is_alive()]
+        dead = [rank for rank, proc in enumerate(procs) if not _alive(proc)]
         if dead:
             logger.error(
                 "%s: TP rank(s) %s died during a barrier call; releasing the rest",
@@ -859,6 +885,9 @@ class AsyncIOProcManager:
                 return
             dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
             dead_proc.join(timeout=5)
+            # Before exit() empties self.procs and stops every other rank, so
+            # a collective_rpc in flight can still name the one that died.
+            _self._dead_ranks[procs.index(dead_proc)] = dead_proc.exitcode
             logger.error(
                 f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
                 f"(exitcode={dead_proc.exitcode}), shutting down.",

@@ -9,6 +9,7 @@ request, so keeping them here is what lets the dispatch layer stay importable on
 a machine with no GPU -- which is also how the non-GPU test runner sees them.
 """
 
+import math
 import queue
 import threading
 from collections.abc import Iterator
@@ -18,6 +19,26 @@ from dataclasses import dataclass
 # The utility-command name the dispatch layer registers. Shared so the manager
 # that sends it and the handler that receives it cannot drift apart.
 COLLECTIVE_RPC_CMD = "collective_rpc"
+
+
+def checked_timeout(timeout) -> float:
+    """*timeout* in seconds, refusing one no deadline can be built from.
+
+    A deadline computed from NaN is never reached -- every comparison with it
+    is false -- and one from infinity never is by definition, so a call with a
+    single silent rank would wait forever. Zero or less is fine: it asks for
+    whatever has already arrived.
+    """
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        seconds = math.nan
+    if not math.isfinite(seconds):
+        raise ValueError(
+            f"collective_rpc timeout must be a finite number of seconds, "
+            f"got {timeout!r}"
+        )
+    return seconds
 
 
 @dataclass(frozen=True)
