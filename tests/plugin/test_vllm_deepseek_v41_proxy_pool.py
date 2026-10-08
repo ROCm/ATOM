@@ -408,3 +408,27 @@ def test_the_proxy_layer_is_markable_for_the_memory_profile():
     assert proxy._atom_v4_profiling_kv_cache is True
     _mark_v4_proxy_cache_mode({"layer": proxy}, False)
     assert proxy._atom_v4_profiling_kv_cache is False
+
+
+def test_the_profile_cache_patch_installs_without_a_v4_model():
+    """Installed by `register_model`, not by V4's proxy-layer registration.
+
+    The patch wraps `initialize_kv_cache` so `_mark_v4_proxy_cache_mode` can
+    flip the profiling flag V4.1's bind reads. It used to be installed from
+    `register_deepseek_v4_proxy_layer`, so a V4.1 run -- which registers its
+    own layer and never that one -- left the flag at its default and bound
+    against the profile's placeholder pool. Checked on the wiring: calling
+    `register_model` here would reach far more than this question.
+    """
+    import importlib
+    import inspect
+
+    register = importlib.import_module("atom.plugin.vllm.register")
+    source = inspect.getsource(register.register_model)
+    assert "apply_vllm_v4_profile_cache_patch()" in source, (
+        "register_model must install the profile-cache patch; installing it "
+        "from a model's own registration is what skipped V4.1"
+    )
+    # `register_platform` installs it too, but it is not checked here: that
+    # hook can be swallowed whole (see `deepseek_v41_state_reserve_patch`), so
+    # it is the belt and this is the braces.
