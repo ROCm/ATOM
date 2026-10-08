@@ -34,16 +34,6 @@ SPARSE_BLOCK_SIZE = 128
 ASM_PAGE_SIZE = 16
 PAGES_PER_SPARSE_BLOCK = SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE  # 8
 
-# Stride (in physical 16-pages) between two consecutive logical 128-blocks when
-# K and V share one block. ATOM's native engine allocates separate K and V caches
-# whose blocks are back to back, so there the stride is just
-# PAGES_PER_SPARSE_BLOCK. Under the vLLM 0.29 plugin, K and V are two head slots
-# of one page: a block's rows are [K page | V page], so the V plane is the K
-# plane shifted half a block and consecutive blocks land 16 physical pages apart
-# while each still fills only 8. See
-# `MiniMaxM3SparseAttention._page16_shuffle_cache_for_sparse_kernel`.
-BLOCK_PAGE_STRIDE = 2 * PAGES_PER_SPARSE_BLOCK  # 16
-
 
 @dataclass
 class MiniMaxM3SparsePrefillMetadata:
@@ -1144,8 +1134,11 @@ def minimax_m3_build_sparse_block_table(
     context_lens for `pa_fwd_asm`.
 
     Each selected logical 128-block expands to its 8 physical 16-pages
-    (``logical_id * block_page_stride + j``; pass ``BLOCK_PAGE_STRIDE`` for a
-    cache whose K and V share a block). The partial tail block is packed last so
+    (``logical_id * block_page_stride + j``). ``block_page_stride`` is the
+    distance between consecutive logical blocks and defaults to
+    ``PAGES_PER_SPARSE_BLOCK``, which is correct for a cache whose blocks are
+    back to back; a caller that packs N planes into one block passes
+    ``N * PAGES_PER_SPARSE_BLOCK``. The partial tail block is packed last so
     pa_fwd_asm's tail mask (context_lens % 16) lands on it.
 
     Returns (sparse_bt [batch, topk*8] int32, sparse_ctx_lens [batch] int32).

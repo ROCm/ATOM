@@ -70,9 +70,15 @@ DECODE_SCORE_NUM_STAGES = 3
 # batch 16-128, and 1<<14 stays within 5% of the per-batch optimum there.
 DECODE_SCORE_TARGET_GRID = 1 << 14
 DECODE_SCORE_MIN_BLOCKS = 3
-# Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache
-# (must match sparse_attn.PAGES_PER_SPARSE_BLOCK). Used by the fused block-table
-# emission in the topk kernels.
+# Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache.
+# Used by the fused block-table emission in the topk kernels.
+#
+# Deliberately a literal rather than an import: `sparse_attn` imports this
+# module (`build_n_valid_column_per_row`), so importing its
+# `PAGES_PER_SPARSE_BLOCK` back would close a cycle. The value is therefore
+# duplicated and must stay equal to `sparse_attn.PAGES_PER_SPARSE_BLOCK`
+# (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`); `tests/test_minimax_m3_page_geometry.py`
+# asserts that rather than leaving it to a comment.
 PAGES_PER_SPARSE_BLOCK = 8
 
 
@@ -99,7 +105,7 @@ def _emit_sparse_block_table_row(
     pid_h,
     block_size: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (16)
+    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
     NUM_KV_HEADS: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -793,10 +799,10 @@ def _launch_select(
                 NUM_KV_HEADS=num_idx_heads,
                 DECODE_MAX_Q=decode_max_q,
                 pages_per_block=PAGES_PER_SPARSE_BLOCK,
-                # Not PAGES_PER_SPARSE_BLOCK: under vLLM 0.29 a logical block
-                # spans two head slots, so the caller's stride is twice the
-                # pages it fills. Hard-coding the two to the same constant
-                # would emit a block table off by half a block per logical
+                # Not PAGES_PER_SPARSE_BLOCK: a caller whose cache packs
+                # several planes into one block has a stride wider than the
+                # pages a block fills. Hard-coding the two to the same constant
+                # would emit a block table off by that difference per logical
                 # block on this path only -- the fused path below already
                 # takes the caller's value.
                 block_page_stride=block_page_stride,
@@ -880,7 +886,7 @@ def _topk_index_packed_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (16)
+    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
     EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)
@@ -1105,11 +1111,11 @@ def minimax_m3_index_topk(
     launch + topk_idx HBM round-trip.
 
     ``block_page_stride`` is the distance in physical 16-pages between two
-    consecutive logical 128-blocks in the KV cache. It equals
-    ``PAGES_PER_SPARSE_BLOCK`` for a cache whose blocks are back to back (ATOM's
-    native engine), and twice that under vLLM 0.29's plugin path, where K and V
-    share one block as two head slots so the K/V planes overlap half a block
-    (see ``sparse_attn.BLOCK_PAGE_STRIDE``).
+    consecutive logical 128-blocks in the KV cache. It defaults to
+    ``PAGES_PER_SPARSE_BLOCK``, which is correct for a cache whose blocks are
+    back to back; a caller that packs N planes into one block, so that the
+    planes overlap and a block no longer fills its own stride, passes
+    ``N * PAGES_PER_SPARSE_BLOCK``.
     ``n_valid_column_per_row`` is the batch's
     ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
     the attention metadata and handed to every sparse layer. It makes the aiter
@@ -1226,11 +1232,11 @@ def minimax_m3_index_topk_decode(
     saving a separate build launch + topk_idx HBM round-trip.
 
     ``block_page_stride`` is the distance in physical 16-pages between two
-    consecutive logical 128-blocks in the KV cache. It equals
-    ``PAGES_PER_SPARSE_BLOCK`` for a cache whose blocks are back to back (ATOM's
-    native engine), and twice that under vLLM 0.29's plugin path, where K and V
-    share one block as two head slots so the K/V planes overlap half a block
-    (see ``sparse_attn.BLOCK_PAGE_STRIDE``).
+    consecutive logical 128-blocks in the KV cache. It defaults to
+    ``PAGES_PER_SPARSE_BLOCK``, which is correct for a cache whose blocks are
+    back to back; a caller that packs N planes into one block, so that the
+    planes overlap and a block no longer fills its own stride, passes
+    ``N * PAGES_PER_SPARSE_BLOCK``.
     ``n_valid_column_per_row`` is the batch's
     ``MiniMaxM3SparseMetadata.n_valid_column_per_row``, built once per forward by
     the attention metadata and handed to every sparse layer. It makes the aiter

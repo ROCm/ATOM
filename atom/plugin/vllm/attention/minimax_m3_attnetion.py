@@ -21,7 +21,6 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from atom.config import get_current_atom_config
 from atom.model_ops.minimax_m3.sparse_attn import (
     ASM_PAGE_SIZE,
-    BLOCK_PAGE_STRIDE,
     PAGES_PER_SPARSE_BLOCK,
     SPARSE_BLOCK_SIZE,
 )
@@ -33,6 +32,21 @@ from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
 from atom.utils import mark_spliting_op
+
+# Stride, in physical 16-pages, between two consecutive logical 128-blocks of
+# THIS cache. Lives here rather than beside PAGES_PER_SPARSE_BLOCK because it
+# describes the vLLM page view, not the kernels: `customize_spec` asks for two
+# head slots, so a block's rows are [K page | V page], the V plane is the K
+# plane shifted half a block, and consecutive blocks land 16 physical pages
+# apart while each still fills only 8. See
+# `MiniMaxM3SparseAttention._page16_shuffle_cache_for_sparse_kernel` below.
+#
+# The kernels take this as a parameter defaulting to PAGES_PER_SPARSE_BLOCK,
+# which is what ATOM's native engine and the sglang plugin get: they allocate
+# separate K and V caches whose blocks are back to back. Only this file
+# overrides it.
+BLOCK_PAGE_STRIDE = 2 * PAGES_PER_SPARSE_BLOCK  # 16
+
 
 _MINIMAX_M3_TOPK_CACHE_STATE: dict = {}
 
