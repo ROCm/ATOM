@@ -194,12 +194,17 @@ def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
     empty here and every connector was admitted without the question being
     asked -- a check that passes because it was never run.
     """
-    validate_runtime_config(
-        vllm_plugin_config(
-            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
-        )
-    )
-    for connector in ("LMCacheConnectorV1", "lmcache_mp", "NixlConnector"):
+    validate_runtime_config(vllm_plugin_config(kv_transfer_config=None))
+    # The allow-list is empty on this path, so every connector is refused --
+    # including `lmcache_mp`, which is admitted natively and means nothing
+    # here. A PAGE prefix restored without its CSA2 STATE kills the engine, so
+    # there is no partial transport worth admitting.
+    for connector in (
+        "AtomLMCacheOffloadConnector",
+        "LMCacheConnectorV1",
+        "lmcache_mp",
+        "NixlConnector",
+    ):
         with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
             validate_runtime_config(
                 vllm_plugin_config(kv_transfer_config={"kv_connector": connector})

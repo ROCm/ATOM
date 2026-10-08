@@ -335,7 +335,15 @@ def validate_speculative_config(config):
 # A plugin-mode transport is named by vLLM's own `kv_connector` string, which is
 # not an ATOM connector name, so it is matched here rather than resolved through
 # `KVConnectorFactory`.
-_VLLM_PLUGIN_KV_CONNECTORS = ("AtomLMCacheOffloadConnector",)
+#
+# Empty, deliberately: no connector on this path carries STATE yet. V4.1 buys
+# its cache in two currencies and `PagedAttentionCache` refuses any request
+# whose cursor is not exactly the frontier the scheduler claims, so a PAGE
+# prefix restored without its STATE is not a degraded answer, it is a dead
+# engine. A connector that moves only PAGE therefore has to be refused rather
+# than admitted and hoped for. This tuple is where one that owns both legs is
+# named once it exists.
+_VLLM_PLUGIN_KV_CONNECTORS: tuple[str, ...] = ()
 
 
 def _kv_transfer_unsupported(config, on_vllm_plugin: bool) -> bool:
@@ -405,8 +413,8 @@ def validate_runtime_config(config):
             # transport is not an ATOM connector at all -- it is vLLM's own
             # `kv_connector`, and feeding that string to ATOM's factory is a
             # category error -- so it is named against its own allow-list.
-            "KV transfer other than lmcache_mp (native) or "
-            "AtomLMCacheOffloadConnector (vLLM plugin)",
+            "KV transfer other than lmcache_mp (native), or any KV connector "
+            "at all (vLLM plugin: none of them carries CSA2 STATE yet)",
             _kv_transfer_unsupported(config, on_vllm_plugin),
         ),
         ("RapidServe", config.enable_rapidserve),
