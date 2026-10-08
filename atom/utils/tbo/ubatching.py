@@ -405,7 +405,6 @@ class TBOContext:
     # -- context manager protocol ----------------------------------------
 
     def __enter__(self):
-        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.ubatch_id
         _CURRENT_CONTEXTS[self.ubatch_id] = self
 
@@ -421,7 +420,6 @@ class TBOContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         try:
@@ -637,7 +635,7 @@ def make_tbo_contexts(
     Threading events are arranged in a ring so that each context's
     ``cpu_signal_event`` is the *next* context's ``cpu_wait_event``.
     """
-    global _NUM_UBATCHES, _CURRENT_CONTEXTS
+    global _NUM_UBATCHES
     assert num_micro_batches > 1
 
     _NUM_UBATCHES = num_micro_batches
