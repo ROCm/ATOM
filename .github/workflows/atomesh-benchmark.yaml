@@ -75,7 +75,10 @@ on:
             ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c32,
             ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c128,
             ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c192,
-            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c256,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c192,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c256,
+            ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c512
 
           DeepSeek-V4-Pro-0813 (accuracy):
             ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16

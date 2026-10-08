@@ -770,6 +770,13 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
+  if [[ "${ATOM_KV_OFFLOAD:-}" == "lmcache_mp" ]]; then
+    prefill_cmd=(
+      python3 "${ATOMESH_SCRIPT_DIR}/pd_lmcache_mp.py"
+      --log-dir "${RUNTIME_LOG_DIR}/${log_name}-mp"
+      -- "${prefill_cmd[@]}"
+    )
+  fi
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
 }
 

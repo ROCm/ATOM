@@ -81,7 +81,11 @@ class V4WorkflowTest(unittest.TestCase):
 
     def test_tw_schedule_includes_v4_weekly_and_existing_models(self):
         cells = self.matrix()
-        v4 = [cell for cell in cells if cell["model"] == MODEL]
+        v4 = [
+            cell
+            for cell in cells
+            if cell["model"] == MODEL and "-no-offload-" in cell["name"]
+        ]
         self.assertEqual(len(v4), 7)
         self.assertEqual({cell["concurrency"][0] for cell in v4}, CONCURRENCIES)
         for cell in v4:
@@ -137,6 +141,60 @@ class V4WorkflowTest(unittest.TestCase):
             self.assertNotIn(
                 "--enable-dp-attention", cell["service"][role]["extra_args"]
             )
+
+    def test_manual_ep_mega_mp_keeps_pd_workload_and_role_boundaries(self):
+        concurrencies = [256, 192, 512]
+        cases = [
+            f"ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c{c}"
+            for c in concurrencies
+        ]
+        cells = self.matrix(
+            event="workflow_dispatch",
+            SUITE="weekly",
+            RUN_ALL_MODELS="false",
+            CASE_NAMES=",".join(cases),
+        )
+        self.assertEqual({cell["name"] for cell in cells}, set(cases))
+        for cell in cells:
+            with self.subTest(concurrency=cell["concurrency"]):
+                self.assertEqual(cell["num_nodes"], 2)
+                self.assertEqual(cell["benchmark"]["benchmark_duration"], 3600)
+                self.assertEqual(cell["benchmark"]["warmup_requests_per_lane"], 1)
+                self.assertEqual(
+                    cell["server_args"]["spec_decode_acceptance_length"], 3.01
+                )
+                self.assertEqual(cell["server_args"]["max_num_seqs"], 128)
+                p = cell["service"]["prefill"]["extra_args"]
+                d = cell["service"]["decode"]["extra_args"]
+                self.assertIn("--moe-backend mega", p)
+                self.assertIn("--enable-expert-parallel", p)
+                self.assertIn("--enable-eplb", p)
+                self.assertNotIn("--enable-expert-parallel", d)
+                self.assertNotIn("--enable-tbo", p + d)
+                self.assertEqual(
+                    cell["env"]["prefill"]["ATOM_KV_OFFLOAD"], "lmcache_mp"
+                )
+                self.assertNotIn("ATOM_KV_OFFLOAD", cell["env"]["decode"])
+                for role in ("prefill", "decode"):
+                    self.assertIn(
+                        "mooncake",
+                        cell["env"][role][f"{role.upper()}_KV_TRANSFER_CONFIG"],
+                    )
+                threshold = "20" if cell["concurrency"] == [192] else "40"
+                self.assertEqual(
+                    cell["env"]["common"]["ROUTER_BALANCE_ABS_THRESHOLD"], threshold
+                )
+                # Execute the same Bash expansion used by pd_server_atom.sh;
+                # quotes inside the compact EPLB JSON must survive as one argv.
+                argv = subprocess.check_output(
+                    ["bash", "-c", "printf '%s\\n' ${ARGS}"],
+                    env=dict(os.environ, ARGS=p),
+                    text=True,
+                ).splitlines()
+                self.assertEqual(
+                    json.loads(argv[argv.index("--eplb-config") + 1]),
+                    {"load_window_size": 100, "rebalance_interval": 200},
+                )
 
 
 class V4AccuracyPhaseTest(unittest.TestCase):

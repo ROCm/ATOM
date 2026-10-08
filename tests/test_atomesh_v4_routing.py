@@ -49,7 +49,11 @@ class V4RoutingTest(unittest.TestCase):
                 text=True,
                 timeout=30,
             )
-            cls.cells = json.loads(output.read_text())["include"]
+            cls.cells = [
+                cell
+                for cell in json.loads(output.read_text())["include"]
+                if "-no-offload-" in cell["name"]
+            ]
         source = (SCRIPTS / "pd_server_atom.sh").read_text()
         functions = []
         for name in ("has_cli_flag", "is_agentic_dpa", "start_router"):

@@ -282,6 +282,49 @@ and runs evaluation without the performance workload or synthetic acceptance
 length. Per-sample evaluation logs are retained in the result artifacts.
 
 
+### V4 AgentX P/D with EP8, MegaMoE, EPLB and LMCache MP
+
+The same `weekly` suite also has three EP/Mega/MP variants, extending the
+P/D configuration from #2346:
+
+```text
+ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c256
+ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c192
+ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c512
+```
+
+Dispatch **Atomesh Benchmark**, select the branch, `suite=weekly`, the TW
+`atomesh-cicd` runner and `run_model_benchmark=true`. Put the three names,
+comma-separated, in `case_names`; leave `benchmark_concurrency` empty.
+Use `rocm/atom-dev:nightly_202610071700` (or a compatible newer image).
+Each case uses a fresh two-node allocation and the existing AgentX dataset,
+AIPerf commit, DSpark K3 and synthetic AL 3.01. The formal measurement remains
+**3600 seconds**; warmup is **1 request per lane** with a 3600-second grace
+period, in addition to the dataset's cold-prefix primers.
+
+P uses EP8, `--all2all-backend high-throughput --moe-backend mega`, EPLB
+window 100 / interval 200 / at most four rebalances, and Mega pad-row masking.
+These settings follow [InferenceX #3819](https://github.com/SemiAnalysisAI/InferenceX/pull/3819).
+The fourth rebalance is not guaranteed to precede profiling with the shorter
+warmup; use the service log timestamps to identify any measured migration.
+The small Mega capacity is 512 rows (128 slots × K3's four verification rows),
+with `AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023`. Both roles reserve 128 state slots
+per DP rank. GPU memory fractions are P 0.75 / D 0.70. D stays EP1; TBO is off
+on both roles. The aggregate recipe's prefill/decode interval is not applied
+to separate P/D workers. Cache-aware stays 20/2.0 at c192 and 40/2.0 at c256;
+c512 starts with 40/2.0 as well.
+
+One standalone MP server runs inside P's container, sharing all eight GPUs,
+with a lazy 1000 GiB L1, chunk 256, 900-second read TTL and LRU watermark 0.98.
+The connector uses `lmcache_mp`, pending saves 8, and minimum save/load 8192
+tokens. Mooncake continues to handle P→D transfers; D has no CPU tier.
+`lmcache.mp.max_pinned_state_bytes` from the reference is omitted because
+the pinned ATOM source does not consume that option. The MP launcher waits
+for RPC and HTTP readiness, fails the worker if MP exits, and cleans up both
+process groups on completion/cancellation. MP commands, service logs and
+30-second metrics snapshots are saved under `logs/prefill-rank-0-mp/` (under
+the execution-phase subdirectory when applicable).
+
 ### Optional AITER wheel for manual agentic benchmarks
 
 `ATOM Agentic Benchmark` accepts an optional **aiter_wheel** input:
