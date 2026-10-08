@@ -68,75 +68,6 @@ class KvCacheLayout(str, Enum):
     SPLIT = "split"
     ATOM = "atom"
 
-
-class ConvStateLayout(str, Enum):
-    """Physical layout of one slot's causal-convolution history."""
-
-    CHANNEL_MAJOR = "channel_major"
-    TIME_MAJOR = "time_major"
-
-
-def conv_state_offset(
-    layout: ConvStateLayout,
-    channel,
-    time: int,
-    channels: int,
-    state_length: int = 3,
-):
-    if not isinstance(layout, ConvStateLayout):
-        raise TypeError(f"conv-state layout must be ConvStateLayout, got {layout!r}")
-    if not 0 <= time < state_length:
-        raise ValueError(f"conv-state time must be in [0, {state_length}), got {time}")
-    if channels <= 0:
-        raise ValueError(f"conv-state channels must be positive, got {channels}")
-    if layout is ConvStateLayout.TIME_MAJOR:
-        return time * channels + channel
-    return channel * state_length + time
-
-
-def conv_state_shape(
-    layout: ConvStateLayout,
-    slots: int,
-    channels: int,
-    state_length: int = 3,
-) -> tuple[int, int, int]:
-    if layout is ConvStateLayout.TIME_MAJOR:
-        return slots, state_length, channels
-    if layout is ConvStateLayout.CHANNEL_MAJOR:
-        return slots, channels, state_length
-    raise TypeError(f"conv-state layout must be ConvStateLayout, got {layout!r}")
-
-
-@dataclass(frozen=True)
-class KimiDecodeGeometry:
-    """One grouped decode/state contract for Kimi-K3 native execution."""
-
-    groups: int
-    q: int
-    conv_state_rows: int
-    state_dtype: str
-    replay_mode: bool
-
-    def __post_init__(self) -> None:
-        if self.groups <= 0:
-            raise ValueError(f"groups must be positive, got {self.groups}")
-        if self.q <= 0:
-            raise ValueError(f"q must be positive, got {self.q}")
-        if self.conv_state_rows < self.q + 2:
-            raise ValueError(
-                "conv_state_rows must retain the q-token rollback window plus "
-                f"two history rows, got q={self.q}, rows={self.conv_state_rows}"
-            )
-        if self.state_dtype not in {"fp16", "fp32"}:
-            raise ValueError(
-                f"state_dtype must be 'fp16' or 'fp32', got {self.state_dtype!r}"
-            )
-
-    @property
-    def tokens(self) -> int:
-        return self.groups * self.q
-
-
 @dataclass(frozen=True)
 class MoeFormat:
     activation: ExpertActivation
@@ -276,16 +207,11 @@ GLM5_CONFIG = LayerConfig(
 GLM5_REFERENCE_TP = 8
 GLM5_TP_SIZES = (4, GLM5_REFERENCE_TP)
 GLM5_GRAPH_BATCHES = tuple(range(1, 97))
-GLM5_AGENTX_BATCHES = tuple(range(2, 11))
+GLM5_AGENTX_BATCHES = (1, 2)
 GLM5_QUERY_LENGTHS = (1, 4, 5, 6)
 GLM5_KERNEL_SAMPLES = (1, 2, 4, 5, 6, 8, 10, 12)
 GLM5_GLOBAL_HEADS = GLM5_CONFIG.local_heads * GLM5_REFERENCE_TP
 GLM5_GLOBAL_INTER = GLM5_CONFIG.inter * GLM5_REFERENCE_TP
-
-
-def glm5_agentx_batches(native_fp4_mfma: bool = False) -> tuple[int, ...]:
-    return (1, *GLM5_AGENTX_BATCHES) if native_fp4_mfma else GLM5_AGENTX_BATCHES
-
 
 def glm5_tp_config(tp_size: int) -> LayerConfig:
     """Return the one GLM-5 shard geometry for ``tp_size``."""

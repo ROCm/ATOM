@@ -16,19 +16,18 @@ from aiter.dist.parallel_state import (
 
 from atom.model_ops.monokernel.config import (
     EPS,
+    GLM5_AGENTX_BATCHES,
     GLM5_CONFIG,
     AttentionWeight,
     KvCacheLayout,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
-    glm5_agentx_batches,
     glm5_kernel_samples,
     glm5_tp_config,
 )
 from atom.model_ops.monokernel.dispatch import (
     MonoUnsupported,
     glm52_native_config,
-    select_backend,
     tp_uniform_local_validation,
 )
 from atom.model_ops.monokernel.weights import (
@@ -301,7 +300,7 @@ class _GlmLayerOp:
             kv_cache_dtype=kv_cache_dtype,
             prepared_weights=prepared_weights,
             runtime=runtime,
-            native_fp4_mfma=envs.ATOM_GLM_NATIVE_FP4_MFMA,
+            native_fp4_mfma=True,
         )
 
     def close(self) -> None:
@@ -311,21 +310,16 @@ class _GlmLayerOp:
 class Glm52MonoDecode:
     """Run eligible GLM-5.2 MoE layers while retaining ATOM's external indexer."""
 
-    def __init__(self, causal_lm, atom_config, mode: str) -> None:
+    def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
         self._atom_config = atom_config
-        self._mode = mode
         self._ops: dict[tuple[int, int], _GlmLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
         self._prepared: dict[int, dict[str, torch.Tensor]] = {}
         self._runtimes: dict[int, object] = {}
         self._refused: set[int] = set()
         self._announced: set[int] = set()
-        self._enabled = mode != "off"
-        self._required = False
-        self._agentx_batches = glm5_agentx_batches(envs.ATOM_GLM_NATIVE_FP4_MFMA)
-        if not self._enabled:
-            return
+        self._enabled = True
 
         config = atom_config.hf_config
         tp_size = atom_config.tensor_parallel_size
@@ -339,7 +333,6 @@ class Glm52MonoDecode:
             mtp=is_mtp,
             query_length=self._query_length,
         )
-        self._required = shard is not None and self._query_length in (5, 6)
         checks = (
             (shard is not None, "native geometry"),
             (getattr(config, "model_type", None) == "glm_moe_dsa", "model type"),
@@ -356,10 +349,6 @@ class Glm52MonoDecode:
         )
         for ok, why in checks:
             if not ok:
-                if self._required:
-                    raise MonoUnsupported(
-                        f"GLM-5.2 required MonoKernel configuration failed: {why}"
-                    )
                 logger.info("GLM-5.2 MonoKernel off: %s", why)
                 self._enabled = False
                 return
@@ -385,20 +374,12 @@ class Glm52MonoDecode:
         }
         for name, value in expected.items():
             if getattr(config, name, None) != value:
-                if self._required:
-                    raise MonoUnsupported(
-                        f"GLM-5.2 required MonoKernel configuration failed: {name}={getattr(config, name, None)!r}"
-                    )
                 logger.info(
                     "GLM-5.2 MonoKernel off: %s=%r", name, getattr(config, name, None)
                 )
                 self._enabled = False
                 return
         if config.moe_intermediate_size != shard.inter * tp_size:
-            if self._required:
-                raise MonoUnsupported(
-                    "GLM-5.2 required MonoKernel configuration failed: expert width"
-                )
             logger.info("GLM-5.2 MonoKernel off: expert width")
             self._enabled = False
             return
@@ -415,10 +396,6 @@ class Glm52MonoDecode:
         if first_moe == len(layers) or any(
             not hasattr(layer.mlp, "experts") for layer in layers[first_moe:]
         ):
-            if self._required:
-                raise MonoUnsupported(
-                    "GLM-5.2 required MonoKernel configuration failed: MoE layer suffix"
-                )
             logger.info("GLM-5.2 MonoKernel off: MoE layers are not a suffix")
             self._enabled = False
             return
@@ -428,10 +405,6 @@ class Glm52MonoDecode:
             if indexer is not None and not layer.self_attn.skip_topk:
                 seen_full_indexer = True
             elif not seen_full_indexer:
-                if self._required:
-                    raise MonoUnsupported(
-                        "GLM-5.2 required MonoKernel configuration failed: shared IndexShare layer precedes a full layer"
-                    )
                 logger.info(
                     "GLM-5.2 MonoKernel off: shared IndexShare layer precedes a full layer"
                 )
@@ -454,10 +427,6 @@ class Glm52MonoDecode:
         if samples in self._refused:
             return False
         if torch.cuda.is_current_stream_capturing():
-            if self._required:
-                raise MonoUnsupported(
-                    f"GLM-5.2 required MonoKernel S={samples} was not prepared before graph capture"
-                )
             return False
 
         from atom.model_ops.monokernel.glm.op import prepare_glm5_weights
@@ -470,9 +439,7 @@ class Glm52MonoDecode:
             _bf16_vector(
                 self._lm.model.norm.weight, "model.norm.weight", self._shard.hidden
             )
-            backend = select_backend(
-                "glm52",
-                self._mode,
+            native_config = glm52_native_config(
                 samples=samples,
                 tp_size=npes,
                 kv_cache_dtype=self._atom_config.kv_cache_dtype,
@@ -481,11 +448,8 @@ class Glm52MonoDecode:
                     and self._atom_config.speculative_config.method == "mtp"
                 ),
                 query_length=query_length,
-                has_moe=True,
-                external_indexer=True,
-                cache_layout="atom",
             )
-            _need(backend == "mono", "layer backend")
+            _need(native_config is not None, "layer backend")
             for layer in layers:
                 if layer.layer_idx not in self._weights:
                     weights = _layer_weights(layer, rank, npes)
@@ -507,8 +471,6 @@ class Glm52MonoDecode:
             )
         except MonoUnsupported as error:
             self._refused.add(samples)
-            if self._required:
-                raise
             logger.warning("GLM-5.2 MonoKernel fallback before launch: %s", error)
             return False
         for layer_idx, weights, prepared in mapped:
@@ -542,10 +504,6 @@ class Glm52MonoDecode:
             if runtime_created:
                 self._runtimes.pop(chunk_samples, None)
             self._refused.add(samples)
-            if self._required:
-                raise MonoUnsupported(
-                    f"GLM-5.2 required MonoKernel construction failed: {error}"
-                ) from error
             logger.warning("GLM-5.2 MonoKernel fallback before launch: %s", error)
             return False
         if rank == 0 and samples not in self._announced:
@@ -553,22 +511,15 @@ class Glm52MonoDecode:
             self._announced.add(samples)
         return True
 
-    def _unsupported(self, reason: str) -> bool:
-        if self._required:
-            raise MonoUnsupported(
-                f"GLM-5.2 required MonoKernel decode failed: {reason}"
-            )
-        return False
-
     def supports(
         self, input_ids, positions, intermediate_tensors, inputs_embeds
     ) -> bool:
         if not self._enabled:
             return False
         if intermediate_tensors is not None:
-            return self._unsupported("intermediate tensors")
+            return False
         if self._lm.model.aux_hidden_state_layers:
-            return self._unsupported("auxiliary hidden states")
+            return False
         samples = input_ids.numel()
         fwd = get_forward_context()
         context = fwd.context
@@ -576,41 +527,34 @@ class Glm52MonoDecode:
         if context is None or metadata is None or context.is_prefill:
             return False
         query_length = metadata.max_seqlen_q
+        native_config = glm52_native_config(
+            samples=samples,
+            tp_size=self._atom_config.tensor_parallel_size,
+            kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            mtp=(
+                self._atom_config.speculative_config is not None
+                and self._atom_config.speculative_config.method == "mtp"
+            ),
+            query_length=query_length,
+        )
+        if native_config is None:
+            return False
         active_batch = getattr(context, "scheduled_bs", None)
         active_batch = samples // query_length if active_batch is None else active_batch
-        if query_length in (5, 6) and active_batch not in self._agentx_batches:
-            return self._unsupported(f"concurrency C={active_batch}")
-        if (
-            select_backend(
-                "glm52",
-                self._mode,
-                samples=samples,
-                tp_size=self._atom_config.tensor_parallel_size,
-                kv_cache_dtype=self._atom_config.kv_cache_dtype,
-                mtp=(
-                    self._atom_config.speculative_config is not None
-                    and self._atom_config.speculative_config.method == "mtp"
-                ),
-                dpa=self._atom_config.enable_dp_attention,
-                dcp=self._atom_config.decode_context_parallel_size > 1,
-                plugin=is_plugin_mode(),
-                query_length=query_length,
-            )
-            != "mono"
-        ):
-            return self._unsupported(f"shape S={samples} q={query_length}")
+        if active_batch not in GLM5_AGENTX_BATCHES:
+            return False
         if (
             positions.dtype is not torch.int64
             or positions.numel() != samples
             or not positions.is_contiguous()
         ):
-            return self._unsupported("positions")
+            return False
         if inputs_embeds is not None and (
             inputs_embeds.shape != (samples, self._shard.hidden)
             or inputs_embeds.dtype is not torch.bfloat16
             or not inputs_embeds.is_contiguous()
         ):
-            return self._unsupported("inputs_embeds")
+            return False
         if (
             fwd.ubatch_slices is not None
             or getattr(context, "running_tokens", samples) != samples
@@ -619,7 +563,7 @@ class Glm52MonoDecode:
             or metadata.sparse_kv_indptr.dtype is not torch.int32
             or metadata.sparse_kv_indptr.numel() < samples + 1
         ):
-            return self._unsupported("paged causal metadata")
+            return False
 
         try:
             shared = _shared_sparse_buffer(self._lm.model.layers)
@@ -645,8 +589,8 @@ class Glm52MonoDecode:
                     and cache.shape[-1] == self._shard.kv_lora + self._shard.pe_dim,
                     f"layer {layer.layer_idx} fused {self._atom_config.kv_cache_dtype} cache",
                 )
-        except (KeyError, MonoUnsupported) as error:
-            return self._unsupported(str(error))
+        except (KeyError, MonoUnsupported):
+            return False
         return self._prepare(samples, query_length)
 
     @staticmethod

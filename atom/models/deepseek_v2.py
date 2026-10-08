@@ -3498,16 +3498,13 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.model.make_empty_intermediate_tensors
         )
         self._glm52_mono = None
-        if getattr(config, "model_type", None) == "glm_moe_dsa":
-            glm52_mono_mode = envs.ATOM_NATIVE_DECODE_MONOKERNEL
-            if glm52_mono_mode != "off":
-                from atom.models.glm52_mono import Glm52MonoDecode
+        if (
+            getattr(config, "model_type", None) == "glm_moe_dsa"
+            and envs.ATOM_GLM_NATIVE_FP4_MFMA
+        ):
+            from atom.models.glm52_mono import Glm52MonoDecode
 
-                self._glm52_mono = Glm52MonoDecode(
-                    self,
-                    atom_config,
-                    glm52_mono_mode,
-                )
+            self._glm52_mono = Glm52MonoDecode(self, atom_config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

@@ -382,14 +382,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # GLM-5.2 / Kimi-K3 native TP8 decode MonoKernel. Model construction
-    # resolves off|auto|mono|staged|staged_c1 once; unsupported forwards use the baseline.
+    # Kimi-K3 C1 fused MoE tail, resolved once at model construction.
     "ATOM_NATIVE_DECODE_MONOKERNEL": lambda: _choice_env(
         "ATOM_NATIVE_DECODE_MONOKERNEL",
         "off",
-        ("off", "auto", "mono", "staged", "staged_c1"),
+        ("off", "staged_c1"),
     ),
-    # GLM production experts use ATOM's 16-byte/lane W4 and shuffled E8M0 ABI.
+    # GLM-5.2 TP4 C1/C2 scaled-FP4 MonoKernel, resolved at model construction.
     "ATOM_GLM_NATIVE_FP4_MFMA": lambda: (
         os.getenv("ATOM_GLM_NATIVE_FP4_MFMA", "0") == "1"
     ),

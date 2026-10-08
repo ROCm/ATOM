@@ -38,23 +38,18 @@ Kimi full-attention layers use true MLA with a compressed latent KV cache. Aiter
 
 Prefix caching remains disabled because the KDA recurrent state is maintained per request and cannot be reconstructed from the paged MLA cache alone. `-tp 8` is required for the model to fit. Use `gpu-memory-utilization 0.93` so the CUDA-graph pool fits alongside the KDA per-request state cache.
 
-### Native KDA MonoKernel decode (opt-in)
+### C1 fused MoE tail (opt-in)
 
-The ATOM-owned path handles supported native TP8 KDA decode batches of 4 or 8
-requests; unsupported layers and forwards continue through the normal path. Enable
-the validated staged mode at model construction:
+The measured TP8 C1 path keeps production attention, KDA and AttnRes, replacing
+only the MoE tail. It requires DSpark with seven speculative tokens, FP8 KV,
+DCP1 and `ATOM_ENABLE_REPLAYSSM=0`. Enable it at model construction:
 
 ```bash
-export ATOM_NATIVE_DECODE_MONOKERNEL=auto
+export ATOM_NATIVE_DECODE_MONOKERNEL=staged_c1
 ```
 
-For FP8 KV cache, run the exact **MXFP4 on 8×MI355 GPUs (TP8)** command above
-unchanged, including its `--online_quant_config`. For BF16 KV cache, run that same
-command and change only `--kv_cache_dtype fp8` to `--kv_cache_dtype bf16`; retain
-every other production argument.
-
-For the final performance A/B, keep the launch command and workload identical and
-change only `ATOM_NATIVE_DECODE_MONOKERNEL` between `off` and `auto`.
+For a performance A/B, keep the launch command and C1 workload identical and
+change only `ATOM_NATIVE_DECODE_MONOKERNEL` between `off` and `staged_c1`.
 
 ---
 
