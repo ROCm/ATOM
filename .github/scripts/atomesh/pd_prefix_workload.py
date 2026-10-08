@@ -24,6 +24,19 @@ def same_output(left, right):
     return bool(left["text"]) and left["text"] == right["text"]
 
 
+def workload_geometry(page_tokens):
+    assert page_tokens > 0
+    mechanism_pages = max(8, (8192 + page_tokens - 1) // page_tokens)
+    performance_pages = max(10, (32768 + page_tokens - 1) // page_tokens)
+    return {
+        "page_tokens": page_tokens,
+        "mechanism_end": mechanism_pages * page_tokens,
+        "mechanism_hit": (mechanism_pages * 3 // 4) * page_tokens,
+        "performance_length": performance_pages * page_tokens + 1,
+        "performance_hit": (performance_pages * 9 // 10) * page_tokens,
+    }
+
+
 class Trace:
     def __init__(self, root):
         self.root = root
@@ -219,13 +232,27 @@ async def run(args):
             suffix = branch if branch[0] != target[hit] else branch[1:]
             assert suffix[0] != target[hit]
             seed = target[:hit] + suffix[:129]
+            with (args.output / "workload.jsonl").open("a") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "group": group,
+                            "item": item,
+                            "hit": hit,
+                            "seed": seed,
+                            "target": target,
+                        }
+                    )
+                    + "\n"
+                )
             workloads.append(
                 {
                     "group": group,
                     "item": item,
                     "hit": hit,
-                    "seed": seed,
-                    "target": target,
+                    "seed_hash": digest(seed),
+                    "target_hash": digest(target),
+                    "target_length": len(target),
                 }
             )
             (args.output / "workload.json").write_text(json.dumps(workloads))
@@ -240,10 +267,16 @@ async def run(args):
                 for seed, _ in pool:
                     await complete(seed, "prepare-seed", count=1)
 
-        await complete(base[:1025], "mechanism-warmup", count=8)
+        warmup = await complete(base[:1025], "mechanism-warmup", count=8)
+        geometry = workload_geometry(warmup["plan"]["page_tokens"])
+        assert geometry["performance_length"] < 1048576
+        base *= (geometry["performance_length"] + len(base) - 1) // len(base)
+        (args.output / "geometry.json").write_text(json.dumps(geometry, indent=2))
         correctness = []
-        for length in (8192, 8193, 8194):
-            seed, target = await pair(length, 6144, f"mechanism-{length}", 0)
+        for length in range(geometry["mechanism_end"], geometry["mechanism_end"] + 3):
+            seed, target = await pair(
+                length, geometry["mechanism_hit"], f"mechanism-{length}", 0
+            )
             reference = await complete(
                 target, "correctness-local-p", url=args.prefill, count=32, observe=False
             )
@@ -258,7 +291,9 @@ async def run(args):
                     "output mismatch",
                 )
                 local = actual["admission"]["local_tokens"]
-                assert local == 0 if condition == "cold" else 0 < local < length - 1
+                assert local == (
+                    0 if condition == "cold" else geometry["mechanism_hit"]
+                )
                 correctness.append(
                     {"length": length, "condition": condition, "passed": True}
                 )
@@ -270,14 +305,16 @@ async def run(args):
         (args.output / "mechanism.json").write_text(json.dumps(correctness, indent=2))
 
         summaries = []
-        for condition, hit in (("cold", 0), ("high", 29440)):
+        for condition, hit in (("cold", 0), ("high", geometry["performance_hit"])):
             active_seconds = 0.0
             measured = []
             segments = []
             cohort = 0
             while active_seconds < args.duration or len(measured) < args.min_samples:
                 pool = [
-                    await pair(32769, hit, f"{condition}-{cohort}", i)
+                    await pair(
+                        geometry["performance_length"], hit, f"{condition}-{cohort}", i
+                    )
                     for i in range(args.pool_size)
                 ]
                 await prepare(pool, condition)
@@ -326,6 +363,7 @@ async def run(args):
             json.dumps(
                 {
                     "variant": args.variant,
+                    "geometry": geometry,
                     "correctness": correctness,
                     "performance": summaries,
                     "workload_hash": digest(workloads),

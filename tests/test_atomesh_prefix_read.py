@@ -19,6 +19,27 @@ def load_script(name):
     return module
 
 
+@pytest.mark.parametrize("page_tokens", [128, 1024, 12288])
+def test_workload_geometry_uses_complete_pages(page_tokens):
+    module = load_script("pd_prefix_workload")
+    geometry = module.workload_geometry(page_tokens)
+    assert geometry["mechanism_end"] >= 8192
+    assert geometry["mechanism_hit"] >= 6 * page_tokens
+    assert geometry["mechanism_hit"] % page_tokens == 0
+    assert geometry["performance_length"] >= 32769
+    assert geometry["performance_hit"] % page_tokens == 0
+    assert (
+        0.8
+        <= geometry["performance_hit"] / (geometry["performance_length"] - 1)
+        <= 0.95
+    )
+    if page_tokens == 12288:
+        assert geometry["mechanism_end"] == 98304
+        assert geometry["mechanism_hit"] == 73728
+        assert geometry["performance_length"] == 122881
+        assert geometry["performance_hit"] == 110592
+
+
 def test_trace_reads_only_complete_lines_and_requires_all_kinds(tmp_path):
     module = load_script("pd_prefix_workload")
     path = tmp_path / "rank.jsonl"

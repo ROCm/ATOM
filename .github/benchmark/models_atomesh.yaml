@@ -917,7 +917,7 @@ models:
         - &mori_prefix_read_a
           <<: *kimi_k3_vllm_dspark_dcp8
           name: kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager
-          isl: [32769]
+          isl: [122881]
           osl: 128
           concurrency: [1]
           run_eval: false
