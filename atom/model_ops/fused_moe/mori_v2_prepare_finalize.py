@@ -743,7 +743,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 raise RuntimeError(
                     "triton_mega_moe drives MegaMoE's token-major dispatch and "
                     "cannot run on the compact stage-1 plan; set "
-                    "ATOM_MEGA_STAGE1_FUSED=0 to use the Triton experts"
+                    "ATOM_MEGA_STAGE1_FUSED=0 to fall back to mori dispatch"
                 )
             from atom.model_ops.fused_moe_triton import triton_mega_moe
 
