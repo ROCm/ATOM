@@ -35,13 +35,11 @@ from aiter.ops.topk import top_k_per_row_decode
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
 from atom.model_ops.v4_kernels import scale_indexer_weights
-from atom.utils import envs
 
 from .candidate_table import lift_candidate_selection
 from .indexer import pick_candidate_blocks
-from .score_workspace import plane_rows
+from .score_workspace import logits_rows
 
 
 def quantize_query_rows(query):
@@ -208,11 +206,10 @@ def score_topk_quantized(
         if candidate_count
         else None
     )
-    band = min(
-        plane_rows(width),
-        sparse_indexer_row_chunk(
-            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
-        ),
+    band = (
+        logits_rows(rows, width)
+        if workspace is None
+        else workspace.logits_rows(rows, width)
     )
     # One band's plane, reused; a short last band is a prefix of it.
     logits = (

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """The paged index scorer's largest temporaries, held for the server's life.
 
-Both are as wide as a request may be long (`plane_rows`), not as its live
-context. Allocated per call they were multi-GiB, at a height that varies with
+Both are as wide as a request may be long, not as its live context. The logits
+band also obeys the shared sparse-indexer byte budget. Allocated per call they
+were multi-GiB, at a height that varies with
 the batch, so the caching allocator was left holding segments too small for
 the next long prefill, which then mapped new ones past the memory budget.
 Sized here from the configuration, before the memory profile, they are counted
@@ -10,6 +11,9 @@ in it and never reallocated.
 """
 
 import torch
+
+from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.utils import envs
 
 
 def plane_rows(width):
@@ -21,6 +25,16 @@ def plane_rows(width):
     there; wherever a batch already fits, this leaves it in one piece.
     """
     return max(1, (2**31 - 1) // width)
+
+
+def logits_rows(rows, width):
+    """One logits band's rows, shared by allocation and execution."""
+    return min(
+        plane_rows(width),
+        sparse_indexer_row_chunk(
+            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        ),
+    )
 
 
 class ScoreWorkspace:
@@ -45,7 +59,7 @@ class ScoreWorkspace:
         }
         widths = [columns * geometry.rows_per_page(ratio) for ratio in ratios]
         self._logits = torch.empty(
-            max((min(max_tokens, plane_rows(w)) * w for w in widths), default=0),
+            max((logits_rows(max_tokens, w) * w for w in widths), default=0),
             dtype=torch.float32,
             device=device,
         )
@@ -78,6 +92,18 @@ class ScoreWorkspace:
     def logits(self, rows, width):
         """`[rows, width]` fp32, one band of the scorer's logits plane."""
         return _view(self._logits, rows, width)
+
+    def logits_rows(self, rows, width):
+        """Rows that fit both the byte budget and this fixed allocation.
+
+        A narrower live/candidate width can round to more total elements than
+        a configured width. Bound by actual storage too, without reallocating
+        buffers captured by graphs or retained by overlapping microbatches.
+        """
+        capacity = self._logits.numel() // width
+        if capacity == 0:
+            raise ValueError("One logits row exceeds the scorer workspace")
+        return min(logits_rows(rows, width), capacity)
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
