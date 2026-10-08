@@ -1988,7 +1988,10 @@ def sparse_attn_indexer(
             # left to filter: the exchange agrees on the cut and emits this
             # rank's owned slots directly, already localized and compacted --
             # the same shape the decode path's fused merge produces.
-            from atom.model_ops.dcp_topk_select import dcp_prefill_candidate_exchange
+            from atom.model_ops.dcp_topk_select import (
+                dcp_prefill_candidate_exchange,
+                dcp_prefill_select_mode,
+            )
 
             dcp_prefill_candidate_exchange(
                 topk_values_prefill,
@@ -2003,6 +2006,7 @@ def sparse_attn_indexer(
                 out_kv_indices=sparse_kv_indices_buffer,
                 out_kv_indptr=dcp_sparse_kv_indptr_buffer,
                 owned_counts=dcp_owned_counts_buffer,
+                select=dcp_prefill_select_mode(),
             )
         elif get_dcp_world_size() > 1:
             # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the

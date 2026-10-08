@@ -368,6 +368,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_INDEXER_PREFILL_BINS": lambda: int(
         os.getenv("ATOM_DCP_INDEXER_PREFILL_BINS", "512")
     ),
+    # How the ranks agree on that cut, once they have each scored only their own
+    # shard. Orthogonal to _LOCAL, which decides whether they shard the scoring at
+    # all; this decides only what crosses the wire afterwards.
+    #   "histogram" -- bracket all-gather + histogram all-reduce. rows * bins * 4
+    #                  bytes, independent of topk and of context length. The cut
+    #                  lands on a bin edge, so the selection is a SUPERSET.
+    #   "exact"     -- all-gather the local candidate SCORES and take the true
+    #                  global k-th. rows * topk * 4 bytes PER RANK, which at the
+    #                  shipped 4096-row chunk and topk=2048 is 32 MiB a rank a
+    #                  layer; far too heavy to serve, but it is bit-exact with the
+    #                  dcp=1 selection and is how the histogram path's
+    #                  over-selection gets measured rather than estimated.
+    "ATOM_DCP_INDEXER_PREFILL_SELECT": lambda: os.getenv(
+        "ATOM_DCP_INDEXER_PREFILL_SELECT", "histogram"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

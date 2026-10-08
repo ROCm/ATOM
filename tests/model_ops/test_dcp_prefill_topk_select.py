@@ -731,3 +731,220 @@ def test_sub_topk_row_needs_k_equal_to_topk(monkeypatch):
             torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
             torch.zeros(rows, dtype=torch.int32, device="cuda"),
         )
+
+
+# --------------------------------------------------------------------------
+# select="exact": the all-gather-candidates reference the histogram is scored
+# against. Same emit, different scalar per row.
+# --------------------------------------------------------------------------
+
+
+def test_select_mode_rejects_a_typo(monkeypatch):
+    """An unreadable mode name must raise, not resolve to the default.
+
+    The exact path's only job is to be the thing the histogram is compared to.
+    A typo that silently selects the histogram makes that comparison measure
+    zero difference and report it as "no over-selection".
+    """
+    from atom.model_ops import dcp_topk_select as mod
+
+    monkeypatch.setattr(mod.envs, "ATOM_DCP_INDEXER_PREFILL_SELECT", "histogram")
+    assert mod.dcp_prefill_select_mode() == "histogram"
+    monkeypatch.setattr(mod.envs, "ATOM_DCP_INDEXER_PREFILL_SELECT", "exact")
+    assert mod.dcp_prefill_select_mode() == "exact"
+    monkeypatch.setattr(mod.envs, "ATOM_DCP_INDEXER_PREFILL_SELECT", "Exact")
+    with pytest.raises(ValueError, match="ATOM_DCP_INDEXER_PREFILL_SELECT"):
+        mod.dcp_prefill_select_mode()
+
+
+class _FakeGroup:
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.rank_in_group = 0
+        self.device_group = None
+
+
+def _exact_thr(monkeypatch, shards, topk, row_tile=512):
+    """Run the shipped exact path with the all-gather replaced by a cat."""
+    from atom.model_ops import dcp_topk_select as mod
+
+    gathered = torch.cat(shards, dim=0)
+    monkeypatch.setattr(mod, "_all_gather_candidates", lambda g, v: gathered)
+    return mod.exact_threshold_from_candidates(
+        _FakeGroup(len(shards)), shards[0], topk, row_tile=row_tile
+    )
+
+
+@needs_gpu
+@pytest.mark.parametrize("row_tile", [512, 2])
+def test_exact_mode_cut_is_the_true_global_kth(monkeypatch, row_tile):
+    """thr is the k-th largest of the union, not the low edge of a bin.
+
+    row_tile=2 runs the loop more than once over 5 rows, which is the only way
+    an off-by-one in the tile slicing shows up -- with the default tile every
+    test is a single iteration.
+    """
+    torch.manual_seed(31)
+    W, rows, k = 3, 5, 24
+    topk = k
+    counts = [k, k, 7, 0, k]
+    shards = [_padded_rows(rows, k, counts, seed=50 + r) for r in range(W)]
+    thr = _exact_thr(monkeypatch, shards, topk, row_tile=row_tile)
+
+    allv = torch.cat(shards, dim=1)
+    for t in range(rows):
+        finite = allv[t][torch.isfinite(allv[t])]
+        if finite.numel() < topk:
+            # Fewer candidates than the target: select all of them, same as the
+            # histogram path's fall to bin 0.
+            assert thr[t].item() == NEG_INF
+            continue
+        want = torch.sort(finite, descending=True).values[topk - 1].item()
+        assert thr[t].item() == pytest.approx(want)
+
+
+@needs_gpu
+def test_exact_mode_reproduces_the_dcp1_selection_exactly(monkeypatch):
+    """Union of the per-rank emits == the exact global top-k. No extras."""
+    torch.manual_seed(32)
+    W, rows, k = 4, 6, 32
+    topk = k
+    shards = [_padded_rows(rows, k, [k, k, 11, k, 0, k], seed=60 + r) for r in range(W)]
+    thr = _exact_thr(monkeypatch, shards, topk)
+
+    allv = torch.cat(shards, dim=1)
+    for t in range(rows):
+        finite = allv[t][torch.isfinite(allv[t])]
+        admitted = int((finite >= thr[t]).sum())
+        assert admitted == min(
+            topk, finite.numel()
+        ), f"row {t} admitted {admitted}, want {min(topk, finite.numel())}"
+
+
+@needs_gpu
+def test_exact_mode_is_a_subset_of_the_histogram_mode(monkeypatch):
+    """The two modes bracket the answer: exact <= histogram, never the reverse.
+
+    This is the measurement harness in test form -- the gap between the two
+    admitted counts IS the over-selection the histogram pays, and it must never
+    be negative, which would mean the histogram had lost a real winner.
+    """
+    torch.manual_seed(33)
+    W, rows, k, nbins = 4, 8, 64, 16
+    topk = k
+    shards = [_padded_rows(rows, k, [k] * rows, seed=70 + r) for r in range(W)]
+    thr_exact = _exact_thr(monkeypatch, shards, topk)
+
+    stats = torch.stack([row_bracket_stats(s) for s in shards], dim=0)
+    lo, hi = reduce_bracket(stats)
+    hist = sum(local_histogram(s, lo, hi, nbins) for s in shards)
+    thr_hist = threshold_from_histogram(hist, lo, hi, topk)
+
+    assert torch.all(thr_hist <= thr_exact + 1e-6)
+    allv = torch.cat(shards, dim=1)
+    n_exact = ((allv >= thr_exact[:, None]) & torch.isfinite(allv)).sum(1)
+    n_hist = ((allv >= thr_hist[:, None]) & torch.isfinite(allv)).sum(1)
+    assert torch.all(n_hist >= n_exact)
+    # A coarse 16 bins over W*K=256 candidates must actually over-select, or
+    # this test would pass just as well against a broken histogram that
+    # happened to return the exact cut.
+    assert int((n_hist - n_exact).sum()) > 0
+
+
+@needs_gpu
+def test_exact_mode_treats_a_non_finite_score_as_absent(monkeypatch):
+    """+inf must not outrank real candidates and then be dropped at emit.
+
+    _admit refuses non-finite scores. If the cut were computed with a +inf
+    counted as a winner, the row would admit topk-1 real tokens -- under-
+    selection, which is exactly what the superset argument exists to rule out.
+    """
+    k = topk = 8
+    a = torch.arange(1.0, 9.0, dtype=torch.float32, device="cuda").reshape(1, k)
+    b = torch.arange(9.0, 17.0, dtype=torch.float32, device="cuda").reshape(1, k)
+    clean = _exact_thr(monkeypatch, [a.clone(), b.clone()], topk)
+    assert clean[0].item() == pytest.approx(9.0)  # 8th of 1..16
+
+    # Poison a candidate ABOVE the cut: replacing 9.0 leaves 15 finite values, so
+    # the 8th largest drops to 8.0. Counting the +inf as a winner would instead
+    # push it UP to 10.0 and leave the row one real token short.
+    poisoned = b.clone()
+    poisoned[0, 0] = POS_INF
+    got = _exact_thr(monkeypatch, [a.clone(), poisoned], topk)
+    assert got[0].item() == pytest.approx(8.0)
+
+
+@needs_gpu
+def test_exchange_rejects_an_unknown_select_mode():
+    rows, k, topk = 1, 4, 4
+    z32 = torch.zeros(rows, k, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="unknown select mode"):
+        dcp_prefill_candidate_exchange(
+            torch.zeros(rows, k, device="cuda"),
+            z32,
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, 4, dtype=torch.int32, device="cuda"),
+            _FakeGroup(2),
+            topk,
+            1,
+            16,
+            torch.zeros(rows * k, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
+            torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            select="bisect",
+        )
+
+
+@needs_gpu
+def test_exchange_in_exact_mode_uses_the_exact_cut_and_the_shared_emit(monkeypatch):
+    """Orchestrator wiring for select="exact": one collective, same emit."""
+    from atom.model_ops import dcp_topk_select as mod
+
+    torch.manual_seed(34)
+    W, rows, k, topk = 2, 3, 32, 32
+    block_size, cols = 4, 8
+    batch_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    block_table = torch.arange(cols, device="cuda").reshape(1, cols).to(torch.int32)
+    local_ks = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    shards = [_padded_rows(rows, k, [k, k, k], seed=80 + r) for r in range(W)]
+    idx0 = (
+        torch.arange(k, dtype=torch.int32, device="cuda").expand(rows, k).contiguous()
+    )
+
+    thr_ref = _exact_thr(monkeypatch, shards, topk)
+    ref = [
+        torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda"),
+        torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
+        torch.zeros(rows, dtype=torch.int32, device="cuda"),
+    ]
+    emit_owned_slots(
+        shards[0], idx0, thr_ref, local_ks, batch_ids, block_table, block_size, *ref
+    )
+
+    # Any use of the histogram transports in this mode is a wiring bug.
+    def _boom(*_a, **_k):
+        raise AssertionError("histogram collective reached in exact mode")
+
+    monkeypatch.setattr(mod, "_all_gather_stats", _boom)
+    monkeypatch.setattr(mod, "_all_reduce_counts", _boom)
+    got = [
+        torch.full((rows * 64,), -7, dtype=torch.int32, device="cuda"),
+        torch.zeros(rows + 1, dtype=torch.int32, device="cuda"),
+        torch.zeros(rows, dtype=torch.int32, device="cuda"),
+    ]
+    dcp_prefill_candidate_exchange(
+        shards[0],
+        idx0,
+        local_ks,
+        batch_ids,
+        block_table,
+        _FakeGroup(W),
+        topk,
+        block_size,
+        16,
+        *got,
+        select="exact",
+    )
+    for g, r in zip(got, ref):
+        assert torch.equal(g, r)

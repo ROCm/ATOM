@@ -9,14 +9,28 @@ the global K-th score: a token in the global top-K is in its own rank's local
 top-K (fewer tokens outrank it locally than globally), so every rank already
 holds every global winner it owns and only needs to know where to cut.
 
-Two collectives agree on that cut:
+Two protocols agree on that cut, selected by ATOM_DCP_INDEXER_PREFILL_SELECT.
+
+"histogram" (default) spends two collectives, neither scaling with topk or with
+context length:
 
   * an all-gather of four per-row scalars, reduced to a bracket [lo, hi] that
     provably contains the global K-th score;
   * an all-reduce of a per-row linear histogram over that bracket.
 
 The cut admits the whole threshold bin, so the emitted set is a SUPERSET of the
-exact global top-K -- nothing the single-rank path would select is lost.
+exact global top-K -- nothing the single-rank path would select is lost, but
+some extra is gained.
+
+"exact" instead all-gathers the candidate scores themselves and takes the true
+global K-th, reproducing the dcp=1 selection exactly. The same superset argument
+is what makes it correct: the union of the local top-K's contains the global
+top-K, so ranking the union ranks the global set. Its payload is rows * topk
+fp32 per rank per layer, which is why it is a reference rather than a default --
+it is how the histogram's over-selection gets measured instead of estimated.
+
+Both share the emit below, so the modes differ only in the value of one scalar
+per row.
 
 The decode twin is ``dcp_ops.dcp_decode_candidate_exchange_fused``, which
 exchanges the candidates themselves. That does not transfer: decode has ~10^2
@@ -57,6 +71,27 @@ def use_dcp_local_indexer_prefill(dcp_world_size: int | None = None) -> bool:
     """
     world = get_dcp_world_size() if dcp_world_size is None else dcp_world_size
     return world > 1 and envs.ATOM_DCP_INDEXER_PREFILL_LOCAL and not pcp_is_enabled()
+
+
+SELECT_HISTOGRAM = "histogram"
+SELECT_EXACT = "exact"
+_SELECT_MODES = (SELECT_HISTOGRAM, SELECT_EXACT)
+
+
+def dcp_prefill_select_mode() -> str:
+    """Which cut-agreement protocol this forward runs. Validated, not defaulted.
+
+    A typo in ``ATOM_DCP_INDEXER_PREFILL_SELECT`` must not silently resolve to the
+    histogram: the whole reason the exact mode exists is to be trusted as the
+    reference the histogram is scored against, and a reference that quietly
+    becomes the thing under test measures a difference of zero.
+    """
+    mode = envs.ATOM_DCP_INDEXER_PREFILL_SELECT
+    if mode not in _SELECT_MODES:
+        raise ValueError(
+            f"ATOM_DCP_INDEXER_PREFILL_SELECT={mode!r} is not one of {_SELECT_MODES}"
+        )
+    return mode
 
 
 @triton.jit
@@ -574,6 +609,60 @@ def _all_reduce_counts(cp_group, counts: torch.Tensor) -> torch.Tensor:
     return counts
 
 
+def _all_gather_candidates(cp_group, local_val: torch.Tensor) -> torch.Tensor:
+    """Gather every rank's ``[rows, K]`` candidate SCORES, concatenated on dim 0.
+
+    Scores only -- the indices stay home. A rank never needs to name another
+    rank's winners, because it never emits them: the global cut is a scalar per
+    row, and once a rank knows it, it filters its own candidates with it. Sending
+    the indices too would double a payload that is already the heaviest thing
+    this file moves, to carry numbers nobody reads.
+    """
+    return cp_group.all_gather(local_val.contiguous(), dim=0)
+
+
+def exact_threshold_from_candidates(
+    cp_group, local_val: torch.Tensor, topk: int, row_tile: int = 512
+) -> torch.Tensor:
+    """Per-row cut value: the TRUE global k-th score, with no bin quantization.
+
+    The reference implementation of the same contract
+    ``threshold_from_histogram`` approximates. It is exact because the union of
+    the per-rank local top-K's provably contains the global top-K (see the module
+    docstring), so a top-K over the gathered ``world * K`` scores IS the global
+    top-K and its minimum IS the global K-th. Emitting ``>= cut`` then reproduces
+    the ``dcp=1`` selection exactly, ties included.
+
+    The price is the payload: ``rows * K`` fp32 per rank per full-index layer,
+    which the histogram exists to avoid. Keep this for A/B and accuracy work.
+
+    Non-finite scores are mapped to ``-inf`` rather than passed to ``topk``, to
+    match ``_admit``, which refuses them. Letting a ``+inf`` through would make it
+    outrank real candidates here and then be dropped at emit, costing the row a
+    selection -- under-selection, the one failure mode the superset argument is
+    supposed to rule out. Rows holding fewer than ``topk`` finite candidates get a
+    ``-inf`` cut and select all of them, exactly as the histogram path does.
+
+    Tiled over rows because the ``[tile, world * K]`` matrix ``topk`` wants is
+    materialized: at ``world=8``, ``K=2048`` the untiled form is 1 GiB for a
+    4096-row chunk. The gathered buffer itself is not tiled -- one collective per
+    layer is the point.
+    """
+    rows, k = local_val.shape
+    world = cp_group.world_size
+    gathered = _all_gather_candidates(cp_group, local_val).reshape(world, rows, k)
+    thr = local_val.new_empty(rows)
+    for start in range(0, rows, row_tile):
+        stop = min(start + row_tile, rows)
+        tile = (
+            gathered[:, start:stop, :].permute(1, 0, 2).reshape(stop - start, world * k)
+        )
+        tile = tile.masked_fill(~torch.isfinite(tile), NEG_INF)
+        kth = torch.topk(tile, topk, dim=1, sorted=False).values.amin(dim=1)
+        thr[start:stop] = kth
+    return thr
+
+
 def dcp_prefill_candidate_exchange(
     local_val: torch.Tensor,
     local_idx: torch.Tensor,
@@ -587,14 +676,21 @@ def dcp_prefill_candidate_exchange(
     out_kv_indices: torch.Tensor,
     out_kv_indptr: torch.Tensor,
     owned_counts: torch.Tensor,
+    select: str = SELECT_HISTOGRAM,
 ) -> None:
     """Agree on the global top-k cut, then emit this rank's owned slots.
 
-    Two collectives, both with payloads that scale with the prefill ROW count
-    rather than with the context length: ``rows * 4`` fp32 gathered, then
-    ``rows * nbins`` int32 reduced. The index-cache all-gather this replaces
+    Only the cut-agreement step differs between the two ``select`` modes; the
+    emit below is shared, so whatever a mode proves about the cut it also proves
+    about the selection.
+
+    ``"histogram"`` spends two collectives whose payloads scale with the prefill
+    ROW count rather than with the context length: ``rows * 4`` fp32 gathered,
+    then ``rows * nbins`` int32 reduced. The index-cache all-gather this replaces
     scaled with ``total_kv`` instead, and forced every rank to re-score the
-    whole sequence.
+    whole sequence. ``"exact"`` spends one collective of ``rows * topk`` fp32 per
+    rank and returns the true global k-th -- a reference, not a shipping option.
+    ``nbins`` is unread in that mode.
 
     Writes ``out_kv_indices`` / ``out_kv_indptr`` / ``owned_counts`` in place and
     returns nothing: like the decode twin, the ownership filter, the slot
@@ -615,12 +711,17 @@ def dcp_prefill_candidate_exchange(
         "a row that holds fewer than topk globally"
     )
 
-    stats = row_bracket_stats(local_val)
-    gathered = _all_gather_stats(cp_group, stats).reshape(world, rows, 4)
-    lo, hi = reduce_bracket(gathered)
+    if select == SELECT_EXACT:
+        thr = exact_threshold_from_candidates(cp_group, local_val, topk_tokens)
+    elif select == SELECT_HISTOGRAM:
+        stats = row_bracket_stats(local_val)
+        gathered = _all_gather_stats(cp_group, stats).reshape(world, rows, 4)
+        lo, hi = reduce_bracket(gathered)
 
-    hist = _all_reduce_counts(cp_group, local_histogram(local_val, lo, hi, nbins))
-    thr = threshold_from_histogram(hist, lo, hi, topk_tokens)
+        hist = _all_reduce_counts(cp_group, local_histogram(local_val, lo, hi, nbins))
+        thr = threshold_from_histogram(hist, lo, hi, topk_tokens)
+    else:
+        raise ValueError(f"unknown select mode {select!r}, want one of {_SELECT_MODES}")
 
     emit_owned_slots(
         local_val,
