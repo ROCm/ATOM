@@ -54,7 +54,7 @@ class AiterMhaBackendForVllm(_VllmAttentionBackendCompat):
         return "CUSTOM"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         # Keep the physical kernel page at 16 even when vLLM's hybrid KV manager
         # uses a larger logical page. Advertising arbitrary multiples makes
         # fp8 hybrid models execute cache kernels against the unsplit logical
@@ -140,7 +140,7 @@ class AiterMhaFlexibleBlockBackendForVllm(AiterMhaBackendForVllm):
     """Draft-only backend whose Triton path accepts the logical KV page size."""
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [MultipleOf(16)]
 
 
@@ -159,7 +159,7 @@ class AiterMlaBackendForVllm(_VllmAttentionBackendCompat):
         return "CUSTOM"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [1]
 
     @classmethod
@@ -310,7 +310,7 @@ class AiterSparseMlaBackendForVllm(AiterMlaBackendForVllm):
     """vLLM-facing sparse MLA backend surface for ATOM attention layers."""
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [1, 64]
 
     @classmethod
@@ -343,7 +343,7 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
     """vLLM-facing sparse MLA indexer backend surface."""
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [1, 64]
 
     @classmethod
@@ -394,7 +394,7 @@ class MiniMaxM3SparseAttentionBackend(_VllmAttentionBackendCompat):
         return "MINIMAX_M3_SPARSE"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [SPARSE_BLOCK_SIZE]
 
     @classmethod
@@ -476,7 +476,7 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
         return "MINIMAX_M3_SPARSE_INDEXER"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [SPARSE_BLOCK_SIZE]
 
     @classmethod

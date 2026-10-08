@@ -2568,7 +2568,21 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
         from vllm.utils.math_utils import cdiv
-        from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
+        try:
+            from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
+        except ImportError:
+            # vLLM 0.31 dropped this helper from cp_utils (nothing upstream
+            # called it any more). It was exactly "the DCP world size, or 1
+            # when DCP is not initialised" -- keep that, read off the same
+            # group object, so the block-table sizing below is unchanged.
+            from vllm.distributed import get_dcp_group
+
+            def get_kv_cache_shard_count() -> int:
+                try:
+                    return get_dcp_group().world_size
+                except AssertionError:
+                    return 1
+
 
         from atom.models.utils import extract_layer_index
 

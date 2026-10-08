@@ -587,7 +587,7 @@ class AtomDeepseekV4ProxyBackend(AttentionBackend):
         return "ATOM_DEEPSEEK_V4_PROXY"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [ATOM_DEEPSEEK_V4_BLOCK_SIZE]
 
     @classmethod
@@ -1130,10 +1130,47 @@ def _infer_atom_attn_state(common_attn_metadata, num_spec_tokens: int = 0):
     decode_q = 1 + max(0, int(num_spec_tokens))
     if _is_pure_uniform_decode(common_attn_metadata, decode_q):
         return AttnState.DECODE
-    num_computed = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
-    if num_computed is not None and bool((num_computed > 0).any().item()):
+    if _batch_has_computed_context(common_attn_metadata):
         return AttnState.PREFILL_PREFIX
     return AttnState.PREFILL_NATIVE
+
+
+def _batch_has_computed_context(common_attn_metadata) -> bool:
+    """True iff any row already has KV committed (``num_computed > 0``).
+
+    vLLM 0.31 removed ``CommonAttentionMetadata._num_computed_tokens_cpu``
+    (deprecated in 0.29, deleted with the rest of the deprecated CPU mirrors),
+    so derive the same quantity on the HOST without a device sync:
+    ``num_computed = seq_len - query_len``. Read the raw backing attributes in
+    the same order ``_build_dsv4_metadata`` does -- the exact ``_seq_lens_cpu``
+    when a build still carries it, else ``seq_lens_cpu_upper_bound``, which is
+    always populated and is exact for prefill rows and for every decode row
+    outside async spec-decode (which this integration does not use). Only fall
+    back to a blocking D2H when neither exists.
+
+    An upper bound can only overstate ``num_computed``, i.e. it can only pick
+    PREFILL_PREFIX where PREFILL_NATIVE would do. That is the safe direction:
+    ``_populate_indexer``'s prefix path handles a batch with no committed KV,
+    while the native path cannot handle one that has it.
+    """
+    num_reqs = int(getattr(common_attn_metadata, "num_reqs", 0) or 0)
+    if num_reqs <= 0:
+        return False
+    q_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
+    if q_cpu is None:
+        return False
+    seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+    if seq_lens_cpu is None:
+        seq_lens = getattr(common_attn_metadata, "seq_lens", None)
+        if seq_lens is None:
+            return False
+        seq_lens_cpu = seq_lens.cpu()
+    q_np = q_cpu[: num_reqs + 1].numpy().astype(np.int64)
+    query_lens = np.diff(q_np)
+    seq_np = seq_lens_cpu[:num_reqs].numpy().astype(np.int64)
+    return bool((seq_np - query_lens > 0).any())
 
 
 def _is_pure_uniform_decode(common_attn_metadata, decode_q: int) -> bool:
