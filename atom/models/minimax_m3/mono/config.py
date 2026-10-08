@@ -46,6 +46,8 @@ PAGE16 = 16
 
 MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
 TP = 4
+# vLLM mode: scalar KV scales, independent index addresses, unit-FP8 index Q.
+VLLM_CACHE_ABI_VERSION = 1
 # indexer context parallelism: a rank computes every index q head
 MAX_QKV_ROWS = qkv_rows(TP)
 # indexer context parallelism serves a step's requests past this many index
