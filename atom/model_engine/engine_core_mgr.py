@@ -7,17 +7,17 @@ import logging
 import multiprocessing
 import multiprocessing.shared_memory
 import os
-import pickle
 import queue
 import time
 import uuid
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, RLock, Thread, local
+from threading import Lock, RLock, Thread, get_ident, local
 
 import zmq
 import zmq.asyncio
+from zmq.utils.monitor import recv_monitor_message
 
 from atom.config import Config
 from atom.model_engine.collective_rpc import (
@@ -35,7 +35,9 @@ from atom.model_engine.engine_utility import (
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
 )
-from atom.model_engine.prefix_hash import take_shipped_chains
+from atom.model_engine.ipc.buffer_types import HostIdentity
+from atom.model_engine.ipc.dto import CompletionResult
+from atom.model_engine.ipc.manager_transport import ManagerTransport
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.observability import tracing
@@ -173,15 +175,10 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     return visible
 
 
-def _add_frame(seqs: list[Sequence]) -> bytes:
-    """An ADD request for an engine that admits `seqs` with a BlockManager:
-    their shipped prompt chains, if any, ride third (`take_shipped_chains`)."""
-    chains = take_shipped_chains(seqs)
-    frame = (EngineCoreRequestType.ADD, seqs) + ((chains,) if chains else ())
-    return pickle.dumps(frame)
-
-
 class CoreManager:
+    # Why requests through this manager cannot be traced, if they cannot.
+    _trace_unsupported: str | None = None
+
     def _init_shared_state(
         self,
         config: Config,
@@ -211,6 +208,19 @@ class CoreManager:
         IndexError the moment the balancer picked a remote rank.
         """
         self.label = label
+        self._config = config
+        self._ipc = ManagerTransport(
+            config, enable_shm=getattr(self, "is_coordinator", True)
+        )
+        self._startup_deadline = time.monotonic() + config.ipc_startup_timeout
+        self._submission_lock = RLock()
+        self._request_writer_id = None
+        self._request_targets = {}
+        self._committed_targets = {}
+        self._submission_ids = {}
+        self._cancelled = set()
+        self._callback_only = set()
+        self._peer_failures = {}
         self._closed = False  # Track whether already closed
         self.local_engine_count = local_engine_count
         self.global_engine_count = (
@@ -246,6 +256,7 @@ class CoreManager:
         # is only safe to admit if it fits wherever the router sends it.
         self.max_pool_tokens: int | None = None
         self.engine_core_processes = []
+        self._local_process_by_rank = {}
         self._distributed_stores = []
         self.input_sockets = []
         self.output_sockets = []
@@ -488,6 +499,11 @@ class CoreManager:
                     )
                     info["process"].start()
                     self.engine_core_processes.append(info["process"])
+                    wire_rank = (
+                        dp_rank * self.pp_size
+                        + info["config"].parallel_config.pipeline_parallel_rank
+                    )
+                    self._local_process_by_rank[wire_rank] = info["process"]
 
                 if not self.is_coordinator:
                     # A worker node hosts engines but owns no router: the
@@ -522,16 +538,24 @@ class CoreManager:
 
                 for addresses in bind_addresses:
                     input_socket = make_zmq_socket(
-                        self.ctx, addresses["input_address"], zmq.ROUTER, bind=True
+                        self.ctx,
+                        addresses["input_address"],
+                        zmq.ROUTER,
+                        bind=True,
+                        hwm=config.ipc_max_pending_jobs,
                     )
-                    identity, _ = input_socket.recv_multipart()
+                    identity = self._receive_identity(input_socket)
                     self.input_sockets.append(input_socket)
                     self.engine_core_identities.append(identity)
 
                     control_socket = make_zmq_socket(
-                        self.ctx, addresses["control_address"], zmq.ROUTER, bind=True
+                        self.ctx,
+                        addresses["control_address"],
+                        zmq.ROUTER,
+                        bind=True,
+                        hwm=config.ipc_max_pending_jobs,
                     )
-                    control_identity, _ = control_socket.recv_multipart()
+                    control_identity = self._receive_identity(control_socket)
                     self.control_sockets.append(control_socket)
                     self.control_identities.append(control_identity)
 
@@ -544,6 +568,7 @@ class CoreManager:
                         addresses["output_address"],
                         zmq.PULL,
                         bind=True,
+                        hwm=config.ipc_max_pending_jobs,
                     )
                     self.output_sockets.append(output_socket)
                     self.shutdown_paths.append(get_open_zmq_inproc_path())
@@ -602,44 +627,72 @@ class CoreManager:
             self.max_pool_tokens = min(self.max_pool_tokens, reported)
 
     def _wait_for_all_ready_signals(self):
-        """Wait for READY signals from all DP ranks in parallel (no timeout)."""
+        pending = set(range(len(self.output_sockets)))
         poller = zmq.Poller()
-        for dp_rank, output_socket in enumerate(self.output_sockets):
-            poller.register(output_socket, zmq.POLLIN)
+        for socket in self.output_sockets:
+            poller.register(socket, zmq.POLLIN)
+        deadline = self._startup_deadline
+        while pending:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Engine IPC handshake timed out: ranks {sorted(pending)}"
+                )
+            if self.finished_procs():
+                raise RuntimeError("Engine process exited during IPC handshake")
+            for socket, _ in poller.poll(100):
+                rank = self.output_sockets.index(socket)
+                message = self._ipc.result.decode(socket.recv_multipart(copy=False))
+                self._handle_handshake(rank, message)
+                if self._ipc.peers.get(rank, {}).get("ready"):
+                    pending.discard(rank)
 
-        engine_count = len(self.output_sockets)
-        ready_received = [False] * engine_count
-        remaining = engine_count
+    def _receive_identity(self, socket):
+        while not socket.poll(100):
+            if time.monotonic() >= self._startup_deadline or self.finished_procs():
+                raise RuntimeError("engine failed to connect its IPC socket")
+        frames = socket.recv_multipart()
+        if len(frames) != 2 or frames[1] != b"":
+            raise ValueError("invalid engine socket identity handshake")
+        return frames[0]
 
-        while remaining > 0:
-            socks = poller.poll()  # Wait indefinitely
-            if not socks:
-                continue
-
-            for socket, _ in socks:
-                # Find which DP rank this socket belongs to
-                dp_rank = self.output_sockets.index(socket)
-                if ready_received[dp_rank]:
-                    continue
-
-                obj = socket.recv(copy=False)
-                request_type, data = pickle.loads(obj)
-
-                if request_type == EngineCoreRequestType.READY:
-                    logger.info(
-                        f"{self.label}: DP rank {dp_rank} is fully initialized and ready"
-                    )
-                    self._record_ready_payload(data)
-                    ready_received[dp_rank] = True
-                    remaining -= 1
-                elif request_type == EngineCoreRequestType.SHUTDOWN:
-                    raise RuntimeError(
-                        f"{self.label}: Received unexpected SHUTDOWN signal from DP rank {dp_rank} during initialization"
-                    )
-                else:
-                    raise RuntimeError(
-                        f"{self.label}: Expected READY signal from DP rank {dp_rank}, but got {request_type}"
-                    )
+    def _handle_handshake(self, rank, message):
+        if message.kind == EngineCoreRequestType.READY:
+            engine_id = message.metadata["engine_id"]
+            if not engine_id or rank in self._ipc.peers:
+                raise ValueError("missing or duplicate engine instance ID")
+            self._record_ready_payload(message.payload)
+            host_id = message.payload.get("host_id", "")
+            self._ipc.peers[rank] = {
+                "engine_id": engine_id,
+                "shm": False,
+                "ready": False,
+                "host_id": host_id,
+                "buffer_modes": message.payload.get("buffer_modes", []),
+                "same_host": bool(host_id and host_id == HostIdentity.current()),
+            }
+            self.input_sockets[rank].setsockopt(zmq.ROUTER_MANDATORY, 1)
+            self.control_sockets[rank].setsockopt(zmq.ROUTER_MANDATORY, 1)
+            self._send_control(
+                rank,
+                self._ipc.control.encode(
+                    "BUFFER_PROBE",
+                    self._ipc.probe_payload(rank),
+                    **self._ipc.context(rank),
+                ),
+            )
+        elif message.kind == "BUFFER_PROBE_RESULT":
+            peer = self._ipc.peers.get(rank, {})
+            if message.metadata[
+                "session_id"
+            ] != self._ipc.session_id or message.metadata["engine_id"] != peer.get(
+                "engine_id"
+            ):
+                raise ValueError("IPC probe belongs to another session")
+            self._ipc.accept_probe(rank, message.payload)
+        elif message.kind == EngineCoreRequestType.METRICS:
+            self.latest_metrics[rank] = message.payload
+        else:
+            raise RuntimeError(f"Unexpected IPC handshake message: {message.kind}")
 
     def _create_output_thread(
         self, dp_rank: int, output_socket: zmq.Socket, shutdown_path: str
@@ -647,34 +700,49 @@ class CoreManager:
         def process_outputs_socket():
             assert isinstance(output_socket, zmq.Socket)
             shutdown_socket = self.ctx.socket(zmq.PAIR)
+            monitor = output_socket.get_monitor_socket(events=zmq.EVENT_DISCONNECTED)
             try:
                 shutdown_socket.bind(shutdown_path)
                 poller = zmq.Poller()
                 poller.register(shutdown_socket, zmq.POLLIN)
                 poller.register(output_socket, zmq.POLLIN)
+                poller.register(monitor, zmq.POLLIN)
                 logger.debug(f"{self.label} (DP {dp_rank}): output thread started")
                 while True:
-                    socks = poller.poll()
+                    socks = dict(poller.poll(100))
+                    self._ipc.reap()
+                    if self._closed:
+                        break
+                    if monitor in socks:
+                        recv_monitor_message(monitor)
+                        raise ConnectionError(f"engine rank {dp_rank} disconnected")
+                    process = self._local_process_by_rank.get(dp_rank)
+                    if process is not None and not process.is_alive():
+                        raise RuntimeError(f"engine rank {dp_rank} exited")
                     if not socks:
                         continue
-                    if len(socks) == 2 or socks[0][0] == shutdown_socket:
+                    if shutdown_socket in socks:
                         # shutdown signal, exit thread.
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive shutdown signal"
                         )
                         break
-
-                    obj = output_socket.recv(copy=False)
-                    try:
-                        request_type, data = pickle.loads(obj)
-                    except Exception:
-                        # Every request on this DP rank waits on this thread,
-                        # so one message it cannot decode must not end it.
-                        logger.exception(
-                            f"{self.label} (DP {dp_rank}): dropping an engine "
-                            f"message that cannot be decoded"
-                        )
+                    if output_socket not in socks:
                         continue
+
+                    message = self._ipc.result.decode(
+                        output_socket.recv_multipart(copy=False),
+                        session_id=self._ipc.session_id,
+                        engine_id=self._ipc.peers[dp_rank]["engine_id"],
+                    )
+                    request_type, data = message.kind, message.payload
+                    self._ipc.reap()
+                    if request_type == "BUFFER_RELEASE":
+                        self._ipc.release_consumer(dp_rank, data)
+                        continue
+                    if request_type in ("ERROR", "STOPPED"):
+                        self._fail_peer(dp_rank, RuntimeError(str(data)))
+                        break
                     if request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
@@ -746,7 +814,12 @@ class CoreManager:
                         self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
-                        seqs = data
+                        with self._submission_lock:
+                            seqs = [
+                                CompletionResult(**value)
+                                for value in data
+                                if value["id"] in self._request_targets
+                            ]
                         # Offline (non-streaming) completions arrive here as
                         # finished sequences; release their in-flight DP load.
                         #
@@ -764,6 +837,12 @@ class CoreManager:
                         for seq in seqs:
                             delivered |= self._deliver_terminal_output(seq)
                             self._release_seq_load(seq.id)
+                            with self._submission_lock:
+                                other_ranks = self._committed_targets.get(
+                                    seq.id, set()
+                                ) - {dp_rank}
+                            for other_rank in other_ranks:
+                                self._send_abort(other_rank, seq.id)
                         if delivered and self._flush_stream_batch_fn is not None:
                             # The callbacks above only buffer into a thread-local;
                             # without this flush the chunk never reaches the
@@ -775,10 +854,28 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        offline = []
+                        with self._submission_lock:
+                            for seq in seqs:
+                                if seq.id not in self._callback_only:
+                                    offline.append(seq)
+                                self._callback_only.discard(seq.id)
+                                self._request_targets.pop(seq.id, None)
+                                self._committed_targets.pop(seq.id, None)
+                                self._submission_ids.pop(seq.id, None)
+                                self._cancelled.discard(seq.id)
+                        if offline:
+                            self.outputs_queue.put_nowait(offline)
+            except Exception as exc:
+                logger.exception(
+                    "%s: output channel for rank %s failed", self.label, dp_rank
+                )
+                self._fail_peer(dp_rank, exc)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
+                output_socket.disable_monitor()
+                monitor.close(linger=0)
                 output_socket.close(linger=0)
 
         return Thread(
@@ -831,7 +928,12 @@ class CoreManager:
     def close(self):
         if self._closed:
             return
-        self._closed = True
+        with self._submission_lock:
+            self._closed = True
+            self._ipc.closed = True
+        self._ipc.executor.shutdown(wait=True, cancel_futures=True)
+        for rank in range(len(self.input_sockets)):
+            self._fail_peer(rank, RuntimeError("CoreManager closed"))
 
         logger.info(
             f"{self.label}: Shutting down {len(self.input_sockets)} EngineCores"
@@ -842,24 +944,33 @@ class CoreManager:
 
         for input_socket in self.input_sockets:
             if not input_socket.closed:
-                input_socket.close()
+                input_socket.close(linger=0)
 
         for control_socket in self.control_sockets:
             if not control_socket.closed:
-                control_socket.close()
+                control_socket.close(linger=0)
 
-        for shutdown_path in self.shutdown_paths:
-            if shutdown_path:
+        for shutdown_path, thread in zip(self.shutdown_paths, self.output_threads):
+            if shutdown_path and thread.is_alive():
                 try:
                     with self.ctx.socket(zmq.PAIR) as shutdown_sender:
+                        shutdown_sender.setsockopt(zmq.LINGER, 0)
+                        shutdown_sender.setsockopt(zmq.SNDTIMEO, 100)
                         shutdown_sender.connect(shutdown_path)
                         shutdown_sender.send(b"")
-                except Exception as e:
+                except zmq.ZMQError as e:
                     logger.debug(f"{self.label}: Error sending shutdown signal: {e}")
 
         for thread in self.output_threads:
             if thread and thread.is_alive():
                 thread.join(timeout=0.5)
+
+        for rank, output_socket in enumerate(self.output_sockets):
+            if (
+                rank >= len(self.output_threads)
+                or not self.output_threads[rank].is_alive()
+            ):
+                output_socket.close(linger=0)
 
         # Wait for EngineCore processes to exit gracefully.
         # Use a single deadline so all processes share the grace period
@@ -882,76 +993,247 @@ class CoreManager:
             if proc is not None and proc.is_alive():
                 proc.join(timeout=1)
 
+        dead_engines = []
         # Final join + close to release sentinel semaphores
         for proc in self.engine_core_processes:
             if proc is not None:
                 if proc.is_alive():
                     proc.kill()
                 proc.join(timeout=1)
+                if not proc.is_alive():
+                    dead_engines.extend(
+                        self._ipc.peers[rank]["engine_id"]
+                        for rank, local in self._local_process_by_rank.items()
+                        if local is proc and rank in self._ipc.peers
+                    )
                 try:
                     proc.close()
                 except (ValueError, OSError):
                     pass
 
+        if all(not thread.is_alive() for thread in self.output_threads):
+            self.ctx.term()
+        self._ipc.close(dead_engines)
+
         # Release the rendezvous server after stopping the local engine processes.
         self._distributed_stores.clear()
         logger.info(f"{self.label}: All EngineCores shut down")
 
-    def _send_request(self, dp_rank: int, payload: bytes) -> None:
-        """Send one already-pickled request to an engine core. Hot path.
-
-        Deliberately unsynchronized: ``input_sockets`` carries nothing but
-        ``add_request``, which runs on a single thread (the API server's event
-        loop online, the caller's thread offline). Everything that can be sent
-        from another thread -- utility commands, abort, shutdown -- goes to
-        :meth:`_send_control` on a separate socket instead.
-
-        That separation is load-bearing, not stylistic. A ZMQ socket is not
-        thread-safe: two unserialized ``send_multipart`` calls interleave their
-        frames, the DEALER on the other end then reads a routing identity where
-        a payload should be, and its input thread dies on ``UnpicklingError``.
-        Nothing recovers from that -- the engine spins on a forever-empty input
-        queue, the workers idle, and every client hangs with no error logged
-        anywhere but that thread's own traceback. So: never send to
-        ``input_sockets`` from anywhere but here.
-        """
-        self.input_sockets[dp_rank].send_multipart(
-            [self.engine_core_identities[dp_rank], payload], copy=False
+    def _send_request(self, dp_rank, payload):
+        """The request socket stays on the caller's original writer thread."""
+        writer = get_ident()
+        if self._request_writer_id is None:
+            self._request_writer_id = writer
+        elif self._request_writer_id != writer:
+            raise RuntimeError("request socket used from a different writer thread")
+        return self.input_sockets[dp_rank].send_multipart(
+            [self.engine_core_identities[dp_rank], *payload.frames],
+            flags=zmq.DONTWAIT,
+            copy=False,
+            track=True,
         )
 
-    def _send_control(self, dp_rank: int, payload: bytes, copy: bool = False) -> None:
-        """Send one already-pickled control message. Serialized, never hot.
-
-        Writers here are the event loop (abort, the /debug/* endpoints) and the
-        per-rank output threads (shutdown), so this does need a lock -- but none
-        of them runs per request, so its cost never lands on admission.
-        """
-        with self._control_send_lock:
-            self.control_sockets[dp_rank].send_multipart(
-                [self.control_identities[dp_rank], payload], copy=copy
-            )
-
-    def add_request(self, seqs: list[Sequence]):
-        tracing.bind_sequences(seqs)
-        logger.debug(
-            f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
+    def _send_control(self, dp_rank, payload, *, deadline=None):
+        deadline = min(
+            deadline if deadline is not None else float("inf"),
+            time.monotonic() + self._config.ipc_send_timeout,
         )
-        # Register callbacks before sending to engine core
-        for seq in seqs:
-            if seq.stream_callback is not None:
-                self._seq_id_to_callback[seq.id] = seq.stream_callback
-                seq.stream_callback = None
-        if self.pp_size > 1:
-            # Pipeline parallel (dp=1): requests enter only at stage 0, which
-            # drives the pipeline downstream.
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, _add_frame(seqs))
-        elif self._routable_engine_count == 1:
-            # Single routable engine, send all requests
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, _add_frame(seqs))
-        else:
-            self._dispatch_to_dp_ranks(seqs)
+        if not self._control_send_lock.acquire(
+            timeout=max(0, deadline - time.monotonic())
+        ):
+            raise TimeoutError("engine control writer is busy")
+        try:
+            while True:
+                try:
+                    tracker = self.control_sockets[dp_rank].send_multipart(
+                        [self.control_identities[dp_rank], *payload.frames],
+                        flags=zmq.DONTWAIT,
+                        copy=False,
+                        track=True,
+                    )
+                    self._ipc.retain(tracker, payload)
+                    return
+                except zmq.Again:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("engine control send timed out")
+                    self.control_sockets[dp_rank].poll(10, zmq.POLLOUT)
+        finally:
+            self._control_send_lock.release()
+
+    def _plan_requests(self, seqs):
+        hints = self._resolve_and_validate_hints(seqs)
+        buckets = [[] for _ in range(self._routable_engine_count)]
+        with self._lb_lock:
+            for seq, hint in zip(seqs, hints):
+                rank = (
+                    0
+                    if self.pp_size > 1
+                    else self._select_dp_rank_for_seq_locked(seq, hint)
+                )
+                if (
+                    self._dp_lb_strategy != "round_robin"
+                    or self._dp_session_affinity_enabled
+                ):
+                    self._charge_seq_load_locked(seq, rank)
+                buckets[rank].append(seq)
+        size = self._config.ipc_max_batch_size
+        return [
+            (rank, values[start : start + size])
+            for rank, values in enumerate(buckets)
+            for start in range(0, len(values), size)
+        ]
+
+    def _register_submission(self, seqs):
+        with self._submission_lock:
+            if self._closed:
+                raise RuntimeError("CoreManager is closed")
+            if len({seq.id for seq in seqs}) != len(seqs):
+                raise ValueError("duplicate request IDs in admission")
+            if any(seq.id in self._request_targets for seq in seqs):
+                raise ValueError("request is already submitted")
+            routes = self._plan_requests(seqs)
+            sequence = self._ipc.next_id()
+            if any(rank in self._peer_failures for rank, _ in routes):
+                for seq in seqs:
+                    self._release_seq_load(seq.id)
+                raise RuntimeError("an admission target is unavailable")
+            for rank, values in routes:
+                for seq in values:
+                    seq.submission_sequence = sequence
+                    self._request_targets.setdefault(seq.id, set()).add(rank)
+                    self._submission_ids[seq.id] = sequence
+            for seq in seqs:
+                if seq.stream_callback is not None:
+                    self._seq_id_to_callback[seq.id] = seq.stream_callback
+                if seq.callback_only:
+                    self._callback_only.add(seq.id)
+            return routes
+
+    def _try_commit(self, entry):
+        with self._submission_lock:
+            if self._closed:
+                raise RuntimeError("CoreManager closed during admission")
+            if entry.rank in self._peer_failures:
+                raise RuntimeError(f"engine rank {entry.rank} is unavailable")
+            if all(seq.id in self._cancelled for seq in entry.requests):
+                return True, None
+            self._ipc.activate(entry)
+            try:
+                tracker = self._send_request(entry.rank, entry.message)
+            except zmq.Again:
+                return False, None
+            entry.sent = True
+            entry.tracker = tracker
+            cancelled = []
+            for seq in entry.requests:
+                self._committed_targets.setdefault(seq.id, set()).add(entry.rank)
+                if seq.id in self._cancelled:
+                    cancelled.append(seq.id)
+            self._ipc.retain(tracker, entry.message, entry.pins)
+            entry.pins = []
+        for req_id in cancelled:
+            self._send_abort(entry.rank, req_id)
+        return True, tracker
+
+    def _finish_submission(self, routes, prepared, nbytes, trackers, failed=False):
+        committed = {
+            seq.id for entry in prepared if entry.sent for seq in entry.requests
+        }
+        all_ids = {seq.id for _, values in routes for seq in values}
+        if failed:
+            for req_id in committed:
+                self.abort_request(req_id)
+        for entry in prepared:
+            if entry.sent:
+                entry.release()
+            else:
+                self._ipc.forget_unsent(entry)
+        with self._submission_lock:
+            for req_id in all_ids - committed:
+                self._release_seq_load(req_id)
+                self._request_targets.pop(req_id, None)
+                self._submission_ids.pop(req_id, None)
+                self._seq_id_to_callback.pop(req_id, None)
+                self._callback_only.discard(req_id)
+                self._cancelled.discard(req_id)
+        self._ipc.defer_unreserve(
+            nbytes, [entry.tracker for entry in prepared if entry.sent]
+        )
+
+    def add_request(self, seqs):
+        if not seqs:
+            return
+        tracing.bind_sequences(seqs, unsupported=self._trace_unsupported)
+        nbytes = self._ipc.input_bytes(seqs)
+        deadline = time.monotonic() + self._config.ipc_send_timeout
+        while not self._ipc.reserve(nbytes):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("IPC preparation queue is full")
+            time.sleep(0.005)
+        routes, prepared, trackers = [], [], []
+        failed = True
+        try:
+            routes = self._register_submission(seqs)
+            prepared = self._ipc.prepare(routes)
+            for entry in prepared:
+                while True:
+                    done, tracker = self._try_commit(entry)
+                    if done:
+                        trackers.append(tracker)
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("engine request send timed out")
+                    self.input_sockets[entry.rank].poll(10, zmq.POLLOUT)
+            failed = False
+        finally:
+            self._finish_submission(routes, prepared, nbytes, trackers, failed)
+
+    async def add_request_async(self, seqs):
+        if not seqs:
+            return
+        tracing.bind_sequences(seqs, unsupported=self._trace_unsupported)
+        nbytes = self._ipc.input_bytes(seqs)
+        deadline = time.monotonic() + self._config.ipc_send_timeout
+        while not self._ipc.reserve(nbytes):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("IPC preparation queue is full")
+            await asyncio.sleep(0.005)
+        routes, prepared, trackers = [], [], []
+        failed = True
+        deferred_cleanup = False
+        try:
+            routes = self._register_submission(seqs)
+            future = self._ipc.executor.submit(self._ipc.prepare, routes)
+            try:
+                prepared = await asyncio.shield(asyncio.wrap_future(future))
+            except asyncio.CancelledError:
+                # The worker owns the buffers until sealing actually finishes.
+                def discard(done, routes=routes, nbytes=nbytes):
+                    try:
+                        values = done.result()
+                    except BaseException:
+                        logger.debug(
+                            "Cancelled admission preparation failed", exc_info=True
+                        )
+                        values = []
+                    self._finish_submission(routes, values, nbytes, [], True)
+
+                deferred_cleanup = True
+                future.add_done_callback(discard)
+                raise
+            for entry in prepared:
+                while True:
+                    done, tracker = self._try_commit(entry)
+                    if done:
+                        trackers.append(tracker)
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("engine request send timed out")
+                    await asyncio.sleep(0.001)
+            failed = False
+        finally:
+            if not deferred_cleanup:
+                self._finish_submission(routes, prepared, nbytes, trackers, failed)
 
     @property
     def _routable_engine_count(self) -> int:
@@ -990,87 +1272,8 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
-        """Route a batch across DP ranks and send each rank its sub-batch.
-
-        Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
-        via ``_select_dp_rank_locked`` (load-aware by default). Selection and the
-        in-flight-load charge happen atomically under ``_lb_lock`` so a burst of
-        requests spreads across ranks instead of all landing on the current
-        minimum.
-        """
-        # Resolve + validate all hints in one pass first — no charging until the
-        # whole batch is known good, so a rejected batch never leaks partial
-        # load. The resolved hints are reused in the loop below to avoid a second
-        # getattr/int pass per seq.
-        hints = self._resolve_and_validate_hints(seqs)
-
-        # round_robin normally skips load bookkeeping. Session affinity still
-        # needs queued-prefill counters even if the fallback strategy is RR.
-        track_load = (
-            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
-        )
-        engine_count = self._routable_engine_count
-        dp_seqs = [[] for _ in range(engine_count)]
-        reqs_snapshot = tokens_snapshot = None
-        with self._lb_lock:
-            for seq, hint in zip(seqs, hints):
-                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint)
-                if track_load:
-                    self._charge_seq_load_locked(seq, dp_rank)
-                dp_seqs[dp_rank].append(seq)
-            # Copy the counters under the lock so the snapshot log below is a
-            # consistent instant, not a torn read racing _release_seq_load.
-            if track_load:
-                reqs_snapshot = list(self._rank_reqs)
-                tokens_snapshot = list(self._rank_tokens)
-
-        # Track which ranks were actually handed off, plus a compact per-rank
-        # delta ("rankR:Nreq/Ttok") for the single summary log after the loop. If
-        # a send fails partway, the seqs on the not-yet-dispatched ranks were
-        # charged above but will never produce a finished output to release them,
-        # so we roll back their in-flight load before propagating — otherwise
-        # routing skews forever.
-        dispatched = [False] * engine_count
-        added = []
-        try:
-            for dp_rank, rank_seqs in enumerate(dp_seqs):
-                if not rank_seqs:
-                    continue
-                self._send_request(dp_rank, _add_frame(rank_seqs))
-                dispatched[dp_rank] = True
-                batch_prefill_tokens = sum(
-                    int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
-                )
-                added.append(
-                    f"rank{dp_rank}: {len(rank_seqs)} req / {batch_prefill_tokens} tok"
-                )
-        except Exception:
-            # Roll back only ranks we never handed off. _release_seq_load is
-            # idempotent (pops from _seq_load), so even if a failing send had
-            # already delivered its frames and the engine finished + released
-            # those seqs on an output thread, this rollback cannot double-count:
-            # whichever release runs first wins, the other is a no-op.
-            if track_load:
-                for dp_rank, rank_seqs in enumerate(dp_seqs):
-                    if rank_seqs and not dispatched[dp_rank]:
-                        for seq in rank_seqs:
-                            self._release_seq_load(seq.id)
-            raise
-
-        # One line per add: the per-rank delta this add placed, plus (for the
-        # load-aware strategies) the resulting in-flight distribution across all
-        # ranks, so a single grep shows both what changed and how balanced it is.
-        if reqs_snapshot is not None:
-            logger.info(
-                "%s: add %s | in-flight reqs=%s queued_prefill_tokens=%s",
-                self.label,
-                ", ".join(added),
-                reqs_snapshot,
-                tokens_snapshot,
-            )
-        else:
-            logger.info("%s: add %s", self.label, ", ".join(added))
+    def _dispatch_to_dp_ranks(self, seqs):
+        self.add_request(seqs)
 
     def _select_dp_rank_locked(self) -> int:
         """Pick a DP engine rank for a new request. Caller must hold _lb_lock.
@@ -1370,40 +1573,59 @@ class CoreManager:
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
 
-    def send_utility_command(self, cmd: str, dp_rank: int | None = None):
+    def _utility_message(self, rank, cmd, args):
+        """*cmd* for *rank*. A ``request_id`` in *args* asks for a reply."""
+        return self._ipc.control.encode(
+            "UTILITY",
+            (cmd, args),
+            **self._ipc.context(rank),
+            metadata={
+                "expected_ranks": [rank],
+                "same_host": self._ipc.peers[rank]["same_host"],
+            },
+        )
+
+    def send_utility_command(self, cmd, dp_rank=None):
         self._refuse_unowned_weight_sync_cmd(cmd, None)
-        if dp_rank is None:
-            # Send to all DP ranks
-            for rank in range(len(self.control_sockets)):
-                logger.debug(
-                    f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
-                )
-                self._send_control(
-                    rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
-                )
-        else:
+        ranks = range(len(self.control_sockets)) if dp_rank is None else [dp_rank]
+        for rank in ranks:
             logger.debug(
-                f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}"
+                f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
             )
-            self._send_control(
-                dp_rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
-            )
+            self._send_control(rank, self._utility_message(rank, cmd, {}))
+
+    def _send_abort(self, rank, req_id):
+        self._send_control(
+            rank,
+            self._ipc.control.encode(
+                "ABORT",
+                {
+                    "request_ids": [req_id],
+                    "submission_sequence": self._submission_ids.get(req_id, 0),
+                },
+                **self._ipc.context(rank),
+            ),
+        )
 
     def abort_request(self, req_id):
-        """Tell the engine core(s) to drop a request (client disconnected).
-
-        Broadcast to every DP rank (only the one holding ``req_id`` acts). The
-        scheduler finishes the seq at its next step via the normal stop path,
-        freeing its KV blocks. Fire-and-forget; safe if the seq already finished.
-        """
-        # Release DP load bookkeeping now: an aborted seq may never emit a
-        # finished STREAM output, so relying on the finish path alone would leak
-        # its in-flight count. _release_seq_load is idempotent.
+        with self._submission_lock:
+            if req_id not in self._request_targets:
+                return
+            self._cancelled.add(req_id)
+            ranks = tuple(self._committed_targets.get(req_id, ()))
+            self._seq_id_to_callback.pop(req_id, None)
         self._release_seq_load(req_id)
-        try:
-            self.broadcast_utility_command("abort_request", req_id=req_id)
-        except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
-            logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
+        for rank in ranks:
+            try:
+                self._send_abort(rank, req_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not cancel request %s on rank %s",
+                    req_id,
+                    rank,
+                    exc_info=True,
+                )
+                self._fail_peer(rank, exc)
 
     def _route_utility_response(self, dp_rank: int, data):
         """Hand a utility reply to the caller waiting on its request id.
@@ -1413,6 +1635,12 @@ class CoreManager:
         late, its caller having given up.
         """
         request_id = data.get("request_id") if isinstance(data, dict) else None
+        if data.get("rank", dp_rank) != dp_rank:
+            logger.warning(
+                f"{self.label}: dropping utility reply {request_id} that rank "
+                f"{data.get('rank')} sent on DP rank {dp_rank}'s socket"
+            )
+            return
         if not isinstance(request_id, str) or not request_id:
             # Routing an unhashable id would raise on this thread and end it.
             logger.debug(
@@ -1463,6 +1691,7 @@ class CoreManager:
         with self._rpc_router.register(request_id) as replies:
             self.broadcast_utility_command(
                 COLLECTIVE_RPC_CMD,
+                _send_deadline=deadline,
                 request_id=request_id,
                 method=method,
                 args=tuple(args),
@@ -1548,17 +1777,33 @@ class CoreManager:
                 f"finishes or aborts them"
             )
 
-    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+    def broadcast_utility_command(
+        self, cmd: str, *, _dispatch_token=None, _send_deadline=None, **kwargs
+    ):
+        """Send *cmd* to every engine; *_send_deadline* bounds the sends
+        (monotonic), apart from the engine's own ``deadline`` in *kwargs*."""
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
-        payload = {"cmd": cmd, **kwargs}
-        # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
-        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        if cmd == "abort_request":
+            # Cancellation is its own message, sent only where it was admitted.
+            self.abort_request(kwargs["req_id"])
+            return
+        # Refused before the first send, so no engine runs a command its
+        # failed peer never will.
+        failed = sorted(
+            set(self._peer_failures) & set(range(len(self.control_sockets)))
+        )
+        if failed:
+            raise RuntimeError(f"engine rank(s) {failed} are unavailable")
         for rank in range(len(self.control_sockets)):
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
-            # copy=True: the same buffer is reused for every rank.
-            self._send_control(rank, serialized_payload, copy=True)
+            # Encoded per rank: each message carries its own peer's session.
+            self._send_control(
+                rank,
+                self._utility_message(rank, cmd, kwargs),
+                deadline=_send_deadline,
+            )
 
     @contextmanager
     def weight_sync_session(self):
@@ -1588,15 +1833,12 @@ class CoreManager:
         the failure that matters, and a rank whose socket fails here must not
         keep its peers, which may hold the failed update, from hearing it.
         """
-        payload = pickle.dumps(
-            (
-                EngineCoreRequestType.UTILITY,
-                {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd},
-            )
-        )
+        args = {"failed_cmd": failed_cmd}
         for rank in range(len(self.control_sockets)):
             try:
-                self._send_control(rank, payload, copy=True)
+                self._send_control(
+                    rank, self._utility_message(rank, DISCARD_WEIGHT_SYNC_CMD, args)
+                )
             except Exception:
                 logger.exception(
                     f"{self.label}: could not tell DP rank {rank} to discard "
@@ -1698,6 +1940,7 @@ class CoreManager:
                 self.broadcast_utility_command(
                     cmd,
                     _dispatch_token=self._weight_sync_dispatch_token,
+                    _send_deadline=deadline,
                     request_id=request_id,
                     timeout=engine_budget(timeout),
                     deadline=worker_deadline,
@@ -1755,13 +1998,56 @@ class CoreManager:
                 raise
         return responses
 
+    def _fail_peer(self, rank, error):
+        with self._submission_lock:
+            if rank in self._peer_failures:
+                return
+            self._peer_failures[rank] = error
+            if rank in self._ipc.peers:
+                self._ipc.peers[rank]["ready"] = False
+            ids = [
+                req_id
+                for req_id, targets in self._request_targets.items()
+                if rank in targets
+            ]
+            for req_id in ids:
+                self._deliver_terminal_output(
+                    CompletionResult(id=req_id, leave_reason="engine_error")
+                )
+                self._release_seq_load(req_id)
+                self._request_targets.pop(req_id, None)
+                self._committed_targets.pop(req_id, None)
+                self._submission_ids.pop(req_id, None)
+                self._callback_only.discard(req_id)
+                self._cancelled.discard(req_id)
+        # Every utility call goes to every engine, so each one waiting would
+        # otherwise wait out its timeout for this rank's reply.
+        self._rpc_router.route_all(
+            (rank, {"error": f"engine rank {rank} failed: {error}"})
+        )
+        if self._flush_stream_batch_fn is not None:
+            try:
+                self._flush_stream_batch_fn()
+            except Exception:
+                logger.warning("Could not flush failed engine callbacks", exc_info=True)
+        self.outputs_queue.put(error)
+        if not self._closed:
+            self._shutdown_engine_core_rank(rank)
+            process = self._local_process_by_rank.get(rank)
+            if (
+                process is not None
+                and not process.is_alive()
+                and self._ipc.arena is not None
+            ):
+                self._ipc.arena.reclaim_dead_engine(self._ipc.peers[rank]["engine_id"])
+
     def _shutdown_engine_core_rank(self, dp_rank: int):
         # Determine whether this rank has a local process and/or a control socket.
         # On a coordinator with remote engines, dp_rank may exceed the local
         # process list -- but we still hold a live control socket for it, and
         # the remote engine must receive SHUTDOWN so its worker node unblocks.
-        has_local_process = dp_rank < len(self.engine_core_processes)
-        process = self.engine_core_processes[dp_rank] if has_local_process else None
+        process = self._local_process_by_rank.get(dp_rank)
+        has_local_process = process is not None
         has_local_alive = process is not None and process.is_alive()
 
         has_control_socket = (
@@ -1777,7 +2063,10 @@ class CoreManager:
             try:
                 if has_control_socket:
                     self._send_control(
-                        dp_rank, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None))
+                        dp_rank,
+                        self._ipc.control.encode(
+                            "SHUTDOWN", None, **self._ipc.context(dp_rank)
+                        ),
                     )
                     logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
                 else:
@@ -2000,15 +2289,30 @@ class DisaggCoreManager(CoreManager):
         def _connect_proc(proc, in_addr, out_addr, ctrl_addr, name):
             proc.start()
             self.engine_core_processes.append(proc)
-            in_sock = make_zmq_socket(self.ctx, in_addr, zmq.ROUTER, bind=True)
-            identity, _ = in_sock.recv_multipart()
+            self._local_process_by_rank[len(self.engine_core_processes) - 1] = proc
+            in_sock = make_zmq_socket(
+                self.ctx,
+                in_addr,
+                zmq.ROUTER,
+                bind=True,
+                hwm=config.ipc_max_pending_jobs,
+            )
+            identity = self._receive_identity(in_sock)
             self.input_sockets.append(in_sock)
             self.engine_core_identities.append(identity)
-            ctrl_sock = make_zmq_socket(self.ctx, ctrl_addr, zmq.ROUTER, bind=True)
-            ctrl_identity, _ = ctrl_sock.recv_multipart()
+            ctrl_sock = make_zmq_socket(
+                self.ctx,
+                ctrl_addr,
+                zmq.ROUTER,
+                bind=True,
+                hwm=config.ipc_max_pending_jobs,
+            )
+            ctrl_identity = self._receive_identity(ctrl_sock)
             self.control_sockets.append(ctrl_sock)
             self.control_identities.append(ctrl_identity)
-            out_sock = make_zmq_socket(self.ctx, out_addr, zmq.PULL)
+            out_sock = make_zmq_socket(
+                self.ctx, out_addr, zmq.PULL, hwm=config.ipc_max_pending_jobs
+            )
             self.output_sockets.append(out_sock)
             self.shutdown_paths.append(get_open_zmq_inproc_path())
             logger.info(f"{self.label}: {name} process started and connected")
@@ -2058,48 +2362,43 @@ class DisaggCoreManager(CoreManager):
         self._output_handler_task = None
         self._asyncio_mode = config.asyncio_mode
 
-    def _wait_for_single_ready(self, idx: int):
-        """Block until output_sockets[idx] sends a READY signal."""
-        sock = self.output_sockets[idx]
-        while True:
-            obj = sock.recv(copy=False)
-            request_type, data = pickle.loads(obj)
-            if request_type == EngineCoreRequestType.READY:
-                self._record_ready_payload(data)
-                return
-            if request_type == EngineCoreRequestType.SHUTDOWN:
-                raise RuntimeError(
-                    f"{self.label}: process {idx} sent SHUTDOWN during initialization"
+    def _wait_for_single_ready(self, idx):
+        socket = self.output_sockets[idx]
+        deadline = self._startup_deadline
+        while not self._ipc.peers.get(idx, {}).get("ready"):
+            if time.monotonic() >= deadline or self.finished_procs():
+                raise RuntimeError(f"engine {idx} failed its IPC handshake")
+            if socket.poll(100):
+                self._handle_handshake(
+                    idx, self._ipc.result.decode(socket.recv_multipart(copy=False))
                 )
 
-    def add_request(self, seqs: list[Sequence]):
-        """Fan-out: send every new sequence to BOTH prefill and decode."""
-        tracing.bind_sequences(seqs, unsupported="pd")
-        logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
-        # Register stream callbacks before sending (decode will produce output).
+    # Tracing needs distinct span identities for the two halves first.
+    _trace_unsupported = "pd"
+
+    def _plan_requests(self, seqs):
+        """Fan-out: every new sequence goes to BOTH prefill and decode."""
+        from copy import copy
+        from dataclasses import replace
+
+        # For prefill: limit each sequence to 1 output token. Prefill discards
+        # all sampled tokens (postprocess is a no-op), but max_tokens=1 ends
+        # the forward after a single generate step. Decode admits and
+        # allocates the blocks (`DecodeScheduler.allocate_waiting`), so it
+        # alone gets the prompt hash chains.
+        prefill = []
         for seq in seqs:
-            if seq.stream_callback is not None:
-                self._seq_id_to_callback[seq.id] = seq.stream_callback
-                seq.stream_callback = None
-
-        # Send decode payload as-is. Decode admits and allocates the blocks
-        # (`DecodeScheduler.allocate_waiting`), so it alone gets the chains.
-        decode_payload = _add_frame(seqs)
-        self._send_request(1, decode_payload)
-
-        # For prefill: limit each sequence to 1 output token.  Prefill discards
-        # all sampled tokens (postprocess is a no-op), but setting max_tokens=1
-        # ensures the forward pass terminates after a single generate step and
-        # that num_scheduled_tokens correctly reflects only the prompt tokens.
-        import copy as _copy
-
-        prefill_seqs = []
-        for seq in seqs:
-            ps = _copy.copy(seq)
-            ps.max_tokens = 1
-            prefill_seqs.append(ps)
-        prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
-        self._send_request(0, prefill_payload)
+            sampling = copy(seq.sampling_params)
+            sampling.max_tokens = 1
+            prefill.append(
+                replace(seq, sampling_params=sampling, prompt_hash_chain=None)
+            )
+        size = self._config.ipc_max_batch_size
+        return [
+            (rank, values[start : start + size])
+            for rank, values in ((1, seqs), (0, prefill))
+            for start in range(0, len(values), size)
+        ]
 
     def _collective_rpc_unsupported(self) -> str | None:
         return "its two engines are the prefill and decode halves of one replica"
@@ -2111,5 +2410,7 @@ class DisaggCoreManager(CoreManager):
             try:
                 self._cu_shm.close()
                 self._cu_shm.unlink()
-            except Exception:
-                pass
+            except (OSError, ValueError):
+                logger.debug(
+                    "Could not close CU partitioning shared memory", exc_info=True
+                )

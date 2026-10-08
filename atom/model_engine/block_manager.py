@@ -779,7 +779,7 @@ class BlockManager:
 
     def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
-        return seq.token_ids[i * hbs : (i + 1) * hbs]
+        return seq.token_snapshot(i * hbs, (i + 1) * hbs)
 
     def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
         """`hit` widened to `compressed_hit` when replaying is cheaper.

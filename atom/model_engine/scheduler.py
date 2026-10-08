@@ -329,17 +329,14 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
-        # Each sequence's window, staged into one array rather than assigned
-        # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
-        # its length, and at decode a window is a single token. `extend`
-        # between two `array("i")` is a memcpy. 4x at bs=256.
+        # Copy only this forward's windows into the owned downstream buffer.
         staged = new_token_ids()
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
                 offset = self.num_cached_tokens[i]
             else:
                 offset = seq.num_tokens - num_rejected[i] - num
-            staged.extend(seq.token_ids[offset : offset + num])
+            seq.copy_tokens_into(staged, offset, offset + num)
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its
         # window would otherwise leave the batch quietly short.
@@ -950,15 +947,14 @@ class Scheduler:
                 continue
             # Reject divergent heads cheaply; equal long buffers stay in NumPy.
             head = min(anchor, 64)
-            if (
-                memoryview(seq.token_ids)[:head]
-                != memoryview(producer.token_ids)[:head]
-            ):
-                continue
-            if np.array_equal(
-                np.frombuffer(seq.token_ids, dtype=np.int32, count=anchor),
-                np.frombuffer(producer.token_ids, dtype=np.int32, count=anchor),
-            ):
+            with seq.prompt_view() as prompt, producer.prompt_view() as other:
+                if prompt[:head] != other[:head]:
+                    continue
+                same_prefix = np.array_equal(
+                    np.frombuffer(prompt, dtype=np.int32, count=anchor),
+                    np.frombuffer(other, dtype=np.int32, count=anchor),
+                )
+            if same_prefix:
                 self._inflight_prefix_wait.setdefault(
                     seq.id, self._schedule_tick + delayer.ttft_max_ticks
                 )
@@ -3844,8 +3840,7 @@ class Scheduler:
             max(0, seq.num_tokens - seq.num_prompt_tokens),
         )
         if strip > 0:
-            del seq.token_ids[-strip:]
-            del seq.output_tokens[-strip:]
+            seq.truncate_tail(strip)
             seq.num_tokens -= strip
             # Each placeholder pushed a 0.0 alongside it (postprocess patches
             # that in place too), so they go together or the two lists stop
@@ -4198,8 +4193,7 @@ class Scheduler:
                     for _ in range(missing_placeholders):
                         seq.append_token(self.eos_token_id)
                 for i, el in enumerate(token_ids):
-                    seq.token_ids[-required_placeholders + i] = el
-                    seq.output_tokens[-required_placeholders + i] = el
+                    seq.overwrite_token(-required_placeholders + i, el)
                 # What the write did NOT consume of the window it was given.
                 # Those slots are still `eos_token_id`, so they are still
                 # placeholders, and on a verify step there are always some: the

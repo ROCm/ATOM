@@ -229,7 +229,30 @@ class AtomEngineService:
             seqs = self._preprocess_fanout_request(request)
         else:
             seqs = [self._preprocess_single_request(request)]
-        self.engine.core_mgr.add_request(seqs)
+        self._submit_admissions(seqs)
+
+    def _submit_admissions(self, admissions) -> None:
+        for admission in admissions:
+            admission.callback_only = True
+        try:
+            self.engine.core_mgr.add_request(admissions)
+        except BaseException:
+            for admission in admissions:
+                self._abort_seq(admission)
+            raise
+
+    def _finish_admission(self, seq_id) -> None:
+        finish = getattr(self.engine.io_processor, "finish_request", None)
+        if finish is not None:
+            finish(seq_id)
+        else:
+            self.engine.io_processor.requests.pop(seq_id, None)
+
+    def _finish_output(self, output) -> None:
+        if getattr(output, "finished", False):
+            seq_id = getattr(output, "request_id", None)
+            if seq_id is not None:
+                self._finish_admission(seq_id)
 
     def start_stream(
         self,
@@ -298,8 +321,10 @@ class AtomEngineService:
             # cost nothing to drop -- there is no abort to do.
             if request.request_id in self._abandoned:
                 self._abandoned.discard(request.request_id)
+                for seq in seqs:
+                    self._finish_admission(seq.id)
                 return
-        self.engine.core_mgr.add_request(seqs)
+        self._submit_admissions(seqs)
         # Published *after* the engine has them, and the close re-checked
         # once more. Publishing first left a window where `abort_stream`
         # popped the list and aborted sequences the engine had not been told
@@ -338,9 +363,11 @@ class AtomEngineService:
         anyway.
         """
         with self._stream_seqs_lock:
-            self._stream_seqs.pop(request_id, None)
+            seqs = self._stream_seqs.pop(request_id, ())
             self._abandoned.discard(request_id)
             self._awaiting_submit.discard(request_id)
+        for seq in seqs:
+            self._finish_admission(seq.id)
 
     def abort_stream(self, request_id: str) -> None:
         """Stop the sequences behind a stream that is still live.
@@ -373,9 +400,7 @@ class AtomEngineService:
             self.engine.core_mgr.abort_request(seq_id)
         except (AttributeError, KeyError, RuntimeError, ValueError) as exc:
             logger.debug("abort_request(%s): %s", seq_id, exc)
-        requests = getattr(self.engine.io_processor, "requests", None)
-        if requests is not None:
-            requests.pop(seq_id, None)
+        self._finish_admission(seq_id)
 
     def _preprocess_single_stream_request(self, request: EngineStreamRequest) -> Any:
         state = StreamRequestState(
@@ -387,6 +412,7 @@ class AtomEngineService:
 
         def completion_callback(request_output: Any) -> None:
             state.record(0, request_output)
+            self._finish_output(request_output)
 
         return self.engine.io_processor.preprocess(
             request.prompt,
@@ -409,6 +435,7 @@ class AtomEngineService:
         def make_callback(index: int):
             def completion_callback(request_output: Any) -> None:
                 state.record(index, request_output)
+                self._finish_output(request_output)
 
             return completion_callback
 
@@ -432,6 +459,7 @@ class AtomEngineService:
 
         def completion_callback(request_output: Any) -> None:
             state.record(request_output)
+            self._finish_output(request_output)
 
         seq = self.engine.io_processor.preprocess(
             request.prompt,
@@ -454,6 +482,7 @@ class AtomEngineService:
         def make_callback(index: int):
             def completion_callback(request_output: Any) -> None:
                 state.record(index, request_output)
+                self._finish_output(request_output)
 
             return completion_callback
 

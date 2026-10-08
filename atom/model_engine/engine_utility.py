@@ -48,24 +48,6 @@ def _remaining_timeout(args: dict, default: float) -> float:
     return checked_timeout(args.get("timeout", default))
 
 
-class _ReplyQueue:
-    """The EngineCore output queue, as the utility handlers see it.
-
-    Stamps every ``UTILITY_RESPONSE`` with the request id of the command it
-    answers, so CoreManager matches replies to callers by id rather than by
-    position, where a late or unasked-for reply became the next caller's.
-    """
-
-    def __init__(self, output_queue):
-        self._queue = output_queue
-        self.request_id = None
-
-    def put_nowait(self, item) -> None:
-        if self.request_id is not None and item[0] == "UTILITY_RESPONSE":
-            item = ("UTILITY_RESPONSE", {**item[1], "request_id": self.request_id})
-        self._queue.put_nowait(item)
-
-
 class EngineUtilityHandler:
     """Centralised handler for all utility commands dispatched by EngineCore.
 
@@ -79,8 +61,8 @@ class EngineUtilityHandler:
     runner_mgr : AsyncIOProcManager
         The model-runner process manager used to execute ``call_func``.
     output_queue : queue.Queue
-        The EngineCore output queue for pushing ``UTILITY_RESPONSE`` messages
-        back to ``CoreManager``.
+        The EngineCore output queue. ``_execute_utility_command`` puts each
+        handler's reply on it as one ``UTILITY_RESPONSE``.
     label : str, optional
         Label used in log messages (default ``"Engine Core"``).
     scheduler : Scheduler, optional
@@ -112,7 +94,7 @@ class EngineUtilityHandler:
         self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
     ):
         self.runner_mgr = runner_mgr
-        self.output_queue = _ReplyQueue(output_queue)
+        self.output_queue = output_queue
         self.label = label
         self.scheduler = scheduler
         self._weight_sync_fenced = False
@@ -144,7 +126,7 @@ class EngineUtilityHandler:
 
         while True:
             try:
-                cmd, args = utility_queue.get_nowait()
+                cmd, args, metadata = utility_queue.get_nowait()
                 if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     # Local success is not global success: another DP engine
                     # can still fail this bucket. Stay fenced until CoreManager
@@ -155,7 +137,9 @@ class EngineUtilityHandler:
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
                     self._weight_sync_in_progress = True
-                reply = self._execute_utility_command(cmd, args)
+                reply = self._execute_utility_command(
+                    cmd, args, metadata, rank=getattr(engine, "_ipc_rank", 0)
+                )
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
@@ -232,45 +216,50 @@ class EngineUtilityHandler:
             except queue.Empty:
                 break
 
-    def _execute_utility_command(self, cmd: str, args: dict) -> dict | None:
-        """Run *cmd*'s handler and return what it returned: the weight
-        updates hand back the reply they sent."""
+    def _execute_utility_command(
+        self, cmd: str, args: dict, metadata=None, rank: int = 0
+    ) -> dict | None:
+        """Run *cmd*'s handler and send its reply; return that reply.
+
+        Handlers return ``{"cmd", "result"}`` or ``{"cmd", "error"}`` (None for
+        the fire-and-forget commands) and never send it themselves, so every
+        reply carries the request id, rank and message id of what it answers.
+        A handler that raises is answered with the reason and the engine keeps
+        serving: a failed utility is the caller's to handle.
+        """
         import time as _time
 
         log = logger.info
         log(f"{self.label}: executing utility command: {cmd}")
         t0 = _time.monotonic()
 
-        reply = None
+        metadata = metadata or {}
         handler_name = self._UTILITY_HANDLERS.get(cmd)
-        self.output_queue.request_id = (
-            args.get("request_id") if isinstance(args, dict) else None
-        )
+        expected = metadata.get("expected_ranks", ())
         try:
-            if handler_name:
-                handler = getattr(self, handler_name)
-                try:
-                    reply = handler(args)
-                except Exception as exc:
-                    # Still fatal to the engine, as before; but a synchronous
-                    # caller now hears why instead of waiting out its timeout.
-                    if cmd not in FIRE_AND_FORGET_UTILITY_CMDS:
-                        self.output_queue.put_nowait(
-                            ("UTILITY_RESPONSE", self._error_reply(cmd, exc))
-                        )
-                    raise
-            else:
+            if handler_name is None:
                 # Answer, do not just log: a synchronous caller would otherwise
                 # wait out its timeout and learn only that, not the misspelling.
                 logger.warning(f"{self.label}: Unknown utility command: {cmd}")
-                self.output_queue.put_nowait(
-                    (
-                        "UTILITY_RESPONSE",
-                        {"cmd": cmd, "error": f"unknown utility command {cmd!r}"},
-                    )
+                reply = {"cmd": cmd, "error": f"unknown utility command {cmd!r}"}
+            elif expected and rank not in expected:
+                reply = {"cmd": cmd, "error": f"not addressed to rank {rank}"}
+            else:
+                reply = getattr(self, handler_name)(args)
+        except Exception as exc:
+            logger.exception("%s: utility %s failed", self.label, cmd)
+            reply = self._error_reply(cmd, exc)
+
+        request_id = args.get("request_id") if isinstance(args, dict) else None
+        if reply is not None and request_id:
+            # Only a caller that named its request waits for an answer.
+            self.output_queue.put_nowait(
+                (
+                    "UTILITY_RESPONSE",
+                    {**reply, "request_id": request_id, "rank": rank},
+                    {"in_reply_to": metadata.get("message_id", 0)},
                 )
-        finally:
-            self.output_queue.request_id = None
+            )
 
         elapsed = _time.monotonic() - t0
         log(f"{self.label}: utility command '{cmd}' finished in {elapsed:.2f}s")
@@ -298,18 +287,12 @@ class EngineUtilityHandler:
             or not isinstance(request_id, str)
             or not request_id
         ):
-            self.output_queue.put_nowait(
-                (
-                    "UTILITY_RESPONSE",
-                    {
-                        "cmd": COLLECTIVE_RPC_CMD,
-                        "request_id": request_id,
-                        "error": "collective_rpc needs a method name and a request "
-                        "id, both non-empty strings",
-                    },
-                )
-            )
-            return
+            return {
+                "cmd": COLLECTIVE_RPC_CMD,
+                "request_id": request_id,
+                "error": "collective_rpc needs a method name and a request "
+                "id, both non-empty strings",
+            }
 
         try:
             payload = RpcPayload(
@@ -324,47 +307,36 @@ class EngineUtilityHandler:
         except Exception as exc:  # noqa: BLE001 - reported, never raised at the loop
             # Raising here would kill the EngineCore busy loop and take the
             # engine down with it; the caller gets the reason instead.
-            self.output_queue.put_nowait(
-                (
-                    "UTILITY_RESPONSE",
-                    {
-                        "cmd": COLLECTIVE_RPC_CMD,
-                        "request_id": request_id,
-                        "method": method,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-            )
-            return
+            return {
+                "cmd": COLLECTIVE_RPC_CMD,
+                "request_id": request_id,
+                "method": method,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         failures = [r for r in replies if not r.ok]
         logger.info(
             f"{self.label}: collective_rpc {method} ranks={len(replies)} "
             f"failed={len(failures)}"
         )
-        self.output_queue.put_nowait(
-            (
-                "UTILITY_RESPONSE",
+        return {
+            "cmd": COLLECTIVE_RPC_CMD,
+            "request_id": request_id,
+            "method": method,
+            # Includes PCP: this is the number of worker processes
+            # behind this EngineCore, not logical tensor parallelism.
+            "worker_world_size": self.runner_mgr.proc_num,
+            # Kept for wire compatibility; prefer worker_world_size.
+            "tp_world_size": self.runner_mgr.proc_num,
+            "results": [
                 {
-                    "cmd": COLLECTIVE_RPC_CMD,
-                    "request_id": request_id,
-                    "method": method,
-                    # Includes PCP: this is the number of worker processes
-                    # behind this EngineCore, not logical tensor parallelism.
-                    "worker_world_size": self.runner_mgr.proc_num,
-                    # Kept for wire compatibility; prefer worker_world_size.
-                    "tp_world_size": self.runner_mgr.proc_num,
-                    "results": [
-                        {
-                            "tp_rank": r.tp_rank,
-                            "value": r.value,
-                            "error": r.error,
-                        }
-                        for r in replies
-                    ],
-                },
-            )
-        )
+                    "tp_rank": r.tp_rank,
+                    "value": r.value,
+                    "error": r.error,
+                }
+                for r in replies
+            ],
+        }
 
     def _begin_weight_sync(self, sync_id: str | None) -> None:
         """Start *sync_id* from a clean slate.
@@ -467,7 +439,6 @@ class EngineUtilityHandler:
             args.get("failed_cmd", "weight update"),
             _FAILED_SYNC_CLEANUP_TIMEOUT_S,
         )
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_finish_weight_sync(self, args: dict) -> dict:
@@ -493,7 +464,6 @@ class EngineUtilityHandler:
             reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "result": True}
         else:
             reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "error": error}
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_get_weight_sync_status(self, args: dict) -> dict:
@@ -506,7 +476,6 @@ class EngineUtilityHandler:
                 "failure": self._weight_sync_failure,
             },
         }
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_update_weights(self, args: dict) -> dict:
@@ -518,7 +487,6 @@ class EngineUtilityHandler:
             args.get("named_tensors", []),
             args.get("flush_cache", True),
         )
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_update_weights_shm(self, args: dict) -> dict:
@@ -543,7 +511,6 @@ class EngineUtilityHandler:
             args.get("is_last", True),
             barrier=True,
         )
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_update_weights_ipc(self, args: dict) -> dict:
@@ -567,7 +534,6 @@ class EngineUtilityHandler:
             args.get("ipc_handles"),
             barrier=True,
         )
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _utility_on_every_rank(
@@ -602,7 +568,6 @@ class EngineUtilityHandler:
             timeout=_remaining_timeout(args, 300.0),
         )
         logger.info(f"{self.label}: release_memory completed, tags={tags}")
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_resume_memory(self, args: dict) -> dict:
@@ -620,7 +585,6 @@ class EngineUtilityHandler:
             timeout=_remaining_timeout(args, 300.0),
         )
         logger.info(f"{self.label}: resume_memory completed, tags={tags}")
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_clear_kv_cache(self, args: dict) -> dict:
@@ -631,7 +595,6 @@ class EngineUtilityHandler:
             timeout=_remaining_timeout(args, 300.0),
         )
         logger.info(f"{self.label}: KV cache cleared")
-        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
     def _handle_abort_request(self, args: dict):
@@ -661,9 +624,7 @@ class EngineUtilityHandler:
             f"{self.label}: configure_hidden_states completed, "
             f"aux_layers={aux_layer_ids}"
         )
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "configure_hidden_states", "result": result})
-        )
+        return {"cmd": "configure_hidden_states", "result": result}
 
     # ------------------------------------------------------------------
     # Profiler
@@ -676,9 +637,7 @@ class EngineUtilityHandler:
         if self.scheduler is not None:
             self.scheduler.profile_active = True
         logger.info(f"{self.label}: profiler started")
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "start_profile", "result": result})
-        )
+        return {"cmd": "start_profile", "result": result}
 
     def _handle_stop_profile(self, args: dict):
         logger.info(f"{self.label}: stopping profiler...")
@@ -686,9 +645,7 @@ class EngineUtilityHandler:
         if self.scheduler is not None:
             self.scheduler.profile_active = False
         logger.info(f"{self.label}: profiler stopped, result={result}")
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})
-        )
+        return {"cmd": "stop_profile", "result": result}
 
     # ------------------------------------------------------------------
     # MTP statistics
@@ -713,9 +670,7 @@ class EngineUtilityHandler:
         else:
             result = stats.spec_statistics()
             result["enabled"] = True
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "get_mtp_statistics", "result": result})
-        )
+        return {"cmd": "get_mtp_statistics", "result": result}
 
     # ------------------------------------------------------------------
     # Prefix cache statistics
@@ -738,9 +693,7 @@ class EngineUtilityHandler:
             # The cache section counts the reuse a request wanted and did not
             # get; the funnel is where it was lost.
             result |= self.scheduler.block_manager.checkpoint_funnel()
-        self.output_queue.put_nowait(
-            ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
-        )
+        return {"cmd": "get_cache_statistics", "result": result}
 
     def push_metrics(self, *, scheduler_metrics: bool = True) -> None:
         """Publish this rank's metrics snapshot on the output socket.

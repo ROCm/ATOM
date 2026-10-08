@@ -1,0 +1,125 @@
+syntax = "proto3";
+package atom.ipc;
+
+enum DType {
+  DTYPE_UNSPECIFIED = 0;
+  INT32 = 1;
+  INT64 = 2;
+  FLOAT32 = 3;
+  FLOAT64 = 4;
+  FLOAT16 = 5;
+  BFLOAT16 = 6;
+  UINT8 = 7;
+  INT8 = 8;
+  BOOL = 9;
+  UINT16 = 10;
+  UINT32 = 11;
+  UINT64 = 12;
+  INT16 = 13;
+  FLOAT8_E4M3FN = 14;
+  FLOAT8_E4M3FNUZ = 15;
+  FLOAT8_E5M2 = 16;
+  FLOAT8_E5M2FNUZ = 17;
+}
+message ShmSlice {
+  string arena_id = 1;
+  uint64 arena_epoch = 2;
+  uint64 allocation_id = 3;
+  uint64 allocation_generation = 4;
+  uint64 offset_bytes = 5;
+  uint64 nbytes = 6;
+  string path = 7;
+}
+message RawFrameSlice {
+  uint32 frame_index = 1;
+  uint64 offset_bytes = 2;
+  uint64 nbytes = 3;
+}
+message BufferRef {
+  string buffer_id = 1;
+  uint64 logical_length = 2;
+  DType dtype = 3;
+  string byte_order = 4;
+  oneof storage {
+    ShmSlice shm = 10;
+    RawFrameSlice raw = 11;
+  }
+}
+message TensorDescriptor {
+  string name = 1;
+  DType dtype = 2;
+  repeated uint64 shape = 3;
+  BufferRef buffer = 4;
+  enum ArrayKind { NUMPY = 0; TORCH = 1; }
+  ArrayKind array_kind = 5;
+}
+message MetaValue {
+  oneof value {
+    bool null_value = 1;
+    bool bool_value = 2;
+    sint64 signed_value = 3;
+    uint64 unsigned_value = 4;
+    double double_value = 5;
+    string string_value = 6;
+    bytes bytes_value = 7;
+    MetaList list_value = 8;
+    MetaObject object_value = 9;
+    // Exact mode only (collective RPC values): a tuple, and a dict with a
+    // key that is not a string.
+    MetaList tuple_value = 10;
+    MetaMap map_value = 11;
+  }
+}
+message MetaList { repeated MetaValue values = 1; }
+message MetaObject { map<string, MetaValue> fields = 1; }
+message MetaPair { MetaValue key = 1; MetaValue value = 2; }
+message MetaMap { repeated MetaPair entries = 1; }
+message Number {
+  oneof value { sint64 signed_value = 1; uint64 unsigned_value = 2; double double_value = 3; bool null_value = 4; bool bool_value = 5; }
+}
+message MtpStatistics {
+  optional bool enabled = 1;
+  optional uint64 total_draft_tokens = 2;
+  optional uint64 total_accepted_tokens = 3;
+  optional double acceptance_rate = 4;
+  map<sint64, uint64> distribution = 5;
+  map<string, Number> counters = 6;
+  repeated string null_fields = 7;
+  bool has_distribution = 8;
+}
+message CacheStatistics {
+  optional bool enabled = 1;
+  optional uint64 requests = 2;
+  optional uint64 cached_tokens = 3;
+  optional uint64 compressed_tokens = 4;
+  optional uint64 wanted_tokens = 5;
+  optional uint64 reusable_tokens = 6;
+  optional uint64 full_tokens = 7;
+  optional uint64 offload_tokens = 8;
+  map<string, Number> counters = 9;
+  repeated string null_fields = 10;
+}
+message CudaIpcTensorRef {
+  uint32 reducer_abi = 1;
+  DType dtype = 2;
+  repeated uint64 shape = 3;
+  repeated sint64 stride = 4;
+  uint64 tensor_offset = 5;
+  sint32 device = 6;
+  bytes storage_handle = 7;
+  uint64 storage_size_bytes = 8;
+  uint64 storage_offset_bytes = 9;
+  bool requires_grad = 10;
+  bytes ref_counter_handle = 11;
+  uint64 ref_counter_offset = 12;
+  bytes event_handle = 13;
+  bool event_sync_required = 14;
+}
+message WeightSlice {
+  string name = 1;
+  repeated uint64 shape = 2;
+  DType dtype = 3;
+  uint64 offset = 4;
+  uint64 nbytes = 5;
+}
+message ArenaRegistration { string root_dir = 1; string arena_id = 2; uint64 epoch = 3; uint64 capacity_bytes = 4; }

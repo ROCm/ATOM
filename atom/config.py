@@ -5,6 +5,7 @@ import enum
 import fnmatch
 import hashlib
 import logging
+import math
 import os
 import re
 from contextlib import contextmanager
@@ -2006,6 +2007,18 @@ class Config:
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
+    # Internal IPC defaults; the prompt pool follows the request capacity.
+    ipc_transport: str = "auto"
+    ipc_shm_dir: str = "/dev/shm"
+    ipc_shm_capacity_bytes: int | None = None
+    ipc_shm_threshold_bytes: int = 64 * 1024
+    ipc_max_header_bytes: int = 4 * 1024 * 1024
+    ipc_max_batch_size: int = 256
+    ipc_max_batch_bytes: int = 512 * 1024 * 1024
+    ipc_max_pending_bytes: int = 512 * 1024 * 1024
+    ipc_max_pending_jobs: int = 32
+    ipc_send_timeout: float = 30.0
+    ipc_startup_timeout: float = 600.0
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
@@ -2128,6 +2141,25 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
+        if self.ipc_transport not in ("auto", "raw", "shm"):
+            raise ValueError("ipc_transport must be auto, raw, or shm")
+        for name in (
+            "ipc_shm_capacity_bytes",
+            "ipc_max_header_bytes",
+            "ipc_max_batch_size",
+            "ipc_max_batch_bytes",
+            "ipc_max_pending_bytes",
+            "ipc_max_pending_jobs",
+            "ipc_send_timeout",
+            "ipc_startup_timeout",
+        ):
+            value = getattr(self, name)
+            if name == "ipc_shm_capacity_bytes" and value is None:
+                continue
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.ipc_shm_threshold_bytes < 0:
+            raise ValueError("ipc_shm_threshold_bytes must be nonnegative")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )

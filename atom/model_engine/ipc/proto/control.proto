@@ -1,0 +1,77 @@
+syntax = "proto3";
+package atom.ipc.control;
+import "atom/model_engine/ipc/proto/common.proto";
+
+message CancelRequest {
+  repeated uint64 request_ids = 1;
+  repeated string admission_ids = 2;
+  uint64 submission_sequence = 3;
+}
+message Empty {}
+message UpdateWeights { repeated atom.ipc.TensorDescriptor named_tensors = 1; bool flush_cache = 2; }
+message UpdateWeightsShm { string shm_name = 1; repeated atom.ipc.WeightSlice bucket = 2; bool is_last = 3; }
+message GpuIpcRef { sint32 gpu = 1; atom.ipc.CudaIpcTensorRef tensor = 2; }
+message UpdateWeightsIpc {
+  atom.ipc.CudaIpcTensorRef ipc_handle = 1;
+  repeated GpuIpcRef ipc_handles = 2;
+  repeated atom.ipc.WeightSlice bucket = 3;
+  bool is_last = 4;
+}
+enum ResourceTag { RESOURCE_UNSPECIFIED = 0; WEIGHTS = 1; KV_CACHE = 2; }
+message MemoryCommand { repeated ResourceTag tags = 1; }
+message HiddenStates { repeated sint32 aux_layer_ids = 1; uint32 config_version = 2; atom.ipc.MetaObject mooncake_config = 3; }
+message AbortRequest { uint64 req_id = 1; }
+message CollectiveRpc {
+  string method = 1;
+  atom.ipc.MetaValue args = 2;
+  atom.ipc.MetaValue kwargs = 3;
+  bool barrier = 4;
+}
+message FinishWeightSync { string completed_cmd = 1; string completed_request_id = 2; }
+message DiscardWeightSync { string failed_cmd = 1; optional string error = 2; }
+message UtilityRequest {
+  // Empty for a command whose sender does not wait; the engine answers only
+  // a request it can be matched back to.
+  string request_id = 1;
+  reserved 2;
+  repeated uint32 expected_ranks = 3;
+  optional double timeout = 4;
+  optional double deadline = 5;
+  optional string sync_id = 6;
+  oneof command {
+    UpdateWeights update_weights = 10;
+    UpdateWeightsShm update_weights_shm = 11;
+    UpdateWeightsIpc update_weights_ipc = 12;
+    MemoryCommand release_memory = 13;
+    MemoryCommand resume_memory = 14;
+    Empty clear_kv_cache = 15;
+    HiddenStates configure_hidden_states = 16;
+    Empty start_profile = 17;
+    Empty stop_profile = 18;
+    Empty get_mtp_stats = 19;
+    Empty get_mtp_statistics = 20;
+    Empty get_cache_statistics = 21;
+    AbortRequest abort_request = 22;
+    CollectiveRpc collective_rpc = 23;
+    FinishWeightSync finish_weight_sync = 24;
+    DiscardWeightSync discard_failed_weight_sync = 25;
+    Empty get_weight_sync_status = 26;
+  }
+}
+message Shutdown { string reason = 1; }
+message BufferProbe { string probe_id = 1; atom.ipc.BufferRef buffer = 2; bytes expected = 3; atom.ipc.ArenaRegistration registration = 4; }
+message ControlMessage {
+  fixed32 schema_id = 1;
+  uint32 protocol_major = 2;
+  uint32 protocol_minor = 3;
+  string manager_session_id = 4;
+  string engine_instance_id = 5;
+  fixed64 message_id = 6;
+  uint32 attachment_count = 7;
+  oneof payload {
+    CancelRequest cancel = 20;
+    UtilityRequest utility = 21;
+    Shutdown shutdown = 22;
+    BufferProbe buffer_probe = 23;
+  }
+}

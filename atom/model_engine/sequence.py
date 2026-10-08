@@ -10,6 +10,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 
+from atom.model_engine.token_storage import TokenStorage
 from atom.sampling_params import SamplingParams
 
 
@@ -277,6 +278,118 @@ class Sequence:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
     ):
+        self._init_runtime_state(
+            new_token_ids(token_ids),
+            block_size,
+            sampling_params=sampling_params,
+            stop_token_sequences=stop_token_sequences,
+            stream_callback=stream_callback,
+            id=id,
+            kv_transfer_params=kv_transfer_params,
+            num_draft_tokens=num_draft_tokens,
+            has_per_req_cache=has_per_req_cache,
+            needs_independent_noise=needs_independent_noise,
+            parent_request_id=parent_request_id,
+            sibling_index=sibling_index,
+            request_id=request_id,
+            multimodal_data=multimodal_data,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
+        )
+
+    @staticmethod
+    def _per_req_cache_model_types() -> frozenset[str]:
+        return frozenset(
+            {
+                "qwen3_next",
+                "qwen3_5_text",
+                "qwen3_5_moe_text",
+                "kimi_linear",
+                "glm5_next_text",
+                "deepseek_v4",
+                "deepseek_v41_text",
+                "qwen4_exp_text",
+            }
+        )
+
+    @classmethod
+    def from_admission(
+        cls,
+        admission,
+        config,
+        *,
+        block_size=None,
+        num_draft_tokens=None,
+        has_per_req_cache=None,
+    ):
+        if block_size is None:
+            block_size = config.kv_cache_block_size
+        if num_draft_tokens is None:
+            speculative = getattr(config, "speculative_config", None)
+            num_draft_tokens = getattr(speculative, "num_speculative_tokens", 0)
+        if has_per_req_cache is None:
+            model_type = getattr(getattr(config, "hf_config", None), "model_type", None)
+            has_per_req_cache = model_type in cls._per_req_cache_model_types()
+        tokens = TokenStorage.borrow_prompt(admission.prompt)
+        seq = cls.__new__(cls)
+        try:
+            seq._init_runtime_state(
+                tokens,
+                block_size,
+                sampling_params=admission.sampling_params,
+                stop_token_sequences=admission.stop_token_sequences,
+                id=admission.id,
+                kv_transfer_params=admission.kv_transfer_params,
+                num_draft_tokens=num_draft_tokens,
+                has_per_req_cache=has_per_req_cache,
+                needs_independent_noise=admission.needs_independent_noise,
+                parent_request_id=admission.parent_request_id,
+                sibling_index=admission.sibling_index,
+                request_id=admission.external_request_id,
+                multimodal_data=admission.multimodal_data,
+                mrope_positions=admission.mrope_positions,
+                mrope_position_delta=admission.mrope_position_delta,
+                data_parallel_rank=getattr(admission, "data_parallel_rank", None),
+                dp_session_id=getattr(admission, "dp_session_id", None),
+                dp_parent_session_id=getattr(admission, "dp_parent_session_id", None),
+            )
+            seq.arrive_time = admission.arrive_time
+            seq.prompt_hash_chain = admission.prompt_hash_chain
+            if admission._atom_trace_carrier:
+                seq._atom_trace_carrier = admission._atom_trace_carrier
+                seq._atom_trace_model = admission._atom_trace_model
+                seq._atom_trace_request_id = admission._atom_trace_request_id
+                seq._atom_trace_timing = None
+        except BaseException:
+            tokens.release()
+            raise
+        return seq
+
+    def _init_runtime_state(
+        self,
+        token_ids: array.array | TokenStorage,
+        block_size: int,
+        sampling_params: SamplingParams | None = None,
+        stop_token_sequences: list[list[int]] | None = None,
+        stream_callback: Callable[[Any], None] | None = None,
+        id=None,
+        kv_transfer_params: dict | None = None,
+        num_draft_tokens: int = 0,
+        has_per_req_cache: bool = False,
+        needs_independent_noise: bool = False,
+        parent_request_id: str | None = None,
+        sibling_index: int = 0,
+        request_id: str | None = None,
+        multimodal_data: dict | None = None,
+        mrope_positions: np.ndarray | None = None,
+        mrope_position_delta: int = 0,
+        data_parallel_rank: int | None = None,
+        dp_session_id: str | None = None,
+        dp_parent_session_id: str | None = None,
+    ):
         # Built here rather than as a default argument: one instance shared by
         # every defaulting Sequence would be a mutable default in all but name.
         if sampling_params is None:
@@ -286,11 +399,11 @@ class Sequence:
                 "Token logprobs are not supported with speculative decoding"
             )
         self.block_size = block_size
-        self.id = id or next(Sequence.counter)
+        self.id = next(Sequence.counter) if id is None else id
         self.external_request_id = request_id
         self.status = SequenceStatus.WAITING
         self.type = SequenceType.DUMMY
-        self.token_ids = new_token_ids(token_ids)
+        self.token_ids = token_ids
         self.last_token = token_ids[-1]
         self.num_draft_tokens = num_draft_tokens
         # `has_per_req_cache=True` means this seq's attention type maintains
@@ -388,8 +501,7 @@ class Sequence:
         self.block_hashes: list[int] = []
         # `prefix_hash.ShippedChain`, consumed by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
-        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
-        # inside a pickled seq (`__getstate__`).
+        # arrives in the seq's `Admission` (`from_admission`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
@@ -467,9 +579,10 @@ class Sequence:
         self.logprobs: array.array = array.array("d")
         # stream callback
         self.stream_callback = stream_callback
-        # The completion half of `token_ids`, kept in step with it by every
-        # writer, so it is the same array type for the same reasons.
-        self.output_tokens = new_token_ids()
+        # Borrowed prompts have one mutable tail, shared by both accessors.
+        self.output_tokens = (
+            token_ids.tail if isinstance(token_ids, TokenStorage) else new_token_ids()
+        )
         # Placeholders from previous postprocess; overwritten in place.
         self.num_placeholder_tokens: int = 0
 
@@ -581,11 +694,48 @@ class Sequence:
 
     @property
     def prompt_token_ids(self):
+        if isinstance(self.token_ids, TokenStorage):
+            return self.token_ids.prompt_view()
         return self.token_ids[: self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens : self.num_tokens]
+
+    def prompt_view(self):
+        if isinstance(self.token_ids, TokenStorage):
+            return self.token_ids.prompt_view()
+        return memoryview(self.token_ids)[: self.num_prompt_tokens].toreadonly()
+
+    def copy_tokens_into(self, destination, start, end):
+        if isinstance(self.token_ids, TokenStorage):
+            self.token_ids.copy_into(destination, start, end)
+        else:
+            destination.extend(self.token_ids[start:end])
+
+    def token_snapshot(self, start, end):
+        if isinstance(self.token_ids, TokenStorage):
+            return self.token_ids.owned_slice(start, end)
+        return self.token_ids[start:end]
+
+    def overwrite_token(self, index, token_id):
+        self.token_ids[index] = token_id
+        if not isinstance(self.token_ids, TokenStorage):
+            if index < 0:
+                index += len(self.token_ids)
+            self.output_tokens[index - self.num_prompt_tokens] = token_id
+
+    def truncate_tail(self, count):
+        if count <= 0:
+            return
+        del self.token_ids[-count:]
+        if not isinstance(self.token_ids, TokenStorage):
+            del self.output_tokens[-count:]
+
+    def release_prompt(self):
+        """Release only after deferred and connector readers have finished."""
+        if isinstance(self.token_ids, TokenStorage):
+            self.token_ids.release()
 
     # @property
     # def num_blocks(self):
@@ -597,19 +747,14 @@ class Sequence:
 
     def block(self, i):
         assert 0 <= i < self.num_blocks
-        return self.token_ids[i * self.block_size : (i + 1) * self.block_size]
+        return self.token_snapshot(i * self.block_size, (i + 1) * self.block_size)
 
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
-        self.output_tokens.append(token_id)
+        if not isinstance(self.token_ids, TokenStorage):
+            self.output_tokens.append(token_id)
         self.num_tokens += 1
-
-    def __getstate__(self):
-        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
-        state = self.__dict__.copy()
-        state["prompt_hash_chain"] = None
-        return state
 
     # def __getstate__(self):
     #     return (

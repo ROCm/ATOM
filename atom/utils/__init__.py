@@ -516,6 +516,7 @@ def make_zmq_socket(
     bind: bool | None = None,
     identity: bytes | None = None,
     linger: int | None = None,
+    hwm: int = 0,
 ) -> zmq.Socket | zmq.asyncio.Socket:  # type: ignore[name-defined]
     """Make a ZMQ socket with the proper bind/connect semantics."""
 
@@ -538,11 +539,11 @@ def make_zmq_socket(
         bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)
 
     if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
-        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, hwm)
         socket.setsockopt(zmq.RCVBUF, buf_size)
 
     if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):
-        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDHWM, hwm)
         socket.setsockopt(zmq.SNDBUF, buf_size)
 
     if identity is not None:

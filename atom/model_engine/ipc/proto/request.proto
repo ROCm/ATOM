@@ -1,0 +1,72 @@
+syntax = "proto3";
+package atom.ipc.request;
+import "atom/model_engine/ipc/proto/common.proto";
+
+message Sampling {
+  double temperature = 1;
+  sint32 top_k = 2;
+  double top_p = 3;
+  uint64 max_tokens = 4;
+  bool ignore_eos = 5;
+  uint32 n = 6;
+  oneof logprobs { bool logprobs_bool = 7; uint32 logprobs_count = 8; }
+  bool has_stop_strings = 9;
+  repeated string stop_strings = 10;
+}
+message StopSequence { repeated sint32 tokens = 1; }
+message EmbeddingSpan { uint64 start = 1; uint64 length = 2; }
+message Multimodal {
+  repeated atom.ipc.TensorDescriptor tensors = 1;
+  repeated EmbeddingSpan embedding_spans = 2;
+  optional uint64 cache_seed = 3;
+  atom.ipc.MetaObject metadata = 4;
+}
+// The frontend's prefix-cache hash chain over the prompt's full blocks
+// (`prefix_hash.ShippedChain`); the engine adopts it only after checking it.
+message PromptHashChain {
+  uint64 hash_block_size = 1;
+  sint64 cache_seed = 2;
+  uint64 num_prompt_tokens = 3;
+  fixed64 fingerprint = 4;
+  repeated fixed64 hashes = 5;
+}
+// The request span an engine's per-sequence spans hang under
+// (`tracing.bind_sequences`).
+message TraceContext {
+  map<string, string> carrier = 1;
+  string model = 2;
+  optional string request_id = 3;
+}
+message Admission {
+  uint64 id = 1;
+  optional string external_request_id = 2;
+  string admission_id = 3;
+  atom.ipc.BufferRef prompt = 4;
+  Sampling sampling = 5;
+  repeated StopSequence stop_token_sequences = 6;
+  optional string parent_request_id = 7;
+  uint32 sibling_index = 8;
+  bool needs_independent_noise = 9;
+  atom.ipc.MetaObject kv_transfer_params = 10;
+  double arrive_time = 11;
+  Multimodal multimodal_data = 12;
+  atom.ipc.TensorDescriptor mrope_positions = 13;
+  sint64 mrope_position_delta = 14;
+  uint64 submission_sequence = 15;
+  optional sint32 data_parallel_rank = 16;
+  optional string dp_session_id = 17;
+  optional string dp_parent_session_id = 18;
+  PromptHashChain prompt_hash_chain = 19;
+  TraceContext trace = 20;
+}
+message SubmitBatch { repeated Admission requests = 1; }
+message RequestMessage {
+  fixed32 schema_id = 1;
+  uint32 protocol_major = 2;
+  uint32 protocol_minor = 3;
+  string manager_session_id = 4;
+  string engine_instance_id = 5;
+  fixed64 message_id = 6;
+  uint32 attachment_count = 7;
+  SubmitBatch submit = 20;
+}

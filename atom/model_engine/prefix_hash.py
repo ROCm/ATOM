@@ -62,8 +62,14 @@ def chained_block_hashes(
 
 
 def prompt_fingerprint(seq) -> int:
-    """xxh64 of `seq`'s prompt token bytes, without a copy."""
-    return _xxh64(memoryview(seq.token_ids)[: seq.num_prompt_tokens])
+    """xxh64 of `seq`'s int32 prompt token bytes.
+
+    Read through `prompt_token_ids`, which the frontend's `AdmissionRequest`
+    and the engine's `Sequence` both expose as int32 tokens: the frontend's
+    shared prompt view and the engine's borrowed `TokenStorage` prompt are
+    hashed in place.
+    """
+    return _xxh64(memoryview(seq.prompt_token_ids).cast("B"))
 
 
 class ShippedChain(NamedTuple):
@@ -82,7 +88,9 @@ def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
     n = full_prompt_blocks(seq, hash_block_size)
-    chain = chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed)
+    chain = chained_block_hashes(
+        seq.prompt_token_ids, hash_block_size, 0, n, seq.cache_seed
+    )
     seq.prompt_hash_chain = ShippedChain(
         hash_block_size,
         seq.cache_seed,
@@ -90,22 +98,3 @@ def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
         prompt_fingerprint(seq),
         array.array("Q", chain),
     )
-
-
-def take_shipped_chains(seqs) -> list | None:
-    """`seqs`' shipped chains, detached for the ADD frame that carries them
-    beside the seqs (a pickled `Sequence` drops its chain); None if none has
-    one. The frontend keeps no copy."""
-    chains = [getattr(seq, "prompt_hash_chain", None) for seq in seqs]
-    if not any(chains):
-        return None
-    for seq in seqs:
-        seq.prompt_hash_chain = None
-    return chains
-
-
-def attach_shipped_chains(seqs, chains=None) -> None:
-    """Hand an ADD frame's chains (`take_shipped_chains`) back to its seqs."""
-    if chains:
-        for seq, chain in zip(seqs, chains, strict=True):
-            seq.prompt_hash_chain = chain

@@ -111,7 +111,7 @@ class PPEngineCoreProc(EngineCore):
 
             rejected = self.scheduler.take_rejected()
             if rejected:
-                self.output_queue.put_nowait(rejected)
+                self._emit_completions(rejected)
 
             if result is None:
                 # Deferred blocks keep `Scheduler.is_finished()` false, so
@@ -204,11 +204,11 @@ class PPEngineCoreProc(EngineCore):
             try:
                 while not self.stream_output_queue.empty():
                     stream_outputs = self.stream_output_queue.get_nowait()
-                    self.output_queue.put_nowait(("STREAM", stream_outputs))
+                    self._emit_streams(stream_outputs)
             except queue.Empty:
                 pass
             if finished_seqs:
-                self.output_queue.put_nowait(finished_seqs)
+                self._emit_completions(finished_seqs)
 
     def _flush_pending_prefix_hashes(self):
         while self._pending_prefix_hash:

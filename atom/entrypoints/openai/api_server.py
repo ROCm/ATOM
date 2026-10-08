@@ -18,7 +18,6 @@ if __name__ == "__main__":
     initialize_metrics()
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -38,6 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
 from atom.model_engine.arg_utils import EngineArgs
+from atom.model_engine.ipc.dto import AdmissionRequest
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
@@ -635,13 +635,53 @@ def _validate_pool_capacity(
     )
 
 
-def _validate_sequence_context_length(seq) -> None:
-    _validate_context_length(
-        seq.num_prompt_tokens,
-        seq.max_tokens,
-        _get_engine_max_model_len(),
-    )
-    _validate_pool_capacity(seq.num_prompt_tokens, _get_engine_max_pool_tokens())
+class _RequestSubmission:
+    """Own a request's admissions through preparation, submission and cleanup."""
+
+    def __init__(self, request_id: str | None = None):
+        self.request_id = request_id
+        self.admissions: list[AdmissionRequest] = []
+
+    async def submit(self, prepare):
+        future = asyncio.get_running_loop().run_in_executor(None, prepare)
+        try:
+            result = await asyncio.shield(future)
+        except BaseException:
+            # The worker may still produce admissions after cancellation.
+            future.add_done_callback(self._discard_prepared)
+            raise
+
+        self.admissions = result if isinstance(result, list) else [result]
+        try:
+            for admission in self.admissions:
+                _validate_context_length(
+                    admission.num_prompt_tokens,
+                    admission.max_tokens,
+                    _get_engine_max_model_len(),
+                )
+                _validate_pool_capacity(
+                    admission.num_prompt_tokens, _get_engine_max_pool_tokens()
+                )
+                admission.callback_only = True
+                if self.request_id is not None:
+                    _seq_id_to_request_id[admission.id] = self.request_id
+            await engine.core_mgr.add_request_async(self.admissions)
+        except BaseException:
+            self.finish(aborted=True)
+            raise
+        return result
+
+    def _discard_prepared(self, future) -> None:
+        if future.cancelled() or future.exception() is not None:
+            return
+        result = future.result()
+        self.admissions = result if isinstance(result, list) else [result]
+        self.finish()
+
+    def finish(self, aborted: bool = False) -> None:
+        admissions, self.admissions = self.admissions, []
+        for admission in admissions:
+            cleanup_stream(admission.id, aborted=aborted)
 
 
 def _has_multimodal_content(messages: list[Any]) -> bool:
@@ -766,6 +806,8 @@ async def generate_async(
     return_token_ids: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate non-streaming output, optionally echoing local prompt token IDs."""
+    if not isinstance(prompt_or_tokens, str):
+        prompt_or_tokens = tuple(prompt_or_tokens)
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -814,13 +856,8 @@ async def generate_async(
             dp_parent_session_id=dp_parent_session_id,
         )
 
-    seq = await loop.run_in_executor(None, do_preprocess)
-    try:
-        _validate_sequence_context_length(seq)
-    except Exception:
-        engine.io_processor.requests.pop(seq.id, None)
-        raise
-    engine.core_mgr.add_request([seq])
+    submission = _RequestSubmission()
+    seq = await submission.submit(do_preprocess)
 
     _finished_ok = False
     try:
@@ -838,19 +875,7 @@ async def generate_async(
                 _finished_ok = True
                 break
     finally:
-        # Two responsibilities, on EVERY exit path:
-        #   1) If we didn't finish (client disconnected / cancelled), tell the
-        #      engine to stop so the seq doesn't run to max_tokens and burn GPU.
-        #   2) Always drop the seq from io_processor.requests. The engine frees
-        #      its own KV on finish, but this dict is only cleaned up here for
-        #      non-stream requests -- without an unconditional pop, every
-        #      completed non-stream request leaks a Sequence (pending grows
-        #      forever). Streaming pops via cleanup_stream instead.
-        if seq is not None:
-            if not _finished_ok:
-                with contextlib.suppress(Exception):
-                    engine.core_mgr.abort_request(seq.id)
-            engine.io_processor.requests.pop(seq.id, None)
+        submission.finish(aborted=not _finished_ok)
 
     text = delivered_text(all_token_ids)
     num_tokens_input = (
@@ -903,6 +928,7 @@ async def generate_async_multimodal(
     dp_parent_session_id: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for one multimodal request."""
+    token_ids = tuple(token_ids)
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -936,13 +962,8 @@ async def generate_async_multimodal(
             dp_parent_session_id=dp_parent_session_id,
         )
 
-    seq = await loop.run_in_executor(None, do_preprocess)
-    try:
-        _validate_sequence_context_length(seq)
-    except Exception:
-        engine.io_processor.requests.pop(seq.id, None)
-        raise
-    engine.core_mgr.add_request([seq])
+    submission = _RequestSubmission()
+    seq = await submission.submit(do_preprocess)
 
     _finished_ok = False
     try:
@@ -960,12 +981,7 @@ async def generate_async_multimodal(
                 _finished_ok = True
                 break
     finally:
-        # See generate_async: abort on early exit, always pop to avoid leak.
-        if seq is not None:
-            if not _finished_ok:
-                with contextlib.suppress(Exception):
-                    engine.core_mgr.abort_request(seq.id)
-            engine.io_processor.requests.pop(seq.id, None)
+        submission.finish(aborted=not _finished_ok)
 
     text = delivered_text(all_token_ids)
     num_tokens_output = len(all_token_ids)
@@ -1012,6 +1028,8 @@ async def generate_async_fanout(
 
     Shared prompt token IDs are returned only in the first output.
     """
+    if not isinstance(prompt_or_tokens, str):
+        prompt_or_tokens = tuple(prompt_or_tokens)
 
     n = int(sampling_params.n)
     assert n >= 1
@@ -1059,14 +1077,8 @@ async def generate_async_fanout(
             dp_parent_session_id=dp_parent_session_id,
         )
 
-    seqs = await loop.run_in_executor(None, do_preprocess)
-    try:
-        _validate_sequence_context_length(seqs[0])
-    except Exception:
-        for seq in seqs:
-            engine.io_processor.requests.pop(seq.id, None)
-        raise
-    engine.core_mgr.add_request(seqs)
+    submission = _RequestSubmission()
+    seqs = await submission.submit(do_preprocess)
     num_tokens_input = seqs[0].num_prompt_tokens
 
     _all_finished = False
@@ -1087,14 +1099,7 @@ async def generate_async_fanout(
                 finished[idx] = True
         _all_finished = True
     finally:
-        # Abort any sibling still running on early exit; always pop all seqs.
-        for _seq in seqs:
-            if not _all_finished:
-                try:
-                    engine.core_mgr.abort_request(_seq.id)
-                except Exception:
-                    logger.debug("abort_request failed on teardown", exc_info=True)
-            engine.io_processor.requests.pop(_seq.id, None)
+        submission.finish(aborted=not _all_finished)
 
     finished_at = time.time()
     outputs: list[dict[str, Any]] = []
@@ -1206,6 +1211,8 @@ async def setup_streaming_request(
     response generator does not have to re-tokenize the prompt on the event
     loop.
     """
+    if not isinstance(prompt_or_tokens, str):
+        prompt_or_tokens = tuple(prompt_or_tokens)
     stream_collector = StreamOutputCollector(request_id)
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
@@ -1221,10 +1228,8 @@ async def setup_streaming_request(
             request_output, request_id, stream_collector, stream_loop, detokenizer
         )
 
-    executor_loop = asyncio.get_event_loop()
-
     def do_preprocess():
-        seq = engine.io_processor.preprocess(
+        return engine.io_processor.preprocess(
             prompt_or_tokens,
             sampling_params,
             stream_callback=stream_callback,
@@ -1234,19 +1239,12 @@ async def setup_streaming_request(
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
         )
-        _seq_id_to_request_id[seq.id] = request_id
-        return seq
 
-    seq = None
+    submission = _RequestSubmission(request_id)
     try:
-        seq = await executor_loop.run_in_executor(None, do_preprocess)
-        _validate_sequence_context_length(seq)
-    except Exception:
-        _stream_loops.pop(request_id, None)
-        _request_start_times.pop(request_id, None)
-        if seq is not None:
-            _seq_id_to_request_id.pop(seq.id, None)
-            engine.io_processor.requests.pop(seq.id, None)
+        seq = await submission.submit(do_preprocess)
+    except BaseException:
+        cleanup_request(request_id)
         raise
     seq_id = seq.id
 
@@ -1259,28 +1257,18 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
-    engine.core_mgr.add_request([seq])
-
     return seq_id, stream_collector, seq.num_prompt_tokens
 
 
 def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
-    """Tear down one stream. A fan-out request runs this once per sibling.
-
-    ``aborted`` says the stream did NOT reach its normal end (client disconnect
-    or abnormal generator teardown), so the seq is likely still running in the
-    engine and must be stopped. On normal completion pass False (the default):
-    the engine has already dropped the seq, so an abort would be a guaranteed
-    no-op that just floods the control path (one broadcast per engine core, per
-    request).
-    """
+    """Release one admission; abort the engine request on early exit."""
     _seq_id_to_request_id.pop(seq_id, None)
     if aborted:
         try:
             engine.core_mgr.abort_request(seq_id)
         except Exception:
             logger.debug("abort_request failed on teardown", exc_info=True)
-    engine.io_processor.requests.pop(seq_id, None)
+    engine.io_processor.finish_request(seq_id)
 
 
 def cleanup_request(request_id: str) -> None:
@@ -1413,6 +1401,8 @@ async def setup_streaming_request_fanout(
     tokenize the same prompt once, so ``num_prompt_tokens`` is shared and lets
     the stream response generator skip re-tokenizing on the event loop.
     """
+    if not isinstance(prompt_or_tokens, str):
+        prompt_or_tokens = tuple(prompt_or_tokens)
     n = int(sampling_params.n)
     assert n >= 1
 
@@ -1441,10 +1431,8 @@ async def setup_streaming_request_fanout(
 
     stream_callbacks = [make_callback(i) for i in range(n)]
 
-    executor_loop = asyncio.get_event_loop()
-
     def do_preprocess():
-        seqs = engine.io_processor.preprocess_fanout(
+        return engine.io_processor.preprocess_fanout(
             prompt_or_tokens,
             sampling_params,
             stream_callbacks=stream_callbacks,
@@ -1455,20 +1443,12 @@ async def setup_streaming_request_fanout(
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
         )
-        for seq in seqs:
-            _seq_id_to_request_id[seq.id] = request_id
-        return seqs
 
-    seqs = []
+    submission = _RequestSubmission(request_id)
     try:
-        seqs = await executor_loop.run_in_executor(None, do_preprocess)
-        _validate_sequence_context_length(seqs[0])
-    except Exception:
-        _stream_loops.pop(request_id, None)
-        _request_start_times.pop(request_id, None)
-        for seq in seqs:
-            _seq_id_to_request_id.pop(seq.id, None)
-            engine.io_processor.requests.pop(seq.id, None)
+        seqs = await submission.submit(do_preprocess)
+    except BaseException:
+        cleanup_request(request_id)
         raise
     seq_ids = [seq.id for seq in seqs]
     # debug for the same reason as its single-sequence counterpart: per-request
@@ -1476,7 +1456,6 @@ async def setup_streaming_request_fanout(
     logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
-    engine.core_mgr.add_request(seqs)
     return seq_ids, shared_collector, seqs[0].num_prompt_tokens
 
 

@@ -170,9 +170,12 @@ def bind_sequences(seqs, *, unsupported=None):
 
 
 def _unbind(seq):
-    # Also safe if an already-bound sequence is passed through again.
-    seq.__dict__.pop("_atom_trace_carrier", None)
-    seq.__dict__.pop("_atom_trace_timing", None)
+    # Also safe if an already-bound sequence is passed through again. Cleared
+    # rather than deleted: a frontend `AdmissionRequest` declares these slots.
+    if getattr(seq, "_atom_trace_carrier", None) is not None:
+        seq._atom_trace_carrier = None
+    if getattr(seq, "_atom_trace_timing", None) is not None:
+        seq._atom_trace_timing = None
 
 
 def set_request_id(request_id):

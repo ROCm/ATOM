@@ -6,13 +6,15 @@ import itertools
 import logging
 import time
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.ipc.buffer_types import PromptHandle
+from atom.model_engine.ipc.dto import AdmissionRequest, CompletionResult, RequestState
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
@@ -189,6 +191,9 @@ class LLMEngine:
         """Shut down engine and release all GPU resources."""
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
+        if hasattr(self, "io_processor"):
+            for request_id in list(self.io_processor.requests):
+                self.io_processor.finish_request(request_id)
 
     def add_request(
         self,
@@ -262,24 +267,29 @@ class LLMEngine:
             request_id_iter = itertools.repeat(None)
 
         reqs = []
-        for prompt, sampling_param, callback, mm_data, request_id in zip(
-            prompt_or_tokens_list,
-            sampling_params_iter,
-            stream_callback_iter,
-            mm_data_iter,
-            request_id_iter,
-        ):
-            fanout = self.io_processor.preprocess_fanout(
-                prompt,
-                sampling_param,
-                stream_callback=callback,
-                multimodal_data=mm_data,
-                parent_request_id=request_id,
-            )
-            reqs.extend(fanout)
-        self.core_mgr.add_request(reqs)
+        try:
+            for prompt, sampling_param, callback, mm_data, request_id in zip(
+                prompt_or_tokens_list,
+                sampling_params_iter,
+                stream_callback_iter,
+                mm_data_iter,
+                request_id_iter,
+            ):
+                fanout = self.io_processor.preprocess_fanout(
+                    prompt,
+                    sampling_param,
+                    stream_callback=callback,
+                    multimodal_data=mm_data,
+                    parent_request_id=request_id,
+                )
+                reqs.extend(fanout)
+            self.core_mgr.add_request(reqs)
+        except BaseException:
+            for req in reqs:
+                self.io_processor.finish_request(req.id)
+            raise
 
-    def step(self) -> list[Sequence]:
+    def step(self) -> list[CompletionResult]:
         seqs = self.core_mgr.get_output()
         return seqs
 
@@ -694,7 +704,7 @@ class InputOutputProcessor:
         self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
-        self.requests = {}
+        self.requests: dict[int, RequestState] = {}
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -726,26 +736,7 @@ class InputOutputProcessor:
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
-        """Single source of truth for which model_types use per-req cache.
-
-        Read by Sequence-construction (here) AND by ModelRunner's startup
-        sanity check, which asserts that any model whose attention builder
-        declares a per-request state sub-pool has its model_type
-        registered here. Adding a new stateful-attention model means
-        adding its model_type to this set.
-        """
-        return frozenset(
-            {
-                "qwen3_next",
-                "qwen3_5_text",
-                "qwen3_5_moe_text",
-                "kimi_linear",
-                "glm5_next_text",
-                "deepseek_v4",
-                "deepseek_v41_text",
-                "qwen4_exp_text",
-            }
-        )
+        return Sequence._per_req_cache_model_types()
 
     def preprocess(
         self,
@@ -759,17 +750,10 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
     ):
-        """responsible for:
-        1) Tokenize
-        2) Create Sequence object
-
-        Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
-        callers which expect exactly one ``Sequence`` back cannot silently
-        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
-        """
+        """Tokenize and prepare one admission; use preprocess_fanout for n > 1."""
         if getattr(sampling_params, "n", 1) > 1:
             raise ValueError(
-                "preprocess() returns a single Sequence; for SamplingParams.n > 1 "
+                "preprocess() returns a single admission; for SamplingParams.n > 1 "
                 "call preprocess_fanout() and manage the returned list."
             )
         seqs = self.preprocess_fanout(
@@ -797,23 +781,8 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
-    ) -> list[Sequence]:
-        """Tokenize once and materialize ``sampling_params.n`` Sequences.
-
-        Returns a list of length ``n``. For ``n == 1`` this is functionally
-        equivalent to the legacy single-sequence path. For ``n > 1``:
-
-        * The prompt is tokenized a single time and the token list is copied
-          into each sibling (``Sequence`` copies internally, so mutations stay
-          isolated).
-        * Every sibling is marked ``needs_independent_noise=True`` so the
-          sampler generates fresh per-row noise instead of reusing the cached
-          shared exponential tensor. Without this, siblings with identical
-          logits would emit identical tokens.
-        * Per-sibling ``stream_callbacks`` can be supplied to route streaming
-          deltas to independent queues (one per choice index). Falls back to
-          the scalar ``stream_callback`` for every sibling.
-        """
+    ) -> list[AdmissionRequest]:
+        """Tokenize once; siblings share a stable prompt and own callback state."""
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(
@@ -822,10 +791,23 @@ class InputOutputProcessor:
                 enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
+        if self.num_speculative_tokens and sampling_params.logprobs:
+            raise ValueError(
+                "Token logprobs are not supported with speculative decoding"
+            )
+        stops = sampling_params.stop_strings
+        sampling_params = replace(
+            sampling_params,
+            stop_strings=(
+                ([stops] if isinstance(stops, str) else list(stops))
+                if stops is not None
+                else None
+            ),
+        )
 
         segment_tokenizer = getattr(self, "segment_tokenizer", None)
         if not isinstance(prompt_or_tokens, str):
-            tokens = prompt_or_tokens
+            tokens = tuple(prompt_or_tokens)
         elif segment_tokenizer is not None:
             tokens = segment_tokenizer.encode(prompt_or_tokens)
         else:
@@ -856,19 +838,17 @@ class InputOutputProcessor:
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
 
-        seqs: list[Sequence] = []
+        prompt = PromptHandle.from_tokens(tokens, owned=True)
+        seqs: list[AdmissionRequest] = []
         for i in range(n):
             cb = (
                 stream_callbacks[i] if stream_callbacks is not None else stream_callback
             )
-            seq = Sequence(
-                tokens,
-                self.block_size,
-                sampling_params,
-                stop_token_sequences,
-                stream_callback=cb,
-                num_draft_tokens=self.num_speculative_tokens,
-                has_per_req_cache=self.has_per_req_cache,
+            seq = AdmissionRequest(
+                id=next(Sequence.counter),
+                prompt=prompt.acquire(),
+                sampling_params=sampling_params,
+                stop_token_sequences=stop_token_sequences,
                 kv_transfer_params=kv_transfer_params,
                 multimodal_data=multimodal_data,
                 mrope_positions=mrope_positions,
@@ -876,17 +856,18 @@ class InputOutputProcessor:
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,
                 sibling_index=i,
-                request_id=parent_request_id if n == 1 else None,
+                external_request_id=parent_request_id if n == 1 else None,
                 data_parallel_rank=data_parallel_rank,
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
             seq.arrive_time = time.time()
-            self.requests[seq.id] = seq
+            self.requests[seq.id] = RequestState(seq, callback=cb)
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
             seqs.append(seq)
+        prompt.release()
 
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
@@ -909,16 +890,21 @@ class InputOutputProcessor:
             )
         return seqs
 
-    def postprocess(self, reqs: list[Sequence]):
+    def finish_request(self, request_id):
+        state = self.requests.pop(request_id, None)
+        external_request_id = self._internal_to_external.pop(request_id, None)
+        if external_request_id is not None:
+            self._external_to_internal.pop(external_request_id, None)
+        if state is not None:
+            state.release_frontend()
+
+    def postprocess(self, reqs: list[CompletionResult]):
         """responsible for:
         1) Compute stats for logging
         2) Detokenize"""
         outputs = {}
         for req in reqs:
-            self.requests.pop(req.id)
-            external_request_id = self._internal_to_external.pop(req.id, None)
-            if external_request_id is not None:
-                self._external_to_internal.pop(external_request_id, None)
+            self.finish_request(req.id)
             output_str = self.tokenizer.decode(req.completion_token_ids)
             req.leave_time = time.time()
 

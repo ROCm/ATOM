@@ -2,11 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
 import time
+import uuid
+from collections import deque
 from contextlib import ExitStack
+from copy import deepcopy
+from dataclasses import replace
 
 import torch
 import zmq
@@ -20,14 +25,22 @@ from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
 )
-from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.prefix_hash import attach_shipped_chains
+from atom.model_engine.ipc.buffer_types import (
+    BufferDescriptor,
+    HostIdentity,
+    PromptHandle,
+)
+from atom.model_engine.ipc.control_codec import ControlCodec
+from atom.model_engine.ipc.dto import AdmissionRequest, CompletionResult
+from atom.model_engine.ipc.frame_utils import Fields, ProtocolError
+from atom.model_engine.ipc.prompt_arena import PromptArenaReader
+from atom.model_engine.ipc.request_codec import RequestCodec
+from atom.model_engine.ipc.result_codec import ResultCodec
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
-    get_exit_sequence,
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
@@ -62,6 +75,55 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+class _BoundedOutputQueue:
+    def __init__(self, config, on_overflow):
+        self._queue = queue.Queue(
+            maxsize=config.ipc_max_pending_jobs * config.ipc_max_batch_size
+        )
+        self._limit = config.ipc_max_pending_bytes
+        self._header_bytes = config.ipc_max_header_bytes
+        self._bytes = 0
+        self._lock = threading.Lock()
+        self._on_overflow = on_overflow
+
+    def put_nowait(self, item):
+        size = self._header_bytes
+        payload = item[1] if isinstance(item, tuple) else item
+        if isinstance(item, tuple) and item[0] == "BUFFER_RELEASE":
+            size = 512 + sum(
+                len(value) for value in payload.values() if isinstance(value, str)
+            )
+        if isinstance(payload, (list, tuple)):
+            for value in payload:
+                value = value[1] if isinstance(value, tuple) else value
+                tokens = getattr(value, "output_tokens", ())
+                size += len(tokens) * 4 + len(getattr(value, "logprobs", ())) * 8
+        with self._lock:
+            overflow = self._bytes + size > self._limit
+            if not overflow:
+                self._bytes += size
+        if not overflow:
+            try:
+                self._queue.put_nowait((item, size))
+                return
+            except queue.Full:
+                with self._lock:
+                    self._bytes -= size
+        self._on_overflow("result queue capacity exceeded")
+
+    def get(self, block=True, timeout=None):
+        item, size = self._queue.get(block=block, timeout=timeout)
+        with self._lock:
+            self._bytes -= size
+        return item
+
+    def get_nowait(self):
+        return self.get(block=False)
+
+    def empty(self):
+        return self._queue.empty()
+
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
@@ -70,13 +132,30 @@ class EngineCore:
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
-        self.input_queue = queue.Queue[Sequence]()
-        self.output_queue = queue.Queue[list[Sequence]]()
+        self._engine_config = config
+        self._ipc_engine_id = uuid.uuid4().hex
+        self._ipc_session_id = None
+        self._ipc_rank = config.parallel_config.data_parallel_rank
+        self._ipc_reader = None
+        self._ipc_lock = threading.RLock()
+        self._ipc_stop = threading.Event()
+        self._ipc_failure_reason = None
+        self._ipc_cancelled = {}
+        self._ipc_pending = set()
+        self._ipc_live = set()
+        self._ipc_pending_bytes = 0
+        self._ipc_finished = set()
+        self._ipc_finished_order = deque()
+        self._ipc_registry_limit = (
+            config.ipc_max_pending_jobs * config.ipc_max_batch_size
+        )
+        self.input_queue = queue.Queue(maxsize=config.ipc_max_pending_jobs)
+        self.output_queue = _BoundedOutputQueue(config, self._fail_ipc)
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
         # Queue for utility commands (processed in busy_loop to avoid thread contention)
-        self.utility_queue = queue.Queue()
+        self.utility_queue = queue.Queue(maxsize=self._ipc_registry_limit)
         self._has_pending_utility = (
             False  # Flag to avoid checking empty queue every loop
         )
@@ -296,7 +375,7 @@ class EngineCore:
     def _send_ready_signal(self):
         self.output_queue.put_nowait(("READY", self._ready_payload()))
 
-    def _ready_payload(self) -> dict[str, int] | None:
+    def _ready_payload(self) -> dict:
         """Startup facts the frontend cannot read off its own Config.
 
         `num_kvcache_blocks` is measured in this subprocess, so the API server's
@@ -305,9 +384,17 @@ class EngineCore:
         its owner, `BlockManager`, and gives the frontend a single number to
         compare a prompt against.
         """
-        if self.scheduler is None:
-            return None
-        return {"max_pool_tokens": self.scheduler.block_manager.max_pool_tokens}
+        payload = {
+            "rank": self._ipc_rank,
+            "role": getattr(self.scheduler, "_METRICS_ROLE", ""),
+            "host_id": HostIdentity.current(),
+            "buffer_modes": ["raw", "shm"],
+        }
+        if self.scheduler is not None:
+            blocks = getattr(self.scheduler, "block_manager", None)
+            if blocks is not None:
+                payload["max_pool_tokens"] = blocks.max_pool_tokens
+        return payload
 
     def _post_model_load_hook(self):
         """Called after ModelRunner is initialized (model loaded) but before
@@ -382,8 +469,10 @@ class EngineCore:
 
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
-        self.output_queue.put_nowait([get_exit_sequence()])
+        self.output_queue.put_nowait(("STOPPED", {}))
         self.output_thread.join(timeout=0.5)
+        if self._ipc_reader is not None:
+            self._ipc_reader.close()
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
@@ -483,7 +572,7 @@ class EngineCore:
         rejected = self.scheduler.take_rejected()
         if rejected:
             self._release_multimodal_requests(rejected)
-            self.output_queue.put_nowait(rejected)
+            self._emit_completions(rejected)
 
         if result is None:
             self._advance_idle_kv_transfer()
@@ -546,13 +635,13 @@ class EngineCore:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()
                 # Send stream outputs as intermediate results
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
+                self._emit_streams(stream_outputs)
         except queue.Empty:
             pass
 
         if finished_seqs:
             self._release_multimodal_requests(finished_seqs)
-            self.output_queue.put_nowait(finished_seqs)
+            self._emit_completions(finished_seqs)
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.
@@ -710,143 +799,445 @@ class EngineCore:
             return
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 
+    def _remember_finished(self, request_id):
+        if not hasattr(self, "_ipc_lock"):
+            return
+        with self._ipc_lock:
+            self._ipc_cancelled.pop(request_id, None)
+            self._ipc_live.discard(request_id)
+            if request_id not in self._ipc_finished:
+                self._ipc_finished.add(request_id)
+                self._ipc_finished_order.append(request_id)
+            while len(self._ipc_finished_order) > self._ipc_registry_limit:
+                self._ipc_finished.discard(self._ipc_finished_order.popleft())
+
+    def _fail_ipc(self, reason):
+        self._ipc_failure_reason = reason
+        self._ipc_stop.set()
+
+    def _emit_completions(self, sequences):
+        outputs = []
+        for sequence in sequences:
+            output = (
+                sequence
+                if isinstance(sequence, CompletionResult)
+                else CompletionResult.from_sequence(sequence)
+            )
+            outputs.append(output)
+            self._remember_finished(output.id)
+        if outputs:
+            self.output_queue.put_nowait(("COMPLETION", outputs))
+
+    def _emit_streams(self, outputs):
+        snapshots = [
+            (
+                request_id,
+                replace(
+                    output,
+                    output_tokens=list(output.output_tokens),
+                    kv_transfer_params_output=deepcopy(
+                        output.kv_transfer_params_output
+                    ),
+                ),
+            )
+            for request_id, output in outputs
+        ]
+        if snapshots:
+            self.output_queue.put_nowait(("STREAM", snapshots))
+
+    def _take_admission(self, admission):
+        if not isinstance(admission, AdmissionRequest):
+            return admission
+        with self._ipc_lock:
+            cancelled = self._ipc_cancelled.pop(admission.id, None)
+            self._ipc_pending.discard(admission.id)
+            self._ipc_pending_bytes -= admission.prompt.nbytes
+        try:
+            if cancelled is not None:
+                self._emit_completions(
+                    [
+                        CompletionResult(
+                            id=admission.id,
+                            num_prompt_tokens=admission.num_prompt_tokens,
+                            arrive_time=admission.arrive_time,
+                            leave_time=time.time(),
+                            leave_reason="abort",
+                        )
+                    ]
+                )
+                return None
+            sequence = Sequence.from_admission(admission, self._engine_config)
+            tracing.enqueue(sequence, received_at=admission.received_at)
+            SchedulerMetrics.enqueue(sequence, received_at=admission.received_at)
+            return sequence
+        except Exception as exc:
+            logger.exception("%s: request %s was rejected", self.label, admission.id)
+            self._remember_finished(admission.id)
+            self.output_queue.put_nowait(
+                (
+                    "ERROR",
+                    {
+                        "code": "admission",
+                        "message": str(exc),
+                        "request_id": admission.id,
+                    },
+                )
+            )
+            return None
+        finally:
+            admission.prompt.release()
+
     def pull_and_process_input_queue(self):
+        if getattr(self, "_ipc_stop", None) is not None and self._ipc_stop.is_set():
+            return True
         recv_reqs = []
-        while not self.input_queue.empty():
-            seqs = self.input_queue.get_nowait()
-            for seq in seqs:
-                if seq.status == SequenceStatus.EXIT_ENGINE:
-                    logger.debug(f"{self.label}: input_queue get exit engine")
-                    return True
-                recv_reqs.append(seq)
-        if len(recv_reqs) > 0:
-            logger.debug(f"{self.label}: put {len(recv_reqs)} reqs to scheduler")
+        shutdown = False
+        while True:
+            try:
+                admissions = self.input_queue.get_nowait()
+            except queue.Empty:
+                break
+            for admission in admissions:
+                sequence = self._take_admission(admission)
+                if sequence is None:
+                    continue
+                if sequence.status == SequenceStatus.EXIT_ENGINE:
+                    shutdown = True
+                else:
+                    recv_reqs.append(sequence)
+        if recv_reqs:
             self.scheduler.extend(recv_reqs)
-        return False
+        return shutdown
+
+    def _release_prompt_consumer(self, descriptor, key):
+        self.output_queue.put_nowait(
+            (
+                "BUFFER_RELEASE",
+                {
+                    "arena_id": descriptor.arena_id,
+                    "arena_epoch": descriptor.epoch,
+                    "allocation_id": descriptor.allocation_id,
+                    "allocation_generation": descriptor.generation,
+                    "admission_id": str(key[2]),
+                    "request_id": key[2],
+                    "rank": self._ipc_rank,
+                    "reason": "last_reader",
+                },
+            )
+        )
+
+    def _handle_buffer_probe(self, message):
+        session = message.metadata["session_id"]
+        payload = message.payload
+        identity = payload["probe_id"].rsplit(":", 1)
+        if not session or len(identity) != 2 or identity[0] != session:
+            raise ProtocolError("probe does not identify the manager session")
+        try:
+            rank = int(identity[1])
+        except ValueError as exc:
+            raise ProtocolError("probe rank is invalid") from exc
+        if rank < 0:
+            raise ProtocolError("probe rank is negative")
+        self._ipc_session_id = session
+        self._ipc_rank = rank
+        result = {"probe_id": payload["probe_id"], "accessible": False, "error": ""}
+        descriptor = payload.get("buffer")
+        registration = payload.get("registration")
+        if descriptor is not None:
+            try:
+                if registration is None or os.path.realpath(
+                    registration["root_dir"]
+                ) != os.path.realpath(self._engine_config.ipc_shm_dir):
+                    raise ValueError(
+                        "probe root is not registered in Core configuration"
+                    )
+                if self._ipc_reader is None:
+                    self._ipc_reader = PromptArenaReader(
+                        registration, on_release=self._release_prompt_consumer
+                    )
+                result["digest"] = self._ipc_reader.probe(descriptor)
+                result["arena_epoch"] = descriptor.epoch
+                result["accessible"] = True
+            except (OSError, ValueError, BufferError) as exc:
+                result["error"] = str(exc)
+        self.output_queue.put_nowait(
+            (
+                "BUFFER_PROBE_RESULT",
+                result,
+                {"in_reply_to": message.metadata["message_id"]},
+            )
+        )
+
+    def _queue_admissions(self, message, received_at):
+        admissions = []
+        accepted = False
+        try:
+            for values in message.payload:
+                prompt = values["prompt"]
+                if isinstance(prompt, BufferDescriptor):
+                    if self._ipc_reader is None:
+                        raise ProtocolError("shared prompt was not verified by a probe")
+                    key = (
+                        self._ipc_session_id,
+                        self._ipc_engine_id,
+                        values["id"],
+                        "request",
+                    )
+                    prompt = self._ipc_reader.acquire(prompt, key)
+                    values["prompt"] = prompt
+                if not isinstance(prompt, PromptHandle):
+                    raise ProtocolError("admission has no prompt owner")
+                admission = AdmissionRequest(**values, received_at=received_at)
+                admissions.append(admission)
+            nbytes = sum(admission.prompt.nbytes for admission in admissions)
+            with self._ipc_lock:
+                ids = {admission.id for admission in admissions}
+                if ids & (self._ipc_live | self._ipc_finished):
+                    raise ProtocolError("duplicate or completed request ID")
+                for admission in admissions:
+                    cancelled = self._ipc_cancelled.get(admission.id, 0)
+                    if (
+                        cancelled
+                        and admission.submission_sequence
+                        and cancelled != admission.submission_sequence
+                    ):
+                        raise ProtocolError("cancel does not match admission sequence")
+                if (
+                    self._ipc_pending_bytes + nbytes
+                    <= self._engine_config.ipc_max_pending_bytes
+                ):
+                    try:
+                        self.input_queue.put_nowait(admissions)
+                    except queue.Full:
+                        pass
+                    else:
+                        self._ipc_pending.update(ids)
+                        self._ipc_live.update(ids)
+                        self._ipc_pending_bytes += nbytes
+                        accepted = True
+            if not accepted:
+                self._emit_completions(
+                    [
+                        CompletionResult(
+                            id=admission.id,
+                            num_prompt_tokens=admission.num_prompt_tokens,
+                            arrive_time=admission.arrive_time,
+                            leave_time=time.time(),
+                            leave_reason="overloaded",
+                            external_request_id=admission.external_request_id,
+                            parent_request_id=admission.parent_request_id,
+                            sibling_index=admission.sibling_index,
+                        )
+                        for admission in admissions
+                    ]
+                )
+        finally:
+            if not accepted:
+                for values in message.payload:
+                    prompt = values.get("prompt")
+                    if isinstance(prompt, PromptHandle):
+                        prompt.release()
+            message.owners.clear()
+
+    def _queue_cancellation(self, message, request_ids=None, *, enqueue=True):
+        watermark = message.metadata.get("submission_sequence", 0)
+        with self._ipc_lock:
+            for request_id in message.payload if request_ids is None else request_ids:
+                if request_id in self._ipc_finished:
+                    continue
+                if (
+                    len(self._ipc_cancelled) >= self._ipc_registry_limit
+                    and request_id not in self._ipc_cancelled
+                ):
+                    raise ProtocolError("Core cancellation registry is full")
+                self._ipc_cancelled[request_id] = watermark
+                if enqueue:
+                    self.utility_queue.put_nowait(
+                        (
+                            "abort_request",
+                            {"req_id": request_id},
+                            {},
+                        )
+                    )
+                    self._has_pending_utility = True
 
     def process_input_sockets(self, input_address: str, control_address: str):
-        """Input IO thread, serving both the request and control sockets.
-
-        Two sockets, one thread: requests arrive on ``input_address`` and
-        control traffic (utility commands, abort, shutdown) on
-        ``control_address``. The split exists on the sending side -- it lets
-        CoreManager keep the request socket single-writer and therefore
-        lock-free -- and both feed the same dispatch below.
-        """
+        """One input thread owns separate request and control decoders."""
+        options = {
+            "max_header_bytes": self._engine_config.ipc_max_header_bytes,
+            "max_batch_size": self._engine_config.ipc_max_batch_size,
+            "max_batch_bytes": getattr(
+                self._engine_config, "ipc_max_batch_bytes", 512 << 20
+            ),
+        }
+        requests, controls = RequestCodec(**options), ControlCodec(**options)
         with ExitStack() as stack, zmq.Context() as ctx:
             input_socket = stack.enter_context(
-                make_zmq_socket(ctx, input_address, zmq.DEALER, bind=False)
+                make_zmq_socket(
+                    ctx,
+                    input_address,
+                    zmq.DEALER,
+                    bind=False,
+                    hwm=self._engine_config.ipc_max_pending_jobs,
+                )
             )
             control_socket = stack.enter_context(
-                make_zmq_socket(ctx, control_address, zmq.DEALER, bind=False)
+                make_zmq_socket(
+                    ctx,
+                    control_address,
+                    zmq.DEALER,
+                    bind=False,
+                    hwm=self._engine_config.ipc_max_pending_jobs,
+                )
             )
             poller = zmq.Poller()
-            # Send initial message on each socket - this is required
-            # before the front-end ROUTER sockets can send messages
-            # back to us.
-            input_socket.send(b"")
-            control_socket.send(b"")
-            poller.register(input_socket, zmq.POLLIN)
-            poller.register(control_socket, zmq.POLLIN)
-            logger.debug(f"{self.label}: input and control sockets connected")
+            for sock in (input_socket, control_socket):
+                sock.send(b"")
+                poller.register(sock, zmq.POLLIN)
             alive = True
-
             while alive:
                 for sock, _ in poller.poll():
-                    # (RequestType, RequestData)
-                    obj = sock.recv(copy=False)
+                    frames = sock.recv_multipart(copy=False)
                     received_at = time.perf_counter()
                     try:
-                        # ADD may carry the seqs' shipped prompt chains third.
-                        request_type, reqs, *chains = pickle.loads(obj)
-                    except Exception:
-                        # This thread is the only way requests reach the engine,
-                        # so letting it die strands every later request: the
-                        # busy loop keeps polling an empty input queue, the
-                        # workers idle, and clients wait forever with no error
-                        # on any log but this thread's own traceback. Drop the
-                        # frame loudly and keep serving.
-                        logger.exception(
-                            f"{self.label}: dropping undecodable input frame "
-                            f"({len(obj.bytes)} bytes)"
+                        decoder = requests if sock is input_socket else controls
+                        message = decoder.decode(
+                            frames,
+                            session_id=self._ipc_session_id,
+                            engine_id=self._ipc_engine_id,
                         )
-                        continue
-                    if request_type == EngineCoreRequestType.ADD:
-                        attach_shipped_chains(reqs, *chains)
-                        tracing.enqueue_many(reqs, received_at=received_at)
-                        for req in reqs:
-                            SchedulerMetrics.enqueue(req, received_at=received_at)
-                        req_ids = [req.id for req in reqs]
-                        logger.debug(
-                            f"{self.label}: input get {request_type} {req_ids}"
-                        )
-                        self.input_queue.put_nowait(reqs)
-                    elif request_type == EngineCoreRequestType.UTILITY:
-                        cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
-                        logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
-                        self.utility_queue.put_nowait((cmd, reqs))
-                        self._has_pending_utility = True
-                    elif request_type == EngineCoreRequestType.SHUTDOWN:
-                        logger.debug(f"{self.label}: input get {request_type}")
-                        self.input_queue.put_nowait([get_exit_sequence()])
+                        kind = Fields.kind(message.kind)
+                        if self._ipc_session_id is None and kind != "BUFFER_PROBE":
+                            raise ProtocolError(
+                                "manager session has not completed its probe"
+                            )
+                        if kind == "ADD":
+                            self._queue_admissions(message, received_at)
+                        elif kind == "BUFFER_PROBE":
+                            self._handle_buffer_probe(message)
+                        elif kind == "UTILITY":
+                            command, args = message.payload
+                            if command == "abort_request":
+                                self._queue_cancellation(
+                                    message, [args["req_id"]], enqueue=False
+                                )
+                            self.utility_queue.put_nowait(
+                                (command, args, message.metadata)
+                            )
+                            self._has_pending_utility = True
+                        elif kind == "ABORT":
+                            self._queue_cancellation(message)
+                        elif kind == "SHUTDOWN":
+                            self._ipc_stop.set()
+                            alive = False
+                        else:
+                            raise ProtocolError(f"unsupported input kind {kind}")
+                    except Exception as exc:
+                        logger.exception("%s: IPC peer failed", self.label)
+                        self._fail_ipc(str(exc))
                         alive = False
-                        reason = request_type
-            logger.debug(f"{self.label}: input thread exit due to {reason}")
+                    finally:
+                        frames = None
+                        message = None
+                    if not alive:
+                        break
 
     def process_output_sockets(self, output_address: str):
-        """Output socket IO thread."""
+        """Serialize snapshots and lease events on the existing result socket."""
+        config = self._engine_config
+        codec = ResultCodec(
+            max_header_bytes=config.ipc_max_header_bytes,
+            max_batch_size=config.ipc_max_batch_size,
+            max_batch_bytes=getattr(config, "ipc_max_batch_bytes", 512 << 20),
+        )
         with ExitStack() as stack, zmq.Context() as ctx:
             socket = stack.enter_context(
-                make_zmq_socket(ctx, output_address, zmq.PUSH, linger=4000)
+                make_zmq_socket(
+                    ctx,
+                    output_address,
+                    zmq.PUSH,
+                    linger=4000,
+                    hwm=config.ipc_max_pending_jobs,
+                )
             )
-            logger.debug(f"{self.label}: output socket connected")
-
+            message_id = 0
             while True:
-                item = self.output_queue.get()
-                if isinstance(item, tuple) and item[0] == "STREAM":
-                    # Send stream outputs
-                    stream_outputs = item[1]
-                    obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
-                    socket.send(obj)
-                    continue
-
-                if isinstance(item, tuple) and item[0] == "READY":
-                    # Send READY signal to indicate EngineCore is fully initialized
-                    obj = pickle.dumps((EngineCoreRequestType.READY, item[1]))
-                    socket.send(obj)
-                    logger.debug(f"{self.label}: sent READY signal")
-                    continue
-
-                if isinstance(item, tuple) and item[0] == "METRICS":
-                    obj = pickle.dumps((EngineCoreRequestType.METRICS, item[1]))
-                    socket.send(obj)
-                    continue
-
-                if isinstance(item, tuple) and item[0] == "UTILITY_RESPONSE":
-                    # Send utility command response back to CoreManager
-                    response_data = item[1]
-                    serialized_obj = pickle.dumps(
-                        (EngineCoreRequestType.UTILITY_RESPONSE, response_data)
-                    )
-                    socket.send(serialized_obj)
-                    continue
-
-                # Regular finished sequences
-                seqs = item
-                valid_seqs = [
-                    seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
-                ]
-                num_valid = len(valid_seqs)
-                if num_valid > 0:
-                    obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
-                    socket.send(obj)
-                    logger.info(f"{self.label}: output send {num_valid} reqs")
-                if len(valid_seqs) != len(seqs):
-                    socket.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
-                    logger.debug(
-                        f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
-                    )
-                    break
+                failure = getattr(self, "_ipc_failure_reason", None)
+                if failure is not None:
+                    item = ("ERROR", {"code": "protocol", "message": failure})
+                else:
+                    try:
+                        item = self.output_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                if isinstance(item, tuple):
+                    kind, payload = item[:2]
+                    metadata = item[2] if len(item) > 2 else {}
+                else:
+                    # Internal shutdown sentinels are never serialized as tokens.
+                    finished = [
+                        seq for seq in item if seq.status != SequenceStatus.EXIT_ENGINE
+                    ]
+                    if finished:
+                        self._emit_completions(finished)
+                    if len(finished) == len(item):
+                        continue
+                    kind, payload, metadata = "STOPPED", {}, {}
+                name = Fields.kind(kind)
+                batches = (
+                    [
+                        payload[start : start + config.ipc_max_batch_size]
+                        for start in range(0, len(payload), config.ipc_max_batch_size)
+                    ]
+                    if name in ("STREAM", "COMPLETION", "ADD")
+                    else [payload]
+                )
+                for batch in batches:
+                    message_id += 1
+                    context = {
+                        "session_id": (
+                            "" if name == "READY" else self._ipc_session_id or ""
+                        ),
+                        "engine_id": self._ipc_engine_id,
+                        "message_id": message_id,
+                        "in_reply_to": metadata.get("in_reply_to", 0),
+                    }
+                    try:
+                        encoded = codec.encode(
+                            kind, batch, metadata=metadata, **context
+                        )
+                    except Exception as exc:
+                        logger.exception("%s: result encoding failed", self.label)
+                        self._fail_ipc(str(exc))
+                        encoded = codec.encode(
+                            "ERROR", {"code": "result", "message": str(exc)}, **context
+                        )
+                    deadline = time.monotonic() + config.ipc_send_timeout
+                    while True:
+                        try:
+                            tracker = socket.send_multipart(
+                                encoded.frames,
+                                flags=zmq.DONTWAIT,
+                                copy=False,
+                                track=True,
+                            )
+                            break
+                        except zmq.Again:
+                            if time.monotonic() >= deadline:
+                                logger.error(
+                                    "%s: result socket send timed out", self.label
+                                )
+                                self._fail_ipc("result socket send timed out")
+                                return
+                            socket.poll(50, zmq.POLLOUT)
+                    if tracker is not None and not tracker.done:
+                        try:
+                            tracker.wait(timeout=config.ipc_send_timeout)
+                        except zmq.NotDone:
+                            self._fail_ipc("result buffer send did not complete")
+                            return
+                if failure is not None or name in ("STOPPED", "SHUTDOWN"):
+                    return
 
 
 class DPEngineCoreProc(EngineCore):
@@ -1209,6 +1600,7 @@ class PrefillEngineCore(EngineCore):
         # Remove completed sequences — prefill produces no output tokens.
         for seq in list(seqs.values()):
             seq.status = SequenceStatus.FINISHED
+            self._remember_finished(seq.id)
             try:
                 self.scheduler.running.remove(seq)
             except ValueError:
@@ -1429,15 +1821,8 @@ class DecodeEngineCore(EngineCore):
     def pull_and_process_input_queue(self):
         """Override: add new sequences to waiting queue, then allocate blocks
         and send BlockAssignment to prefill for any that fit."""
-        recv_reqs = []
-        while not self.input_queue.empty():
-            seqs = self.input_queue.get_nowait()
-            for seq in seqs:
-                if seq.status == SequenceStatus.EXIT_ENGINE:
-                    return True
-                recv_reqs.append(seq)
-        if recv_reqs:
-            self.scheduler.extend(recv_reqs)
+        if super().pull_and_process_input_queue():
+            return True
         for seq in self.scheduler.allocate_waiting():
             self._send_block_assignment(seq)
         return False
@@ -1473,11 +1858,11 @@ class DecodeEngineCore(EngineCore):
         try:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
+                self._emit_streams(stream_outputs)
         except queue.Empty:
             pass
         if finished_seqs:
-            self.output_queue.put_nowait(finished_seqs)
+            self._emit_completions(finished_seqs)
         return True
 
     @staticmethod

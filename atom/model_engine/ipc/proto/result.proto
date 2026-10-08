@@ -1,0 +1,125 @@
+syntax = "proto3";
+package atom.ipc.result;
+import "atom/model_engine/ipc/proto/common.proto";
+
+message ProtocolVersion { fixed32 schema_id = 1; uint32 major = 2; uint32 minor = 3; }
+message Ready {
+  ProtocolVersion request_version = 1;
+  ProtocolVersion control_version = 2;
+  ProtocolVersion result_version = 3;
+  optional uint64 max_pool_tokens = 4;
+  string role = 5;
+  string host_id = 6;
+  repeated string buffer_modes = 7;
+  uint32 rank = 8;
+  atom.ipc.ArenaRegistration arena = 9;
+}
+message StreamOutput {
+  uint64 request_id = 1;
+  repeated sint32 output_tokens = 2;
+  bool finished = 3;
+  optional string finish_reason = 4;
+  atom.ipc.MetaObject kv_transfer_params_output = 5;
+  uint64 num_cached_tokens = 6;
+}
+message StreamBatch { repeated StreamOutput outputs = 1; }
+message Completion {
+  uint64 id = 1;
+  atom.ipc.BufferRef completion_token_ids = 2;
+  atom.ipc.BufferRef logprobs = 3;
+  bool return_logprobs = 4;
+  optional string leave_reason = 5;
+  uint64 num_prompt_tokens = 6;
+  uint64 num_cached_tokens = 7;
+  double arrive_time = 8;
+  double first_token_time = 9;
+  double leave_time = 10;
+  atom.ipc.MetaObject kv_transfer_params_output = 11;
+  optional string external_request_id = 12;
+  optional string parent_request_id = 13;
+  uint32 sibling_index = 14;
+  double prefill_start_time = 15;
+  double prefill_end_time = 16;
+}
+message CompletionBatch { repeated Completion outputs = 1; }
+message KvPool {
+  optional uint64 used = 1;
+  optional uint64 free = 2;
+  optional uint64 total = 3;
+  optional uint64 indexed = 4;
+  optional uint64 evictable = 5;
+  optional uint64 vacant = 6;
+}
+message SchedulerMetrics { optional uint64 running = 1; optional uint64 waiting = 2; optional uint64 waiting_kv = 3; }
+message MetricsSnapshot {
+  optional bool enabled = 1;
+  optional string role = 2;
+  optional uint64 requests_running = 3;
+  optional uint64 requests_waiting = 4;
+  optional uint64 requests_parked_kv_load = 5;
+  optional uint64 requests_partial_prefill = 6;
+  optional uint64 requests_finished = 7;
+  optional uint64 prompt_tokens = 8;
+  optional uint64 generation_tokens = 9;
+  optional uint64 preemptions = 10;
+  atom.ipc.MtpStatistics mtp = 11;
+  atom.ipc.CacheStatistics cache = 12;
+  KvPool kv_pool = 13;
+  SchedulerMetrics scheduler_metrics = 14;
+  map<string, atom.ipc.Number> offload = 15;
+  map<string, atom.ipc.Number> counters = 16;
+  repeated string null_fields = 17;
+  bool has_offload = 18;
+}
+message RankResult { sint32 tp_rank = 1; atom.ipc.MetaValue value = 2; optional string error = 3; }
+message CollectiveRpcResult {
+  string method = 1;
+  uint32 worker_world_size = 2;
+  repeated RankResult results = 3;
+}
+message UtilityResponse {
+  string request_id = 1;
+  uint32 rank = 2;
+  string command = 3;
+  optional string error = 4;
+  oneof result {
+    atom.ipc.MetaValue acknowledgement = 10;
+    atom.ipc.MtpStatistics mtp = 11;
+    atom.ipc.CacheStatistics cache = 12;
+    CollectiveRpcResult collective_rpc = 13;
+  }
+}
+message BufferRelease {
+  string arena_id = 1;
+  uint64 arena_epoch = 2;
+  uint64 allocation_id = 3;
+  uint64 allocation_generation = 4;
+  string admission_id = 5;
+  uint64 request_id = 6;
+  uint32 rank = 7;
+  string reason = 8;
+}
+message ProtocolError { string code = 1; string message = 2; optional uint64 request_id = 3; uint64 command_id = 4; }
+message Stopped { string reason = 1; }
+message BufferProbeResult { string probe_id = 1; bool accessible = 2; string error = 3; bytes digest = 4; uint64 arena_epoch = 5; }
+message ResultMessage {
+  fixed32 schema_id = 1;
+  uint32 protocol_major = 2;
+  uint32 protocol_minor = 3;
+  string manager_session_id = 4;
+  string engine_instance_id = 5;
+  fixed64 message_id = 6;
+  uint32 attachment_count = 7;
+  fixed64 in_reply_to = 8;
+  oneof payload {
+    Ready ready = 30;
+    StreamBatch stream = 31;
+    CompletionBatch completion = 32;
+    UtilityResponse utility_response = 33;
+    MetricsSnapshot metrics = 34;
+    BufferRelease release = 35;
+    ProtocolError error = 36;
+    Stopped stopped = 37;
+    BufferProbeResult buffer_probe_result = 38;
+  }
+}

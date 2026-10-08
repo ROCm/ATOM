@@ -199,6 +199,18 @@ class RpcResponseRouter:
         own.put_nowait(item)
         return True
 
+    def route_all(self, item: object) -> int:
+        """Hand *item* to every waiter; how many there were.
+
+        For news every caller in flight is waiting on, such as an engine
+        that failed and so will answer none of them.
+        """
+        with self._lock:
+            queues = list(self._queues.values())
+        for own in queues:
+            own.put_nowait(item)
+        return len(queues)
+
     def in_flight(self) -> int:
         with self._lock:
             return len(self._queues)
