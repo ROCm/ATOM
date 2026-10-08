@@ -515,6 +515,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
         )
         metadata.cache, metadata.step = cache, step
+        metadata.block_table_rows = rows
         metadata.state_slot_out = state_slot_out
         metadata.dummy = batch.is_dummy_run
         metadata.token_mask = token_mask
@@ -541,7 +542,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
-            batch, running_bs, batch.total_tokens_num, query_prefix_ready=True, is_prefill=True
+            batch,
+            running_bs,
+            batch.total_tokens_num,
+            query_prefix_ready=True,
+            is_prefill=True,
         )
 
     @contextmanager
@@ -646,6 +651,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         step = prepare_batch_step(
             tuple(spans),
             self.device,
+            block_tables=metadata.block_table_rows[rs],
             is_prefill=True,
             buffers=buffers,
             running_bs=running_bs,
@@ -653,6 +659,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state_slot_out=parent.slots[rs],
             ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
         )
+        if metadata.cache.workspace is not None:
+            step.tile_workspace = metadata.cache.workspace.tile_slice(ts)
         step.plans = make_compress_plans(
             np.asarray([span.length for span in spans], dtype=np.int32),
             np.asarray([span.end for span in spans], dtype=np.int32),
@@ -682,6 +690,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
         )
         child.cache, child.step = metadata.cache, step
+        child.block_table_rows = metadata.block_table_rows[rs]
         child.state_slot_out = step.slots
         child.dummy = metadata.dummy
         child.token_mask = metadata.token_mask[ts]

@@ -20,6 +20,8 @@ def test_million_token_context_does_not_allocate_eight_gib_logits():
 @pytest.mark.parametrize("trim_tiles", [False, True])
 def test_paged_scoring_bands_match_one_shot(monkeypatch, candidate_mode, trim_tiles):
     from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
+    from atom.model_ops.deepseek_v41.index_plane import IndexUnits
     from atom.utils import envs
 
     torch.manual_seed(312)
@@ -28,7 +30,7 @@ def test_paged_scoring_bands_match_one_shot(monkeypatch, candidate_mode, trim_ti
     values = torch.randn(units, tile * dim, device="cuda").to(torch.float8_e4m3fn)
     scales = torch.ones(units, tile, dtype=torch.float32, device="cuda")
     plane = torch.cat((values.view(torch.uint8), scales.view(torch.uint8)), dim=1)
-    plane = plane.view(units, tile, dim + 4)
+    plane = IndexUnits(plane.view(units, tile, dim + 4))
     query = torch.randn(rows, heads, dim, dtype=torch.bfloat16, device="cuda")
     weights = torch.randn(rows, heads, dtype=torch.bfloat16, device="cuda")
     tiles = torch.arange(units, dtype=torch.int32, device="cuda").repeat(rows, 1)
@@ -53,6 +55,14 @@ def test_paged_scoring_bands_match_one_shot(monkeypatch, candidate_mode, trim_ti
             weights_scale=0.01,
             block_size=tile,
             candidate_count=128,
+        )
+        candidates = bind_candidates(
+            candidates,
+            tiles,
+            torch.arange(rows, dtype=torch.int32, device="cuda"),
+            1,
+            visible,
+            rows_per_block=tile,
         )
     kwargs = {
         "topk": 64,
@@ -93,6 +103,7 @@ def test_unit_tiles_bound_prefill_but_keep_decode_capacity(decode, index_block_r
     from types import SimpleNamespace
 
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.model_ops.deepseek_v41.unit_table import unit_table
 
     # A chunk starting after a cached prefix crosses a page boundary. Its
@@ -107,16 +118,21 @@ def test_unit_tiles_bound_prefill_but_keep_decode_capacity(decode, index_block_r
         requests=(SimpleNamespace(end=1025), SimpleNamespace(end=512)),
     )
     cache = SimpleNamespace(
-        geometry=SimpleNamespace(
-            block_size=1024,
+        workspace=None,
+        geometry=V41PoolGeometry(
+            1,
+            ((0, 2),),
+            1024,
+            4,
+            512,
+            128,
             index_block_rows=index_block_rows,
-            rows_per_page=lambda ratio: 1024 // ratio,
-        )
+        ),
     )
-    actual = PagedAttentionCache.unit_tiles(cache, step, 4)
-    units_per_page = 256 // index_block_rows
+    actual = PagedAttentionCache.unit_tiles(cache, step, 2)
+    units_per_page = 512 // index_block_rows
     full = unit_table(tables, batches, units_per_page)
     columns = 1024 if decode else 2
     assert actual.shape == (4, columns * units_per_page)
     torch.testing.assert_close(actual, full[:, : columns * units_per_page])
-    assert PagedAttentionCache.unit_tiles(cache, step, 4) is actual
+    assert PagedAttentionCache.unit_tiles(cache, step, 2) is actual

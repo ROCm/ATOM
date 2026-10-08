@@ -70,22 +70,6 @@ class MoE(V4MoE):
 
         self.experts.custom_routing_function = self._topk
 
-    def routed_expert_forward(
-        self, x, shared_partial=None, before_stage2=None, stage2_stream=None
-    ):
-        routed, is_complete = super().routed_expert_forward(
-            x,
-            shared_partial=shared_partial,
-            before_stage2=before_stage2,
-            stage2_stream=stage2_stream,
-        )
-        # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
-        # returns the fallback routed output before shared combine/mHC.
-        # This marker protects consumers after dispatch returns; it cannot
-        # fence an internal combine in a backend returning is_complete=True.
-        v41_record_tbo_expert_output(routed)
-        return routed, is_complete
-
     def _topk(self, hidden_states, gating_output, topk, renormalize):
         image_mask = getattr(get_forward_context().attn_metadata, "image_mask", None)
         if image_mask is None:
@@ -133,13 +117,19 @@ class MoE(V4MoE):
         before_stage2=None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
-        return self.experts.forward_maybe_comm_fused(
+        routed, is_complete = self.experts.forward_maybe_comm_fused(
             x,
             self.router_logits(x),
             shared_partial,
             before_stage2=before_stage2,
             stage2_stream=stage2_stream,
         )
+        # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO
+        # returns the fallback routed output before shared combine/mHC.
+        # This marker protects consumers after dispatch returns; it cannot
+        # fence an internal combine in a backend returning is_complete=True.
+        v41_record_tbo_expert_output(routed)
+        return routed, is_complete
 
     def forward(self, hidden):
         return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)

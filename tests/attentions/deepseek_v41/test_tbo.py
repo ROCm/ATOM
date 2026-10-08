@@ -81,6 +81,9 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
             child.step.positions, parent.step.positions[start:end]
         )
         assert child.step.slots.tolist() == parent.step.slots[rs].tolist()
+        torch.testing.assert_close(
+            child.step.block_tables, parent.step.block_tables[rs]
+        )
         assert child.step.cu_seqlens_q.tolist() == (
             [s.offset for s in child.step.requests] + [end - start]
         )
@@ -147,20 +150,58 @@ def test_parent_engram_join_runs_when_a_microbatch_fails():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_prefill_microbatches_keep_workspace_tiles_across_layer_interleaving():
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+
+    builder, parent = make_parent("cuda")
+    workspace = ScoreWorkspace(builder.geometry, 32, 4, "cuda")
+    parent.cache.workspace = workspace
+    parts = _split_prefill_token_midpoint(2, [10, 4], 2, None)
+    children = [
+        builder.build_ubatch_prefill_metadata(
+            parent, part, part.request_slice.stop - part.request_slice.start, i
+        )
+        for i, part in enumerate(parts)
+    ]
+    for ratio in (1, 2):
+        first = parent.cache.unit_tiles(children[0].step, ratio)
+        expected = first.clone()
+        second = parent.cache.unit_tiles(children[1].step, ratio)
+        # The first worker revisits this ratio after its partner's attention.
+        # Its memoized table must still name its own requests' pages.
+        again = parent.cache.unit_tiles(children[0].step, ratio)
+        assert again is first
+        torch.testing.assert_close(again, expected, rtol=0, atol=0)
+        assert first.data_ptr() != second.data_ptr()
+        for table in (first, second):
+            assert (
+                table.untyped_storage().data_ptr()
+                == workspace._tiles[ratio].untyped_storage().data_ptr()
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
     monkeypatch,
 ):
+    from atom.model_ops.engram.device.hashing import engram_row_indices_reference
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import (
         tbo_switch_to_compute_sync,
         tbo_yield_and_switch_from_compute_to_comm,
     )
     from tests.model_ops.engram.test_hash_bounds import build, tiny_config
-    from tests.model_ops.engram.test_overlap import make_batch, make_staging
+    from tests.model_ops.engram.test_overlap import (
+        fill_step,
+        make_batch,
+        make_staging,
+        make_step,
+    )
 
     builder, parent = make_parent("cuda", lengths=(9, 5))
     mapping = build(tiny_config())
     staging, _backing = make_staging(mapping)
+    engram_step = make_step(staging.uva.hash_tables, 32, verify=False)
     calls = []
     start = staging.start
     join = staging.join
@@ -187,18 +228,22 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
     ids = torch.arange(14, device="cuda", dtype=torch.int32)
     slices = _split_prefill_token_midpoint(2, [9, 5], 2, None)
     for seed in (7, 31):
-        batch, _, _, _ = make_batch(mapping, [9, 5], seed)
-        # Keep the original history in snapshot even after the caller commits it.
-        rows = staging.prepare(batch, 14)
-        rows.stage()
+        _, tokens, histories, masks = make_batch(mapping, [9, 5], seed)
+        fill_step(engram_step, tokens, histories, masks, starts=(3, 8))
+        # Staging snapshots before advancing the real cursor. Both workers
+        # must still read the original history through their parent lookup.
+        rows = staging.prepare(engram_step, 14)
+        layer = mapping.config.layer_ids[-1]
+        indices = engram_row_indices_reference(mapping, layer, tokens, histories, masks)
         expected = (
-            rows.get(mapping.config.layer_ids[-1])[0].float().clone()
-            + ids.float()[:, None] * 2
+            staging.host.prefetcher._tables[layer]
+            ._tensor[torch.as_tensor(indices)]
+            .reshape(14, -1)
+            .to(device="cuda", dtype=torch.float32)
         )
-        rows.join()
+        expected = expected + ids.float()[:, None] * 2
         calls.clear()
         parent.engram_embeddings = rows
-        batch.history.fill_(99)
         ctx = ForwardContext(
             attn_metadata=parent,
             no_compile_layers={},
@@ -447,6 +492,11 @@ def test_dp_moe_original_schedule_preserves_outputs(
             return self(hidden, router), False
 
     class Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            # This synthetic gate exercises the ordinary GEMM fallback.
+            self.register_buffer("weight", torch.empty(0, 0, device="cuda"))
+
         def forward(self, hidden):
             return hidden + 3
 

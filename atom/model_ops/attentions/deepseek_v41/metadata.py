@@ -88,6 +88,8 @@ class BatchStep:
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
+    # TBO keeps memoized tile tables in a disjoint part of the parent budget.
+    tile_workspace: object | None = None
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.

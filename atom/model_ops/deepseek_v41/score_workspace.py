@@ -33,6 +33,7 @@ class ScoreWorkspace:
     """
 
     def __init__(self, geometry, max_tokens, columns, device):
+        self._max_tokens = max_tokens
         ratios = sorted({ratio for _, ratio in geometry.owners})
         self._tiles = {
             ratio: torch.empty(
@@ -58,6 +59,22 @@ class ScoreWorkspace:
             raise ValueError("the FP4 index plane's scorers read no tile table")
         return _view(self._tiles[ratio], tokens, width)
 
+    def tile_slice(self, token_slice):
+        """Disjoint tile storage for a prefill microbatch, within this budget.
+
+        Tile tables are memoized across layers, so overlapping forwards need
+        independent regions. Logits are consumed within one attention call
+        on the shared compute stream and keep using the parent workspace.
+        """
+        if not 0 <= token_slice.start < token_slice.stop <= self._max_tokens:
+            raise ValueError("Microbatch tile slice is outside the workspace")
+        return _TileWorkspace(
+            {
+                ratio: flat.view(self._max_tokens, -1)[token_slice].view(-1)
+                for ratio, flat in self._tiles.items()
+            }
+        )
+
     def logits(self, rows, width):
         """`[rows, width]` fp32, one band of the scorer's logits plane."""
         return _view(self._logits, rows, width)
@@ -65,6 +82,14 @@ class ScoreWorkspace:
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
         return self._row_starts[: rows + 1]
+
+
+class _TileWorkspace:
+    def __init__(self, tiles):
+        self._tiles = tiles
+
+    def unit_table(self, ratio, tokens, width):
+        return _view(self._tiles[ratio], tokens, width)
 
 
 def _view(flat, rows, width):
