@@ -428,11 +428,17 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   it. Mooncake leaves RDMA work posted only when a batch runs out its
   hard-coded 60 s wait: any result of a call that returned sooner -- a
   `TRANSFER_FAIL` from a dead owner after a second included -- frees its
-  slots. A `TRANSFER_FAIL` (or unknown code) from a call that took 60 s, or a
-  call that raised, holds its slots back for 300 s, well past Mooncake's own
-  retries; one whose GPU copy failed without a device fence is retired for
-  good. A region with no usable slot left fails its transfers at once (logged
-  once as an error) until a held slot returns.
+  slots. A `TRANSFER_FAIL` (or unknown code) from a call that took 60 s, a
+  call that raised, or a GPU copy that failed without a device fence
+  quarantines its slots for good: nothing bounds how late that work can
+  land (a NIC whose completion queue stalls holds it indefinitely, as rdma2
+  of pit2-p03-g23 did for the last 5 minutes of a c56 run). The startup
+  probe's put and get are settled the same way. A region with no usable slot
+  left fails its transfers at once (logged once as an error), and a pool with
+  a quarantined or still-leased slot stays registered and allocated after
+  `close()` for the life of the process, while the Store client's teardown
+  ends its RDMA work. Re-creating the client after repeated stalls, which
+  would let the slots return, is a follow-up.
 - The engine reclaims a save's source blocks `save_abandon_timeout_s` after
   dispatch. A worker therefore stops starting GPU reads for a save that is
   still queued `timeout - min(60 s, timeout / 5)` after the scheduler

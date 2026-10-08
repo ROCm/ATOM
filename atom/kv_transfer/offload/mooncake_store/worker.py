@@ -26,8 +26,8 @@ Completion protocol, per worker and operation:
   without the quiescent claim.
 * A load ends in exactly one of done or failed, all-or-nothing.
 * A slot returns to the pool only once no GPU or NIC access can still reach
-  it. One a Store transfer may still reach is held back for
-  ``_UNSETTLED_TRANSFER_HOLD_S``; one a GPU copy may still reach, retired.
+  it. One a Store transfer or a GPU copy may still reach is quarantined for
+  good, and the pool's memory then outlives the worker (``pool.close``).
 """
 
 from __future__ import annotations
@@ -81,12 +81,6 @@ _WARNING_INTERVAL_S = 30.0
 # A save stops reading its source blocks this long (at most) before the
 # scheduler may reclaim them; see `_source_read_deadline`.
 _MAX_SOURCE_READ_MARGIN_S = 60.0
-# Seconds a slot stays out of use after a Store transfer that may still reach
-# it: a batch Mooncake gave up on after its 60 s wait, or a call that raised.
-# Mooncake re-posts a failed piece of a transfer at most MC_RETRY_CNT (9) times,
-# each attempt bounded by its 10 s endpoint handshake and ready-ACK waits and
-# the QP's ~0.5 s transport retry, so such work ends minutes before this.
-_UNSETTLED_TRANSFER_HOLD_S = 300.0
 
 
 def _tp_group():
@@ -282,55 +276,97 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """Send one chunk of random bytes through the Store and compare it back.
 
         An unregistered pool, an unreachable owner or a misrouted NIC
-        otherwise shows up only as every lookup missing.
+        otherwise shows up only as every lookup missing. The probe's slots are
+        settled as a save's and a load's are, so one its failed put or get
+        may still reach stays quarantined when startup gives up.
         """
         key = probe_key(namespace, rank, uuid.uuid4().hex)
         nbytes = pool.chunk_bytes
         [source] = pool.acquire("save", 1)
         [target] = pool.acquire("load", 1)
-        source.tensor.copy_(
-            torch.randint(
-                0, 256, (nbytes,), dtype=torch.uint8, device=source.tensor.device
-            )
-        )
-        target.tensor.zero_()
-        _synchronize(pool.device)
-        [put_rc] = client.put([key], [source.ptr], [nbytes])
-        if put_rc != 0:
-            raise RuntimeError(
-                f"Mooncake Store startup probe: put of {nbytes} bytes to "
-                f"{client.master_server_addr} failed ({store_client.describe(put_rc)})"
-            )
+        # The probe's slots no transfer may still reach.
+        leased = [source, target]
         try:
-            [present] = client.exists([key])
-            if present != 1:
-                raise RuntimeError(
-                    "Mooncake Store startup probe: a chunk just put is not in the "
-                    f"Store ({store_client.describe(present)}); is an owner "
-                    "mounted and is the pool registered?"
+            source.tensor.copy_(
+                torch.randint(
+                    0, 256, (nbytes,), dtype=torch.uint8, device=source.tensor.device
                 )
-            [get_rc] = client.get([key], [target.ptr], [nbytes])
-            if get_rc != nbytes:
-                raise RuntimeError(
-                    "Mooncake Store startup probe: get returned "
-                    f"{store_client.describe(get_rc)} for a {nbytes}-byte chunk"
-                )
+            )
+            target.tensor.zero_()
             _synchronize(pool.device)
-            if not torch.equal(source.tensor, target.tensor):
+            put_rc = self._probe_transfer(
+                pool, leased, source, lambda: client.put([key], [source.ptr], [nbytes])
+            )
+            if put_rc != 0:
                 raise RuntimeError(
-                    "Mooncake Store startup probe: the chunk read back differs "
-                    "from the one written"
+                    f"Mooncake Store startup probe: put of {nbytes} bytes to "
+                    f"{client.master_server_addr} failed "
+                    f"({store_client.describe(put_rc)})"
                 )
-        finally:
-            removed = client.remove(key, force=True)
-            if removed != 0:
-                logger.warning(
-                    "Mooncake Store startup probe: could not remove %s (%s); it "
-                    "stays until evicted",
-                    key,
-                    store_client.describe(removed),
+            try:
+                [present] = client.exists([key])
+                if present != 1:
+                    raise RuntimeError(
+                        "Mooncake Store startup probe: a chunk just put is not in "
+                        f"the Store ({store_client.describe(present)}); is an "
+                        "owner mounted and is the pool registered?"
+                    )
+                get_rc = self._probe_transfer(
+                    pool,
+                    leased,
+                    target,
+                    lambda: client.get([key], [target.ptr], [nbytes]),
                 )
-        pool.release([source, target])
+                if get_rc != nbytes:
+                    raise RuntimeError(
+                        "Mooncake Store startup probe: get returned "
+                        f"{store_client.describe(get_rc)} for a {nbytes}-byte chunk"
+                    )
+                _synchronize(pool.device)
+                if not torch.equal(source.tensor, target.tensor):
+                    raise RuntimeError(
+                        "Mooncake Store startup probe: the chunk read back differs "
+                        "from the one written"
+                    )
+            finally:
+                removed = client.remove(key, force=True)
+                if removed != 0:
+                    logger.warning(
+                        "Mooncake Store startup probe: could not remove %s (%s); "
+                        "it stays until evicted",
+                        key,
+                        store_client.describe(removed),
+                    )
+        except BaseException:
+            self._release_once_device_idle(pool, leased)
+            raise
+        pool.release(leased)
+
+    @staticmethod
+    def _probe_transfer(
+        pool: TransferSlotPool, leased: list[Slot], slot: Slot, call: Any
+    ) -> int:
+        """Run the probe's put or get on ``slot``, quarantining it if unsettled.
+
+        A quarantined slot leaves ``leased``, the probe's slots still to release.
+        """
+        clock = store_client.CallClock()
+        try:
+            [code] = call()
+        except BaseException:
+            leased.remove(slot)
+            pool.quarantine([slot], reason="a startup probe transfer raised")
+            raise
+        if not store_client.buffer_settled(code, clock.seconds()):
+            leased.remove(slot)
+            pool.quarantine(
+                [slot],
+                reason=(
+                    f"a startup probe transfer gave up after {clock.seconds():.0f}s "
+                    "with its RDMA work possibly still posted"
+                ),
+            )
+        return code
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
@@ -455,7 +491,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                             producer_event=producer_event,
                         )
             except BaseException:
-                self._settle_after_gpu_error(pool, slots)
+                self._release_once_device_idle(pool, slots)
                 raise
             pack_ms += (time.perf_counter() - t_pack0) * 1000
             # Both paths return after their final stream sync: no GPU work of
@@ -501,9 +537,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     group_ids=group_ids,
                 )
             except Exception as exc:  # noqa: BLE001  # reported below
-                pool.quarantine(
-                    slots, reason="a put raised", hold_s=_UNSETTLED_TRANSFER_HOLD_S
-                )
+                pool.quarantine(slots, reason="a put raised")
                 failure, detail = "put_raised", repr(exc)
                 break
             put_ms += (time.perf_counter() - t_put0) * 1000
@@ -647,9 +681,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     [self._chunk_bytes] * len(slots),
                 )
             except Exception as exc:  # noqa: BLE001  # reported below
-                pool.quarantine(
-                    slots, reason="a get raised", hold_s=_UNSETTLED_TRANSFER_HOLD_S
-                )
+                pool.quarantine(slots, reason="a get raised")
                 failure, detail = "get_raised", repr(exc)
                 break
             get_ms += (time.perf_counter() - t_get0) * 1000
@@ -682,7 +714,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                         block_ids=req.block_ids,
                     )
             except BaseException:
-                self._settle_after_gpu_error(pool, slots)
+                self._release_once_device_idle(pool, slots)
                 raise
             unpack_ms += (time.perf_counter() - t_unpack0) * 1000
             # Both paths synchronized before returning: the slots are idle.
@@ -821,7 +853,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         codes: list[int],
         call_seconds: float,
     ) -> None:
-        """Release each slot whose Store transfer is over; hold back the rest.
+        """Release each slot whose Store transfer is over; quarantine the rest.
 
         ``call_seconds`` is how long the call that returned ``codes`` took: a
         failure is unsettled only after Mooncake's batch wait ran out.
@@ -841,19 +873,22 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     f"a Store transfer gave up after {call_seconds:.0f}s with "
                     "its RDMA work possibly still posted"
                 ),
-                hold_s=_UNSETTLED_TRANSFER_HOLD_S,
             )
 
-    def _settle_after_gpu_error(
+    def _release_once_device_idle(
         self, pool: TransferSlotPool, slots: list[Slot]
     ) -> None:
-        """After a failed GPU copy: release the slots only if the device is idle."""
+        """After a failure: release the slots only if the device is idle.
+
+        A GPU copy that raised may still run; a device that cannot be fenced
+        leaves the slots quarantined.
+        """
         try:
             _synchronize(self._codec.device if self._codec is not None else pool.device)
         except Exception:
             logger.exception(
-                "Mooncake Store offload: device synchronize failed after a GPU "
-                "copy error"
+                "Mooncake Store offload: device synchronize failed after a "
+                "transfer slot's copy or transfer failed"
             )
             pool.quarantine(slots, reason="a GPU copy failed and did not fence")
             return
