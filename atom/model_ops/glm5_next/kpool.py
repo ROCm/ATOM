@@ -611,10 +611,12 @@ def _kpool_seed_tail_kernel(
 ):
     """Persist each prefill request's trailing incomplete pool.
 
-    Chunk boundaries are pool-aligned, so every non-final chunk ends with
-    ``seq_len % POOL == 0`` and seeds nothing; the final chunk always contains
-    the whole tail. The ``i < q_start`` guard makes a violation of that
-    alignment drop the write rather than read another request's tokens.
+    Every tail position ``p`` is written to row ``p % ROWS`` of the output
+    slot. A position this chunk holds comes from ``k``/``gate``. One that
+    precedes the chunk (``i < q_start``, the chunk started mid-pool) is copied
+    from the same row of the input slot, so a forked or relocated slot keeps
+    the earlier rows; reading batch row ``i`` would take another request's
+    token instead.
     """
     r = tl.program_id(0)
     j = tl.program_id(1)

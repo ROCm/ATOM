@@ -285,13 +285,8 @@ def test_cached_chunk_reads_the_tail_from_its_history_ring_rows(monkeypatch):
     assert seen["pool_gate"][:, :, 0].tolist() == [[200, 201, 202, 203]]
 
 
-def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch):
-    """MLA verify always reads sparse_kv_indices, so the indexer must write them.
-
-    `max_seqlen_k == 0` is what CUDAGraph capture metadata carries; skipping on
-    it would record the skip into every replay. The scoring scratch is sized
-    from the model limit for the same reason.
-    """
+def _run_speculative_verify(monkeypatch, positions, max_model_len):
+    """Verify one request's rows at `positions`, recording what the ops get."""
     from atom.model_ops.glm5_next import speculative as SPEC
 
     # The op imports these at call time; patch the defining modules. A dotted
@@ -318,12 +313,16 @@ def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch)
         aiter_cache, "indexer_k_quant_and_cache", lambda *_a, **_k: None
     )
 
-    def paged_logits(_q, _kv, _w, logits, _lens, _bt, max_pools, **_kwargs):
+    def paged_logits(_q, _kv, _w, logits, lens, _bt, max_pools, **_kwargs):
         seen["logits_width"] = logits.shape[1]
         seen["max_pools"] = max_pools
+        seen["logits_lens"] = lens.tolist()
+
+    def top_k(_logits, _next_n, lens, *_args, **_kwargs):
+        seen["topk_lens"] = lens.tolist()
 
     monkeypatch.setattr(aiter_logits, "deepgemm_fp8_paged_mqa_logits", paged_logits)
-    monkeypatch.setattr(aiter_topk, "top_k_per_row_decode", lambda *_a, **_k: None)
+    monkeypatch.setattr(aiter_topk, "top_k_per_row_decode", top_k)
     monkeypatch.setattr(
         SPEC.kpool, "expand_pools_and_append_tail", lambda *_a, **_k: None
     )
@@ -333,35 +332,60 @@ def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch)
 
     monkeypatch.setattr(SPEC, "map_token_indices_to_slots", map_to_slots)
 
+    rows = len(positions)
     SPEC.run_speculative_kpool_indexer(
         SimpleNamespace(
-            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32),
             max_seqlen_k=0,
             block_tables=torch.zeros((1, 4), dtype=torch.int32),
-            sparse_kv_indptr=torch.tensor([0, 6, 13], dtype=torch.int32),
+            sparse_kv_indptr=torch.zeros(rows + 1, dtype=torch.int32),
         ),
         kv_cache=torch.zeros((16, 1, 132), dtype=torch.uint8),
-        queries=torch.zeros((2, 2, 128)),
-        keys=torch.zeros((2, 128), dtype=torch.bfloat16),
-        gates=torch.zeros((2, 128), dtype=torch.bfloat16),
-        weights=torch.zeros((2, 2)),
+        queries=torch.zeros((rows, 2, 128)),
+        keys=torch.zeros((rows, 128), dtype=torch.bfloat16),
+        gates=torch.zeros((rows, 128), dtype=torch.bfloat16),
+        weights=torch.zeros((rows, 2)),
         pool_bias=torch.zeros((4, 128)),
-        history=torch.zeros((1, 2, 8, 128), dtype=torch.bfloat16),
+        history=torch.zeros((1, 2, 16, 128), dtype=torch.bfloat16),
         source_slots=torch.tensor([0], dtype=torch.int32),
         destination_slots=torch.tensor([0], dtype=torch.int32),
-        positions=torch.tensor([5, 6]),
+        positions=torch.tensor(positions),
         sparse_kv_indices=torch.zeros(16, dtype=torch.int32),
         pool_size=4,
         topk_tokens=2048,
         output_width=2176,
         block_size=16,
-        max_model_len=8192,
+        max_model_len=max_model_len,
         scale_fmt="ue8m0",
         stable_topk=False,
     )
+    return seen
+
+
+def test_speculative_verify_selects_below_index_topk_and_at_capture(monkeypatch):
+    """MLA verify always reads sparse_kv_indices, so the indexer must write them.
+
+    `max_seqlen_k == 0` is what CUDAGraph capture metadata carries; skipping on
+    it would record the skip into every replay. The scoring scratch is sized
+    from the model limit for the same reason.
+    """
+    seen = _run_speculative_verify(monkeypatch, [5, 6], max_model_len=8192)
 
     assert seen.get("mapped") is True
     assert seen["logits_width"] == seen["max_pools"] == 8192 // 4
+
+
+def test_speculative_verify_scores_no_pool_past_the_model_limit(monkeypatch):
+    """A 15-token request under a 16-token limit verifies 5 drafts at 15..19.
+
+    Row 19 spans pools 0..4, one more than the 4 columns the scratch holds.
+    """
+    seen = _run_speculative_verify(
+        monkeypatch, [14, 15, 16, 17, 18, 19], max_model_len=16
+    )
+
+    assert seen["max_pools"] == 4
+    assert seen["logits_lens"] == seen["topk_lens"] == [3, 4, 4, 4, 4, 4]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="exercises Triton tail copy")

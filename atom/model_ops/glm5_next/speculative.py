@@ -307,7 +307,11 @@ def run_speculative_kpool_indexer(
         end = min(num_query_tokens, begin + 128)
         count = end - begin
         sequence_lengths = (positions[begin:end] + 1).to(torch.int32)
-        pool_lengths = (sequence_lengths // pool_size).contiguous()
+        # A draft row can sit up to num_speculative_tokens - 1 positions past
+        # max_model_len - 1, so its pools can run past the last one the scratch
+        # (and the block table) covers. Top-k would read those columns from the
+        # next row, or past the buffer on the last one.
+        pool_lengths = (sequence_lengths // pool_size).clamp_max(max_pools).contiguous()
         logits = logits_scratch[:count]
         selected_pools = selected_pools_scratch[:count]
         deepgemm_fp8_paged_mqa_logits(

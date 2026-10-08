@@ -75,18 +75,17 @@ def _kpool_write_completed_pools(
         )
         from_tail = abs_slot < chunk_start[req_idx][:, None]
         read_slots = state_slot_idx if state_slot_idx_in is None else state_slot_idx_in
-        safe_slots = read_slots[req_idx].clamp_min(0)
-        stash = tail_cache[safe_slots]
+        safe_slots = read_slots[req_idx].clamp_min(0)[:, None]
         # The tail holds position `p` at row `p % ROWS`; ROWS exceeds the pool
-        # size when it doubles as the speculative history ring.
-        stash_rows = (abs_slot.clamp_min(0) % stash.shape[-2])[..., None].expand(
-            -1, -1, stash.shape[-1]
-        )
+        # size when it doubles as the speculative history ring. Index the
+        # [n, POOL] rows directly: `tail_cache[safe_slots]` would copy each
+        # token's whole [2, ROWS, D] ring first.
+        stash_rows = abs_slot.clamp_min(0) % tail_cache.shape[-2]
         pool_k = torch.where(
-            from_tail[..., None], stash[:, 0].gather(1, stash_rows), pool_k
+            from_tail[..., None], tail_cache[safe_slots, 0, stash_rows], pool_k
         )
         pool_gate = torch.where(
-            from_tail[..., None], stash[:, 1].gather(1, stash_rows), pool_gate
+            from_tail[..., None], tail_cache[safe_slots, 1, stash_rows], pool_gate
         )
 
     pooled = kpool.pool_and_rotate(pool_k, pool_gate, compress_ape)
