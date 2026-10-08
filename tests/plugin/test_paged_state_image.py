@@ -386,3 +386,41 @@ def test_plan_refuses_an_unrestored_resume_without_images(monkeypatch):
         name="Fake",
     )
     assert md.image_restore_rows == [] and md.image_store_rows == []
+
+
+def test_v4_adapter_spec_is_native_and_k_follows_it():
+    pytest.importorskip("aiter", reason="the V4 bridge reaches AITER dtypes")
+    from atom.plugin.vllm.deepseek_v4_image import (
+        register_v4_image_adapter,
+        v4_image_sizing,
+    )
+
+    ratios = [0, 0, 4, 128, 4, 128, 4, 0]
+    hf = NS(
+        compress_ratios=ratios,
+        num_hidden_layers=len(ratios) - 1,
+        head_dim=512,
+        index_head_dim=128,
+        qk_rope_head_dim=64,
+        sliding_window=128,
+        index_topk=512,
+    )
+    vc = NS(
+        model_config=NS(
+            hf_config=hf, max_model_len=4096, architectures=["DeepseekV4ForCausalLM"]
+        ),
+        scheduler_config=NS(max_num_seqs=4),
+        cache_config=NS(cache_dtype="fp8", enable_prefix_caching=True),
+        speculative_config=None,
+    )
+    a = register_v4_image_adapter()
+    s = a.sizing(vc)
+    assert isinstance(s.spec, PagedStateCheckpointSpec)
+    assert (
+        s.spec.page_unit_bytes,
+        s.spec.slot_bytes,
+        s.spec.image_bytes,
+        s.spec.layout_id,
+    ) == (s.page_unit_bytes, s.slot_bytes, s.image_bytes, s.layout_id)
+    assert s.k == s.spec.units_per_checkpoint == -(-s.image_bytes // s.page_unit_bytes)
+    assert a.block_size == 128 and a.matches(vc) and s == v4_image_sizing(vc)

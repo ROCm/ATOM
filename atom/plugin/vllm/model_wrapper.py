@@ -583,6 +583,21 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
             )
+            if not self._is_deepseek_v4_mtp:
+                from atom.plugin.vllm.deepseek_v4_image import (
+                    deepseek_v4_image_state_copy_funcs,
+                    deepseek_v4_images_on,
+                    register_deepseek_v4_image_layers,
+                )
+
+                if deepseek_v4_images_on(vllm_config):
+                    # Prefix hits restore the slot from k checkpoint-image
+                    # blocks vLLM manages as MambaSpec(align) groups. This
+                    # worker's config has to say "align" before the input
+                    # batch sizes its block tables at KV-cache init.
+                    vllm_config.cache_config.mamba_cache_mode = "align"
+                    register_deepseek_v4_image_layers(vllm_config)
+                    self.get_mamba_state_copy_func = deepseek_v4_image_state_copy_funcs
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
