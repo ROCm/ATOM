@@ -218,6 +218,9 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode: &glm52_agentic_lmcache_cpp4_dcp4_env_decode
@@ -890,6 +893,9 @@ models:
             common_args:
               decode_max_num_seqs: 256
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
@@ -1022,6 +1028,9 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
@@ -1075,6 +1084,9 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
@@ -1166,6 +1178,9 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
@@ -1220,6 +1235,9 @@ models:
             workers: 1
             tp: 4
           env:
+            common:
+              # Force RDMA to avoid HIP IPC shared-pool address corruption.
+              MC_DISABLE_HIP: "1"
             prefill:
               HIP_VISIBLE_DEVICES: "0,1,2,3"
             decode:
