@@ -85,6 +85,16 @@
           "bench_args": "--use-chat-template",
           "conc_min": 64,
           "conc_max": 512
+        },
+        {
+          "label": "DPA TBO mixed DSpark",
+          "suffix": "-dpa-tbo-mixed-dspark",
+          "path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+          "extra_args": "--method dspark --num-speculative-tokens 7 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}'",
+          "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1\nATOM_TBO_MIXED=1\nATOM_PROBE_TBO_MIXED=1",
+          "bench_args": "--use-chat-template --metric-percentiles 50,99,99.9,100",
+          "conc_min": 256,
+          "conc_max": 512
         }
       ]
     },
