@@ -312,10 +312,9 @@ class AsyncIOProc:
                         # Broken by the manager once a rank is found dead: that
                         # rank can never arrive, and this one would otherwise
                         # wait for it forever instead of answering.
-                        out = RpcResult(
-                            payload.request_id,
-                            self.rank,
-                            error=f"{func_name!r} ran, but the barrier broke "
+                        out = self._failure(
+                            payload,
+                            f"{func_name!r} ran, but the barrier broke "
                             f"before every TP rank reached it",
                         )
                 if payload is not None:
@@ -361,39 +360,35 @@ class AsyncIOProc:
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
             # getattr's default covers AttributeError only. A non-string name
             # raises TypeError, which would otherwise end this worker's loop.
-            return RpcResult(
-                payload.request_id,
-                self.rank,
-                error=f"cannot look up {func_name!r} on {type(runner).__name__}: "
+            return self._failure(
+                payload,
+                f"cannot look up {func_name!r} on {type(runner).__name__}: "
                 f"{type(exc).__name__}: {exc}",
             )
         if func is None:
-            return RpcResult(
-                payload.request_id,
-                self.rank,
-                error=f"{type(runner).__name__} has no method {func_name!r}",
+            return self._failure(
+                payload, f"{type(runner).__name__} has no method {func_name!r}"
             )
         try:
             result = RpcResult(
                 payload.request_id, self.rank, value=func(*call_args, **call_kwargs)
             )
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
-            return RpcResult(
-                payload.request_id,
-                self.rank,
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            return self._failure(payload, f"{type(exc).__name__}: {exc}")
         try:
             # The reply crosses a ZMQ socket, so an unpicklable value would kill
             # the sender thread rather than fail this call. Find out here.
             pickle.dumps(result)
         except Exception as exc:  # noqa: BLE001 - same reason
-            return RpcResult(
-                payload.request_id,
-                self.rank,
-                error=f"unpicklable result from {func_name!r}: {type(exc).__name__}: {exc}",
+            return self._failure(
+                payload,
+                f"unpicklable result from {func_name!r}: {type(exc).__name__}: {exc}",
             )
         return result
+
+    def _failure(self, payload: RpcPayload, error: str) -> RpcResult:
+        """This rank's reply to *payload* when the call could not succeed."""
+        return RpcResult(payload.request_id, self.rank, error=error)
 
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()
@@ -705,8 +700,8 @@ class AsyncIOProcManager:
                 # dies mid-call is reported promptly instead of at the deadline.
                 reply = output_queue.get(timeout=max(0.0, min(1.0, remaining)))
             except queue.Empty:
-                # Ahead of every return below: once this call gives up, nothing
-                # else would release ranks still waiting on a dead one.
+                # Before this call can give up: once it has, nothing else would
+                # release ranks still waiting on a dead one.
                 self._break_barrier_for_dead_ranks(procs)
                 # Death before the deadline, even once it has passed: waiting on
                 # another rank can use up the budget, and a rank that died is
@@ -731,32 +726,29 @@ class AsyncIOProcManager:
                     error = f"timed out waiting for {func_name!r} on TP rank {rank}"
                 else:
                     continue
-                return RpcResult(payload.request_id, rank, error=error)
-
-            if not isinstance(reply, RpcResult):
-                return RpcResult(
-                    payload.request_id,
-                    rank,
-                    error=f"unexpected reply type {type(reply).__name__} from rank {rank}",
-                )
-            if reply.request_id != payload.request_id:
-                # A late reply from an earlier call. Dropping it is correct:
-                # that caller has already been answered or has given up.
-                logger.warning(
-                    "%s: dropping stale reply %s from rank %d while awaiting %s",
-                    self.label,
-                    reply.request_id,
-                    rank,
-                    payload.request_id,
-                )
-                continue
-            if reply.tp_rank != rank:
-                return RpcResult(
-                    payload.request_id,
-                    rank,
-                    error=f"reply rank mismatch: channel {rank} carried {reply.tp_rank}",
-                )
-            return reply
+            else:
+                if not isinstance(reply, RpcResult):
+                    error = (
+                        f"unexpected reply type {type(reply).__name__} from rank {rank}"
+                    )
+                elif reply.request_id != payload.request_id:
+                    # A late reply from an earlier call. Dropping it is correct:
+                    # that caller has already been answered or has given up.
+                    logger.warning(
+                        "%s: dropping stale reply %s from rank %d while awaiting %s",
+                        self.label,
+                        reply.request_id,
+                        rank,
+                        payload.request_id,
+                    )
+                    continue
+                elif reply.tp_rank != rank:
+                    error = (
+                        f"reply rank mismatch: channel {rank} carried {reply.tp_rank}"
+                    )
+                else:
+                    return reply
+            return RpcResult(payload.request_id, rank, error=error)
 
     def _break_barrier_for_dead_ranks(self, procs: list) -> None:
         """Release the ranks waiting at the barrier once one can never arrive.
