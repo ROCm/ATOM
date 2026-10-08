@@ -35,6 +35,13 @@ from atom.utils.forward_context import side_stream
 from .config import AttentionMode
 from .layers import native_quant_config
 
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+except ImportError:  # native ATOM runs without vLLM installed
+
+    def eager_break_during_capture(fn):
+        return fn
+
 
 class Indexer(nn.Module):
     def __init__(self, config, spec):
@@ -361,7 +368,43 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
+    def _alloc_attn_out(self, hidden):
+        """The buffer the attention region writes its rows into.
+
+        Caller-owned, because breakable cudagraph capture requires the eager
+        region to write in place: a region that returns a fresh tensor hands
+        back a different address every step, and a replay reruns no host code
+        to learn the new one. Allocated here, in what stays inside the graph,
+        so the capture records one address and every replay finds it.
+        """
+        return torch.empty(
+            (hidden.shape[0], self.heads, self.head_dim),
+            dtype=hidden.dtype,
+            device=hidden.device,
+        )
+
     def forward(self, hidden, hidden_scale, cache, step, rope):
+        attn_out = self._alloc_attn_out(hidden)
+        self._attend_block(attn_out, hidden, hidden_scale, cache, step, rope)
+        return self._project_out(attn_out, rope, cache.rope_positions(step))
+
+    @eager_break_during_capture
+    def _attend_block(self, attn_out, hidden, hidden_scale, cache, step, rope):
+        """Everything from the compressor fork to the attention rows.
+
+        The wide eager region, and wide on purpose. Upstream keeps a narrower
+        one for Model Runner V2 and a wide one for V1, because V1's piecewise
+        capture produces garbage with the narrow region (vllm #51430) -- the
+        attention input preparation stays in the graph and the replay reuses
+        it. Wide is correct under both; narrow is an optimisation under one.
+        Picking by runner would mean a config-dependent choice whose wrong
+        side is silent, so this takes the side that is right either way until
+        there is a measurement saying the narrower region is worth it.
+
+        Writes into `attn_out` and returns nothing, which is the contract the
+        decorator is held to: a region that returned rows would hand back a
+        new address every step and a replay reruns no host code to find it.
+        """
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
@@ -371,6 +414,16 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
+        self._attend(attn_out, query, kv_normed, selecting, cache, step, rope)
+
+    def _attend(self, attn_out, query, kv_normed, selecting, cache, step, rope):
+        """The sparse indexer's join and the MLA attention, into `attn_out`.
+
+        Writes and returns nothing. That is the contract a breakable-cudagraph
+        eager region is held to, and keeping it here -- rather than returning
+        the rows and letting `forward` place them -- is what lets this region
+        be marked without restructuring it again later.
+        """
         # One launch for both rotations, the KV row's FP8 bytes and, where a
         # decode allows it, the window write. `window_kv` is what is left for
         # `write_window` below, which is nothing when that fold happened.
@@ -386,20 +439,32 @@ class Attention(nn.Module):
             self.spec, step
         )
         flat_query = query.flatten(0, 1)
+        flat_out = attn_out.flatten(0, 1)
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
             decode = packed_decode if cache.packed else sparse_attn_v4_paged_decode
-            output = decode(
-                flat_query,
-                cache.pool,
-                prefix,
-                prefix_indptr,
-                self.attn_sink,
-                self.softmax_scale,
+            # No `out=` on this kernel, and it is shared with V4, so the rows
+            # land in its own buffer and are copied to the caller's. The copy
+            # is what makes the address stable; the kernel's own allocation is
+            # free to move because this region runs eagerly.
+            flat_out.copy_(
+                decode(
+                    flat_query,
+                    cache.pool,
+                    prefix,
+                    prefix_indptr,
+                    self.attn_sink,
+                    self.softmax_scale,
+                )
             )
         else:
             prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_prefill
-            output = prefill(
+            # `out=` is a request, not a guarantee: `packed_prefill` carries
+            # the same pointer check internally, which is the evidence that
+            # the underlying kernel may answer in a buffer of its own. Ignoring
+            # the return would leave `attn_out` holding whatever was there
+            # before, with nothing raised.
+            produced = prefill(
                 flat_query,
                 cache.pool,
                 prefix,
@@ -409,10 +474,9 @@ class Attention(nn.Module):
                 extend_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_query,
+                out=flat_out,
             )
+            if produced.data_ptr() != flat_out.data_ptr():
+                flat_out.copy_(produced)
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        return self._project_out(
-            output.view_as(query), rope, cache.rope_positions(step)
-        )
