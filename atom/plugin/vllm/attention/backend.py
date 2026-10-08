@@ -38,6 +38,47 @@ class _VllmAttentionBackendCompat:
         """ATOM metadata builders plan from exact CPU query boundaries."""
         return False
 
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        """Does this backend accept ``block_size`` as the framework page?
+
+        vLLM 0.29 picked the KV page by asking ONE backend for
+        ``get_preferred_block_size()``. 0.31 negotiates across every attention
+        backend a model uses (``Platform._preferred_block_size_for_backends``):
+        it first asks whether all of them accept the 16-token default, and only
+        on a "no" searches the LCMs of their declared kernel sizes. Duck-typed
+        ATOM backends had no ``supports_block_size`` at all, so any model with
+        two or more of them -- GLM-5.2 is main MLA plus a DSA indexer -- died
+        with AttributeError before the workers came up.
+
+        Answering from ``get_preferred_block_size`` rather than from
+        ``get_supported_kernel_block_sizes`` is deliberate. The sparse MLA
+        backends declare ``[1, 64]`` but prefer 64, because 64 is what takes
+        the indexer's preshuffled path; under vLLM's own rule
+        (``block_size % supported == 0`` against EVERY declared size) the 1
+        makes 16 acceptable, the first branch returns the 16-token default, and
+        the preference is silently dropped. Keying on the preference reproduces
+        what 0.29 actually chose: 16 is rejected, the LCM search runs, and 64
+        wins.
+
+        A backend that declares no preference accepts anything, matching
+        vLLM's "a backend declaring no sizes contributes 1".
+
+        NOTE: ``AiterMhaBackendForVllm.get_preferred_block_size`` calls
+        ``supports_block_size``. That is not a cycle only because that class
+        overrides this method; a future subclass that copies the pattern
+        without its own override would recurse.
+        """
+        if block_size is None:
+            return True
+        get_preferred = getattr(cls, "get_preferred_block_size", None)
+        if get_preferred is None:
+            return True
+        preferred = get_preferred(block_size)
+        if not preferred:
+            return True
+        return block_size % preferred == 0
+
 
 class AiterMhaBackendForVllm(_VllmAttentionBackendCompat):
     """vLLM-facing MHA backend surface for ATOM attention layers."""
