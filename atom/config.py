@@ -2418,9 +2418,15 @@ class Config:
             # the scheduler never does, so hashing the live config gives each a
             # different namespace and every scheduler lookup misses. Snapshot it
             # here, before the config is shipped to either process.
-            from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+            from atom.kv_transfer.offload.config import (
+                snapshot_page_hf_geometry,
+                snapshot_rope_config,
+            )
 
             self.offload_page_hf_geometry = snapshot_page_hf_geometry(self.hf_config)
+            # Likewise the RoPE settings: llama.py adds a key to the live
+            # `rope_parameters` while a worker builds the model.
+            self.offload_rope_config = snapshot_rope_config(self.hf_config)
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
