@@ -1103,6 +1103,29 @@ print(json.dumps({**config, **extra}, separators=(",", ":")))
     || exit 2
 }
 
+# require_mooncake_store_number <name> <default> <kind>: refuses a numeric
+# Store setting that is not one of its kind, before anything starts. The
+# helpers and bash arithmetic would misread it later: a NaN or negative reserve
+# passes any NUMA budget, a compaction timeout of 0 skips the compaction, and a
+# wait timeout bash cannot add aborts the wait without stopping what it waited
+# for. Kinds: positive_integer, integer (>= 0), positive and non_negative
+# (decimals), fraction (a decimal in (0, 1]).
+require_mooncake_store_number() {
+  local name="$1" value valid=0
+  value="$(mooncake_setting "$1" "$2")"
+  case "$3" in
+    positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
+    integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
+    positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
+    non_negative) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ ]] && valid=1 ;;
+    fraction) [[ "${value}" =~ ^(0[.][0-9]*[1-9][0-9]*|1([.]0+)?)$ ]] && valid=1 ;;
+  esac
+  if ((!valid)); then
+    echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
+    exit 2
+  fi
+}
+
 # Refuses a prefill setting the Store cannot run with, and fills the owner
 # plan. Independent of the node: the owners' devices and memory are checked
 # where the Store starts.
@@ -1156,6 +1179,16 @@ check_mooncake_store_settings() {
     echo "[mooncake-store][FAIL] MOONCAKE_STORE_HOST_POOL_GIB=${MOONCAKE_STORE_HOST_POOL_GIB:-} is not a number of GiB" >&2
     exit 2
   fi
+  require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
+  require_mooncake_store_number MOONCAKE_STORE_NODE_RESERVE_GIB 128 non_negative
+  require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
+  require_mooncake_store_number MOONCAKE_STORE_MASTER_WAIT_TIMEOUT 120 positive_integer
+  require_mooncake_store_number MOONCAKE_STORE_PAGE_CACHE_DROP_SECONDS 1800 non_negative
+  require_mooncake_store_number MOONCAKE_STORE_OWNER_THREADS 4 positive_integer
+  require_mooncake_store_number MOONCAKE_STORE_OWNER_MAX_MR_SIZE 68719476736 positive_integer
+  require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  require_mooncake_store_number MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90 fraction
+  require_mooncake_store_number MOONCAKE_STORE_EVICTION_RATIO 0.05 fraction
   mooncake_store_worker_config >/dev/null
   plan_mooncake_store_owners
   plan_mooncake_store_pools

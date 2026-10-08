@@ -1065,6 +1065,26 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             ({"MOONCAKE_STORE_LEASE_TTL_MS": "0"}, "LEASE_TTL_MS=0 is not"),
             ({"MOONCAKE_STORE_LEASE_TTL_MS": "10s"}, "LEASE_TTL_MS=10s is not"),
             ({"MOONCAKE_STORE_HOST_POOL_GIB": "-1"}, "HOST_POOL_GIB=-1 is not"),
+            # Each would be misread later: by the NUMA budget, the compaction's
+            # timeout, bash arithmetic in the waits, or a Store process.
+            *(
+                ({f"MOONCAKE_STORE_{name}": value}, f"{name}={value} is not a {kind}")
+                for name, value, kind in (
+                    ("COMPACT_TIMEOUT", "0", "positive number"),
+                    ("COMPACT_TIMEOUT", "-600", "positive number"),
+                    ("COMPACT_TIMEOUT", "nan", "positive number"),
+                    ("NODE_RESERVE_GIB", "-8", "non negative number"),
+                    ("NODE_RESERVE_GIB", "nan", "non negative number"),
+                    ("WAIT_TIMEOUT", "20m", "positive integer number"),
+                    ("MASTER_WAIT_TIMEOUT", "120.5", "positive integer number"),
+                    ("PAGE_CACHE_DROP_SECONDS", "inf", "non negative number"),
+                    ("OWNER_THREADS", "0", "positive integer number"),
+                    ("OWNER_MAX_MR_SIZE", "64G", "positive integer number"),
+                    ("MASTER_NUMA", "-1", "integer number"),
+                    ("EVICTION_HIGH_WATERMARK", "1.5", "fraction number"),
+                    ("EVICTION_RATIO", "0", "fraction number"),
+                )
+            ),
             # The default owners name their own NICs; this one takes the list.
             (
                 {
