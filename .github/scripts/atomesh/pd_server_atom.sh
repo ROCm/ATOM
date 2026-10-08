@@ -225,6 +225,13 @@ AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTA
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
+# Torch profiler window inside the aiperf Profiling phase; off while DURATION is
+# 0. START counts from the phase start rather than from aiperf launch, so a
+# warmup of any length does not move the window. Once every rank's trace is on
+# disk, aiperf is stopped and the run passes regardless of its exit code.
+ATOMESH_TORCH_PROFILE_START="${ATOMESH_TORCH_PROFILE_START:-300}"
+ATOMESH_TORCH_PROFILE_DURATION="${ATOMESH_TORCH_PROFILE_DURATION:-0}"
+ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
@@ -762,6 +769,20 @@ write_metadata() {
 EOF
 }
 
+# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
+# passes its own torch_profiler_dir (None by default), which overrides the env
+# default in Config, so the profiler is off unless the flag is on the command.
+# One directory per worker keeps P/D ranks that share a node apart.
+build_torch_profiler_args() {
+  local log_name="$1"
+  local -n out_args="$2"
+  out_args=()
+  (( ATOMESH_TORCH_PROFILE_DURATION > 0 )) || return 0
+  local dir="${RUN_DIR}/torch_traces/${log_name}"
+  mkdir -p "${dir}"
+  out_args=(--torch-profiler-dir "${dir}")
+}
+
 start_prefill() {
   local log_name="$1"
   local server_port="${2:-${PREFILL_PORT}}"
@@ -789,6 +810,8 @@ start_prefill() {
   else
     prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
+  local -a prefill_profiler_args=()
+  build_torch_profiler_args "${log_name}" prefill_profiler_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -798,6 +821,7 @@ start_prefill() {
     --max-num-seqs "${MAX_NUM_SEQS}"
     --kv-transfer-config "${prefill_kv_transfer_config}"
     "${prefill_cudagraph_args[@]}"
+    "${prefill_profiler_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
@@ -845,6 +869,8 @@ start_decode() {
   else
     decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
+  local -a decode_profiler_args=()
+  build_torch_profiler_args "${log_name}" decode_profiler_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -855,6 +881,7 @@ start_decode() {
     "${decode_max_num_batched_tokens_args[@]}"
     --kv-transfer-config "${decode_kv_transfer_config}"
     "${decode_cudagraph_args[@]}"
+    "${decode_profiler_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
@@ -898,6 +925,8 @@ start_aggregated() {
   if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
     server_kv_transfer_args=(--kv-transfer-config "${DECODE_KV_TRANSFER_CONFIG}")
   fi
+  local -a server_profiler_args=()
+  build_torch_profiler_args "${log_name}" server_profiler_args
   echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a server_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -908,6 +937,7 @@ start_aggregated() {
     "${server_max_num_batched_tokens_args[@]}"
     "${server_kv_transfer_args[@]}"
     "${decode_cudagraph_args[@]}"
+    "${server_profiler_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "SERVER" "${server_cmd[@]}"
@@ -1076,6 +1106,173 @@ write_aiperf_chrome_trace() {
     || echo "[aiperf] WARNING: chrome trace conversion failed for ${out_dir}" >&2
 }
 
+# stop_profile holds each engine until its kineto export is on disk, so the tail
+# of the window stalls the run: aiperf numbers from a profiled cell are not
+# comparable to an unprofiled one.
+run_torch_profile_window() {
+  local out_dir="$1"
+  local done_file="$2"
+  local trace_ok_file="$3"
+  local aiperf_pid_file="$4"
+  set +e
+  local -a roles=() targets=()
+  local -A seen=()
+  local role idx target
+  IFS=',' read -r -a roles <<< "${ATOMESH_TORCH_PROFILE_ROLES}"
+  for role in "${roles[@]}"; do
+    role="${role//[[:space:]]/}"
+    case "${role}" in
+      prefill)
+        for idx in "${!prefill_ips[@]}"; do
+          target="${prefill_ips[$idx]}:${prefill_ports[$idx]}"
+          [[ -n "${seen[$target]:-}" ]] || { seen[$target]=1; targets+=("${target}"); }
+        done
+        ;;
+      decode)
+        for idx in "${!decode_ips[@]}"; do
+          target="${decode_ips[$idx]}:${decode_ports[$idx]}"
+          [[ -n "${seen[$target]:-}" ]] || { seen[$target]=1; targets+=("${target}"); }
+        done
+        ;;
+      "") ;;
+      *) echo "[profile] ignoring unknown role '${role}'" ;;
+    esac
+  done
+  if [[ "${#targets[@]}" -eq 0 ]]; then
+    echo "[profile] no targets for roles=${ATOMESH_TORCH_PROFILE_ROLES}; skipping"
+    return 0
+  fi
+
+  # $$ is the launcher shell: under set -e a failed aiperf exits it without
+  # touching done_file, and this watcher must not outlive it.
+  aiperf_gone() { [[ -e "${done_file}" ]] || ! kill -0 "$$" 2>/dev/null; }
+
+  echo "[profile] waiting for the aiperf Profiling phase; targets=${targets[*]}"
+  until grep -qiE 'Phase profiling .*started|Credit phase start: profiling' \
+    "${out_dir}/logs/aiperf.log" "${out_dir}/aiperf.log" 2>/dev/null; do
+    if aiperf_gone; then
+      echo "[profile] aiperf exited before its Profiling phase; no trace taken"
+      return 0
+    fi
+    sleep 2
+  done
+
+  local deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_START ))
+  echo "[profile] Profiling phase started at $(date -Is); window opens in ${ATOMESH_TORCH_PROFILE_START}s"
+  while (( $(date +%s) < deadline )); do
+    if aiperf_gone; then
+      echo "[profile] aiperf exited before the window opened; no trace taken"
+      return 0
+    fi
+    sleep 2
+  done
+
+  # Wait on the curl pids only: a bare `wait` also waits on the caller's tee
+  # process substitution, which cannot end before this function does.
+  local -a pids=()
+  local start_marker="${out_dir}/.torch_trace_start"
+  touch "${start_marker}"
+  echo "[profile] start_profile at $(date -Is)"
+  for target in "${targets[@]}"; do
+    curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
+      | sed "s|^|[profile] ${target} start: |" &
+    pids+=($!)
+  done
+  wait "${pids[@]}"
+
+  deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_DURATION ))
+  while (( $(date +%s) < deadline )) && ! aiperf_gone; do
+    sleep 2
+  done
+
+  # The server waits ATOM_PROFILER_TIMEOUT for its ranks; give curl headroom
+  # past that so the client never abandons an export still being written.
+  local stop_timeout=$(( ${ATOM_PROFILER_TIMEOUT:-300} + 300 ))
+  echo "[profile] stop_profile at $(date -Is) (client timeout ${stop_timeout}s)"
+  pids=()
+  local -a stop_files=()
+  local stop_file
+  for target in "${targets[@]}"; do
+    stop_file="${out_dir}/.stop_profile_${target//[:.]/_}.json"
+    stop_files+=("${stop_file}")
+    {
+      curl -sS -X POST --max-time "${stop_timeout}" "http://${target}/stop_profile" \
+        > "${stop_file}"
+      sed "s|^|[profile] ${target} stop: |" "${stop_file}"
+      echo
+    } &
+    pids+=($!)
+  done
+  wait "${pids[@]}"
+  echo "[profile] stop_profile returned at $(date -Is)"
+
+  if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
+    echo "[profile] traces incomplete; leaving aiperf to finish on its own"
+    return 0
+  fi
+  touch "${trace_ok_file}"
+  local aiperf_pid
+  aiperf_pid="$(cat "${aiperf_pid_file}" 2>/dev/null)"
+  if [[ -n "${aiperf_pid}" ]] && kill -0 "${aiperf_pid}" 2>/dev/null; then
+    # SIGTERM, not SIGINT: a background job of a non-interactive shell starts
+    # with SIGINT ignored. collect_metrics forwards it to aiperf's group.
+    echo "[profile] traces complete; stopping aiperf (pid ${aiperf_pid})"
+    kill -TERM "${aiperf_pid}"
+  fi
+}
+
+# stop_profile returns once TP rank 0 has exported, while the other ranks may
+# still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
+# removes the raw file, so a rank is done once it holds a .gz newer than the
+# window start and no raw .json.
+wait_for_torch_traces() {
+  local marker="$1"
+  shift
+  local stop_file trace_dir worker_dir rank_dir
+  local -A worker_dirs=()
+  for stop_file in "$@"; do
+    if ! grep -qE '"status" *: *"success"' "${stop_file}" 2>/dev/null; then
+      echo "[profile] stop_profile failed: $(cat "${stop_file}" 2>/dev/null)"
+      return 1
+    fi
+    while IFS= read -r trace_dir; do
+      [[ -n "${trace_dir}" ]] && worker_dirs["$(dirname "${trace_dir}")"]=1
+    done < <(grep -oE '"trace_dir" *: *"[^"]+"' "${stop_file}" \
+      | sed -E 's/.*"([^"]+)"$/\1/')
+  done
+  if [[ "${#worker_dirs[@]}" -eq 0 ]]; then
+    echo "[profile] stop_profile reported no trace_dir"
+    return 1
+  fi
+
+  local deadline=$(( $(date +%s) + ${ATOM_PROFILER_TIMEOUT:-300} ))
+  local pending ranks
+  while :; do
+    pending=0
+    ranks=0
+    for worker_dir in "${!worker_dirs[@]}"; do
+      for rank_dir in "${worker_dir}"/rank_*/; do
+        ranks=$(( ranks + 1 ))
+        if [[ ! -d "${rank_dir}" ]] \
+          || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
+          || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
+            -newer "${marker}" -print -quit)" ]]; then
+          pending=$(( pending + 1 ))
+        fi
+      done
+    done
+    if (( pending == 0 )); then
+      echo "[profile] all ${ranks} rank traces on disk at $(date -Is): ${!worker_dirs[*]}"
+      return 0
+    fi
+    if (( $(date +%s) >= deadline )); then
+      echo "[profile] ${pending}/${ranks} rank traces still missing after ${ATOM_PROFILER_TIMEOUT:-300}s"
+      return 1
+    fi
+    sleep 5
+  done
+}
+
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
@@ -1131,6 +1328,20 @@ run_aiperf_agentic_benchmark() {
 
     echo "[aiperf] ${result_file}"
     mkdir -p "${out_dir}"
+    local profile_pid=""
+    local profile_done="${out_dir}/.aiperf_done"
+    local trace_ok="${out_dir}/.torch_trace_ok"
+    local aiperf_pid_file="${out_dir}/.aiperf_pid"
+    rm -f "${profile_done}" "${trace_ok}" "${aiperf_pid_file}"
+    if (( ATOMESH_TORCH_PROFILE_DURATION > 0 )); then
+      if (( AIPERF_BENCHMARK_DURATION < ATOMESH_TORCH_PROFILE_START + ATOMESH_TORCH_PROFILE_DURATION )); then
+        echo "[profile] WARNING: benchmark duration ${AIPERF_BENCHMARK_DURATION}s ends before the" \
+          "trace window (${ATOMESH_TORCH_PROFILE_START}s + ${ATOMESH_TORCH_PROFILE_DURATION}s)" >&2
+      fi
+      run_torch_profile_window "${out_dir}" "${profile_done}" "${trace_ok}" "${aiperf_pid_file}" \
+        > >(tee "${out_dir}/torch_profile.log") 2>&1 &
+      profile_pid=$!
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
@@ -1168,8 +1379,32 @@ run_aiperf_agentic_benchmark() {
       "${server_metrics_args[@]}" \
       --output-artifact-dir "${out_dir}" \
       --public-dataset "${AIPERF_PUBLIC_DATASET}" \
-      2>&1 | tee "${out_dir}/aiperf.log"
+      > >(tee "${out_dir}/aiperf.log") 2>&1 &
+    local aiperf_pid=$!
+    echo "${aiperf_pid}" > "${aiperf_pid_file}"
+    local aiperf_rc=0
+    wait "${aiperf_pid}" || aiperf_rc=$?
 
+    if [[ -n "${profile_pid}" ]]; then
+      touch "${profile_done}"
+      wait "${profile_pid}" || true
+    fi
+
+    # The trace is the deliverable of a profiled cell; once it is on disk,
+    # aiperf was stopped on purpose and its exit code no longer matters.
+    if [[ -f "${trace_ok}" ]]; then
+      echo "[profile] torch traces captured; treating the run as passed (aiperf rc=${aiperf_rc})"
+      if [[ -f "${aiperf_json}" ]]; then
+        write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}" \
+          || echo "[aiperf] WARNING: dashboard JSON skipped for the stopped run" >&2
+        write_aiperf_chrome_trace "${out_dir}"
+      fi
+      continue
+    fi
+    if (( aiperf_rc != 0 )); then
+      echo "[aiperf][FAIL] aiperf exited with code ${aiperf_rc}" >&2
+      return "${aiperf_rc}"
+    fi
     if [[ ! -f "${aiperf_json}" ]]; then
       echo "[aiperf][FAIL] ${aiperf_json} was not produced" >&2
       return 1
