@@ -42,7 +42,7 @@ def glm52_native_config(
     if tp_size != 4 or kv_cache_dtype != "fp8" or not mtp:
         return None
     if (
-        query_length not in (5, 6)
+        query_length != 5
         or samples % query_length
         or samples // query_length not in GLM5_GRAPH_BATCHES
     ):

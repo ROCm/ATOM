@@ -245,9 +245,10 @@ four; the case block resolves both the draft depth and its golden AL from
 `CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
 offload is only used from `C16` upwards.
 
-The native scaled-FP4 MonoKernel is enabled only at C1/C2 through
-`ATOM_MONO_ENABLE=1`. C4 and above remain on the production path; the
-current multi-chunk native schedule is slower at those widths.
+The default recipe keeps MTP5 on the production path. The scaled-FP4
+MonoKernel has measured model-level evidence for MTP4 C1/C2 only; set
+`ENABLE_MTP4_MONO=1` for that controlled A/B. C4 and above remain on the
+production path because the current multi-chunk native schedule is slower.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -258,17 +259,16 @@ export AITER_USE_FLYDSL_MOE_SORTING=1
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
+export ENABLE_MTP4_MONO=${ENABLE_MTP4_MONO:-0}
 ATOM_MONO_ENABLE=0
 
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
   1)
     CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MTP_K=5; MTP_AL=3.61
-    ATOM_MONO_ENABLE=1
     ;;
   2)
     CUDAGRAPH_CAPTURE_SIZES='[1,2,4]'; MTP_K=5; MTP_AL=3.61
-    ATOM_MONO_ENABLE=1
     ;;
   4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
@@ -279,6 +279,16 @@ case "${CONC}" in
     exit 2
     ;;
 esac
+
+if [[ "${ENABLE_MTP4_MONO}" == "1" ]]; then
+  if [[ "${CONC}" != "1" && "${CONC}" != "2" ]]; then
+    echo "ENABLE_MTP4_MONO=1 supports only C1/C2" >&2
+    exit 2
+  fi
+  MTP_K=4
+  MTP_AL=3.61
+  ATOM_MONO_ENABLE=1
+fi
 
 export ATOM_MONO_ENABLE
 

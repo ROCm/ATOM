@@ -387,15 +387,16 @@ def test_glm_native_fp4_agentx_concurrency_contract():
         {"mtp": False},
         {"query_length": 1},
         {"query_length": 4},
+        {"query_length": 6},
     ],
 )
 def test_unsupported_glm_forward_falls_back(override):
     args = {
-        "samples": 6,
+        "samples": 5,
         "tp_size": 4,
         "kv_cache_dtype": "fp8",
         "mtp": True,
-        "query_length": 6,
+        "query_length": 5,
     }
     args.update(override)
     assert glm52_native_config(**args) is None
@@ -450,29 +451,28 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
         return value
 
     rank_zero = runner()
-    assert rank_zero._prepare(6, 6)
-    assert rank_zero._prepare(6, 6)
-    assert rank_zero._prepare(12, 6)
+    assert rank_zero._prepare(5, 5)
+    assert rank_zero._prepare(5, 5)
+    assert rank_zero._prepare(10, 5)
     rank[0] = 1
-    assert runner()._prepare(6, 6)
+    assert runner()._prepare(5, 5)
     assert messages == [
-        ("GLM-5.2 MonoKernel on: S=%d chunk=%d", 6, 6),
-        ("GLM-5.2 MonoKernel on: S=%d chunk=%d", 12, 12),
+        ("GLM-5.2 MonoKernel on: S=%d chunk=%d", 5, 5),
+        ("GLM-5.2 MonoKernel on: S=%d chunk=%d", 10, 10),
     ]
     rank_zero.close()
     assert rank_zero._announced == set()
 
 
 def test_glm_scaled_fp4_dispatch_contract():
-    for query_length in (5, 6):
-        config = glm52_native_config(
-            samples=query_length,
-            tp_size=4,
-            kv_cache_dtype="fp8",
-            mtp=True,
-            query_length=query_length,
-        )
-        assert config == glm5_tp_config(4)
+    config = glm52_native_config(
+        samples=5,
+        tp_size=4,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        query_length=5,
+    )
+    assert config == glm5_tp_config(4)
 
 
 def test_glm_tp4_geometry_and_padded_graph_ladder():
@@ -483,19 +483,6 @@ def test_glm_tp4_geometry_and_padded_graph_ladder():
     assert tp8.inter * 8 == tp4.inter * 4
     assert tp4.n_experts + tp4.num_shared_experts == 257
     for batch in GLM5_GRAPH_BATCHES:
-        samples = batch * 6
-        assert (
-            glm52_native_config(
-                samples=samples,
-                tp_size=4,
-                kv_cache_dtype="fp8",
-                mtp=True,
-                query_length=6,
-            )
-            == tp4
-        )
-        chunk = glm5_kernel_samples(samples, 6)
-        assert chunk in (6, 12) and chunk % 6 == 0 and samples % chunk == 0
         samples = batch * 5
         assert (
             glm52_native_config(
@@ -811,7 +798,7 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
         enable_expert_parallel=False,
         enable_tbo=False,
         enable_tbo_decode=False,
-        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=5),
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4),
         kv_cache_dtype="fp8",
     )
     layer = SimpleNamespace(
@@ -837,18 +824,18 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
     assert not module.Glm52MonoDecode(causal_lm, atom_config)._enabled
 
 
-def test_glm_c1_c2_padded_graph_dispatches_q6(monkeypatch):
+def test_glm_c1_c2_padded_graph_dispatches_q5(monkeypatch):
     import torch
 
     module = _glm_mono_module()
-    samples, active = 16 * 6, 2 * 6
+    samples, active = 16 * 5, 2 * 5
     runner = object.__new__(module.Glm52MonoDecode)
     runner._enabled = True
     runner._shard = glm5_tp_config(4)
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=4,
         kv_cache_dtype="fp8",
-        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=5),
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4),
         enable_dp_attention=False,
         decode_context_parallel_size=1,
     )
@@ -861,7 +848,7 @@ def test_glm_c1_c2_padded_graph_dispatches_q6(monkeypatch):
         lambda rows, query_length: seen.append((rows, query_length)) or True
     )
     metadata = SimpleNamespace(
-        max_seqlen_q=6,
+        max_seqlen_q=5,
         slot_mapping=torch.cat(
             (
                 torch.arange(active, dtype=torch.int64),
@@ -895,13 +882,13 @@ def test_glm_c1_c2_padded_graph_dispatches_q6(monkeypatch):
     assert runner.supports(
         torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
     )
-    assert seen == [(samples, 6)]
+    assert seen == [(samples, 5)]
 
     context.scheduled_bs = 1
     assert runner.supports(
         torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
     )
-    assert seen == [(samples, 6), (samples, 6)]
+    assert seen == [(samples, 5), (samples, 5)]
 
     context.scheduled_bs = 4
     assert not runner.supports(
