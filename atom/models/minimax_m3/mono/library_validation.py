@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Validate tensor storage and prepare mono's private weight representations."""
-
-from dataclasses import dataclass
+"""Validate borrowed weights and caches without converting their storage."""
 
 import torch
 
@@ -34,66 +32,27 @@ def checked_tensor(
     return tensor
 
 
-def _ptpc(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.shuffle import shuffle_weight
+def validate_layer(spec: LayerSpec, device: torch.device) -> None:
+    """Check a prepared layer before any runtime allocation or IPC handshake."""
 
-    values = weight.float()
-    scale = values.abs().amax(dim=1).div(448).clamp_min(1e-30)
-    quantized = (values / scale[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
-    return shuffle_weight(quantized, layout=(16, 16)), scale
+    def check(tensor, name, shape, dtype=torch.bfloat16):
+        checked_tensor(tensor, f"layer {spec.layer_id} {name}", shape, dtype, device)
 
-
-@dataclass(frozen=True)
-class PreparedLayer:
-    layer_id: int
-    g_in: torch.Tensor
-    w_qkv: torch.Tensor
-    s_qkv: torch.Tensor
-    g_q: torch.Tensor
-    g_k: torch.Tensor
-    g_iq: torch.Tensor
-    g_ik: torch.Tensor
-    cos_sin: torch.Tensor
-    w_o: torch.Tensor
-    s_o: torch.Tensor
-    g_post: torch.Tensor
-    gate: torch.Tensor
-    bias: torch.Tensor
-    w13: torch.Tensor
-    s13: torch.Tensor
-    w2: torch.Tensor
-    s2: torch.Tensor
-
-    @classmethod
-    def from_spec(cls, spec: LayerSpec, device: torch.device):
-        def check(tensor, name, shape, dtype=torch.bfloat16):
-            return checked_tensor(
-                tensor, f"layer {spec.layer_id} {name}", shape, dtype, device
-            )
-
-        w_qkv, s_qkv = _ptpc(check(spec.w_qkv, "QKV", (2560, 6144)))
-        w_o, s_o = _ptpc(check(spec.w_o, "O", (6144, 2048)))
-        gate = check(spec.gate, "router", (128, 6144), torch.float32).bfloat16()
-        return cls(
-            spec.layer_id,
-            check(spec.g_in, "input norm", (6144,)),
-            w_qkv,
-            s_qkv,
-            check(spec.g_q, "Q norm", (128,)),
-            check(spec.g_k, "K norm", (128,)),
-            check(spec.g_iq, "index Q norm", (128,)),
-            check(spec.g_ik, "index K norm", (128,)),
-            check(spec.cos_sin, "cos/sin", (spec.cos_sin.shape[0], 64)),
-            w_o,
-            s_o,
-            check(spec.g_post, "post norm", (6144,)),
-            gate,
-            check(spec.bias, "router bias", (128,), torch.float32),
-            check(spec.w13, "w13", (129, 1536, 3072), torch.float4_e2m1fn_x2),
-            check(spec.s13, "s13", (129, 1536, 192), torch.uint8),
-            check(spec.w2, "w2", (129, 6144, 384), torch.float4_e2m1fn_x2),
-            check(spec.s2, "s2", (129, 6144, 24), torch.uint8),
-        )
+    check(spec.w_qkv, "QKV", (2560, 6144), torch.float8_e4m3fn)
+    check(spec.s_qkv, "QKV scales", (2560,), torch.float32)
+    check(spec.w_o, "O", (6144, 2048), torch.float8_e4m3fn)
+    check(spec.s_o, "O scales", (6144,), torch.float32)
+    check(spec.gate, "router", (128, 6144))
+    check(spec.g_in, "input norm", (6144,))
+    for name in ("g_q", "g_k", "g_iq", "g_ik"):
+        check(getattr(spec, name), name, (128,))
+    check(spec.cos_sin, "cos/sin", (spec.cos_sin.shape[0], 64))
+    check(spec.g_post, "post norm", (6144,))
+    check(spec.bias, "router bias", (128,), torch.float32)
+    check(spec.w13, "w13", (129, 1536, 3072), torch.float4_e2m1fn_x2)
+    check(spec.s13, "s13", (129, 1536, 192), torch.uint8)
+    check(spec.w2, "w2", (129, 6144, 384), torch.float4_e2m1fn_x2)
+    check(spec.s2, "s2", (129, 6144, 24), torch.uint8)
 
 
 def validate_cache(cache: CacheSpec, device: torch.device):

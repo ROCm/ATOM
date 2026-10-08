@@ -164,6 +164,7 @@ class K4Build:
     shared_weight: float
     swiglu_limit: float
     debug: bool
+    router_logits_fp32: bool = field(default=False, metadata={"sym": "rf32"})
 
 
 def build_post_attn_kernel(
@@ -182,6 +183,7 @@ def build_post_attn_kernel(
     debug: bool = False,
     index_topk: bool = True,
     cache_mode: str = "atom",
+    router_logits_fp32: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -202,7 +204,7 @@ def build_post_attn_kernel(
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
-        swiglu_limit=swiglu_limit, debug=debug,
+        swiglu_limit=swiglu_limit, debug=debug, router_logits_fp32=router_logits_fp32,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``

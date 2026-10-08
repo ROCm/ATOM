@@ -51,16 +51,27 @@ def main():
     }
     cfg = json.loads((directory / "info.json").read_text())["config"]
     ep = "block_sparse_moe.experts.routed_experts."
+
+    def projection(name, shape):
+        weight = weights[f"self_attn.{name}.weight"]
+        if tuple(weight.shape) == shape[::-1]:
+            weight = weight.t()
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "Capture native online PTPC weights; BF16 captures are unsupported"
+            )
+        return weight, weights[f"self_attn.{name}.weight_scale"].view(-1)
+
     spec = LayerSpec(
         args.layer_id,
         weights["input_layernorm.weight"],
-        weights["self_attn.qkv_proj.weight"],
+        *projection("qkv_proj", (2560, 6144)),
         *[
             weights[f"self_attn.{k}_norm.weight"]
             for k in ("q", "k", "index_q", "index_k")
         ],
         weights["cos_sin"].bfloat16(),
-        weights["self_attn.o_proj.weight"],
+        *projection("o_proj", (6144, 2048)),
         weights["post_attention_layernorm.weight"],
         weights["block_sparse_moe.gate.weight"],
         weights["block_sparse_moe.e_score_correction_bias"],

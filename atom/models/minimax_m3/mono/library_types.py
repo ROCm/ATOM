@@ -21,21 +21,24 @@ class TPContext:
 
 @dataclass(frozen=True)
 class LayerSpec:
-    """One TP4 sparse layer. Projection weights are original BF16 matrices;
+    """One TP4 sparse layer. Projections are AITER-shuffled PTPC E4M3 weights;
     expert weights are AITER-shuffled MXFP4 with shuffled E8M0 scales.
     Norm weights use Gemma's (1 + weight) convention and partial NeoX RoPE.
-    ATOM retains these tensors and owns any conversion copies.
+    Router weights are BF16; routing keeps FP32 logits. All tensors are borrowed
+    without quantization, casts, shuffling, or copies.
     """
 
     layer_id: int
     g_in: torch.Tensor
     w_qkv: torch.Tensor
+    s_qkv: torch.Tensor
     g_q: torch.Tensor
     g_k: torch.Tensor
     g_iq: torch.Tensor
     g_ik: torch.Tensor
     cos_sin: torch.Tensor
     w_o: torch.Tensor
+    s_o: torch.Tensor
     g_post: torch.Tensor
     gate: torch.Tensor
     bias: torch.Tensor

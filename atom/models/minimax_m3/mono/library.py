@@ -34,16 +34,23 @@ from atom.models.minimax_m3.mono.library_types import (
     StepMetadata,
     TPContext,
 )
-from atom.models.minimax_m3.mono.library_weights import (
-    PreparedLayer,
+from atom.models.minimax_m3.mono.library_validation import (
     require,
     validate_cache,
+    validate_layer,
 )
 from atom.mono.runtime.compile import compile_only
 from atom.mono.runtime.consensus import bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 
-__all__ = ["AtomM3Mono", "CacheSpec", "LayerSpec", "StepMetadata", "TPContext"]
+__all__ = [
+    "AtomM3Mono",
+    "CacheSpec",
+    "LayerSpec",
+    "StepMetadata",
+    "TPContext",
+    "validate_layer",
+]
 SUPPORTED_TOKENS = (1, 4, 8, 16)
 _RUNTIMES = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
@@ -270,7 +277,9 @@ class AtomM3Mono:
             validate_cache(cache, self.tp.device)
         self.caches = list(caches)
         self.width = triton.next_power_of_2((caches[0].max_context + 127) // 128)
-        self.weights = [PreparedLayer.from_spec(s, self.tp.device) for s in specs]
+        for spec in specs:
+            validate_layer(spec, self.tp.device)
+        self.weights = list(specs)
         self._indices = {s.layer_id: i for i, s in enumerate(specs)}
         self._weights = [
             [
@@ -295,6 +304,7 @@ class AtomM3Mono:
             tokens,
             fuse_k1=True,
             cache_mode="vllm",
+            router_logits_fp32=True,
         )
 
     def _allocate_metadata(self):

@@ -18,10 +18,11 @@ for layer_id in sparse_layer_ids:
 mono.close()
 ```
 
-`LayerSpec` contains original BF16 QKV/O projections, FP32 router weights, norm
-and rotary tensors, shuffled MXFP4 expert tensors, and numerical constants.
-ATOM validates storage and creates private FP8 projection and BF16 router copies.
-The caller's native parameters remain available for fallback. The library and
+`LayerSpec` contains AITER-shuffled per-channel E4M3 QKV/O projections and FP32
+scales, BF16 router weights, norm and rotary tensors, shuffled MXFP4 expert
+tensors, and numerical constants. `validate_layer` checks this contract before
+runtime allocation. ATOM borrows all weights without conversion or copies;
+native execution and mono use the same storage. The library and
 native ATOM runner share sparse allocation and execution through `SparseExecution`,
 and use the common compilation, IPC, and per-step mailbox runtime.
 
@@ -43,11 +44,18 @@ at the start of every step.
 ## Supported contract
 
 - gfx950 with 256 CUs; TP4 using the caller's existing CPU process group.
+- Dedicated GPU capacity: the persistent kernel's forward-progress contract
+  assumes all 256 CTAs can reside together. External GPU work can invalidate
+  this assumption; concurrent workloads are not qualified by the library.
 - `TPContext.device` must be the rank's current CUDA device. Every rank must
   construct, prepare the same step shape, execute the same layer order, and
   close together. Initialization failures are agreed before IPC or execution.
 - Sparse indexed M3 layers: hidden size 6144, local Q/KV/index heads 16/1/1,
   Gemma norms, partial NeoX rotary dimension 64, top-16 blocks, init/local 0/1.
+- BF16 router weights with FP32 logits, sigmoid, and correction bias. The library
+  builds kernels with `router_logits_fp32=True`; native ATOM retains its existing
+  BF16-logit rounding by default. Choosing BF16 router weights is lossy and is
+  the caller's explicit model configuration, not an implicit library conversion.
 - Packed scalar FP8 K/V and independent unit-scale E4M3 index caches, contexts
   up to 16384, at most four requests, token counts 1/4/8/16, query length 1 or 4.
 - Eager execution and CUDA graph capture/replay. `torch.compile` is explicitly
@@ -61,6 +69,12 @@ input views to warm any tensor-alignment specialization for those views.
 Unsupported configuration or compilation failure raises; the library does not
 silently fall back. Native ATOM's default cache mode remains available to its
 runner and retains per-token scale behavior.
+
+The vLLM adapter checks all sparse layers collectively, including the actual
+AITER quantization backend and shuffled layout. Unsupported weights use native
+execution without allocating this runtime. At each step, unsupported token/query
+shapes or more than four padded request rows also use native execution. A larger
+configured scheduler concurrency does not disable eligible smaller batches.
 
 Returned activation buffers are reused after two layers. Clone auxiliary states
 that must survive that reuse. Keep the runtime, weights, caches, scales, and all
@@ -78,7 +92,8 @@ suite compiles both cache modes and checks that mode changes cannot reuse a
 binary with different cache semantics.
 
 `tests/minimax_m3_mono_replay.py` is an opt-in TP4 replay harness for captured
-native layer tensors. Each `rank-N` directory contains `weights.pt`, `info.json`
+native layer tensors with online PTPC projections and a BF16/FP32-output router.
+Each `rank-N` directory contains `weights.pt`, `info.json`
 (the model's numerical configuration), and `case-*.pt` (native inputs, caches,
 metadata, and expected outputs). Input captures must contain only live rows;
 the harness injects padding itself. It reports precision differences from native
@@ -95,3 +110,5 @@ python -m torch.distributed.run --master-addr 127.0.0.1 --master-port 29631 \
 Repeat with `--k-scale-factor 2 --v-scale-factor 0.5` to exercise independent,
 non-unit scalar scales; the harness rescales captured cache payloads accordingly.
 Checkpoint captures are external fixtures and are not included in CPU CI.
+Older BF16-projection captures must be regenerated; the harness does not convert
+them into a different weight configuration.
