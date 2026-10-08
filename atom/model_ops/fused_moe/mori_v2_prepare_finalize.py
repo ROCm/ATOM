@@ -810,7 +810,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         if pad_rows is not None:
             # combine sums every top-k slot and a -1 slot holds stale (possibly
             # non-finite) data, so select zeros for the pad rows.
-            out = torch.where(pad_rows, 0, out)
+            from atom.model_ops.fused_moe.flydsl_mega_experts import zero_pad_rows_
+
+            out = zero_pad_rows_(out, pad_rows)
         return out
 
     @staticmethod

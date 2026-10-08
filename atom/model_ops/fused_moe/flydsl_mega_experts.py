@@ -40,6 +40,8 @@ import logging
 import os
 
 import torch
+import triton
+import triton.language as tl
 
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
@@ -338,7 +340,30 @@ def run_mega_moe(
     if pad_rows is not None and not combine_can_mask:
         # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
         # an earlier call left there (possibly non-finite). Select zeros.
-        out = torch.where(pad_rows, 0, out)
+        out = zero_pad_rows_(out, pad_rows)
+    return out
+
+
+@triton.jit
+def _zero_pad_rows_kernel(out_ptr, pad_ptr, stride_row, hidden, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    if tl.load(pad_ptr + row) != 0:
+        offs = tl.arange(0, BLOCK)
+        zeros = tl.zeros([BLOCK], dtype=out_ptr.dtype.element_ty)
+        for start in range(0, hidden, BLOCK):
+            tl.store(out_ptr + row * stride_row + start + offs, zeros, mask=start + offs < hidden)
+
+
+def zero_pad_rows_(out: torch.Tensor, pad_rows: torch.Tensor) -> torch.Tensor:
+    """In place `torch.where(pad_rows, 0, out)` for a `[rows, hidden]` output.
+
+    Only the pad rows are written; real rows are not read at all, where the
+    elementwise select streams the whole output (~15 us/layer at 1536 x 7168)."""
+    if out.dim() != 2 or out.stride(1) != 1:
+        return torch.where(pad_rows, 0, out)
+    _zero_pad_rows_kernel[(out.shape[0],)](
+        out, pad_rows.view(torch.uint8), out.stride(0), out.shape[1], BLOCK=1024
+    )
     return out
 
 
