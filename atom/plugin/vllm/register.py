@@ -302,6 +302,14 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    # vLLM auto-enables the breakable cudagraph for V4 while building
+    # VllmConfig, which happens after this hook in every process.
+    from atom.plugin.vllm.deepseek_v4_cudagraph_patch import (
+        apply_vllm_v4_breakable_cudagraph_opt_out,
+    )
+
+    apply_vllm_v4_breakable_cudagraph_opt_out()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
