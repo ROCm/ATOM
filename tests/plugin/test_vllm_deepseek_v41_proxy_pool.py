@@ -432,3 +432,26 @@ def test_the_profile_cache_patch_installs_without_a_v4_model():
     # `register_platform` installs it too, but it is not checked here: that
     # hook can be swallowed whole (see `deepseek_v41_state_reserve_patch`), so
     # it is the belt and this is the braces.
+
+
+def test_the_bind_stands_down_while_cudagraphs_are_being_captured():
+    """Capture is a third phase, distinct from serving and from profiling.
+
+    Measured at the bind: the capture forward arrives with
+    `num_gpu_blocks=64`, a 64-block proxy tensor, and the profiling flag
+    correctly False -- capture is not the memory profile, and the guard for
+    one does not cover the other. Binding there carves the STATE tail out of
+    a pool 3800x too small and raises "proxy pool is too small", which is true
+    of the capture's pool and silent about the one that will serve.
+    """
+    import atom.plugin.vllm.deepseek_v41_bridge as bridge_mod
+
+    monitor = pytest.importorskip("vllm.compilation.monitor")
+    before = getattr(monitor, "cudagraph_capturing_enabled", False)
+    try:
+        monitor.cudagraph_capturing_enabled = True
+        assert bridge_mod._v41_cudagraph_capture_in_progress() is True
+        monitor.cudagraph_capturing_enabled = False
+        assert bridge_mod._v41_cudagraph_capture_in_progress() is False
+    finally:
+        monitor.cudagraph_capturing_enabled = before
