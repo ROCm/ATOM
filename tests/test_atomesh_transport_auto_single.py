@@ -24,6 +24,56 @@ def auto_probe(tmp_path, monkeypatch, fault=None):
     second["device"] = "fixture_z"
     inv["ports"].append(second)
     root = tmp_path / "transport-diagnostic/benchmark"
+    publish = probe.publish_once
+    startup_peer = None
+
+    def publish_with_peer(path, doc):
+        nonlocal startup_peer
+        publish(path, doc)
+        if path.name == "auto-startup-entry-0.json":
+            startup_peer = {
+                **doc,
+                "rank": 1,
+                "hostname": "peer-fixture",
+                "node_ip": "192.0.2.2",
+                "nonce": "a" * 32,
+            }
+            if fault == "startup_timeout":
+                return
+            if fault == "startup_stale":
+                startup_peer["created_at"] -= 1000
+            startup_mismatches = {
+                "startup_cross_job": ("job_id", "old-job"),
+                "startup_token": ("run_token", "old-token"),
+                "startup_phase": ("phase", "eval"),
+                "startup_image": ("image", "other-image"),
+                "startup_script": ("script_sha256", "other-script"),
+                "startup_rank": ("rank", 0),
+                "startup_host": ("hostname", "local-fixture"),
+                "startup_ip": ("node_ip", "192.0.2.99"),
+            }
+            if fault in startup_mismatches:
+                key, value = startup_mismatches[fault]
+                startup_peer[key] = value
+            kind = "error" if fault == "startup_peer_error" else "entry"
+            publish(root / f"auto-startup-{kind}-1.json", startup_peer)
+        elif path.name == "auto-startup-ack-0.json" and startup_peer:
+            agreement = {
+                "0": probe.evidence_digest(
+                    json.loads((root / "auto-startup-entry-0.json").read_text())
+                ),
+                "1": probe.evidence_digest(startup_peer),
+            }
+            if fault == "startup_old_ack":
+                agreement["0"] = "old-entry"
+            publish(
+                root / "auto-startup-ack-1.json",
+                {**startup_peer, "agreement": agreement},
+            )
+
+    monkeypatch.setattr(probe, "publish_once", publish_with_peer)
+    if fault == "startup_timeout":
+        monkeypatch.setattr(probe, "STARTUP_SECONDS", 0.01)
 
     def peer(path, timeout=45):
         assert timeout == 45
@@ -101,6 +151,80 @@ def auto_probe(tmp_path, monkeypatch, fault=None):
 
     monkeypatch.setattr(probe, "supervise", supervise)
     return probe, env, inv, calls, root
+
+
+@pytest.mark.parametrize(
+    "fault,classification",
+    [
+        ("startup_timeout", "STARTUP_TIMEOUT"),
+        ("startup_stale", "STARTUP_INVALID"),
+        ("startup_cross_job", "STARTUP_INVALID"),
+        ("startup_token", "STARTUP_INVALID"),
+        ("startup_phase", "STARTUP_INVALID"),
+        ("startup_image", "STARTUP_INVALID"),
+        ("startup_script", "STARTUP_INVALID"),
+        ("startup_rank", "STARTUP_INVALID"),
+        ("startup_host", "STARTUP_INVALID"),
+        ("startup_ip", "STARTUP_INVALID"),
+        ("startup_peer_error", "STARTUP_PEER_FAILED"),
+        ("startup_old_ack", "STARTUP_INVALID"),
+        ("startup_conflict", "STARTUP_INVALID"),
+        ("startup_workload_error", "STARTUP_PEER_FAILED"),
+    ],
+)
+def test_startup_failure_never_collects_inventory_or_launches_transport(
+    tmp_path, monkeypatch, fault, classification
+):
+    probe, env, _, calls, root = auto_probe(tmp_path, monkeypatch, fault)
+    if fault == "startup_conflict":
+        root.mkdir(parents=True)
+        (root / "auto-startup-entry-0.json").write_text('{"old":true}')
+    if fault == "startup_workload_error":
+        (tmp_path / "workload-failure.json").write_text(
+            json.dumps(
+                {
+                    "job_id": env["SLURM_JOB_ID"],
+                    "run_token": env["ATOMESH_RUN_TOKEN"],
+                    "num_ranks": 2,
+                    "return_code": 2,
+                }
+            )
+        )
+    inventories = []
+    monkeypatch.setattr(probe, "inventory", lambda: inventories.append(True))
+    assert probe.main() == 2
+    assert inventories == []
+    assert calls == []
+    assert not list(root.glob("auto-inventory-*.json"))
+    summary = report(tmp_path)
+    assert summary["stages"]["startup-rendezvous"]["classification"] == classification
+    assert summary["stages"]["nixl-rdma-gpu-read"]["classification"] == "NOT_TESTED"
+    assert summary["stages"]["mori-register"]["classification"] == "NOT_TESTED"
+    if fault == "startup_conflict":
+        assert (root / "auto-startup-entry-0.json").read_text() == '{"old":true}'
+
+
+@pytest.mark.parametrize("mode", [None, "1"])
+def test_default_and_explicit_modes_do_not_enter_startup_rendezvous(
+    tmp_path, monkeypatch, mode
+):
+    probe, _, _, _, calls = setup_probe(tmp_path, monkeypatch, mode=mode)
+    assert probe.main() == 0
+    assert calls
+    assert not list(tmp_path.rglob("auto-startup-*.json"))
+    assert "startup-rendezvous" not in report(tmp_path)["stages"]
+
+
+def test_startup_keeps_one_total_alarm_and_unchanged_fresh_inventory_wait(
+    tmp_path, monkeypatch
+):
+    probe, _, _, _, _ = auto_probe(tmp_path, monkeypatch)
+    alarms = []
+    monkeypatch.setattr(probe.signal, "alarm", alarms.append)
+    assert probe.main() == 0
+    assert alarms == [600, 0]
+    assert report(tmp_path)["stages"]["startup-rendezvous"]["timeout_seconds"] == 180
+    # auto_probe's peer exchange asserts the existing 45-second wait.
 
 
 @pytest.mark.parametrize("fault", [None, "original_failure"])
@@ -326,14 +450,14 @@ def test_read_session_rejects_stale_metadata_and_receipt(tmp_path, monkeypatch, 
     assert ("remote" in events) == (fault != "metadata")
 
 
-@pytest.mark.parametrize("mismatch", [False, True])
-def test_independent_rank_processes_agree_or_fail_closed(tmp_path, mismatch):
+@pytest.mark.parametrize("mismatch,delay", [(False, 0), (True, 0), (False, 0.6)])
+def test_independent_rank_processes_agree_or_fail_closed(tmp_path, mismatch, delay):
     script = (
         Path(__file__).resolve().parents[1]
         / ".github/scripts/atomesh/pd_transport_probe.py"
     )
     driver = r"""
-import sys, os, json, importlib.util
+import sys, os, json, importlib.util, time
 from pathlib import Path
 spec=importlib.util.spec_from_file_location("probe", sys.argv[1])
 p=importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
@@ -343,7 +467,12 @@ def port(name):
  return {"device":name,"port":"1","state":"4: ACTIVE","link_layer":"Ethernet","gids":[{"index":"3","gid":f"::ffff:192.0.2.{rank+1}","type":"RoCE v2","ndev":"fixture_eth"}]}
 ports=[port("fixture_a"),port("fixture_z")]
 if rank: ports.reverse()
-p.inventory=lambda:{"ports":ports}
+def inventory():
+ root=Path(os.environ["RUN_DIR"])/"transport-diagnostic/benchmark"
+ assert (root/"auto-startup-entry-0.json").exists()
+ assert (root/"auto-startup-entry-1.json").exists()
+ return {"ports":ports}
+p.inventory=inventory
 p.current_selection=lambda selection:{**{k:v for k,v in port(selection.split(":")[0]).items() if k!="gids"},"gid":port("fixture_a")["gids"][0]}
 def supervised(argv, log, timeout, env):
  kind=argv[argv.index("--child")+1]
@@ -352,7 +481,9 @@ def supervised(argv, log, timeout, env):
  return 0,False
 p.supervise=supervised
 real_wait=p.wait_json
-p.wait_json=lambda path,timeout=45:real_wait(path,timeout=min(timeout,2))
+p.wait_json=lambda path,timeout=45:real_wait(path,timeout=min(timeout,0.3))
+p.STARTUP_SECONDS=3
+if rank: time.sleep(float(os.environ["PEER_DELAY"]))
 sys.argv=[sys.argv[1]]
 sys.exit(p.main())
 """
@@ -361,6 +492,7 @@ sys.exit(p.main())
         env = {
             **os.environ,
             "NODE_RANK": str(rank),
+            "PEER_DELAY": str(delay),
             "IPADDRS": "192.0.2.1,192.0.2.2",
             "RUN_DIR": str(tmp_path),
             "SLURM_JOB_ID": "fixture-job",
@@ -410,3 +542,19 @@ sys.exit(p.main())
             )
         assert sessions[0] == sessions[1]
         assert len(set(sessions[0]["agreement"]["nonces"].values())) == 2
+        root = tmp_path / "transport-diagnostic/benchmark"
+        entries = [
+            json.loads((root / f"auto-startup-entry-{rank}.json").read_text())
+            for rank in (0, 1)
+        ]
+        for rank in (0, 1):
+            inv = json.loads((root / f"auto-inventory-{rank}.json").read_text())
+            assert inv["created_at"] >= max(entry["created_at"] for entry in entries)
+            assert inv["nonce"] != entries[rank]["nonce"]
+            summary = json.loads((root / f"rank-{rank}/summary.json").read_text())
+            assert (
+                summary["stages"]["startup-rendezvous"]["classification"]
+                == "STARTUP_READY"
+            )
+        if delay:
+            assert entries[1]["created_at"] - entries[0]["created_at"] >= 0.3

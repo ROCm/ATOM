@@ -39,6 +39,9 @@ TINY_BYTES = 4096
 MAX_MORI_BYTES = 2493186048
 STAGE_SECONDS = 60
 TOTAL_SECONDS = 600
+# Leave 420s for inventory commands (up to 42s), three 60s children,
+# and the three 45s peer exchanges; startup never resets the total alarm.
+STARTUP_SECONDS = 180
 
 
 class Unknown(RuntimeError):
@@ -234,9 +237,8 @@ def evidence_digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def auto_single_probe(inv, root, out, rank, run, summary):
-    """Agree on one fresh sysfs candidate, then validate it without retries."""
-    context = {
+def auto_context():
+    return {
         "job_id": os.environ["SLURM_JOB_ID"],
         "run_token": os.environ["ATOMESH_RUN_TOKEN"],
         "image": os.environ["DOCKER_IMAGE"],
@@ -248,6 +250,116 @@ def auto_single_probe(inv, root, out, rank, run, summary):
         "nixl_read_only": "1",
         "auto_single": "1",
     }
+
+
+def auto_startup(root, rank, summary):
+    """Rendezvous at probe entry, before collecting any inventory."""
+    context = auto_context()
+    identity = {
+        **context,
+        "rank": rank,
+        "hostname": socket.gethostname(),
+        "node_ip": context["allocation_ips"][rank],
+        "nonce": os.urandom(16).hex(),
+    }
+    deadline = time.monotonic() + STARTUP_SECONDS
+    stage = {
+        "status": "UNKNOWN",
+        "classification": "STARTUP_PENDING",
+        "timeout_seconds": STARTUP_SECONDS,
+    }
+    summary["stages"]["startup-rendezvous"] = stage
+    for name in ("mori-register", "nixl-rdma-gpu-read"):
+        summary["stages"][name] = {
+            "status": "UNKNOWN",
+            "classification": "NOT_TESTED",
+            "reason": "AUTO_SINGLE startup rendezvous not completed",
+        }
+
+    def publish(kind, **payload):
+        doc = {**identity, "created_at": time.time(), **payload}
+        publish_once(root / f"auto-startup-{kind}-{rank}.json", doc)
+        return doc
+
+    def validate(doc):
+        if (
+            not isinstance(doc, dict)
+            or any(doc.get(key) != value for key, value in context.items())
+            or type(doc.get("rank")) is not int
+            or doc["rank"] != 1 - rank
+            or doc.get("node_ip") != context["allocation_ips"][1 - rank]
+            or not isinstance(doc.get("hostname"), str)
+            or not doc["hostname"]
+            or doc["hostname"] == identity["hostname"]
+            or not isinstance(doc.get("nonce"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", doc["nonce"]) is None
+            or type(doc.get("created_at")) not in (int, float)
+            or not -5 <= time.time() - doc["created_at"] <= STARTUP_SECONDS
+        ):
+            raise Unknown("stale or mismatched startup peer")
+        return doc
+
+    def receive(kind):
+        while time.monotonic() < deadline:
+            failure = Path(os.environ["RUN_DIR"]) / "workload-failure.json"
+            if failure.exists():
+                doc = json.loads(failure.read_text())
+                if (
+                    doc.get("job_id") == context["job_id"]
+                    and doc.get("run_token") == context["run_token"]
+                    and type(doc.get("return_code")) is int
+                    and 0 < doc["return_code"] <= 255
+                    and (
+                        doc.get("num_ranks") == 2
+                        or doc.get("source") == "spur_dispatch"
+                    )
+                ):
+                    stage["classification"] = "STARTUP_PEER_FAILED"
+                    raise Unknown("startup peer/workload failure")
+            error = root / f"auto-startup-error-{1-rank}.json"
+            if error.exists():
+                validate(json.loads(error.read_text()))
+                stage["classification"] = "STARTUP_PEER_FAILED"
+                raise Unknown("startup peer reported failure")
+            path = root / f"auto-startup-{kind}-{1-rank}.json"
+            if path.exists():
+                return validate(json.loads(path.read_text()))
+            time.sleep(0.1)
+        stage["classification"] = "STARTUP_TIMEOUT"
+        raise Unknown("startup rendezvous timed out before inventory")
+
+    try:
+        local = publish("entry")
+        peer = receive("entry")
+        # A fresh acknowledgement of both random entries prevents a recent
+        # leftover peer entry from being mistaken for a live container.
+        agreement = {
+            str(rank): evidence_digest(local),
+            str(1 - rank): evidence_digest(peer),
+        }
+        publish("ack", agreement=agreement)
+        ack = receive("ack")
+        if (
+            ack["nonce"] != peer["nonce"]
+            or ack["hostname"] != peer["hostname"]
+            or ack.get("agreement") != agreement
+        ):
+            raise Unknown("startup acknowledgement mismatch")
+        stage.update(status="PASS", classification="STARTUP_READY")
+    except Exception as exc:
+        if stage["classification"] == "STARTUP_PENDING":
+            stage["classification"] = "STARTUP_INVALID"
+        stage["reason"] = str(exc)
+        try:
+            publish("error", reason=str(exc))
+        except (OSError, Unknown):
+            pass
+        raise
+
+
+def auto_single_probe(inv, root, out, rank, run, summary):
+    """Agree on one fresh sysfs candidate, then validate it without retries."""
+    context = auto_context()
     identity = {
         **context,
         "rank": rank,
@@ -699,6 +811,8 @@ def main():
         signal.signal(sig, interrupted)
     signal.alarm(TOTAL_SECONDS)
     try:
+        if auto_single == "1":
+            auto_startup(root, rank, summary)
         inv = inventory()
         write_json(out / "inventory.json", inv)
 
