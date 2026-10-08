@@ -11,7 +11,6 @@ import torch
 
 from atom.config import get_current_atom_config
 
-
 logger = logging.getLogger(__name__)
 
 
