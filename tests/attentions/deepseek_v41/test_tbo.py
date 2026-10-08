@@ -10,6 +10,7 @@ pytest.importorskip("aiter")
 
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.prefill_storage import PrefillStoragePool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils.forward_context import Context, ForwardContext, _forward_context_local
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, _split_prefill_token_midpoint
@@ -32,6 +33,7 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8)):
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.device, builder.geometry, builder.block_size = device, geo, 32
     builder.cache = cache
+    builder._tbo_storage = PrefillStoragePool()
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(4, 32, 4, device, geo)
     )
@@ -344,13 +346,24 @@ def test_clean_exit_on_compute_adds_no_redundant_ordering(monkeypatch):
 
 
 def test_parent_engram_join_runs_when_a_microbatch_fails():
+    from atom.model_ops.engram.device.staging import EngramStagedRows
+
     events = []
-    parent = SimpleNamespace(
-        engram_embeddings=SimpleNamespace(
-            stage=lambda: events.append("stage"), join=lambda: events.append("join")
-        )
-    )
+
+    class Rows(EngramStagedRows):
+        def __init__(self):
+            dict.__init__(self)
+
+        def stage(self, *, tbo=False):
+            assert tbo
+            events.append("stage")
+
+        def join(self):
+            events.append("join")
+
+    parent = SimpleNamespace(engram_embeddings=Rows())
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder._tbo_storage = PrefillStoragePool()
     with (
         pytest.raises(RuntimeError, match="failed child"),
         builder.ubatch_forward(parent),
@@ -473,7 +486,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
     monkeypatch.setattr(staging, "join", lambda: (calls.append("join"), join())[-1])
 
     class Model(torch.nn.Module):
-        def forward(self, ids, positions):
+        def forward(self, ids, positions, inputs_embeds=None):
             ctx = get_forward_context()
             step = ctx.attn_metadata.step
             step.begin_forward()
@@ -591,9 +604,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
     order = []
 
     class Model(torch.nn.Module):
-        tbo_comm_stream_priority = -1
-
-        def forward(self, ids, positions):
+        def forward(self, ids, positions, inputs_embeds=None):
             index = tbo_current_ubatch_id()
             step = get_forward_context().attn_metadata.step
             part = parts[index]
@@ -623,7 +634,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
         ubatch_slices=parts,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
-    actual = UBatchWrapper(Model(), builder)(
+    actual = UBatchWrapper(Model(), builder, comm_stream_priority=-1)(
         torch.arange(14, device="cuda", dtype=torch.int32), parent.step.positions
     )
     assert order == [
@@ -648,7 +659,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
     """Exercise the real MoE scheduler with delayed, local collective stand-ins.
 
     Keep the original MoE yield-before-communication schedule.
-    Exercise the V4.1 post-dispatch lifetime boundary with delayed compute
+    Exercise shared FusedMoE allocation ownership with delayed compute
     and enough partner allocations to reuse an unprotected comm output.
     The synthetic complete=True return checks downstream consumers and flag
     preservation only. It does not exercise comm-fused backend internals;
@@ -658,7 +669,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
     from atom.model_ops import moe
     from atom.models.deepseek_v41.model import Block
     from atom.models.deepseek_v41.moe import MoE
-    from atom.models.deepseek_v41.runtime import DeepseekV41RuntimeModel, RuntimeBlock
+    from atom.models.deepseek_v41.runtime import RuntimeBlock
     from atom.utils.decorators import support_torch_compile
     from atom.utils.forward_context import get_forward_context
     from atom.utils.tbo.ubatching import tbo_active, tbo_current_ubatch_id
@@ -773,14 +784,12 @@ def test_dp_moe_original_schedule_preserves_outputs(
 
     @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": 0})
     class Model(torch.nn.Module):
-        tbo_comm_stream_priority = DeepseekV41RuntimeModel.tbo_comm_stream_priority
-
         def __init__(self, atom_config):
             super().__init__()
             # Keep the real V4.1 routed-expert dispatch boundary.
             self.block = RuntimeBlock()
 
-        def forward(self, input_ids, positions):
+        def forward(self, input_ids, positions, inputs_embeds=None):
             result = input_ids.float()[:, None].expand(-1, width).contiguous()
             for _ in range(layers):
                 result, complete = self.block.ffn.routed_expert_forward(result)
@@ -808,7 +817,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
         model(ids, parent.step.positions)
     if level == 3:
         assert len(model.compiled_codes) == 1
-    wrapper = UBatchWrapper(model, builder)
+    wrapper = UBatchWrapper(model, builder, comm_stream_priority=-1)
     for _ in range(3):
         calls.clear()
         actual = wrapper(ids, parent.step.positions)
@@ -890,7 +899,7 @@ def test_prefill_microbatch_preserves_dp_shape_mode(monkeypatch, unified):
 
 
 @pytest.mark.parametrize("dp_attention", [False, True])
-def test_runtime_image_scope_preserves_tp_but_rejects_dpa(monkeypatch, dp_attention):
+def test_forward_does_not_repeat_request_admission(monkeypatch, dp_attention):
     from atom.models.deepseek_v41.runtime import v41_begin_forward
 
     metadata = SimpleNamespace(
@@ -903,8 +912,44 @@ def test_runtime_image_scope_preserves_tp_but_rejects_dpa(monkeypatch, dp_attent
     )
     monkeypatch.setattr(_forward_context_local, "ctx", context, raising=False)
     hidden = torch.empty(1, 1, 1)
-    if dp_attention:
-        with pytest.raises(NotImplementedError, match="DP attention supports text"):
-            v41_begin_forward(hidden)
-    else:
-        v41_begin_forward(hidden)
+    # Admission rejects unsupported media before any distributed forward.
+    # Repeating that check here could strand peers in their collectives.
+    v41_begin_forward(hidden)
+
+
+def test_tbo_rejects_compacted_scheduler_rows_before_slicing():
+    builder, parent = make_parent("cpu", lengths=(0, 4))
+    assert parent.scheduler_rows == (1,)
+    with pytest.raises(ValueError, match="uncompacted scheduler"):
+        builder.build_ubatch_prefill_metadata(
+            parent, UBatchSlice(slice(0, 1), slice(0, 4)), 1
+        )
+
+
+def test_v4_wrapper_accepts_explicit_empty_embeddings(monkeypatch):
+    from atom.models import deepseek_v4
+
+    monkeypatch.setattr(deepseek_v4, "_pcp_active", lambda: False)
+    monkeypatch.setattr(deepseek_v4, "_moe_pcp_merge_active", lambda: False)
+    context = SimpleNamespace(context=SimpleNamespace(input_ids=None))
+    monkeypatch.setattr(deepseek_v4, "get_forward_context", lambda: context)
+
+    class Model(torch.nn.Module):
+        forward = deepseek_v4.DeepseekV4ForCausalLM.forward
+        _need_ids_gather = False
+
+        def model(self, input_ids, positions):
+            return input_ids + positions
+
+    ids = torch.arange(4)
+    positions = ids + 10
+    monkeypatch.setattr(
+        _forward_context_local,
+        "ctx",
+        SimpleNamespace(ubatch_slices=None),
+        raising=False,
+    )
+    torch.testing.assert_close(UBatchWrapper(Model())(ids, positions), ids + positions)
+    torch.testing.assert_close(context.context.input_ids, ids)
+    with pytest.raises(ValueError, match="token IDs"):
+        UBatchWrapper(Model())(ids, positions, inputs_embeds=torch.zeros(4, 8))

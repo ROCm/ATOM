@@ -164,6 +164,7 @@ def test_unit_tiles_bound_prefill_but_keep_decode_capacity(decode, index_block_r
         block_tables=tables,
         batch_ids=batches,
         tiles={},
+        tile_workspace=None,
         decode=decode,
         requests=(SimpleNamespace(end=1025), SimpleNamespace(end=512)),
     )

@@ -93,7 +93,7 @@ def test_completed_child_metadata_reuse_needs_no_wait(monkeypatch, cross_stream)
         observed = child.step.positions.clone()
     # Model a caller that has already waited for the previous result.
     observed.cpu()
-    builder._tbo_storage[0][3].synchronize()
+    builder._tbo_storage.slots[0][builder._tbo_storage.last[0]].done.synchronize()
     storage = child.step.positions.data_ptr()
     stream = torch.cuda.Stream() if cross_stream else torch.cuda.current_stream()
 
@@ -112,10 +112,10 @@ def test_completed_child_metadata_reuse_needs_no_wait(monkeypatch, cross_stream)
 
 def test_release_kv_pools_drops_child_storage_and_rebuilds():
     builder, parent = make_parent("cpu")
-    buffers, indptrs = builder._prefill_ubatch_storage(0)
-    buffer_ref = weakref.ref(buffers["positions"].gpu)
-    indptr_ref = weakref.ref(next(iter(indptrs.values()))[0])
-    del buffers, indptrs
+    storage = builder._prefill_ubatch_storage(0)
+    buffer_ref = weakref.ref(storage.buffers["positions"].gpu)
+    indptr_ref = weakref.ref(next(iter(storage.indptrs.values()))[0])
+    del storage
     builder.release_kv_pools()
     assert buffer_ref() is None
     assert indptr_ref() is None
@@ -174,8 +174,9 @@ def test_wrapper_preserves_image_embeddings_and_masks(monkeypatch, split):
         # Persistent workers must not retain the last child through thread
         # locals or job closures after the builder releases its storage.
         refs = [
-            weakref.ref(buffers["positions"].gpu)
-            for buffers, _, _, _ in builder._tbo_storage.values()
+            weakref.ref(slot.buffers["positions"].gpu)
+            for slots in builder._tbo_storage.slots.values()
+            for slot in slots
         ]
         builder.release_kv_pools()
         assert all(ref() is None for ref in refs)
@@ -204,6 +205,7 @@ def test_parent_fallback_gathers_once_per_layer_and_stage():
         },
     )
     staging.collective = None
+    staging.fallback_done = {layer: torch.cuda.Event() for layer in layers}
     staging.flat = {layer: torch.empty(8, 2, device=device) for layer in layers}
     staging.stream = torch.cuda.Stream()
     staging.done = {layer: torch.cuda.Event() for layer in layers}
@@ -223,7 +225,7 @@ def test_parent_fallback_gathers_once_per_layer_and_stage():
     results = []
     for cycle in range(2):
         generation[0] = cycle
-        parent.stage()
+        parent.stage(tbo=True)
         assert len(gathered) == len(layers) * (cycle + 1)
         with torch.cuda.stream(consumer):
             results.append(
@@ -303,3 +305,86 @@ def test_host_staging_reuse_does_not_wait_for_model_completion(monkeypatch):
         upload.synchronize()
     torch.testing.assert_close(observed.cpu(), expected)
     torch.testing.assert_close(next_child.step.positions, second.step.positions)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_second_metadata_slot_does_not_wait_for_pending_h2d(monkeypatch):
+    builder, parent = make_parent("cuda")
+    part = UBatchSlice(slice(0, 2), slice(0, 14))
+    # Allocate both slots before delaying H2D.
+    builder.build_ubatch_prefill_metadata(parent, part, 2)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1_000_000_000)
+            first = builder.build_ubatch_prefill_metadata(parent, part, 2)
+            with builder.ubatch_forward(parent):
+                observed = first.step.positions.clone()
+            assert not builder._tbo_storage.slots[0][0].h2d_done.query()
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    torch.cuda.Event,
+                    "synchronize",
+                    lambda *a: pytest.fail("second slot waited for H2D"),
+                )
+                second = builder.build_ubatch_prefill_metadata(parent, part, 2)
+            assert first.step.positions.data_ptr() != second.step.positions.data_ptr()
+    finally:
+        stream.synchronize()
+    torch.testing.assert_close(observed, parent.step.positions)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_ordinary_tp_fallback_is_lazy_and_reuses_events(monkeypatch):
+    layers = (1, 3)
+    gathered = []
+
+    class Group:
+        def all_gather(self, value, **kwargs):
+            gathered.append(value.clone())
+            return torch.cat((value, value + 10), dim=1)
+
+    staging = EngramStaging.__new__(EngramStaging)
+    staging.host = SimpleNamespace(
+        device="cuda",
+        _tp_group=Group(),
+        embed_width=4,
+        buffers={
+            layer: CpuGpuBuffer(8, 4, dtype=torch.float32, device="cuda")
+            for layer in layers
+        },
+    )
+    staging.collective = None
+    staging.fallback_done = {layer: torch.cuda.Event() for layer in layers}
+    staging.done = {layer: torch.cuda.Event() for layer in layers}
+    staging.flat = {
+        layer: torch.full((8, 2), float(layer), device="cuda") for layer in layers
+    }
+
+    def start(width):
+        for event in staging.done.values():
+            event.record()
+
+    staging.start = start
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            torch.cuda,
+            "Event",
+            lambda *a, **kw: pytest.fail("allocated event per forward"),
+        )
+        for cycle in range(3):
+            rows = EngramStagedRows(staging, 8)
+            rows.stage()
+            assert len(gathered) == 2 * cycle
+            for i, layer in enumerate(layers):
+                actual = rows.get(layer)
+                rows.get(layer)  # Repeat consumers reuse the same gather.
+                assert len(gathered) == 2 * cycle + i + 1
+                expected = torch.tensor(
+                    [layer, layer, layer + 10, layer + 10],
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+                torch.testing.assert_close(actual, expected.expand_as(actual))

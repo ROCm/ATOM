@@ -13,6 +13,7 @@ if not torch.cuda.is_available():
 
 from atom.config import CompilationConfig, CUDAGraphMode
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.models.deepseek_v41.multimodal import DeepseekV41MultimodalModel
 from atom.models.deepseek_v41.runtime import (
     DeepseekV41RuntimeModel,
@@ -34,10 +35,12 @@ class Step:
         self.selected.clear()
 
 
-class Rows(dict):
+class Rows(EngramStagedRows):
     def __init__(self):
-        super().__init__()
+        dict.__init__(self)
         self.events = []
+
+    get = dict.get
 
     def stage(self):
         self.events.append("stage")

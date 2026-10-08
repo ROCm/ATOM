@@ -10,6 +10,7 @@ fixed addresses (`EngramStep`): a replay reads its own step.
 import logging
 import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -77,6 +78,11 @@ class EngramStaging:
         self.collective = None
         self.gathered = {}
         self._init_collective()
+        self.fallback_done = (
+            {layer: torch.cuda.Event() for layer in host.layer_ids}
+            if host._tp_group is not None and self.collective is None
+            else {}
+        )
 
     def _init_collective(self):
         host = self.host
@@ -248,23 +254,20 @@ class EngramStagedRows(dict):
             for layer, buffer in staging.host.buffers.items()
         )
         self.staging, self.width = staging, width
-        fallback = staging.host._tp_group is not None and staging.collective is None
-        self._fallback_done = (
-            {layer: torch.cuda.Event() for layer in self} if fallback else {}
-        )
         self._fallback_ready = set()
 
-    def stage(self):
+    def stage(self, *, tbo=False):
         self._fallback_ready.clear()
         self.staging.start(self.width)
-        # Shared-communicator collectives must be issued once, in layer order,
-        # on the parent thread before either TBO worker can enqueue model work.
-        for layer in self._fallback_done:
-            self.get(layer)
+        # Only TBO must serialize shared-communicator gathers before workers
+        # start. Ordinary TP consumes each layer just before it is needed.
+        if tbo:
+            for layer in self.staging.fallback_done:
+                self.get(layer)
 
     def get(self, layer, default=None):
         if layer in self:
-            done = self._fallback_done.get(layer)
+            done = self.staging.fallback_done.get(layer)
             if done is None or layer not in self._fallback_ready:
                 self.staging.consume(layer, self.width)
                 if done is not None:
@@ -302,3 +305,16 @@ class EngramRowsView(Mapping):
 
     def __len__(self):
         return len(self._rows)
+
+
+@contextmanager
+def engram_staging(rows: Mapping[int, torch.Tensor], *, tbo=False):
+    """Own the parent fork/join; token views never restart its lookup."""
+    if not isinstance(rows, EngramStagedRows):
+        yield
+        return
+    try:
+        rows.stage(tbo=tbo)
+        yield
+    finally:
+        rows.join()

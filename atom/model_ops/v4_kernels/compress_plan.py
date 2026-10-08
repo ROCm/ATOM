@@ -103,6 +103,17 @@ def plan_context_lens(
     return (positions[cu_seqlens_q[:bs]] + extend_lens).astype(np.int32)
 
 
+def compress_plan_buffer_names(ratio, *, key_rope=False, prefix=""):
+    """Names owned by the plan publisher, shared by parent and child storage."""
+    names = {
+        "compress": f"{prefix}v4_compress_plan_{ratio}",
+        "write": f"{prefix}v4_write_plan_{ratio}",
+    }
+    if key_rope:
+        names["key_rope"] = f"{prefix}v41_key_rope_positions_{ratio}"
+    return names
+
+
 def make_compress_plans(
     extend_lens_cpu: np.ndarray,
     context_lens_cpu: np.ndarray,

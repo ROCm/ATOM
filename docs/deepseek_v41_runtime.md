@@ -172,7 +172,7 @@ host table storage, so startup registration takes longer than TP4.
 
 Add `--enable-tbo prefill` to the DPA command above, leaving EP disabled.
 V4.1 prefill TBO requires DP attention with more than one effective DP rank.
-Before engine normalization this width is `tensor_parallel_size * data_parallel_size`:
+`Config.attention_dp_size` provides the normalized width to validation and launch:
 TP4 with the default DP size of 1 launches four DP-attention ranks and is accepted.
 Plain TP and effective single-rank DPA are rejected. Microbatches use
 the configured compilation level; decode keeps its CUDA Graph path.
@@ -197,32 +197,42 @@ both microbatches. Each consumes its token slice and waits at its Engram layer;
 the parent joins the lookup after both workers finish, including failure.
 Already-staged rows are sliced identically when Engram overlap is disabled.
 
-V4.1 requests communication priority -1 through `tbo_comm_stream_priority`;
-models without a declaration retain priority 0. MoE keeps the existing
-compute-to-communication yield and event order. V4.1 records the compute
-consumer of the fallback routed output at the dispatch return, before
-shared-expert combine and mHC consume the result. This prevents a partner
-microbatch from reusing its storage before those consumers finish. The existing
+The execution config passes communication priority -1 for V4.1 and 0 for other
+models explicitly to the TBO wrapper. MoE keeps the existing
+compute-to-communication yield and event order. Shared `FusedMoE` records the
+compute consumer of gathered inputs and the scatter output immediately after
+switching back from communication. This protects all models using that shared
+path, before shared-expert combine or mHC consumes the output. The existing
 `create_comm_fused_moe_backend` factory rejects TBO and DP > 1, so TBO cannot
-enter the communication-fused backend. A `complete=True` return already includes
-shared-expert combine and TP reduction; a marker after that return can protect
-only downstream consumers, not backend-internal allocations or combine. If
-comm-fused TBO support is added, its internal consumer boundary must be audited
-separately. A custom-op boundary
-keeps the thread-local TBO query at runtime and retains the lifetime marker
-in compiled execution. Microbatches use the normal model call and honor the
+enter the communication-fused backend. If comm-fused TBO support is added, its
+internal allocations and consumer boundaries must be audited separately.
+The shared `moe_forward` custom-op boundary keeps stream ownership at runtime
+in compiled execution; no V4.1-specific lifetime marker is required.
+Microbatches use the normal model call, including the optional `inputs_embeds`
+argument, and honor the
 configured compilation level. DPA remains text-only: image requests are
 rejected during request preprocessing, before sequences reach any DP worker,
 including when DSpark is disabled. TP vision runs without TBO.
 
-Child metadata reuse first queries the prior completion event. If it has
-completed, storage is reused without host or device waits. Otherwise, pinned
-staging waits only if its previous H2D is still pending, while the upload stream
-waits for prior GPU consumers before overwriting device storage. Storage is
-released with the KV pools. When the private Engram TP collective is unavailable,
-the parent materializes one
-fallback gather per layer before launching workers; child views only wait
-for and slice these rows.
+Step-buffer allocation and capacity checks share `step_buffer_specs`; parent
+and child metadata use one assembler. Compression-plan names come from the
+plan publisher. TBO rejects compacted scheduler rows before applying a request
+slice, so scheduler indices cannot silently address another request.
+
+Each microbatch has two bounded pinned/device metadata slots, owned by a
+`PrefillStoragePool`. Completed storage is reused without waits; an in-flight
+slot switches to its alternate. If both slots are still busy, pinned staging
+waits only for its previous H2D. Device overwrites wait for prior consumers
+when the upload stream differs; same-stream order needs no additional event
+wait. Slots are fenced on preparation failure and after worker completion,
+and released with the KV pools. Two slots reduce waits but do not guarantee
+that a CPU running ahead of both can never wait.
+
+When the private Engram TP collective is unavailable, the TBO parent
+materializes one fallback gather per layer before launching workers; child
+views only wait for and slice these rows. Ordinary TP keeps lazy per-layer
+consumption, so later lookups can overlap earlier layer computation. Completion
+events belong to `EngramStaging` and are reused across forwards.
 
 Eager prefill expands index tile tables only through the largest request end,
 including cached prefixes. Paged scoring bounds each logits band by both its

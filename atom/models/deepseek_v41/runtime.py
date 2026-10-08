@@ -4,6 +4,7 @@
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -22,16 +23,13 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
     """Read live request state on every execution, including graph capture."""
     context = get_forward_context()
     metadata = context.attn_metadata
-    if metadata.image_mask is not None and context.dp_metadata is not None:
-        raise NotImplementedError("V4.1 DP attention supports text requests only")
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
     if hidden.shape[-2] != metadata.step.width:
         raise ValueError("Token rows disagree with the width this step declared")
-    stage = getattr(metadata.engram_embeddings, "stage", None)
-    if stage is not None:
-        stage()
+    if isinstance(metadata.engram_embeddings, EngramStagedRows):
+        metadata.engram_embeddings.stage()
 
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
@@ -41,7 +39,7 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
         hidden.zero_()
         return
     rows = metadata.engram_embeddings
-    if getattr(rows, "stage", None) is not None:
+    if isinstance(rows, EngramStagedRows):
         rows.join()
 
 
@@ -90,9 +88,6 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # imports directly and does not route through here.
 
     block_cls = RuntimeBlock
-    # Keep communication on a separate HIP priority queue. The runtime blocks
-    # protect comm-allocated expert outputs at their compute consumer boundary.
-    tbo_comm_stream_priority = -1
 
     def __init__(self, atom_config):
         config = atom_config

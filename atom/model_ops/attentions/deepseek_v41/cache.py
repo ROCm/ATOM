@@ -533,7 +533,7 @@ class PagedAttentionCache:
                 block_tables,
                 step.batch_ids,
                 self.geometry.index_blocks_per_page(ratio),
-                workspace=getattr(step, "tile_workspace", None) or self.workspace,
+                workspace=step.tile_workspace or self.workspace,
                 ratio=ratio,
             )
         return table

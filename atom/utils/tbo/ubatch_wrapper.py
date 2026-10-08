@@ -43,11 +43,14 @@ class UBatchWrapper(nn.Module):
         model: nn.Module,
         attn_metadata_builder=None,
         dp_gather_scatter: bool = False,
+        *,
+        comm_stream_priority: int = 0,
     ):
         super().__init__()
         self.model = model
         self.attn_metadata_builder = attn_metadata_builder
         self.dp_gather_scatter = dp_gather_scatter
+        self.comm_stream_priority = comm_stream_priority
         self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
         self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
@@ -96,8 +99,7 @@ class UBatchWrapper(nn.Module):
 
     def _ensure_comm_stream(self):
         if self.comm_stream is None:
-            priority = getattr(self.model, "tbo_comm_stream_priority", 0)
-            self.comm_stream = torch.cuda.Stream(priority=priority)
+            self.comm_stream = torch.cuda.Stream(priority=self.comm_stream_priority)
 
     def forward(
         self,
@@ -107,9 +109,7 @@ class UBatchWrapper(nn.Module):
     ) -> UBatchModelOutput:
         ctx = get_forward_context()
         if ctx.ubatch_slices is None:
-            if inputs_embeds is not None:
-                return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
-            return self.model(input_ids, positions)
+            return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
         return self._run_ubatches(input_ids, positions, ctx, inputs_embeds)
 
     def _run_ubatches(
@@ -199,15 +199,16 @@ class UBatchWrapper(nn.Module):
                 try:
                     ub_input_ids, ub_positions = ub_inputs[idx]
                     with tbo_ctxs[idx]:
-                        if inputs_embeds is None:
-                            model_output = self.model(ub_input_ids, ub_positions)
-                        else:
-                            token_slice = ctx.ubatch_slices[idx].token_slice
-                            model_output = self.model(
-                                ub_input_ids,
-                                ub_positions,
-                                inputs_embeds=inputs_embeds[token_slice],
-                            )
+                        token_slice = ctx.ubatch_slices[idx].token_slice
+                        model_output = self.model(
+                            ub_input_ids,
+                            ub_positions,
+                            inputs_embeds=(
+                                None
+                                if inputs_embeds is None
+                                else inputs_embeds[token_slice]
+                            ),
+                        )
                     results.append((idx, self._validate_ubatch_output(model_output)))
                 except Exception as e:
                     # logger.exception captures the full traceback. The partner
@@ -223,13 +224,12 @@ class UBatchWrapper(nn.Module):
         saved_ctx = getattr(_forward_context_local, "ctx", None)
         _forward_context_local.ctx = None
 
-        parent_forward = getattr(self.attn_metadata_builder, "ubatch_forward", None)
         try:
             # Start parent-owned prefetch after metadata construction, just
             # before waking the workers, so it overlaps model computation.
             with (
-                parent_forward(ctx.attn_metadata)
-                if parent_forward is not None
+                self.attn_metadata_builder.ubatch_forward(ctx.attn_metadata)
+                if self.attn_metadata_builder is not None
                 else nullcontext()
             ):
                 for i in range(N):
@@ -335,7 +335,9 @@ class UBatchWrapper(nn.Module):
 
                 ub_input_ids, ub_positions = ub_inputs[idx]
                 with tbo_ctxs[idx]:
-                    model_output = self.model(ub_input_ids, ub_positions)
+                    model_output = self.model(
+                        ub_input_ids, ub_positions, inputs_embeds=None
+                    )
                 results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
                 traceback.print_exc()

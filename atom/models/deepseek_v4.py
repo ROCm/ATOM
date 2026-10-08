@@ -4786,7 +4786,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,  # [num_tokens] int
         positions: torch.Tensor,  # [num_tokens] int  required
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]  hidden_states
+        if inputs_embeds is not None:
+            raise ValueError(
+                "DeepSeek-V4 requires token IDs instead of input embeddings"
+            )
         # Stash input_ids on forward_context for the V4 hash MoE routing
         # callback (`MoE._hash_topk`), which runs inside the Dynamo-opaque
         # `maybe_dual_stream_forward` custom op and can't receive input_ids

@@ -85,7 +85,12 @@ def runtime_config(**overrides):
         "hf_config": SimpleNamespace(),
     }
     fields.update(overrides)
-    return SimpleNamespace(**fields)
+    from atom.config import Config
+
+    class RuntimeConfig(SimpleNamespace):
+        attention_dp_size = Config.attention_dp_size
+
+    return RuntimeConfig(**fields)
 
 
 @pytest.mark.parametrize(
@@ -417,3 +422,16 @@ def test_real_config_accepts_tbo_before_dpa_rank_expansion(
     assert cfg.tensor_parallel_size == tp
     assert cfg.parallel_config.data_parallel_size == dp
     assert len(iter_dp_rank_assignments(cfg)) == tp * dp
+
+
+@pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1), (2, 4)])
+def test_attention_rank_count_is_stable_across_normalization(tp, dp):
+    cfg = runtime_config(
+        enable_dp_attention=True,
+        tensor_parallel_size=tp,
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+    )
+    assert cfg.attention_dp_size == tp * dp
+    cfg.parallel_config.data_parallel_size = cfg.attention_dp_size
+    cfg.tensor_parallel_size = 1
+    assert cfg.attention_dp_size == tp * dp

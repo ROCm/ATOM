@@ -2,6 +2,7 @@
 """Request spans shared by CSA2 paging, compression and Engram staging."""
 
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -10,6 +11,24 @@ from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
+
+
+class TileWorkspace(Protocol):
+    def unit_table(self, ratio: int, tokens: int, width: int) -> torch.Tensor: ...
+
+
+@dataclass(frozen=True)
+class StepBufferSpec:
+    shape: tuple[int, ...]
+    dtype: torch.dtype = torch.int32
+
+    def allocate(self, device):
+        return CpuGpuBuffer(
+            *self.shape,
+            dtype=self.dtype,
+            device=device,
+            pin_memory=torch.device(device).type != "cpu",
+        )
 
 
 @dataclass(frozen=True)
@@ -37,9 +56,9 @@ class BatchStep:
     and `running_bs` requests -- and not the scheduled batch, because a
     captured graph replays the width it was captured at whatever the batch
     turns out to be. The tail past `scheduled` is padding: a token there
-    carries batch id -1, which is what the scatters bail on, and a request
-    there is zero-length in `cu_seqlens_q`, which is what the per-request
-    kernels bail on.
+    carries batch id -1, which is what the scatters bail on. Query padding is
+    zero-length except for an idle rank's dummy query segment: sampling and
+    DSpark retain that segment while cache metadata still contains no requests.
     """
 
     requests: tuple[RequestSpan, ...]
@@ -89,7 +108,7 @@ class BatchStep:
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
     # TBO keeps memoized tile tables in a disjoint part of the parent budget.
-    tile_workspace: object | None = None
+    tile_workspace: TileWorkspace | None = None
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -125,6 +144,19 @@ class BatchStep:
 def visible_buffer_name(ratio):
     """One spelling for the buffer the builder declares and this module fills."""
     return f"v41_index_visible_{ratio}"
+
+
+def step_buffer_specs(
+    ratios, *, tokens, requests, block_table_cols, position_dtype=torch.int32
+):
+    """One declaration for private allocation, capacity checks and TBO storage."""
+    return {
+        "positions": StepBufferSpec((tokens,), position_dtype),
+        "cu_seqlens_q": StepBufferSpec((requests + 1,)),
+        "batch_id_per_q_token": StepBufferSpec((tokens,)),
+        "block_tables": StepBufferSpec((requests, block_table_cols)),
+        **{visible_buffer_name(ratio): StepBufferSpec((tokens,)) for ratio in ratios},
+    }
 
 
 def prepare_batch_step(
@@ -166,34 +198,27 @@ def prepare_batch_step(
         raise ValueError("Request metadata exceeds the declared batch/token capacity")
     if max_q_len is not None and lengths.size and max_q_len < int(lengths.max()):
         raise ValueError("A request is longer than the query width this forward runs")
+    specs = step_buffer_specs(
+        ratios,
+        tokens=running_tokens,
+        requests=running_bs,
+        block_table_cols=max((len(row) for row in block_tables), default=0),
+        position_dtype=(
+            torch.int32 if buffers is None else buffers["positions"].cpu.dtype
+        ),
+    )
     if buffers is None:
-        width = max((len(row) for row in block_tables), default=0)
-        shapes = {
-            "positions": (running_tokens,),
-            "cu_seqlens_q": (running_bs + 1,),
-            "batch_id_per_q_token": (running_tokens,),
-            "block_tables": (running_bs, width),
-            **{visible_buffer_name(ratio): (running_tokens,) for ratio in ratios},
-        }
-        buffers = {
-            name: CpuGpuBuffer(
-                *shape,
-                dtype=torch.int32,
-                device=device,
-                pin_memory=torch.device(device).type != "cpu",
-            )
-            for name, shape in shapes.items()
-        }
-    required = {
-        "positions": running_tokens,
-        "cu_seqlens_q": running_bs + 1,
-        "batch_id_per_q_token": running_tokens,
-        "block_tables": running_bs,
-        **{visible_buffer_name(ratio): running_tokens for ratio in ratios},
-    }
-    for name, count in required.items():
-        if count > buffers[name].np.shape[0]:
-            raise ValueError(f"{name} metadata buffer cannot hold {count} rows")
+        buffers = {name: spec.allocate(device) for name, spec in specs.items()}
+    required = {name: spec.shape[0] for name, spec in specs.items()}
+    for name, spec in specs.items():
+        buffer = buffers[name]
+        if buffer.cpu.dtype != spec.dtype or len(buffer.cpu.shape) != len(spec.shape):
+            raise ValueError(f"{name} metadata buffer has the wrong dtype or rank")
+        if any(
+            needed > available
+            for needed, available in zip(spec.shape, buffer.cpu.shape)
+        ):
+            raise ValueError(f"{name} metadata buffer cannot hold shape {spec.shape}")
     if publication_group is not None:
         publication_group.check_writable()
     tables = block_table_state(buffers["block_tables"]).prepare(

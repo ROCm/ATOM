@@ -134,13 +134,17 @@ def test_request_admission_checks_dpa_independently_of_dspark(dpa, draft_tokens,
 
 
 @pytest.mark.parametrize("draft_tokens", [0, 5])
-def test_dpa_media_rejected_before_tokenization_and_sequence_creation(draft_tokens):
+@pytest.mark.parametrize("entry", ["preprocess", "preprocess_fanout", "add_request"])
+def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
+    draft_tokens, entry
+):
     from atom.model_engine.llm_engine import InputOutputProcessor
 
     def unexpected_encode(prompt):
         pytest.fail("Unsupported media reached tokenization")
 
-    processor = SimpleNamespace(
+    processor = InputOutputProcessor.__new__(InputOutputProcessor)
+    processor.__dict__.update(
         config=SimpleNamespace(
             hf_config=DeepseekV41TextConfig(), enable_dp_attention=True
         ),
@@ -148,9 +152,19 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(draft_toke
         tokenizer=SimpleNamespace(encode=unexpected_encode),
     )
     with pytest.raises(ValueError, match="DP attention supports text requests only"):
-        InputOutputProcessor.preprocess_fanout(
-            processor,
-            "image prompt",
-            SimpleNamespace(n=2),
-            multimodal_data={"image": 1},
-        )
+        if entry == "add_request":
+            from atom.model_engine.llm_engine import LLMEngine
+
+            engine = SimpleNamespace(io_processor=processor)
+            LLMEngine.add_request(
+                engine,
+                ["image prompt"],
+                SimpleNamespace(n=2),
+                multimodal_data_list=[{"image": 1}],
+            )
+        else:
+            getattr(processor, entry)(
+                "image prompt",
+                SimpleNamespace(n=1 if entry == "preprocess" else 2),
+                multimodal_data={"image": 1},
+            )

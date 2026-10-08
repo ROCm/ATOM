@@ -373,14 +373,7 @@ def validate_runtime_config(config):
         (
             "prefill TBO without multi-rank DP attention",
             config.enable_tbo
-            and (
-                not config.enable_dp_attention
-                # Config validates before CoreManager folds TP into DP.
-                # After normalization TP is 1, so the product is unchanged.
-                or config.parallel_config.data_parallel_size
-                * config.tensor_parallel_size
-                <= 1
-            ),
+            and (not config.enable_dp_attention or config.attention_dp_size <= 1),
         ),
         (
             # `lmcache_mp` is the one transport admitted: it checkpoints STATE
