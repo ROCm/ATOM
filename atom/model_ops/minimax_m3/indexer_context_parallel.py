@@ -41,14 +41,15 @@ def indexer_context_scores(
     here, and the two are NOT the same number under a cudagraph: the map's row
     count is the grid, baked at capture, so its bound is the model length, while
     ``max_seq_len`` is this step's longest request. The shard is therefore the
-    wider of the two and carries dead trailing blocks. Both widths are correct
+    wider of the two and carries dead trailing blocks. Either width is a correct
     input to `local_candidate_keys`, which reads the width off the tensor and
-    masks by length.
+    masks what is not this rank's to answer for.
 
-    The scorer writes only the blocks a request actually has, leaving dead slots
-    untouched. That is a correct input to `local_candidate_keys`, which masks by
-    length and sends every masked lane below any real candidate -- but the
-    result is not safe to read raw past that.
+    Dead slots -- past a request's own blocks, or past this rank's share of the
+    global ones -- are left UNWRITTEN, so the result is not safe to read raw.
+    `local_candidate_keys` is what makes that sound: it masks both kinds, the
+    second from the (rank, world, global block count) it is given rather than
+    from the length. See the comment on the allocation below.
     """
     if (
         world_size < 1
@@ -115,6 +116,16 @@ def indexer_context_scores(
     # non-contiguous score outright. Both layouts carry bit-identical values,
     # so asking for this one here costs the store's coalescing and nothing
     # else, and it beats a copy after the fact.
+    #
+    # Uninitialised is correct here, though it is not obvious. Round-robin
+    # sharding does not divide evenly -- at 257 global blocks over 4 ranks,
+    # rank 0 owns 65 and ranks 1-3 own 64 while every shard is `ceil(257/4)`
+    # wide -- so three of the four carry a trailing slot the scorer never
+    # writes. `local_candidate_keys` masks those out from `(rank, world_size,
+    # global_blocks)` rather than from the length alone, so their content
+    # cannot reach the selection; `test_a_shard_that_runs_past_the_global_end
+    # _is_not_selectable` pins exactly that, and the Triton kernel this
+    # replaced paid for a full -inf store to get the same property.
     out = torch.empty((heads, tokens, width), dtype=torch.float32, device=idx_q.device)
     return decode_index_score(
         idx_q, index_cache, block_table, seq_lens, width,

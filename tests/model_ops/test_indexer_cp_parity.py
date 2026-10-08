@@ -38,6 +38,7 @@ pytest.importorskip("triton", reason="requires Triton")
 from atom.distributed.indexer_cp import _exchange_via_all_gather
 from atom.model_ops.minimax_m3.index_topk import (
     build_index_score_work_map,
+    decode_index_score,
     minimax_m3_index_topk_decode,
 )
 from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
@@ -412,3 +413,59 @@ def test_the_shard_scores_match_the_definition(max_query_len, cache_dtype):
                 assert torch.allclose(
                     got[:, rows, p], want, rtol=2e-2, atol=2e-2
                 ), f"rank {rank} request {b} local block {p} (global {gp})"
+
+
+@needs_gpu
+@pytest.mark.parametrize("blocks", [257, 129, 7], ids=["257", "129", "7"])
+def test_a_shard_that_runs_past_the_global_end_is_not_selectable(blocks):
+    """A rank whose last slot has no global block must not be able to win top-k.
+
+    Round-robin sharding does not divide evenly. At 257 global blocks over
+    WORLD=4, rank 0 owns 65 and ranks 1-3 own 64, yet every shard is
+    ``ceil(257/4) = 65`` wide -- so those three carry a trailing slot with no
+    block behind it. The scorer leaves such a slot untouched, and
+    ``local_candidate_keys`` bounds by LENGTH, which cannot see that a rank ran
+    past the global end -- so the scorer leaves those slots UNWRITTEN and the
+    buffer is a plain `torch.empty`.
+
+    What makes that sound is that `local_candidate_keys` masks from the
+    ``(rank, world_size, global_blocks)`` it is given, not from the length
+    alone. That is the property under test, and it is worth pinning precisely
+    because it is invisible at the call site: the Triton kernel this path
+    replaced bought the same guarantee by storing -inf to every slot, empty
+    shards included, and dropping that store moved the guarantee somewhere
+    else without anything recording the move.
+
+    Poison the dead slots three ways and demand one selection. A mask that
+    went back to bounding by length alone fails here.
+    """
+    max_seq_len = blocks * BLOCK
+    local = (blocks + WORLD - 1) // WORLD
+    assert any(
+        len(range(r, blocks, WORLD)) < local for r in range(WORLD)
+    ), "the shape under test divides evenly and cannot show the bug"
+    idx_q, cache, block_table, lens, _ = _inputs(2, max_seq_len, 1, torch.bfloat16, 5)
+
+    def selection(poison):
+        keys = []
+        for rank in range(WORLD):
+            out = torch.full(
+                (WORLD, idx_q.shape[0], local),
+                poison, dtype=torch.float32, device="cuda",
+            )  # fmt: skip
+            scores = decode_index_score(
+                idx_q, cache, block_table, lens, local, 1, WORLD, SCALE, None,
+                cp_world=WORLD, cp_rank=rank, out=out,
+            )  # fmt: skip
+            keys.append(
+                local_candidate_keys(
+                    scores, lens, 16, rank, WORLD, 1, blocks, 0, 1
+                ).clone()
+            )
+        return keys
+
+    live = selection(float("-inf"))
+    for poison in (1e30, -1e30, 0.0):
+        assert all(
+            torch.equal(a, b) for a, b in zip(live, selection(poison))
+        ), f"selection moved when the dead slots held {poison}"
