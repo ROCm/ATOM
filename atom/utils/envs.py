@@ -350,6 +350,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # DCP sparse PREFILL: score only this rank's 1/W index shard and agree on the
+    # global top-k cut through a bracket all-gather plus a histogram all-reduce,
+    # instead of all-gathering the whole index cache so that every rank can
+    # recompute the identical global top-k. Set to "0" for the old gather path --
+    # an A/B on throughput, NOT on output: the new path admits the whole threshold
+    # bin, so its selection is a SUPERSET of the old one rather than the same set.
+    # No effect at dcp=1, and PCP is refused outright (see sparse_attn_indexer).
+    "ATOM_DCP_INDEXER_PREFILL_LOCAL": lambda: (
+        os.getenv("ATOM_DCP_INDEXER_PREFILL_LOCAL", "1") == "1"
+    ),
+    # Bin count for that histogram. Bytes per full-index layer are rows * bins * 4
+    # and expected over-selection is world_size * topk / bins extra tokens per row,
+    # so this is the knob that trades all-reduce size against how much wider than
+    # 2048 the selected set gets. 512 over a 4096-row chunk is ~8.4 MB and ~32
+    # extra tokens of 2048 at dcp=8.
+    "ATOM_DCP_INDEXER_PREFILL_BINS": lambda: int(
+        os.getenv("ATOM_DCP_INDEXER_PREFILL_BINS", "512")
+    ),
+    # How the ranks agree on that cut, once they have each scored only their own
+    # shard. Orthogonal to _LOCAL, which decides whether they shard the scoring at
+    # all; this decides only what crosses the wire afterwards.
+    #   "histogram" -- bracket all-gather + histogram all-reduce. rows * bins * 4
+    #                  bytes, independent of topk and of context length. The cut
+    #                  lands on a bin edge, so the selection is a SUPERSET.
+    #   "exact"     -- all-gather the local candidate SCORES and take the true
+    #                  global k-th. rows * topk * 4 bytes PER RANK, which at the
+    #                  shipped 4096-row chunk and topk=2048 is 32 MiB a rank a
+    #                  layer; far too heavy to serve, but it is bit-exact with the
+    #                  dcp=1 selection and is how the histogram path's
+    #                  over-selection gets measured rather than estimated.
+    "ATOM_DCP_INDEXER_PREFILL_SELECT": lambda: os.getenv(
+        "ATOM_DCP_INDEXER_PREFILL_SELECT", "histogram"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

@@ -92,6 +92,7 @@ from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
+from atom.model_ops.dcp_topk_select import use_dcp_local_indexer_prefill
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
@@ -1428,6 +1429,40 @@ class DeepseekV32IndexerCache(nn.Module):
         self.dtype = dtype
 
 
+def _dcp_local_indexer_k_prefill(
+    kv_cache: torch.Tensor,
+    prefill_metadata,
+    head_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read THIS RANK's indexer K shard for prefill top-k. No collective.
+
+    The gather's own slot formula, ``block_table[j // bs] * bs + j % bs`` over
+    LOCAL cu_seqlens, is exactly the round-robin write layout, so the result is
+    the rank's own 1/W of the sequence in local order -- which is the only part
+    it scores.
+
+    This is the first step of ``_dcp_gather_indexer_k_prefill`` below with the
+    all-gather and the de-interleave removed: under the threshold exchange in
+    ``model_ops.dcp_topk_select`` no rank ever needs the global key order, so the
+    columns stay local and the scorer's row windows come from
+    ``dcp_indexer_local_ks`` / ``dcp_indexer_local_ke`` rather than
+    ``cu_seqlen_ks`` / ``cu_seqlen_ke``.
+    """
+    local_total = prefill_metadata.dcp_indexer_local_total
+    k_fp8 = torch.empty([local_total, head_dim], device=device, dtype=dtypes.fp8)
+    k_scale = torch.empty([local_total, 1], device=device, dtype=torch.float32)
+    cp_gather_indexer_k_quant_cache(
+        kv_cache,
+        k_fp8,
+        k_scale.view(dtypes.fp8),
+        prefill_metadata.block_tables,
+        prefill_metadata.dcp_indexer_local_cu_seqlens,
+        preshuffle=True,
+    )
+    return k_fp8, k_scale
+
+
 def _dcp_gather_indexer_k_prefill(
     kv_cache: torch.Tensor,
     prefill_metadata,
@@ -1464,6 +1499,39 @@ def _dcp_gather_indexer_k_prefill(
     k_fp8 = gathered_k.index_select(0, gather_index)
     k_scale = gathered_scale.index_select(0, gather_index)
     return k_fp8, k_scale
+
+
+def _dcp_stage_local_indexer_fp4_prefill(
+    kv_cache: torch.Tensor,
+    kv_cache_scale: torch.Tensor,
+    prefill_metadata,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stage THIS RANK's FP4 index planes into a compact identity-paged buffer.
+
+    The same two-plane read as the gather version below -- the E2M1 and e8m0
+    planes disagree on their row axis, so both bend through the precomputed
+    read/stage row maps -- minus the all-gather and the de-interleave.
+
+    The staged buffer is `local_total` rows rather than `total_kv`, so over its
+    identity block table column ``j`` is LOCAL flat index ``j``: the space
+    ``dcp_indexer_local_ks`` / ``dcp_indexer_local_ke`` speak, and the one
+    ``_build_dcp_indexer_fp4_prefill_meta``'s stage row map is sized for.
+    """
+    page = prefill_metadata.dcp_indexer_fp4_read_page
+    row = prefill_metadata.dcp_indexer_fp4_read_row
+    data = kv_cache[page, :, :, row, :]
+    scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
+
+    page = prefill_metadata.dcp_indexer_fp4_stage_page
+    row = prefill_metadata.dcp_indexer_fp4_stage_row
+    scale_row = prefill_metadata.dcp_indexer_fp4_stage_scale_row
+    pages = -(-prefill_metadata.dcp_indexer_local_total // block_size)
+    staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
+    staged[page, :, :, row, :] = data
+    staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
+    staged_scale[page, :, :, scale_row] = scale
+    return staged, staged_scale
 
 
 def _dcp_stage_indexer_fp4_prefill(
@@ -1750,6 +1818,10 @@ def sparse_attn_indexer(
         total_kv = (
             prefill_metadata.total_kv if prefill_metadata.has_cached else k.shape[0]
         )
+        # Local-shard scoring: this rank scores only the 1/W of the sequence it
+        # owns and the ranks agree on the global cut via a threshold exchange,
+        # instead of every rank reconstructing and re-scoring the whole key set.
+        dcp_local_prefill = use_dcp_local_indexer_prefill()
         if prefill_metadata.block_tables.shape[0] < num_prefills:
             new_shape = (num_prefills, prefill_metadata.block_tables.shape[1])
             prefill_metadata.block_tables = torch.full(
@@ -1765,7 +1837,15 @@ def sparse_attn_indexer(
             fp4_kv_cache = kv_cache
             fp4_kv_scale = indexer_module.k_cache.kv_cache_scale
             fp4_block_tables = prefill_metadata.block_tables
-            if get_dcp_world_size() > 1:
+            if dcp_local_prefill:
+                fp4_kv_cache, fp4_kv_scale = _dcp_stage_local_indexer_fp4_prefill(
+                    kv_cache,
+                    fp4_kv_scale,
+                    prefill_metadata,
+                    runner_block_size,
+                )
+                fp4_block_tables = prefill_metadata.dcp_indexer_fp4_block_tables
+            elif get_dcp_world_size() > 1:
                 fp4_kv_cache, fp4_kv_scale = _dcp_stage_indexer_fp4_prefill(
                     kv_cache,
                     fp4_kv_scale,
@@ -1774,6 +1854,10 @@ def sparse_attn_indexer(
                     runner_block_size,
                 )
                 fp4_block_tables = prefill_metadata.dcp_indexer_fp4_block_tables
+        elif dcp_local_prefill:
+            k_fp8, k_scale = _dcp_local_indexer_k_prefill(
+                kv_cache, prefill_metadata, head_dim, k.device
+            )
         elif get_dcp_world_size() > 1:
             k_fp8, k_scale = _dcp_gather_indexer_k_prefill(
                 kv_cache, prefill_metadata, head_dim, k.device
@@ -1793,10 +1877,16 @@ def sparse_attn_indexer(
                 ),
                 preshuffle=True,
             )
-        # Per-row window bounds, in the column space this scorer emits.
+        # Per-row window bounds, in the column space this scorer emits. Under
+        # local-shard DCP that space is this rank's own 1/W, so the causal end
+        # counts only the positions this rank owns (the FP4 metadata builder
+        # folds the same local bounds into indexer_fp4_local_starts/ends).
         if indexer_fp4:
             cu_seqlen_ks = prefill_metadata.indexer_fp4_local_starts
             cu_seqlen_ke = prefill_metadata.indexer_fp4_local_ends
+        elif dcp_local_prefill:
+            cu_seqlen_ks = prefill_metadata.dcp_indexer_local_ks
+            cu_seqlen_ke = prefill_metadata.dcp_indexer_local_ke
         else:
             cu_seqlen_ks = prefill_metadata.cu_seqlen_ks
             cu_seqlen_ke = prefill_metadata.cu_seqlen_ke
@@ -1806,9 +1896,23 @@ def sparse_attn_indexer(
         num_rows = q_prefill.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
         topk_indices_prefill = topk_indices[num_decode_tokens:num_tokens, :topk_tokens]
-        row_width = (
-            prefill_metadata.indexer_fp4_max_seq_len if indexer_fp4 else total_kv
+        # The threshold exchange ranks candidates by SCORE, so the local top-k
+        # has to come back with its values; nothing else reads this buffer.
+        topk_values_prefill = (
+            torch.empty(
+                (num_rows, topk_tokens),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            if dcp_local_prefill
+            else None
         )
+        if indexer_fp4:
+            row_width = prefill_metadata.indexer_fp4_max_seq_len
+        elif dcp_local_prefill:
+            row_width = prefill_metadata.dcp_indexer_local_total
+        else:
+            row_width = total_kv
         # The dense logits buffer is [num_rows, row_width] fp32. For FP8 that
         # width is total_kv, the sum of all co-scheduled prefill contexts, and
         # is unbounded by max_num_batched_tokens, so a burst of long-context
@@ -1869,13 +1973,42 @@ def sparse_attn_indexer(
                 rowStarts=row_starts,
                 rowEnds=row_ends,
                 indices=topk_indices_prefill[chunk_start:chunk_end],
-                values=None,
+                values=(
+                    None
+                    if topk_values_prefill is None
+                    else topk_values_prefill[chunk_start:chunk_end]
+                ),
                 numRows=chunk_end - chunk_start,
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
                 stable=stable_topk,
             )
-        if get_dcp_world_size() > 1:
+        if dcp_local_prefill:
+            # The rank scored only its own shard, so there is no global top-k
+            # left to filter: the exchange agrees on the cut and emits this
+            # rank's owned slots directly, already localized and compacted --
+            # the same shape the decode path's fused merge produces.
+            from atom.model_ops.dcp_topk_select import (
+                dcp_prefill_candidate_exchange,
+                dcp_prefill_select_mode,
+            )
+
+            dcp_prefill_candidate_exchange(
+                topk_values_prefill,
+                topk_indices_prefill,
+                prefill_metadata.dcp_indexer_local_ks,
+                attn_metadata.batch_id_per_q_token,
+                attn_metadata.block_tables,
+                get_dcp_group(),
+                topk_tokens,
+                runner_block_size,
+                envs.ATOM_DCP_INDEXER_PREFILL_BINS,
+                out_kv_indices=sparse_kv_indices_buffer,
+                out_kv_indptr=dcp_sparse_kv_indptr_buffer,
+                owned_counts=dcp_owned_counts_buffer,
+                select=dcp_prefill_select_mode(),
+            )
+        elif get_dcp_world_size() > 1:
             # DCP: topk_indices hold GLOBAL flat KV indices (the indexer scored the
             # full sequence via the all-gathered k). Keep only the positions this
             # rank owns (pos % W == r), map them through the round-robin

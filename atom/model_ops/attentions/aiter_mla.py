@@ -46,6 +46,7 @@ from atom.model_ops.attention_mla import (
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
 )
+from atom.model_ops.dcp_topk_select import use_dcp_local_indexer_prefill
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     topk_output_width,
@@ -1680,7 +1681,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             rank ``(p//S) % W`` at local index ``(p//(S*W))*S + p%S`` (S=1 -> the
             round-robin ``p%W`` / ``p//W``), hence
             ``src = owner(p) * sum(Lpad) + cu_pad[b] + local_index(p)``.
+            Read only by the ``ATOM_DCP_INDEXER_PREFILL_LOCAL=0`` fallback: the
+            local-shard path never reconstructs the global key order.
+
+        ``dcp_indexer_local_ks`` / ``dcp_indexer_local_ke``
+            per-QUERY-TOKEN causal window in the LOCAL shard's column space, for
+            the scorer that reads only this rank's 1/W. See the build below.
         """
+        from atom.distributed.dcp_layout import dcp_prefill_local_window
         from atom.model_ops.dcp_ops import dcp_local_index, dcp_owner_rank
 
         W = self.dcp_world_size
@@ -1714,6 +1722,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.dcp_indexer_gather_index = torch.from_numpy(
             src.astype(np.int32)
         ).to(dev, non_blocking=True)
+
+        # Per-QUERY-TOKEN causal window in the LOCAL shard's column space. The
+        # global window of query token t in request b is
+        # [cu_seqlens_k[b], cu_seqlens_k[b] + p_t + 1), built from the same
+        # p_t = cached_len[b] + offset_in_chunk[t] that `cu_seqlen_ke` uses.
+        # Locally the start is the request's local region base and the end
+        # counts only the positions this rank owns below p_t + 1.
+        #
+        # dcp_local_prefix_count(p_t + 1) <= this rank's real local length <=
+        # lpad[b], so a scorer driven by these bounds never reaches the
+        # inter-rank padding rows that cp_gather_indexer_k_quant_cache leaves
+        # uninitialized.
+        q_counts = (
+            var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
+        ).astype(np.int64)
+        local_ks, local_ke = dcp_prefill_local_window(
+            cu_pad, g_lens, q_counts, self.dcp_rank, W, S
+        )
+        attn_metadata.dcp_indexer_local_ks = torch.from_numpy(
+            local_ks.astype(np.int32)
+        ).to(dev, non_blocking=True)
+        attn_metadata.dcp_indexer_local_ke = torch.from_numpy(
+            local_ke.astype(np.int32)
+        ).to(dev, non_blocking=True)
         if self._indexer_fp4:
             self._build_dcp_indexer_fp4_prefill_meta(
                 attn_metadata, bs, lpad, cu_pad, total_kv, var
@@ -1739,16 +1771,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             slots.astype(np.int32)
         ).to(dev, non_blocking=True)
 
+        # How many rows the STAGE side holds. The read side is always this
+        # rank's local slot list; under the local-shard path nothing gathers it
+        # back up to the global key set, so the staged buffer is the shard, not
+        # the sequence. `cu_pad[bs] == dcp_indexer_local_total`.
+        stage_total = (
+            int(cu_pad[bs])
+            if use_dcp_local_indexer_prefill(self.dcp_world_size)
+            else total_kv
+        )
+
         # Page / row / e8m0 row for the DCP FP4 staging gather. They depend only
-        # on `slots` and `total_kv`, so build them once per forward, not per layer.
+        # on `slots` and `stage_total`, so build them once per forward, not per
+        # layer.
         read, stage = "dcp_indexer_fp4_read", "dcp_indexer_fp4_stage"
         slots_dev = attn_metadata.dcp_indexer_fp4_local_slots
         lut = getattr(self, "_fp4_scale_row_lut", None)
         if lut is not None:
-            idx = decompose_slots_triton(slots_dev, total_kv, block, lut)
+            idx = decompose_slots_triton(slots_dev, stage_total, block, lut)
         else:
             # Torch fallback (CPU / test builders); also the kernel's reference.
-            token = torch.arange(total_kv, dtype=torch.int32, device=dev)
+            token = torch.arange(stage_total, dtype=torch.int32, device=dev)
             idx = []
             for src in (slots_dev, token):
                 page, row = src // block, src % block
@@ -1768,7 +1811,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # keeps their cached tokens off `max_num_batched_tokens`, which is a
         # legal schedule, and this table is the only thing that would have
         # bounded it. Buys one scorer variant against the non-DCP width.
-        pages = -(-total_kv // block)
+        pages = -(-stage_total // block)
         cols = self.max_bs * self.block_table_cols
         staged_tables = torch.zeros(bs, cols, dtype=torch.int32, device=dev)
         staged_tables[:, :pages] = torch.arange(pages, dtype=torch.int32, device=dev)
@@ -1894,11 +1937,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_indptr = var["sparse_kv_indptr"].copy_to_gpu(
                 scheduled_tokens + 1
             )
+            # DCP metadata FIRST: under the local-shard indexer path the FP4
+            # schedule is built over dcp_indexer_local_ks/ke and
+            # dcp_indexer_local_total, which this call is what publishes. The
+            # two are otherwise independent -- the schedule reads
+            # batch_id_per_q_token / cu_seqlen_ks / cu_seqlen_ke / total_kv, none
+            # of which this touches.
+            if self.dcp_world_size > 1:
+                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             self._publish_indexer_fp4_prefill_schedule(
                 attn_metadata, sparse_counts, int(full_seq_lens.sum())
             )
-            if self.dcp_world_size > 1:
-                self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
             get_mla_metadata_v1(
                 attn_metadata.sparse_cu_seqlens_q,
                 attn_metadata.sparse_kv_indptr,
@@ -2374,16 +2423,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         right-sizing the logits buffer to this batch rather than max_model_len
         costs no device sync.
 
-        Under DCP the scorer reads a staged copy of every sequence's keys rather
-        than the in-place shard, so its columns are the flat concatenated ones
-        the FP8 path ranks in and the width is the whole key set.
+        Under DCP the scorer reads a staged copy rather than the in-place shard,
+        so its columns are the flat ones the FP8 path ranks in -- but WHICH flat
+        space depends on the path. With ATOM_DCP_INDEXER_PREFILL_LOCAL the staged
+        copy is this rank's own 1/W, so the columns are the local concatenated
+        ones and the causal end counts only owned positions; with the gather
+        fallback the staged copy is the whole key set.
         """
         if not self._indexer_fp4:
             return
         if self.dcp_world_size > 1:
-            local_starts = attn_metadata.cu_seqlen_ks
-            local_ends = attn_metadata.cu_seqlen_ke
-            max_seq_len = max(int(total_kv), 1)
+            if use_dcp_local_indexer_prefill(self.dcp_world_size):
+                local_starts = attn_metadata.dcp_indexer_local_ks
+                local_ends = attn_metadata.dcp_indexer_local_ke
+                max_seq_len = max(int(attn_metadata.dcp_indexer_local_total), 1)
+            else:
+                local_starts = attn_metadata.cu_seqlen_ks
+                local_ends = attn_metadata.cu_seqlen_ke
+                max_seq_len = max(int(total_kv), 1)
         else:
             local_starts = None
             local_ends = attn_metadata.cu_seqlen_ke - attn_metadata.cu_seqlen_ks
