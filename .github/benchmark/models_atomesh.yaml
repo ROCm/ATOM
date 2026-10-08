@@ -771,6 +771,28 @@ models:
               max_num_seqs: 144
           env: *kimi_k3_agentic_lmcache192_env
 
+        # PR #2449 on the C72 cell above. ATOM_WARMUP_PREFILL_TOKEN_STRIDE
+        # compiles the prefill GEMM M buckets at startup, so no prefill step
+        # stalls on an online JIT. The state index now mirrors the CPU tier's
+        # entry cap; the tier gets 96 GiB of a 224 GiB pool so the images a
+        # later turn reloads are still there.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-jitwarm-statecap-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_PREFILL_TOKEN_STRIDE: "32"
+
         # Non-disaggregated counterpart to the C72 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
