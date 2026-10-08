@@ -108,7 +108,13 @@ The native TP4 reference is GSM8K `0.9204` over 1,319 questions
 same backbone against the same weights, so it is judged against that number.
 Measured on the plugin path at TP4, BF16 pool, `--max-model-len 8192`:
 `0.9242 +/- 0.0073` over the same 1,319 questions (strict-match and
-flexible-extract agree).
+flexible-extract agree) -- **on the tree this work was first written against,
+not on this one.** That run predates a rebase onto a newer `main` that moved
+three things on the numerical path: the aiter the kernels come from, the
+`workspace` argument `PagedAttentionCache` now takes (the bridge hands it the
+builder's own scorer scratch, as the native path does), and the `index_fp4`
+field the pool geometry gained. Treat the number as the expectation to confirm,
+not as this tree's result, until it is re-measured here.
 
 Pass `tokenizer_backend=none` as well if you point `lm_eval` at a local
 checkpoint directory: with no HF `tokenizer.json` beside the weights, the
