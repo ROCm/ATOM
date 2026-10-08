@@ -207,55 +207,15 @@ def _proxy_region_byte_sizes(
 
 
 def _proxy_page_bytes(vllm_config) -> int:
-    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
-        UnifiedPoolGeometry,
-    )
+    """What one 128-token block really costs: both plane envelopes + indexer.
 
-    hf = vllm_config.model_config.hf_config
-    ratios, _dense, csa_layers, _hca = _layer_counts(hf)
-    head_dim = int(getattr(hf, "head_dim", 512))
-    rope_head_dim = _v4_rope_head_dim(hf)
-    index_head_dim = int(getattr(hf, "index_head_dim", 128))
-    kv_fp8 = _v4_kv_fp8(vllm_config)
-    _arena_planes, arena_rows, _row_widths = _v4_state_layout(vllm_config, kv_fp8)
-    win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
-    max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
-    max_model_len = int(vllm_config.model_config.max_model_len)
-    min_blocks = max(
-        1,
-        (max_model_len + ATOM_DEEPSEEK_V4_BLOCK_SIZE - 1)
-        // ATOM_DEEPSEEK_V4_BLOCK_SIZE,
-    )
-    geometry = UnifiedPoolGeometry(
-        ratios,
-        num_blocks=min_blocks,
-        num_slots=max_num_seqs,
-        ring_slots=win,
-        block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
-        arena_rows=arena_rows,
-    )
-    from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
+    The per-request slots are not in this price. They are withheld from the
+    block pool as a tail (`deepseek_v4_image.V4ImageSizing.usable_blocks`), so
+    vLLM's block count is a block count and every image page is a real page.
+    """
+    from atom.plugin.vllm.deepseek_v4_image import v4_image_sizing
 
-    regions = _proxy_region_byte_sizes(
-        geometry=geometry,
-        csa_layers=csa_layers,
-        num_blocks=min_blocks,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        index_head_dim=index_head_dim,
-        kv_fp8=kv_fp8,
-    )
-    _, total = plan_regions(regions)
-    # vLLM 0.26 may pack this cache after another layer at a non-aligned
-    # storage offset. Budget one-time leading slack so the runtime carve can
-    # move its first plane to the 256B boundary EntryMajorArena requires.
-    total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1
-    page_bytes = (total + min_blocks - 1) // min_blocks
-    if page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT:
-        page_bytes += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - (
-            page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
-        )
-    return page_bytes
+    return v4_image_sizing(vllm_config).page_bytes
 
 
 def slice_deepseek_v4_proxy_cache_views(
@@ -273,8 +233,13 @@ def slice_deepseek_v4_proxy_cache_views(
     arena_planes=None,
     arena_rows: int = 0,
     row_widths: list[int] | None = None,
+    num_blocks: int | None = None,
 ) -> dict[str, object]:
-    """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
+    """Carve native-equivalent unified V4 planes from vLLM proxy storage.
+
+    ``num_blocks`` is how many blocks the pool may hand out; it defaults to the
+    tensor's own count. The slots take the bytes past those blocks.
+    """
     from atom.model_ops.attentions.pool_layout.entry_arena import (
         EntryMajorArena,
         SplitEntryMajorArena,
@@ -292,7 +257,13 @@ def slice_deepseek_v4_proxy_cache_views(
     physical = proxy_kv_cache.permute(1, 0, 2, 3, 4)
     if not physical.is_contiguous():
         raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
-    num_blocks = int(physical.shape[0])
+    tensor_blocks = int(physical.shape[0])
+    num_blocks = tensor_blocks if num_blocks is None else int(num_blocks)
+    if not 0 < num_blocks <= tensor_blocks:
+        raise ValueError(
+            f"DeepSeek V4 proxy carve of {num_blocks} blocks does not fit a "
+            f"{tensor_blocks}-block tensor"
+        )
     raw = physical.reshape(-1)
     if raw.dtype is not torch.uint8:
         raise ValueError(f"DeepSeek V4 proxy cache must be uint8, got {raw.dtype}")
@@ -353,9 +324,13 @@ def slice_deepseek_v4_proxy_cache_views(
             .view(geometry.plane_rows, rope_head_dim)
         )
         region_idx += 1
+    csa_indexer_pool = None
     if n_csa:
         per_layer_indexer = num_blocks * csa_rows * index_dim
         indexer_blob = take_region(region_idx)
+        csa_indexer_pool = indexer_blob.view(dtypes.fp8).view(
+            n_csa, num_blocks, csa_rows, index_dim
+        )
         for layer_idx in range(n_csa):
             sl = indexer_blob[
                 layer_idx * per_layer_indexer : (layer_idx + 1) * per_layer_indexer
@@ -421,6 +396,11 @@ def slice_deepseek_v4_proxy_cache_views(
 
     return {
         "geometry": geometry,
+        "num_blocks": num_blocks,
+        "kv_plane": kv_plane,
+        "kv_plane_rope": kv_plane_rope,
+        "csa_indexer_pool": csa_indexer_pool,
+        "arena_planes": arena_planes,
         "state_arena": arena,
         "unified": unified,
         "csa_main": csa_main,
@@ -563,12 +543,20 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
         # on the capture path, so carry the signal into ATOM's forward context.
         md.in_hipgraph = bool(capturing)
-        # Selective per-slot reset OUTSIDE the captured region. For decode this
-        # is empty (no fresh slots are bound mid-generation); it fires for the
-        # prefill chunk that first allocates a request's slot, which is eager.
-        reset_slots = getattr(md, "reset_slots", None)
-        if reset_slots:
-            reset_deepseek_v4_state_slots(model, reset_slots)
+        # Image ops and the selective per-slot reset, OUTSIDE the captured
+        # region. For decode the reset is empty (no fresh slots are bound
+        # mid-generation); it fires for the prefill chunk that first allocates a
+        # request's slot, which is eager.
+        from atom.plugin.vllm.paged_state_image import run_image_step
+
+        run_image_step(
+            getattr(model, "_atom_image_worker", None),
+            md,
+            capturing=capturing,
+            plan=lambda: _plan_deepseek_v4_image_ops(model, md, common_attn_metadata),
+            reset_fn=lambda slots: reset_deepseek_v4_state_slots(model, slots),
+            name="DeepSeek-V4",
+        )
         common_attn_metadata.atom_v4_md = md
         return common_attn_metadata
 
@@ -905,9 +893,32 @@ def bind_deepseek_v4_proxy_cache_views(
     ratios = [int(r) for r in model.args.compress_ratios]
     num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
     # Stash the per-request state-slot allocator and the geometry parameters
-    # the bridge cannot read from common_attn_metadata.
+    # the bridge cannot read from common_attn_metadata. Slots come back on
+    # vLLM's finished / preempted / resumed events, never by guessing.
     if not hasattr(model, "_atom_v4_slot_allocator"):
-        model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+        from atom.plugin.vllm.paged_state_image import register_slot_allocator
+
+        model._atom_v4_slot_allocator = _V4StateSlotAllocator(
+            num_slots, evict_lru=False
+        )
+        register_slot_allocator(model._atom_v4_slot_allocator)
+    is_target = layer_name == ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    sizing = None
+    carve_blocks = None
+    if is_target:
+        from atom.plugin.vllm.deepseek_v4_image import v4_image_sizing
+
+        sizing = v4_image_sizing(vllm_config)
+        if list(sizing.ratios) != ratios:
+            raise RuntimeError(
+                f"DeepSeek-V4 sizing priced {len(sizing.ratios)} layers but the "
+                f"target model carves {len(ratios)}"
+            )
+        # The scheduler was told the same count (`get_kv_cache_configs` hook);
+        # the bytes past these blocks hold the slots.
+        carve_blocks = sizing.usable_blocks(
+            int(proxy.kv_cache.permute(1, 0, 2, 3, 4).shape[0])
+        )
     window_size = int(model.args.window_size)
     win_with_spec = _v4_win_with_spec(vllm_config, window_size)
     # Single fp8 authority for the whole bind (must agree with the _proxy_page_bytes
@@ -941,9 +952,14 @@ def bind_deepseek_v4_proxy_cache_views(
         arena_planes=arena_planes,
         arena_rows=arena_rows,
         row_widths=row_widths,
+        num_blocks=carve_blocks,
     )
     geometry = views["geometry"]
     model._atom_v4_geometry = geometry
+    model._atom_v4_is_target = is_target
+    model._atom_image_worker = None
+    if is_target:
+        _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy)
     arena = views["state_arena"]
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
@@ -1037,6 +1053,77 @@ def bind_deepseek_v4_proxy_cache_views(
         )
     model._atom_vllm_v4_proxy_cache_ptr = ptr
     return True
+
+
+def _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy) -> None:
+    """Attach the image worker when vLLM gave this worker the k image groups."""
+    from atom.plugin.vllm.deepseek_v4_image import (
+        deepseek_v4_image_layer_names,
+        deepseek_v4_images_on,
+        make_v4_image_copier,
+        register_v4_image_adapter,
+    )
+    from atom.plugin.vllm.paged_state_image import (
+        ImageWorker,
+        PagedStateImageLayer,
+        register_image_worker,
+    )
+
+    if not deepseek_v4_images_on(vllm_config):
+        return
+    sfc = vllm_config.compilation_config.static_forward_context
+    names = deepseek_v4_image_layer_names(sizing.k)
+    layers = [sfc.get(n) for n in names]
+    gids = [getattr(layer, "_atom_image_group_id", None) for layer in layers]
+    unbound = any(not isinstance(x, PagedStateImageLayer) for x in layers)
+    if unbound or any(g is None for g in gids):
+        raise RuntimeError(
+            "DeepSeek-V4 prefix caching is on but this worker has no bound image "
+            f"groups for {names[:2]}...; refusing to serve bare prefix hits"
+        )
+    copier = make_v4_image_copier(
+        sizing, views, num_blocks=views["num_blocks"], device=proxy.kv_cache.device
+    )
+    copier.warmup_per_req_cache()
+    model._atom_image_worker = ImageWorker(register_v4_image_adapter(), copier, gids)
+    register_image_worker(model._atom_image_worker)
+    logger.info(
+        "ATOM DeepSeek-V4 image prefix bound: page_bytes=%d page_unit_bytes=%d "
+        "image_k=%d image_bytes=%d block_size=%d slots=%d carve_blocks=%d "
+        "image_group_ids=%s",
+        sizing.page_bytes,
+        sizing.page_unit_bytes,
+        sizing.k,
+        sizing.image_bytes,
+        ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        sizing.num_slots,
+        views["num_blocks"],
+        gids,
+    )
+
+
+def _plan_deepseek_v4_image_ops(model, md, common_attn_metadata) -> None:
+    """This step's restores and stores (``paged_state_image.plan_image_ops``)
+    over the V4 rows: the bound slot, ``chunk_start`` and query length of every
+    real row, and the rows bound to a fresh slot by this build."""
+    from atom.plugin.vllm.paged_state_image import plan_image_ops
+
+    rows = getattr(md, "_atom_v4_real_rows", 0)
+    if not rows:
+        return
+    q_np = common_attn_metadata.query_start_loc_cpu[: rows + 1].numpy()
+    plan_image_ops(
+        getattr(model, "_atom_image_worker", None),
+        md,
+        rows=rows,
+        slots=md._atom_v4_slot_groups,
+        chunk_start=md.chunk_start_per_seq_cpu,
+        lens=np.diff(q_np),
+        fresh_rows=md._atom_v4_fresh_rows,
+        block=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        is_target=getattr(model, "_atom_v4_is_target", False),
+        name="DeepSeek-V4",
+    )
 
 
 def reset_deepseek_v4_state_slots(model, slots) -> None:
@@ -1254,20 +1341,39 @@ class _V4StateSlotAllocator:
     bound to an unseen ``req_id``, or when a known ``req_id`` reappears with
     ``num_computed == 0`` -- vLLM recomputes preempted requests from scratch
     under the same id, so the slot's accumulated state must be cleared on resume.
+    ``last_fresh_rows`` lists the batch rows bound to a new slot by the last
+    ``assign``; a fresh row with ``num_computed > 0`` is a prefix hit whose slot
+    the caller has to restore before the forward.
 
-    Slots are reclaimed lazily on exhaustion by evicting the least-recently-seen
-    slot whose ``req_id`` is absent from the current step (its request finished
-    or was preempted). vLLM caps concurrency at ``num_slots`` (max_num_seqs), so
-    a request that is live this step never has its slot evicted.
+    With ``evict_lru`` (the default) slots are reclaimed lazily on exhaustion by
+    evicting the least-recently-seen slot whose ``req_id`` is absent from the
+    current step. Without it slots come back only through ``release`` -- the
+    caller feeds it vLLM's finished / preempted / resumed request ids -- and an
+    exhausted free list is an error rather than a guess about which request is
+    gone.
     """
 
-    def __init__(self, num_slots: int):
+    def __init__(self, num_slots: int, *, evict_lru: bool = True):
         self.num_slots = max(1, int(num_slots))
+        self.evict_lru = bool(evict_lru)
         self._key_to_slot: dict[object, int] = {}
         self._slot_to_key: list[object] = [None] * self.num_slots
         self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
+        self.last_fresh_rows: list[int] = []
+
+    def release(self, req_keys) -> list[int]:
+        """Return the slots of requests vLLM has finished, preempted or resumed."""
+        freed = []
+        for k in req_keys:
+            slot = self._key_to_slot.pop(k, None)
+            if slot is None:
+                continue
+            self._slot_to_key[slot] = None
+            self._free.append(slot)
+            freed.append(slot)
+        return freed
 
     def assign(self, req_keys, num_computed):
         """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``.
@@ -1295,6 +1401,7 @@ class _V4StateSlotAllocator:
         step = self._step
         slots = [0] * n
         reset: set[int] = set()
+        fresh: list[int] = []
         for i in range(n):
             k = keys[i]
             slot = key_to_slot.get(k)
@@ -1303,16 +1410,24 @@ class _V4StateSlotAllocator:
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
                 reset.add(slot)
+                fresh.append(i)
             elif nc[i] == 0:
                 # Known request recomputed from scratch (preemption resume).
                 reset.add(slot)
             slots[i] = slot
             last_seen[slot] = step
+        self.last_fresh_rows = fresh
         return np.asarray(slots, dtype=np.int32), reset
 
     def _acquire(self, active: set) -> int:
         if self._free:
             return self._free.pop()
+        if not self.evict_lru:
+            raise RuntimeError(
+                f"all {self.num_slots} state slots are bound to live requests "
+                f"({sorted(map(str, self._key_to_slot))[:4]}...); a slot comes back "
+                "only when vLLM reports its request finished or preempted"
+            )
         victim = -1
         victim_seen = None
         for s in range(self.num_slots):
@@ -1479,6 +1594,8 @@ def build_atom_v4_attention_metadata(
             "apply_vllm_req_id_passthrough_patch() ran at model registration "
             "and is still active."
         )
+    md._atom_v4_real_rows = 0
+    md._atom_v4_fresh_rows = []
     if not real_slots or len(req_ids) < scheduled_bs:
         # Capture / profiling / warmup / empty synthetic batch (patch ran but
         # there are no -- or too few -- real request ids): throwaway arange
@@ -1494,6 +1611,9 @@ def build_atom_v4_attention_metadata(
         # -1 so the per-token decode kernels never read them.
         slot_arr = np.zeros(num_reqs, dtype=np.int32)
         slot_arr[:scheduled_bs] = slot_real
+        md._atom_v4_real_rows = scheduled_bs
+        md._atom_v4_fresh_rows = list(getattr(slot_allocator, "last_fresh_rows", []))
+    md._atom_v4_slot_groups = slot_arr
     physical_slot_arr = np.asarray(
         [md.pool_geometry.physical_slot(int(slot)) for slot in slot_arr],
         dtype=np.int32,
