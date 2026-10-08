@@ -914,6 +914,57 @@ models:
           vllm:
             source:
               sha: 34735d6776b9c43086fdf5c6c6392d9de45f322f
+        - &mori_prefix_read_a
+          <<: *kimi_k3_vllm_dspark_dcp8
+          name: kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager
+          isl: [32769]
+          osl: 128
+          concurrency: [1]
+          run_eval: false
+          env:
+            common:
+              ATOMESH_PREFIX_AB: "1"
+              ATOMESH_PREFIX_VARIANT: "A"
+              ATOMESH_PREFIX_DURATION: "300"
+              ATOMESH_EVAL_ONLY: "0"
+              ATOMESH_STALE_CELL_IDS: ""
+          server:
+            common_args:
+              extra_args: &mori_prefix_no_spec_args >-
+                --moe-backend auto --load-format safetensors --gpu-memory-utilization 0.88
+                --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
+                --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576
+                --stream-interval 1 --enable-prefix-caching --prefix-match-unit 128
+                --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384
+                --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
+                --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
+                --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4","re:.*\\.self_attn\\.(in_proj_qkvgfab|f_b_proj|o_proj|fused_qkv_a_proj|q_b_proj|g_proj)$":"fp8_per_channel","re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.mlp\\.(gate_up_proj|down_proj)$":"fp8_per_channel"}}'
+          vllm:
+            source:
+              sha: 34735d6776b9c43086fdf5c6c6392d9de45f322f
+        - &mori_prefix_read_b
+          <<: *mori_prefix_read_a
+          name: kimi-k3-mori-prefix-read-b-nospec-tp8-dcp8-eager
+          env:
+            common:
+              ATOMESH_PREFIX_AB: "1"
+              ATOMESH_PREFIX_VARIANT: "B"
+              ATOMESH_PREFIX_DURATION: "300"
+              ATOMESH_EVAL_ONLY: "0"
+              ATOMESH_STALE_CELL_IDS: ""
+          vllm:
+            source:
+              sha: d4a1acab353d2435221f2679e930b538a1bc686c
+        - <<: *mori_prefix_read_b
+          name: kimi-k3-mori-prefix-read-b-gsm8k-nospec-tp8-dcp8-eager
+          run_eval: true
+          env:
+            common:
+              ATOMESH_PREFIX_AB: "0"
+              ATOMESH_EVAL_ONLY: "1"
+              ATOMESH_STALE_CELL_IDS: ""
+          accuracy:
+            threshold: 0.94
     accuracy:
       task: gsm8k
       fewshot: 5

@@ -1364,7 +1364,15 @@ PY
 }
 
 run_workload_phase() {
-  if [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
+  if [[ "${ATOMESH_PREFIX_AB:-0}" == "1" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_prefix_workload.py" \
+      --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
+      --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \
+      --router "http://127.0.0.1:${ROUTER_PORT}" --model "${SERVED_MODEL_NAME}" \
+      --variant "${ATOMESH_PREFIX_VARIANT:?}" \
+      --output "${RUN_DIR}/prefix-results" --trace "${RUN_DIR}/prefix-trace" \
+      --duration "${ATOMESH_PREFIX_DURATION:-300}"
+  elif [[ "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_DIAGNOSTIC:-0}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/pd_vllm_profile.py" \
       --prefill "http://${NODE0_ADDR}:${PREFILL_PORT}" \
       --decode "http://${IP_ARRAY[1]}:${DECODE_PORT}" \

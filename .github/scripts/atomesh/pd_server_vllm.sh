@@ -30,6 +30,11 @@ install_native_vllm() {
   git -C "${src}" fetch -q --depth 1 "${repo}" "${sha}"
   git -C "${src}" checkout -q FETCH_HEAD
   [[ "$(git -C "${src}" rev-parse HEAD)" == "${sha}" ]] || return 2
+  if [[ "${ATOMESH_PREFIX_AB:-0}" == "1" ]]; then
+    export MORI_PREFIX_TRACE_DIR="${RUN_DIR}/prefix-trace"
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_prefix_observer.py" "${src}" \
+      > "${RUNTIME_LOG_DIR}/prefix-observation-patch-rank-${NODE_RANK}.json"
+  fi
   uv venv --system-site-packages "${venv}"
   uv pip install --python "${venv}/bin/python" \
     setuptools-scm setuptools-rust wheel ninja cmake
@@ -46,7 +51,9 @@ install_native_vllm() {
   env PYTHONPATH= "${venv}/bin/python" - "${venv}" "${sha}" \
     "${RUNTIME_LOG_DIR}/native-manifest-rank-${NODE_RANK}.json" <<'PY'
 import importlib.metadata
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -59,6 +66,11 @@ manifest = {
     "source_sha": sys.argv[2], "source_path": vllm.__file__,
     "torch": torch.__version__, "hip": torch.version.hip,
     "packages": {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
+    "model_files": {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for pattern in ("*config*.json", "tokenizer*.json", "tokenizer.model")
+        for path in Path(os.environ["MODEL_PATH"]).glob(pattern)
+    },
 }
 Path(sys.argv[3]).write_text(json.dumps(manifest, indent=2) + "\n")
 print(f"[vllm] native source installation OK: {sys.argv[2]} {vllm.__file__}")
