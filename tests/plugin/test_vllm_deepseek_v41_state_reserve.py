@@ -60,10 +60,34 @@ class TestReserveArithmetic:
 
     def test_configs_without_the_proxy_layer_are_untouched(self):
         # The patch is installed for the whole process; a group that is not
-        # ours must come back exactly as it went in.
-        config = _kv_cache_config(10_000, [OTHER_LAYER])
-        _reserve_state_tail([config], 900, _vllm_config())
-        assert config.num_blocks == 10_000
+        # ours must come back exactly as it went in. Checked beside one that
+        # IS ours, because a reserve with nothing at all to apply it to is a
+        # different case and now raises -- see the test below.
+        ours = _kv_cache_config(10_000, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+        theirs = _kv_cache_config(10_000, [OTHER_LAYER])
+        _reserve_state_tail([theirs, ours], 900, _vllm_config())
+        assert theirs.num_blocks == 10_000
+        assert ours.num_blocks == 10_000 - 900
+
+    def test_a_reserve_that_matches_nothing_is_an_error_not_a_no_op(self):
+        """Silently skipping leaves the pool full-size and the bind to die.
+
+        The reserve is computed only for V4.1 on the plugin, so a non-zero one
+        with no config owning the proxy layer means the layer name moved, not
+        that there was nothing to do. Skipping quietly produced a pool built at
+        full size and a bind-time failure that named this patch as the cause --
+        of a shortfall it had not caused.
+        """
+        theirs = _kv_cache_config(10_000, [OTHER_LAYER])
+        with pytest.raises(RuntimeError) as excinfo:
+            _reserve_state_tail([theirs], 900, _vllm_config())
+        message = str(excinfo.value)
+        assert "900" in message
+        # Names what it looked for and what it found, so the next reader does
+        # not have to reproduce the miss to learn the layer names.
+        assert ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME in message
+        assert OTHER_LAYER in message
+        assert theirs.num_blocks == 10_000
 
     def test_a_pool_too_small_for_one_request_fails_with_the_numbers(self):
         # 8192 tokens need 32 PAGEs; 40 blocks minus a 32-block tail leaves 8.

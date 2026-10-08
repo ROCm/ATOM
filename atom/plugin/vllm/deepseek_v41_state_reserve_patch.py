@@ -96,13 +96,18 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
     # can never admit anything -- a clearer failure here than a request that
     # is preempted forever.
     min_usable = max(1, -(-max_model_len // ATOM_DEEPSEEK_V41_BLOCK_SIZE))
+    applied = False
+    seen_groups = []
     for cfg in configs:
+        for group in cfg.kv_cache_groups:
+            seen_groups.extend(group.layer_names)
         owns_proxy = any(
             ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME in group.layer_names
             for group in cfg.kv_cache_groups
         )
         if not owns_proxy:
             continue
+        applied = True
         usable = cfg.num_blocks - reserve
         if usable < min_usable:
             raise ValueError(
@@ -123,6 +128,18 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
             usable,
         )
         cfg.num_blocks = usable
+
+    if not applied:
+        # A non-zero reserve with nothing to apply it to is a miss, not a
+        # no-op: the pool then gets built at full size and the bind dies
+        # later with a message blaming this patch for never running. Name it
+        # here, where the layer names that failed to match are still in hand.
+        raise RuntimeError(
+            f"DeepSeek-V4.1 plugin: computed a {reserve}-block STATE tail "
+            f"reserve but no KV-cache config owns "
+            f"{ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME!r}. Groups seen: "
+            f"{sorted(set(seen_groups))}"
+        )
 
 
 def apply_vllm_v41_state_reserve_patch() -> bool:
