@@ -63,7 +63,7 @@ def test_only_two_new_cells_change_original_k3_semantics():
     suites = config["suites"]
     removed = [cell for cell in suites["vllm"] if cell["name"] in PAIRS]
     assert len(removed) == 2
-    suites["vllm"] = [cell for cell in suites["vllm"] if cell["name"] not in PAIRS]
+    suites["vllm"] = [cell for cell in suites["vllm"] if cell["name"] in (BASE, DRAFT)]
     # Preserve original K3 metadata/cells without coupling unrelated model updates.
     assert (
         hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()

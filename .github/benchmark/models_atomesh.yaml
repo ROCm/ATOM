@@ -991,6 +991,14 @@ models:
             tp: 8
             dcp: 8
             extra_args: *survey_k3_draft
+        - <<: *survey_k3_read_dspark
+          name: survey-k3-main-read-dspark3-bounded-perf-c1-1p1d-tp8-dcp8-eager
+          isl: [1025, 2050, 3073]
+          osl: 128
+          concurrency: [1]
+          vllm:
+            <<: *survey_k3_draft_visibility
+            diagnostic_mode: bounded-perf
         - <<: *survey_k3_read
           name: survey-k3-main-read-apc-1p1d-tp8-dcp8-eager
           vllm:

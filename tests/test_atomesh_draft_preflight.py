@@ -255,10 +255,15 @@ def resolve_machine_paths(cell, monkeypatch, hostname="other-runner"):
         return json.loads(output.read_text().split("=", 1)[1])
 
 
-@pytest.mark.parametrize("composition", [False, True])
-def test_only_survey_dspark_cells_gate_actual_speculative_paths(
-    monkeypatch, composition
-):
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        "survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager",
+        "survey-k3-main-read-dspark3-apc-1p1d-tp8-dcp8-eager",
+        "survey-k3-main-read-dspark3-bounded-perf-c1-1p1d-tp8-dcp8-eager",
+    ],
+)
+def test_only_survey_dspark_cells_gate_actual_speculative_paths(monkeypatch, case_name):
     import re
     import shlex
 
@@ -287,13 +292,10 @@ def test_only_survey_dspark_cells_gate_actual_speculative_paths(
     names = {
         "survey-k3-main-read-dspark3-1p1d-tp8-dcp8-eager",
         "survey-k3-main-read-dspark3-apc-1p1d-tp8-dcp8-eager",
+        "survey-k3-main-read-dspark3-bounded-perf-c1-1p1d-tp8-dcp8-eager",
     }
     assert {cell["name"] for cell in gated} == names
-    original = next(
-        cell
-        for cell in gated
-        if bool(cell["vllm"].get("cache_composition")) == composition
-    )
+    original = next(cell for cell in gated if cell["name"] == case_name)
     cell = resolve_machine_paths(original, monkeypatch)
     assert cell["name"] in names
     path = cell["vllm"]["draft_model_path"]
