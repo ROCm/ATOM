@@ -157,9 +157,11 @@ HIP_VISIBLE_DEVICES=0,1,2,3 python -m atom.entrypoints.openai_server \
   --attn-prefill-chunk-size 16384
 ```
 
-Idle ranks participate in collectives using empty request metadata in the same
-pool buffers that graph capture used. Padding rows carry batch ID -1 and
-zero-length requests, so they neither read nor write state. Startup warmup,
+Idle ranks participate in collectives using empty cache-request metadata in the
+same pool buffers that graph capture used. Padding rows carry batch ID -1 and
+sentinel write plans, so captured attention kernels neither read nor write state.
+The runner's dummy query segment remains nonempty for sampling and DSpark to
+select a valid anchor row. Startup warmup,
 before pool allocation, continues to use its private scratch cache.
 
 Engram follows the attention TP group: under DPA each rank reads all hash

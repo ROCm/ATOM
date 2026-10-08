@@ -429,21 +429,18 @@ class TBOContext:
             # cleanup, so a receive hook that raises — an async MoE receive
             # failing, say — must not skip it: that would wedge the partner on
             # its next yield and leave the comm stream unordered.
-            self._leave_stream(exc_type is not None or sys.exc_info()[0] is not None)
-            # Mark this ubatch done BEFORE the final signal so that if the
-            # partner is racing into its next `_cpu_yield` between our signal
-            # and its wait, it observes `partner.done == True` and skips the
-            # wait instead of sleeping forever. Without this, any asymmetry
-            # (e.g. partner exits mid-forward via exception) leaves the
-            # survivor wedged on the next yield: the dead partner only signals
-            # exactly once from __exit__, but the survivor still has ≥1 yield
-            # left to do.
-            self.done = True
-            # No CPU-blocking synchronize — GPU ordering is handled by
-            # torch.Event record/wait in switch_to_comm_sync /
-            # switch_to_compute_sync.
-            self.cpu_signal_event.set()
-            self.cpu_wait_event.clear()
+            try:
+                self._leave_stream(
+                    exc_type is not None or sys.exc_info()[0] is not None
+                )
+            finally:
+                # Even a stream-ordering failure on a normal exit must wake
+                # the partner so the parent can surface the original error.
+                # Publish done before signalling: a later partner yield must
+                # not wait for another signal from this finished ubatch.
+                self.done = True
+                self.cpu_signal_event.set()
+                self.cpu_wait_event.clear()
         return False
 
     def _leave_stream(self, unwinding: bool):

@@ -247,6 +247,57 @@ def test_failing_recv_hook_still_signals_partner_and_fences(monkeypatch):
     assert signal.is_set()
 
 
+@pytest.mark.parametrize("failure_point", ["record", "set_stream", "wait_event"])
+@pytest.mark.parametrize("unwinding", [False, True])
+def test_stream_cleanup_failure_always_releases_partner(
+    monkeypatch, failure_point, unwinding
+):
+    import threading
+
+    from atom.utils.tbo import ubatching
+
+    def fail_at(point):
+        if point == failure_point:
+            raise RuntimeError("async HIP failure")
+
+    class Stream:
+        def wait_event(self, event):
+            fail_at("wait_event")
+
+    class Event:
+        def record(self, stream):
+            fail_at("record")
+
+    compute, comm = Stream(), Stream()
+    signal, wait = threading.Event(), threading.Event()
+    wait.set()
+    ctx = ubatching.TBOContext(
+        ubatch_id=0,
+        compute_stream=compute,
+        comm_stream=comm,
+        forward_context=None,
+        ready_barrier=None,
+        cpu_wait_event=wait,
+        cpu_signal_event=signal,
+        gpu_comm_done_event=Event(),
+        gpu_compute_done_event=Event(),
+    )
+    ctx.current_stream = comm
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: fail_at("set_stream"))
+    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
+    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [ctx])
+    if unwinding:
+        assert ctx.__exit__(ValueError, ValueError("original failure"), None) is False
+    else:
+        with pytest.raises(RuntimeError, match="async HIP failure"):
+            ctx.__exit__(None, None, None)
+    assert ctx.done
+    assert signal.is_set()
+    assert not wait.is_set()
+    assert ubatching._CURRENT_CONTEXTS == [None]
+    assert threading.get_ident() not in ubatching._THREAD_ID_TO_CONTEXT
+
+
 def test_clean_exit_on_compute_adds_no_redundant_ordering(monkeypatch):
     """Already on the compute stream, the exit records nothing of its own."""
     import threading

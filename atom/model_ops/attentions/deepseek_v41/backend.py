@@ -377,6 +377,54 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
+    def _prepare_idle(
+        self,
+        batch,
+        running_bs,
+        running_tokens,
+        *,
+        max_q_len,
+        tentative,
+        is_prefill,
+        query_prefix_ready,
+    ):
+        """Publish padding on the captured pool, retaining the dummy input row.
+
+        Cache work has no requests, but sampling and DSpark still consume the
+        runner's dummy query segment. Its last token must remain a valid anchor.
+        """
+        lengths = np.asarray(batch.num_scheduled_tokens, dtype=np.int32)
+        count = len(batch.req_ids)
+        if (
+            lengths.size != count
+            or np.any(lengths <= 0)
+            or int(lengths.sum()) != batch.total_tokens_num
+            or running_bs < count
+            or running_tokens < batch.total_tokens_num
+        ):
+            raise ValueError("CSA2 idle input layout disagrees with the runner")
+        if not query_prefix_ready:
+            cu = self.model_runner.forward_vars["cu_seqlens_q"]
+            if cu._publication is not None:
+                cu._publication.acquire_write()
+            cu.np[0] = 0
+            np.cumsum(lengths, out=cu.np[1 : count + 1])
+            cu.np[count + 1 : running_bs + 1] = batch.total_tokens_num
+            cu.copy_to_gpu(running_bs + 1)
+        return self._prepare_step(
+            batch,
+            (),
+            [],
+            self.cache,
+            running_bs,
+            running_tokens,
+            max_q_len=max_q_len,
+            tentative=tentative,
+            is_prefill=is_prefill,
+            query_prefix_ready=True,
+            engram_live=False,
+        )
+
     def _prepare(
         self,
         batch,
@@ -392,11 +440,20 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     ):
         """``engram_live`` False: Engram's forward kernels run on no token (a
         capture: they record on serving's buffers, touching none)."""
-        spans, rows, offset, next_page = [], [], 0, 0
         # Once graphs bind the serving pool, an idle DP rank must publish
         # padding into that pool's metadata. A fresh scratch cache would refill
         # different indptr addresses while replay still reads the captured ones.
-        idle = batch.is_dummy_run and self.cache is not None
+        if batch.is_dummy_run and self.cache is not None:
+            return self._prepare_idle(
+                batch,
+                running_bs,
+                running_tokens,
+                max_q_len=max_q_len,
+                tentative=tentative,
+                is_prefill=is_prefill,
+                query_prefix_ready=query_prefix_ready,
+            )
+        spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
             raise ValueError("CSA2 requires a STATE slot for every scheduled request")
@@ -404,7 +461,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             zip(batch.req_ids, batch.num_scheduled_tokens, batch.context_lens)
         ):
             length, end = int(length), int(end)
-            if idle or length == 0:
+            if length == 0:
                 continue
             if batch.is_dummy_run:
                 # Warmup uses private scratch. A dummy rank may never mutate
@@ -423,7 +480,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             spans.append(RequestSpan(request_id, position, offset, length, slot))
             rows.append(blocks)
             offset += length
-        if (not idle and offset != batch.total_tokens_num) or running_tokens < offset:
+        if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
         cache = (
             PagedAttentionCache(
@@ -434,11 +491,48 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
             )
-            if batch.is_dummy_run and not idle
+            if batch.is_dummy_run
             else self.cache
         )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
+        compacted = len(spans) != len(batch.req_ids)
+        return self._prepare_step(
+            batch,
+            spans,
+            rows,
+            cache,
+            running_bs,
+            running_tokens,
+            max_q_len=max_q_len,
+            tentative=tentative,
+            is_prefill=is_prefill,
+            query_prefix_ready=query_prefix_ready and not compacted,
+            query_prefix_republish_reason=(
+                "compact zero-token scheduler rows for CSA2 after input assembly"
+                if query_prefix_ready and compacted
+                else None
+            ),
+            engram_live=engram_live,
+        )
+
+    def _prepare_step(
+        self,
+        batch,
+        spans,
+        rows,
+        cache,
+        running_bs,
+        running_tokens,
+        *,
+        max_q_len,
+        tentative,
+        is_prefill,
+        query_prefix_ready,
+        query_prefix_republish_reason=None,
+        engram_live=True,
+    ):
+        offset = sum(span.length for span in spans)
         groups = getattr(self.model_runner, "h2d_groups", None)
         combined = None if groups is None else groups.get("v41_metadata")
         if combined is not None and combined.transport != "packed":
@@ -496,12 +590,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             plans=plans,
             planners=self.step_planners,
             publication_group=step_group,
-            query_prefix_ready=query_prefix_ready and len(spans) == len(batch.req_ids),
-            query_prefix_republish_reason=(
-                "compact zero-token scheduler rows for CSA2 after input assembly"
-                if query_prefix_ready and len(spans) != len(batch.req_ids)
-                else None
-            ),
+            query_prefix_ready=query_prefix_ready,
+            query_prefix_republish_reason=query_prefix_republish_reason,
         )
         positions = self.model_runner.forward_vars["positions"]
         cu = self.model_runner.forward_vars["cu_seqlens_q"].gpu[: running_bs + 1]
@@ -852,8 +942,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs, max_q_len=1):
         # Binds the serving allocation, as V4 does: a scratch cache would bake
-        # the wrong window address into the shared draft graph. Runtime dummies
-        # still get the private cache `_prepare` picks for them.
+        # the wrong window address into the shared draft graph. Runtime idle
+        # ranks also use this pool; startup dummies use private scratch.
         if self.cache is None:
             raise RuntimeError("Allocate the serving cache before graph capture")
         if bs < 1 or max_q_len < 1 or bs * max_q_len > self.max_num_batched_tokens:
