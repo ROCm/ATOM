@@ -629,7 +629,11 @@ class TestDecodeScoreAgainstTheDefinition:
         work_map = m.build_index_score_work_map(
             kw["seq_lens"], max_block=2 * max_block, max_query_len=1, num_idx_heads=2
         )
-        with pytest.raises(AssertionError, match="different bounds"):
+        # ValueError and not AssertionError: the bound comes from launch
+        # flags and a captured buffer, so `python -O` must not be able to turn
+        # a stale map into unreported wrong scores. Same rule as
+        # `TestPackableBound`.
+        with pytest.raises(ValueError, match="different bounds"):
             self._run(kw, work_map, 0)
 
 
@@ -710,10 +714,18 @@ def _prefill_score_oracle(kw, heads, cache=None):
         # `reshape(-1, HEAD_DIM)` lays the columns out.
         cuts = prefix + torch.arange(hi - lo, device=dev).repeat_interleave(heads) + 1
         q = idx_q[lo:hi].reshape(-1, HEAD_DIM)
+        if cache.dtype != idx_q.dtype:
+            # PREFILL rounds Q DOWN to the cache dtype -- the Triton kernel is
+            # `tl.dot(q.to(k.dtype), k)` under `k.dtype.is_fp8()`, and flydsl's
+            # `fp8_mfma` does the same. That is the opposite of decode, which
+            # lifts K to Q, so this oracle must not borrow the decode rule: at
+            # the 2e-2 tolerance the two roundings are close enough that an
+            # fp8-Q regression shared by both scorers would pass unnoticed.
+            q = q.to(cache.dtype)
         for blk in range(-(-length // p)):
-            # K is lifted to Q's dtype before fp32, not the other way round, so
-            # an fp8 cache reproduces the kernels' rounding instead of skipping it.
-            k = cache[int(kw["block_table"][b, blk])].to(idx_q.dtype).float()
+            # K goes straight to fp32 -- exact from either dtype. The rounding
+            # that matters here is Q's, applied above.
+            k = cache[int(kw["block_table"][b, blk])].float()
             z = (k @ q.float().T) * scale
             z = z.masked_fill((blk * p + within)[:, None] >= cuts[None, :], -torch.inf)
             col = torch.where(
@@ -808,7 +820,13 @@ class TestPrefillScoreAgainstTheDefinition:
         # uninitialised by design.
         live = ~torch.isnan(want)
         assert live.any()
-        assert torch.allclose(score[live], want[live], rtol=2e-2, atol=2e-2)
+        # atol 1e-3, not 2e-2. Measured worst case over every shape, head count
+        # and backend here is 1.7e-5 on an fp8 cache and ~0 on bf16, so 2e-2
+        # was three orders of magnitude of slack -- enough that the oracle
+        # could model the WRONG rounding (lifting K to Q, which is decode's
+        # rule) and still pass at 1.69e-2, within 18% of the bound. 1e-3 keeps
+        # ~60x headroom over the real error and still fails that mistake.
+        assert torch.allclose(score[live], want[live], rtol=2e-2, atol=1e-3)
 
     @pytest.mark.parametrize("backend", ["flydsl", "triton"])
     def test_a_perturbed_cache_moves_the_scores(self, backend):
@@ -839,7 +857,10 @@ class TestPrefillScorersAgree:
         fly, want = _prefill_score(kw, 2, "flydsl", fp8)
         tri, _ = _prefill_score(kw, 2, "triton", fp8)
         live = ~torch.isnan(want)
-        assert torch.allclose(fly[live], tri[live], rtol=2e-2, atol=2e-2)
+        # Same bound as the oracle comparison above, for the same reason: each
+        # scorer sits within 1.7e-5 of the definition, so they sit within twice
+        # that of each other and 2e-2 would hide a real divergence.
+        assert torch.allclose(fly[live], tri[live], rtol=2e-2, atol=1e-3)
 
     @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)

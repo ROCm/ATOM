@@ -1339,15 +1339,21 @@ def decode_index_score(
         # The map's row count IS the grid, so a map built against a different
         # max_block is not a shorter map -- it is the kernel walking the
         # right-sized grid through rows that mean something else. Silent wrong
-        # scores, hence an assert.
+        # scores, so this has to refuse.
+        #
+        # ValueError and not an assert, for the reason `_require_packable`
+        # gives: the bound traces back to launch flags and a captured buffer,
+        # and `python -O` must not be able to turn a stale map into wrong
+        # scores that nothing reports.
         rows = index_score_work_map_size(
             batch, max_block, max_query_len, num_idx_heads, cp_world, cp_rank,
         )  # fmt: skip
-        assert work_map.shape[0] == rows, (
-            f"index_score_work_map has {work_map.shape[0]} rows, this call needs "
-            f"{rows} (max_block={max_block}) -- the two were built against "
-            f"different bounds"
-        )
+        if work_map.shape[0] != rows:
+            raise ValueError(
+                f"index_score_work_map has {work_map.shape[0]} rows, this call "
+                f"needs {rows} (max_block={max_block}) -- the two were built "
+                f"against different bounds"
+            )
 
     # `out` is for a consumer that needs a LAYOUT, not one that wants to reuse
     # a buffer. Past `total_q * num_idx_heads >= 16` the allocator hands back
