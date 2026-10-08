@@ -3,8 +3,8 @@
 The two-node companion to
 [`DeepSeek-V4-Agentic-InferenceX.md`](DeepSeek-V4-Agentic-InferenceX.md). That
 file is one node, no disaggregation, and is the right starting point. This one
-splits prefill from decode across two nodes. The concurrency-256 configuration
-uses EP8 + Mega + EPLB and a shared LMCache MP CPU tier on prefill.
+splits prefill from decode across two nodes and adds a CPU KV offload tier,
+which is what the workload needs at high concurrency.
 
 - Hardware: MI355X ×8 per node, **two nodes**, prefill/decode disaggregated (1P1D)
 - Model: `DeepSeek-V4-Pro-0813`, FP4 weights, FP8 KV, FP4 index cache;
@@ -12,8 +12,8 @@ uses EP8 + Mega + EPLB and a shared LMCache MP CPU tier on prefill.
   (benchmark-only; see [Forced acceptance length](../docs/forced_acceptance_length.md))
 - Transport: Mooncake RDMA, GID index 1
 - Scenario: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
-- Router: `atomesh`, PD mode, independent P/D rank selection; DP sticky at
-  concurrency 256, cache-aware at 64–128, round-robin for TP
+- Router: `atomesh`, PD mode, independent P/D rank selection; cache-aware on
+  both sides for DP, round-robin for TP
 
 Pick the section by the concurrency you are running:
 
@@ -337,38 +337,21 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
 
 ## DP attention with CPU offload — concurrency 256
 
-This configuration uses **EP8 + Mega + EPLB + LMCache MP on prefill**, and
-TP8 with DP attention and EP1 on decode. TBO is disabled on both nodes.
-The router uses **DP sticky for both P and D** with independent rank selection.
-The commands describe the current experiment; its full 3,600 s sticky result
-is still pending. The [historical measurements](#measured) below used other
-configurations.
+The commands below use concurrency 256 on both server nodes and the client.
+Replace `10.0.0.1` and `10.0.0.2` with the prefill and decode IPs
+in both the server and router commands. Prefill uses EP8, Mega, EPLB and
+LMCache MP; decode uses plain Mooncake without EP or CPU offload. TBO is off
+on both nodes.
+Decode captures every per-rank batch size from 1 through `CONC / 4`
+(1–64 at concurrency 256); prefill uses default graph sizes.
 
-Replace `10.0.0.1` and `10.0.0.2` with the prefill and decode node IPs.
-Each server admits at most **128 sequences per DP rank**; this is separate
-from the client's global concurrency of 256. Prefill captures sizes 1–16,
-32, 48, 64 and 128; decode captures every size from 1 through 64.
-The memory fractions, 0.75 on P and 0.70 on D, match the current Crusoe run;
-see [startup memory limits](#if-the-servers-oom-at-startup) before changing them.
-
-Use an ATOM/AITER build with Mega and EPLB support, LMCache with the `server`
-CLI and native-state MP support, an `atomesh` build with `dp_sticky`, and an
-AIPerf build that supports the scenario flags and session-header environment
-variable below. Start the MP server, P server, D server, router, and client in
-separate shells. Wait for both model servers and the router to become healthy
-before starting AIPerf.
-
-### MP server on the prefill node
-
-Start one MP server in the **same container or network namespace** as the
-prefill engine. All eight P ranks share its L1 CPU cache. The `--l1-size-gb 1000`
-limit is for the whole node, not 1,000 per rank. Lazy allocation defers memory
-allocation; provision enough available host RAM for that limit plus engine and
-transfer-buffer headroom, or reduce the limit before startup.
+Start one LMCache MP server in a separate shell in the same container or
+network namespace as prefill. Its lazy L1 cache is shared by all eight P ranks;
+`--l1-size-gb 1000` is a node-wide limit. Provision that much available host
+RAM plus engine and transfer-buffer headroom, or reduce the limit.
 
 ```bash
-lmcache server \
-  --host 127.0.0.1 --port 5555 \
+lmcache server --host 127.0.0.1 --port 5555 \
   --chunk-size 256 --null-block-id -1 \
   --separate-object-groups --supported-transfer-mode lmcache_driven \
   --l1-size-gb 1000 --l1-use-lazy --l1-read-ttl-seconds 900 \
@@ -376,20 +359,19 @@ lmcache server \
   --http-host 127.0.0.1 --http-port 19555
 ```
 
-Port 5555 serves MP RPC; 19555 serves the MP HTTP API and metrics. The
-`lmcache.mp.port` in the P environment must match the RPC port.
-No MP server or CPU offload tier is used on D.
-
 ### Prefill node
 
 ```bash
+export CONC=256
+if [[ ! "$CONC" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Set CONC to a positive integer before starting the server." >&2
+  exit 1
+fi
+
 export MODEL_PATH="<DeepSeek-V4-Pro-0813 checkpoint path or model ID>"
 export TOKENIZER_PATH="$MODEL_PATH"
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONUNBUFFERED=1
-export PYTHONHASHSEED=0
-export OMP_NUM_THREADS=4
-export TOKENIZERS_PARALLELISM=false
 export AITER_LOG_LEVEL=WARNING
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
@@ -399,19 +381,25 @@ unset ATOM_MOONCAKE_IB_DEVICE
 # For rail-isolated fabrics; omit if all default P/D HCA pairs are reachable.
 export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME="<prefill node network interface>"
-export MORI_SOCKET_IFNAME="$NCCL_SOCKET_IFNAME"
 export ATOM_DISABLE_MMAP=true
 export ATOM_NUMA_BIND=1
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
-export ATOM_PD_RANK_MAPPING_POLICY=none
 
 export ATOM_PREFIX_CACHE_POLICY=lru
 export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
-export ATOM_ENABLE_PREFILL_DELAYER=0
-export ATOM_ENABLE_METRICS_DEVICE_TIMER=1
+
+export ATOM_ENABLE_PREFILL_DELAYER=0       # Disable cross-DP prefill coalescing
 export GPU_MAX_HW_QUEUES=5
+
+export PYTHONHASHSEED=0                  # Consistent LMCache hashes across processes
+export OFFLOAD_COPY_WORKERS=1
+export OFFLOAD_MIN_LOAD_TOKENS=8192
+export OFFLOAD_MIN_SAVE_TOKENS=8192
+export OFFLOAD_MAX_PENDING_SAVES=8
+export ATOM_KV_OFFLOAD=lmcache_mp
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5555,"lmcache.mp.tp_rank_collapse":true}'
+export LMCACHE_CHUNK_SIZE=256
 
 export MORI_SHMEM_HEAP_SIZE=16G
 export ATOM_MEGA_MASK_PAD_ROWS=1
@@ -419,29 +407,19 @@ export ATOM_MEGA_DECODE_MTPR=512
 export AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023
 export ATOM_EPLB_MAX_REBALANCES=4
 
-export ATOM_KV_OFFLOAD=lmcache_mp
-export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5555,"lmcache.mp.tp_rank_collapse":true}'
-export LMCACHE_CHUNK_SIZE=256
-export LMCACHE_DISABLE_BANNER=1
-export OFFLOAD_COPY_WORKERS=1
-export OFFLOAD_MAX_PENDING_SAVES=8
-export OFFLOAD_MIN_LOAD_TOKENS=8192
-export OFFLOAD_MIN_SAVE_TOKENS=8192
-
 python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
-  --host 0.0.0.0 --server-port 8010 --port 8006 --trust-remote-code \
-  --tensor-parallel-size 8 --enable-dp-attention \
-  --decode-context-parallel-size 1 \
-  --enable-expert-parallel --all2all-backend high-throughput \
-  --moe-backend mega --enable-eplb \
-  --eplb-config '{"load_window_size":100,"rebalance_interval":200}' \
-  --kv-cache-dtype fp8 --index-cache-dtype fp4 --block-size 256 \
-  --gpu-memory-utilization 0.75 --max-num-seqs 128 \
+  --host 0.0.0.0 --server-port 8010 \
+  --tensor-parallel-size 8 \
+  --enable-dp-attention --enable-expert-parallel \
+  --all2all-backend high-throughput --moe-backend mega \
+  --enable-eplb --eplb-config '{"load_window_size":100,"rebalance_interval":200}' \
+  --kv-cache-dtype fp8 --index-cache-dtype fp4 \
+  --enable-prefix-caching \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
-  --state-checkpoint-interval-tokens 8192 --enable-prefix-caching \
+  --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL \
-  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,48,64,128]' \
   --method dspark --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 3.01 \
   --kv-transfer-config '{
@@ -453,67 +431,54 @@ python3 -u -m atom.entrypoints.openai_server \
   }'
 ```
 
-The Mooncake connector transfers KV from P to D; `ATOM_KV_OFFLOAD=lmcache_mp`
-enables the separate native-state CPU tier on P. Do not add the legacy
-`multi` / `lmcache_offload` connector or its SLOT sidecar settings to this
-command. `tp_rank_collapse=true` matches the DPA layout and lets MP reuse
-content-addressed cache objects across the P ranks.
-
-EPLB samples a 100-step load window, checks for rebalancing every 200 steps,
-and stops after at most four rebalances. Check the rebalance timestamps when
-comparing runs; a warmup of one request per lane does not guarantee that all
-rebalances finish before measurement.
-
 ### Decode node
 
-Run this in a fresh shell on the decode node so it does not inherit the P
-offload environment. D uses EP1 and the standard MoE backend.
-
 ```bash
+export CONC=256
+if [[ ! "$CONC" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Set CONC to a positive integer before starting the server." >&2
+  exit 1
+fi
+
 export MODEL_PATH="<DeepSeek-V4-Pro-0813 checkpoint path or model ID>"
 export TOKENIZER_PATH="$MODEL_PATH"
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export PYTHONUNBUFFERED=1
-export PYTHONHASHSEED=0
-export OMP_NUM_THREADS=4
-export TOKENIZERS_PARALLELISM=false
 export AITER_LOG_LEVEL=WARNING
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
 export ATOM_HOST_IP="10.0.0.2"
 export MC_GID_INDEX=1
 unset ATOM_MOONCAKE_IB_DEVICE
+# For rail-isolated fabrics; omit if all default P/D HCA pairs are reachable.
 export ATOM_MOONCAKE_MATCHED_RAILS=auto
 export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME="<decode node network interface>"
-export MORI_SOCKET_IFNAME="$NCCL_SOCKET_IFNAME"
 export ATOM_DISABLE_MMAP=true
 export ATOM_NUMA_BIND=1
 export ATOM_DP_MASTER_PORT=29510
 export ATOM_DP_BASE_PORT=29610
-export ATOM_PD_RANK_MAPPING_POLICY=none
 
 export ATOM_PREFIX_CACHE_POLICY=lru
 export ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5
-export ATOM_ENABLE_PREFILL_DELAYER=0
-export ATOM_ENABLE_METRICS_DEVICE_TIMER=1
-unset ATOM_KV_OFFLOAD ATOM_KV_OFFLOAD_EXTRA_CONFIG
 
-DENSE_CAPTURE_SIZES="$(python3 - <<'PY'
-import json
-print(json.dumps(list(range(1, 65))))
+export ATOM_ENABLE_PREFILL_DELAYER=0       # Disable cross-DP prefill coalescing
+
+DENSE_CAPTURE_SIZES="$(python3 - "$CONC" <<'PY'
+import json, sys
+print(json.dumps(list(range(1, int(sys.argv[1]) // 4 + 1))))
 PY
 )"
 
 python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
-  --host 0.0.0.0 --server-port 8020 --port 8006 --trust-remote-code \
-  --tensor-parallel-size 8 --enable-dp-attention \
-  --decode-context-parallel-size 1 \
-  --kv-cache-dtype fp8 --index-cache-dtype fp4 --block-size 256 \
-  --gpu-memory-utilization 0.70 --max-num-seqs 128 \
+  --host 0.0.0.0 --server-port 8020 \
+  --tensor-parallel-size 8 \
+  --enable-dp-attention \
+  --kv-cache-dtype fp8 --index-cache-dtype fp4 \
+  --enable-prefix-caching \
+  --max-num-seqs $(( CONC * 2 )) \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
-  --state-checkpoint-interval-tokens 8192 --enable-prefix-caching \
+  --state-checkpoint-interval-tokens 8192 \
   --level 3 --cudagraph-mode FULL --cudagraph-capture-sizes "$DENSE_CAPTURE_SIZES" \
   --method dspark --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 3.01 \
@@ -526,84 +491,43 @@ python3 -u -m atom.entrypoints.openai_server \
   }'
 ```
 
-### Router
+### Router, then client
 
 ```bash
+# Matching 0813 tokenizer files must be accessible on this host.
 export TOKENIZER_PATH="<local 0813 tokenizer path or model ID>"
 
 atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
   --prefill http://10.0.0.1:8010 --decode http://10.0.0.2:8020 \
-  --dp-aware --policy dp_sticky \
-  --prefill-policy dp_sticky --decode-policy dp_sticky \
-  --atom-pd-rank-mapping-policy none \
+  --dp-aware --prefill-policy cache_aware --decode-policy cache_aware \
+  --cache-threshold 0.8 --balance-abs-threshold 20 --balance-rel-threshold 2.0 \
+  --eviction-interval 300 --atom-pd-rank-mapping-policy none \
   --backend atom --model-path "$TOKENIZER_PATH" \
   --disable-circuit-breaker --prometheus-port 29100 \
-  --request-timeout-secs 1800 --worker-startup-timeout-secs 4500
-```
-
-DP sticky binds each `X-Session-ID` to a worker and DP rank independently on
-P and D. Reuse the same header for all turns in one conversation. Without
-that header the policy falls back to load-based routing. The cache-aware
-40/2.0 thresholds are not used by this configuration.
-
-### Client — 256 concurrent requests, 3,600 s measurement
-
-```bash
-export TOKENIZER_PATH="<local 0813 tokenizer path or model ID>"
-export TOKENIZERS_PARALLELISM=false
-export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
-export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
-export AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT=300
-export AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES=0
-export AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800
-export AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT=1800
-export AIPERF_UI_REALTIME_METRICS_ENABLED=true
+  --request-timeout-secs 1800
 
 aiperf profile --scenario inferencex-agentx-mvp \
   --url http://localhost:8000 --endpoint /v1/chat/completions \
   --endpoint-type chat --streaming \
   --model deepseek-ai/DeepSeek-V4-Pro \
   --tokenizer "$TOKENIZER_PATH" --tokenizer-trust-remote-code \
-  --apply-chat-template --max-context-length 1048576 \
   --concurrency 256 --benchmark-duration 3600 \
   --stats-interval 30 --random-seed 42 \
   --failed-request-threshold 0.10 \
   --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
-  --warmup-requests-per-lane 1 --warmup-grace-period 3600 \
+  --warmup-requests-per-lane 10 \
   --trace-idle-gap-cap-seconds 300 \
+  --agentic-warmup-grace-period 1800 \
   --use-server-token-count --no-gpu-telemetry \
   --num-dataset-entries 393 --slice-duration 1.0 \
-  --output-artifact-dir ./aiperf-c256-ep8-mega-mp-dpsticky \
   --public-dataset semianalysis_cc_traces_weka_062126
 ```
 
-The AIPerf environment derives `X-Session-ID` from each trajectory's
-correlation ID. Use the same AIPerf build and warmup count for comparisons.
-Mandatory primers and one warmup request per lane run before the 3,600 s
-measurement; the 3,600 s warmup grace period is a timeout, not a fixed wait.
-Completion/drain time can extend the total runtime beyond the measurement.
+MP uses the shared CPU limit configured above. The legacy
+`lmcache_offload` SLOT-sidecar tuning and measurements below do not apply
+to this native-state MP configuration.
 
-DSpark K3 with **synthetic acceptance length 3.01** is a performance setup.
-Remove `--spec-decode-acceptance-length 3.01` on both servers before accuracy
-evaluation; this benchmark does not validate output correctness.
-
-### Verify the MP and EP paths
-
-Check for Mega capacity construction, `EPLB runtime initialized`, and
-`LMCache MP native state registered` in the P log. Record EPLB rebalance events.
-D should have neither EPLB initialization nor MP registration, and neither
-server should report TBO enabled. Confirm the actual router command uses
-`dp_sticky` for both roles and that requests carry `X-Session-ID`.
-
-MP registration proves attachment. CPU cache reuse requires nonzero successful
-load/restore activity in the MP and engine metrics. Record GPU and CPU hits
-separately: a combined cache-hit rate is not a GPU-only hit rate.
-
-## Legacy LMCache offload tuning
-
-This section records the older `multi` / `lmcache_offload` connector and
-its historical measurements. Its SLOT sidecar knobs and per-worker CPU
-capacity do not configure the native-state MP tier used above.
+## The offload settings that matter
 
 Both default to values this workload cannot live with, and neither is set by the
 reference scripts. They are the two knobs that moved the needle most.
@@ -660,11 +584,7 @@ with prefill rather than serving it. Output-per-user drops from 56.2 to 35.1
 tok/s over the same move — this trades interactivity for throughput rather than
 being free.
 
-## Client — TP and DP concurrency 1–128
-
-Use the dedicated client command above for the EP8 + MP + DP sticky c=256
-configuration. This command retains the historical warmup count for lower
-concurrencies.
+## Client
 
 ```bash
 # Matching 0813 tokenizer files must be accessible on this host.
@@ -695,13 +615,10 @@ anything shorter unless you pass `--unsafe-override`, which marks the run
 
 Budget warmup separately: mandatory primers plus
 `--warmup-requests-per-lane × lanes` are not covered by
-`--benchmark-duration`. The lower-concurrency command uses 10 per lane; the c=256 command uses 1.
-Compare runs with the same warmup setting.
+`--benchmark-duration`. The current setting is 10 per lane; compare runs with
+the same warmup setting.
 
-## Legacy offload log checks
-
-These PAGE+SLOT sidecar checks apply to the legacy offload connector only.
-Use the MP checks in the c=256 section for the current configuration.
+## What to watch in the prefill log
 
 ```bash
 grep -c 'page_visibility_timeout'    server.log   # must be 0
@@ -723,8 +640,7 @@ tokens, so it is dominated by prefix-cache reads rather than compute. `x` is
 AIPerf's `Output Token Throughput Per User` at p90.
 
 The historical rows used the earlier model/MTP and router configuration,
-with memory fraction 0.75 prefill / 0.70 decode. They do not measure the
-EP8 + Mega + EPLB + MP + DP sticky configuration documented above.
+with memory fraction 0.75 prefill / 0.70 decode.
 
 With 0813 + `dspark` at c=128, independent P/D ranks, P cache-aware,
 and **prefill TBO disabled** (the historical configuration):
@@ -743,11 +659,11 @@ with D cache-aware. The latter is an extrapolation, not a completed 3,600 s run.
 | 256 | DP | defaults | 21,599 | 56.2 | 31.0 ms | 192.8 s | 91.0% |
 | 256 | DP | **tuned** | **30,686** | 35.1 | 34.3 ms | **36.0 s** | **94.6%** |
 
-The two c=256 rows compare the legacy connector with and without its tuned
-offload settings: `defaults` is `max_pending_saves=2` and
+The two c=256 rows are the same run with and without the offload settings in
+this recipe: `defaults` is `max_pending_saves=2` and
 `slot_sidecar_staging_slots=1`, `tuned` is 8 and 4.
 
-The c=64 and c=128 rows carry no offload tier at all, so the legacy offload tuning
+The c=64 and c=128 rows carry no offload tier at all, so the offload settings
 section does not apply to them.
 
 Three caveats on that pair. The tuned run sampled a longer trace
@@ -768,14 +684,12 @@ throughput, because decode was never the constraint.
 ## Extending past 1P1D
 
 Both `--prefill` and `--decode` accept repeats, so the router line extends to
-xPyD. Keep `--dp-aware` and `--atom-pd-rank-mapping-policy none` for independent
-P/D rank selection. The 64–128 recipe uses cache-aware with thresholds 20/2;
-the c=256 EP8 + MP recipe uses DP sticky and a stable session header.
+xPyD. Keep `--dp-aware`, both cache-aware policies, thresholds 20/2, and
+`--atom-pd-rank-mapping-policy none` for additional DP workers.
 
-Each P node needs its own local MP server; loopback endpoints and the shared
-L1 cache are node-local. A prefix in one node's CPU cache is not automatically
-available on another. Verify matched-rail reachability across every P/D node
-pair and remeasure locality and throughput when adding workers.
+Each prefill node owns a private `LocalCPUBackend`; a prefix saved on one is
+invisible to the others. Cache-aware routing preserves locality when load
+permits. Verify matched-rail reachability across every P/D node pair.
 
 ## V4 cache and graph flags
 
@@ -788,10 +702,9 @@ The server commands use the following V4 cache and graph flags:
 
 ## If the servers OOM at startup
 
-The TP and c=64–128 commands use the default memory utilization; c=256
-explicitly uses 0.75 on P and 0.70 on D. If startup runs out of memory, adjust
-`--gpu-memory-utilization` for the affected node; registration and workspace
-requirements vary by cluster.
+The server commands use the default memory utilization. If startup runs out of
+memory, set `--gpu-memory-utilization` for the affected node; registration and
+workspace requirements vary by cluster.
 
 The Crusoe MI355X cluster these numbers came from also needed a GPU-memory
 registration workaround:
