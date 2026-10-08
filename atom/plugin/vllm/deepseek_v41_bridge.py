@@ -492,10 +492,39 @@ def bind_deepseek_v41_proxy_cache(
 
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 
-    physical = proxy.kv_cache.permute(1, 0, 2, 3, 4)
+    # vLLM hands this back in one of two ranks, and the difference is which
+    # side applied `get_kv_cache_stride_order`. Through 0.28 the tensor keeps
+    # the declared `(2, num_blocks, ...)` and the permute below is what makes
+    # one block's bytes contiguous. 0.31 returns it already block-major and
+    # without the leading K/V pair: `(num_blocks, num_kv_heads, block_size,
+    # head_size)`, stride[0] == block_size * head_size. Rank is the only thing
+    # that distinguishes them, so it is what this reads -- and the byte check
+    # further down is left to judge the size, rather than scaling anything
+    # here on the assumption that the missing 2 means what it looks like.
+    if proxy.kv_cache.dim() == 5:
+        physical = proxy.kv_cache.permute(1, 0, 2, 3, 4)
+    elif proxy.kv_cache.dim() == 4:
+        physical = proxy.kv_cache
+    else:
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy KV cache has an unexpected rank "
+            f"{proxy.kv_cache.dim()} (shape {tuple(proxy.kv_cache.shape)}); "
+            "this bridge knows the 5-dim pre-0.31 layout and the 4-dim "
+            "block-major one 0.31 returns"
+        )
     if not physical.is_contiguous():
         raise ValueError("DeepSeek-V4.1 proxy cache must be block-major contiguous")
-    raw = physical.reshape(-1)
+    # The arena is the whole allocation, not the view over it. Through 0.28
+    # those are the same tensor. 0.31 builds the view from the block count the
+    # KV-cache manager will hand out (`make_kv_cache_view`), which is the count
+    # AFTER `deepseek_v41_state_reserve_patch` withheld the STATE tail -- so
+    # the tail is present in the allocation and absent from the view, and
+    # sizing from `view.numel()` reports a pool short by exactly the reserve
+    # while the bytes are sitting right there. Read the storage instead, which
+    # is the same number on both versions.
+    storage = proxy.kv_cache.untyped_storage()
+    raw = torch.empty(0, dtype=torch.uint8, device=proxy.kv_cache.device)
+    raw.set_(storage, 0, (storage.nbytes(),))
     if raw.storage_offset() % ATOM_DEEPSEEK_V41_PROXY_ALIGNMENT:
         raise RuntimeError(
             f"DeepSeek-V4.1 proxy KV storage offset {raw.storage_offset()} is not "
@@ -529,10 +558,11 @@ def bind_deepseek_v41_proxy_cache(
         raise RuntimeError(
             "DeepSeek-V4.1 proxy pool is too small: "
             f"{raw.numel()} bytes for {pages} PAGEs + {num_slots} STATE slots "
-            f"({required} bytes needed). The STATE tail reserve "
-            f"({v41_proxy_state_reserve_blocks(vllm_config)} blocks) was not "
-            "applied -- apply_vllm_v41_state_reserve_patch() must run before "
-            "vLLM determines the KV-cache config."
+            f"({required} bytes needed, short by {required - raw.numel()}). "
+            f"The STATE tail is {v41_proxy_state_reserve_blocks(vllm_config)} "
+            "blocks. Report, do not diagnose: this message once named the "
+            "reserve patch as the cause, which sent a reader hunting a patch "
+            "that had in fact run -- the shortfall had another source."
         )
 
     builder.num_blocks = pages
