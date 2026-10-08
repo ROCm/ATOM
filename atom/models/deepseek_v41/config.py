@@ -413,8 +413,11 @@ def validate_runtime_config(config):
             # transport is not an ATOM connector at all -- it is vLLM's own
             # `kv_connector`, and feeding that string to ATOM's factory is a
             # category error -- so it is named against its own allow-list.
-            "KV transfer other than lmcache_mp (native), or any KV connector "
-            "at all (vLLM plugin: none of them carries CSA2 STATE yet)",
+            (
+                "KV transfer other than lmcache_mp (native), or any KV "
+                "connector at all (vLLM plugin: none of them carries CSA2 "
+                "STATE yet)"
+            ),
             _kv_transfer_unsupported(config, on_vllm_plugin),
         ),
         ("RapidServe", config.enable_rapidserve),

@@ -328,10 +328,10 @@ def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
     an offset past the absolute end of the paged region), which is exactly the
     layout the patch exists to stop vLLM from recycling out from under.
     """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _V4_PROXY_LAYER_MARKERS
     from atom.plugin.vllm.deepseek_v41_bridge import (
         ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
     )
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import _V4_PROXY_LAYER_MARKERS
 
     assert any(
         marker in ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
@@ -348,14 +348,15 @@ def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
     lifts the refusal has to lift this too, and this test is what says so.
     """
     import re
+    from pathlib import Path
 
-    src = open("atom/plugin/vllm/deepseek_v41_bridge.py").read()
+    src = Path("atom/plugin/vllm/deepseek_v41_bridge.py").read_text()
     assert re.search(r"speculative_tokens=0", src), (
         "v41_proxy_geometry no longer hardcodes speculative_tokens=0 -- if "
         "speculative decoding is now supported, drop this test; if not, the "
         "pool is being sized from an unverified source"
     )
-    platform = open("atom/plugin/vllm/platform.py").read()
+    platform = Path("atom/plugin/vllm/platform.py").read_text()
     assert "does not support speculative" in platform, (
         "the hardcoded speculative_tokens=0 is only safe while the platform "
         "refuses speculative decoding, and that refusal is gone"

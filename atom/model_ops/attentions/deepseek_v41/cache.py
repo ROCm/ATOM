@@ -84,7 +84,15 @@ class PagedAttentionCache:
         return backing[:size]
 
     def __init__(
-        self, geometry, pages, slots, device, max_tokens=0, workspace=None, *, backing=None
+        self,
+        geometry,
+        pages,
+        slots,
+        device,
+        max_tokens=0,
+        workspace=None,
+        *,
+        backing=None,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
