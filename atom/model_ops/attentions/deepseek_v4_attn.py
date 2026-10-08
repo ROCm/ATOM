@@ -429,6 +429,49 @@ class MixedViewUnslicedField(RuntimeError):
     """
 
 
+def _mixed_carrier_spans(
+    prefill_meta,
+    decode_meta,
+    n_p_seqs: int,
+    n_d_seqs: int,
+    n_p_tokens: int,
+    running_bs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A mixed carrier's whole-batch `(cu_seqlens_q, state_slot_out)`.
+
+    The target forward never reads these on a mixed step: each segment runs
+    under `_segment_forward_context`, which swaps in its own metadata. What
+    reads the carrier is everything around it -- the LM head's mixed gather,
+    and the DSpark drafter (`write_context_kv`, `Drafter.prepare_inputs`, the
+    block pass), which index the whole `[prefill | decode]` batch by request.
+    Built on the device from the two published halves: no H2D, so nothing is
+    published twice.
+
+    `cu_seqlens_q` is the prefill spans, then the decode spans shifted past the
+    prefill tokens; its first `n_p_seqs + 1` entries ARE the prefill spans,
+    which is all the LM head reads. `state_slot_out` is per request, padded to
+    `running_bs` with 0 as `prepare_decode` pads it: under DP `running_bs` is
+    the group's ladder rung and can exceed this rank's batch, and the draft
+    block runs at that width and masks the pad rows' writes itself
+    (`prepare_block`).
+    """
+    cu_seqlens_q = torch.cat(
+        [
+            prefill_meta.cu_seqlens_q[: n_p_seqs + 1],
+            decode_meta.cu_seqlens_q[1 : n_d_seqs + 1] + n_p_tokens,
+        ]
+    )
+    n = n_p_seqs + n_d_seqs
+    state_slot_out = torch.zeros(
+        max(running_bs, n),
+        dtype=prefill_meta.state_slot_out.dtype,
+        device=prefill_meta.state_slot_out.device,
+    )
+    state_slot_out[:n_p_seqs] = prefill_meta.state_slot_out[:n_p_seqs]
+    state_slot_out[n_p_seqs:n] = decode_meta.state_slot_out[:n_d_seqs]
+    return cu_seqlens_q, state_slot_out
+
+
 class _MixedDecodeView:
     """Thin read-only view exposing the DECODE rows ``[n_prefill:]`` of a mixed
     batch as if they were a standalone decode batch, so the unmodified
@@ -517,6 +560,27 @@ class _MixedDecodeView:
         self.num_cached_tokens = _nct[n_prefill_seqs:] if _nct is not None else _nct
         _lbn = getattr(batch, "last_block_num_tokens", None)
         self.last_block_num_tokens = _lbn[n_prefill_seqs:] if _lbn is not None else _lbn
+        # Speculative-decode per-row fields. No current consumer on the decode
+        # half reads them, but a view either slices a per-row field or raises
+        # on it, and these carry the decode rows' drafts and verify outcome.
+        _ssd = getattr(batch, "scheduled_spec_decode_tokens", None)
+        self.scheduled_spec_decode_tokens = (
+            _ssd[n_prefill_seqs:] if _ssd is not None else _ssd
+        )
+        _nrj = getattr(batch, "num_rejected", None)
+        self.num_rejected = _nrj[n_prefill_seqs:] if _nrj is not None else _nrj
+        _nbn = getattr(batch, "num_bonus", None)
+        self.num_bonus = _nbn[n_prefill_seqs:] if _nbn is not None else _nbn
+        # A TOKEN-axis array, so the per-row length guard in `__getattr__` does
+        # not recognise it and would pass the whole batch's ids through.
+        _stk = getattr(batch, "scheduled_tokens", None)
+        self.scheduled_tokens = (
+            _stk[batch.total_tokens_num_prefill :] if _stk is not None else _stk
+        )
+        # Where the decode rows start in the full batch. For per-row arrays
+        # that live OFF the batch and so cannot be sliced here -- the runner's
+        # `tokenID_processor.num_rejected`, which `prepare_decode` reads.
+        self.row_offset = n_prefill_seqs
         self.total_seqs_num_decode = batch.total_seqs_num_decode
         self.total_tokens_num_decode = batch.total_tokens_num_decode
         self.total_seqs_num_prefill = 0
@@ -2786,10 +2850,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         decode_view = _MixedDecodeView(batch, n_p_seqs)
         # prepare_decode READS var["cu_seqlens_q"] (it never writes it) as a
         # device view, and on a mixed step `publish_cu_seqlens_q` has already
-        # published the DECODE segment's spans into it (1 token per decode seq,
-        # no MTP in mixed) -- so swa_write / paged-decode index the decode kv
-        # from 0 instead of running off the end (GPU OOB in swa_write). The
-        # host check is what stands between a full-batch cumsum and that OOB.
+        # published the DECODE segment's spans into it (anchor + drafts per
+        # decode seq) -- so swa_write / paged-decode index the decode kv from 0
+        # instead of running off the end (GPU OOB in swa_write). The host check
+        # is what stands between a full-batch cumsum and that OOB.
+        #
+        # Every decode row is exactly `num_spec_step + 1` wide here, so the
+        # check can be a product: DSpark's ragged / q-bucket shrink never runs
+        # on a mixed step (`_dspark_apply_q_bucket` returns before either on
+        # any batch with prefill tokens). If that guard moves, this check must
+        # become a comparison against the real per-row lengths.
         decode_max_q = batch.num_spec_step + 1
         if var["cu_seqlens_q"].np[n_d_seqs] != n_d_seqs * decode_max_q:
             raise RuntimeError(
@@ -2819,11 +2889,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             [prefill_positions[:n_p_tokens], decode_positions[:n_d_tokens]]
         )
 
+        # ---- Whole-batch views on the carrier, for readers AFTER the forward.
+        cu_seqlens_q, state_slot_out = _mixed_carrier_spans(
+            prefill_meta, decode_meta, n_p_seqs, n_d_seqs, n_p_tokens, bs
+        )
+
         merged = AttentionMetaData_DSV4(
-            # Surface prefill cu_seqlens_q so the ParallelLMHead mixed-batch
-            # gather (embed_head.py) finds per-prefill-seq last-token indices
-            # without reaching into the nested prefill metadata.
-            cu_seqlens_q=prefill_meta.cu_seqlens_q,
+            cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=None,
             max_seqlen_q=max(prefill_meta.max_seqlen_q, decode_meta.max_seqlen_q),
             max_seqlen_k=max(prefill_meta.max_seqlen_k, decode_meta.max_seqlen_k),
@@ -2835,6 +2907,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         merged.prefill_attn_metadata = prefill_meta
         merged.decode_attn_metadata = decode_meta
+        merged.state_slot_out = state_slot_out
         # Marker the forward reads to take the mixed branch.
         merged.is_mixed = True
         merged.num_prefill_tokens = n_p_tokens
@@ -2842,6 +2915,33 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         merged.num_decode_tokens = n_d_tokens
         merged.num_decode_seqs = n_d_seqs
         return merged, positions
+
+    def commit_speculative_state(self, metadata, last_token_indices):
+        """Hand a mixed step's whole-batch ring slots to a REPLAYED draft block.
+
+        The DSpark block reads `state_slot_out[:running_bs]` to find each
+        request's draft window. Run eager it reads the carrier's merged tensor
+        (`_mixed_carrier_spans`); REPLAYED it reads the address its capture
+        saw -- this buffer, which on a mixed step holds only the decode half's
+        slots, staged at rows `[0:n_decode)`, so a replayed block would read
+        its windows from the wrong requests.
+
+        Measured on V4-Flash-DSpark tp4 + TBO, mnbt 2048: without this copy
+        every draft proposed on a mixed step is accepted at 0.11 per row (vs
+        ~3.1), overall acceptance ~7%; with it, 65%. (The 12% seen with only
+        this copy was a second, independent bug: `drafter_aux_capture`.)
+
+        A device copy, after the target forward's reads of this buffer and
+        before the draft's, both on this stream; the next step's publish
+        overwrites it. Not an H2D, so it is no second publication of the host
+        source this epoch.
+        """
+        del last_token_indices
+        if not getattr(metadata, "is_mixed", False):
+            return
+        slots = metadata.state_slot_out
+        buf = self.model_runner.forward_vars["v4_meta_state_slot_out"].gpu
+        buf[: slots.shape[0]].copy_(slots)
 
     @h2d_producer("prefill", "positions", "v4_state", runner="model_runner")
     def prepare_decode(
@@ -2883,6 +2983,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if not batch.is_dummy_run and max_seqlen_q > 1:
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
+                # One entry per row of the WHOLE batch, and it lives on the
+                # runner, not the batch -- so the mixed decode view cannot slice
+                # it and says where its rows start instead.
+                row0 = getattr(batch, "row_offset", 0)
+                num_rejected = num_rejected[row0 : row0 + len(context_lens_np)]
                 context_lens_np = context_lens_np - num_rejected.astype(np.int32)
         # DSpark q-shrink: anchor the forwarded q tokens to the draft span HEAD
         # (ctx-full_q), not the tail, so they stay in [ctx-full_q .. ctx-1] (never

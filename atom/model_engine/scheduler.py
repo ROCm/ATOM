@@ -656,6 +656,10 @@ class Scheduler:
         # (which only drafts for handoff to the decode node).
         pp_size = getattr(config, "pipeline_parallel_size", 1)
         self.spec_decode_local = self.use_spec and pp_size == 1
+        # Draft rows each decode seq forwards: anchor + drafts if verifying
+        # locally, anchor alone otherwise. One number for the decode loop's
+        # spend and the mixed decode-first reserve, which must agree.
+        self.decode_spec_width = self.mtp_k if self.spec_decode_local else 0
         if self.use_spec and not self.spec_decode_local:
             logger.info(
                 "Speculative decoding: drafting only (pipeline_parallel_size=%d). "
@@ -1699,12 +1703,15 @@ class Scheduler:
         # identical to decode-first for mixed-batch formation. Only active when
         # mixed batching is enabled; flag-off => reserve 0 => byte-identical to
         # the old prefill-first behavior.
+        # Reserved at what the decode loop below actually spends per seq
+        # (`decode_spec_width + 1`), not at `mtp_k + 1`: the two differ under
+        # PP, where the loop spends no draft rows.
         decode_token_reserve = 0
         if self.enable_mixed_prefill_decode:
             n_decode_inflight = sum(1 for s in self.running if not s.is_partial_prefill)
             n_decode_inflight = min(n_decode_inflight, self.max_num_seqs)
             decode_token_reserve = min(
-                n_decode_inflight * (self.mtp_k + 1),
+                n_decode_inflight * (self.decode_spec_width + 1),
                 self.max_num_batched_tokens,
             )
         prefill_budget = self.max_num_batched_tokens - decode_token_reserve
@@ -2209,8 +2216,7 @@ class Scheduler:
         # the prefill tokens scheduled this step, and they share the same budget.
         # A decode-only counter is equivalent on a pure-decode step but lets a
         # mixed step overshoot.
-        # anchor + drafts if verifying locally, anchor alone otherwise.
-        spec_width = self.mtp_k if self.spec_decode_local else 0
+        spec_width = self.decode_spec_width
         tokens_per_decode_seq = spec_width + 1
         num_new_tokens = spec_width + 1
         remote_kv_blocks: set[int] = set()
@@ -2405,7 +2411,7 @@ class Scheduler:
             total_seqs_num_prefill=num_seqs_prefill,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
-            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            num_spec_step=self.decode_spec_width,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             num_cached_tokens=num_cached_tokens_list,
             # None on a pure-decode batch, where `produces_output` answers from
@@ -3391,7 +3397,7 @@ class Scheduler:
         need_placeholder = is_deferred_out or self.spec_decode_local
         # Drafts occupy trailing slots only on an engine that verifies them; a
         # drafting-only engine's tokens are all real.
-        num_placeholder_width = self.mtp_k if self.spec_decode_local else 0
+        num_placeholder_width = self.decode_spec_width
         num_placeholder = self.mtp_k
         if is_deferred_out:
             num_placeholder += 1

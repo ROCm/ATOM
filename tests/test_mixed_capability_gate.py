@@ -17,6 +17,8 @@ stay as backstops, but every one of them is now a `raise`.
 import ast
 import pathlib
 
+from types import SimpleNamespace
+
 import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -121,10 +123,36 @@ class _FakeConfig:
 
     _validate_mixed_prefill_decode = None  # bound below
 
-    def __init__(self, *, enabled=True, hf=None, spec=None):
+    def __init__(
+        self,
+        *,
+        enabled=True,
+        hf=None,
+        spec=None,
+        pp=1,
+        max_num_seqs=256,
+        max_num_batched_tokens=16384,
+        cudagraph_mode=None,
+    ):
         self.enable_mixed_prefill_decode = enabled
         self.hf_config = hf if hf is not None else _FakeHF()
         self.speculative_config = spec
+        self.pipeline_parallel_size = pp
+        self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
+
+
+def _v4_hf():
+    hf = _FakeHF(kv_lora_rank=512)
+    hf.model_type = "deepseek_v4"
+    return hf
+
+
+def _spec(method="dspark", k=7):
+    # Not a real SpeculativeConfig: its __post_init__ fetches the draft's HF
+    # config. The validator reads only these two fields.
+    return SimpleNamespace(method=method, num_speculative_tokens=k)
 
 
 def _bind():
@@ -141,11 +169,52 @@ def test_validator_runs_against_a_real_config_surface():
     _FakeConfig()._validate_mixed_prefill_decode()
 
 
-def test_validator_refuses_speculative_decode():
+def test_validator_allows_v4_dspark():
+    """The one speculative combination the mixed split is wired for."""
     _bind()
-    cfg = _FakeConfig(spec=object())
-    with pytest.raises(ValueError, match="speculative decoding"):
+    _FakeConfig(hf=_v4_hf(), spec=_spec())._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize("method", ["mtp", "eagle3"])
+def test_validator_refuses_other_spec_methods(method):
+    _bind()
+    cfg = _FakeConfig(hf=_v4_hf(), spec=_spec(method))
+    with pytest.raises(ValueError, match=f"speculative decoding via '{method}'"):
         cfg._validate_mixed_prefill_decode()
+
+
+def test_validator_refuses_spec_on_dense_mla():
+    """Dense MLA's `prepare_mixed` stages one token per decode row."""
+    _bind()
+    cfg = _FakeConfig(spec=_spec())
+    with pytest.raises(ValueError, match="speculative decoding on the"):
+        cfg._validate_mixed_prefill_decode()
+
+
+def test_validator_refuses_spec_under_pipeline_parallel():
+    _bind()
+    cfg = _FakeConfig(hf=_v4_hf(), spec=_spec(), pp=2)
+    with pytest.raises(ValueError, match="pipeline parallel"):
+        cfg._validate_mixed_prefill_decode()
+
+
+def test_validator_warns_when_a_full_decode_set_eats_the_step(caplog):
+    """256 seqs x (7+1) = 2048 reserved: all of a 2048-token step."""
+    _bind()
+    cfg = _FakeConfig(
+        hf=_v4_hf(), spec=_spec(k=7), max_num_seqs=256, max_num_batched_tokens=2048
+    )
+    with caplog.at_level("WARNING", logger="atom"):
+        cfg._validate_mixed_prefill_decode()
+    assert "leaving prefill no budget" in caplog.text
+
+
+def test_validator_is_quiet_when_prefill_keeps_budget(caplog):
+    _bind()
+    cfg = _FakeConfig(hf=_v4_hf(), spec=_spec(k=7), max_num_batched_tokens=16384)
+    with caplog.at_level("WARNING", logger="atom"):
+        cfg._validate_mixed_prefill_decode()
+    assert "leaving prefill no budget" not in caplog.text
 
 
 def test_validator_refuses_sparse_mla():
@@ -211,8 +280,43 @@ def test_validator_is_inert_when_the_flag_is_off():
 def test_all_reasons_are_reported_not_just_the_first():
     """A user fixing one conflict should not discover the next on relaunch."""
     _bind()
-    cfg = _FakeConfig(hf=_FakeHF(index_topk=2048), spec=object())
+    cfg = _FakeConfig(hf=_FakeHF(index_topk=2048), spec=_spec("mtp"))
     with pytest.raises(ValueError) as e:
         cfg._validate_mixed_prefill_decode()
     assert "speculative decoding" in str(e.value)
     assert "sparse MLA" in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "mode,refused",
+    [
+        ("FULL", False),  # the CLI default
+        ("NONE", False),
+        ("PIECEWISE", True),  # what the CI DSpark config runs
+        ("FULL_AND_PIECEWISE", True),
+        ("AF_PIECEWISE", True),
+    ],
+)
+def test_v4_refuses_every_piecewise_compiled_mode(mode, refused):
+    """Keyed off `requires_piecewise_compilation`, the predicate V4's forward
+    routes on -- not off one enum member."""
+    _bind()
+    from atom.config import CUDAGraphMode
+
+    cfg = _FakeConfig(hf=_v4_hf(), cudagraph_mode=CUDAGraphMode[mode])
+    if refused:
+        with pytest.raises(ValueError, match=f"--cudagraph-mode {mode} on DeepSeek-V4"):
+            cfg._validate_mixed_prefill_decode()
+    else:
+        cfg._validate_mixed_prefill_decode()
+
+
+def test_piecewise_refusal_is_v4_only():
+    """Scoped to V4, whose narrow split order was seen to take mixed batches.
+    Whether dense MLA under PIECEWISE has the same gap is not established;
+    widening this refusal needs that evidence first."""
+    _bind()
+    from atom.config import CUDAGraphMode
+
+    cfg = _FakeConfig(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+    cfg._validate_mixed_prefill_decode()

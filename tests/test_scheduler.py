@@ -3229,3 +3229,45 @@ class TestMixedBatch:
         assert batch.total_seqs_num_prefill == 1
         assert batch.total_seqs_num_decode == 0
         assert batch.is_mixed is False
+
+
+class TestMixedSpecDecodeReserve:
+    """Decode-first reserves what the decode loop spends, `decode_spec_width+1`.
+
+    The reserve used to be written against `mtp_k + 1` while the loop spent
+    `spec_width + 1`; they only agree when this engine verifies locally.
+    """
+
+    def _sched(self, mtp_k, **overrides):
+        return Scheduler(
+            MockConfig(
+                enable_mixed_prefill_decode=True,
+                num_kvcache_blocks=64,
+                max_num_seqs=4,
+                max_num_batched_tokens=16,
+                max_model_len=128,
+                speculative_config=_spec_config(mtp_k),
+                **overrides,
+            )
+        )
+
+    def test_spend_and_reserve_share_one_width(self):
+        assert self._sched(3).decode_spec_width == 3
+        # Drafting-only under PP: no draft rows are forwarded, none reserved.
+        assert self._sched(3, pipeline_parallel_size=2).decode_spec_width == 0
+
+    def test_mixed_step_fills_the_budget_exactly(self, seq_factory):
+        sched = self._sched(3)
+        decode = seq_factory([1, 2, 3, 4])
+        sched.add(decode)
+        sched.schedule()  # prefill
+        decode.num_cached_tokens = decode.num_prompt_tokens
+        decode.append_token(99)
+        sched.add(seq_factory(list(range(10, 40))))  # 30-token prompt: chunked
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        # [prefill chunk | decode row]; the decode row forwards anchor + 3.
+        assert batch.num_scheduled_tokens[1] == 4
+        # 16 - one reserved row of 4 = 12 for prefill, and nothing left over.
+        assert batch.num_scheduled_tokens[0] == 12
+        assert batch.total_tokens_num == 16

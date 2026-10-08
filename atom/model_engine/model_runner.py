@@ -517,24 +517,33 @@ class tokenIDProcessor:
             self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
 
         if is_mixed:
-            # Mixed batch layout: [prefill_tokens | decode_tokens], one token per
-            # decode seq, in batch order -- which matches the decode attention
-            # metadata's row order. MTP / speculative decode with mixed batches
-            # is a separate follow-up.
-            # `raise`, not `assert`: stripped under `python -O`, and what it
-            # guards is the spec layout being read with the wrong token width.
-            # Config._validate_mixed_prefill_decode should have refused this at
-            # launch; reaching here means that table has a gap.
-            if self.use_spec:
-                raise NotImplementedError(
-                    "Mixed prefill+decode batches do not yet support MTP / "
-                    "speculative decode. Disable "
-                    "--enable-mixed-prefill-decode."
-                )
+            # Mixed batch layout: [prefill_tokens | decode_tokens], decode rows
+            # in batch order -- which matches the decode attention metadata's
+            # row order. With speculative decode a decode row forwards anchor +
+            # drafts exactly as in a pure-decode step; a prefill row carries no
+            # drafts and verifies as a 0-draft row (docs/mixed_dspark_design.md).
+            #
             # Both regions start from the scheduler's ids: exact for prefill and
             # for a decode row with nothing deferred; a placeholder the kernel
             # below overwrites for a deferred one.
             self.input_ids.np[:total_tokens] = scheduled_tokens[:total_tokens]
+            n_decode_seqs = batch.total_seqs_num_decode
+            if self.use_spec:
+                if not self.is_deferred_out:
+                    # Same gap as the pure-decode branch: no spec path stages
+                    # drafts without deferred output.
+                    raise NotImplementedError(
+                        "mixed prefill+decode with speculative decode needs "
+                        "deferred output"
+                    )
+                # A prefill row verified nothing last step and rejects nothing
+                # now: 0, as a pure-prefill step reports. Decode rows are
+                # remapped from last step's device status below.
+                self.num_rejected = batch.num_rejected
+                self.num_bonus = batch.num_bonus
+                if self.num_rejected is not None:
+                    self.num_rejected[:total_reqs_prefill] = 0
+                    self.num_bonus[:total_reqs_prefill] = 0
 
             # Non-deferred OR first step (no prior batch to gather from): decode
             # inputs come straight from scheduled_tokens.
@@ -543,18 +552,39 @@ class tokenIDProcessor:
 
             # Deferred path: each decode seq's input is the token sampled for it
             # last step, kept on-GPU in `prev_token_ids` (ordered by
-            # prev_batch.req_ids). A decode seq is ALWAYS in prev_batch in steady
-            # state (it decoded last step); a genuinely-new decode row (just
-            # finished prefill elsewhere) keeps its staged id. Prefill rows are
-            # never gathered: the kernel only sees the decode region.
-            n_decode_seqs = batch.total_seqs_num_decode
+            # prev_batch.req_ids), and under spec its drafts, in
+            # `draft_token_ids` at the same row. A decode seq is ALWAYS in
+            # prev_batch in steady state -- as a decode row, or as the prefill
+            # row that just finished its last chunk; a genuinely-new decode row
+            # keeps its staged ids. Mapped over the decode rows only, NOT via
+            # `get_token_locations`: a chunked prefill's middle chunk is in
+            # prev_batch too, and would be taken for a carried-over decode.
             prev_id_to_idx = {rid: j for j, rid in enumerate(self.prev_batch.req_ids)}
             src_np = self.decode_src.np[:n_decode_seqs]
             src_np.fill(NEW_SEQUENCE)
+            # Decode-local spans: `publish_cu_seqlens_q` writes the DECODE
+            # segment's on a mixed step, which is exactly the addressing the
+            # kernel wants over the decode region.
+            cu_np = self.runner.forward_vars["cu_seqlens_q"].np[: n_decode_seqs + 1]
+            lens = batch.num_scheduled_tokens[total_reqs_prefill:]
+            remap = self.use_spec and self.prev_rejected_num is not None
+            spec = batch.scheduled_spec_decode_tokens if self.use_spec else None
             for i, rid in enumerate(batch.req_ids[total_reqs_prefill:]):
                 prev_idx = prev_id_to_idx.get(rid)
+                row = total_reqs_prefill + i
                 if prev_idx is not None:
                     src_np[i] = prev_idx
+                    if remap:
+                        self.num_rejected[row] = self.prev_rejected_num[prev_idx]
+                        self.num_bonus[row] = self.prev_bonus_num[prev_idx]
+                elif spec is not None:
+                    # Not in `prev_token_ids`, so the kernel skips it and its
+                    # draft columns come from the scheduler, as in the
+                    # pure-decode path.
+                    n_draft = int(lens[i]) - 1
+                    if n_draft > 0:
+                        s = total_tokens_prefill + int(cu_np[i]) + 1
+                        self.input_ids.np[s : s + n_draft] = spec[row, :n_draft]
             group = (
                 self.runner.h2d_groups["input_ids"]
                 if publication_group is None
@@ -564,16 +594,19 @@ class tokenIDProcessor:
             counts[group.indices["input_ids"]] = total_tokens
             counts[group.indices["decode_src"]] = n_decode_seqs
             group.publish(counts)
-            # `cu_seqlens_q` holds the DECODE segment's spans on a mixed step
-            # (`publish_cu_seqlens_q`), which is exactly the addressing the
-            # kernel wants over the decode region. Eager, so no padded tail.
+            # Eager, so no padded tail: the forward reads exactly the decode
+            # region.
             fill_deferred_decode_ids(
                 self.input_ids.gpu[total_tokens_prefill:],
                 self.runner.forward_vars["cu_seqlens_q"].gpu[: n_decode_seqs + 1],
                 self.decode_src.gpu[:n_decode_seqs],
                 self.prev_token_ids,
-                None,
-                max_tokens_per_seq=1,
+                (
+                    self.draft_token_ids
+                    if self.pre_num_decode_token_per_seq > 1
+                    else None
+                ),
+                max_tokens_per_seq=int(lens.max()) if n_decode_seqs else 1,
                 width=total_tokens_decode,
             )
             # prev_batch / prev_token_ids are advanced by prepare_sampled_ids
@@ -2617,6 +2650,44 @@ class ModelRunner:
         # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
         return int(q_eff)
 
+    def _verify_spans(
+        self, batch: ScheduledBatch
+    ) -> tuple[np.ndarray, np.ndarray, int] | None:
+        """This step's verify layout in LOGIT-row space, or None if it verifies nothing.
+
+        Returns `(sampled_lens, cu_end, shift)`: rows each request samples, their
+        inclusive prefix sum (`cu_num_sampled_tokens`), and the offset from a
+        logit row to its token row. The spec indices are built over logit rows
+        and the draft ids gathered out of `input_ids[shift:]`.
+
+        Pure decode: every token row reaches the LM head, so the two row spaces
+        coincide and `shift` is 0. Mixed: the LM head keeps one row per prefill
+        seq (its last token) then every decode token, so a prefill row is a
+        0-draft request sampling one row, and decode token j sits at logit row
+        `n_p + j` but token row `n_p_tokens + j` -- a constant `n_p_tokens -
+        n_p`. The prefill rows' `(1, 0 drafts)` spans are exactly what
+        `prepare_spec_decode_indices` and the rejection sampler already accept.
+        """
+        if not hasattr(self, "drafter") or batch.is_dummy_run:
+            return None
+        n_p = batch.total_seqs_num_prefill
+        if n_p == 0:
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            return lens, cu[1:], 0
+        if not getattr(batch, "is_mixed", False):
+            return None  # pure prefill: sampled without verification
+        lens = np.concatenate(
+            [
+                np.ones(n_p, dtype=np.int32),
+                np.asarray(batch.num_scheduled_tokens[n_p:], dtype=np.int32),
+            ]
+        )
+        return (
+            lens,
+            np.cumsum(lens, dtype=np.int32),
+            batch.total_tokens_num_prefill - n_p,
+        )
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
@@ -2648,17 +2719,13 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        if is_mixed and hasattr(self, "drafter") and not batch.is_dummy_run:
-            raise NotImplementedError(
-                "Mixed prefill+decode batches do not yet support MTP / speculative "
-                "decode (P2-M4 follow-up). Disable --enable-mixed-prefill-decode."
-            )
-        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
-            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+        spans = self._verify_spans(batch)
+        if spans is not None:
+            lens, cu_end, shift = spans
             # Inside the staging window: without the token group it publishes
             # the indices itself. Packed indices already share the token upload.
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                lens, cu[1:], input_ids, prepared_indices=spec_decode_indices
+                lens, cu_end, input_ids[shift:], prepared_indices=spec_decode_indices
             )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
@@ -2831,10 +2898,11 @@ class ModelRunner:
             token_group.counts[token_group.indices["cu_seqlens_q"]] = cu_count
             spec_group = self.h2d_groups.get("spec_decode")
             if spec_group is not None:
-                if batch.total_tokens_num_prefill == 0 and not batch.is_dummy_run:
-                    _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+                spans = self._verify_spans(batch)
+                if spans is not None:
+                    lens, cu_end, _ = spans
                     spec_decode_indices = self.drafter.prepare_spec_decode_indices(
-                        lens, cu[1:], token_group
+                        lens, cu_end, token_group
                     )
                 else:
                     # A preceding decode may have filled these counts. Prefill
@@ -3339,6 +3407,38 @@ class ModelRunner:
         return True
 
     @_profile_runner_stage
+    def _settle_mixed_verdict(
+        self,
+        batch: ScheduledBatch,
+        num_reject_tokens: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> None:
+        """Re-express a mixed step's verdict in the batch's TOKEN rows, in place.
+
+        The rejection verdict is computed over LOGIT rows: `anchors` is each
+        request's bonus logit row minus its drafts plus its accepts, and
+        `num_reject` is `mtp_k - accepted`. On a pure-decode step logit rows are
+        token rows. On a mixed step the LM head keeps one row per prefill seq
+        (its last token) and then every decode token, so:
+
+        * a prefill row (they lead the batch) verified a 0-draft span. It
+          rejects nothing, as a pure-prefill step reports it -- left at
+          `mtp_k`, the next step rolls that request's ctx back K positions the
+          moment it decodes, shifting its positions and KV slots, and the
+          acceptance stats count K rejected drafts it never had. Its anchor is
+          its chunk's last TOKEN row, not its logit row.
+        * a decode row's logit row `n_p + j` is token row `n_p_tokens + j`.
+        """
+        if not getattr(batch, "is_mixed", False):
+            return
+        n_p = batch.total_seqs_num_prefill
+        num_reject_tokens[:n_p] = 0
+        # The carrier's whole-batch spans: its first `n_p + 1` entries are the
+        # prefill segment's.
+        cu = get_forward_context().attn_metadata.cu_seqlens_q
+        anchors[:n_p] = cu[1 : n_p + 1] - 1
+        anchors[n_p:] += batch.total_tokens_num_prefill - n_p
+
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -3418,6 +3518,7 @@ class ModelRunner:
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
                 verdict = _g.broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
+            self._settle_mixed_verdict(batch, num_reject_tokens, anchors)
             next_token_locs = num_bonus_tokens
 
         # Drafter input must agree across TP ranks.

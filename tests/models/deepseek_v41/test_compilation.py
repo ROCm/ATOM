@@ -146,11 +146,15 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
     model.layers[0].register_forward_pre_hook(pre_hook)
     with torch.inference_mode():
-        for rows, shift, empty in [
-            (6, 1.0, False),
-            (17, 3.0, False),
-            (4, -2.0, False),
-            (6, 0.0, True),
+        # `offset` is the TBO micro-batch's token offset. It changes between
+        # calls of ONE compiled graph: an offset read inline in the traced hook
+        # bakes to its trace-time value, so a later ubatch would write from
+        # row 0 over its partner's rows.
+        for rows, shift, empty, offset in [
+            (6, 1.0, False, 0),
+            (17, 3.0, False, 5),
+            (4, -2.0, False, 0),
+            (6, 0.0, True, 2),
         ]:
             step = Step(rows, shift, empty)
             embeddings = Rows()
@@ -172,7 +176,7 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                 forward_context.ForwardContext(
                     attn_metadata=metadata,
                     no_compile_layers=config.compilation_config.static_forward_context,
-                    context=SimpleNamespace(is_draft=False, ubatch_token_offset=0),
+                    context=SimpleNamespace(is_draft=False, ubatch_token_offset=offset),
                 ),
             )
             tokens = torch.arange(rows, device="cuda", dtype=torch.int64)
@@ -191,7 +195,7 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                 expected = expected + mask.T * 10
             torch.testing.assert_close(actual, expected)
             if not empty:
-                torch.testing.assert_close(aux[:rows], expected_embed)
+                torch.testing.assert_close(aux[offset : offset + rows], expected_embed)
             assert not step.selected
             assert embeddings.events == ([] if empty else ["stage", "join"])
     if level == 3:

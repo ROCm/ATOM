@@ -808,7 +808,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         """Publish this step's `cu_seqlens_q`. The only writer.
 
         A mixed batch's attention runs as two segments, and this buffer carries
-        the DECODE segment's spans (1 token per row, from 0): that is what the
+        the DECODE segment's spans (anchor + drafts per row, from 0): that is what the
         decode builder reads, and publishing it here, once, keeps the ledger to
         one upload per epoch. The prefill segment's spans go to its private
         bank in `mixed_prefill_bank_active`.
