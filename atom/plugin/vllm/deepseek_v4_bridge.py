@@ -1163,6 +1163,32 @@ def _is_pure_uniform_decode(common_attn_metadata, decode_q: int) -> bool:
     return max_q == decode_q and num_tokens == decode_q * num_reqs
 
 
+def _indexer_decode_group(lens, decode_q: int, is_prefilling=None) -> tuple[int, int]:
+    """Rows of a prefill-classified step that take the paged decode indexer.
+
+    The leading contiguous run of rows sharing the first row's length, when
+    that is a decode / verify length (``<= decode_q``), and that are not still
+    prefilling. A prefilling row of decode length -- the lone last prompt token
+    after a prefill cut, or a one-token extend after a full prefix hit -- is a
+    prefill row to native ATOM, whose prefill forward scores it on the dense
+    ``_score_topk_prefill`` path; here it ends the decode group the same way a
+    longer row does, so the dense group is never empty on a prefill-classified
+    step. Returns ``(num_decodes, decode_next_n)``.
+    """
+    num_reqs = len(lens)
+    if num_reqs == 0 or int(lens[0]) > decode_q:
+        return 0, 1
+    next_n = int(lens[0])
+    stop = np.asarray(lens) != next_n
+    if is_prefilling is not None:
+        pref = is_prefilling[:num_reqs]
+        if isinstance(pref, torch.Tensor):
+            pref = pref.cpu().numpy()
+        stop = stop | np.asarray(pref, dtype=bool)
+    first = np.nonzero(stop)[0]
+    return (int(first[0]) if first.size else num_reqs), next_n
+
+
 def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
     out = np.zeros(len(counts) + 1, dtype=np.int32)
     out[1:] = np.cumsum(counts, dtype=np.int32)
@@ -1628,13 +1654,11 @@ def build_atom_v4_attention_metadata(
         # its `[total_tokens, total_committed]` logits never explode the way
         # they would if every running seq were summed in. `lens` is a CPU numpy
         # array (from `query_start_loc.cpu()`), so this adds no H2D/D2H sync.
-        if num_reqs > 0 and int(lens[0]) <= decode_q:
-            idx_decode_next_n = int(lens[0])
-            mismatch = np.nonzero(lens != idx_decode_next_n)[0]
-            idx_num_decodes = int(mismatch[0]) if mismatch.size else num_reqs
-        else:
-            idx_decode_next_n = 1
-            idx_num_decodes = 0
+        idx_num_decodes, idx_decode_next_n = _indexer_decode_group(
+            lens[:num_reqs],
+            decode_q,
+            getattr(common_attn_metadata, "is_prefilling", None),
+        )
         idx_num_decode_tokens = int(q_np[idx_num_decodes]) if idx_num_decodes > 0 else 0
     _populate_indexer(
         md,

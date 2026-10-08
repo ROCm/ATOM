@@ -103,6 +103,13 @@ class IndexerVllm(IndexerBase):
             next_n=int(indexer_meta["decode_next_n"]),
             n_committed_per_seq=n_committed_per_seq[:num_decodes],
         )  # [num_decode_tokens, topk] int32
+        if num_decode_tokens >= q_quant.size(0):
+            # No prefill rows left. The bridge keeps prefilling rows out of the
+            # decode group (`_indexer_decode_group`), so this is a fallback: the
+            # dense path must never run on an empty slice, because its
+            # committed meta still claims one row and the paged K gather would
+            # read through an empty block table.
+            return decode_topk
         # Prefill rows: dense logits now sized only by the PREFILL seqs'
         # committed K (the bridge builds the committed meta over the prefill
         # sub-batch), so `total_committed` no longer explodes.
