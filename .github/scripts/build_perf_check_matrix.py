@@ -12,6 +12,7 @@ Reads from the environment:
     PERF_MODELS            catalog prefixes, comma separated
     PERF_JUDGING_CONCS     levels the criterion reads
     PERF_REFERENCE_CONCS   levels measured and shown but never judged
+    PERF_PROMPT_MULTS      per-level prompt count, as a multiple of the level
     PERF_ISL / PERF_OSL / PERF_RATIO    the single scenario this line runs
 
 This lives here rather than inline in the workflow for the reason
@@ -42,6 +43,13 @@ CATALOG = ".github/benchmark/models.json"
 # and this line does not watch them; the nightly does. Adding one is a line
 # here plus the GPU jobs it costs, not a change to the criterion.
 PAIRED_VARIANTS = {"deepseek-v4-pro": "-mtp3"}
+
+# How many prompts a measured phase runs, as a multiple of its concurrency
+# level, for levels that should not run the default. The default is what the
+# nightly runs (`atom_test.sh`: CONC * 10) and is what a level gets when it is
+# not named here -- an unlisted level is measured at full length, never at a
+# cheaper one nobody chose for it.
+DEFAULT_PROMPT_MULT = 10
 
 
 def selected_variants(prefixes: set[str]) -> set[tuple[str, str]]:
@@ -84,6 +92,34 @@ def concurrency_levels() -> list[str]:
         + os.environ.get("PERF_REFERENCE_CONCS", "")
     )
     return [c for c in (x.strip() for x in raw.split(",")) if c]
+
+
+def prompt_mults(concs: list[str]) -> dict[str, int]:
+    """Parse ``PERF_PROMPT_MULTS`` ("32:10,256:4") against the levels in play.
+
+    A key naming a level this run does not measure is an error rather than a
+    no-op: the whole point of the setting is to cut the cost of one specific
+    level, and a typo there costs nothing visible -- the matrix still builds,
+    every level quietly runs at full length, and the saving simply does not
+    happen. That reads as "the change did not help" rather than as a mistake.
+    """
+    raw = os.environ.get("PERF_PROMPT_MULTS", "")
+    mults: dict[str, int] = {}
+    for item in (x.strip() for x in raw.split(",")):
+        if not item:
+            continue
+        level, _, mult = item.partition(":")
+        if not mult.isdigit() or int(mult) < 1:
+            raise SystemExit(
+                f"::error::PERF_PROMPT_MULTS entry {item!r} is not <level>:<n>"
+            )
+        if level.strip() not in concs:
+            raise SystemExit(
+                f"::error::PERF_PROMPT_MULTS names level {level.strip()!r}, "
+                f"which this run does not measure (levels: {','.join(concs)})"
+            )
+        mults[level.strip()] = int(mult)
+    return mults
 
 
 def _emit(cells: list[dict]) -> None:
@@ -136,10 +172,16 @@ def main() -> int:
         )
         return 1
 
+    mults = prompt_mults(concs)
+    for cell in cells:
+        cell["prompt_mult"] = mults.get(str(cell["conc"]), DEFAULT_PROMPT_MULT)
+
     _emit(cells)
+    shown = ", ".join(f"c={c} x{mults.get(c, DEFAULT_PROMPT_MULT)}" for c in concs)
     print(
         f"{len(cells)} cells: {len(keep)} entries x {len(concs)} levels "
-        f"({isl}/{osl}, judged at {os.environ['PERF_JUDGING_CONCS']})",
+        f"({isl}/{osl}, judged at {os.environ['PERF_JUDGING_CONCS']}; "
+        f"prompts {shown})",
         file=sys.stderr,
     )
     return 0

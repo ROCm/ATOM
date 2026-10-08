@@ -1339,3 +1339,109 @@ def test_warmup_length_comes_from_the_workflow(workspace, fake_docker):
     assert mult >= 1
     result = run_half(ws, bindir, base_sha, "warmup", WARMUP_MULT=str(mult), CONC="8")
     assert f"NUM_PROMPTS_OVERRIDE={8 * mult}" in result.stdout
+
+
+# ------------------------------------------- measured window, per level ---
+# c=256 is 73% of the matrix's machine time and the longest single job, so it
+# is the only level whose window is worth shortening. These four hold the
+# wiring that makes that true at runtime rather than only in a comment.
+
+
+def test_a_level_can_run_a_shorter_measured_window():
+    """PERF_PROMPT_MULTS reaches the cell, and only the level it names."""
+    proc = _run_matrix(PERF_PROMPT_MULTS="256:4")
+    assert proc.returncode == 0, proc.stderr
+    cells = json.loads(proc.stdout)
+    by_level = {}
+    for c in cells:
+        by_level.setdefault(c["conc"], set()).add(c["prompt_mult"])
+    assert by_level[256] == {4}
+    # Every other level keeps the nightly's length. A change that quietly
+    # shortened all of them would still pass a test that only checked c=256.
+    assert all(m == {10} for lvl, m in by_level.items() if lvl != 256), by_level
+
+
+def test_a_prompt_mult_for_an_unmeasured_level_is_an_error():
+    """A level that is not in the matrix cannot be given a window.
+
+    The failure this prevents is invisible: the matrix still builds, every
+    level runs at full length, and the only symptom is that the run costs what
+    it did before. That reads as "shortening the window did not help" rather
+    than as a typo.
+    """
+    proc = _run_matrix(PERF_PROMPT_MULTS="512:4")
+    assert proc.returncode != 0
+    assert "512" in proc.stderr
+    assert "does not measure" in proc.stderr
+
+
+def test_the_shipped_matrix_shortens_only_the_longest_job():
+    """Run the builder on the workflow's own env, not on the test fixture.
+
+    The fixture levels and the shipped levels have drifted apart before. This
+    asserts the thing that actually runs: that the shipped PERF_PROMPT_MULTS
+    parses against the shipped PERF_JUDGING_CONCS at all -- a mismatch between
+    the two is a hard error, and finding it here costs nothing while finding
+    it in CI costs a queue slot.
+    """
+    import yaml
+
+    env = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "atom-perf-check.yaml").read_text()
+    )["env"]
+    proc = _run_matrix(
+        **{k: str(v) for k, v in env.items() if k.startswith("PERF_")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    cells = json.loads(proc.stdout)
+    windows = {c["conc"]: c["conc"] * c["prompt_mult"] for c in cells}
+    longest = max(windows)
+    assert windows[longest] < longest * 10, (
+        f"c={longest} is the job the whole run waits on and it is still "
+        f"measured at full length: {windows}"
+    )
+
+
+def test_the_measured_phases_get_the_level_s_prompt_count(workspace, fake_docker):
+    """PROMPT_MULT reaches base/head, and the warmup keeps its own length.
+
+    One variable short-circuiting the other is the failure mode worth a test:
+    a warmup that silently ran the measurement's length would cost a third
+    phase, and a measurement that ran the warmup's would be a tenth of a
+    measurement reported as one.
+    """
+    ws, base_sha, _ = workspace
+    bindir, _ = fake_docker
+
+    result = run_half(
+        ws, bindir, base_sha, "base", PROMPT_MULT="4", WARMUP_MULT="1", CONC="256"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "NUM_PROMPTS_OVERRIDE=1024" in result.stdout, result.stdout
+
+    result = run_half(
+        ws, bindir, base_sha, "warmup", PROMPT_MULT="4", WARMUP_MULT="1", CONC="256"
+    )
+    assert "NUM_PROMPTS_OVERRIDE=256" in result.stdout, result.stdout
+
+
+def test_the_seed_is_pinned_on_every_phase(workspace, fake_docker):
+    """Identical prompts across halves is what lets the window be shortened.
+
+    benchmark_serving defaults --seed to 0 today, so this changes nothing
+    observable -- which is the point: the pairing must not depend on an
+    upstream default staying what it is. If that default ever became
+    time-based, every pair would gain a noise source and no test would fail.
+    """
+    ws, base_sha, _ = workspace
+    bindir, log = fake_docker
+
+    for half in ("warmup", "base", "head"):
+        assert run_half(ws, bindir, base_sha, half).returncode == 0
+    benchmark_calls = [
+        line
+        for line in log.read_text().splitlines()
+        if line.startswith("ARGS:") and "BENCH_EXTRA_ARGS" in line
+    ]
+    assert len(benchmark_calls) == 3, benchmark_calls
+    assert all("--seed=0" in line for line in benchmark_calls), benchmark_calls

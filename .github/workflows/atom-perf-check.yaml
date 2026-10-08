@@ -87,6 +87,32 @@ env:
   # level that contributes no detection.
   PERF_REFERENCE_CONCS: ""
   PERF_EXPECTED_ENTRIES: 5
+  # Measured-window length per level, as a multiple of the level. Unlisted
+  # levels run the nightly's CONC * 10; c=32 is one of them, where the window
+  # is only 298s and shortening it would buy ~2.5 min on a job that is not the
+  # one setting the wall clock.
+  #
+  # c=256 is. Three phases of 1307s make it 50.6 min against c=32's 18.5, 73%
+  # of the matrix's machine time, and the longest single job is the floor the
+  # whole run waits on. The window is linear in this number (at c=64, 64
+  # prompts took 98.03s and 640 took 982.64s -- 10.02x), so x4 takes that
+  # window from 982s to 393s and the job to ~31 min.
+  #
+  # What x4 does not cost: --seed is pinned, so base and head draw identical
+  # prompts and identical output lengths. Workload sampling contributes nothing
+  # to the delta at either length -- the shorter window averages run-level
+  # noise (thermal, clock, scheduling) over less time, and nothing else.
+  # Whether that alone widens the spread past the +-1.8 this check documents is
+  # not yet measured at x4; a run whose levels wander further than that is the
+  # signal to put this back.
+  #
+  # What it does not touch: the CONC * 2 `--num-warmups` atom_test.sh runs
+  # before the measured window, and server launch and teardown -- 325s per
+  # phase at c=256, which is why 4/10 of the window is ~2/3 of the job.
+  PERF_PROMPT_MULTS: "256:4"
+  # Pinned so the pairing's determinism is this workflow's property rather than
+  # an upstream default's. perf_check_half.sh carries the argument.
+  PERF_SEED: 0
   # Warmup length as a multiple of the concurrency level. The warmup phase
   # exists to fill the JIT, inductor and hipblaslt caches that outlive a server
   # restart inside the shared container -- without it the half that ran second
@@ -181,6 +207,7 @@ jobs:
           PERF_RATIO: ${{ env.PERF_RATIO }}
           PERF_JUDGING_CONCS: ${{ env.PERF_JUDGING_CONCS }}
           PERF_REFERENCE_CONCS: ${{ env.PERF_REFERENCE_CONCS }}
+          PERF_PROMPT_MULTS: ${{ env.PERF_PROMPT_MULTS }}
 
   # -------------------------------------------------------- paired bench ---
   paired-bench:
@@ -201,6 +228,10 @@ jobs:
       CONC: ${{ matrix.cell.conc }}
       RANDOM_RANGE_RATIO: ${{ matrix.cell.ratio }}
       RESULT_FILENAME: ${{ matrix.cell.result_filename }}
+      # Per-level, from the matrix cell: a job-level env cannot read `env`, so
+      # the level's prompt multiple travels in the cell rather than being
+      # looked up again here from PERF_PROMPT_MULTS.
+      PROMPT_MULT: ${{ matrix.cell.prompt_mult }}
       CONTAINER: atom-perf-check
     steps:
       - name: Reclaim disk before starting
