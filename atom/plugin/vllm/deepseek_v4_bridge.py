@@ -553,6 +553,12 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             num_spec_tokens=self._num_spec_tokens,
             cudagraph_token_sizes=self._cg_token_sizes,
         )
+        if not capturing:
+            from atom.plugin.vllm.deepseek_v4_cudagraph_patch import (
+                check_v4_dispatch_consistency,
+            )
+
+            check_v4_dispatch_consistency(md.state, common_attn_metadata)
         # Native ATOM enables V4 compressor side-stream launches only while the
         # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
         # on the capture path, so carry the signal into ATOM's forward context.
