@@ -106,6 +106,10 @@ class FakeCluster:
         self.setup_rc = 0
         # A get that reports success but never writes: the probe must notice.
         self.silent_gets = False
+        # The result of every put not in a store's put_codes, if set.
+        self.put_code: int | None = None
+        # A call every store raises from, as `FakeStore.raise_on`.
+        self.raise_on: str | None = None
 
     def new_store(self) -> FakeStore:
         store = FakeStore(self)
@@ -163,7 +167,7 @@ class FakeStore:
         )
 
     def _maybe_raise(self, call):
-        if self.raise_on == call:
+        if call in (self.raise_on, self.cluster.raise_on):
             raise RuntimeError(f"{call} blew up")
 
     def batch_is_exist(self, keys):
@@ -180,7 +184,7 @@ class FakeStore:
             return [store_client.INVALID_PARAMS] * len(keys)
         codes = []
         for index, (key, ptr, size) in enumerate(zip(keys, ptrs, sizes, strict=True)):
-            code = self.put_codes.get(key)
+            code = self.put_codes.get(key, self.cluster.put_code)
             if code is None:
                 if not self._is_registered(ptr, size):
                     code = store_client.TRANSFER_FAIL
@@ -309,6 +313,8 @@ def cluster(monkeypatch):
         "_allocate_pool_tensor",
         lambda nbytes, device: torch.empty((nbytes,), dtype=torch.uint8),
     )
+    # What closed pools kept for the life of the process, per test.
+    monkeypatch.setattr(pool_mod, "_UNSETTLED_ALLOCATIONS", [])
     return cluster
 
 
@@ -477,12 +483,6 @@ def scheduler_clock(monkeypatch):
         ),
     )
     return clock
-
-
-def _held_out(pool, region):
-    """Seconds until each held slot of ``region`` returns."""
-    now = time.monotonic()
-    return [slot.held_until - now for slot in pool._held[region]]
 
 
 # --- config ------------------------------------------------------------------
@@ -924,55 +924,58 @@ def test_a_window_is_at_most_a_quarter_of_its_region(cluster):
     ]
     assert pool.window("save", 1) == 1
     # A transfer that never settled leaves the rest of the region working.
-    pool.quarantine(pool.acquire("load", 4), hold_s=300)
+    pool.quarantine(pool.acquire("load", 4))
     assert pool.usable("load") == 12 and pool.window("load", 1) == 3
 
 
-def test_held_slots_come_back_after_their_hold(cluster, caplog, monkeypatch):
-    clock = SimpleNamespace(now=1000.0)
-    monkeypatch.setattr(pool_mod, "time", SimpleNamespace(monotonic=lambda: clock.now))
+def test_quarantined_slots_never_come_back(cluster, caplog):
     pool = _pool(cluster)
     held = pool.acquire("save", 2)
     with caplog.at_level(logging.INFO, logger="atom"):
-        pool.quarantine(held, reason="test", hold_s=300)
+        pool.quarantine(held, reason="test")
         assert (pool.usable("save"), pool.quarantined("save")) == (0, 2)
         with pytest.raises(SlotPoolExhausted, match="0 usable slots of 2"):
             pool.acquire("save", 1)
         # Reported once, as an error: every save of this worker now fails.
-        pool.quarantine(pool.acquire("load", 1), reason="test", hold_s=300)
+        pool.quarantine(pool.acquire("load", 1), reason="test")
         errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
         assert errors == [
             (
                 "Mooncake Store offload: every save slot of this worker is out "
-                "of use; its saves fail at once until a held slot returns"
+                "of use; its saves fail at once for good"
             )
         ]
-        clock.now += 299
-        assert pool.usable("save") == 0
-        clock.now += 1
-        assert (pool.usable("save"), pool.quarantined("save")) == (2, 0)
-        assert (pool.usable("load"), pool.quarantined("load")) == (3, 0)
-        assert any("back in use" in r.getMessage() for r in caplog.records)
-    assert pool.acquire("save", 2) == held
+    # No time brings them back: nothing bounds how late an RDMA access lands.
+    assert (pool.usable("save"), pool.quarantined("save")) == (0, 2)
+    assert (pool.usable("load"), pool.quarantined("load")) == (2, 1)
+    assert not hasattr(held[0], "held_until")
 
 
-def test_a_waiter_takes_a_held_slot_when_it_returns(cluster):
+def test_closing_a_pool_with_a_quarantined_slot_keeps_its_memory(cluster, caplog):
     pool = _pool(cluster)
-    first, second = pool.acquire("save", 2)
-    held_at = time.monotonic()
-    pool.quarantine([first], reason="test", hold_s=0.2)
-    got = []
+    [store] = cluster.stores
+    backing = pool._backing
+    pool.quarantine(pool.acquire("load", 1), reason="test")
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        pool.close()
+    # Registered and referenced for the life of the process: a late RDMA
+    # transfer into a quarantined slot lands in memory nothing else is given.
+    assert store.registered == {pool.base_ptr: pool.nbytes}
+    assert ("unregister", pool.base_ptr) not in store.calls
+    assert pool_mod._UNSETTLED_ALLOCATIONS == [backing]
+    assert any(
+        "stay registered and allocated" in r.getMessage() for r in caplog.records
+    )
+    with pytest.raises(RuntimeError, match="closed"):
+        pool.acquire("save", 1)
 
-    def wait_for_one():
-        got.extend(pool.acquire("save", 1))
-        got.append(time.monotonic())
 
-    # One slot usable and taken: only the end of the hold can free one.
-    waiter = threading.Thread(target=wait_for_one, daemon=True)
-    waiter.start()
-    waiter.join(timeout=5)
-    assert got[0] is first and got[1] - held_at >= 0.2
-    pool.release([first, second])
+def test_closing_a_pool_with_a_leased_slot_keeps_its_memory(cluster):
+    pool = _pool(cluster)
+    pool.acquire("save", 1)  # a transfer that never came back
+    pool.close()
+    assert cluster.stores[0].registered == {pool.base_ptr: pool.nbytes}
+    assert len(pool_mod._UNSETTLED_ALLOCATIONS) == 1
 
 
 def test_quarantine_retires_slots_and_wakes_waiters(cluster):
@@ -1842,8 +1845,8 @@ def test_a_put_transfer_failure_before_the_batch_wait_frees_its_slots(
     )
 
 
-def test_a_put_the_batch_wait_gave_up_on_holds_only_its_slot(
-    cluster, make_worker, slow_calls
+def test_a_put_the_batch_wait_gave_up_on_quarantines_only_its_slot(
+    cluster, make_worker, slow_calls, monkeypatch
 ):
     worker, _ = make_worker(save_slots=8)
     request = _save_req(17, 16)
@@ -1852,28 +1855,25 @@ def test_a_put_the_batch_wait_gave_up_on_holds_only_its_slot(
     )
     worker._do_save_req(request)
     pool = worker._pool
+    # The chunk that went through settled; the one whose RDMA read of the slot
+    # may still be posted is out of use for good.
     assert (pool.quarantined("save"), pool.usable("save")) == (1, 7)
     assert _store(request.save_operation, False) in (
         worker.get_finished().connector_completions
     )
-    # Held for minutes, not for good: the slot returns after its hold.
-    [hold] = _held_out(pool, "save")
-    assert hold == pytest.approx(worker_mod._UNSETTLED_TRANSFER_HOLD_S, abs=5)
-    pool._held["save"][0].held_until = 0.0
-    assert (pool.quarantined("save"), pool.usable("save")) == (0, 8)
+    # However long ago: nothing bounds how late that RDMA work can land.
+    later = time.monotonic() + 3600
+    monkeypatch.setattr(time, "monotonic", lambda: later)
+    assert (pool.quarantined("save"), pool.usable("save")) == (1, 7)
 
 
-def test_a_put_that_raises_holds_its_window(cluster, make_worker):
+def test_a_put_that_raises_quarantines_its_window(cluster, make_worker):
     worker, _ = make_worker(save_slots=8)
     worker._client._store.raise_on = "put"
     request = _save_req(18, 16)
     worker._do_save_req(request)
     pool = worker._pool
     assert (pool.quarantined("save"), pool.usable("save")) == (2, 6)
-    assert (
-        _held_out(pool, "save")
-        == [pytest.approx(worker_mod._UNSETTLED_TRANSFER_HOLD_S, abs=5)] * 2
-    )
     output = worker.get_finished()
     assert output.connector_completions >= {
         _store(request.save_operation, False),
@@ -1888,7 +1888,7 @@ def test_a_put_that_raises_holds_its_window(cluster, make_worker):
 
 def test_a_region_with_no_usable_slot_fails_saves_at_once(cluster, make_worker):
     worker, gpu = make_worker(save_slots=2)
-    worker._pool.quarantine(worker._pool.acquire("save", 2), hold_s=300)
+    worker._pool.quarantine(worker._pool.acquire("save", 2))
     request = _save_req(19, 16)
     worker._do_save_req(request)
     assert gpu.calls == []
@@ -1926,9 +1926,8 @@ def test_gpu_copy_failure_without_a_fence_retires_its_slots(
 
     monkeypatch.setattr(worker_mod, "_synchronize", no_fence)
     worker._guard("save", worker._do_save_req, _save_req(21, 16))
-    # A copy that may still run has no time bound: retired, not held.
+    # A copy that may still run has no time bound: out of use for good.
     assert worker._pool.quarantined("save") == 2
-    assert worker._pool._held["save"] == []
 
 
 def test_a_save_queued_past_its_deadline_reads_nothing(cluster, make_worker):
@@ -2157,8 +2156,8 @@ def test_load_transfer_failure_before_the_batch_wait_frees_its_slots(
     assert worker.get_finished().finished_loading == {again.load_operation}
 
 
-def test_a_load_the_batch_wait_gave_up_on_holds_only_its_slot(
-    cluster, make_worker, slow_calls
+def test_a_load_the_batch_wait_gave_up_on_quarantines_only_its_slot(
+    cluster, make_worker, slow_calls, monkeypatch
 ):
     worker, _ = make_worker(load_slots=8)
     worker._do_save_req(_save_req(36, 16))
@@ -2168,23 +2167,22 @@ def test_a_load_the_batch_wait_gave_up_on_holds_only_its_slot(
     )
     worker._do_load_req(request)
     pool = worker._pool
-    # The chunk that arrived settled; the one whose RDMA read may still land
-    # is held back for minutes, then returns.
+    # The chunk that arrived settled; the one whose RDMA write may still land
+    # is out of use for good.
     assert (pool.quarantined("load"), pool.usable("load")) == (1, 7)
-    assert _held_out(pool, "load") == [
-        pytest.approx(worker_mod._UNSETTLED_TRANSFER_HOLD_S, abs=5)
-    ]
     assert worker.get_finished().failed_loading == {request.load_operation}
+    later = time.monotonic() + 3600
+    monkeypatch.setattr(time, "monotonic", lambda: later)
+    assert (pool.quarantined("load"), pool.usable("load")) == (1, 7)
 
 
-def test_a_get_that_raises_holds_its_window(cluster, make_worker):
+def test_a_get_that_raises_quarantines_its_window(cluster, make_worker):
     worker, _ = make_worker(load_slots=8)
     worker._do_save_req(_save_req(38, 16))
     worker._client._store.raise_on = "get"
     request = _load_req(38, hbm=0, lmc=16, block_ids=list(range(4)))
     worker._do_load_req(request)
     assert (worker._pool.quarantined("load"), worker._pool.usable("load")) == (2, 6)
-    assert worker._pool._held["load"]  # held for a while, not retired
     assert worker.get_finished().failed_loading == {request.load_operation}
 
 
@@ -2208,6 +2206,23 @@ def test_worker_close_releases_everything_once(cluster, make_worker):
     worker.close()
     assert gpu.closed and store.closed and store.registered == {}
     assert worker._pool is None and worker._client is None
+
+
+def test_worker_close_keeps_a_pool_a_transfer_may_still_reach(
+    cluster, make_worker, slow_calls
+):
+    worker, _ = make_worker(save_slots=8)
+    request = _save_req(39, 16)
+    worker._client._store.put_codes[_key(request.chunk_hashes, 1)] = (
+        store_client.TRANSFER_FAIL
+    )
+    worker._do_save_req(request)
+    store, pool = worker._client._store, worker._pool
+    worker.close()
+    # The executors are joined, but the abandoned put's RDMA read may still be
+    # posted: the client's teardown ends it, and the memory is never handed out.
+    assert store.closed and store.registered == {pool.base_ptr: pool.nbytes}
+    assert len(pool_mod._UNSETTLED_ALLOCATIONS) == 1
 
 
 # --- end to end on CPU: scheduler, worker, aggregation ----------------------
@@ -2349,6 +2364,46 @@ def test_a_failed_probe_stops_startup_and_releases_the_pool(cluster, one_rank):
             worker.register_kv_caches(_kv_caches(), num_blocks=8)
         [store] = cluster.stores
         assert store.closed and store.registered == {}
+        assert worker._pool is None
+        assert pool_mod._UNSETTLED_ALLOCATIONS == []
+    finally:
+        worker.close()
+
+
+def test_a_probe_put_failing_at_once_releases_the_pool(cluster, one_rank):
+    # A dead owner fails the put before any RDMA work is posted.
+    cluster.put_code = store_client.TRANSFER_FAIL
+    worker = MooncakeStoreOffloadConnector(_registering_config())
+    try:
+        with pytest.raises(RuntimeError, match=r"put of 128 bytes .*TRANSFER_FAIL"):
+            worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        [store] = cluster.stores
+        assert store.closed and store.registered == {}
+        assert pool_mod._UNSETTLED_ALLOCATIONS == []
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("failure", ["batch_wait", "raise"])
+def test_a_probe_transfer_left_unsettled_keeps_the_pool(
+    cluster, one_rank, monkeypatch, failure
+):
+    if failure == "batch_wait":
+        cluster.put_code = store_client.TRANSFER_FAIL
+        monkeypatch.setattr(
+            store_client.CallClock, "seconds", lambda _self: store_client.BATCH_WAIT_S
+        )
+    else:
+        cluster.raise_on = "put"
+    worker = MooncakeStoreOffloadConnector(_registering_config())
+    try:
+        with pytest.raises(RuntimeError, match="TRANSFER_FAIL|put blew up"):
+            worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        [store] = cluster.stores
+        # Startup gives up, but the probe's put may still read its slot: the
+        # pool stays registered and allocated while the client tears down.
+        assert store.closed and len(store.registered) == 1
+        assert len(pool_mod._UNSETTLED_ALLOCATIONS) == 1
         assert worker._pool is None
     finally:
         worker.close()
@@ -2536,7 +2591,7 @@ def test_pool_hands_out_a_window_as_one_run(cluster):
     assert [slot.index for slot in pool.acquire("save", 2)] == [0, 1]
     # Only 5 is free now; 2-4 are taken, so no run of two exists yet.
     pool.release(second)
-    pool.quarantine([pool.acquire("save", 1)[0]], reason="test", hold_s=60)
+    pool.quarantine([pool.acquire("save", 1)[0]], reason="test")
     scattered = pool.acquire("save", 2)
     assert [slot.index for slot in scattered] == [3, 4]
     assert pool.contiguous_view(scattered) is not None
@@ -2616,13 +2671,11 @@ def test_scattered_slots_fall_back_to_the_staging_copy(cluster, make_in_place_wo
     worker, gpu, codec, _stream = make_in_place_worker(save_slots=16)
     gpu.pattern = staticmethod(_page_pattern)
     pool = worker._pool
-    # Hold every odd slot back: 8 usable slots give windows of two, and no two
+    # Quarantine every odd slot: 8 usable slots give windows of two, and no two
     # free slots are adjacent, so a window is two scattered slots.
     slots = pool.acquire("save", 16)
     pool.release([slot for slot in slots if slot.index % 2 == 0])
-    pool.quarantine(
-        [slot for slot in slots if slot.index % 2], reason="test", hold_s=60
-    )
+    pool.quarantine([slot for slot in slots if slot.index % 2], reason="test")
     request = _save_req(43, 32)
     worker._do_save_req(request)
 
