@@ -51,9 +51,11 @@ OUT_DIR="perf-pair/${HALF}"
 mkdir -p "$OUT_DIR"
 
 if [ "$HALF" = "warmup" ]; then
-  # Same prompt count as the measurement, not a fraction of it. A tenth was
-  # tried first and left a +4.19/+5.65/+3.10% residual on MI355X (run
-  # 34233036220); the PR description carries the measurements and the cost.
+  # A fraction of the measurement's prompt count, set by WARMUP_MULT in the
+  # workflow, which carries the measurements. This phase fills caches that
+  # outlive a server restart; it is not a measurement and is discarded. The
+  # default here is the measurement's own length, so that a caller who sets
+  # nothing gets the conservative behaviour rather than the cheap one.
   export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$(( CONC * ${WARMUP_MULT:-10} ))}"
   echo "warmup: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (results discarded)"
 fi

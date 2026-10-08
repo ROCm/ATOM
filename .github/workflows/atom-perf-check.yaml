@@ -87,15 +87,31 @@ env:
   # level that contributes no detection.
   PERF_REFERENCE_CONCS: ""
   PERF_EXPECTED_ENTRIES: 5
-  # Warmup length as a multiple of the concurrency level, matching the
-  # measurement at 10. Set to 1 to reproduce the short warmup the residual
-  # was first measured under -- the only single-variable way to separate
-  # the warmup from the nightly image, which moves underneath every run.
+  # Warmup length as a multiple of the concurrency level. The warmup phase
+  # exists to fill the JIT, inductor and hipblaslt caches that outlive a server
+  # restart inside the shared container -- without it the half that ran second
+  # read +5.89/+9.14/+2.77% faster on identical code. It does not exist to
+  # produce a measurement, so it does not need the measurement's length. Each
+  # phase already carries its own `--num-warmups` of CONC*2 from atom_test.sh,
+  # which is what the nightly relies on; this is the extra, cross-restart part.
+  #
+  # Measured on mi355-gpu-41, DeepSeek-V4-Pro tp=8 under dummy weights, c=32:
+  # the phase is 460s at 10 and 188s at 1 -- the 162s of server start and graph
+  # capture is fixed, only the benchmark inside it shrinks. Across the matrix
+  # that is about 18% of total GPU time.
+  #
+  # The residual it leaves is not resolved. Two A/A runs at 1 gave -1.66% and
+  # +0.07% on identical code, against -0.21% for a single run at 10: the spread
+  # between two runs of the same setting (1.73 points) is larger than the gap
+  # between settings, so n=2 cannot separate them. Both sit inside the +-1.8
+  # RESIDUAL_SPREAD_PCT this check already documents. Raise this back to 10 if
+  # a run shows levels wandering further than that.
+  #
   # Not PERF_-prefixed like the others: workflow-level env is inherited
   # straight into every step, and perf_check_half.sh reads this name, so
   # no mapping is needed (and a job-level one is not even allowed to
   # reference env).
-  WARMUP_MULT: 10
+  WARMUP_MULT: 1
 
   # Weight-loading flags appended to every phase by perf_check_half.sh, which
   # carries the full rationale and the measurements. In short: model load is
