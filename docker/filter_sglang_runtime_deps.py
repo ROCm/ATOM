@@ -7,8 +7,9 @@ runtime_common lines never sees transformers. Expand the extra, then skip it.
 
 from __future__ import annotations
 
-import tomli
 from pathlib import Path
+
+import tomli
 
 BLOCKED_PREFIXES = (
     "compressed-tensors",
@@ -27,7 +28,9 @@ def _pkg_name(dep: str) -> str:
     return name.strip()
 
 
-def _expand(extras: dict[str, list[str]], names: list[str], seen: set[str]) -> list[str]:
+def _expand(
+    extras: dict[str, list[str]], names: list[str], seen: set[str]
+) -> list[str]:
     out: list[str] = []
     for dep in names:
         key = dep.strip()
@@ -51,10 +54,15 @@ def main() -> None:
         name = _pkg_name(dep)
         if name == "numpy":
             continue
-        if any(dep.startswith(prefix) or name == prefix.split("=", 1)[0] for prefix in BLOCKED_PREFIXES):
+        if any(
+            dep.startswith(prefix) or name == prefix.split("=", 1)[0]
+            for prefix in BLOCKED_PREFIXES
+        ):
             continue
         kept.append(dep)
-    Path("/tmp/sglang-runtime-common.txt").write_text("".join(f"{dep}\n" for dep in kept))
+    Path("/tmp/sglang-runtime-common.txt").write_text(
+        "".join(f"{dep}\n" for dep in kept)
+    )
 
 
 if __name__ == "__main__":
