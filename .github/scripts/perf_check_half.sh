@@ -58,7 +58,29 @@ if [ "$HALF" = "warmup" ]; then
   # nothing gets the conservative behaviour rather than the cheap one.
   export NUM_PROMPTS_OVERRIDE="${WARMUP_PROMPTS:-$(( CONC * ${WARMUP_MULT:-10} ))}"
   echo "warmup: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (results discarded)"
+else
+  # How long the measured window is, per level, from the matrix cell. The
+  # benchmark's duration is linear in this: on one container at c=64, 64
+  # prompts took 98.03 s and 640 took 982.64 s, a ratio of 10.02. Everything
+  # else in the phase -- server launch, the `--num-warmups` of CONC*2 that
+  # atom_test.sh runs ahead of the measured window, teardown -- is fixed, so
+  # halving this does not halve the phase.
+  #
+  # Defaults to the nightly's CONC * 10. A level that wants less says so in
+  # PERF_PROMPT_MULTS; a level that says nothing is measured at full length.
+  export NUM_PROMPTS_OVERRIDE="${NUM_PROMPTS_OVERRIDE:-$(( CONC * ${PROMPT_MULT:-10} ))}"
+  echo "${HALF}: NUM_PROMPTS_OVERRIDE=${NUM_PROMPTS_OVERRIDE} (CONC * ${PROMPT_MULT:-10})"
 fi
+
+# Pinned rather than inherited. benchmark_serving defaults --seed to 0 and
+# seeds both `random` and `np.random` from it, which is why warmup, base and
+# head draw identical prompts and identical output lengths: workload sampling
+# contributes nothing to the delta, and that is what lets the measured window
+# be shortened without the pairing getting noisier. Today that rests on an
+# upstream default this line does not control -- if it ever became time-based,
+# every pair would quietly gain a noise source and nothing would fail. One
+# argument makes it a property of this workflow instead.
+BENCH_ARGS="--seed=${PERF_SEED:-0}${BENCH_EXTRA_ARGS:+ ${BENCH_EXTRA_ARGS}}"
 
 echo "========== ${HALF}: reclaiming workspace ownership =========="
 # The container runs as root against a bind-mounted workspace, so anything it
@@ -120,7 +142,7 @@ echo "========== ${HALF}: running benchmark =========="
 docker exec \
   -e RESULT_FILENAME="${RESULT_FILENAME}" \
   -e SERVER_ARGS="${LAUNCH_ARGS}" \
-  -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}" \
+  -e BENCH_EXTRA_ARGS="${BENCH_ARGS}" \
   -e ISL="${ISL}" \
   -e OSL="${OSL}" \
   -e CONC="${CONC}" \
