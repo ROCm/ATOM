@@ -60,14 +60,6 @@ def _profiler_detail_env(name: str) -> bool:
     return raw == "1"
 
 
-def _choice_env(name: str, default: str, choices: tuple[str, ...]) -> str:
-    value = os.getenv(name, default).strip().lower()
-    if value not in choices:
-        expected = ", ".join(choices)
-        raise ValueError(f"{name} must be one of {expected}, got {value!r}")
-    return value
-
-
 def _optional_int_env(name: str, *, min_value: int | None = None) -> int | None:
     """Unset or empty reads as None; anything else must be an integer."""
     raw = os.getenv(name)
@@ -382,20 +374,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # Kimi-K3 C1 fused MoE tail, resolved once at model construction.
-    "ATOM_NATIVE_DECODE_MONOKERNEL": lambda: _choice_env(
-        "ATOM_NATIVE_DECODE_MONOKERNEL",
-        "off",
-        ("off", "staged_c1"),
-    ),
-    # GLM-5.2 TP4 C1/C2 scaled-FP4 MonoKernel, resolved at model construction.
-    "ATOM_GLM_NATIVE_FP4_MFMA": lambda: (
-        os.getenv("ATOM_GLM_NATIVE_FP4_MFMA", "0") == "1"
-    ),
-    # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
-    # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
-    # path supports is ever routed to it; every other batch keeps the original
-    # model. 0 disables it.
+    # Fused decode for measured model/deployment/step geometries. Unsupported
+    # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.

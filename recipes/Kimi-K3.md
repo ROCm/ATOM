@@ -45,11 +45,11 @@ only the MoE tail. It requires DSpark with seven speculative tokens, FP8 KV,
 DCP1 and `ATOM_ENABLE_REPLAYSSM=0`. Enable it at model construction:
 
 ```bash
-export ATOM_NATIVE_DECODE_MONOKERNEL=staged_c1
+export ATOM_MONO_ENABLE=1
 ```
 
 For a performance A/B, keep the launch command and C1 workload identical and
-change only `ATOM_NATIVE_DECODE_MONOKERNEL` between `off` and `staged_c1`.
+change only `ATOM_MONO_ENABLE` between `0` and `1`.
 
 ---
 

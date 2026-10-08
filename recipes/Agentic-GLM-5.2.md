@@ -90,7 +90,7 @@ export PYTHONHASHSEED=0
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_GLM_NATIVE_FP4_MFMA=0
+export ATOM_MONO_ENABLE=0
 export ATOM_MLA_PAGE_SIZE=1
 export ATOM_ONLINE_QUANT_STREAMING=0
 export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
@@ -144,7 +144,7 @@ export PYTHONHASHSEED=0
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_GLM_NATIVE_FP4_MFMA=0
+export ATOM_MONO_ENABLE=0
 export ATOM_MLA_PAGE_SIZE=1
 export ATOM_ONLINE_QUANT_STREAMING=0
 export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
@@ -246,7 +246,7 @@ four; the case block resolves both the draft depth and its golden AL from
 offload is only used from `C16` upwards.
 
 The native scaled-FP4 MonoKernel is enabled only at C1/C2 through
-`ATOM_GLM_NATIVE_FP4_MFMA=1`. C4 and above remain on the production path; the
+`ATOM_MONO_ENABLE=1`. C4 and above remain on the production path; the
 current multi-chunk native schedule is slower at those widths.
 
 ```bash
@@ -258,17 +258,17 @@ export AITER_USE_FLYDSL_MOE_SORTING=1
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
-ATOM_GLM_NATIVE_FP4_MFMA=0
+ATOM_MONO_ENABLE=0
 
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
   1)
     CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MTP_K=5; MTP_AL=3.61
-    ATOM_GLM_NATIVE_FP4_MFMA=1
+    ATOM_MONO_ENABLE=1
     ;;
   2)
     CUDAGRAPH_CAPTURE_SIZES='[1,2,4]'; MTP_K=5; MTP_AL=3.61
-    ATOM_GLM_NATIVE_FP4_MFMA=1
+    ATOM_MONO_ENABLE=1
     ;;
   4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
@@ -280,7 +280,7 @@ case "${CONC}" in
     ;;
 esac
 
-export ATOM_GLM_NATIVE_FP4_MFMA
+export ATOM_MONO_ENABLE
 
 python -m atom.entrypoints.openai_server \
   --model "${MODEL_PATH}" \
@@ -335,7 +335,7 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_GLM_NATIVE_FP4_MFMA=0
+export ATOM_MONO_ENABLE=0
 
 # LMCache-related settings
 export PYTHONHASHSEED=0
@@ -413,7 +413,7 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
-export ATOM_GLM_NATIVE_FP4_MFMA=0
+export ATOM_MONO_ENABLE=0
 
 # LMCache-related settings
 export PYTHONHASHSEED=0

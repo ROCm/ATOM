@@ -373,30 +373,6 @@ def test_glm_kernel_indexes_int64_metadata_as_word_offsets():
         assert dtype.attr == "i32"
 
 
-def test_native_decode_flag(monkeypatch):
-    from atom.utils import envs
-
-    name = "ATOM_NATIVE_DECODE_MONOKERNEL"
-    monkeypatch.delenv(name, raising=False)
-    assert getattr(envs, name) == "off"
-    for value in ("off", "staged_c1"):
-        monkeypatch.setenv(name, value.upper())
-        assert getattr(envs, name) == value
-    monkeypatch.setenv(name, "on")
-    with pytest.raises(ValueError, match="off, staged_c1"):
-        getattr(envs, name)
-
-
-def test_glm_native_fp4_mfma_flag(monkeypatch):
-    from atom.utils import envs
-
-    name = "ATOM_GLM_NATIVE_FP4_MFMA"
-    monkeypatch.delenv(name, raising=False)
-    assert getattr(envs, name) is False
-    monkeypatch.setenv(name, "1")
-    assert getattr(envs, name) is True
-
-
 def test_glm_native_fp4_agentx_concurrency_contract():
     assert GLM5_AGENTX_BATCHES == (1, 2)
 
@@ -996,15 +972,6 @@ def test_kimi_staged_c1_config_is_explicit(monkeypatch):
     config.speculative_config.num_speculative_tokens = 3
     with pytest.raises(module.MonoUnsupported, match="DSpark7"):
         module.validate_kimi_c1_config(config)
-
-
-def test_kimi_default_off_does_not_inspect_runtime_config():
-    runner = _kimi_mono_module().KimiStagedC1Decode(None, object(), "off")
-    assert runner._enabled is False
-    assert runner._ops == {}
-    assert runner._prepared == {}
-    assert runner._outputs == {}
-    assert runner._prebuilt is False
 
 
 def test_kimi_staged_c1_supports_only_one_q8_request(monkeypatch):

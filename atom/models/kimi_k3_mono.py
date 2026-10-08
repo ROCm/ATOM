@@ -195,11 +195,7 @@ def validate_kimi_c1_config(atom_config) -> None:
 class KimiStagedC1Decode:
     """Replace only the measured Kimi-K3 C1 MoE tail."""
 
-    def __init__(self, causal_lm, atom_config, mode: str) -> None:
-        if mode not in {"off", "staged_c1"}:
-            raise ValueError(
-                f"Kimi fused-tail mode must be off or staged_c1, got {mode!r}"
-            )
+    def __init__(self, causal_lm, atom_config) -> None:
         self._lm = causal_lm
         self._ops: dict[int, _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
@@ -207,10 +203,8 @@ class KimiStagedC1Decode:
         self._outputs: dict[int, torch.Tensor] = {}
         self._refused: set[int] = set()
         self._prebuilt = False
-        self._enabled = mode == "staged_c1"
+        self._enabled = True
         self._announced = False
-        if not self._enabled:
-            return
 
         checks = (
             (atom_config.tensor_parallel_size == 8, "not TP8"),

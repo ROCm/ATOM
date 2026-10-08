@@ -3500,7 +3500,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self._glm52_mono = None
         if (
             getattr(config, "model_type", None) == "glm_moe_dsa"
-            and envs.ATOM_GLM_NATIVE_FP4_MFMA
+            and envs.ATOM_MONO_ENABLE
         ):
             from atom.models.glm52_mono import Glm52MonoDecode
 
