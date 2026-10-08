@@ -673,11 +673,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
         os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
-    # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
+    # Route the paged decode to aiter's FlyDSL kernel instead of gluon. Needs
+    # aiter with #5809; upgrade ATOM and aiter together.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
-    # FlyDSL GPU work planner, built once per forward in the metadata
-    # builder. Needs ATOM_PA_FLYDSL=1. On by default so enabling FlyDSL gets the
-    # measured configuration (+20.5% interactivity at conc 20).
+    # FlyDSL work planner. Since aiter #5809 every FlyDSL decode needs a plan,
+    # so with ATOM_PA_FLYDSL=1 setting this to 0 routes the decode to gluon.
     "ATOM_PA_FLYDSL_PLAN": lambda: (os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
