@@ -383,3 +383,28 @@ def test_the_proxy_backend_answers_block_sizes_with_or_without_a_spec():
         AtomDeepseekV41ProxyBackend.get_supported_kernel_block_sizes(object())
         == expected
     )
+
+
+def test_the_proxy_layer_is_markable_for_the_memory_profile():
+    """The bind must be able to tell a profiling pool from the serving one.
+
+    `_mark_v4_proxy_cache_mode` only marks layers carrying
+    `_atom_v4_proxy_layer`, and the bind reads
+    `_atom_v4_profiling_kv_cache`. V4.1's proxy had neither, so the flag never
+    left its default and the bind ran against the profile's placeholder pool
+    -- 64 blocks under cudagraph capture, where `num_gpu_blocks` is already
+    non-zero and so clears the `pages <= 0` check. The result was a bind-time
+    "pool is too small", true of the placeholder and silent about the real one.
+    """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _mark_v4_proxy_cache_mode
+    from atom.plugin.vllm.deepseek_v41_bridge import AtomDeepseekV41ProxyAttention
+
+    proxy = AtomDeepseekV41ProxyAttention()
+    assert proxy._atom_v4_proxy_layer is True
+    assert proxy._atom_v4_profiling_kv_cache is False
+
+    # The marker reaches it, both ways, through the shared V4 helper.
+    _mark_v4_proxy_cache_mode({"layer": proxy}, True)
+    assert proxy._atom_v4_profiling_kv_cache is True
+    _mark_v4_proxy_cache_mode({"layer": proxy}, False)
+    assert proxy._atom_v4_profiling_kv_cache is False

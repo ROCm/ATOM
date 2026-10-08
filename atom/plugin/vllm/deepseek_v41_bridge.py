@@ -315,6 +315,13 @@ class AtomDeepseekV41ProxyAttention(nn.Module, AttentionLayerBase):
         self._atom_v41_proxy_layer = True
         self.kv_cache = torch.tensor([])
         self.impl = nn.Identity()
+        # Marked for `_mark_v4_proxy_cache_mode`, which flips the flag below
+        # around the memory profile. Without the attribute the layer is never
+        # marked and the flag never leaves its default, so the bind cannot
+        # tell a profiling pool from the serving one -- see the guard in
+        # `bind_deepseek_v41_proxy_cache`.
+        self._atom_v4_proxy_layer = True
+        self._atom_v4_profiling_kv_cache = False
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AtomDeepseekV41ProxyBackend
@@ -486,6 +493,16 @@ def bind_deepseek_v41_proxy_cache(
         return False
     if not isinstance(proxy.kv_cache, torch.Tensor) or proxy.kv_cache.numel() == 0:
         return False
+    if getattr(proxy, "_atom_v4_profiling_kv_cache", False):
+        # The memory profile runs with a placeholder pool -- 64 blocks under
+        # cudagraph capture, where `num_gpu_blocks` is already non-zero and so
+        # slips past the `pages <= 0` check below. Binding against it carved
+        # the STATE tail out of a pool 3800x too small and reported it as the
+        # pool being too small, which is true of the placeholder and says
+        # nothing about the one that will serve. V4 has guarded this since it
+        # had a proxy; V4.1 lacked the marker attribute, so the guard had
+        # nothing to read.
+        return False
     ptr = proxy.kv_cache.untyped_storage().data_ptr()
     if getattr(model, "_atom_v41_proxy_cache_ptr", None) == ptr:
         return True
@@ -557,12 +574,14 @@ def bind_deepseek_v41_proxy_cache(
     if raw.numel() < required:
         raise RuntimeError(
             "DeepSeek-V4.1 proxy pool is too small: "
-            f"{raw.numel()} bytes for {pages} PAGEs + {num_slots} STATE slots "
-            f"({required} bytes needed, short by {required - raw.numel()}). "
-            f"The STATE tail is {v41_proxy_state_reserve_blocks(vllm_config)} "
-            "blocks. Report, do not diagnose: this message once named the "
-            "reserve patch as the cause, which sent a reader hunting a patch "
-            "that had in fact run -- the shortfall had another source."
+            # Facts only. An earlier version of this message named the
+            # reserve patch as the cause; the patch had run, the shortfall
+            # came from elsewhere, and a reader (me) spent a cycle on the
+            # wrong suspect. The reasoning belongs here, not in what an
+            # operator reads.
+            f"{raw.numel()} bytes for {pages} PAGEs + {num_slots} STATE slots; "
+            f"{required} needed, short by {required - raw.numel()}. "
+            f"STATE tail: {v41_proxy_state_reserve_blocks(vllm_config)} blocks."
         )
 
     builder.num_blocks = pages
