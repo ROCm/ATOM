@@ -17,6 +17,8 @@ PREFILL_DECODE_INTERVAL="${PREFILL_DECODE_INTERVAL:-0}"
 PREFILL_DELAYER_TARGET_FILL="${PREFILL_DELAYER_TARGET_FILL:-0.9}"
 BF16_GEMM_CONFIG="${BF16_GEMM_CONFIG:-}"
 ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
+USE_FLYDSL_GATHER="${USE_FLYDSL_GATHER:-1}"
+USE_TRITON_GEMM="${USE_TRITON_GEMM:-0}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-0}"
 SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
@@ -36,17 +38,20 @@ export ENABLE_CK=0
 
 export ATOM_USE_TRITON_MLA=1
 export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0
-export ATOM_UNFUSED_GATHER_KV_B_PROJ=1
+export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ="${USE_FLYDSL_GATHER}"
+export ATOM_UNFUSED_GATHER_KV_B_PROJ=0
 export ATOM_USE_AITER_TRITON_ATTN=1 ATOM_USE_UNIFIED_ATTN=1
 
 export ATOM_MOE_GU_ITLV=1
 export ATOM_USE_TRITON_MOE_DECODE=0
 export MEGA_DISPATCH=mori MEGA_DISPATCH_WIRE=fp4
+# Existing stock infrastructure, held constant across A/B. This is not a
+# recipe-owned optimization and does not require experimental_mori_aiter.patch.
 export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED="${MORI_FUSED}"
 export ATOM_MEGA_COMBINE_WIRE="${MEGA_COMBINE_WIRE}"
 export AITER_USE_GROUPED_GEMM=1 AITER_USE_OPUS_MOE_SORTING=1
 
-export ATOM_USE_TRITON_GEMM=1 ATOM_WO_A_USE_FLYDSL=1
+export ATOM_USE_TRITON_GEMM="${USE_TRITON_GEMM}" ATOM_WO_A_USE_FLYDSL=1
 export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1
 export AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1
 
@@ -72,16 +77,14 @@ if [[ -n "${BF16_GEMM_CONFIG}" ]]; then
   export AITER_CONFIG_GEMM_BF16="${BF16_GEMM_CONFIG}"
 fi
 
-# PR #2380 defines this runtime switch. Stock image ATOM silently ignores the
-# environment variable, then crashes on a long chunked prefill. Fail before
-# allocating model weights when the required patch was not installed.
-python3 -c '
+if [[ "${USE_FLYDSL_GATHER}" == "1" ]]; then
+  python3 -c '
 from atom.utils import envs
-assert hasattr(envs, "ATOM_UNFUSED_GATHER_KV_B_PROJ"), (
-    "Kimi-K3 gfx1250 requires ATOM PR #2380; "
-    "ATOM_UNFUSED_GATHER_KV_B_PROJ is missing"
-)
+from aiter.ops.flydsl import gather_kv_b_proj_flydsl
+assert envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ
+assert callable(gather_kv_b_proj_flydsl)
 '
+fi
 
 if [[ "${MEGA_COMBINE_WIRE}" != "bf16" ]]; then
   python3 -c '

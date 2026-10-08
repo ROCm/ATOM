@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-CONCURRENCY="${CONCURRENCY:-32}"
-BENCHMARK_DURATION="${BENCHMARK_DURATION:-900}"
-WARMUP_REQUESTS_PER_LANE="${WARMUP_REQUESTS_PER_LANE:-3}"
+readonly CONCURRENCY=32
+readonly BENCHMARK_DURATION=900
+readonly WARMUP_REQUESTS_PER_LANE=3
 RUN_NAME="${RUN_NAME:-agentx-c${CONCURRENCY}-$(date -u +%Y%m%d_%H%M%S)}"
 AIPERF="${AIPERF:-/root/agentx/venv/bin/aiperf}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/root/agentx/artifacts-opt}"
