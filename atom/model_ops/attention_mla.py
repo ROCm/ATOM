@@ -1445,7 +1445,7 @@ class MLAAttention(nn.Module):
         return self.o_proj(x.reshape(-1, self.num_heads * self.v_head_dim))
 
     @mark_trace(prefix="q_proj_and_k_up_proj", torch_compile=False)
-    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False):
+    def _q_proj_and_k_up_proj(self, x, x_scale=None, group=False, out_dtype=None):
         # QREP: q_proj emits the full DCP-group head set. group=True (decode)
         # keeps them all and uses W_K_qrep, so the caller skips the AllGather Q;
         # group=False (prefill / non-QREP) takes only this rank's heads.
@@ -1485,12 +1485,34 @@ class MLAAttention(nn.Module):
             # hipBLASLt bf16 batched path memory-faults). batched_gemm_bf16 does
             # X @ W^T with W (B,N,K): q_nope (N,B,P) @ W_K (N,L,P)^T -> (N,B,L),
             # then -> (B,N,L) to match the fp8/fp4 output layout.
-            ql_nope = _aiter_triton_bf16_bmm(q_nope, W_K).transpose(0, 1)
+            #
+            # Emit ql_nope directly in the q_out dtype (fp8 for an fp8 KV cache).
+            # The bf16 absorb's accuracy win is the bf16-weight matmul + fp32
+            # accumulation, which is preserved; casting the fp32 accumulator
+            # straight to fp8 here is a SINGLE rounding to the exact fp8 the fp8
+            # attention needs anyway -- strictly less error than letting ql_nope
+            # go out bf16 and having the rope-cache do a second fp32->bf16->fp8
+            # double round. It also re-enables the rope-cache fp8 passthrough.
+            ql_nope = _aiter_triton_bf16_bmm(
+                q_nope,
+                W_K,
+                dtype=out_dtype if out_dtype is not None else torch.bfloat16,
+            ).transpose(0, 1)
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L), Convert from (N, B, L) to (B, N, L)
             # ql_nope = torch.bmm(q_nope, self.W_UK_T).transpose(0, 1)
+            # Emit ql_nope directly in the q_out dtype (fp8 for an fp8 KV cache)
+            # so the downstream rope-cache does an fp8->fp8 passthrough instead
+            # of reading bf16 and casting. Halves the dominant ql_nope read in
+            # rope-cache AND the output store of this (store-bound) BMM. Same
+            # final fp8 q (single- vs double-rounding), so accuracy-neutral.
             ql_nope = _aiter_triton_fp8_bmm(
-                q_nope, W_K, W_K_scale, group_size=128, transpose_bm=True
+                q_nope,
+                W_K,
+                W_K_scale,
+                group_size=128,
+                transpose_bm=True,
+                dtype=out_dtype if out_dtype is not None else torch.bfloat16,
             )
         return ql_nope, q_pe
 
@@ -2995,7 +3017,19 @@ class MLAAttention(nn.Module):
                 self.qrep_enabled and not context.is_prefill and not self.use_seg_mla
             )
             q_nope, q_rope = self._q_proj_and_k_up_proj(
-                q, x_scale=q_scale, group=use_qrep
+                q,
+                x_scale=q_scale,
+                group=use_qrep,
+                # Match the rope-cache q_out dtype (fp8 for an fp8 KV cache) so
+                # ql_nope is produced fp8 -- from either the fp8 absorb bmm or
+                # the bf16 absorb bmm (ATOM_MLA_ABSORB_BF16) -- and the rope-cache
+                # passthrough avoids the bf16->fp8 read+cast. None (bf16) when KV
+                # isn't fp8.
+                out_dtype=(
+                    attn_metadata.dtype_q
+                    if self.kv_cache_dtype.startswith("fp8")
+                    else None
+                ),
             )
 
             # ---- Prefill Context Parallel --------------------------------
