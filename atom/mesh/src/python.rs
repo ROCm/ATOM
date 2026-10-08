@@ -330,7 +330,45 @@ mod tests {
             let config: PyRef<'_, PyServerConfig> = object.extract().unwrap();
             let router = &config.inner.as_ref().unwrap().router_config;
             assert_eq!(router.resolved_prepare_workers(), 2);
+            assert_eq!(router.resolved_prepare_pool().queue_capacity, 20);
+            assert!(cli.get_item("prepare_queue_capacity").unwrap().is_none());
             assert_eq!(router.resolved_max_tokenize_bytes(), 8192);
+        });
+    }
+
+    #[test]
+    fn python_parser_preserves_explicit_prepare_queue_capacity() {
+        Python::attach(|py| {
+            let parsed = parse_from(
+                py,
+                vec![
+                    "--prepare-workers".into(),
+                    "2".into(),
+                    "--prepare-queue-capacity".into(),
+                    "6".into(),
+                ],
+            )
+            .unwrap();
+            let cli = parsed.bind(py).get_item("cli_args").unwrap().unwrap();
+            assert_eq!(
+                cli.get_item("prepare_queue_capacity")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                6
+            );
+            let object = parsed.bind(py).get_item("server_config").unwrap().unwrap();
+            let config: PyRef<'_, PyServerConfig> = object.extract().unwrap();
+            assert_eq!(
+                config
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .router_config
+                    .resolved_prepare_pool()
+                    .queue_capacity,
+                6
+            );
         });
     }
 

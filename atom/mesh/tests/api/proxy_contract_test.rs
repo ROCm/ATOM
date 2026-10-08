@@ -7,6 +7,132 @@ use serde_json::json;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn preparation_budget_is_reusable_while_upstream_headers_are_blocked() {
+    use axum::{extract::State, response::Response, Router};
+    use bytes::Bytes;
+    use mesh::{
+        app_context::AppContext,
+        config::{PolicyConfig, RouterConfig},
+        core::prepare_pool::PreparePoolRuntime,
+        core::BasicWorkerBuilder,
+    };
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::{mpsc, oneshot};
+
+    type Captured = (Bytes, oneshot::Sender<Response>);
+    async fn backend(
+        State(tx): State<mpsc::UnboundedSender<Captured>>,
+        request: Request<Body>,
+    ) -> Response {
+        let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let (reply, response) = oneshot::channel();
+        tx.send((body, reply)).unwrap();
+        response
+            .await
+            .unwrap_or_else(|_| Response::new(Body::empty()))
+    }
+
+    let (tx, mut captured) = mpsc::unbounded_channel::<Captured>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(backend).with_state(tx))
+            .await
+            .unwrap();
+    });
+
+    for policy in [
+        PolicyConfig::RoundRobin,
+        PolicyConfig::CacheAware {
+            cache_threshold: 0.8,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 300,
+            max_tree_size: 1000,
+        },
+    ] {
+        for path in multi_api::APIS {
+            let raw = Bytes::from(multi_api::request(path, false).to_string());
+            let mut config = RouterConfig {
+                policy: policy.clone(),
+                disable_retries: true,
+                ..Default::default()
+            };
+            config.prepare_pool.workers = Some(1);
+            // There is only enough preparation budget for one request at a time.
+            config.prepare_pool.max_retained_input_bytes = raw.len();
+            let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+            let pool = runtime.handle();
+            let context = Arc::new(
+                AppContext::from_config(config, 5, pool.clone())
+                    .await
+                    .unwrap(),
+            );
+            context.worker_registry.register(Arc::new(
+                BasicWorkerBuilder::new(&url).model_id("test-model").build(),
+            ));
+            let app = multi_api::http_app(context).await;
+            let request = || {
+                Request::post(*path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(raw.clone()))
+                    .unwrap()
+            };
+
+            let first = tokio::spawn(app.clone().oneshot(request()));
+            let (first_body, first_reply) =
+                tokio::time::timeout(Duration::from_secs(5), captured.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(first_body, raw);
+            assert!(!first.is_finished());
+            assert_eq!(pool.stats().retained_input_bytes, 0, "{path}");
+
+            // Leave the first response headers blocked while the next request enters.
+            let second = tokio::spawn(app.oneshot(request()));
+            let (second_body, second_reply) =
+                tokio::time::timeout(Duration::from_secs(5), captured.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(second_body, raw);
+            assert!(!first.is_finished());
+            assert!(!second.is_finished());
+            assert_eq!(pool.stats().retained_input_bytes, 0, "{path}");
+
+            for reply in [first_reply, second_reply] {
+                reply
+                    .send(
+                        Response::builder()
+                            .header("content-type", "application/json")
+                            .body(Body::from(multi_api::output(path, false)))
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            for task in [first, second] {
+                let response = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                    multi_api::output(path, false)
+                );
+            }
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn http_preserves_all_api_requests_and_json_sse_errors() {
     for key in [None, Some("worker-secret")] {
         let mut backend = multi_api::Backend::start().await;

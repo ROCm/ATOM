@@ -24,9 +24,6 @@ pub(super) struct RequestEnvelope {
     buffered_bytes: usize,
     budget: Option<Arc<Semaphore>>,
     memory: Vec<OwnedSemaphorePermit>,
-    // Held until the request is dropped.
-    input_leases: Vec<InputLease>,
-    input_pool: Option<PrepareHandle>,
 }
 
 pub(super) struct RoutingInput {
@@ -137,8 +134,6 @@ impl RequestEnvelope {
             buffered_bytes: 0,
             budget: None,
             memory: Vec::new(),
-            input_leases: Vec::new(),
-            input_pool: None,
         })
     }
 
@@ -217,13 +212,7 @@ impl RequestEnvelope {
                 "prepared request body limit exceeded",
             ));
         }
-        let retained: usize = self.input_leases.iter().map(InputLease::bytes).sum();
-        let extra = match &self.input_pool {
-            Some(pool) if body.len() > retained => Some(pool.retain_input(body.len() - retained)?),
-            _ => None,
-        };
         self.reserve_buffer(body.len(), limit)?;
-        self.input_leases.extend(extra);
         metrics::gauge!("mesh_ext_proc_buffered_request_bytes")
             .decrement(self.buffered_bytes as f64);
         self.raw.clear();
@@ -257,6 +246,12 @@ pub(super) struct RequestParser {
     pub budget: Arc<Semaphore>,
 }
 
+struct PreparingRequest {
+    request: RequestEnvelope,
+    // Last: a canceled job releases its actual input before its preparation charge.
+    lease: InputLease,
+}
+
 impl RequestParser {
     pub fn new(app: &AppContext) -> Self {
         Self {
@@ -270,29 +265,36 @@ impl RequestParser {
 
     pub async fn parse(
         &self,
-        mut request: RequestEnvelope,
+        request: RequestEnvelope,
         decision_deadline: Instant,
     ) -> Result<(RequestEnvelope, RoutingInput), ProcessingError> {
         let deadline = decision_deadline.min(self.pool.prepare_deadline());
         let lease = self.pool.retain_input(request.raw.len())?;
-        request.input_leases.push(lease);
-        request.input_pool = Some(self.pool.clone());
+        let preparing = PreparingRequest { request, lease };
         let routing = self.routing.clone();
-        self.pool
-            .try_submit(deadline, move |context| {
+        let (input, preparing) = self
+            .pool
+            .submit(deadline, move |context| {
                 context.check()?;
-                let parsed = ParsedInference::parse(&request.path, &request.raw)
-                    .map_err(ProcessingError::invalid)?;
+                let parsed =
+                    ParsedInference::parse(&preparing.request.path, &preparing.request.raw)
+                        .map_err(ProcessingError::invalid)?;
                 let (metadata, tokens) = routing.prepare(&parsed, context)?;
                 let input = RoutingInput {
                     metadata,
                     tokens,
                     state_reference: parsed.requires_state_domain(),
                 };
-                Ok::<_, ProcessingError>((request, input))
-            })?
-            .wait()
+                Ok::<_, ProcessingError>((input, preparing))
+            })
             .await?
+            .wait()
+            .await??;
+        // Handoff occurs only after the worker's final deadline/cancellation
+        // check succeeds. Forwarding retains its independent buffer budget.
+        let PreparingRequest { request, lease } = preparing;
+        drop(lease);
+        Ok((request, input))
     }
 }
 
@@ -307,8 +309,12 @@ impl Drop for RequestEnvelope {
 mod tests {
     use super::*;
     use crate::core::prepare_pool::PreparePoolRuntime;
+    use crate::tokenizer::{
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+        MockTokenizer,
+    };
     use std::{
-        sync::atomic::{AtomicBool, Ordering},
+        sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
 
@@ -339,6 +345,27 @@ mod tests {
         request
     }
 
+    fn inference_request(budget: Arc<Semaphore>) -> RequestEnvelope {
+        let mut body = br#"{"model":"test-model","text":"hello","vendor":{"kept":true}}"#.to_vec();
+        body.resize(512, b' ');
+        let mut request = envelope(budget, 0);
+        request.replace_body(body, 1024).unwrap();
+        request
+    }
+
+    async fn parser_with_budget(input_bytes: usize) -> (RequestParser, PreparePoolRuntime) {
+        let mut config = crate::config::RouterConfig::default();
+        config.policy = crate::config::PolicyConfig::RoundRobin;
+        config.prepare_pool.workers = Some(1);
+        config.prepare_pool.max_retained_input_bytes = input_bytes;
+        config.ext_proc.max_buffered_bytes = 1024;
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = AppContext::from_config(config, 5, runtime.handle())
+            .await
+            .unwrap();
+        (RequestParser::new(&app), runtime)
+    }
+
     #[test]
     fn buffer_budget_covers_capacity_growth_rewrites_and_drop() {
         let budget = Arc::new(Semaphore::new(1024));
@@ -356,33 +383,64 @@ mod tests {
         assert_eq!(budget.available_permits(), 1024);
     }
 
-    #[test]
-    fn body_rewrite_keeps_both_input_budgets_until_drop() {
-        let runtime = PreparePoolRuntime::new(crate::core::prepare_pool::PoolConfig {
-            max_retained_input_bytes: 800,
-            ..Default::default()
-        })
-        .unwrap();
+    #[tokio::test]
+    async fn forwarding_buffers_do_not_hold_the_preparation_budget() {
+        let (parser, mut runtime) = parser_with_budget(512).await;
         let pool = runtime.handle();
-        let budget = Arc::new(Semaphore::new(1024));
-        let mut request = envelope(budget.clone(), 300);
-        request.input_leases.push(pool.retain_input(300).unwrap());
-        request.input_pool = Some(pool.clone());
+        let request = inference_request(parser.budget.clone());
+        let original = request.raw.clone();
+        let (first, _) = parser
+            .parse(request, pool.prepare_deadline())
+            .await
+            .unwrap();
+        assert_eq!(first.raw, original);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(parser.budget.available_permits(), 512);
 
+        // The preparation budget fits only one request, but the first forwarded
+        // request can remain buffered while the next request is prepared.
+        let (second, _) = parser
+            .parse(
+                inference_request(parser.budget.clone()),
+                pool.prepare_deadline(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.raw, original);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(parser.budget.available_permits(), 0);
+        drop(first);
+        assert_eq!(parser.budget.available_permits(), 512);
+        drop(second);
+        assert_eq!(parser.budget.available_permits(), 1024);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_body_rewrites_only_charge_the_transport_buffer_budget() {
+        let (parser, mut runtime) = parser_with_budget(512).await;
+        let pool = runtime.handle();
+        let (mut request, _) = parser
+            .parse(
+                inference_request(parser.budget.clone()),
+                pool.prepare_deadline(),
+            )
+            .await
+            .unwrap();
         request.replace_body(vec![b'x'; 700], 1024).unwrap();
-        assert_eq!(pool.stats().retained_input_bytes, 700);
-        assert_eq!(budget.available_permits(), 0);
-        let error = request.replace_body(vec![b'y'; 801], 1024).unwrap_err();
-        assert_eq!(error.code, "prepare_input_budget");
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(parser.budget.available_permits(), 0);
+        let error = request.replace_body(vec![b'y'; 1025], 2048).unwrap_err();
+        assert_eq!(error.code, "buffer_budget_exhausted");
         assert_eq!(request.raw, vec![b'x'; 700]);
-        assert_eq!(pool.stats().retained_input_bytes, 700);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
 
         request.replace_body(vec![b'z'; 10], 1024).unwrap();
         // A rewrite can retain the old allocation; release conservatively at drop.
-        assert_eq!(pool.stats().retained_input_bytes, 700);
+        assert_eq!(parser.budget.available_permits(), 0);
         drop(request);
-        assert_eq!(pool.stats().retained_input_bytes, 0);
-        assert_eq!(budget.available_permits(), 1024);
+        assert_eq!(parser.budget.available_permits(), 1024);
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
@@ -422,59 +480,121 @@ mod tests {
                 .unwrap();
             assert_eq!(error.status, 413);
             assert_eq!(error.code, "tokenizer_input_too_large");
+            assert_eq!(parser.pool.stats().retained_input_bytes, 0);
+        }
+    }
+
+    struct GatedTokenizer {
+        inner: MockTokenizer,
+        started: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        gate: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Encoder for GatedTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().take();
+            if let Some(gate) = gate {
+                self.started.lock().take().unwrap().send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for GatedTokenizer {
+        fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(tokens, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for GatedTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+        fn id_to_token(&self, token: u32) -> Option<String> {
+            self.inner.id_to_token(token)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
     #[tokio::test]
-    async fn canceled_jobs_keep_ext_proc_buffers_until_cleanup() {
-        let runtime = PreparePoolRuntime::new(crate::core::prepare_pool::PoolConfig {
-            workers: 1,
-            ..Default::default()
-        })
-        .unwrap();
+    async fn cancellation_releases_waiting_buffers_but_keeps_running_buffers() {
+        let mut config = crate::config::RouterConfig::default();
+        config.policy = crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        };
+        config.prepare_pool.workers = Some(1);
+        config.prepare_pool.max_retained_input_bytes = 1024;
+        config.ext_proc.max_buffered_bytes = 1024;
+        let mut runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
         let pool = runtime.handle();
-        let budget = Arc::new(Semaphore::new(1024));
-        let mut request = envelope(budget.clone(), 512);
-        request.input_leases.push(pool.retain_input(512).unwrap());
+        let app = AppContext::from_config(config, 5, pool.clone())
+            .await
+            .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let stages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let completed_stages = stages.clone();
-        let running = pool
-            .try_submit(pool.prepare_deadline(), move |context| {
-                let _request = request;
-                started_tx.send(()).unwrap();
-                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-                context.check()?;
-                completed_stages.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, crate::core::prepare_pool::PrepareError>(())
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(GatedTokenizer {
+            inner: MockTokenizer::new(),
+            started: parking_lot::Mutex::new(Some(started_tx)),
+            gate: parking_lot::Mutex::new(Some(release_rx)),
+            calls: calls.clone(),
+        });
+        app.tokenizer_registry
+            .load("gated-test", "test-model", "mock", || async {
+                Ok(tokenizer)
             })
+            .await
             .unwrap();
-        let task = tokio::spawn(running.wait());
+        let parser = Arc::new(RequestParser::new(&app));
+        let request = inference_request(parser.budget.clone());
+        let running_parser = parser.clone();
+        let deadline = pool.prepare_deadline();
+        let task = tokio::spawn(async move { running_parser.parse(request, deadline).await });
         started_rx.await.unwrap();
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("running parser was not canceled"),
+        }
         assert_eq!(pool.stats().busy_workers, 1);
         assert_eq!(pool.stats().retained_input_bytes, 512);
-        assert_eq!(budget.available_permits(), 512);
+        assert_eq!(parser.budget.available_permits(), 512);
+        assert!(matches!(
+            pool.retain_input(513),
+            Err(crate::core::prepare_pool::PrepareError::BudgetExceeded)
+        ));
 
-        let mut queued_request = envelope(budget.clone(), 512);
-        queued_request
-            .input_leases
-            .push(pool.retain_input(512).unwrap());
-        let queued_ran = Arc::new(AtomicBool::new(false));
-        let ran = queued_ran.clone();
-        let queued = pool
-            .try_submit(pool.prepare_deadline(), move |_| {
-                let _request = queued_request;
-                ran.store(true, Ordering::SeqCst);
-            })
-            .unwrap();
-        drop(queued);
-        // Cancellation retains queued buffers until dequeue.
-        assert_eq!(budget.available_permits(), 0);
+        let queued_request = inference_request(parser.budget.clone());
+        let mut queued = Box::pin(parser.parse(queued_request, pool.prepare_deadline()));
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        assert_eq!(parser.budget.available_permits(), 0);
         assert_eq!(pool.stats().retained_input_bytes, 1024);
         assert_eq!(pool.stats().queued_jobs, 1);
+        drop(queued);
+        // A canceled waiter has not dispatched work, so both budgets release now.
+        assert_eq!(parser.budget.available_permits(), 512);
+        assert_eq!(pool.stats().retained_input_bytes, 512);
+        assert_eq!(pool.stats().queued_jobs, 0);
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while pool.stats().retained_input_bytes != 0 {
@@ -483,8 +603,8 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(budget.available_permits(), 1024);
-        assert_eq!(stages.load(Ordering::SeqCst), 0);
-        assert!(!queued_ran.load(Ordering::SeqCst));
+        assert_eq!(parser.budget.available_permits(), 1024);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        runtime.shutdown().await;
     }
 }

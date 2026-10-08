@@ -82,7 +82,7 @@ impl Router {
 
     async fn send_inference_once(
         &self,
-        request: &super::ingress::InferenceEnvelope,
+        request: &super::ingress::HttpInferenceRequest,
         descriptor: &RequestDescriptor<'_>,
         planner: &dyn PdPlanner,
         policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
@@ -424,16 +424,9 @@ impl Router {
             );
         }
         let headers = headers.cloned().unwrap_or_default();
-        if origins.len() > 1
-            && (headers.contains_key("authorization") || headers.contains_key("x-api-key"))
-            && origins.values().any(Option::is_none)
-        {
-            return error::service_unavailable(
-                "ambiguous_response_credentials",
-                "Responses resource lookup cannot forward client credentials to multiple backends; configure a worker API key for each backend or use a single backend",
-            );
-        }
 
+        // Match inference: configured worker keys override client credentials;
+        // eligible backends without a worker key receive the client credentials.
         // Validate every credential before sending any DELETE or cancel request.
         let mut requests = Vec::with_capacity(origins.len());
         for (base, key) in origins {
@@ -481,14 +474,17 @@ impl Router {
                 Err(response) => response,
             };
             let status = response.status();
-            let priority = if status.is_server_error() {
+            let priority = if status.is_client_error() && status != StatusCode::NOT_FOUND {
                 0
-            } else if status == StatusCode::NOT_FOUND {
-                2
-            } else {
+            } else if status.is_server_error() {
                 1
+            } else if status == StatusCode::NOT_FOUND {
+                3
+            } else {
+                2
             };
-            // Prefer server failures, then non-404 errors; ties follow URL order.
+            // Preserve actionable client errors over failures at other backends.
+            // A missing resource is the fallback; ties follow URL order.
             let rank = (priority, index);
             if best_error
                 .as_ref()
@@ -722,20 +718,19 @@ impl RouterTrait for Router {
         use super::ingress::IngressRouting;
         use crate::core::placement::traits::PolicySource;
         let routing = IngressRouting::new(app);
-        let resources = routing.clone();
         let route = request.metadata.route;
-        let (request, (metadata, tokens)) = match request
-            .prepare(&app.prepare_pool, move |request, ctx| {
-                resources.prepare(&request.parsed, ctx)
-            })
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(err) => return err.response(route),
-        };
+        let (request, (metadata, tokens)) =
+            match request.prepare_routing(&app.prepare_pool, &routing).await {
+                Ok(prepared) => prepared,
+                Err(err) => return err.response(route),
+            };
         let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
         {
             Ok(workers) => workers,
+            Err(err) => return err.response(metadata.route),
+        };
+        let request = match request.into_http_request() {
+            Ok(request) => request,
             Err(err) => return err.response(metadata.route),
         };
         let planner = DefaultPlanner::new(
