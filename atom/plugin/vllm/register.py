@@ -269,7 +269,15 @@ def _patch_vllm_harmony_parser_manager() -> None:
         enable_auto_tools=False,
         model_name=None,
         is_harmony=False,
+        **kwargs,
     ):
+        # **kwargs forwards parameters this wrapper does not know about.
+        # vLLM 0.31 added `tool_strict_level` to ParserManager.get_parser;
+        # enumerating the 0.29 parameter list exactly meant the new keyword hit
+        # this wrapper instead of the real method and raised TypeError on the
+        # serving path, after the model had already loaded. Only `is_harmony`
+        # is read here, so everything else can pass straight through and the
+        # next added parameter will not break the patch.
         parser_cls = original(
             cls,
             tool_parser_name=tool_parser_name,
@@ -277,6 +285,7 @@ def _patch_vllm_harmony_parser_manager() -> None:
             enable_auto_tools=enable_auto_tools,
             model_name=model_name,
             is_harmony=is_harmony,
+            **kwargs,
         )
         if parser_cls is not None or not is_harmony:
             return parser_cls
