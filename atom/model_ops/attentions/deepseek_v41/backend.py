@@ -29,6 +29,31 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
+
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+except ImportError:  # native ATOM runs without vLLM installed
+
+    def eager_break_during_capture(fn):
+        return fn
+
+
+def _breakable_cudagraph_enabled() -> bool:
+    """Whether graphs may be captured around this model's step work.
+
+    Read per call rather than once at import: the env var is set before the
+    worker imports vLLM, but a test may flip it, and the cost is a dict lookup
+    next to a cache allocation.
+    """
+    try:
+        from vllm.compilation.breakable_cudagraph import (
+            is_breakable_cudagraph_enabled,
+        )
+    except ImportError:
+        return False
+    return bool(is_breakable_cudagraph_enabled())
+
+
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
 
@@ -431,6 +456,50 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
+    def _dummy_cache(self, pages, slots, running_tokens):
+        """Scratch for a dummy batch: per call, except under graph capture.
+
+        A dummy run must never touch a live PAGE or STATE slot, so it gets its
+        own cache. Allocating a fresh one per call is right while nothing is
+        being captured -- it is freed again immediately, and the eager path
+        pays nothing for it.
+
+        Under a breakable capture it is fatal, and loudly so. The kernels
+        recorded during capture hold this cache's addresses; the object dies
+        when the capture returns, and the first replay reads freed memory as an
+        illegal access, reported asynchronously somewhere else entirely. So
+        while capture is possible, hand out one cache, allocated once at the
+        capture ceiling and kept alive on the builder. Every bucket's dummy
+        batch fits inside it -- its page, slot and token counts are caps, and
+        the batch indexes from zero -- so one allocation serves them all
+        without the per-bucket cost of a cache each (the STATE side alone is
+        ~5 MiB per slot).
+        """
+        if not _breakable_cudagraph_enabled():
+            return PagedAttentionCache(
+                self.geometry,
+                pages,
+                slots,
+                self.device,
+                max_tokens=running_tokens,
+                workspace=self.score_workspace,
+            )
+        cached = getattr(self, "_capture_dummy_cache", None)
+        if cached is None:
+            ceiling_pages = max(
+                pages, -(-self.max_num_batched_tokens // self.block_size)
+            )
+            cached = PagedAttentionCache(
+                self.geometry,
+                ceiling_pages,
+                max(slots, self.max_bs),
+                self.device,
+                max_tokens=max(running_tokens, self.max_num_batched_tokens),
+                workspace=self.score_workspace,
+            )
+            self._capture_dummy_cache = cached
+        return cached
+
     def _prepare(
         self,
         batch,
@@ -475,14 +544,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
         cache = (
-            PagedAttentionCache(
-                self.geometry,
-                max(next_page, 1),
-                max(len(spans), 1),
-                self.device,
-                max_tokens=running_tokens,
-                workspace=self.score_workspace,
-            )
+            self._dummy_cache(max(next_page, 1), max(len(spans), 1), running_tokens)
             if batch.is_dummy_run
             else self.cache
         )
@@ -672,7 +734,24 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             candidates=step.max_q_len if tentative else 0,
         )
 
+    @eager_break_during_capture
     def prepare_model_inputs(self, input_ids, metadata):
+        """One CSA2 step's host-side work: Engram rows, state, cursor.
+
+        A break point for breakable cudagraph capture, which is what lets this
+        model be captured at all. None of this can be replayed from a graph --
+        the Engram row staging hashes token ids, `prepare_state` resets the
+        slots this batch recycled, and `advance_cursor` writes the committed
+        position -- and it has to happen once, in order, per step.
+
+        It meets the decorator's contract without restructuring: it returns no
+        tensor and writes only into `forward_vars` buffers that were reserved
+        once and never reallocated, precisely so a replay (which reruns no host
+        code) finds the addresses its kernels recorded. See `_reserve_indptrs`.
+
+        Outside a capture context the decorator is identity, so the native
+        engine's path is unchanged.
+        """
         step, cache = metadata.step, metadata.cache
         # The rows the requests own, not the rows the forward runs: the padding
         # tail is zeroed inside `run_model`, after this, so what stands there
