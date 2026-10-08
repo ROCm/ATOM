@@ -23,6 +23,7 @@ from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     RpcResponseRouter,
     RpcResult,
+    checked_timeout,
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import FIRE_AND_FORGET_UTILITY_CMDS
@@ -1409,9 +1410,11 @@ class CoreManager:
 
         Never raises for a worker-side failure -- the failure travels in
         ``RpcResult.error`` so the ranks that did succeed are still reported.
-        Raises up front for a manager whose engines are not one DP rank each,
-        which the replies would otherwise be reported as.
+        Raises up front for a timeout that is not a finite number of seconds,
+        and for a manager whose engines are not one DP rank each, which the
+        replies would otherwise be reported as.
         """
+        timeout = checked_timeout(timeout)
         unsupported = self._collective_rpc_unsupported()
         if unsupported is not None:
             raise NotImplementedError(

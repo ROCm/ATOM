@@ -384,6 +384,16 @@ def test_prefill_and_decode_engines_are_refused_too():
     assert mgr.sent == []
 
 
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf")])
+def test_a_timeout_no_deadline_can_be_built_from_is_refused(timeout):
+    """remaining <= 0 is never true of NaN, so the call polled forever for an
+    engine that did not answer."""
+    mgr = _mgr(2)
+    with pytest.raises(ValueError, match="finite"):
+        mgr.collective_rpc("m", timeout=timeout)
+    assert mgr.sent == [], "nothing may be broadcast for a refused call"
+
+
 # ── the legacy synchronous path ────────────────────────────────────────────
 
 
