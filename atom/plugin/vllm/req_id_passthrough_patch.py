@@ -29,6 +29,11 @@ forward), so ``req_ids[i]`` still aligns with row ``i`` of the draft metadata --
 the same invariant the target build relies on. ATOM's V4 metadata builder reads
 the snapshot via ``get_current_req_ids()`` and keys slot allocation on it, with
 no D2H. All of this lives in ATOM; no vLLM source is modified.
+
+The same wrappers expose the ``InputBatch`` itself through
+``get_current_input_batch()``. DeepSeek-V4's checkpoint-image ops read the
+host mirror of the image groups' block tables from it, which
+``CommonAttentionMetadata`` does not carry without a device sync.
 """
 
 from __future__ import annotations
@@ -40,6 +45,16 @@ import threading
 logger = logging.getLogger("atom")
 
 _req_id_local = threading.local()
+
+
+def get_current_input_batch():
+    """Return the current step's vLLM ``InputBatch``, or None.
+
+    Valid over the same window as :func:`get_current_req_ids` -- the batch is
+    the object ``req_ids`` was snapshotted from, handed over live rather than
+    copied. Callers must not hold the reference past the call that exposed it.
+    """
+    return getattr(_req_id_local, "input_batch", None)
 
 
 def get_current_req_ids() -> list[str] | None:
@@ -68,6 +83,8 @@ def _wrap_with_req_id_snapshot(cls, method_name: str) -> bool:
     @functools.wraps(original)
     def wrapped(self, *args, **kwargs):
         prev = getattr(_req_id_local, "req_ids", None)
+        prev_batch = getattr(_req_id_local, "input_batch", None)
+        _req_id_local.input_batch = getattr(self, "input_batch", None)
         try:
             # Snapshot now: req_ids is already batch-reordered (swap_states ran
             # in _prepare_inputs) so it aligns with the per-request rows the
@@ -81,6 +98,7 @@ def _wrap_with_req_id_snapshot(cls, method_name: str) -> bool:
             return original(self, *args, **kwargs)
         finally:
             _req_id_local.req_ids = prev
+            _req_id_local.input_batch = prev_batch
 
     wrapped._atom_req_id_passthrough_patched = True  # type: ignore[attr-defined]
     setattr(cls, method_name, wrapped)
