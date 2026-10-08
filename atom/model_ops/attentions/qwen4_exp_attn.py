@@ -630,7 +630,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         context. The op cannot catch it: its guard compares batch and kv-head
         count, and neither changes.
         """
-        return self.refresh_flydsl_plan(var["context_lens"].gpu[:running_bs])
+        return self.refresh_flydsl_plan(
+            var["context_lens"].gpu[:running_bs], role="draft"
+        )
 
     def prepare_mtp_decode(
         self,

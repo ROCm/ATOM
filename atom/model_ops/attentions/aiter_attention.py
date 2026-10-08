@@ -262,6 +262,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # Kept flydsl work plan here and refreshed once per prepare_*.
         self._flydsl_kv_heads = num_head_k
         self._flydsl_plans: dict[tuple, object] = {}
+        # (role, batch) -> offline-tuned budget, pinned during the pre-capture
+        # warmup by the op (see adopt_flydsl_budget). Target and draft may tune
+        # to different budgets; a plan's capacity is fixed when it is built.
+        self._flydsl_role_budgets: dict[tuple, int] = {}
         self._flydsl_plan_unplanned = False
         (
             (work_meta_data_size, work_meta_data_type),
@@ -794,7 +798,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             tp_replication_factor=1,
         )
 
-    def refresh_flydsl_plan(self, context_lens, *, create=False):
+    def refresh_flydsl_plan(self, context_lens, *, create=False, role="target"):
         """Build or refresh aiter #5546's work plan for this forward.
 
         Depends only on context_lens, which every layer of one forward shares,
@@ -833,7 +837,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # `max_partitions` omitted on purpose: that takes plan_pa_decode's own
         # default. Setting it from the static split count clamps every request
         # alike and removes the planner's mechanism -- this tree did that once.
-        key = (n, self._flydsl_kv_heads, context_lens.device.index)
+        # Budget is part of the key: since aiter #5809 it fixes the plan's
+        # capacity at build time, so target and draft share an object only
+        # when their tuned budgets agree. None is aiter's own default.
+        budget = self._flydsl_role_budgets.get((role, n))
+        key = (n, self._flydsl_kv_heads, budget, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
             # Plans are only ever minted during cudagraph capture, where the
@@ -857,13 +865,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             return None
         if plan is None:
-            plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
+            kwargs = {} if budget is None else {"workgroup_budget": budget}
+            plan = plan_pa_decode(
+                context_lens, self._flydsl_kv_heads, query_length=1, **kwargs
+            )
             self._flydsl_plans[key] = plan
             logger.info(
-                "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
-                "capacity=%d",
+                "flydsl work plan: role=%s num_seqs=%d kv_heads=%d budget=%s "
+                "max_partitions=%d capacity=%d",
+                role,
                 n,
                 self._flydsl_kv_heads,
+                budget,
                 int(plan.max_partitions),
                 int(plan.capacity),
             )
@@ -875,6 +888,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 plan=plan,
             )
         return plan
+
+    def adopt_flydsl_budget(self, context_lens, budget, *, role):
+        """Pin ``role``'s plan for this batch to ``budget`` and return it.
+
+        Called by the op during the eager warmup that precedes each capture,
+        with the budget it resolved from the real tensors. Later refreshes for
+        this role pick the new plan, so capture and replay use it too.
+        """
+        self._flydsl_role_budgets[(role, int(context_lens.shape[0]))] = int(budget)
+        return self.refresh_flydsl_plan(context_lens, create=True, role=role)
 
     def prepare_mtp_decode(
         self,
@@ -973,8 +996,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # computed; the GDN and Qwen4 overrides would have to reach for the
         # forward context to save the same kernel.
         workinfos["flydsl_work_plan"] = (
-            None if skip_update else self.refresh_flydsl_plan(context_lens[:running_bs])
+            None
+            if skip_update
+            else self.refresh_flydsl_plan(context_lens[:running_bs], role="draft")
         )
+        workinfos["flydsl_plan_role"] = "draft"
+        workinfos["flydsl_plan_builder"] = self
         return workinfos
 
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
@@ -1274,6 +1301,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens
         )
+        attn_metadata.flydsl_plan_role = "target"
+        attn_metadata.flydsl_plan_builder = self
         if self._has_sparse_attention:
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
@@ -1553,6 +1582,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens, create=True
         )
+        attn_metadata.flydsl_plan_role = "target"
+        attn_metadata.flydsl_plan_builder = self
         context = Context(
             positions=positions,
             is_prefill=False,

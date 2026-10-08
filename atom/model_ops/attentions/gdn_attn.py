@@ -1552,8 +1552,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # pre-bump context -- a wrong answer, and one the op cannot detect: the
         # shape guard only compares batch and kv-head count.
         result["flydsl_work_plan"] = self.refresh_flydsl_plan(
-            var["context_lens"].gpu[:running_bs]
+            var["context_lens"].gpu[:running_bs], role="draft"
         )
+        result["flydsl_plan_role"] = "draft"
+        result["flydsl_plan_builder"] = self
         return result
 
     def build_for_cudagraph_capture(self, bs: int):

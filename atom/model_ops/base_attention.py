@@ -280,6 +280,8 @@ _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
 _FLYDSL_RUNTIME_PLANS: dict[tuple, object] = {}
 _FLYDSL_BUDGETS: dict[tuple, int] = {}
 _FLYDSL_UNIT_SCALES: dict[tuple, torch.Tensor] = {}
+# (builder id, role, batch) whose capture-owned plan budget has been decided.
+_FLYDSL_ROLE_DECIDED: set[tuple] = set()
 
 
 def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
@@ -373,6 +375,7 @@ def _flydsl_prepare_explicit_plan(
     sliding_window,
     max_context_length,
     existing_plan,
+    plan_owner=None,
 ):
     """Resolve #5809's offline budget and return its required explicit plan."""
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
@@ -398,6 +401,19 @@ def _flydsl_prepare_explicit_plan(
     )
     if context_bound < query_length:
         raise ValueError("max_context_length must cover every query token")
+
+    # A capture-owned plan is decided once per (role, batch), in the eager
+    # warmup before capture, then used as-is -- so capture and replay never
+    # look up a budget or record a second plan into the graph.
+    role = getattr(plan_owner, "flydsl_plan_role", None)
+    builder = getattr(plan_owner, "flydsl_plan_builder", None)
+    decided_key = (id(builder), role, num_seqs)
+    if existing_plan is not None and builder is not None and role is not None:
+        if (
+            decided_key in _FLYDSL_ROLE_DECIDED
+            or torch.cuda.is_current_stream_capturing()
+        ) and flydsl_plan_matches(existing_plan, num_seqs, num_kv_heads):
+            return existing_plan
 
     # Only the dense/full planner has an offline-tuning contract today. Sparse
     # and plugin calls used the old static path with a small partition cap and
@@ -456,13 +472,23 @@ def _flydsl_prepare_explicit_plan(
         num_seqs * max_partitions,
         max(num_seqs, (budget + num_kv_heads - 1) // num_kv_heads),
     )
-    if (
+    compatible = (
         existing_plan is not None
         and flydsl_plan_matches(existing_plan, num_seqs, num_kv_heads)
-        and int(existing_plan.capacity) == capacity
         and int(existing_plan.sliding_window) == window
         and (window == 0 or int(existing_plan.query_length) == query_length)
-    ):
+    )
+    if compatible and builder is not None and role is not None:
+        _FLYDSL_ROLE_DECIDED.add(decided_key)
+        if int(existing_plan.capacity) != capacity:
+            adopted = builder.adopt_flydsl_budget(
+                context_lens[:num_seqs], budget, role=role
+            )
+            if adopted is not None:
+                existing_plan = adopted
+                plan_owner.flydsl_work_plan = adopted
+        return existing_plan
+    if compatible and int(existing_plan.capacity) == capacity:
         return existing_plan
 
     # Plans own GPU metadata and their scratch cache keeps them alive. Keying
@@ -542,6 +568,7 @@ def run_pa_decode(
     ps: bool = True,
     work_plan=None,
     max_context_length: int | None = None,
+    plan_owner=None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -658,6 +685,7 @@ def run_pa_decode(
             sliding_window=sliding_window,
             max_context_length=max_context_length,
             existing_plan=work_plan,
+            plan_owner=plan_owner,
         )
         if work_plan is None:
             es, ml, tmp = exp_sums[:n], max_logits[:n], temporary_output[:n]
