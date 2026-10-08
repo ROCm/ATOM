@@ -167,6 +167,7 @@ from atom.model_ops.monokernel.ops import (
     xshfl as _xshfl,
 )
 
+
 def build_glm5_monokernel(
     S: int = 1,
     heads: int = 8,
@@ -1341,7 +1342,8 @@ def build_glm5_monokernel(
 
         def stage_xq(samples):
             """Poll the router's packed FP8 activation + block scales of ``samples``
-            (sample list, or one runtime sample) into LDS, slot 0 for one runtime sample."""
+            (sample list, or one runtime sample) into LDS, slot 0 for one runtime sample.
+            """
             nxw = HIDDEN // 4 // THREADS
             nscale = XQ_GROUPS if native_fp4_mfma else XQ_BLOCKS
             got = poll(
@@ -3711,8 +3713,8 @@ def build_glm5_monokernel(
         # in-flight weight batches fit comfortably in LDS/VGPRs.
         DN_NKC = expert_inter // 64
         DN_R = (
-            (DN_TILE + 15) // 16
-        )  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
+            DN_TILE + 15
+        ) // 16  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
         DN_WPR = WAVES // DN_R
         DN_BATCH = down_prefetch_batch(S, native_fp4_mfma)
         DN_W_BYTES = HIDDEN * expert_inter // (2 if expert_mxfp4 else 1)

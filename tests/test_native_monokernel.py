@@ -987,14 +987,10 @@ def test_shared_linear_scale_unshuffle_round_trip():
 def test_kimi_staged_c1_config_is_explicit(monkeypatch):
     module = _kimi_mono_module()
     config = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            method="dspark", num_speculative_tokens=7
-        ),
+        speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=7),
         decode_context_parallel_size=1,
     )
-    monkeypatch.setattr(
-        module, "envs", SimpleNamespace(ATOM_ENABLE_REPLAYSSM=False)
-    )
+    monkeypatch.setattr(module, "envs", SimpleNamespace(ATOM_ENABLE_REPLAYSSM=False))
     module.validate_kimi_c1_config(config)
 
     config.speculative_config.num_speculative_tokens = 3
@@ -1107,9 +1103,7 @@ def test_kimi_tail_preparation_has_no_attention_weights(monkeypatch):
     monkeypatch.setattr(
         prepared_module,
         "prepare_aiter_mxfp4_expert_storage",
-        lambda _weights: tuple(
-            torch.zeros(1, dtype=torch.uint8) for _ in range(4)
-        ),
+        lambda _weights: tuple(torch.zeros(1, dtype=torch.uint8) for _ in range(4)),
     )
 
     prepared = prepared_module.prepare_kimi_k3_tail_weights(weights)

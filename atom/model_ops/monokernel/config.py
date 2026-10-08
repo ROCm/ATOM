@@ -68,6 +68,7 @@ class KvCacheLayout(str, Enum):
     SPLIT = "split"
     ATOM = "atom"
 
+
 @dataclass(frozen=True)
 class MoeFormat:
     activation: ExpertActivation
@@ -212,6 +213,7 @@ GLM5_QUERY_LENGTHS = (1, 4, 5, 6)
 GLM5_KERNEL_SAMPLES = (1, 2, 4, 5, 6, 8, 10, 12)
 GLM5_GLOBAL_HEADS = GLM5_CONFIG.local_heads * GLM5_REFERENCE_TP
 GLM5_GLOBAL_INTER = GLM5_CONFIG.inter * GLM5_REFERENCE_TP
+
 
 def glm5_tp_config(tp_size: int) -> LayerConfig:
     """Return the one GLM-5 shard geometry for ``tp_size``."""
