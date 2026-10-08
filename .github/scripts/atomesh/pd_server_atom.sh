@@ -2278,9 +2278,10 @@ run_benchmark_and_eval() {
 validate_mooncake_store_settings
 write_metadata
 
-# A branch that starts several servers installs its EXIT trap before the first
-# (the pids expand at exit): a start that fails stops those started before it,
-# and their Store.
+# Every branch installs its EXIT trap before its first start (the pids expand
+# at exit): start_prefill and start_decode start the Store's masters and owners
+# before their server, so a start that fails stops what it and the starts
+# before it left running.
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   start_prefill "prefill-rank-0"
@@ -2384,8 +2385,8 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
-  start_prefill "prefill-rank-0"
   trap 'cleanup_processes ${router_pid:-} ${server_pid:-}' EXIT
+  start_prefill "prefill-rank-0"
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -2418,20 +2419,20 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   wait_router_closed
   cleanup_processes "${decode_pids[@]}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
-  start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
-  start_prefill "prefill-rank-${NODE_RANK}"
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_prefill "prefill-rank-${NODE_RANK}"
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
-  start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"

@@ -115,6 +115,30 @@ class NumaMemoryBudgetTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot read NUMA node 2", result.stderr)
 
+    def test_non_finite_or_negative_amounts_are_refused(self):
+        # 1600 GiB on a 1511 GiB node fails; a NaN or negative reserve or pin
+        # would compare its way past that check, so none is taken.
+        self.assertEqual(self.run_script("0:1600").returncode, 2)
+        for args in (
+            ("--reserve-gib", "nan", "0:1600"),
+            ("--reserve-gib", "-200", "0:1600"),
+            ("--reserve-gib", "inf", "0:8"),
+            ("--per-gpu-gib", "-1", "--gpus", "0", "0:8"),
+            ("--compact", "--compact-timeout", "0", "0:8"),
+            ("--compact", "--compact-timeout", "nan", "0:8"),
+            ("--compact", "--compact-timeout", "-5", "0:8"),
+        ):
+            with self.subTest(args=args):
+                result = self.run_script(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertRegex(result.stderr, "is not a finite (GiB|seconds)")
+                self.assertNotIn("compacting", result.stdout)
+        for pin in ("0:nan", "0:-800", "0:inf", "0:x"):
+            with self.subTest(pin=pin):
+                result = self.run_script("0:1600", pin)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"'{pin}' is not <node>:<GiB>", result.stderr)
+
     def compact(self, *args, stalled_node=None):
         calls, timeouts = [], []
 

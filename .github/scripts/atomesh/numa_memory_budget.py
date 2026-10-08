@@ -29,12 +29,34 @@ bound the start.
 from __future__ import annotations
 
 import argparse
+import math
 import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 GIB = 1 << 30
+
+
+def non_negative_gib(text: str) -> float:
+    """A finite number of GiB, 0 or more.
+
+    ``float`` also takes "nan", "inf" and negative numbers: a NaN reserve or
+    pin compares false with every node's memory and a negative one cancels
+    other pins, so either passes any budget.
+    """
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite GiB >= 0")
+    return value
+
+
+def positive_seconds(text: str) -> float:
+    """A finite number of seconds above 0; a compaction timeout of 0 stops it at once."""
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite seconds > 0")
+    return value
 
 
 def node_meminfo(sysfs: Path, node: int) -> dict[str, int]:
@@ -110,9 +132,16 @@ def plan_pins(
     planned: dict[int, float] = defaultdict(float)
     for pin in pins:
         node, sep, gib = pin.partition(":")
-        if not sep or not node.isdigit():
-            raise SystemExit(f"[numa-budget][FAIL] '{pin}' is not <node>:<GiB>")
-        planned[int(node)] += float(gib)
+        try:
+            if not sep or not node.isdigit():
+                raise ValueError(pin)
+            amount = non_negative_gib(gib)
+        except (ValueError, argparse.ArgumentTypeError):
+            raise SystemExit(
+                f"[numa-budget][FAIL] '{pin}' is not <node>:<GiB> with a finite "
+                "GiB >= 0"
+            ) from None
+        planned[int(node)] += amount
     ordinals = [int(ordinal) for ordinal in gpus.split(",") if ordinal.strip()]
     if ordinals and per_gpu_gib > 0:
         for node in gpu_numa_nodes(sysfs, ordinals):
@@ -158,10 +187,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--gpus", default="", help="HIP ordinals; each pins --per-gpu-gib"
     )
-    parser.add_argument("--per-gpu-gib", type=float, default=0.0)
+    parser.add_argument("--per-gpu-gib", type=non_negative_gib, default=0.0)
     parser.add_argument(
         "--reserve-gib",
-        type=float,
+        type=non_negative_gib,
         default=0.0,
         help="memory each node keeps for everything that is not pinned here",
     )
@@ -172,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--compact-timeout",
-        type=float,
+        type=positive_seconds,
         default=600.0,
         help="seconds each node's compaction may take before it is stopped",
     )
