@@ -361,3 +361,25 @@ def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
         "the hardcoded speculative_tokens=0 is only safe while the platform "
         "refuses speculative decoding, and that refusal is gone"
     )
+
+
+def test_the_proxy_backend_answers_block_sizes_with_or_without_a_spec():
+    """vLLM 0.31 passes `kv_cache_spec` positionally; 0.28 passes nothing.
+
+    Both call sites in 0.31 (`attention.py`, `composite.py`) hand it one
+    argument, so a zero-arg definition raises TypeError there -- a break that
+    is invisible on 0.28 and fatal on 0.31. Accepting an optional argument
+    answers both, and the answer does not depend on it: V4.1's PAGE is 256
+    tokens whatever spec is asking.
+    """
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_BLOCK_SIZE,
+        AtomDeepseekV41ProxyBackend,
+    )
+
+    expected = [ATOM_DEEPSEEK_V41_BLOCK_SIZE]
+    assert AtomDeepseekV41ProxyBackend.get_supported_kernel_block_sizes() == expected
+    assert (
+        AtomDeepseekV41ProxyBackend.get_supported_kernel_block_sizes(object())
+        == expected
+    )
