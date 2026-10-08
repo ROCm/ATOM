@@ -1585,6 +1585,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens, create=True
         )
+        attn_metadata.flydsl_plan_role = "target"
+        attn_metadata.flydsl_plan_builder = self
 
         # A capture runs a full synthetic batch, so nothing is padded and the
         # scheduled shape is the running one.

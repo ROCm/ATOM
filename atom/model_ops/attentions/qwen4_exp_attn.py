@@ -653,6 +653,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 "slot_mapping": slots,
                 "qsa_metadata": None,
                 "flydsl_work_plan": self._refreshed_flydsl_plan(var, running_bs),
+                "flydsl_plan_role": "draft",
+                "flydsl_plan_builder": self,
             }
         logical = var["qsa_logical_positions"].gpu[:running_bs]
         req_ids = var["qsa_token_to_req"].gpu[:running_bs]
@@ -674,6 +676,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         return {
             "slot_mapping": slots,
             "flydsl_work_plan": self._refreshed_flydsl_plan(var, running_bs),
+            "flydsl_plan_role": "draft",
+            "flydsl_plan_builder": self,
             "qsa_metadata": Qwen4ExpQSAMetadata(
                 tables,
                 slots,

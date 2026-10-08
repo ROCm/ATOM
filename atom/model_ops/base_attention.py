@@ -360,6 +360,18 @@ def _flydsl_context_bound(max_context_length, block_tables, k_cache):
     return min(bound, capacity)
 
 
+def _flydsl_forward_refreshed() -> set:
+    """Runtime-plan keys already refreshed in the current forward."""
+    from atom.utils.forward_context import get_forward_context
+
+    ctx = get_forward_context()
+    refreshed = getattr(ctx, "_flydsl_refreshed_plans", None)
+    if refreshed is None:
+        refreshed = set()
+        ctx._flydsl_refreshed_plans = refreshed
+    return refreshed
+
+
 def _flydsl_prepare_explicit_plan(
     *,
     q,
@@ -376,8 +388,16 @@ def _flydsl_prepare_explicit_plan(
     max_context_length,
     existing_plan,
     plan_owner=None,
+    refresh_once_per_forward=False,
 ):
-    """Resolve #5809's offline budget and return its required explicit plan."""
+    """Resolve #5809's offline budget and return its required explicit plan.
+
+    ``refresh_once_per_forward``: the caller guarantees every call sharing this
+    plan within one forward has identical lengths (MiniMax-M3 sparse decode:
+    all sparse layers of a step select the same per-row lengths), so the plan
+    is refreshed by the first such call only -- one planner launch per step
+    instead of one per layer, in eager and in the captured graph alike.
+    """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
     from aiter.ops.flydsl.pa_decode_tuning import (
         get_cached_budget,
@@ -511,6 +531,11 @@ def _flydsl_prepare_explicit_plan(
     )
     plan = _FLYDSL_RUNTIME_PLANS.get(plan_key)
     lengths = context_lens[:num_seqs]
+    if refresh_once_per_forward:
+        refreshed = _flydsl_forward_refreshed()
+        if plan is not None and plan_key in refreshed:
+            return plan
+        refreshed.add(plan_key)
     if plan is None:
         plan = plan_pa_decode(
             lengths,
@@ -569,6 +594,7 @@ def run_pa_decode(
     work_plan=None,
     max_context_length: int | None = None,
     plan_owner=None,
+    refresh_once_per_forward: bool = False,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -581,10 +607,6 @@ def run_pa_decode(
     validation so an unsupported shape falls back here instead of raising
     inside aiter.
     """
-    max_context_length = _flydsl_context_bound(
-        max_context_length, block_tables, k_cache
-    )
-
     # aiter #5809 has no no-plan FlyDSL decode. Keep PLAN=0 useful as a clean
     # A/B switch by routing it to Gluon instead of silently constructing an
     # implicit planner inside the call.
@@ -606,6 +628,11 @@ def run_pa_decode(
         sliding_window=sliding_window,
         ps=ps,
     )
+    # Every FlyDSL call now needs a plan, and aiter's planner rejects more than
+    # _FLYDSL_PLAN_MAX_BATCH rows (e.g. a long sparse prefill chunk folded into
+    # rows). Gluon has no such bound.
+    if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
+        flydsl_seqs = None
     # Inside the guard, not before it: this runs 63 times per decode step and
     # attention is a piecewise split op, so graph replay does not elide it. A
     # deployment that never enables FlyDSL should pay nothing here.
@@ -639,6 +666,10 @@ def run_pa_decode(
 
     if flydsl_seqs:
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
+
+        max_context_length = _flydsl_context_bound(
+            max_context_length, block_tables, k_cache
+        )
 
         n = flydsl_seqs
         # Handed in by the caller off the ForwardContext it already holds, not
@@ -686,6 +717,7 @@ def run_pa_decode(
             max_context_length=max_context_length,
             existing_plan=work_plan,
             plan_owner=plan_owner,
+            refresh_once_per_forward=refresh_once_per_forward,
         )
         if work_plan is None:
             es, ml, tmp = exp_sums[:n], max_logits[:n], temporary_output[:n]

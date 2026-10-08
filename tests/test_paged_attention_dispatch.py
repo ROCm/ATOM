@@ -963,7 +963,15 @@ class _BudgetPlan:
         self.refreshed = 0
 
 
-@pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #5809 (explicit plans)")
+try:
+    _HAS_PA_TUNING = (
+        importlib.util.find_spec("aiter.ops.flydsl.pa_decode_tuning") is not None
+    )
+except ModuleNotFoundError:
+    _HAS_PA_TUNING = False
+
+
+@pytest.mark.skipif(not _HAS_PA_TUNING, reason="needs aiter #5809 (pa_decode_tuning)")
 class TestCaptureOwnedPlanBudget:
     """Target and draft tune to different budgets, and a plan's capacity is
     fixed when it is built. One shared capture plan cannot carry both, and the
@@ -1094,6 +1102,108 @@ class TestCaptureOwnedPlanBudget:
         self._call(ba, builder, "draft", 1)
         self._call(ba, builder, "draft", 1)
         assert lookups == [1], f"decided role looked up again: {lookups}"
+
+    def _runtime_call(self, ba, refresh_once):
+        import torch
+
+        n = 16
+        return ba._flydsl_prepare_explicit_plan(
+            q=torch.empty((n, 16, 128), dtype=torch.bfloat16, device="meta"),
+            k_cache=torch.empty((64, 1, 8, 16, 16), device="meta"),
+            v_cache=torch.empty((64, 1, 1, 128, 16), device="meta"),
+            block_tables=torch.empty((n, 128), device="meta"),
+            context_lens=_Ctx(n),
+            k_scale=None,
+            v_scale=None,
+            num_seqs=n,
+            query_length=1,
+            max_context_partition_num=8,
+            sliding_window=0,
+            max_context_length=2048,
+            existing_plan=None,
+            refresh_once_per_forward=refresh_once,
+        )
+
+    def _forward(self, monkeypatch):
+        import torch
+
+        from atom.utils import forward_context as fc
+
+        ctx = SimpleNamespace()
+        monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda device=None: SimpleNamespace(cuda_stream=7),
+        )
+
+    def test_sparse_plan_is_refreshed_once_per_forward(self, monkeypatch):
+        """All sparse layers of one step share lengths, so one refresh serves 57."""
+        ba, _, _ = self._setup(monkeypatch, {1: 512}, capturing=lambda: False)
+        monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
+        self._forward(monkeypatch)
+        plans = [self._runtime_call(ba, True) for _ in range(57)]
+        assert all(p is plans[0] for p in plans)
+        assert plans[0].refreshed == 0, "only the build may fill it in this forward"
+        self._forward(monkeypatch)  # next step: a new forward context
+        self._runtime_call(ba, True)
+        self._runtime_call(ba, True)
+        assert plans[0].refreshed == 1, "a new forward must refresh exactly once"
+
+    def test_without_the_opt_in_every_call_refreshes(self, monkeypatch):
+        """Dense eager / plugin callers do not promise shared lengths."""
+        ba, _, _ = self._setup(monkeypatch, {1: 512}, capturing=lambda: False)
+        monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
+        self._forward(monkeypatch)
+        plans = [self._runtime_call(ba, False) for _ in range(3)]
+        assert plans[0].refreshed == 2
+
+
+@pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+class TestPlanBatchLimit:
+    """aiter's planner rejects more than 4096 rows and every FlyDSL call now
+    needs a plan, so larger calls (a long sparse prefill folded into rows) must
+    go to gluon instead of raising inside the worker."""
+
+    def test_rows_past_the_planner_limit_take_gluon(self, monkeypatch):
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        n = ba._FLYDSL_PLAN_MAX_BATCH + 1
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL_PLAN", True)
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
+
+        def no_flydsl(**kw):
+            raise AssertionError("routed to FlyDSL past the planner limit")
+
+        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", no_flydsl)
+        seen = []
+        monkeypatch.setattr(
+            torch.ops.aiter, "pa_decode_gluon", lambda *a, **kw: seen.append(1)
+        )
+        meta = lambda *shape: torch.empty(shape, device="meta")  # noqa: E731
+        ba.run_pa_decode(
+            output=meta(n, 16, 128),
+            q=meta(n, 16, 128),
+            k_cache=meta(8, 1, 8, 16, 16),
+            v_cache=meta(8, 1, 1, 128, 16),
+            context_lens=meta(n),
+            block_tables=meta(n, 8),
+            softmax_scale=1.0,
+            max_seqlen_q=1,
+            max_context_partition_num=8,
+            context_partition_size=256,
+            compute_type=torch.bfloat16,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+            exp_sums=meta(n, 1, 8, 16),
+            max_logits=meta(n, 1, 8, 16),
+            temporary_output=meta(n, 1, 8, 16, 128),
+        )
+        assert seen, "gluon was not called"
 
 
 class TestFlyDSLCapabilityGate:

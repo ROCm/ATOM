@@ -1338,6 +1338,9 @@ def minimax_m3_sparse_attn_decode_asm(
             topk_idx, block_table, seq_lens, block_page_stride=block_page_stride
         )
 
+    # Every sparse layer of one decode step selects the same per-row lengths
+    # (checked: 0 differences over 9,000 C15 steps x 56 layer pairs), so the
+    # FlyDSL plan is refreshed by the first sparse layer only.
     _sparse_pa_per_row(
         q,
         k_cache,
@@ -1349,6 +1352,7 @@ def minimax_m3_sparse_attn_decode_asm(
         output,
         k_scale,
         v_scale,
+        refresh_plan_once=True,
     )
 
 
@@ -1364,6 +1368,7 @@ def _sparse_pa_per_row(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    refresh_plan_once: bool = False,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and Gluon else.
 
@@ -1454,6 +1459,7 @@ def _sparse_pa_per_row(
         sinks=None,
         sliding_window=-1,
         ps=True,
+        refresh_once_per_forward=refresh_plan_once,
     )
 
 
