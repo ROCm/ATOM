@@ -510,18 +510,25 @@ fi
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"
+  # Torch profiler traces run to GBs per case. The workflow uploads them from
+  # LOG_ROOT as their own artifact, so they stay out of the results copy that
+  # every summarize job downloads.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
     tar \
       --exclude='.cache' \
       --exclude='./.cache' \
       --exclude='.aiter' \
       --exclude='./.aiter' \
+      --exclude='./slurm_job-*/torch_traces' \
       -C "${LOG_ROOT}" \
       -cf - . | tar \
       --no-same-owner \
       --no-same-permissions \
       -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" \
       -xf - || true
+  elif compgen -G "${LOG_ROOT}/slurm_job-*/torch_traces" >/dev/null; then
+    tar --exclude='./slurm_job-*/torch_traces' -C "${LOG_ROOT}" -cf - . \
+      | tar -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" -xpf - || true
   else
     cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true
   fi

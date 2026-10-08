@@ -852,6 +852,34 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 512
 
+      # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
+      # the published dashboard. The stop_profile export stalls both engines,
+      # which makes this cell's aiperf numbers incomparable with its C72 twin.
+      profile:
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              # 30 s starting 900 s into the aiperf Profiling phase, on every
+              # prefill and decode server; traces land under ${RUN_DIR}/torch_traces/<worker>/rank_<tp>/.
+              ATOMESH_TORCH_PROFILE_START: "900"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              # Kernel names and durations only; shapes/stacks on a TP8 window
+              # risk OOMing the ranks during export.
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+
     accuracy:
       task: gsm8k
       fewshot: 5

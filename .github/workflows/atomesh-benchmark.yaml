@@ -38,6 +38,7 @@ on:
           - weekly
           - agentic_multi_decode
           - accuracy
+          - profile
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'
         required: false
@@ -111,6 +112,9 @@ on:
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
+
+          Kimi-K3 (profile suite, torch trace in minutes 5-6):
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile
 
           Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
@@ -1826,6 +1830,41 @@ jobs:
             --output "atomesh-reports/$MATRIX_ID" \
             --summary-only
 
+      - name: Locate torch profiler traces
+        if: always()
+        id: torch-traces
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          # pd_submit.sh leaves torch_traces out of atomesh-results, so read
+          # them straight from the case's shared log root.
+          log_root_file="atomesh-results/${MATRIX_ID}.log-root"
+          log_root=""
+          if [[ -s "${log_root_file}" ]]; then
+            log_root="$(tr -d '\n' < "${log_root_file}")"
+          fi
+          if [[ -n "${log_root}" ]] \
+            && [[ -n "$(find "${log_root}" -path '*/torch_traces/*' -name '*.pt.trace.json*' -print -quit 2>/dev/null)" ]]; then
+            echo "has_traces=true" >> "$GITHUB_OUTPUT"
+            echo "log_root=${log_root}" >> "$GITHUB_OUTPUT"
+            find "${log_root}" -path '*/torch_traces/*' -type f -printf '%s\t%P\n' | sort -k2
+          else
+            echo "has_traces=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload torch profiler traces
+        if: ${{ always() && steps.torch-traces.outputs.has_traces == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-torch-traces-${{ matrix.id }}
+          path: |
+            ${{ steps.torch-traces.outputs.log_root }}/slurm_job-*/torch_traces/
+            ${{ steps.torch-traces.outputs.log_root }}/slurm_job-*/benchmark_results/*/torch_profile.log
+          # Traces are already gzip; recompressing GBs buys nothing.
+          compression-level: 0
+          if-no-files-found: ignore
+
       - name: Upload model benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -1955,6 +1994,126 @@ jobs:
           artifact-name: aiperf-chrome-traces-${{ github.run_id }}
           output-dir: aiperf-traces
           run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # Without merge-multiple each case keeps its own directory, named after
+      # its per-case artifact.
+      - name: Download torch profiler traces
+        if: always()
+        uses: actions/download-artifact@v8
+        with:
+          pattern: atomesh-torch-traces-*
+          path: torch-traces
+
+      - name: Index torch profiler traces
+        if: always()
+        id: torch-traces
+        run: |
+          set -euo pipefail
+          if [[ -z "$(find torch-traces -name '*.pt.trace.json*' -print -quit 2>/dev/null)" ]]; then
+            echo "has_traces=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_traces=true" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          from pathlib import Path
+
+          root = Path("torch-traces")
+          # A non-zipped artifact takes its file's basename as its name, and
+          # names must be unique in the run, so each trace is staged under
+          # case/worker/rank.
+          direct = Path("torch-traces-direct")
+          direct.mkdir(exist_ok=True)
+          manifest = []
+          for path in sorted(root.rglob("*.pt.trace.json*")):
+              parts = path.relative_to(root).parts
+              case = parts[0].removeprefix("atomesh-torch-traces-")
+              # .../torch_traces/<worker>/<rank>/<file>
+              worker, rank = parts[-3], parts[-2]
+              size = path.stat().st_size / 2**20
+              suffix = path.name[path.name.find(".pt.trace.json"):]
+              staged = direct / f"{case}_{worker}_{rank}{suffix}"
+              try:
+                  os.link(path, staged)
+              except OSError:
+                  shutil.copy2(path, staged)
+              manifest.append(
+                  {
+                      "case": case,
+                      "worker": worker,
+                      "rank": rank,
+                      "size_mb": round(size, 1),
+                      "file": str(staged),
+                  }
+              )
+          Path("torch-traces-manifest.json").write_text(json.dumps(manifest, indent=2))
+          PY
+          du -sh torch-traces
+
+      # upload-artifact takes one non-zipped file per step and the trace count
+      # varies per run, so loop over @actions/artifact from a JS step: run
+      # steps never see ACTIONS_RUNTIME_TOKEN.
+      - name: Install artifact client for per-rank traces
+        if: ${{ always() && steps.torch-traces.outputs.has_traces == 'true' }}
+        continue-on-error: true
+        run: npm install --prefix "${RUNNER_TEMP}/artifact-client" --no-save --no-audit --no-fund @actions/artifact@^6.2.0
+
+      - name: Upload per-rank torch profiler traces
+        if: ${{ always() && steps.torch-traces.outputs.has_traces == 'true' }}
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs')
+            const path = require('path')
+            const {pathToFileURL} = require('url')
+            const clientEntry = path.join(
+              process.env.RUNNER_TEMP,
+              'artifact-client/node_modules/@actions/artifact/lib/artifact.js'
+            )
+            const {DefaultArtifactClient} = await import(pathToFileURL(clientEntry).href)
+            const client = new DefaultArtifactClient()
+            const manifest = JSON.parse(fs.readFileSync('torch-traces-manifest.json', 'utf8'))
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            for (const entry of manifest) {
+              try {
+                const {id} = await client.uploadArtifact(
+                  path.basename(entry.file),
+                  [entry.file],
+                  path.dirname(entry.file),
+                  {skipArchive: true}
+                )
+                entry.url = `${runUrl}/artifacts/${id}`
+              } catch (err) {
+                core.warning(`per-rank upload failed for ${entry.file}: ${err.message}`)
+              }
+            }
+            fs.writeFileSync('torch-traces-manifest.json', JSON.stringify(manifest, null, 2))
+
+      - name: Link torch profiler traces in summary
+        if: ${{ always() && steps.torch-traces.outputs.has_traces == 'true' }}
+        run: |
+          set -euo pipefail
+          {
+            echo
+            echo "### Torch Profiler Traces"
+            echo
+            echo "Each Download link fetches that rank's \`.pt.trace.json.gz\` alone, unzipped; open it in [Perfetto UI](https://ui.perfetto.dev)."
+            echo "The case's \`torch_profile.log\`, which records when the window opened and closed, stays in its \`atomesh-torch-traces-<case>\` artifact."
+            echo
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          print("| Case | Worker | Rank | Size (MB) | Download |")
+          print("| --- | --- | --- | --- | --- |")
+          for e in json.loads(Path("torch-traces-manifest.json").read_text()):
+              link = f"[{Path(e['file']).name}]({e['url']})" if e.get("url") else "—"
+              print(f"| {e['case']} | {e['worker']} | {e['rank']} | {e['size_mb']:.1f} | {link} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark summary
         if: ${{ steps.summary.outputs.has_results == 'true' }}
