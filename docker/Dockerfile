@@ -219,15 +219,13 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
-COPY docker/filter_sglang_runtime_deps.py /tmp/filter_sglang_runtime_deps.py
-
 RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
     cd /app/sglang/python && \
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
-    "${VENV_PYTHON}" /tmp/filter_sglang_runtime_deps.py && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; extras = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']; blocked = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar==', 'transformers'); seen = set(); out = []; walk = lambda names: [None for dep in names for key in [dep.strip()] if key and key not in seen and not seen.add(key) and (walk(extras[key[len('sglang['):-1]]) if key.startswith('sglang[') and key.endswith(']') else out.append(key))]; pkg = lambda dep: dep.split('[')[0].split('=')[0].split('<')[0].split('>')[0].split('!')[0].strip(); walk(extras['runtime_common']); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in out if pkg(dep) != 'numpy' and not any(dep.startswith(p) or pkg(dep) == p.split('=', 1)[0] for p in blocked)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
