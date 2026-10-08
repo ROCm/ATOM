@@ -16,6 +16,7 @@ the real interpreter, except the image check's ``import mooncake.store``.
 import ast
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -29,7 +30,8 @@ SERVER_SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_server_atom.sh"
 )
 
-PYTHON_STUB = textwrap.dedent("""\
+PYTHON_STUB = textwrap.dedent(
+    """\
     #!/usr/bin/env bash
     if [[ "${1:-}" == "-c" ]]; then
       if [[ "${2:-}" == "import mooncake.store" ]]; then
@@ -64,9 +66,11 @@ PYTHON_STUB = textwrap.dedent("""\
       *"/numa_memory_budget.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
     esac
     exit 0
-    """)
+    """
+)
 
-CURL_STUB = textwrap.dedent("""\
+CURL_STUB = textwrap.dedent(
+    """\
     #!/usr/bin/env bash
     url="${*: -1}"
     case "${url}" in
@@ -86,7 +90,8 @@ CURL_STUB = textwrap.dedent("""\
         ;;
       *) exit 7 ;;
     esac
-    """)
+    """
+)
 
 # The image check only looks the Store binaries up on PATH; the launcher runs
 # them through numa_exec.py, which the python3 stub stands in for.
@@ -390,7 +395,8 @@ stop_mooncake_store
             source.index("start_prefill() {") : source.index("start_router() {")
         ]
         result = self.run_shell(
-            servers + """
+            servers
+            + """
 # Records each server's command line, one argument per line.
 start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
@@ -1334,6 +1340,27 @@ class LauncherWiringTest(unittest.TestCase):
         for waiter in ("wait_http() {", "wait_router_closed() {"):
             body = self.source.split(waiter)[1].split("\n}\n")[0]
             self.assertIn("exit_if_mooncake_store_died", body)
+
+    def test_every_role_branch_traps_exit_before_it_starts_a_server(self):
+        # start_prefill and start_decode start the Store's masters and owners
+        # before their server: a branch whose trap came after a start would
+        # leave them running when the rest of that start fails under set -e.
+        dispatch = self.source[
+            self.source.index("\nvalidate_mooncake_store_settings\nwrite_metadata\n") :
+        ]
+        branches = re.split(
+            r"^(?:if|elif) .*; then$|^else$", dispatch, flags=re.MULTILINE
+        )
+        branches = branches[1:]
+        self.assertEqual(len(branches), 8)
+        for branch in branches:
+            starts = re.search(r"^\s*start_(?:prefill|decode)\b", branch, re.MULTILINE)
+            trap = re.search(
+                r"^\s*trap 'cleanup_processes [^']*' EXIT$", branch, re.MULTILINE
+            )
+            self.assertIsNotNone(starts, branch[:200])
+            self.assertIsNotNone(trap, branch[:200])
+            self.assertLess(trap.start(), starts.start(), branch[:200])
 
     def test_the_launcher_knows_every_connector_setting(self):
         # The launcher checks a case's connector settings before the Store
