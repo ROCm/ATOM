@@ -25,10 +25,15 @@ class NodeSelectionTest(unittest.TestCase):
         decode_workers=1,
         single_node="auto",
         node_pool="",
+        unrestricted=False,
     ):
         with patch.dict(
             os.environ,
-            {"ATOMESH_SINGLE_NODE": single_node, "ATOMESH_NODE_POOL": node_pool},
+            {
+                "ATOMESH_SINGLE_NODE": single_node,
+                "ATOMESH_NODE_POOL": node_pool,
+                "ATOMESH_UNRESTRICTED_NODES": "1" if unrestricted else "0",
+            },
         ):
             return pd_matrix.build_cell(
                 cfg={
@@ -104,6 +109,23 @@ class NodeSelectionTest(unittest.TestCase):
                 )
                 self.assertEqual(cell["nodes"], pool.split(","))
                 self.assertEqual(cell["num_nodes"], expected)
+
+    def test_unrestricted_tw_has_no_candidates_and_keeps_required_count(self):
+        cell = self.build_cell(node_pool="tw1,tw2,tw3", unrestricted=True)
+        self.assertEqual(cell["nodes"], [])
+        self.assertEqual(cell["num_nodes"], 2)
+
+    def test_unrestricted_tw_rejects_conflicting_explicit_nodes(self):
+        for overrides in ({"nodes": "tw1,tw2"}, {"single_node": "tw1"}):
+            with (
+                self.subTest(overrides=overrides),
+                self.assertRaisesRegex(ValueError, "automatic node inputs"),
+            ):
+                self.build_cell(unrestricted=True, **overrides)
+
+    def test_unrestricted_flag_does_not_relax_other_cluster_requirements(self):
+        with self.assertRaisesRegex(ValueError, "non-empty Spur nodelist"):
+            self.build_cell(runner="atomesh-cicd-mi350", unrestricted=True)
 
     def test_configured_pool_validates_explicit_selection(self):
         pool = "pit2-p03-g01,pit2-p03-g03,pit2-p03-g07"

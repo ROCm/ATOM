@@ -62,7 +62,14 @@ def main():
     # Do not attach to a stale or unrelated MP server on the host network.
     for candidate in (port, http_port):
         with socket.socket() as check:
-            check.bind(("127.0.0.1", candidate))
+            try:
+                check.bind(("127.0.0.1", candidate))
+            except OSError as error:
+                kind = "RPC" if candidate == port else "HTTP metrics"
+                raise RuntimeError(
+                    f"LMCache MP {kind} port 127.0.0.1:{candidate} is unavailable; "
+                    "check the port owner and clean up the previous worker"
+                ) from error
     mp_command = [
         "lmcache",
         "server",

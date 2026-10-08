@@ -189,6 +189,16 @@ on:
         required: false
         default: auto
         type: string
+      atomesh_unrestricted_nodes:
+        description: 'TW only: let Slurm select nodes outside the configured candidate pool; leave node selections on auto'
+        required: false
+        default: false
+        type: boolean
+      atomesh_cleanup_job_ids:
+        description: 'Optional comma-separated IDs of your stopped Slurm jobs whose leftover ATOMesh containers may be removed on allocated nodes'
+        required: false
+        default: ''
+        type: string
       benchmark_concurrency:
         description: 'Optional benchmark concurrency override, e.g. 1,2,4 (no quotes)'
         required: false
@@ -211,6 +221,8 @@ on:
         type: boolean
 
 env:
+  ATOMESH_UNRESTRICTED_NODES: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_unrestricted_nodes && '1' || '0' }}
+  ATOMESH_CLEANUP_JOB_IDS: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_cleanup_job_ids || '' }}
   ATOMESH_NODE_POOL: pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g08,pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g13,pit2-p03-g15,pit2-p03-g17,pit2-p03-g19,pit2-p03-g20,pit2-p03-g23,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g42
   # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
   NCCL_IB_GID_INDEX: '1'

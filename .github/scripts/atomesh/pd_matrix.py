@@ -292,13 +292,22 @@ def build_cell(
         "atomesh-cicd-mi355-crusoe",
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
+    unrestricted_nodes = (
+        slurm_submit_runner == "atomesh-cicd"
+        and os.environ.get("ATOMESH_UNRESTRICTED_NODES", "0") == "1"
+    )
     node_pool = (
         resolve_nodes(os.environ.get("ATOMESH_NODE_POOL", ""))
-        if slurm_submit_runner == "atomesh-cicd"
+        if slurm_submit_runner == "atomesh-cicd" and not unrestricted_nodes
         else []
     )
 
     single_node_override = os.environ.get("ATOMESH_SINGLE_NODE", "").strip()
+    if unrestricted_nodes and (
+        single_node_override not in ("", "auto")
+        or resolve_nodes(suite_cfg.get("nodes"))
+    ):
+        raise ValueError("Unrestricted TW selection requires automatic node inputs")
     if single_node_pd and single_node_override not in ("", "auto"):
         nodes = resolve_nodes(single_node_override)
         if len(nodes) != 1:

@@ -133,6 +133,17 @@ class LMCacheMPLifecycleTest(unittest.TestCase):
         self.assertFalse((self.root / "engine.pid").exists())
         self.assert_child_stopped("mp")
 
+    def test_occupied_port_reports_address_without_launching_children(self):
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", self.rpc))
+            occupied.listen()
+            process = self.launch("healthy")
+            output, _ = process.communicate(timeout=15)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn(f"RPC port 127.0.0.1:{self.rpc} is unavailable", output)
+        self.assertFalse((self.root / "mp.pid").exists())
+        self.assertFalse((self.root / "engine.pid").exists())
+
     def test_mp_failure_stops_running_engine_and_fails_worker(self):
         process = self.launch("runtime-fail", 60)
         output, _ = process.communicate(timeout=15)

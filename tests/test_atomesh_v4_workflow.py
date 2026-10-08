@@ -123,6 +123,24 @@ class V4WorkflowTest(unittest.TestCase):
             cells[0]["env"]["common"]["ROUTER_BALANCE_ABS_THRESHOLD"], "40"
         )
 
+    def test_manual_sticky_mp_256_can_use_unrestricted_tw_allocation(self):
+        cells = self.matrix(
+            event="workflow_dispatch",
+            SUITE="weekly",
+            RUN_ALL_MODELS="false",
+            CASE_NAMES="ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-dpsticky-c256",
+            ATOMESH_UNRESTRICTED_NODES="1",
+        )
+        self.assertEqual(len(cells), 1)
+        cell = cells[0]
+        self.assertEqual(cell["nodes"], [])
+        self.assertEqual(cell["num_nodes"], 2)
+        self.assertEqual(cell["concurrency"], [256])
+        self.assertEqual(cell["service"]["router"]["policy"], "dp_sticky")
+        self.assertEqual(cell["env"]["prefill"]["ATOM_KV_OFFLOAD"], "lmcache_mp")
+        self.assertNotIn("ROUTER_BALANCE_ABS_THRESHOLD", cell["env"]["common"])
+        self.assertEqual(cell["benchmark"]["benchmark_duration"], 3600)
+
     def test_manual_accuracy_is_eval_only_without_dpa_or_synthetic_al(self):
         cells = self.matrix(
             event="workflow_dispatch",

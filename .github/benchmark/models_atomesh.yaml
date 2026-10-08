@@ -1411,6 +1411,14 @@ models:
             warmup_grace_period: 3600
 
         - <<: *dsv4_0813_agentic_ep8_mega_mp
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-dpsticky-c256
+          router:
+            policy: dp_sticky
+          env:
+            common: {}
+            prefill: *dsv4_0813_agentic_ep8_mega_mp_prefill
+
+        - <<: *dsv4_0813_agentic_ep8_mega_mp
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-c192
           concurrency: [192]
           env:

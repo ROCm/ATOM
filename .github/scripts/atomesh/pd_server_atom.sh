@@ -894,6 +894,8 @@ start_router() {
       --eviction-interval 300
     )
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
+  elif [[ "${router_policy}" == "dp_sticky" ]]; then
+    router_policy_args+=(--prefill-policy dp_sticky --decode-policy dp_sticky)
   fi
   local -a router_cmd=(
     "${mesh_binary}" launch

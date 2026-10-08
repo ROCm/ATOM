@@ -136,20 +136,9 @@ PY
 }
 
 pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
-
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-  else
-    echo "no running containers"
-  fi
-  set -e
+  echo "=== pre-cleanup: explicitly selected previous jobs on $(hostname) ==="
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_cleanup.py" \
+    --job-ids "${ATOMESH_CLEANUP_JOB_IDS:-}" --current-job-id "${JOB_ID}"
 }
 
 run_container_rank() {
@@ -391,7 +380,11 @@ run_spur_job() {
   echo "ips=${IPADDRS}"
   echo "run_dir=${RUN_DIR}"
 
-  pre_cleanup_local
+  pre_cleanup_local || {
+    local cleanup_rc=$?
+    publish_rank_rc "${node_rank}" "${cleanup_rc}"
+    return "${cleanup_rc}"
+  }
   write_env_file "${env_file}"
   if [[ "${node_rank}" -eq 0 ]]; then
     cat > "${RUN_DIR}/cell-metadata.json" <<EOF
@@ -486,31 +479,12 @@ SELECTED_NODES=("${ALLOC_NODES[@]:0:${NUM_NODES}}")
 SELECTED_NODELIST="$(IFS=,; echo "${SELECTED_NODES[*]}")"
 
 pre_cleanup_nodes() {
-  echo "=== pre-cleanup: stop all running containers ==="
+  echo "=== pre-cleanup: explicitly selected previous jobs ==="
   for node in "${SELECTED_NODES[@]}"; do
     echo "[pre-cleanup] node=${node}"
-    srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc '
-      set +e
-      echo "host=$(hostname)"
-
-      running=()
-      while read -r id; do
-        [[ -n "${id}" ]] && running+=("${id}")
-      done < <(docker ps -q 2>/dev/null)
-
-      if [[ "${#running[@]}" -gt 0 ]]; then
-        echo "stopping running containers:"
-        docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-        docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-      else
-        echo "no running containers"
-      fi
-
-      sleep 2
-      if command -v rocm-smi >/dev/null 2>&1; then
-        rocm-smi --showmemuse 2>/dev/null || true
-      fi
-    ' || true
+    srun --nodes=1 --ntasks=1 --nodelist="${node}" \
+      python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_cleanup.py" \
+      --job-ids "${ATOMESH_CLEANUP_JOB_IDS:-}" --current-job-id "${JOB_ID}"
   done
   echo "=== pre-cleanup done ==="
 }

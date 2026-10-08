@@ -49,10 +49,9 @@ class V4RoutingTest(unittest.TestCase):
                 text=True,
                 timeout=30,
             )
+            cls.all_cells = json.loads(output.read_text())["include"]
             cls.cells = [
-                cell
-                for cell in json.loads(output.read_text())["include"]
-                if "-no-offload-" in cell["name"]
+                cell for cell in cls.all_cells if "-no-offload-" in cell["name"]
             ]
         source = (SCRIPTS / "pd_server_atom.sh").read_text()
         functions = []
@@ -146,6 +145,20 @@ start_router
                     json.loads(cell["service"]["decode"]["cudagraph"]),
                     list(range(1, slots // 8 + 1)),
                 )
+
+    def test_mp_sticky_case_launches_both_roles_without_cache_thresholds(self):
+        cell = next(c for c in self.all_cells if "-dpsticky-c256" in c["name"])
+        self.assertEqual(cell["env"]["prefill"]["ATOM_KV_OFFLOAD"], "lmcache_mp")
+        args = self.router_args(cell)
+        self.assertIn("--dp-aware", args)
+        for flag in ("--policy", "--prefill-policy", "--decode-policy"):
+            self.assertEqual(args[args.index(flag) + 1], "dp_sticky")
+        for flag in (
+            "--cache-threshold",
+            "--balance-abs-threshold",
+            "--balance-rel-threshold",
+        ):
+            self.assertNotIn(flag, args)
 
     def test_existing_agentic_dpa_default_remains_sticky(self):
         args = self.router_args(self.cells[0], policy="random")

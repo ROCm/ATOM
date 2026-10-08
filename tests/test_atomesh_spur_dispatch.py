@@ -29,6 +29,9 @@ class SpurDispatchTest(unittest.TestCase):
         shutil.copyfile(
             JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py"
         )
+        shutil.copyfile(
+            JOB_SCRIPT.with_name("pd_cleanup.py"), scripts / "pd_cleanup.py"
+        )
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()

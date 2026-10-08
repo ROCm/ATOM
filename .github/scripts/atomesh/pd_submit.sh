@@ -523,7 +523,10 @@ if [[ -d "${LOG_ROOT}" ]]; then
       -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" \
       -xf - || true
   else
-    cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true
+    # Shared NFS may allow content writes while rejecting chmod/chown.
+    # Copy logs and symlinks without restoring source filesystem metadata.
+    cp -R --no-preserve=all "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || \
+      echo "WARNING: Some benchmark artifacts could not be copied" >&2
   fi
 fi
 
