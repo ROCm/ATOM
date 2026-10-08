@@ -1136,22 +1136,26 @@ def _infer_atom_attn_state(common_attn_metadata, num_spec_tokens: int = 0):
 
 
 def _batch_has_computed_context(common_attn_metadata) -> bool:
-    """True iff any row already has KV committed (``num_computed > 0``).
+    """True iff any sequence in the batch already has KV committed.
 
-    vLLM 0.31 removed ``CommonAttentionMetadata._num_computed_tokens_cpu``
-    (deprecated in 0.29, deleted with the rest of the deprecated CPU mirrors),
-    so derive the same quantity on the HOST without a device sync:
-    ``num_computed = seq_len - query_len``. Read the raw backing attributes in
-    the same order ``_build_dsv4_metadata`` does -- the exact ``_seq_lens_cpu``
-    when a build still carries it, else ``seq_lens_cpu_upper_bound``, which is
-    always populated and is exact for prefill rows and for every decode row
-    outside async spec-decode (which this integration does not use). Only fall
-    back to a blocking D2H when neither exists.
+    A sequence's ``num_computed`` is, by definition, the global position of its
+    FIRST token this forward. Read that from ``positions``; do NOT derive it as
+    ``seq_len - query_len``.
 
-    An upper bound can only overstate ``num_computed``, i.e. it can only pick
-    PREFILL_PREFIX where PREFILL_NATIVE would do. That is the safe direction:
-    ``_populate_indexer``'s prefix path handles a batch with no committed KV,
-    while the native path cannot handle one that has it.
+    This file already records why (see ``_build_dsv4_metadata``'s "Exact per-seq
+    chunk start"): on a speculative-decode (MTP) mixed prefill+verify batch
+    ``seq_lens_cpu_upper_bound`` OVERESTIMATES ``seq_len``, so the subtraction
+    exceeds a verify token's true position. vLLM 0.29 deprecated and 0.31
+    removed the exact CPU mirrors (``_seq_lens_cpu``,
+    ``_num_computed_tokens_cpu``), leaving only that upper bound -- so on this
+    pin the subtraction has no exact source left at all, and a first version of
+    this helper that preferred ``_seq_lens_cpu`` silently always fell through to
+    the bound.
+
+    The overestimate is not harmless in this direction: it routes a batch with
+    NO committed KV onto ``PREFILL_PREFIX``. The first-token position is exact,
+    which is the same reason ``_build_dsv4_metadata`` uses it for
+    ``chunk_start`` rather than the subtraction.
     """
     num_reqs = int(getattr(common_attn_metadata, "num_reqs", 0) or 0)
     if num_reqs <= 0:
@@ -1159,18 +1163,21 @@ def _batch_has_computed_context(common_attn_metadata) -> bool:
     q_cpu = getattr(common_attn_metadata, "query_start_loc_cpu", None)
     if q_cpu is None:
         return False
-    seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
-    if seq_lens_cpu is None:
-        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
-    if seq_lens_cpu is None:
-        seq_lens = getattr(common_attn_metadata, "seq_lens", None)
-        if seq_lens is None:
-            return False
-        seq_lens_cpu = seq_lens.cpu()
+    positions = getattr(common_attn_metadata, "positions", None)
+    if positions is None:
+        # No exact source. ``_build_dsv4_metadata`` substitutes ``arange`` here,
+        # which describes a batch starting at token 0 -- no committed KV -- so
+        # match that rather than guessing the other way.
+        return False
     q_np = q_cpu[: num_reqs + 1].numpy().astype(np.int64)
-    query_lens = np.diff(q_np)
-    seq_np = seq_lens_cpu[:num_reqs].numpy().astype(np.int64)
-    return bool((seq_np - query_lens > 0).any())
+    lens = np.diff(q_np)
+    # Cudagraph-padded requests contribute no tokens; their "first token" is not
+    # a real row, so drop them before indexing.
+    first_tok = q_np[:num_reqs][lens > 0]
+    if first_tok.size == 0:
+        return False
+    idx = torch.from_numpy(first_tok).to(positions.device)
+    return bool((positions.index_select(0, idx) > 0).any().item())
 
 
 def _is_pure_uniform_decode(common_attn_metadata, decode_q: int) -> bool:
