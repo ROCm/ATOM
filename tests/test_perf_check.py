@@ -1313,3 +1313,29 @@ def test_the_server_log_survives_a_failed_run():
     # to read them out of.
     order = [s.get("name") for s in steps]
     assert order.index("Dump server log") < order.index("Clean up")
+
+
+def test_warmup_length_comes_from_the_workflow(workspace, fake_docker):
+    """WARMUP_MULT reaches the warmup phase, and the workflow's value is used.
+
+    The variable travels by environment inheritance rather than by an explicit
+    `-e`, so a broken link fails silently: the script falls back to its own
+    default of 10 and the phase costs the measurement's full length again. At
+    c=256 that is twelve minutes a job with nothing to show for it.
+    """
+    import yaml
+
+    ws, base_sha, _ = workspace
+    bindir, _ = fake_docker
+
+    result = run_half(ws, bindir, base_sha, "warmup", WARMUP_MULT="3", CONC="8")
+    assert "NUM_PROMPTS_OVERRIDE=24" in result.stdout, result.stdout
+
+    # And the workflow's own value is what a real run would get.
+    workflow = yaml.safe_load(
+        (REPO / ".github" / "workflows" / "atom-perf-check.yaml").read_text()
+    )
+    mult = int(workflow["env"]["WARMUP_MULT"])
+    assert mult >= 1
+    result = run_half(ws, bindir, base_sha, "warmup", WARMUP_MULT=str(mult), CONC="8")
+    assert f"NUM_PROMPTS_OVERRIDE={8 * mult}" in result.stdout
