@@ -259,7 +259,13 @@ class AtomDeepseekV41ProxyBackend(AttentionBackend):
         return "ATOM_DEEPSEEK_V41_PROXY"
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):
+        # `kv_cache_spec` is passed positionally by vLLM 0.31
+        # (`attention.py` and `composite.py` both call it with one argument)
+        # and not at all before that, so it is accepted and defaulted rather
+        # than required. V4.1 answers the same way either way: its PAGE is
+        # 256 tokens whatever spec is asking, which is the whole reason the
+        # proxy layer exists.
         return [ATOM_DEEPSEEK_V41_BLOCK_SIZE]
 
     @classmethod
