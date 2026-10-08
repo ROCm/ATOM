@@ -260,6 +260,8 @@ def test_writers_logits_topk_and_graph_replay(written_inputs, monkeypatch):
     attn = importlib.import_module("atom.model_ops.attentions.deepseek_v4_attn")
     monkeypatch.setattr(attn, "sparse_indexer_row_chunk", lambda *args: 3)
     md.csa_n_committed_per_token = ends
+    md.batch_id_per_q_token = row_map.clone()
+    md.batch_id_per_q_token[-1] = -1
     prefill = {}
     builder._build_fp4_opus_prefill_plans(
         attn_metadata=md,
@@ -281,7 +283,7 @@ def test_writers_logits_topk_and_graph_replay(written_inputs, monkeypatch):
         inp.q, inp.qs, inp.bt, inp.weights, prefill, 8
     )
     torch.testing.assert_close(pre_top[:8], eager[:8], rtol=0, atol=0)
-    assert (pre_top[8] == -1).all()
+    # The dummy row is skipped by consumers; its top-k storage is unspecified.
 
     # Exercise the explicit FlyDSL escape hatch with the same quantized values.
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (

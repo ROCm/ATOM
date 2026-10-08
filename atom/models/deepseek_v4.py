@@ -2087,17 +2087,12 @@ class Indexer(nn.Module):
         chunks = indexer_meta["fp4_opus_prefill_chunks"]
         local_starts = indexer_meta["fp4_prefill_local_starts"]
         local_ends = indexer_meta["visible_end_gpu"]
-        # Every planned row is fully overwritten by top_k_per_row_prefill,
-        # including its -1 padding when fewer than ``topk`` entries are visible.
-        # Match the FP8/FlyDSL path and avoid a full-output fill before every CSA
-        # layer. DCP may append dummy rows that are deliberately excluded from
-        # the OPUS plans; only that unplanned tail still needs the sentinel.
+        # Planned rows are fully overwritten, including their top-k padding.
+        # PCP padding rows are excluded from the plans and have batch_id=-1;
+        # csa_translate_pack skips them before reading topk_out.
         topk_out = torch.empty(
             (total_tokens, topk), dtype=torch.int32, device=q_fp4.device
         )
-        planned_tokens = chunks[-1][1] if chunks else 0
-        if planned_tokens < total_tokens:
-            topk_out[planned_tokens:].fill_(-1)
         kv_block_size = (
             self.kv_cache.size(2)
             if self.indexer_layout == FP4_GFX950_OPUS
