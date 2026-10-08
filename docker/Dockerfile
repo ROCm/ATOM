@@ -219,13 +219,15 @@ RUN echo "========== [SGLANG-ATOM 2/6] Build sglang kernel ==========" && \
     AMDGPU_TARGET="${FINAL_AMDGPU_TARGET}" "${VENV_PYTHON}" setup_rocm.py install && \
     "${VENV_PYTHON}" -m pip show sglang-kernel || true
 
+COPY docker/filter_sglang_runtime_deps.py /tmp/filter_sglang_runtime_deps.py
+
 RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" && \
     cd /app/sglang/python && \
     rm -f pyproject.toml && \
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
-    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar==', 'transformers'); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" /tmp/filter_sglang_runtime_deps.py && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -257,15 +259,14 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     test -n "${TORCH_HIP}" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps "transformers==5.16.1" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
-      "huggingface-hub>=1.5.0,<2.0" \
-      "tokenizers>=0.23.1,<0.24.0" \
+      "huggingface-hub==1.5.0" \
+      "tokenizers==0.23.1" \
       "safetensors>=0.8.0" \
       "regex>=2025.10.22" \
       "typer" \
       "packaging>=20.0" \
       "pyyaml>=5.1" \
       "tqdm>=4.60" && \
-    "${VENV_PYTHON}" -c "import torch, transformers; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch while installing transformers'; assert transformers.__version__ == '5.16.1', transformers.__version__; cfg = AutoConfig.for_model('qwen4_exp_text'); assert cfg.model_type == 'qwen4_exp_text', cfg.model_type" && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
@@ -287,13 +288,14 @@ RUN echo "========== [SGLANG-ATOM 4/6] Restore base image Triton ==========" && 
     "${VENV_PYTHON}" -m pip show triton
 
 RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" && \
-    "${VENV_PYTHON}" -c "import runpy, sys; import atom.plugin.sglang.patches.qwen4_exp_recognition_patch; sys.argv=['sglang.launch_server', '--help']; runpy.run_module('sglang.launch_server', run_name='__main__')" >/dev/null && \
+    "${VENV_PYTHON}" -m sglang.launch_server --help >/dev/null && \
     "${VENV_PYTHON}" -c "import os, torch, torchvision, torchaudio, sglang, triton, transformers; from torchvision.io import decode_jpeg; assert torch.version.hip is not None, 'Torch is not ROCm build (torch.version.hip is None).'; print(f'torch: {torch.__version__}'); print(f'triton: {triton.__version__}'); print(f'transformers: {transformers.__version__}'); print(f'torchvision: {torchvision.__version__}'); print(f'torchaudio: {torchaudio.__version__}'); print(f'decode_jpeg: {decode_jpeg.__name__}'); print(f'sglang imported from: {sglang.__file__}'); print(f'PYTHONPATH={os.environ.get(\"PYTHONPATH\", \"\")}')" && \
     echo "Validated sglang launch_server entrypoint"
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
-    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
+    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer && \
+    "${VENV_PYTHON}" -c "import importlib.metadata as m; import torch; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch'; assert m.version('transformers') == '5.16.1', m.version('transformers'); assert m.version('tokenizers') == '0.23.1', m.version('tokenizers'); assert m.version('huggingface-hub') == '1.5.0', m.version('huggingface-hub'); cfg = AutoConfig.for_model('qwen4_exp_text'); assert cfg.model_type == 'qwen4_exp_text', cfg.model_type"
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
