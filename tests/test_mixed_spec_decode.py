@@ -30,15 +30,15 @@ NUM_SCHEDULED = np.array(PREFILL_LENS + [K + 1] * N_D, dtype=np.int32)
 
 
 def _mixed_batch(**overrides):
-    fields = dict(
-        is_mixed=True,
-        is_dummy_run=False,
-        total_seqs_num_prefill=N_P,
-        total_seqs_num_decode=N_D,
-        total_seqs_num=N_P + N_D,
-        total_tokens_num_prefill=N_P_TOKENS,
-        num_scheduled_tokens=NUM_SCHEDULED.copy(),
-    )
+    fields = {
+        "is_mixed": True,
+        "is_dummy_run": False,
+        "total_seqs_num_prefill": N_P,
+        "total_seqs_num_decode": N_D,
+        "total_seqs_num": N_P + N_D,
+        "total_tokens_num_prefill": N_P_TOKENS,
+        "num_scheduled_tokens": NUM_SCHEDULED.copy(),
+    }
     fields.update(overrides)
     return SimpleNamespace(**fields)
 
