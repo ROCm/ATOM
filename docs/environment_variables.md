@@ -116,6 +116,13 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_V4_HCA_PERSIST_MIN_ROWS** | int | 15 | Smallest decode call (q rows) that uses `ATOM_V4_HCA_PERSIST`; smaller calls stay on the ASM path. |
 | **ATOM_DCP_SPARSE_PREFILL_NONPS** | bool | 1 (true) | DSA models under DCP: run sparse prefill attention on the non-persistent fp8 gqa64 MLA kernel, which needs no work metadata. Applies with fp8 q/KV, 64 gathered heads (tp4/dcp4, tp8/dcp8), gfx950, `ATOM_MLA_PAGE_SIZE=1` and `--max-num-batched-tokens` <= 32768 (each prefill token is one kernel row; a larger step budget logs a warning and keeps the default kernel). Needs an aiter that ships the kernel (ROCm/aiter#6132); with an older aiter set `0`, or the first sparse prefill past `index_topk` raises. |
 
+### MiniMax-M3
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_M3_PREFILL_INDEX_SCORE** | `auto` \| `flydsl` \| `triton` | `auto` | Which kernel scores the lightning-indexer blocks during prefill: aiter's FlyDSL MFMA kernel (`aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill`) or the Triton query-tile kernel it is being measured against. `auto` follows the **index cache dtype**: FlyDSL on an fp8 cache, Triton on bf16. That is where the kernel's `k_lds` path — which stages K through LDS and so reads a quarter of the K bytes — becomes legal; without it the FlyDSL kernel takes a register path measured 3.6–4.8× *slower* than Triton at 32k–116k context, and with it 36–46% faster over that same range. `auto` also falls back to Triton on an aiter that predates the kernel — it is newer than the aiter ATOM pins. The two explicit values never fall back: asking for `flydsl` on an aiter that lacks it raises, because an arm that silently ran the other kernel is a wrong measurement rather than a degraded one. Set one of them by name when benchmarking, never `auto`. Selection is unaffected either way — the two scorers agree on every block a row can select — so this is a pure performance A/B. Decode has no equivalent: FlyDSL is its only scorer. |
+
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
