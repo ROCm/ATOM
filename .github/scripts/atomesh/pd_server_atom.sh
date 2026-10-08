@@ -560,6 +560,18 @@ if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
     --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
   )
 fi
+check_peer_failures() {
+  local rc_file peer_rc
+  for rc_file in "${RUN_DIR}"/rank-rc-*; do
+    [[ -f "${rc_file}" ]] || continue
+    peer_rc="$(cat "${rc_file}")"
+    if [[ "${peer_rc}" =~ ^[1-9][0-9]*$ ]]; then
+      echo "[wait][FAIL] peer worker exited: ${rc_file} rc=${peer_rc}" >&2
+      exit 1
+    fi
+  done
+}
+
 wait_http() {
   local url="$1"
   local name="$2"
@@ -568,6 +580,7 @@ wait_http() {
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+    check_peer_failures
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -591,6 +604,7 @@ wait_router_closed() {
   local max_misses=3
   echo "[wait] router shutdown http://${NODE0_ADDR}:${ROUTER_PORT}/health"
   while true; do
+    check_peer_failures
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
@@ -769,6 +783,7 @@ start_prefill() {
     "${prefill_cudagraph_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
+  python3 "${ATOMESH_SCRIPT_DIR}/pd_rdma_preflight.py" --kv-transfer-config "${prefill_kv_transfer_config}"
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
   if [[ "${ATOM_KV_OFFLOAD:-}" == "lmcache_mp" ]]; then
     prefill_cmd=(
@@ -833,6 +848,7 @@ start_decode() {
     "${decode_cudagraph_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
+  python3 "${ATOMESH_SCRIPT_DIR}/pd_rdma_preflight.py" --kv-transfer-config "${decode_kv_transfer_config}"
   dump_launch_info "DECODE" "${decode_cmd[@]}"
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
