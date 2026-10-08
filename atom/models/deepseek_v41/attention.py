@@ -377,8 +377,15 @@ class Attention(nn.Module):
         to learn the new one. Allocated here, in what stays inside the graph,
         so the capture records one address and every replay finds it.
         """
+        # Every leading dimension of `hidden`, not just the first: ATOM hands
+        # this layer `[batch, tokens, dim]` where upstream's native V4.1 gets
+        # `[tokens, dim]`, so `hidden.shape[0]` is the batch and sizing from
+        # it yields one row per sequence instead of one per token. The rest of
+        # this path flattens the leading pair, which turns that into a kernel
+        # `out=` mismatch rather than a wrong answer -- loud, but only because
+        # the kernel checks.
         return torch.empty(
-            (hidden.shape[0], self.heads, self.head_dim),
+            (*hidden.shape[:-1], self.heads, self.head_dim),
             dtype=hidden.dtype,
             device=hidden.device,
         )

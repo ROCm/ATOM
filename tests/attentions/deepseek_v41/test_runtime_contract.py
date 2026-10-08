@@ -463,3 +463,31 @@ def test_the_scorer_plane_fits_the_candidate_list_at_short_contexts():
     narrow = ScoreWorkspace(geo, 8192, columns, "cpu")
     with pytest.raises(ValueError, match="exceeds its workspace"):
         narrow.logits(8192, candidate_width)
+
+
+def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
+    """Sized from every leading dim of `hidden`, not from `shape[0]`.
+
+    ATOM hands this layer `[batch, tokens, dim]`; upstream's native V4.1 gets
+    `[tokens, dim]`, and its `_alloc_attn_out(hidden_states.shape[0], ...)`
+    is correct only for that shape. Copying the form without the premise
+    allocates one row per sequence, and the 518 tests here all passed on it --
+    only a kernel's own `out=` check caught it, at server startup.
+    """
+    import torch
+
+    pytest.importorskip("aiter", reason="the attention module reaches AITER")
+    from atom.models.deepseek_v41.attention import Attention
+
+    heads, head_dim = 16, 512
+    stub = SimpleNamespace(heads=heads, head_dim=head_dim)
+
+    for shape, tokens in (((8192, 7168), 8192), ((1, 8192, 7168), 8192)):
+        hidden = torch.empty(shape, dtype=torch.bfloat16, device="cpu")
+        out = Attention._alloc_attn_out(stub, hidden)
+        assert out.shape[-2:] == (heads, head_dim)
+        # The leading dims are whatever `hidden` had, so the flatten this
+        # path performs next yields one row per token under either layout.
+        assert (
+            out.shape[:-2].numel() == tokens
+        ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"
