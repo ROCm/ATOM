@@ -133,6 +133,105 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
     assert parent.cache.pending is None
 
 
+def test_exceptional_exit_orders_comm_stream_before_compute(monkeypatch):
+    """A ubatch unwinding on the comm stream still fences its own buffers.
+
+    The parent records each child's reuse event on the compute stream, so a
+    comm stream left unordered lets that event report complete while comm
+    kernels are still reading the child's buffers -- and the next forward
+    overwrites them.
+    """
+    import threading
+
+    from atom.utils.tbo import ubatching
+
+    calls = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", self.name, event.name))
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name, stream.name))
+
+    compute, comm = FakeStream("compute"), FakeStream("comm")
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
+    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
+    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [None])
+
+    ctx = ubatching.TBOContext(
+        ubatch_id=0,
+        compute_stream=compute,
+        comm_stream=comm,
+        forward_context=None,
+        ready_barrier=None,
+        cpu_wait_event=threading.Event(),
+        cpu_signal_event=threading.Event(),
+        gpu_comm_done_event=FakeEvent("comm_done"),
+        gpu_compute_done_event=FakeEvent("compute_done"),
+    )
+    # Where a forward that raised mid-communication leaves us.
+    ctx.current_stream = comm
+
+    assert ctx.__exit__(RuntimeError, RuntimeError("failed child"), None) is False
+
+    assert ("record", "comm_done", "comm") in calls
+    assert ("wait", "compute", "comm_done") in calls
+    assert ctx.current_stream is compute
+
+
+def test_clean_exit_on_compute_adds_no_redundant_ordering(monkeypatch):
+    """Already on the compute stream, the exit records nothing of its own."""
+    import threading
+
+    from atom.utils.tbo import ubatching
+
+    calls = []
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            calls.append(("wait", self.name, event.name))
+
+    class FakeEvent:
+        def __init__(self, name):
+            self.name = name
+
+        def record(self, stream):
+            calls.append(("record", self.name, stream.name))
+
+    compute, comm = FakeStream("compute"), FakeStream("comm")
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
+    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
+    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [None])
+
+    ctx = ubatching.TBOContext(
+        ubatch_id=0,
+        compute_stream=compute,
+        comm_stream=comm,
+        forward_context=None,
+        ready_barrier=None,
+        cpu_wait_event=threading.Event(),
+        cpu_signal_event=threading.Event(),
+        gpu_comm_done_event=FakeEvent("comm_done"),
+        gpu_compute_done_event=FakeEvent("compute_done"),
+    )
+
+    ctx.__exit__(None, None, None)
+
+    assert calls == []
+    assert ctx.current_stream is compute
+
+
 def test_parent_engram_join_runs_when_a_microbatch_fails():
     events = []
     parent = SimpleNamespace(

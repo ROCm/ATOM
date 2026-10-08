@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,6 +10,9 @@ import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
+
+
+logger = logging.getLogger(__name__)
 
 
 def tbo_overlap_enabled() -> bool:
@@ -421,6 +425,25 @@ class TBOContext:
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         self.maybe_run_recv_hook()
+        # Leave on the compute stream, with the comm stream ordered ahead of
+        # it. A forward that raises mid-communication unwinds from
+        # `comm_stream`, and the parent fences this ubatch's storage by
+        # recording an event on the compute stream -- which says nothing about
+        # comm kernels still reading those buffers. Without this edge that
+        # fence reports complete while they run, and the next forward
+        # overwrites what they are reading.
+        if self.current_stream is not self.compute_stream:
+            try:
+                self.switch_to_compute_sync()
+            except Exception:
+                # Whatever broke CUDA is likely why we are unwinding; losing
+                # the edge must not replace the error that caused it.
+                if exc_type is None:
+                    raise
+                logger.exception(
+                    "[TBO] ubatch %d could not rejoin the compute stream",
+                    self.ubatch_id,
+                )
         # Mark this ubatch done BEFORE the final signal so that if the partner
         # is racing into its next `_cpu_yield` between our signal and its wait,
         # it observes `partner.done == True` and skips the wait instead of
