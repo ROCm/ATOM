@@ -230,6 +230,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.max_num_batched_tokens,
             self.block_table_cols,
             self.device,
+            # A candidate-consuming layer's plane is as wide as the candidate
+            # list, which the checkpoint fixes and `max_model_len` does not
+            # bound. Short contexts make it the widest plane in the model.
+            candidate_blocks=int(getattr(self.config, "candidate_topk_blocks", 0) or 0),
         )
         self.cache = self.copies = self.engram = None
         self.dummy_weights = bool(model_runner.config.load_dummy)

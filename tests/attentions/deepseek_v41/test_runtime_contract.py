@@ -426,3 +426,40 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+def test_the_scorer_plane_fits_the_candidate_list_at_short_contexts():
+    """The candidate plane is wider than the context one below ~16k tokens.
+
+    `candidate_topk_blocks` comes from the checkpoint and `max_model_len` does
+    not bound it, so which of the two planes is widest flips with the context
+    length. Sizing from the context alone fits every long-context
+    configuration and none of the short ones -- and the failure surfaces as
+    "a [8192, 16384] scorer temporary exceeds its workspace", naming the
+    scorer rather than the budget it was sized from. This is checkable from a
+    geometry alone: no model, no GPU, no vLLM.
+    """
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+
+    geo = V41PoolGeometry(
+        26, ((20, 1),), 256, 128, 512, 128, index_block_rows=8, index_topk=512
+    )
+    # 8192 tokens of context: 32 PAGEs of 256, so the context plane is
+    # 32 * 256 = 8192 wide. The candidate list is 2048 blocks of 8 = 16384.
+    columns, candidate_blocks = 32, 2048
+    context_width = columns * geo.rows_per_page(1)
+    candidate_width = candidate_blocks * geo.index_block_rows
+    assert candidate_width > context_width, "fixture no longer exercises the case"
+
+    ws = ScoreWorkspace(geo, 8192, columns, "cpu", candidate_blocks=candidate_blocks)
+    # The call the old sizing refused, at the exact shape it refused it in.
+    ws.logits(8192, candidate_width)
+
+    # And the context plane still fits, so this widened rather than traded.
+    ws.logits(8192, context_width)
+
+    # Negative control: without the candidate width the same call must fail,
+    # or this test would pass against the defect it exists to catch.
+    narrow = ScoreWorkspace(geo, 8192, columns, "cpu")
+    with pytest.raises(ValueError, match="exceeds its workspace"):
+        narrow.logits(8192, candidate_width)

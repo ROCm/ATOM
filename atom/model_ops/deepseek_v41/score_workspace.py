@@ -32,7 +32,7 @@ class ScoreWorkspace:
     width: the two dimensions every later request is checked against.
     """
 
-    def __init__(self, geometry, max_tokens, columns, device):
+    def __init__(self, geometry, max_tokens, columns, device, candidate_blocks=0):
         ratios = sorted({ratio for _, ratio in geometry.owners})
         self._tiles = {
             ratio: torch.empty(
@@ -42,7 +42,20 @@ class ScoreWorkspace:
             )
             for ratio in ([] if geometry.index_fp4 else ratios)
         }
+        # Two independent widths, and the plane has to hold the larger.
+        #
+        # A layer reading the whole context needs `columns * rows_per_page`.
+        # A layer reading an earlier layer's candidate list needs
+        # `candidate_blocks * index_block_rows` instead -- and that second
+        # number comes from the checkpoint (`candidate_topk_blocks`), not from
+        # `max_model_len`, so which of the two is larger flips with the
+        # context length. Sizing from the first alone fits every long-context
+        # configuration and none of the short ones: the candidate plane then
+        # overruns a workspace whose own arithmetic is correct, and the error
+        # names the scorer rather than the budget it was sized from.
         widths = [columns * geometry.rows_per_page(ratio) for ratio in ratios]
+        if candidate_blocks:
+            widths.append(candidate_blocks * geometry.index_block_rows)
         self._logits = torch.empty(
             max((min(max_tokens, plane_rows(w)) * w for w in widths), default=0),
             dtype=torch.float32,
