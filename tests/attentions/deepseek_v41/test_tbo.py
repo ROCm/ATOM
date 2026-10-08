@@ -309,6 +309,59 @@ def test_parent_engram_join_runs_when_a_microbatch_fails():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_narrowed_tile_rows_stay_compact_and_within_their_microbatch():
+    """A child table packs rows at its own width, not the allocation's.
+
+    `tile_slice` hands out a region whose rows are as wide as the workspace
+    was built for, but a request whose live `block_tables` is narrower fills
+    only part of each. The kernel is handed `out.stride(0)`, so it writes at
+    the same compact pitch the view reads at -- the unused tail of a row is
+    simply never addressed, and the rows stay inside the slice they were cut
+    from.
+    """
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+    from atom.model_ops.deepseek_v41.unit_table import unit_table
+
+    from tests.models.deepseek_v41.reference_unit_table import unit_table_reference
+
+    units, alloc_columns, max_tokens = 2, 8, 8
+    geometry = SimpleNamespace(
+        index_fp4=False,
+        owners=((0, 1),),
+        index_blocks_per_page=lambda ratio: units,
+        rows_per_page=lambda ratio: 16,
+    )
+    workspace = ScoreWorkspace(geometry, max_tokens, alloc_columns, "cuda")
+
+    torch.manual_seed(1409)
+    live_columns, tokens = 3, 4
+    assert live_columns < alloc_columns  # armed: the row has an unused tail
+    batch_ids = torch.arange(tokens, dtype=torch.int32, device="cuda")
+    first_pages = torch.randint(
+        0, 999, (tokens, live_columns), dtype=torch.int32, device="cuda"
+    )
+    second_pages = first_pages + 500
+
+    halves = [slice(0, tokens), slice(tokens, 2 * tokens)]
+    tables = [
+        unit_table(
+            pages,
+            batch_ids,
+            units,
+            workspace=workspace.tile_slice(half),
+            ratio=1,
+        )
+        for pages, half in zip((first_pages, second_pages), halves)
+    ]
+
+    # Each child names its own requests' pages, so neither wrote over the
+    # other's rows, and each matches the oracle element for element.
+    for table, pages in zip(tables, (first_pages, second_pages)):
+        assert table.stride(0) == live_columns * units
+        assert torch.equal(table, unit_table_reference(pages, batch_ids, units))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_prefill_microbatches_keep_workspace_tiles_across_layer_interleaving():
     from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 
