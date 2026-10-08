@@ -2568,6 +2568,7 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         except ImportError:
             from vllm.utils.platform_utils import get_cu_count as num_compute_units
         from vllm.utils.math_utils import cdiv
+
         try:
             from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
         except ImportError:
@@ -2582,7 +2583,6 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
                     return get_dcp_group().world_size
                 except AssertionError:
                     return 1
-
 
         from atom.models.utils import extract_layer_index
 
