@@ -113,6 +113,8 @@ on:
           MiniMax:
             minimax-m3-fp4-1p1d-tp4,minimax-m3-fp4-2p1d-dpa-tp4,
             minimax-m3-fp4-1p1d-tp4-eagle3,minimax-m3-fp4-2p1d-dpa-tp4-eagle3,
+            minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40,
+            minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c48,
             minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
             minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
         required: false

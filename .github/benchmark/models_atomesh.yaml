@@ -1112,6 +1112,93 @@ models:
           run_eval: true
           eval_concurrency: [256, 512, 768, 1024]
 
+        # PD adaptation of the TP4 C40/C48 LMCache arms in InferenceX@69ab0f4:
+        # https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36590574116/attempts/3
+        # Keep each concurrency in a separate job with fresh prefix caches.
+        - &minimax_m3_agentic_lmcache_tp4_tp4
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40
+          topology: 1p1d_eagle3
+          display_topology: 1P1D-TP4-EAGLE3
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [40]
+          server:
+            common_args: &minimax_m3_agentic_lmcache_args
+              kv_cache_dtype: fp8
+              block_size: 128
+              enable_prefix_caching: true
+              gpu_memory_utilization: 0.95
+              # AgentX primers need the native 1M context. Clear the random
+              # workload's 32K cap and its cross-layer index-cache override.
+              max_model_len: ""
+              hf_overrides: ""
+              max_num_seqs: 80
+              decode_max_num_seqs: 80
+              max_num_batched_tokens: 32768
+              method: eagle3
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3-GQA"
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 2.78
+              extra_args: >-
+                --index-cache-dtype fp8
+                --default-chat-template-kwargs {"thinking_mode":"enabled"}
+                --timeout-keep-alive 900
+          prefill:
+            workers: 1
+            tp: 4
+            cudagraph_mode: FULL
+            cudagraph: &minimax_m3_agentic_cudagraph >-
+              [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20,22,24,26,28,30,32,34,36,40,48,56,64]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph_mode: FULL
+            cudagraph: *minimax_m3_agentic_cudagraph
+          env:
+            common:
+              PYTHONNOUSERSITE: "1"
+              PYTHONHASHSEED: "0"
+              MC_DISABLE_HIP: "1"
+              AITER_SITUV2_A4W4: "1"
+              AITER_FLYDSL_STAGE2_FP8: "1"
+              ATOM_PA_FLYDSL: "1"
+              ATOM_PA_FLYDSL_PLAN: "1"
+              ATOM_M3_INDEXER_CP: "1"
+              ATOM_MONO_ENABLE: "0"
+              ATOM_DRAFT_CUDAGRAPH: "1"
+              ATOM_PREFIX_CACHE_POLICY: slru
+              ATOM_PREFIX_CACHE_PROTECTED_RATIO: "0.5"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_NUMA_MODE: auto
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_CHUNK_SIZE: "256"
+              LMCACHE_CACHE_POLICY: ATOM_SLRU
+              LMCACHE_LOOKUP_SERVER_WORKER_IDS: "0,1,2,3"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              # The launcher supplies the Mooncake consumer and offsets its
+              # handshake port by PREFILL_TP_SIZE for single-node P/D.
+          benchmark: *agentic_1m_aiperf
+          # Fixed acceptance length is for performance measurement only.
+          run_eval: false
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_tp4
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c48
+          concurrency: [48]
+          server:
+            common_args:
+              <<: *minimax_m3_agentic_lmcache_args
+              max_num_seqs: 96
+              decode_max_num_seqs: 96
+
     accuracy:
       task: gsm8k
       fewshot: 5
