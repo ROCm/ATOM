@@ -15,13 +15,19 @@ rows of anchor + 3 drafts (mtp_k = 3):
     logit rows  [0    | 1    | 2..5  | 6..9  ]        10 rows (LM head gather)
 """
 
-import importlib.util
 import types
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+
+# Every test here reaches `model_runner`, `drafter` or `deepseek_v4_attn`, and
+# each imports aiter at module scope; the CPU CI runner has none, and a stubbed
+# aiter does not survive their custom-op registration (`tests/aiter_stub.py`
+# covers only the connectors). Same convention as
+# test_cudagraph_capture_bounds.py: these run wherever aiter is installed.
+pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 N_P, N_D, K = 2, 2, 3
 PREFILL_LENS = [5, 3]
@@ -203,15 +209,9 @@ def test_mixed_step_is_never_shrunk_even_with_unchanged_composition():
     assert batch.num_scheduled_tokens.tolist() == NUM_SCHEDULED.tolist()
 
 
-# ── V4 builder pieces (deepseek_v4_attn imports aiter at module scope) ──────
-
-requires_aiter = pytest.mark.skipif(
-    importlib.util.find_spec("aiter") is None,
-    reason="deepseek_v4_attn imports aiter at module scope; CI has none",
-)
+# ── V4 builder pieces ────────────────────────────────────────────────────────
 
 
-@requires_aiter
 def test_carrier_spans_cover_the_whole_batch():
     from atom.model_ops.attentions.deepseek_v4_attn import _mixed_carrier_spans
 
@@ -232,7 +232,6 @@ def test_carrier_spans_cover_the_whole_batch():
     assert slots.tolist() == [11, 12, 21, 22, 0, 0]
 
 
-@requires_aiter
 def test_decode_view_slices_spec_fields_and_says_where_its_rows_start():
     from atom.model_ops.attentions.deepseek_v4_attn import _MixedDecodeView
 
