@@ -34,6 +34,7 @@ translations, and GSM8K still scored **0.9621** over the full 1319.
 | agentic numbers and how they were taken | [Agentic (AgentX)](#agentic-agentx) → [AgentX result](#agentx-result) |
 | why it is slow and what to try | [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
 | take a profile | [Profiling](#profiling) |
+| try the optimization PR stack — **pending verification** | [Optimized source stack](#optimized-source-stack--pending-verification) |
 | you are on A0 silicon | [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon) |
 
 ### Measured on B0, `rocm/fw-bringup:gfx1250-atom-20260918-ep8`
@@ -632,6 +633,14 @@ to run.
 | usable with `MEGA_DISPATCH_WIRE=bf16` | yes | yes |
 | what this recipe runs | **this one** | — |
 
+> **Scope:** the table and the paragraph below describe the aiter inside
+> `gfx1250-atom-20260918-ep8`. Since aiter #5814 (2026-09-25) flydsl's TDM
+> dispatch carries the scale row too, so on newer aiter — including the
+> [optimized source stack](#optimized-source-stack--pending-verification) — the
+> flydsl column no longer holds. The environment variable stays inert either
+> way: the ATOM comment above dates from 2026-09-01 (ATOM #2018), and ATOM
+> still hard-wires `mori` for fp4/fp8.
+
 **Switching to flydsl means giving up fp4 on the wire.** It is a pair, not a
 single knob:
 
@@ -794,7 +803,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `FAIL: HOTSWAP=1 but /app/rjprefix not found` | The prefix is not in the container. Re-install it; `docker rm` removes it. **Do not "fix" this with `HOTSWAP=0`** |
 | First decode request SIGABRTs, silently | `ATOM_USE_TRITON_MLA=1` not set |
 | `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
-| LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM |
+| LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM. The [optimized source stack](#optimized-source-stack--pending-verification) fixes it in aiter instead (#6120) |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
@@ -1267,6 +1276,337 @@ another rank; its isolated contribution is unmeasured.
 
 ---
 
+## Optimized source stack — pending verification
+
+> ⚠️ **Pending verification. Nothing in this section has been run on this
+> page's harness yet.** It merges XiaobingSuper's optimization work on the same
+> rack (2026-10-01 → 10-07, branch
+> [`xiaobingsuper/kimi-k3-mi455-b0-recipe`](https://github.com/ROCm/ATOM/tree/xiaobingsuper/kimi-k3-mi455-b0-recipe)).
+> Every speedup quoted below is the PR's own **isolated operator** number
+> (MI455 B0, CUDAGraph replay) — none is end-to-end, and they must not be added
+> up. The stack has not passed the
+> [accuracy gate](#accuracy-gate--run-this-before-any-benchmark) or produced an
+> AgentX result. Until it does, run
+> [Appendix A](#appendix-a-the-exact-configuration-this-was-validated-on).
+
+Unlike the rest of this page, this is a **source build**, not the bring-up
+image: ATOM and aiter at pinned commits plus eight PRs, all still open on
+2026-10-08. The launch is Config B with the deltas in
+[Environment and CLI](#environment-and-cli--delta-from-config-b).
+
+### Why these PRs: TP1 shapes on gfx1250
+
+Wide EP runs attention and the dense layers at `-tp 1`, so every per-rank shape
+is the **full model width**: 96 heads where a TP8 deployment sees 12, a dense
+intermediate of 33792 where TP8 sees 4224, and every rank resolving routes over
+all 896 global experts. aiter's kernels were sized and validated on MI355 TP8
+shapes, and at TP1 several of their limits are crossed — a 512-expert scan, a
+64 KB LDS assumption, a grid-stride loop that only appears at 96 heads. Most of
+the PRs below remove one of those limits; the rest retune for what is specific
+to gfx1250: wave32, 320 KB LDS, FP8 WMMA, TDM.
+
+### The PRs
+
+#### Decode hot path — every MoE layer, every step (×92)
+
+**[aiter #6131](https://github.com/ROCm/aiter/pull/6131) — router top-k.**
+Adds a gfx1250 Triton kernel for sigmoid + bias top-k and dispatches it from
+`biased_grouped_topk` when `num_expert_group == topk_group == 1`
+(E ∈ {512, 768, 896, 900, 1024}, K ∈ {4, 8, 16}, bf16 logits). K3's router —
+896 experts, top-16, `noaux_tc` — reaches exactly this call through ATOM's
+`rocm_aiter_biased_grouped_topk`; on `main` it runs the generic HIP kernel. The
+new kernel reproduces the HIP kernel's wave32 tie-break order, so the selected
+expert ids are bit-identical. *Isolated:* E896/K16 34–36% faster than the best
+generic path, M = 1…128.
+
+**[aiter #6115](https://github.com/ROCm/aiter/pull/6115) — global→local expert LUT, 512 → 1024.**
+On the fp4 wire ATOM forces the **mori** dispatch backend (see
+[The MoE dispatch backend](#the-moe-dispatch-backend-mori-and-why-mega_dispatchflydsl-does-nothing)),
+and with mori the MegaMoE receiver rebuilds a global→local expert LUT **every
+layer, every step** — the same kernel also zeroes the per-expert route
+counters. The FlyDSL LUT kernel was a single 512-thread workgroup with one
+thread per global expert, so K3's 896 fell back to ~7 torch launches plus a
+counter fill and a multiply. The PR scans in two levels — DPP inside each wave,
+then one wave over the wave totals, 2 barriers instead of 9–10 — in a
+1024-thread workgroup; 1024 = 32² is exactly what that covers on wave32.
+*Isolated:* 13.4× at the K3 shape (896 global / 56 local / top-16);
+1.33–1.42× for the existing ≤ 512 cases.
+
+#### MXFP4 routed projections — `routed_expert_down/up_proj` (×184 GEMMs per step)
+
+**[ATOM #2466](https://github.com/ROCm/ATOM/pull/2466) — MXFP4 scale layouts.**
+On gfx1250 with preshuffled MXFP4 weights, ATOM's default GEMM (Opus F4GEMM)
+expects `shuffle_scale_f4` scales while ATOM stores `e8m0_shuffle`. The PR
+routes these layers to aiter's `gemm_afp4wfp4_preshuffle` instead — the gfx1250
+Gluon TDM kernel, which reads `e8m0_shuffle` — and disables the routed
+RMSNorm+MXFP4 fusion on gfx1250, whose padded/preshuffled `[256, 112]` scales do
+not match the row-major `[M, 112]` that GEMM wants below M = 32. **This is what
+makes `ATOM_USE_TRITON_GEMM=0` safe on gfx1250** — the switch this stack needs
+so BF16 GEMMs take the tuned table and ptpc FP8 GEMMs take aiter's preshuffled
+kernels. Without it, that switch silently pairs MXFP4 weights with the wrong
+scale layout. Needs aiter #6097 (merged, already in the aiter base).
+*Isolated:* none claimed — correctness.
+
+#### Dense MLP — layer 0 only
+
+**[aiter #6078](https://github.com/ROCm/aiter/pull/6078) — SiTUv2 + per-token FP8 at D = 33792.**
+K3's only dense MLP has intermediate 33792, unsharded at `-tp 1`. Under ptpc its
+`down_proj` is per-token FP8, so ATOM calls aiter's fused SiTUv2+quant kernel —
+and on `main` that kernel's `AITER_CHECK(d <= 16376)` **aborts the process**;
+the cap came from assuming 64 KB of LDS. The PR uses gfx1250's real 320 KB,
+reads LDS size and wave size per device, removes the cap, adds a 1024-thread
+`D = 33792` dispatch with packed BF16 math, and recomputes activations for rows
+that do not fit in LDS. Required for ptpc at TP1, not merely faster; the shared
+experts (D = 6144) already worked. *Isolated:* 2.36–2.57× against SiTUv2
+followed by a standalone quant.
+
+#### KDA prefill (69 layers)
+
+**[aiter #6130](https://github.com/ROCm/aiter/pull/6130) — FlashKDA K2 schedule.**
+K3 prefill runs `chunk_kimi_delta_attn` → `flash_kda_fwd`; the Gluon K1/K2 is
+gfx950-only, so gfx1250 runs the Triton K2 — the serial, per-chunk delta-rule
+recurrence. The PR publishes a gfx1250 schedule (`BW=16, num_warps=1,
+num_stages=3`) and fixes the selection bug that made publishing necessary: with
+autotune off, the production default, `autotune_configs` always returned the
+fallback config, so no architecture's tuned shortlist was ever used. Only
+gfx1250 changes (gfx950's first shortlisted entry equals the fallback). Output
+and final state are bitwise equal. *Isolated:* K2 1.52× / 1.59× / 1.64× at
+2K / 4K / 14K tokens (marked provisional in the PR).
+
+**[ATOM #2458](https://github.com/ROCm/ATOM/pull/2458) — gated RMSNorm after KDA.**
+Two parts. Prefill now hands the contiguous KDA output straight to `o_norm`
+instead of `out.copy_()`-ing it into an identical buffer — about 100 MB of copy
+traffic per KDA layer per 2048-token chunk. And a multi-row gated-RMSNorm kernel
+replaces one program per 128-element (token, head) row — 196,608 programs for a
+2048-token chunk at 96 heads — with 8 rows per program (32 at ≥ 900,000 rows,
+which a 16384-token chunk does not reach). ⚠️ **The multi-row kernel only runs
+when `o_proj` is BF16.** With ptpc, as in this stack, `o_norm` fuses per-token
+FP8 quant in a different kernel (one program per token), and only the copy
+removal applies. *Isolated:* copy + norm pipeline 1.32–4.97× over 256–16,384
+tokens.
+
+#### MLA cached-prefix expansion (24 layers; chunked-prefill chunk ≥ 2, or a prefix-cache hit)
+
+**[aiter #6120](https://github.com/ROCm/aiter/pull/6120) — the LLVM PHI assertion, fixed at the root.**
+This is the assertion [PR #2380](#-required-patch-atom-pr-2380) works around.
+The flat (page-size-1) Triton `gather_kv_b_proj` caps its workers at
+`CU × 6 / heads` and grid-strides over the remaining chunks; at 96 heads the cap
+is 16 chunks (128 at TP8's 12 heads), so TP1 generates the loop on modest
+prefixes, and gfx1250's LLVM asserts on it. On gfx1250 the PR launches one
+workgroup per KV chunk, so the loop is never generated and the kernel stays
+fused. With it, the unfused fallback is not needed. *Isolated:* none claimed —
+compile fix.
+
+**[aiter #6121](https://github.com/ROCm/aiter/pull/6121) — FlyDSL FP8 WMMA `gather_kv_b_proj`.**
+Gathers the FP8 latent rows, runs an 8-wave **FP8 WMMA** projection whose
+epilogue writes K-nope and V directly, then broadcasts K-PE across the heads —
+no full projection temporary. At 96 heads each prefix row expands to ~61 KB of
+K/V, so the op is output-bandwidth-bound and grows with context length
+(quadratically over a long prompt split into chunks). It requires an FP8,
+16×16-preshuffled `kv_b_proj` with per-row scale — which ptpc produces — and an
+FP8, unshuffled KV cache. ATOM picks it up through
+`ATOM_USE_FLYDSL_GATHER_KV_B_PROJ`, whose default is already `1`. *Isolated:*
+1.07× / 2.07× / 2.70× / 2.80× at 2K / 4K / 8K / 16K prefix rows — against a
+multi-kernel unfused baseline, not against the #6120-fixed fused kernel.
+
+#### Also in the bundle, without a PR
+
+The bundle's `atom.patch` carries five local changes that have no PR yet; their
+tests are included.
+
+| change | what | why |
+|---|---|---|
+| KDA decode recurrence | `fused_sigmoid_gating_delta_rule_update`: `num_warps` 4 → 8 | wider launch for the 96-head decode recurrence. ⚠️ unconditional — applies to every model and arch that uses this kernel |
+| causal-conv1d decode | width-4, single-token update writes the shifted conv state from registers instead of re-reading columns through a 2-D tile; fork-safe | K3's normal decode step |
+| causal-conv1d prefill | width-4 conv vectorised across 8 token rows instead of a serial rolling window; a new `has_state_fork` metadata flag keeps forks, APC, other layouts and short calls on the generic kernel | K3 long prefill |
+| guarded MLA split8 | Triton MLA decode `num_kv_splits` 4 → 8, only for the exact K3 contract (gfx1250, bf16, fp8 KV, 96 heads, 512/128/64/128, page 1, max batch ≤ 8, unshuffled) **and** a live batch ≤ 2 | AgentX decodes about one sequence per rank; for wider batches split8 regresses on short tails |
+| AttentionResidual long prefill | `(num_warps, num_stages, BL) = (4, 2, 1)` for H = 7168, T ≥ 2048 on gfx1250 | long-prefill launch tuning |
+
+Deliberately **not** included: ATOM #2447, a SiTU shape guard that fell back to
+the unfused path — superseded by aiter #6078, which fixes the kernel instead —
+and a closed ATOM grouped-top-k candidate, superseded by aiter #6131. The
+bundle's opt-in `--experimental-mori` overlay (MegaMoE TDM tile choice, direct
+EP route and counter reset on the mori path) is **not** part of this stack: it
+has only EP4/operator evidence and a page-fault history.
+
+Xiaobing's measurement log — profiles, the `ATOM_MORI_V2_FUSED` A/B, the BF16
+tuning, rejected candidates — is `recipes/Kimi-K3-455-wideEP-optimization.md` on
+his branch. It describes the image-based stack as of 2026-10-02.
+
+### Getting the source stack
+
+```bash
+git clone git@github.com:ROCm/ATOM.git ATOM-base
+git -C ATOM-base checkout --detach a526f0d557eeed08396670249af58bd85fa57338
+git clone git@github.com:ROCm/aiter.git AITER-base
+git -C AITER-base checkout --detach 57b7cf03ad32f72247c151cff2933abd11ff77d1
+
+git clone --branch xiaobingsuper/kimi-k3-mi455-b0-recipe \
+  git@github.com:ROCm/ATOM.git xb-recipe
+BUNDLE=$PWD/xb-recipe/experiments/kimi_k3_b0/all_optimizations
+"$BUNDLE/apply.sh" "$PWD/ATOM-base" "$PWD/AITER-base"
+```
+
+`apply.sh` refuses to run unless both checkouts sit at those bases and every
+artifact matches its checksum. It then applies `atom.patch` (ATOM #2458 @
+`9f20a70`, #2466 @ `b52cc83`, plus the five local changes) and `aiter.patch`
+(#6078 @ `3e2807d`, #6115 @ `2ca6fff`, #6120 @ `0acb6d6`, #6121 @ `d6d8777`,
+#6130 @ `4fa13d4`, #6131 @ `45a599a`; #6097 is already in the base), and
+installs the BF16 GEMM table as
+`aiter/configs/k3_bf16_hot_gfx1250_production_safe.csv`. Re-running is safe.
+**Do not substitute a newer `main`** — the patches apply only to these bases.
+
+⚠️ **Not yet recorded — settle these on the first run:**
+
+- **Runtime image and install.** The bundle patches source trees; which image
+  they were installed into, and how, is not written down. #6078 changes
+  `csrc/`, so aiter's `module_activation` must be rebuilt from the patched
+  tree — a stale build keeps the `d <= 16376` abort.
+- **mori version.** The aiter base contains aiter #5810, which imports
+  `TokOffExt` from `mori.ops.dispatch_combine_v2.hip_backend` — with no
+  fallback — whenever `MORI_EP_TOKOFF_EXT` is on, which is the default. mori
+  made that class public on 2026-09-24 (ROCm/mori#708), after the `20260918`
+  image was built. Either run a mori that has it, or set
+  `MORI_EP_TOKOFF_EXT=0`, which leaves dispatch serialised on one cco-window
+  atomic. *Inferred from the code, not observed.*
+
+  ```bash
+  python3 -c "from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt; print('ok')"
+  ```
+
+### Environment and CLI — delta from Config B
+
+Everything not in this table is identical to
+[Config B](#config-b--agentic-throughput-agentx): architecture, attention, MoE
+(`MEGA_DISPATCH=mori`, `MEGA_DISPATCH_WIRE=fp4`, `ATOM_MORI_V2_FUSED=1`, …),
+`ATOM_WO_A_USE_FLYDSL`, `ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE`,
+`AITER_ROPE_TRITON_BACKEND` / `AITER_USE_SYSTEM_TRITON`, communication, session
+affinity, loading, and every other CLI flag.
+
+| | Config B (validated) | source stack | why |
+|---|---|---|---|
+| software | image + PR #2380 | pinned bases + bundle | [above](#getting-the-source-stack) |
+| translation lines | set, inert on B0 | dropped | B0 only |
+| `ATOM_UNFUSED_GATHER_KV_B_PROJ` | `1` | `0` | #2380 is not in the ATOM base, where the variable is not even defined; #6120 removes the need |
+| `ATOM_USE_FLYDSL_GATHER_KV_B_PROJ` | unset (default `1`; the image's FlyDSL gather is gfx950-only, so a no-op) | `1` tier B, `0` tier A | switches #6121. The default is `1`, so tier A must set `0` explicitly |
+| `ATOM_USE_TRITON_GEMM` | `1` | `0` | BF16 GEMMs take the tuned table, ptpc FP8 GEMMs take aiter's preshuffled kernels. Safe only with ATOM #2466 |
+| `AITER_CONFIG_GEMM_BF16` | — | the installed CSV | 75 hot K3 BF16 shapes tuned on gfx1250, restricted to kernel ids in the default production build; in isolation 64/75 are ≥ 3% faster, median +58.5% |
+| `--online_quant_config` | — | ptpc_fp8, see below | attention, dense MLP and shared experts to per-token FP8 — gfx1250's FP8 WMMA runs at roughly 4× BF16. #6078 and #6121 depend on it |
+
+Run on every node, `DPRANK` = 0 / 4 / 8 / 12:
+
+```bash
+#!/bin/bash
+# --- architecture ---
+export PYTORCH_ROCM_ARCH=gfx1250 AITER_RUNTIME_GPU_ARCH=gfx1250
+export GPU_ARCHS=gfx1250 GPU_ARCH_LIST=gfx1250 MORI_GPU_ARCHS=gfx1250
+export HSA_OVERRIDE_GFX_VERSION=12.5.0
+export ENABLE_CK=0
+# --- attention ---
+export ATOM_USE_TRITON_MLA=1
+export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0
+export ATOM_UNFUSED_GATHER_KV_B_PROJ=0          # CHANGED 1 -> 0: aiter #6120
+export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1       # NEW: aiter #6121 (tier B); 0 = tier A
+export ATOM_USE_AITER_TRITON_ATTN=1 ATOM_USE_UNIFIED_ATTN=1
+# --- MoE ---
+export ATOM_MOE_GU_ITLV=1
+export ATOM_USE_TRITON_MOE_DECODE=0
+export MEGA_DISPATCH=mori MEGA_DISPATCH_WIRE=fp4
+export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1
+export AITER_USE_GROUPED_GEMM=1 AITER_USE_OPUS_MOE_SORTING=1
+# --- GEMM / quantization ---
+export ATOM_USE_TRITON_GEMM=0 ATOM_WO_A_USE_FLYDSL=1   # CHANGED 1 -> 0: needs ATOM #2466
+export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1
+export AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1
+export AITER_CONFIG_GEMM_BF16=<AITER-base>/aiter/configs/k3_bf16_hot_gfx1250_production_safe.csv  # NEW
+export ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*.f_b_proj","*block_sparse_moe.gate","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'  # NEW
+# --- communication ---
+export NCCL_MNNVL_ENABLE=1
+export NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS NCCL_CUMEM_ENABLE=1
+export ATOM_DP_LM_HEAD_MODE=allgather
+export ATOM_USE_CUSTOM_ALL_GATHER=1 AITER_CUSTOM_AR_USE_SYMM_MEM=1
+export MORI_SOCKET_IFNAME=enp1s0f1 NCCL_SOCKET_IFNAME=enp1s0f1 GLOO_SOCKET_IFNAME=enp1s0f1
+# --- agentic: pin a session to its cache owner across turns ---
+export ATOM_DP_SESSION_AFFINITY=1
+# --- loading ---
+export HSA_XNACK=1 HSA_USE_SVM=1 HSA_ENABLE_SDMA=1
+export ATOM_LOADER_USE_THREADPOOL=1 ATOM_LOADER_NUM_THREADS=4
+
+cd /tmp
+exec python3 -m atom.entrypoints.openai_server \
+  --model /models/Kimi-K3 \
+  --served-model-name moonshotai/Kimi-K3 \
+  --trust-remote-code \
+  -tp 1 \
+  --data-parallel-size 16 \
+  --data-parallel-size-local 4 \
+  --data-parallel-rank ${DPRANK} \
+  --data-parallel-master-ip <node0-data-plane-ip> \
+  --data-parallel-master-port 29500 --data-parallel-base-port 29700 \
+  --enable-expert-parallel --enable-dp-attention \
+  --fake-eplb \
+  --kv_cache_dtype fp8 --index-cache-dtype fp8 \
+  --cudagraph-mode FULL \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 16384 \
+  --gpu-memory-utilization 0.94 \
+  --enable_prefix_caching \
+  --online_quant_config "$ONLINE_QUANT_CONFIG" \
+  --disable_uvicorn_access_log
+```
+
+`--fake-eplb` is for AgentX only: **drop it for the accuracy gate**, as for
+Config A. The bundle's own `launch_server.sh` defaults to `FAKE_EPLB=1`, so run
+it with `FAKE_EPLB=0` for accuracy. It also exports a few scheduler knobs
+(`ATOM_DP_LB_REQ_EQUIV=512`, the prefill-delayer settings,
+`--state-checkpoint-interval-tokens 8192`, …) at ATOM's own defaults — they are
+not changes.
+
+⚠️ **Do not use the bundle's `ptpc_online_experimental.json` as is.** Its MoE
+patterns are written `*.mlp.gate`, `*.mlp.experts`, `*.mlp.routed_expert_*`,
+but ATOM names K3's MoE block `block_sparse_moe` (`atom/models/kimi_k3.py`), and
+the online `exclude_layer` list is matched with `fnmatch` against those module
+names (`_matches_exclude` in `atom/config.py`). Under that rule the routed
+experts and both routed projections are **not** excluded, and
+`will_online_requant` / `FusedMoE._online_quant` would re-quantize them from
+MXFP4 to FP8 — established by replaying the matching rule on K3's layer names,
+not by booting it. The list above keeps the bundle's intent with K3's names:
+the patterns from [Kimi-K3.md](Kimi-K3.md) plus the bundle's `*.f_b_proj`
+(K = 128). `kv_b_proj` stays quantized on purpose, because #6121 needs it in
+FP8.
+
+### What "verified" means for this section
+
+Run in this order and stop at the first failure:
+
+1. **Boot.** On every rank: `Created MegaMoE ... experts=896 ... dispatch=mori
+   wire=fp4` — MegaMoE requires MXFP4 experts, so this also confirms the
+   exclusion list held — a positive `available_for_kv`, and the `TokOffExt`
+   check above. ptpc re-quantizes weights during load, so allow a longer cold
+   start than Config B's.
+2. **Tier A — correctness reference**, `ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0`, no
+   `--fake-eplb`: the [sanity gate](#accuracy-gate--run-this-before-any-benchmark)
+   (no `!`, no single repeated token, no empty `content`), then full 5-shot
+   [GSM8K](#gsm8k). Reference points: Config A scored 0.9621; on earlier cuts
+   of this stack Xiaobing measured strict 0.9583 (before #6121, #6078 and
+   #6131 were added) and 0.9598 (ptpc only).
+3. **Tier B — full stack**, `ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1`: the same gate
+   again.
+4. **AgentX**, with `--fake-eplb` and **this page's** client exactly (con32,
+   `--benchmark-duration 1800`, warmup 3/lane, seed 42), against Config B's p90
+   **2.53 tok/s/user** and **182 tok/s per GPU**. The bundle's `run_agentx.sh`
+   runs 900 s; its 2.97 baseline is not comparable with 2.53.
+5. **dmesg** before and after each run. Xiaobing's two 1800 s attempts on this
+   rack each lost a rank to a gfx1250 `no-retry page fault`
+   (`Faulty UTCL2 client ID: TCP`), on different nodes, with the image-based
+   configuration — so it is a platform issue to watch, not a property of these
+   PRs. A node that afterwards reports `MES ring buffer is full` or SDMA fence
+   timeouts is not healthy even at 0% VRAM.
+
+Then record the numbers here and drop "pending" — or strike whatever failed.
+
+---
+
 ## Appendix A: the exact configuration this was validated on
 
 Everything below was run as written on a 4-node gfx1250 rack. Copy it rather
@@ -1618,3 +1958,5 @@ A correct run logs lines of this shape:
   per GPU for KV, which is the obvious lever for pushing concurrency up.
 - `--max-num-seqs` has not been swept; see the note under
   [Throughput](#throughput) for why it is the first thing to try.
+- The [optimized source stack](#optimized-source-stack--pending-verification)
+  as a whole: boot, accuracy and AgentX are all pending.
