@@ -16,7 +16,6 @@ stay as backstops, but every one of them is now a `raise`.
 
 import ast
 import pathlib
-
 from types import SimpleNamespace
 
 import pytest
