@@ -1186,7 +1186,7 @@ def dcp_decode_candidate_exchange_fused(
     from aiter.ops.topk import flydsl_dcp_topk_merge, top_k_per_row_decode
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-    from atom.model_ops.sparse_indexer_fp4 import FP4_MQA_BLOCK_K
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 
     dcp_world_size = get_dcp_world_size()
     # Size everything off num_decode_tokens, the rows this rank actually
@@ -1231,25 +1231,26 @@ def dcp_decode_candidate_exchange_fused(
     else:
         from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
-        # The schedule the metadata builder published is the one this kernel was
-        # captured with, and it is built off `local_ctx` at `l_max` -- the same
-        # two the call below scores in. Neither may be re-derived here.
         flydsl_pa_mqa_logits_fp4(
             q_rows,
             q_scale[:num_decode_tokens].unsqueeze(1),
             kv_cache,
             kv_scale,
-            block_tables,
-            weights[:num_decode_tokens],
-            local_ctx,
-            l_max,
+            weights=weights[:num_decode_tokens],
+            max_seq_len=l_max,
             weight_scale=weights_scale,
-            next_n=1,
-            block_k=FP4_MQA_BLOCK_K,
             kv_block_size=runner_block_size,
             out=local_logits,
-            cta_info=attn_metadata.indexer_fp4_cta_info,
-            total_ctas=attn_metadata.indexer_fp4_n_ctas,
+            **Fp4MqaRaggedMetadata(
+                attn_metadata.sparse_cu_seqlens_q[: num_decode_tokens + 1],
+                1,
+                block_tables,
+            ).kernel_args(
+                local_ctx,
+                heads=q_rows.shape[-2],
+                page_size=runner_block_size,
+                max_seq_len=l_max,
+            ),
         )
 
     # k_loc is the constant `topk_tokens`, never the live local length: the

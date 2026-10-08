@@ -25,7 +25,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr.typing import T
 
-from atom.models.minimax_m3.mono.kernels.common import (
+from atom.mono.device.ops import (
     bf16_round,
     fp8_pack4,
     fp8x8_bf16_pk,

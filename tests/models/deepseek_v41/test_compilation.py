@@ -202,11 +202,10 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm mHC")
-@pytest.mark.parametrize("mode", ["pre", "fused_post_pre", "unfused_post_pre"])
-def test_mhc_guard_outputs_and_input_alias(monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["pre", "post_pre"])
+def test_mhc_guard_outputs_and_input_alias(mode):
     from atom.model_ops.deepseek_v41 import mhc_pre_delayed as mhc
 
-    monkeypatch.setattr(mhc, "prefers_unfused", lambda rows: mode == "unfused_post_pre")
     device = "cuda"
     rows, hc, hidden = 6, 4, 5120
     residual = torch.randn(1, rows, hc, hidden, device=device, dtype=torch.bfloat16)
@@ -214,7 +213,14 @@ def test_mhc_guard_outputs_and_input_alias(monkeypatch, mode):
     fn = torch.randn(hc * (hc + 2), hc * hidden, device=device) * 0.01
     scale = torch.ones(3, device=device)
     base = torch.zeros(hc * (hc + 2), device=device)
-    kwargs = {"rms_eps": 1e-6, "hc_eps": 1e-6, "sinkhorn_iters": 20, "post_mult": 2.0}
+    norm = torch.ones(hidden, device=device, dtype=torch.bfloat16)
+    kwargs = {
+        "rms_eps": 1e-6,
+        "hc_eps": 1e-6,
+        "sinkhorn_iters": 20,
+        "post_mult": 2.0,
+        "norm_eps": 1e-6,
+    }
     if mode != "pre":
         kwargs.update(
             sublayer_output=torch.randn(
@@ -225,7 +231,7 @@ def test_mhc_guard_outputs_and_input_alias(monkeypatch, mode):
             .expand(1, rows, hc, hc)
             .contiguous(),
         )
-    args = (residual, pre, fn, scale, base)
+    args = (residual, pre, fn, scale, base, norm)
     with torch.inference_mode():
         before = residual.clone()
         outputs = mhc.pre_delayed(*args, **kwargs)

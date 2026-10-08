@@ -19,6 +19,7 @@ selector then finds the scores in place instead of scoring after its launch.
 """
 
 import struct
+from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import flydsl.compiler as flyc
@@ -29,21 +30,18 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.mono.config import (
-    BLOCKS,
     HEAD_DIM,
-    INDEX_CP_FROM_BLOCKS,
+    LONG_FROM_BLOCKS,
     MAX_INDEX_BLOCKS,
     MAX_TOKENS,
     ONE_INDEX_HEAD,
     SPARSE_BLOCK,
-    THREADS,
     TOPK_BLOCKS,
     TP,
-    WAVES,
     IndexHeads,
 )
-from atom.models.minimax_m3.mono.kernels.common import (
-    Mailbox,
+from atom.models.minimax_m3.mono.sources import SOURCES
+from atom.mono.device.ops import (
     butterfly,
     fp8x8_bf16_pk,
     kernel_symbol,
@@ -56,6 +54,11 @@ from atom.models.minimax_m3.mono.kernels.common import (
     uniform,
     unlikely,
 )
+from atom.mono.device.sync import Addr, Mailbox
+from atom.mono.plan.arith import pick
+from atom.mono.plan.build_key import key_tuple, symbol_params
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
+from atom.mono.plan.trace import Space
 
 INDEX_BLOCK_BYTES = SPARSE_BLOCK * HEAD_DIM  # one fp8 index-K block
 KEY_TILES = SPARSE_BLOCK // 16  # MFMA row tiles of a block
@@ -91,10 +94,9 @@ class StepRows(NamedTuple):
 
 
 def step_rows(seq_lens, tokens: int, q_len, heads: IndexHeads) -> StepRows:
-    """The one place a request is decided long: past INDEX_CP_FROM_BLOCKS index
-    blocks with every index head (its scores take the context-parallel layout,
-    ``emit_index_scores``), past THREADS with one (more blocks than
-    ``rank_blocks`` ranks); either way K4 selects it past the split stage.
+    """The one place a request is decided long: past LONG_FROM_BLOCKS index
+    blocks (with every index head its scores take the context-parallel layout,
+    ``emit_index_scores``); K4 selects it past the split stage.
 
     Decided by the request's last row (a request is ``q_len`` consecutive rows):
     a speculative verify's rows can sit either side of the threshold, and a
@@ -109,16 +111,7 @@ def step_rows(seq_lens, tokens: int, q_len, heads: IndexHeads) -> StepRows:
         req_blks[k] = (fx.Int32(k) % q_len == q_len - 1).select(
             n_blks[k], req_blks[k + 1]
         )
-    past = INDEX_CP_FROM_BLOCKS if heads.count > 1 else THREADS
-    return StepRows(seq, n_blks, [nb > past for nb in req_blks])
-
-
-def _pick(vals, k):
-    """vals[k] for a traced index k."""
-    v = vals[0]
-    for j in range_constexpr(1, len(vals)):
-        v = (k == j).select(vals[j], v)
-    return v
+    return StepRows(seq, n_blks, [nb > LONG_FROM_BLOCKS for nb in req_blks])
 
 
 @traced
@@ -134,7 +127,7 @@ def emit_index_scores(
     consecutive rows sharing a block table; the last one has the longest context
     and lists the request's scored blocks. ``q_frag(k, s)``: this lane's B operand
     for token k, k-chunk s (bf16x8 of index q). Pair k * MAX_INDEX_BLOCKS + b of
-    mailbox ``iscore`` <- the score of token k's block b.
+    mailbox ``iscore`` (an ``Addr``) <- the score of token k's block b.
 
     ``wait_new_keys()`` (K1 fused into the layer kernel; wave-local) waits for the
     index keys this launch inserts: a block within MAX_TOKENS keys of a token's
@@ -184,7 +177,7 @@ def emit_index_scores(
         tk = fx.Int32(0)
         for j in range_constexpr(1, tokens):
             tk = tk + (u >= pre[j]).select(fx.Int32(1), fx.Int32(0))
-        return tk, first + stride * (u - _pick(pre[:tokens], tk))
+        return tk, first + stride * (u - pick(pre[:tokens], tk))
 
     def page_of(tk, b):
         return fx.Int32(
@@ -194,13 +187,13 @@ def emit_index_scores(
     def new_keys_in(tk, b):
         """Block b of the request ending at token tk may hold keys this launch
         inserts (a speculative verify's earlier rows)."""
-        return (b + 1) * SPARSE_BLOCK > _pick(seq, tk) - MAX_TOKENS
+        return (b + 1) * SPARSE_BLOCK > pick(seq, tk) - MAX_TOKENS
 
     def cols_of(tk):
         """B column l16's token (the request's token l16, the last one repeated)
         and its context."""
         col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
-        return col, _pick(seq, col)
+        return col, pick(seq, col)
 
     def load_raw(page, tiles):
         """Key tiles ``tiles`` (16 keys each) of a block, in flight: lane g4 =
@@ -267,7 +260,7 @@ def emit_index_scores(
         if const_expr(prepare_heads is not None):
             prepare_heads()
         tiles = range(KEY_TILES)
-        seq_lane = _pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
+        seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
         n_cols = TP * q_len
 
         def score_cp(tk, b, page):
@@ -338,7 +331,7 @@ def emit_index_scores(
         if const_expr(prepare is not None):
             prepare(fx.Int32(0), fx.Int32(tokens - 1))
         tiles = range(KEY_TILES)
-        seq_lane = _pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
+        seq_lane = pick(seq, fx.min(lane, tokens - 1))  # lane k: token k's context
 
         def score_task(tk, b, page):
             """Block b of the request ending at token tk, at ``page``."""
@@ -390,6 +383,18 @@ def q_frag_from(iq, heads=ONE_INDEX_HEAD):
     return q_frag, q_frag_head
 
 
+@dataclass(frozen=True)
+class ScoreBuild:
+    """Every parameter of a standalone score build (``atom.mono.plan.build_key``)."""
+
+    tokens: int = field(metadata={"sym": "s"})
+    init_blocks: int = field(metadata={"sym": "ib"})
+    local_blocks: int = field(metadata={"sym": "lb"})
+    index_heads: int = field(metadata={"sym": "ih"})
+    index_own: int = field(metadata={"sym": "io"})
+    sm_scale: float
+
+
 def build_index_score_kernel(
     sm_scale: float,
     init_blocks: int,
@@ -399,24 +404,23 @@ def build_index_score_kernel(
 ):
     """``@flyc.jit`` launcher of the score tasks alone (index q from memory,
     ``heads.count`` heads a token), for K4's harnesses: scores into mailbox
-    ``iscore`` with K4's (step, layer) tag."""
+    ``iscore`` with K4's layer tag."""
     assert 1 <= tokens <= MAX_TOKENS
+    key = ScoreBuild(
+        tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
+        index_heads=heads.count, index_own=heads.own, sm_scale=sm_scale,
+    )  # fmt: skip
+    build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     scale = index_scale_log2e(sm_scale)
-    # the JIT cache key holds scalar closure values only: the heads go in as ints
+    # the kernel body rebuilds IndexHeads from ints: an object in a closure is not
+    # a cache-key value (``build_key`` keys them anyway)
     ih_count, ih_own = heads.count, heads.own
 
     @fx.struct
     class Smem:
         red: fx.Array[fx.Float32, WAVES * 16, 16]
 
-    kernel_name = kernel_symbol(
-        "minimax_m3_index_score",
-        s=tokens,
-        ib=init_blocks,
-        lb=local_blocks,
-        ih=heads.count,
-        io=heads.own,
-    )
+    kernel_name = kernel_symbol("minimax_m3_index_score", **symbol_params(key))
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def index_score_kernel(
@@ -427,18 +431,18 @@ def build_index_score_kernel(
         bt_width: Int32,
         q_len: Int32,
         iscore: Int64,
-        step: Int64,
         layer: Int32,
     ):
         tid = fx.thread_idx.x
         lds = fx.SharedAllocator().allocate(Smem).peek()
         red = lds.red.ptr
-        mbox = Mailbox(iscore, step, layer)
+        mbox = Mailbox(layer)
         mb_put = mbox.put
         k_heads = IndexHeads(ih_count, ih_own)
         q_frag, q_frag_head = q_frag_from(iq, k_heads)
         emit_index_scores(
-            fx.block_idx.x, tid % 64, uniform(tid // 64), red, mb_put, iscore,
+            fx.block_idx.x, tid % 64, uniform(tid // 64), red, mb_put,
+            Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, scale, index_cache,
             block_table, seq_lens, bt_width, heads=k_heads, q_frag_head=q_frag_head,
         )  # fmt: skip
@@ -452,10 +456,10 @@ def build_index_score_kernel(
         bt_width: Int32,
         q_len: Int32,
         iscore: Int64,
-        step: Int64,
         layer: Int32,
         stream: fx.Stream = _CURRENT_STREAM,
     ):
+        _ = build_key  # every build parameter in the JIT cache key
         index_score_kernel(
             iq,
             index_cache,
@@ -464,7 +468,6 @@ def build_index_score_kernel(
             bt_width,
             q_len,
             iscore,
-            step,
             layer,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 

@@ -2585,7 +2585,6 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
     )
     monkeypatch.setattr(type(p), "verify_scheduler", None, raising=False)
     p.block = types.SimpleNamespace(
-        stage=lambda bs, srcs: {"anchor_positions": torch.zeros(bs, dtype=torch.int64)},
         label=lambda s, r: f"bs={s}/{r}",
         run=lambda bs, **staged: (torch.zeros(bs, T, dtype=torch.int32), None),
     )
@@ -2596,8 +2595,8 @@ def test_a_dp_sync_dummy_describes_every_row_of_the_block_as_pad(monkeypatch):
         out = p._propose_with_draft(
             fc,
             fc.attn_metadata,
-            torch.zeros(1, dtype=torch.int32),
-            torch.zeros(1, dtype=torch.int64),
+            {"anchor_positions": torch.zeros(4, dtype=torch.int64)},
+            1,
         )
         assert seen["described_bs"] == expect, f"is_dummy_run={dummy}"
         assert seen["rows"] == 4, "the width is the agreed batch either way"
@@ -2687,3 +2686,20 @@ def test_the_premise_check_passes_the_configuration_k3_actually_ships(monkeypatc
         "reduce_final_map",
         "reduce_partial_map",
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
+    from atom.spec_decode.dspark_proposer import _stage_anchors_kernel
+
+    running_bs, vocab_max = 6, 99
+    next_ids = torch.tensor([5, -1, 140, 7], dtype=torch.int32, device="cuda")
+    positions = torch.arange(20, dtype=torch.int64, device="cuda") * 3
+    rows = torch.tensor([2, 5, 9, 13], dtype=torch.int32, device="cuda")
+    ids = torch.full((running_bs,), -7, dtype=torch.int32, device="cuda")
+    anchor_positions = torch.full((running_bs,), -7, dtype=torch.int64, device="cuda")
+    _stage_anchors_kernel[(running_bs,)](
+        ids, anchor_positions, next_ids, positions, rows, 4, vocab_max
+    )
+    assert ids.tolist() == [5, 0, 99, 7, 7, 7]
+    assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]

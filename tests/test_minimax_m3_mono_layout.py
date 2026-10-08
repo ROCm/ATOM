@@ -9,7 +9,6 @@ import pytest
 
 from atom.models.minimax_m3.mono import layout
 from atom.models.minimax_m3.mono.config import (
-    BLOCKS,
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
@@ -17,6 +16,7 @@ from atom.models.minimax_m3.mono.config import (
     TOP_K,
     IndexHeads,
 )
+from atom.mono.plan.execution import BLOCKS
 
 TOKEN_COUNTS = range(1, MAX_TOKENS + 1)
 

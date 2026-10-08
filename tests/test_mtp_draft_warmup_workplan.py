@@ -61,15 +61,10 @@ def _fake_proposer(num_attention_heads, *, fused, returns_slots=False):
             out["slot_mapping"] = torch.tensor([11, 12, 13], dtype=torch.int32)
         return out
 
-    def publish_schedule(attn_metadata, running_bs, qlen):
-        # Must see the plan `prepare_mtp_decode` just installed.
-        calls.append({"publish": attn_metadata.work_indptr, "qlen": qlen})
-
     builder = types.SimpleNamespace(
         num_attention_heads=num_attention_heads,
         fuse_mtp_decode_position_update=fused,
         prepare_mtp_decode=prepare_mtp_decode,
-        _publish_indexer_fp4_decode_schedule=publish_schedule,
     )
     proposer = types.SimpleNamespace(
         _share_mtp_indices=False,
@@ -111,17 +106,15 @@ def test_step_warmup_installs_draft_work_plan(
     attn_metadata, _ = _warm_one_size(proposer)
 
     # Same call `propose` makes at step 0, mirroring its only_update rule.
-    prepare, publish = calls
+    (prepare,) = calls
     assert prepare["bs"] == 3
     assert prepare["only_update"] is expect_update
     assert prepare["max_seqlen_q"] == expect_q
     assert prepare["num_reject_tokens"].shape == (3,)
     assert not prepare["num_reject_tokens"].any()
-    # The target's plan is replaced by the draft's, before the schedule
-    # publish that follows it in `propose`.
+    # The target's plan is replaced by the draft's.
     assert attn_metadata.work_indptr == "draft-plan"
     assert attn_metadata.work_info_set == "draft-info"
-    assert publish == {"publish": "draft-plan", "qlen": 1}
 
 
 def test_step_warmup_advances_like_propose_fused():
