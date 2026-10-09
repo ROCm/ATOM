@@ -722,6 +722,23 @@ def _v41_scheduled_batch(snapshot, slot_allocator):
     per-request arrays.
     """
     slots, _reset = slot_allocator.assign(snapshot.req_ids, snapshot.num_computed)
+    if len(set(slots.tolist())) != len(slots):
+        # vLLM's warmup and capture batches repeat one placeholder request id
+        # across every row. The allocator is keyed on that id, so it hands all
+        # of them the same slot, and `begin_step` refuses the batch -- STATE is
+        # per in-flight request and two rows cannot share one.
+        #
+        # A repeat identifies the synthetic batch without asking vLLM which
+        # phase this is: it never schedules one request twice in a step, so no
+        # real batch can produce one. Give those rows distinct slots and leave
+        # them on the serving pool. Routing them to the scratch cache instead
+        # would bake the scratch addresses into the graph being captured.
+        if len(slots) > slot_allocator.num_slots:
+            raise ValueError(
+                f"DeepSeek-V4.1 warmup batch has {len(slots)} rows and only "
+                f"{slot_allocator.num_slots} STATE slots exist"
+            )
+        slots = np.arange(len(slots), dtype=np.int32)
     return SimpleNamespace(
         is_dummy_run=False,
         req_ids=snapshot.req_ids,
