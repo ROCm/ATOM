@@ -29,6 +29,13 @@ from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.fp4_layout import (
+    Fp4BackendKind,
+    MXScaleLayout,
+    decode_fp4_backend_layout_code,
+    resolve_current_fp4_backend_spec,
+    to_mxfp4_scale_layout,
+)
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -163,6 +170,7 @@ def gemm_a4w4_quant_fake(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    backend_layout_code: int,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -178,10 +186,25 @@ def gemm_a4w4_quant(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    backend_layout_code: int,
 ) -> torch.Tensor:
+    if params_dtype == dtypes.fp4x2:
+        backend_kind, activation_scale_layout, weight_scale_layout = (
+            decode_fp4_backend_layout_code(backend_layout_code)
+        )
+    else:
+        # Preserve the pre-existing non-MXFP4/per_1x32 behavior. These values
+        # are not consumed outside the MXFP4 branches.
+        backend_kind = Fp4BackendKind.DEFAULT_AITER
+        activation_scale_layout = MXScaleLayout.AITER_E8M0
+        weight_scale_layout = MXScaleLayout.AITER_E8M0
+
     # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
     # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
-    if params_dtype == dtypes.fp4x2 and use_fp4_non_shuffle_triton_gemm():
+    if (
+        params_dtype == dtypes.fp4x2
+        and backend_kind == Fp4BackendKind.TRITON_NONSHUFFLE
+    ):
         if gemm_afp4wfp4 is None:
             raise RuntimeError(
                 "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
@@ -192,7 +215,7 @@ def gemm_a4w4_quant(
                 x,
                 quant_dtype=params_dtype,
                 scale=input_scale,
-                shuffle=False,
+                scale_layout=activation_scale_layout,
             )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
@@ -209,6 +232,8 @@ def gemm_a4w4_quant(
             dtype=otype,
             device=x.device,
         )
+        # This legacy Triton entry point has a fixed row-major scale ABI; the
+        # explicit backend code above rejects every other layout.
         y = gemm_afp4wfp4(
             x.view(torch.uint8),
             weight.view(torch.uint8),
@@ -221,10 +246,13 @@ def gemm_a4w4_quant(
     # and the non-shuffle path is disabled. This expects preshuffled weights.
     elif (
         params_dtype == dtypes.fp4x2
-        and use_triton_gemm()
-        and not use_fp4_non_shuffle_triton_gemm()
-        and gemm_afp4wfp4_preshuffle is not None
+        and backend_kind == Fp4BackendKind.TRITON_PRESHUFFLE
     ):
+        if gemm_afp4wfp4_preshuffle is None:
+            raise RuntimeError(
+                "ATOM_USE_TRITON_GEMM=1 requires "
+                "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
+            )
         m, _ = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
@@ -242,61 +270,64 @@ def gemm_a4w4_quant(
             x, x_scale = quant_func(
                 x,
                 quant_dtype=params_dtype,
-                shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
+                scale_layout=activation_scale_layout,
             )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
             x = x.view(torch.float4_e2m1fn_x2)
 
-        if m >= MXFP4_QUANT_BLOCK_SIZE:
-            x_scale = x_scale.view(torch.uint8).view(
-                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
-            )
-        else:
-            x_scale = x_scale[:m, ...].view(torch.uint8)
-
         y = gemm_afp4wfp4_preshuffle(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
-            x_scale,
-            weight_scale.view(torch.uint8).view(
-                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
-            ),
+            x_scale.view(torch.uint8),
+            weight_scale.view(torch.uint8),
             y=y,
+            x_scale_layout=activation_scale_layout,
+            w_scale_layout=weight_scale_layout,
         )
     # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
     # and use the backend ASM implementation.
     else:
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
-            x, x_scale = quant_func(
-                x,
-                quant_dtype=params_dtype,
-                scale=input_scale,
-                shuffle=True,
-            )
+            if params_dtype == dtypes.fp4x2:
+                x, x_scale = quant_func(
+                    x,
+                    quant_dtype=params_dtype,
+                    scale=input_scale,
+                    scale_layout=activation_scale_layout,
+                )
+            else:
+                # Preserve the legacy MXFP8/non-FP4 per_1x32 call exactly.
+                x, x_scale = quant_func(
+                    x,
+                    quant_dtype=params_dtype,
+                    scale=input_scale,
+                    shuffle=True,
+                )
         else:
             x_scale = x_scale.view(torch.float8_e8m0fnu)
             x = x.view(torch.float4_e2m1fn_x2)
 
         m = x.view(-1, x.size(-1)).shape[0]
-        y = torch.empty(
-            (
-                (m + MXFP4_QUANT_BLOCK_SIZE - 1)
-                // MXFP4_QUANT_BLOCK_SIZE
-                * MXFP4_QUANT_BLOCK_SIZE,
-                output_size,
-            ),
-            dtype=otype,
-            device=x.device,
-        )
-        y = gemm_a4w4(
-            x,
-            weight,
-            x_scale,
-            weight_scale,
-            y,
-        )
+        if params_dtype == dtypes.fp4x2:
+            y = gemm_a4w4(
+                x,
+                weight,
+                x_scale,
+                weight_scale,
+                dtype=otype,
+                a_scale_layout=activation_scale_layout,
+                b_scale_layout=weight_scale_layout,
+            )
+        else:
+            y = gemm_a4w4(
+                x,
+                weight,
+                x_scale,
+                weight_scale,
+                dtype=otype,
+            )
 
     return y[:m, ...]
 
@@ -656,6 +687,9 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        # Cached contract for every MXFP4 forward. It is refreshed once after
+        # online quantization at load time, because that pass can change dtype.
+        self.fp4_backend_spec = resolve_current_fp4_backend_spec(params_dtype)
         # E8M0 rather than FP32 128x128 block scales, for the weight and the
         # activation quantized for it alike (QuantizationConfig decides).
         self.blockscale_e8m0_scale = (
@@ -1163,6 +1197,9 @@ class LinearBase(nn.Module):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
             self.online_quantize_weight()
+        # online_quantize_weight may have changed params_dtype. Resolve the
+        # final consumer exactly once before transforming checkpoint scales.
+        self.fp4_backend_spec = resolve_current_fp4_backend_spec(self.params_dtype)
         if self.params_dtype == NVFP4_DTYPE:
             raise RuntimeError(
                 f"{self.prefix}: NVFP4 weights were not converted to MXFP4 by "
@@ -1225,32 +1262,46 @@ class LinearBase(nn.Module):
             w_q, w_s = self.quant_func(
                 self.weight.data,
                 quant_dtype=self.params_dtype,
-                shuffle=False,
+                scale_layout=MXScaleLayout.ROW_MAJOR,
             )
             self.weight.data = w_q
             self.weight_scale = atom_parameter(w_s)
             # Only quantized 2D GEMM weights use aiter's preshuffle layout.
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
-            if self.weight.dim() == 2 and not use_fp4_non_shuffle_triton_gemm():
+            if (
+                self.weight.dim() == 2
+                and self.fp4_backend_spec.kind != Fp4BackendKind.TRITON_NONSHUFFLE
+            ):
                 shuffle_weights(self.weight)
-            # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
-            need_shuffle = weight_is_stored_preshuffled(
-                self.quant_type,
-                self.params_dtype,
-                needs_preshuffled_weight=getattr(
-                    self, "needs_preshuffled_weight", False
-                ),
-            )
+            if self.fp4_backend_spec is not None:
+                need_shuffle = (
+                    self.fp4_backend_spec.kind != Fp4BackendKind.TRITON_NONSHUFFLE
+                )
+            else:
+                need_shuffle = weight_is_stored_preshuffled(
+                    self.quant_type,
+                    self.params_dtype,
+                    needs_preshuffled_weight=getattr(
+                        self, "needs_preshuffled_weight", False
+                    ),
+                )
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
-                # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # shuffle weight scale once so no reshuffling for every gemm
-        if self.quant_type.value == QuantType.per_1x32.value and (
-            self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
+        # Convert a checkpoint/online-quant row-major scale exactly once, so no
+        # layout transform is left in the GEMM hot path.
+        if (
+            self.quant_type.value == QuantType.per_1x32.value
+            and self.fp4_backend_spec is not None
         ):
+            self.weight_scale.data = to_mxfp4_scale_layout(
+                self.weight_scale.data,
+                self.fp4_backend_spec.weight_scale_layout,
+            )
+        elif self.quant_type.value == QuantType.per_1x32.value:
+            # Preserve MXFP8 and legacy non-FP4 per_1x32 behavior.
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
@@ -1490,6 +1541,11 @@ class LinearBase(nn.Module):
                     self.params_dtype,
                     getattr(self, "input_scale", None),
                     self.output_size,
+                    (
+                        self.fp4_backend_spec.backend_layout_code
+                        if self.fp4_backend_spec is not None
+                        else -1
+                    ),
                 )
                 if self.bias is not None:
                     y += self.bias

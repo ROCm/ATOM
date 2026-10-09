@@ -44,8 +44,6 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    use_fp4_non_shuffle_triton_gemm,
-    use_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -175,6 +173,20 @@ def _effective_layer_quant(
         if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
             cfg = online_cfg
     return cfg.quant_type, cfg.quant_dtype
+
+
+def _should_fuse_routed_norm_quant(
+    latent_moe_use_norm: bool,
+    quant_type: QuantType,
+    quant_dtype: torch.dtype | None,
+) -> bool:
+    return latent_moe_use_norm and (
+        (quant_type.value == QuantType.per_1x32.value and quant_dtype == dtypes.fp4x2)
+        or (
+            quant_type.value in (QuantType.per_1x128.value, QuantType.per_Token.value)
+            and quant_dtype == dtypes.fp8
+        )
+    )
 
 
 class SituAndMul(nn.Module):
@@ -400,23 +412,12 @@ class KimiSparseMoeBlock(nn.Module):
                 quant_config, up_proj_prefix
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
-            # AITER RMSNorm+quant emits the activation layout consumed directly by
-            # the routed up-projection. FP4 Triton paths choose an M-dependent
-            # shuffled/non-shuffled scale layout, so keep those on their existing
-            # standalone quant path until the fused kernel supports both layouts.
-            fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
-                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
-            )
-            self.fuse_routed_norm_quant = latent_moe_use_norm and (
-                (
-                    up_proj_quant_type == QuantType.per_1x32
-                    and up_proj_quant_dtype == dtypes.fp4x2
-                    and not fp4_triton_active
-                )
-                or (
-                    up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)
-                    and up_proj_quant_dtype == dtypes.fp8
-                )
+            # AITER RMSNorm+quant emits the explicit activation-scale layout
+            # cached by the routed up-projection's backend contract.
+            self.fuse_routed_norm_quant = _should_fuse_routed_norm_quant(
+                latent_moe_use_norm,
+                up_proj_quant_type,
+                up_proj_quant_dtype,
             )
             self.routed_expert_norm = (
                 RMSNorm(
@@ -425,6 +426,11 @@ class KimiSparseMoeBlock(nn.Module):
                     fused_quant=self.fuse_routed_norm_quant,
                     quant_config=quant_config,
                     prefix=up_proj_prefix,
+                    mxfp4_scale_layout=(
+                        self.routed_expert_up_proj.fp4_backend_spec.activation_scale_layout
+                        if self.routed_expert_up_proj.fp4_backend_spec is not None
+                        else None
+                    ),
                 )
                 if latent_moe_use_norm
                 else None
@@ -833,14 +839,12 @@ class KimiFullAttention(nn.Module):
         )
         q_shuffle = False
         q_scale_shuffle_padding = False
-        if self.qknorm_dtype == dtypes.fp4x2:
-            from atom.model_ops.linear import use_triton_gemm
-            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
-
-            if not use_triton_gemm():
-                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
-                    q_c.shape[0]
-                )
+        q_backend = self.q_b_proj.fp4_backend_spec
+        mxfp4_scale_layout = (
+            q_backend.activation_scale_layout
+            if self.qknorm_dtype == dtypes.fp4x2 and q_backend is not None
+            else None
+        )
         (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
             q_c,
             self.q_a_layernorm.weight,
@@ -856,6 +860,7 @@ class KimiFullAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            mxfp4_scale_layout=mxfp4_scale_layout,
         )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
