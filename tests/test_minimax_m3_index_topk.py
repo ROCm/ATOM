@@ -90,6 +90,68 @@ class TestPackableBound:
         assert 0xFFFE * SPARSE_BLOCK_SIZE > 8_000_000
 
 
+class TestTheAiterDependencyIsDeferred:
+    """A missing decode kernel must not break IMPORT, only use.
+
+    The FlyDSL M3 index-score kernels are newer than the aiter ATOM's image
+    builds (`AITER_COMMIT: HEAD` -> aiter main), so on an aiter that predates
+    them these symbols are simply absent. That has to stay contained: this
+    module is imported at module scope by `sparse_attn`, which is imported at
+    module scope by `atom/plugin/vllm/attention/backend.py` for
+    `SPARSE_BLOCK_SIZE` -- and that module carries the MLA prefill backends.
+    A module-scope `from aiter.ops.flydsl import minimax_m3_*` would therefore
+    take down far more than MiniMax-M3.
+
+    Decode still has no fallback, so using it must fail loudly; these two tests
+    pin both halves of that.
+    """
+
+    def test_the_symbols_are_not_imported_at_module_scope(self):
+        import inspect
+
+        body = inspect.getsource(m)
+        offenders = [
+            line
+            for line in body.splitlines()
+            if line.startswith(("from aiter", "import aiter"))
+            and "minimax_m3_index_score" in line
+        ]
+        assert not offenders, f"module-scope aiter M3 import reintroduced: {offenders}"
+
+    def test_using_it_without_the_kernel_names_the_dependency(self, monkeypatch):
+        import sys
+        import types
+
+        real = sys.modules["aiter.ops.flydsl"]
+        stub = types.ModuleType("aiter.ops.flydsl")
+        # `__getattr__` is excluded deliberately, not incidentally: aiter's
+        # flydsl package resolves its kernels through a module-level lazy
+        # loader, so copying it would hand the stub the very symbols this test
+        # is pretending do not exist.
+        stub.__dict__.update(
+            {
+                k: v
+                for k, v in real.__dict__.items()
+                if "minimax" not in k.lower() and k not in ("__getattr__", "__dir__")
+            }
+        )
+        # Both, and the attribute is the one that matters: the resolver says
+        # `from aiter.ops import flydsl`, which reads the attribute off the
+        # parent package rather than going through sys.modules.
+        monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", stub)
+        monkeypatch.setattr("aiter.ops.flydsl", stub)
+        m._flydsl.cache_clear()
+        m.index_score_config.cache_clear()
+        try:
+            with pytest.raises(RuntimeError, match="aiter#5626"):
+                m.index_score_config()
+        finally:
+            # Both caches memoize across tests; a stubbed entry left behind
+            # would fail every later GPU test in this file.
+            m._flydsl.cache_clear()
+            m.index_score_config.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Kernel behaviour. Needs a GPU and triton.
 # ---------------------------------------------------------------------------

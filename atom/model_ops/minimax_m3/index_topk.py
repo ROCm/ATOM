@@ -46,17 +46,34 @@ except ImportError:  # pragma: no cover - aiter is optional at import time
     topk_per_row_small_k = None
     topk_per_row_small_k_supported = None
 
+
 # aiter's MFMA block-score kernel: max-over-128-tokens block scoring on the
 # matrix cores, with a packed work map so a ragged batch does not pay for its
-# holes. This is the ONLY decode scorer -- the Triton one it replaced is gone,
-# so the import is hard on purpose. A missing symbol here should be an
-# ImportError at module load, not a silent downgrade discovered 57 layers into a
-# decode step.
-from aiter.ops.flydsl import (
-    MiniMaxM3IndexScoreConfig,
-    minimax_m3_index_score_alloc,
-    minimax_m3_index_score_flydsl,
-)
+# holes. This is the ONLY decode scorer -- the Triton one it replaced is gone --
+# so a missing kernel is fatal to M3 decode and this must not degrade silently.
+#
+# Resolved on FIRST USE rather than at import, though, because an ImportError
+# here is not contained to M3: `sparse_attn` imports this module at module
+# scope, `atom/plugin/vllm/attention/backend.py` imports `sparse_attn` for
+# `SPARSE_BLOCK_SIZE`, and that module carries the MLA prefill backends. A hard
+# import would take all of them down on an aiter that merely predates the
+# kernel. Deferring keeps the blast radius at "M3 decode raises, with a message
+# that names what to install".
+@functools.cache
+def _flydsl(name):
+    """One aiter decode-scorer symbol, or a RuntimeError naming the dependency."""
+    from aiter.ops import flydsl
+
+    try:
+        return getattr(flydsl, name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"MiniMax-M3 decode needs aiter.ops.flydsl.{name}, which this aiter "
+            f"does not carry. The decode index scorer has no Triton fallback, so "
+            f"this is not recoverable at runtime -- install an aiter that "
+            f"includes the FlyDSL M3 index-score kernels (ROCm/aiter#5626)."
+        ) from exc
+
 
 # aiter's MFMA prefill block-score kernel. Optional, unlike the decode one: it
 # is newer than the aiter ATOM pins, and an aiter without it is still a working
@@ -313,7 +330,7 @@ def index_score_config(cp_world=1, cp_rank=0):
     and the score call identically -- they re-derive the same per-request local
     block count from it -- so it is built here rather than at each site.
     """
-    return MiniMaxM3IndexScoreConfig(cp_world=cp_world, cp_rank=cp_rank)
+    return _flydsl("MiniMaxM3IndexScoreConfig")(cp_world=cp_world, cp_rank=cp_rank)
 
 
 def build_index_score_work_map(
@@ -341,9 +358,7 @@ def build_index_score_work_map(
     """
     if seq_lens.shape[0] <= 0:
         return None
-    from aiter.ops.flydsl import minimax_m3_index_score_work_map
-
-    return minimax_m3_index_score_work_map(
+    return _flydsl("minimax_m3_index_score_work_map")(
         seq_lens,
         max_block,
         max_query_len,
@@ -362,9 +377,7 @@ def index_score_work_map_size(
     """
     if batch <= 0:
         return 0
-    from aiter.ops.flydsl import minimax_m3_index_score_work_map_size
-
-    return minimax_m3_index_score_work_map_size(
+    return _flydsl("minimax_m3_index_score_work_map_size")(
         batch,
         max_block,
         max_query_len,
@@ -1366,13 +1379,13 @@ def decode_index_score(
     # nothing else.
     score = out
     if score is None:
-        score = minimax_m3_index_score_alloc(
+        score = _flydsl("minimax_m3_index_score_alloc")(
             batch, max_query_len, num_idx_heads, max_block, idx_q.device
         )
     # sm_scale passes through as-is: the kernel applies `sm_scale * log2(e)`
     # itself, validated against an independent torch oracle in aiter's
     # op_tests/test_flydsl_minimax_m3_index_score.py.
-    minimax_m3_index_score_flydsl(
+    _flydsl("minimax_m3_index_score_flydsl")(
         idx_q,
         index_kv_cache,
         block_table,
