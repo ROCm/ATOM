@@ -257,6 +257,9 @@ EOF
     -e FLYDSL_RUNTIME_CACHE_DIR="/tmp/atomesh-cache-${JOB_ID}-${rank}/flydsl"
     -e NCCL_NET_PLUGIN=none
     -e NCCL_IB_HCA=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+    # MoRI ignores NCCL_IB_*; give it the same ionic HCAs and RoCE GID index.
+    -e MORI_RDMA_DEVICES=ionic_0,ionic_1,ionic_2,ionic_3,ionic_4,ionic_5,ionic_6,ionic_7
+    -e MORI_IB_GID_INDEX="${NCCL_IB_GID_INDEX}"
     -e NCCL_CROSS_NIC=0
     -e NCCL_PXN_DISABLE=0
     -e NCCL_NET_DISABLE_INTRA=1
@@ -463,17 +466,15 @@ if [[ "${1:-}" == "--spur-worker" ]]; then
 fi
 
 if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
-  # Spur sbatch runs the batch script only on the first allocated node; the
-  # other nodes run placeholders until an srun step dispatches their workers.
-  # Use an explicit worker argument because the batch shell also has rank 0
-  # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
-  # environment, including SPUR_PEER_NODES in allocation order.
-  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
-  exec srun \
-    --nodes="${NUM_NODES}" \
-    --ntasks="${NUM_NODES}" \
-    --ntasks-per-node=1 \
-    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
+  # Unlike Slurm, Spur dispatches the batch body to every allocated node and
+  # gives each one its own SPUR_TASK_OFFSET, so each node runs its own rank in
+  # place and no step fan-out is needed. An srun here would instead start one
+  # step per node: the duplicate workers of a rank collide on the container
+  # name and the loser exits 125. Letting only the first node dispatch is no
+  # better, because Spur ends the job as soon as any batch instance exits.
+  echo "=== Spur job ${JOB_ID}: rank ${SPUR_TASK_OFFSET:-0}/${NUM_NODES} running in place ==="
+  run_spur_job
+  exit $?
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")

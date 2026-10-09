@@ -137,6 +137,22 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
         return result
 
+    def run_all_ranks(self, *args, expected_rc=0, **env):
+        """Spur dispatches the batch body to every allocated node, each with its
+        own SPUR_TASK_OFFSET, so an N-node job is N invocations."""
+        nodes = int(env.get("NUM_NODES", self.env["NUM_NODES"]))
+        results = []
+        for rank in range(nodes):
+            rank_rc = expected_rc
+            if isinstance(expected_rc, (list, tuple)):
+                rank_rc = expected_rc[rank]
+            results.append(
+                self.run_job(
+                    *args, expected_rc=rank_rc, **{**env, "SPUR_TASK_OFFSET": str(rank)}
+                )
+            )
+        return results
+
     def docker_calls(self, rank):
         return [
             json.loads(line)
@@ -144,7 +160,7 @@ class SpurDispatchTest(unittest.TestCase):
         ]
 
     def test_eval_only_pulls_image_and_runs_only_eval_on_both_workers(self):
-        self.run_job(EVAL_ONLY="true", RUN_EVAL="true", EVAL_TASK="gsm8k")
+        self.run_all_ranks(EVAL_ONLY="true", RUN_EVAL="true", EVAL_TASK="gsm8k")
         for rank in range(2):
             calls = self.docker_calls(rank)
             self.assertEqual(calls.count(["pull", "test-image"]), 1)
@@ -155,7 +171,7 @@ class SpurDispatchTest(unittest.TestCase):
 
     def test_eval_only_rejects_disabled_eval(self):
         self.run_job(EVAL_ONLY="true", RUN_EVAL="false", expected_rc=2)
-        self.assertFalse((self.root / "dispatch.json").exists())
+        self.assertFalse(list(self.root.glob("docker-*.jsonl")))
 
     def test_eval_only_rejects_invalid_port_offset(self):
         self.run_job(
@@ -164,13 +180,10 @@ class SpurDispatchTest(unittest.TestCase):
             ATOMESH_RESTART_PORT_OFFSET="invalid",
             expected_rc=2,
         )
-        self.assertFalse((self.root / "dispatch.json").exists())
+        self.assertFalse(list(self.root.glob("docker-*.jsonl")))
 
-    def test_batch_dispatches_both_workers_and_preserves_topology(self):
-        self.run_job()
-        dispatch = json.loads((self.root / "dispatch.json").read_text())
-        for option in ("--nodes=2", "--ntasks=2", "--ntasks-per-node=1"):
-            self.assertIn(option, dispatch)
+    def test_each_node_runs_its_own_rank_and_preserves_topology(self):
+        self.run_all_ranks()
         for rank in range(2):
             calls = self.docker_calls(rank)
             runs = [call for call in calls if call[0] == "run"]
@@ -181,6 +194,10 @@ class SpurDispatchTest(unittest.TestCase):
             interface = "eno0" if rank == 0 else "enp5s0"
             self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
+            # MoRI reads neither NCCL_IB_HCA nor NCCL_IB_GID_INDEX.
+            hcas = ",".join(f"ionic_{index}" for index in range(8))
+            self.assertIn(f"MORI_RDMA_DEVICES={hcas}", runs[0])
+            self.assertIn("MORI_IB_GID_INDEX=1", runs[0])
             self.assertIn(["rm", "-f", f"atomesh-test-cell-42-{rank}"], calls)
             self.assertEqual((self.run_dir / f"rank-rc-{rank}").read_text(), "0\n")
             result = json.loads(
@@ -189,6 +206,16 @@ class SpurDispatchTest(unittest.TestCase):
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["run_token"], "test-submission")
 
+    def test_batch_never_fans_out_with_srun(self):
+        # Spur already placed the batch body on every node. An srun step here
+        # would add a second worker per rank, and the duplicates collide on the
+        # container name; the loser exits 125 and fails the job.
+        self.run_job(SPUR_TASK_OFFSET="1")
+        self.assertFalse((self.root / "dispatch.json").exists())
+        self.assertFalse((self.root / "docker-0.jsonl").exists())
+        run = next(call for call in self.docker_calls(1) if call[0] == "run")
+        self.assertIn("NODE_RANK=1", run)
+
     def test_worker_does_not_dispatch_again(self):
         self.run_job("--spur-worker", SPUR_TASK_OFFSET="1")
         self.assertFalse((self.root / "dispatch.json").exists())
@@ -196,15 +223,11 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertEqual((self.run_dir / "rank-rc-1").read_text(), "0\n")
 
     def test_decode_failure_reaches_batch_exit_and_rank_status(self):
-        self.run_job(expected_rc=7, FAIL_RANK="1")
+        self.run_all_ranks(expected_rc=[0, 7], FAIL_RANK="1")
         self.assertEqual((self.run_dir / "rank-rc-1").read_text(), "7\n")
         result = json.loads((self.run_dir / "rank-workload-1.json").read_text())
         self.assertEqual(result["status"], "running")
         self.assertIn(["rm", "-f", "atomesh-test-cell-42-1"], self.docker_calls(1))
-
-    def test_dispatch_failure_is_not_reported_as_success(self):
-        self.run_job(expected_rc=9, DISPATCH_RC="9")
-        self.assertFalse((self.root / "docker-0.jsonl").exists())
 
     def test_large_container_output_stays_in_shared_log(self):
         size = 33 * 1024 * 1024
@@ -298,7 +321,7 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "2\n")
 
     def test_benchmark_and_eval_phases_run_on_each_worker(self):
-        self.run_job(
+        self.run_all_ranks(
             BENCHMARK_KIND="aiperf_agentic", RUN_EVAL="true", EVAL_TASK="gsm8k"
         )
         for rank in range(2):
@@ -313,7 +336,7 @@ class SpurDispatchTest(unittest.TestCase):
                 self.assertIn(f"MORI_SOCKET_IFNAME={interface}", run)
 
     def test_eval_failure_after_benchmark_does_not_publish_completion(self):
-        self.run_job(
+        self.run_all_ranks(
             BENCHMARK_KIND="aiperf_agentic",
             RUN_EVAL="true",
             EVAL_TASK="gsm8k",
