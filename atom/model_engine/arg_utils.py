@@ -510,7 +510,7 @@ class EngineArgs:
             action="store_true",
             default=False,
             help=(
-                "DeepSeek-V4.1: in eager prefill, run the layers after the last "
+                "DeepSeek-V4.1: in prefill, run the layers after the last "
                 "KV-source layer on each request's last window-ring rows only "
                 "(window + speculative tokens). Faster prefill; not numerically "
                 "equivalent to a full prefill. Same as SGLang's "

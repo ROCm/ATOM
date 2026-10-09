@@ -20,6 +20,9 @@ through end-to-end `lm_eval` evaluation.
 - `model_ops/engram/` prepares Engram rows after final GPU token IDs and restored
   state are available. There is no separate committed history map. Its host half
   (`mapping`, `tables`, `host`) imports without Triton; `device/` does not.
+- `runtime.py` compiles the layers as two graphs split after the last KV-source
+  layer (`_EarlyLayers`, `_LateLayers`); `bounded_replay.py` builds the late
+  layers' tail step for decoder SWA bounded replay (below).
 - Scheduler consumes the existing generic `StateTransfer.copy` capability.
   The only scheduling change fixes cancellation of requests with no sampled
   output, including a middle prefill chunk and the first deferred step.
@@ -136,3 +139,22 @@ The [chat and tool protocol](deepseek_v41_protocol.md) and
 [vision and multimodal chunking](deepseek_v41_vision.md) are enabled
 independently of speculation. Host Engram lookup still reads final GPU IDs on
 the CPU; moving the lookup to HBM and fusing it further is future work.
+
+## Decoder SWA bounded replay
+
+`--enable-decoder-swa-bounded-replay` (off by default) is SGLang's flag of the
+same name and vLLM's `--swa-bounded-replay`. Layers 21..39 own no global KV,
+only their sliding-window rings, so after a prefill only each request's last
+ring of rows in them is ever read. A prefill therefore runs the early graph on
+every row and the late graph on each request's last `ring_slots` rows (window +
+speculative tokens, 133 with five DSpark tokens), with a tail `BatchStep`
+whose `swa_replay_start` keeps the index build from reading window rows the
+late layers never wrote. Decode, warmup, draft, TBO, image and padded steps run
+both graphs on every row.
+
+Accuracy: the tail's first rows see a window truncated at the tail start in
+layer 21, and each later layer carries that at most one window further, so the
+last token's logits and the ring rows decode reads are close to, not equal to,
+a full prefill's. This is the approximation SGLang and vLLM make; it is why the
+flag is off by default. Measured on V4.1-Flash: GSM8K and long-context
+retrieval unchanged within run-to-run noise.

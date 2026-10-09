@@ -852,6 +852,15 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
+        if (
+            config.enable_decoder_swa_bounded_replay
+            and hf_config.architectures[0] != "DeepseekV41ForCausalLM"
+        ):
+            logger.warning(
+                "--enable-decoder-swa-bounded-replay is ignored: only "
+                "DeepSeek-V4.1 supports it, not %s.",
+                hf_config.architectures[0],
+            )
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(

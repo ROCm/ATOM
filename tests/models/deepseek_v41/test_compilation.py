@@ -120,7 +120,10 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
 
     monkeypatch.setattr(VllmBackend, "__call__", record_backend)
     config = SimpleNamespace(
-        hf_config=SimpleNamespace(hc_mult=4, hidden_size=8),
+        # no KV-source layers: the early graph holds the one layer, the late
+        # one only the collapse and the Engram join
+        hf_config=SimpleNamespace(hc_mult=4, hidden_size=8, num_hidden_layers=1),
+        enable_decoder_swa_bounded_replay=False,
         max_model_len=32,
         online_quant_config=None,
         compilation_config=CompilationConfig(
@@ -195,7 +198,9 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
             assert not step.selected
             assert embeddings.events == ([] if empty else ["stage", "join"])
     if level == 3:
-        assert len(calls) == len(model.compiled_codes) == 1
+        # the early and late layer graphs, each compiled once
+        assert len(calls) == 2
+        assert len(model.early.compiled_codes) == len(model.late.compiled_codes) == 1
     else:
         assert not calls
     assert tuple(model.state_dict()) == names == ("embed.weight",)

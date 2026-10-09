@@ -135,6 +135,21 @@ def test_lmcache_mp_is_the_only_kv_transfer_admitted():
         )
 
 
+
+def _attach_uncompiled_stages(model):
+    """The runtime model's two compiled layer stages, built bare and run
+    uncompiled, for a model assembled without its constructor."""
+    from atom.models.deepseek_v41 import runtime
+
+    model.replay, model.aux_rows, model.late_specs = False, [], []
+    for name, cls in (("early", runtime._EarlyLayers), ("late", runtime._LateLayers)):
+        stage = cls.__new__(cls)
+        torch.nn.Module.__init__(stage)
+        stage.do_not_compile = True
+        stage.__dict__["owner"] = model
+        stage.first = stage.last = len(model.layers)
+        setattr(model, name, stage)
+
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
@@ -160,6 +175,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_stages(model)
     # No layers are constructed: a step with no requests must not reach one.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert output.shape == (8, 64) and output.count_nonzero() == 0
@@ -209,6 +225,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_stages(model)
     model(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
     assert seen == {name: {} for name in memos}
 
