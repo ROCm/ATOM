@@ -52,6 +52,7 @@ from atom.config import (
     qrep_for_step,
 )
 from atom.distributed.dcp_utils import (
+    NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
     get_dcp_group,
@@ -912,6 +913,7 @@ class MLAAttention(nn.Module):
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
                 self.dcp_persistent_supported,
+                get_current_atom_config().max_num_batched_tokens,
             )
             (
                 self.dcp_sparse_prefill_persistent,
@@ -2282,6 +2284,12 @@ class MLAAttention(nn.Module):
                     "one its gathered query width was padded for; update "
                     "mla_dcp_sparse_prefill_is_persistent alongside this gate."
                 )
+                nonps = dcp_sparse and self.dcp_sparse_prefill_nonps
+                assert not nonps or q.shape[0] <= NONPS_MAX_Q_ROWS, (
+                    f"non-persistent DCP sparse prefill got total_q={q.shape[0]} "
+                    f"q rows, more than the {NONPS_MAX_Q_ROWS} it takes; the "
+                    "max_num_batched_tokens gate should have kept it persistent."
+                )
                 if sparse_dcp_persistent and self.owns_sparse_indexer:
                     self._rebuild_sparse_dcp_persistent_metadata(
                         attn_metadata,
@@ -2311,8 +2319,7 @@ class MLAAttention(nn.Module):
                     max_q_len,
                     page_size=page_size,
                     num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
-                        dcp_sparse and self.dcp_sparse_prefill_nonps,
-                        self.dcp_world_size,
+                        nonps, self.dcp_world_size
                     ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,

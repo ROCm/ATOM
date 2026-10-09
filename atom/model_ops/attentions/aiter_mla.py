@@ -16,6 +16,7 @@ from aiter import (
 )
 
 from atom.distributed.dcp_utils import (
+    NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
@@ -454,8 +455,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.num_attention_heads * self.dcp_world_size,
                 self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
                 dcp_persistent,
+                config.max_num_batched_tokens,
             )
         )
+        if (
+            envs.ATOM_DCP_SPARSE_PREFILL_NONPS
+            and self.is_sparse
+            and config.max_num_batched_tokens > NONPS_MAX_Q_ROWS
+        ):
+            logger.warning(
+                "ATOM_DCP_SPARSE_PREFILL_NONPS ignored: max_num_batched_tokens=%d "
+                "exceeds the %d q rows the non-persistent gqa64 kernel takes; "
+                "DCP sparse prefill stays persistent.",
+                config.max_num_batched_tokens,
+                NONPS_MAX_Q_ROWS,
+            )
         if self.sparse_dcp_metadata_rebuild:
             # persistent_num_heads above is decode's width; sparse prefill
             # rounds differently and can disagree (see
@@ -2297,41 +2311,47 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
         # --- rebuild the sparse-prefill work buffers for the owned queries.
+        #     The non-persistent DCP sparse prefill reads no work plan.
         var = self.model_runner.forward_vars
-        get_mla_metadata_v1(
-            attn_metadata.sparse_cu_seqlens_q,
-            attn_metadata.sparse_kv_indptr,
-            attn_metadata.kv_last_page_lens,
-            self.padded_num_attention_heads,
-            1,  # nhead_kv
-            True,
-            var["sparse_prefill_work_meta_data"],
-            var["sparse_prefill_work_info_set"],
-            var["sparse_prefill_work_indptr"],
-            var["sparse_prefill_reduce_indptr"],
-            var["sparse_prefill_reduce_final_map"],
-            var["sparse_prefill_reduce_partial_map"],
-            page_size=self.block_size,
-            dtype_q=self.dtype_q,
-            dtype_kv=self.dtype_kv,
-            kv_granularity=max(self.block_size, 16),
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=1,
-            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
-        )
-        attn_metadata.sparse_prefill_work_meta_data = var[
-            "sparse_prefill_work_meta_data"
-        ]
-        attn_metadata.sparse_prefill_work_info_set = var["sparse_prefill_work_info_set"]
-        attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
-        attn_metadata.sparse_prefill_reduce_indptr = var["sparse_prefill_reduce_indptr"]
-        attn_metadata.sparse_prefill_reduce_final_map = var[
-            "sparse_prefill_reduce_final_map"
-        ]
-        attn_metadata.sparse_prefill_reduce_partial_map = var[
-            "sparse_prefill_reduce_partial_map"
-        ]
+        if not self.dcp_sparse_prefill_nonps:
+            get_mla_metadata_v1(
+                attn_metadata.sparse_cu_seqlens_q,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.kv_last_page_lens,
+                self.padded_num_attention_heads,
+                1,  # nhead_kv
+                True,
+                var["sparse_prefill_work_meta_data"],
+                var["sparse_prefill_work_info_set"],
+                var["sparse_prefill_work_indptr"],
+                var["sparse_prefill_reduce_indptr"],
+                var["sparse_prefill_reduce_final_map"],
+                var["sparse_prefill_reduce_partial_map"],
+                page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                kv_granularity=max(self.block_size, 16),
+                max_seqlen_qo=1,
+                uni_seqlen_qo=1,
+                fast_mode=1,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+            )
+            attn_metadata.sparse_prefill_work_meta_data = var[
+                "sparse_prefill_work_meta_data"
+            ]
+            attn_metadata.sparse_prefill_work_info_set = var[
+                "sparse_prefill_work_info_set"
+            ]
+            attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
+            attn_metadata.sparse_prefill_reduce_indptr = var[
+                "sparse_prefill_reduce_indptr"
+            ]
+            attn_metadata.sparse_prefill_reduce_final_map = var[
+                "sparse_prefill_reduce_final_map"
+            ]
+            attn_metadata.sparse_prefill_reduce_partial_map = var[
+                "sparse_prefill_reduce_partial_map"
+            ]
 
         # --- owned slot_mapping for the fused q_out kernel in MLAAttention. The
         #     fused MLA kernel that produces q_out also writes k to these slots;

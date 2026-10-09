@@ -36,6 +36,7 @@ runner, and those are the only ones that gate actually runs.
 """
 
 import ast
+import collections
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -953,25 +954,27 @@ def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
 
 
 @pytest.mark.parametrize(
-    "env, dcp, heads, fp8, gfx950, page, expected",
+    "env, dcp, heads, fp8, gfx950, page, mbt, expected",
     [
-        ("1", 4, 64, True, True, "1", True),  # tp4/dcp4: the one shape it serves
-        ("1", 8, 64, True, True, "1", True),  # tp8/dcp8, 8 heads a rank
-        ("0", 4, 64, True, True, "1", False),  # opt-in only
-        ("1", 1, 64, True, True, "1", False),  # no DCP group
-        ("1", 2, 32, True, True, "1", False),  # kernel is gqa64 only
-        ("1", 4, 128, True, True, "1", False),
-        ("1", 4, 64, False, True, "1", False),  # bf16 q/KV
-        ("1", 4, 64, True, False, "1", False),  # not gfx950
-        ("1", 4, 64, True, True, "16", False),  # paged MLA
+        ("1", 4, 64, True, True, "1", 16384, True),  # tp4/dcp4: the one shape it serves
+        ("1", 8, 64, True, True, "1", 16384, True),  # tp8/dcp8, 8 heads a rank
+        ("1", 4, 64, True, True, "1", 32768, True),  # largest step budget it takes
+        ("1", 4, 64, True, True, "1", 65536, False),  # more q rows than it takes
+        ("0", 4, 64, True, True, "1", 16384, False),  # opt-in only
+        ("1", 1, 64, True, True, "1", 16384, False),  # no DCP group
+        ("1", 2, 32, True, True, "1", 16384, False),  # kernel is gqa64 only
+        ("1", 4, 128, True, True, "1", 16384, False),
+        ("1", 4, 64, False, True, "1", 16384, False),  # bf16 q/KV
+        ("1", 4, 64, True, False, "1", 16384, False),  # not gfx950
+        ("1", 4, 64, True, True, "16", 16384, False),  # paged MLA
     ],
 )
 def test_sparse_prefill_nonps_gate(
-    monkeypatch, env, dcp, heads, fp8, gfx950, page, expected
+    monkeypatch, env, dcp, heads, fp8, gfx950, page, mbt, expected
 ):
     monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", env)
     monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
-    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950) is expected
+    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950, mbt) is expected
 
 
 @pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])
@@ -985,12 +988,52 @@ def test_sparse_prefill_nonps_overrides_mode_and_width(persistent, width):
 
 @pytest.mark.parametrize("dcp", [2, 4, 8])
 def test_sparse_prefill_nonps_runs_one_split(dcp):
-    """One split for the non-persistent kernel, which caps total_q * splits at
-    32768 -- a full 16K chunk at the default splits would exceed it."""
+    """One split for the non-persistent kernel, whose multi-split calls need
+    total_q * splits <= 32768 -- a full 16K step at the default splits would
+    exceed it."""
     assert mla_dcp_sparse_prefill_kv_splits(True, dcp) == 1
     assert 16384 * mla_dcp_sparse_prefill_kv_splits(True, dcp) <= 32768
     assert mla_dcp_sparse_prefill_kv_splits(False, dcp) == max(2, 16 // dcp)
     assert 16384 * mla_dcp_sparse_prefill_kv_splits(False, 4) > 32768
+
+
+@pytest.mark.parametrize("nonps, plans", [(True, 0), (False, 1)])
+def test_pcp_reindex_builds_work_plan_only_when_read(monkeypatch, nonps, plans):
+    """Under PCP the owned-query reindex rebuilds the sparse-prefill work plan;
+    the non-persistent kernel reads none, so it must not be built or attached."""
+    try:
+        from atom.distributed import pcp_utils
+        from atom.model_ops.attentions import aiter_mla
+    except ImportError as e:  # aiter/triton absent
+        pytest.skip(f"requires full atom import env: {e}")
+    built = []
+    monkeypatch.setattr(
+        aiter_mla, "get_mla_metadata_v1", lambda *a, **k: built.append(a)
+    )
+    monkeypatch.setattr(aiter_mla, "get_pcp_world_size", lambda: 2)
+    monkeypatch.setattr(pcp_utils, "get_pcp_rank", lambda: 0)
+    builder = SimpleNamespace(
+        device="cpu",
+        index_topk=2048,
+        dcp_sparse_prefill_nonps=nonps,
+        padded_num_attention_heads=64,
+        block_size=1,
+        dtype_q=None,
+        dtype_kv=None,
+        model_runner=SimpleNamespace(forward_vars=collections.defaultdict(object)),
+    )
+    md = SimpleNamespace(
+        cu_seqlen_ks=torch.zeros(4, dtype=torch.int32),
+        cu_seqlen_ke=torch.arange(4, dtype=torch.int32),
+        batch_id_per_q_token=torch.zeros(4, dtype=torch.int32),
+        slot_mapping=torch.arange(4),
+    )
+    aiter_mla.AiterMLAMetadataBuilder._apply_pcp_reindex(
+        builder, md, 4, np.array([1, 2, 3, 4])
+    )
+    assert len(built) == plans
+    assert hasattr(md, "sparse_prefill_work_meta_data") == bool(plans)
+    assert md.sparse_cu_seqlens_q.tolist() == [0, 1, 2]  # rank 0 owns q0, q2
 
 
 def test_gate_reason_is_human_readable():

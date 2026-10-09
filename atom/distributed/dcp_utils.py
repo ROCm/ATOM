@@ -104,13 +104,25 @@ def mla_dcp_sparse_prefill_is_persistent(
     )
 
 
+# Most q rows one non-persistent gqa64 sparse prefill call takes. aiter checks
+# total_q * splits <= 32768 only for multi-split calls (the fp32 partials are
+# addressed with 32-bit offsets); one-split calls past it are untested.
+NONPS_MAX_Q_ROWS = 32768
+
+
 def mla_dcp_sparse_prefill_uses_nonps(
-    dcp_world_size: int, gathered_heads: int, fp8_qkv: bool, is_gfx950: bool
+    dcp_world_size: int,
+    gathered_heads: int,
+    fp8_qkv: bool,
+    is_gfx950: bool,
+    max_num_batched_tokens: int,
 ) -> bool:
     """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
 
     Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1. It needs
     no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
+    Every prefill token of a step is one q row, so a step budget above
+    NONPS_MAX_Q_ROWS stays on the persistent path.
     """
     return (
         envs.ATOM_DCP_SPARSE_PREFILL_NONPS
@@ -119,6 +131,7 @@ def mla_dcp_sparse_prefill_uses_nonps(
         and fp8_qkv
         and is_gfx950
         and envs.ATOM_MLA_PAGE_SIZE <= 1
+        and max_num_batched_tokens <= NONPS_MAX_Q_ROWS
     )
 
 
@@ -136,7 +149,8 @@ def mla_dcp_sparse_prefill_kv_splits(uses_nonps: bool, dcp_world_size: int) -> i
     """KV splits for DCP sparse prefill.
 
     The non-persistent gqa64 kernel runs at one split: it writes O and LSE
-    directly, and it caps total_q * splits at 32768.
+    directly, and its multi-split calls need total_q * splits <= 32768, which
+    a 16K-token step at the default splits exceeds.
     """
     return 1 if uses_nonps else max(2, 16 // max(1, dcp_world_size))
 
