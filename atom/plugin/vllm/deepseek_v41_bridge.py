@@ -806,8 +806,55 @@ def _v41_capture_active() -> bool:
     return bool(BreakableCUDAGraphCapture.is_active())
 
 
+def _v41_live_step_inputs(builder, slot_allocator, input_ids, proxy_layer_name):
+    """This step's batch, read from state the replay path keeps current.
+
+    Read here rather than passed in. `eager_break_during_capture` binds a
+    break's arguments at capture time (weakly, so the cudagraph pool can
+    reclaim them), and `_replay` never calls the model again -- it walks the
+    recorded segments. A break handed a per-step Python object therefore sees
+    the object from the forward that was recorded, on every later step: the
+    batch this was staged for would be the warmup batch for the life of the
+    graph.
+
+    vLLM rebuilds its forward context and the attention metadata on it before
+    each call, outside the captured region, so reading the snapshot through
+    that context is live on replay. The builder and the slot allocator are
+    stable objects whose contents move underneath them, which is what a
+    captured segment needs.
+    """
+    common_attn_metadata = get_deepseek_v41_proxy_metadata_from_vllm_context(
+        proxy_layer_name
+    )
+    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
+    running_tokens = int(input_ids.shape[0]) if input_ids is not None else 0
+    if (
+        snapshot is None
+        or slot_allocator is None
+        or builder.cache is None
+        or snapshot.num_reqs == 0
+    ):
+        running_tokens = max(running_tokens, 1)
+        batch = _v41_dummy_batch(
+            running_tokens,
+            max_req_tokens=builder.block_table_cols
+            * builder.block_ratio
+            * builder.block_size,
+            max_reqs=builder.max_bs,
+        )
+        return snapshot, batch, batch.total_seqs_num, running_tokens, True
+    batch = _v41_scheduled_batch(snapshot, slot_allocator)
+    return (
+        snapshot,
+        batch,
+        int(snapshot.num_reqs),
+        max(running_tokens, batch.total_tokens_num),
+        False,
+    )
+
+
 @eager_break_during_capture
-def v41_stage_step(builder, batch, running_bs, running_tokens, input_ids, snapshot):
+def v41_stage_step(builder, slot_allocator, input_ids, proxy_layer_name, force_dummy):
     """One CSA2 step's host-side work, as a single break point.
 
     Both halves have to be in the *same* eager break, and the break has to be
@@ -827,6 +874,9 @@ def v41_stage_step(builder, batch, running_bs, running_tokens, input_ids, snapsh
     captured segments keep reading the addresses they recorded while the
     contents are refreshed underneath them.
     """
+    snapshot, batch, running_bs, running_tokens, synthetic = _v41_live_step_inputs(
+        builder, None if force_dummy else slot_allocator, input_ids, proxy_layer_name
+    )
     metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
     # Engram embeddings, the per-request state reset and the cursor advance --
     # everything that must happen once per step, before any layer runs.
@@ -841,7 +891,7 @@ def v41_stage_step(builder, batch, running_bs, running_tokens, input_ids, snapsh
         # Printing the whole table turns "off by one" into a row to look at.
         _dump_v41_state_rows(snapshot, batch, builder, exc)
         raise
-    return metadata, step_positions
+    return metadata, step_positions, running_bs, running_tokens, synthetic
 
 
 @contextmanager
@@ -852,7 +902,6 @@ def atom_deepseek_v41_forward_context(
     input_ids,
     positions,
     slot_allocator=None,
-    common_attn_metadata=None,
     force_dummy: bool = False,
     proxy_layer_name: str = ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
 ):
@@ -875,37 +924,13 @@ def atom_deepseek_v41_forward_context(
         set_forward_context,
     )
 
-    if common_attn_metadata is None:
-        common_attn_metadata = get_deepseek_v41_proxy_metadata_from_vllm_context(
-            proxy_layer_name
-        )
-    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
-    running_tokens = int(input_ids.shape[0]) if input_ids is not None else 0
-
-    dummy = (
-        force_dummy
-        or snapshot is None
-        or slot_allocator is None
-        or builder.cache is None
-        or snapshot.num_reqs == 0
-    )
-    if dummy:
-        running_tokens = max(running_tokens, 1)
-        batch = _v41_dummy_batch(
-            running_tokens,
-            max_req_tokens=builder.block_table_cols
-            * builder.block_ratio
-            * builder.block_size,
-            max_reqs=builder.max_bs,
-        )
-        running_bs = batch.total_seqs_num
-    else:
-        batch = _v41_scheduled_batch(snapshot, slot_allocator)
-        running_bs = int(snapshot.num_reqs)
-        running_tokens = max(running_tokens, batch.total_tokens_num)
-
-    metadata, step_positions = v41_stage_step(
-        builder, batch, running_bs, running_tokens, input_ids, snapshot
+    # Which batch this step runs is decided inside `v41_stage_step`, not here.
+    # Everything this function does outside that call runs at capture time and
+    # never again: `_replay` walks the recorded segments and does not call the
+    # model. Deciding here and passing the result in would pin every later
+    # replay to the batch that was scheduled when the graph was recorded.
+    metadata, step_positions, running_bs, running_tokens, dummy = v41_stage_step(
+        builder, slot_allocator, input_ids, proxy_layer_name, force_dummy
     )
 
     is_prefill = metadata.state.value.startswith("prefill")

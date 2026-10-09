@@ -354,6 +354,12 @@ class PagedAttentionCache:
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
+        # Held so a reader that cannot be handed this object still finds it.
+        # Under vLLM's breakable capture an eager break is replayed with the
+        # arguments it was captured with, so attention cannot take `step` as a
+        # parameter and see this step -- it would see the one recorded with the
+        # graph. The cache outlives every step, so reading it from here is live.
+        self.current_step = step
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)

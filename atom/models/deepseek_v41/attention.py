@@ -396,8 +396,17 @@ class Attention(nn.Module):
         return self._project_out(attn_out, rope, cache.rope_positions(step))
 
     @eager_break_during_capture
-    def _attend_block(self, attn_out, hidden, hidden_scale, cache, step, rope):
+    def _attend_block(self, attn_out, hidden, hidden_scale, cache, _step, rope):
         """Everything from the compressor fork to the attention rows.
+
+        Takes the cache, not the step. `eager_break_during_capture` binds a
+        break's arguments at capture time and `_replay` reruns no host code to
+        rebind them, so a `step` parameter would hold the step the graph was
+        recorded with on every later replay -- the warmup batch's lengths and
+        cursors, for the life of that graph. The cache outlives every step and
+        `begin_step` leaves the current one on it, so `cache.current_step` is
+        this step's. `_step` is kept in the signature for the native callers
+        that still pass it positionally, and deliberately unused.
 
         The wide eager region, and wide on purpose. Upstream keeps a narrower
         one for Model Runner V2 and a wide one for V1, because V1's piecewise
@@ -412,6 +421,7 @@ class Attention(nn.Module):
         decorator is held to: a region that returned rows would hand back a
         new address every step and a replay reruns no host code to find it.
         """
+        step = getattr(cache, "current_step", None) or _step
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
