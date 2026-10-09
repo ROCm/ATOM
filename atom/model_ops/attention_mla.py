@@ -59,6 +59,7 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -887,6 +888,7 @@ class MLAAttention(nn.Module):
         # can't silently borrow decode's answer if the two ever diverge.
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
+        self.dcp_sparse_prefill_nonps = False
         if dcp_world_size > 1 and self.is_sparse_mla:
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
@@ -903,6 +905,17 @@ class MLAAttention(nn.Module):
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
             )
+            # aiter's non-persistent fp8 gqa64 kernel serves the gathered width
+            # exactly, so it replaces both the persistent mode and the pad.
+            self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
+                dcp_world_size,
+                self.num_heads * dcp_world_size,
+                self.kv_cache_dtype.startswith("fp8"),
+                self.dcp_persistent_supported,
+            )
+            if self.dcp_sparse_prefill_nonps:
+                self.dcp_sparse_prefill_persistent = False
+                self.dcp_sparse_prefill_num_heads = 64
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         """Head padding for a DCP sparse prefill.
@@ -2255,6 +2268,7 @@ class MLAAttention(nn.Module):
                     and self.sparse_dcp_metadata_rebuild
                     and self.dcp_persistent_supported
                     and page_size <= 1
+                    and not self.dcp_sparse_prefill_nonps
                 ), (
                     "DCP sparse prefill would run in a different mode than the "
                     "one its gathered query width was padded for; update "
@@ -2288,7 +2302,14 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
+                    # The non-persistent gqa64 kernel writes O and LSE directly
+                    # at one split; it also caps total_q * splits at 32768,
+                    # which a 16K chunk at the usual 4 would exceed.
+                    num_kv_splits=(
+                        1
+                        if dcp_sparse and self.dcp_sparse_prefill_nonps
+                        else max(2, 16 // max(1, self.dcp_world_size))
+                    ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
                     kv_scale=self._k_scale if is_fp8 else None,

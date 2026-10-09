@@ -57,6 +57,7 @@ from atom.config import (
 from atom.distributed.dcp_utils import (
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 
 try:
@@ -947,6 +948,28 @@ def test_gate_takes_no_interleave_input():
 )
 def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
     assert qrep_for_step(qrep, seg, prefill, prefill_qrep) is expected
+
+
+@pytest.mark.parametrize(
+    "env, dcp, heads, fp8, gfx950, page, expected",
+    [
+        ("1", 4, 64, True, True, "1", True),  # tp4/dcp4: the one shape it serves
+        ("1", 8, 64, True, True, "1", True),  # tp8/dcp8, 8 heads a rank
+        ("0", 4, 64, True, True, "1", False),  # opt-in only
+        ("1", 1, 64, True, True, "1", False),  # no DCP group
+        ("1", 2, 32, True, True, "1", False),  # kernel is gqa64 only
+        ("1", 4, 128, True, True, "1", False),
+        ("1", 4, 64, False, True, "1", False),  # bf16 q/KV
+        ("1", 4, 64, True, False, "1", False),  # not gfx950
+        ("1", 4, 64, True, True, "16", False),  # paged MLA
+    ],
+)
+def test_sparse_prefill_nonps_gate(
+    monkeypatch, env, dcp, heads, fp8, gfx950, page, expected
+):
+    monkeypatch.setenv("ATOM_DCP_SPARSE_PREFILL_NONPS", env)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", page)
+    assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950) is expected
 
 
 def test_gate_reason_is_human_readable():

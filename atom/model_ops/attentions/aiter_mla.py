@@ -21,6 +21,7 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -446,6 +447,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
 
+        # Same predicate the attention layer uses: when DCP sparse prefill runs
+        # the non-persistent kernel, nothing reads the step-level plan below.
+        self.dcp_sparse_prefill_nonps = (
+            self.is_sparse
+            and mla_dcp_sparse_prefill_uses_nonps(
+                self.dcp_world_size,
+                self.num_attention_heads * self.dcp_world_size,
+                self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
+                dcp_persistent,
+            )
+        )
         if self.sparse_dcp_metadata_rebuild:
             # persistent_num_heads above is decode's width; sparse prefill
             # rounds differently and can disagree (see
@@ -1899,44 +1911,49 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             if self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
-            get_mla_metadata_v1(
-                attn_metadata.sparse_cu_seqlens_q,
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.sparse_kv_last_page_lens,
-                self.padded_num_attention_heads,
-                1,  # nhead_kv
-                True,
-                var["sparse_prefill_work_meta_data"],
-                var["sparse_prefill_work_info_set"],
-                var["sparse_prefill_work_indptr"],
-                var["sparse_prefill_reduce_indptr"],
-                var["sparse_prefill_reduce_final_map"],
-                var["sparse_prefill_reduce_partial_map"],
-                page_size=self.block_size,
-                dtype_q=self.dtype_q,
-                dtype_kv=self.dtype_kv,
-                kv_granularity=max(self.block_size, 16),
-                max_seqlen_qo=1,
-                uni_seqlen_qo=1,
-                fast_mode=1,
-                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
-            )
-            attn_metadata.sparse_prefill_work_meta_data = var[
-                "sparse_prefill_work_meta_data"
-            ]
-            attn_metadata.sparse_prefill_work_info_set = var[
-                "sparse_prefill_work_info_set"
-            ]
-            attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
-            attn_metadata.sparse_prefill_reduce_indptr = var[
-                "sparse_prefill_reduce_indptr"
-            ]
-            attn_metadata.sparse_prefill_reduce_final_map = var[
-                "sparse_prefill_reduce_final_map"
-            ]
-            attn_metadata.sparse_prefill_reduce_partial_map = var[
-                "sparse_prefill_reduce_partial_map"
-            ]
+            # Skipped only for the non-persistent DCP sparse prefill, which
+            # reads no work plan (see mla_dcp_sparse_prefill_uses_nonps).
+            if not self.dcp_sparse_prefill_nonps:
+                get_mla_metadata_v1(
+                    attn_metadata.sparse_cu_seqlens_q,
+                    attn_metadata.sparse_kv_indptr,
+                    attn_metadata.sparse_kv_last_page_lens,
+                    self.padded_num_attention_heads,
+                    1,  # nhead_kv
+                    True,
+                    var["sparse_prefill_work_meta_data"],
+                    var["sparse_prefill_work_info_set"],
+                    var["sparse_prefill_work_indptr"],
+                    var["sparse_prefill_reduce_indptr"],
+                    var["sparse_prefill_reduce_final_map"],
+                    var["sparse_prefill_reduce_partial_map"],
+                    page_size=self.block_size,
+                    dtype_q=self.dtype_q,
+                    dtype_kv=self.dtype_kv,
+                    kv_granularity=max(self.block_size, 16),
+                    max_seqlen_qo=1,
+                    uni_seqlen_qo=1,
+                    fast_mode=1,
+                    max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+                )
+                attn_metadata.sparse_prefill_work_meta_data = var[
+                    "sparse_prefill_work_meta_data"
+                ]
+                attn_metadata.sparse_prefill_work_info_set = var[
+                    "sparse_prefill_work_info_set"
+                ]
+                attn_metadata.sparse_prefill_work_indptr = var[
+                    "sparse_prefill_work_indptr"
+                ]
+                attn_metadata.sparse_prefill_reduce_indptr = var[
+                    "sparse_prefill_reduce_indptr"
+                ]
+                attn_metadata.sparse_prefill_reduce_final_map = var[
+                    "sparse_prefill_reduce_final_map"
+                ]
+                attn_metadata.sparse_prefill_reduce_partial_map = var[
+                    "sparse_prefill_reduce_partial_map"
+                ]
 
             # ---- Prefill Context Parallel: shrink per-query sparse metadata --
             # to this rank's 1/pcp round-robin queries. Gate on
