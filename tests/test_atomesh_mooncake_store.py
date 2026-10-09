@@ -293,8 +293,8 @@ stop_mooncake_store
 """,
             MOONCAKE_STORE_OWNERS="0:64;1:96",
         )
-        # The page cache goes before anything allocates, then the budget; the
-        # connector's transfer pool sits in GPU memory, so the GPUs pin nothing.
+        # The page cache goes before anything allocates, then the budget of the
+        # owners' pins.
         drop, budget = [
             line.split(" ", 1)[1]
             for line in self.calls.read_text().splitlines()
@@ -302,8 +302,8 @@ stop_mooncake_store
         ]
         self.assertTrue(drop.endswith("/scripts/drop_page_cache.py /models/m"), drop)
         self.assertIn(
-            "/scripts/numa_memory_budget.py --reserve-gib 128 --gpus 0,1,2,3 "
-            "--per-gpu-gib 0 --compact --compact-timeout 600 0:64 1:96",
+            "/scripts/numa_memory_budget.py --reserve-gib 128 --compact "
+            "--compact-timeout 600 0:64 1:96",
             budget,
         )
         (master,) = self.store_calls("mooncake_master")
@@ -473,7 +473,7 @@ stop_mooncake_store
         _, env = self.start_and_stop(
             MOONCAKE_STORE_OWNERS="0:8;1:8",
             MOONCAKE_STORE_CONNECTOR_CONFIG=(
-                ' {"mooncake_store.pool_device": "cpu",'
+                ' {"mooncake_store.direct_copy": false,'
                 ' "mooncake_store.load_pool_mib": 512, "max_pending_saves": 4} '
             ),
             MOONCAKE_STORE_LEASE_TTL_MS="30000",
@@ -481,7 +481,7 @@ stop_mooncake_store
             MC_MAX_MR_SIZE="4294967296",
         )
         extra = json.loads(env["ATOM_KV_OFFLOAD_EXTRA_CONFIG"])
-        self.assertEqual(extra["mooncake_store.pool_device"], "cpu")
+        self.assertIs(extra["mooncake_store.direct_copy"], False)
         self.assertEqual(extra["mooncake_store.load_pool_mib"], 512)
         self.assertEqual(extra["max_pending_saves"], 4)
         self.assertEqual(extra["mooncake_store.master"], f"{HOST}:{self.master_port}")
@@ -676,7 +676,7 @@ stop_mooncake_store
             if "numa_memory_budget.py" in line
         ]
         self.assertIn(
-            "--gpus  --per-gpu-gib 0 --compact --compact-timeout 600 0:96 0:96", budget
+            "--reserve-gib 128 --compact --compact-timeout 600 0:96 0:96", budget
         )
         owners = self.store_calls("mooncake_client")
         self.assertEqual(len(owners), 2)
@@ -730,16 +730,15 @@ stop_mooncake_store
     def test_the_compaction_budget_counts_each_pinned_numa_node(self):
         result = self.run_shell(
             """
-echo "PREFILL $(mooncake_store_compaction_budget MOONCAKE_STORE_OWNERS host_pools)"
+echo "PREFILL $(mooncake_store_compaction_budget MOONCAKE_STORE_OWNERS)"
 echo "DECODE $(mooncake_store_compaction_budget MOONCAKE_STORE_DECODE_OWNERS)"
 """,
             MOONCAKE_STORE_OWNERS="0:8;1:8;1:8",
             MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
             MOONCAKE_STORE_COMPACT_TIMEOUT="600.5",
-            MOONCAKE_STORE_HOST_POOL_GIB="1.5",
         )
-        # Two owner nodes and one for the GPUs' host pools, 600.5 s each.
-        self.assertIn("PREFILL 1802\n", result.stdout)
+        # Two owner nodes, 600.5 s each.
+        self.assertIn("PREFILL 1201\n", result.stdout)
         self.assertIn("DECODE 601\n", result.stdout)
 
     def test_decode_owners_allow_for_the_prefill_nodes_compaction(self):
@@ -827,8 +826,7 @@ stop_mooncake_store
     def test_several_prefill_workers_on_a_node_are_refused_before_anything_starts(
         self,
     ):
-        # The Store's memory plan and compaction cover one prefill worker's
-        # GPUs. A second worker in the same shell found it only once the first
+        # The Store's owners are placed around one prefill worker's GPUs. A second worker in the same shell found it only once the first
         # was up, and its refusal then stopped the Store under the first.
         for script, env, workers in (
             ("", {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "2"}, 2),
@@ -862,7 +860,7 @@ stop_mooncake_store
                 self.run_shell(script + "check_mooncake_store_settings\n", **env)
 
     def test_a_prefill_worker_on_other_gpus_is_refused(self):
-        # The Store's memory plan covered the first worker's GPUs only; the
+        # The Store's owners were placed around the first worker's GPUs; the
         # settings check refuses the layouts that would get here first.
         result = self.run_shell(
             """
@@ -954,16 +952,13 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             "prepare_mooncake_store_memory\n",
             MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS="/share/models:/data/cache",
             MOONCAKE_STORE_NODE_RESERVE_GIB="64",
-            # A transfer pool in host memory pins on each prefill GPU's node.
-            MOONCAKE_STORE_HOST_POOL_GIB="1.5",
             # A fragmented node may need longer than the default 600 s.
             MOONCAKE_STORE_COMPACT_TIMEOUT="1800",
         )
         calls = self.calls.read_text()
         self.assertIn("/scripts/drop_page_cache.py /share/models /data/cache\n", calls)
         self.assertIn(
-            "--reserve-gib 64 --gpus 0,1,2,3 --per-gpu-gib 1.5 --compact "
-            "--compact-timeout 1800\n",
+            "--reserve-gib 64 --compact --compact-timeout 1800\n",
             calls,
         )
 
@@ -1034,20 +1029,17 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                 "sets mooncake_store.pools, which the launcher sets",
             ),
             ({connector_config: '{"chunk_size":256}'}, "sets chunk_size: it takes"),
-            ({connector_config: '["mooncake_store.pool_device"]'}, "a JSON object"),
-            ({connector_config: "{pool_device: cpu}"}, "is not JSON"),
+            ({connector_config: '["mooncake_store.load_pool_mib"]'}, "a JSON object"),
+            ({connector_config: "{load_pool_mib: 512}"}, "is not JSON"),
             # The workers refuse these too, but only after the Store started.
             (
-                {connector_config: '{"mooncake_store.pool_devices":"cpu"}'},
-                "sets mooncake_store.pool_devices: it takes",
+                # Gone: the transfer pool is always in the worker GPU's HBM.
+                {connector_config: '{"mooncake_store.pool_device":"cpu"}'},
+                "sets mooncake_store.pool_device: it takes",
             ),
             (
                 {connector_config: '{"mooncake_store.load_pool_mib":"512"}'},
                 'sets mooncake_store.load_pool_mib to "512": it must be a positive',
-            ),
-            (
-                {connector_config: '{"mooncake_store.pool_device":"hbm"}'},
-                'sets mooncake_store.pool_device to "hbm": it must be "gpu" or',
             ),
             (
                 {connector_config: '{"mooncake_store.startup_probe":1}'},
@@ -1064,7 +1056,6 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             ({"MC_MS_AUTO_DISC": "1"}, "MC_MS_AUTO_DISC=1 makes the Store's"),
             ({"MOONCAKE_STORE_LEASE_TTL_MS": "0"}, "LEASE_TTL_MS=0 is not"),
             ({"MOONCAKE_STORE_LEASE_TTL_MS": "10s"}, "LEASE_TTL_MS=10s is not"),
-            ({"MOONCAKE_STORE_HOST_POOL_GIB": "-1"}, "HOST_POOL_GIB=-1 is not"),
             # Each would be misread later: by the NUMA budget, the compaction's
             # timeout, bash arithmetic in the waits, or a Store process.
             *(
