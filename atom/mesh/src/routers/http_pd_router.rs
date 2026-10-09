@@ -1069,8 +1069,7 @@ impl PDRouter {
                     prefill_request_json,
                     decode_request_json,
                     context,
-                    prefill,
-                    decode,
+                    placement,
                 )
                 .await;
         }
@@ -1266,11 +1265,21 @@ impl PDRouter {
         prefill_body: Value,
         decode_body: Value,
         context: PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        placement: Arc<ReservedPair>,
     ) -> Response {
-        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
-        let decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
+        // Transfer the selected pair's reservations into the concurrent requests.
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let [prefill_guard, decode_guard] = match placement.take_load() {
+            Ok(guards) => guards,
+            Err(response) => return response,
+        };
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
         let p = match self
             .build_worker_post_with_headers(
                 &self.client,
@@ -1303,11 +1312,10 @@ impl PDRouter {
         // Drain P independently; D can allocate and request writes immediately.
         let results = tokio::try_join!(
             async {
-                let response = p
-                    .send()
+                let response = self
+                    .send_worker(p, prefill.clone())
                     .await
                     .map_err(|e| error::bad_gateway("prefill_server_error", e.to_string()))?;
-                prefill.record_outcome(response.status().is_success());
                 if !response.status().is_success() {
                     return Err(error::create_error(
                         response.status(),
@@ -1316,17 +1324,18 @@ impl PDRouter {
                     ));
                 }
                 response
-                    .bytes()
+                    .drain()
                     .await
                     .map_err(|e| error::bad_gateway("prefill_read_error", e.to_string()))?;
                 drop(prefill_guard);
                 Ok(())
             },
             async {
-                let response = d
-                    .send()
+                let response = self
+                    .send_worker(d, decode.clone())
                     .await
                     .map_err(|e| error::bad_gateway("decode_server_error", e.to_string()))?;
+                events::RequestReceivedEvent {}.emit();
                 if !response.status().is_success() {
                     return Err(error::create_error(
                         response.status(),
@@ -1347,7 +1356,7 @@ impl PDRouter {
 
     async fn finish_atom_decode_response(
         &self,
-        res: reqwest::Response,
+        res: WorkerResponse,
         context: PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
         decode_guard: WorkerLoadGuard,

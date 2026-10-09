@@ -144,24 +144,17 @@ fn dispatch(
             )
             .unwrap();
         match kind {
-            DispatchKind::AtomChunked => {
-                router
-                    .dispatch_atom_chunked_internal(
-                        None,
-                        json!({}),
-                        json!({}),
-                        context,
-                        prefill,
-                        decode,
-                    )
-                    .await
-            }
-            DispatchKind::Atom => {
+            DispatchKind::Atom | DispatchKind::AtomChunked => {
+                let decode_body = if matches!(kind, DispatchKind::AtomChunked) {
+                    json!({"kv_transfer_params": {"chunked_transfer": true}})
+                } else {
+                    json!({})
+                };
                 router
                     .dispatch_atom_relay_internal(
                         None,
                         json!({}),
-                        json!({}),
+                        decode_body,
                         context,
                         placement,
                         ctx,
@@ -474,29 +467,7 @@ async fn stalled_decode_error_body_cancels_pending_prefill() {
 #[tokio::test]
 async fn atom_chunked_dispatch_starts_decode_before_prefill_completes() {
     let (mut p, mut d) = servers().await;
-    let router = tests::create_test_pd_router();
-    let prefill = p.worker.clone();
-    let decode = d.worker.clone();
-    let task = tokio::spawn(async move {
-        router
-            .dispatch_atom_chunked_internal(
-                None,
-                json!({}),
-                json!({}),
-                PDRequestContext {
-                    route: "/v1/chat/completions",
-                    batch_size: None,
-                    is_stream: false,
-                    return_logprob: false,
-                    request_text: None,
-                    model_id: None,
-                    headers: None,
-                },
-                prefill,
-                decode,
-            )
-            .await
-    });
+    let task = dispatch(DispatchKind::AtomChunked, &p, &d, false);
     // P has not produced any response. D must nevertheless be able to
     // preallocate and send its write request to every PP stage.
     p.wait_entered().await;
