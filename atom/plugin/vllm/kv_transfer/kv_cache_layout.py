@@ -108,7 +108,22 @@ def split_kv_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | 
     layers), in which case the whole tensor travels as ``k_cache``.
     """
     # (nb, 2, ...) -- K/V split across dim 1, each half contiguous on its own.
-    if tensor.ndim >= 4 and tensor.shape[1] == 2:
+    #
+    # The contiguity is the test, not a remark about it. A size-2 dim 1 says
+    # "K and V" only in the layouts whose `get_kv_cache_stride_order` puts that
+    # axis outermost, which is what leaves each half contiguous. From vLLM 0.31
+    # the per-layer view is `(num_blocks, num_heads, block_size, state_bytes)`
+    # with K and V interleaved in the last dim, so dim 1 is the head count and
+    # a model with two KV heads would match the shape while meaning nothing of
+    # the kind. There the halves are strided, so the test declines and the
+    # tensor travels whole -- which is correct for that layout, since one
+    # block's bytes are contiguous in it.
+    if (
+        tensor.ndim >= 4
+        and tensor.shape[1] == 2
+        and tensor[:, 0].is_contiguous()
+        and tensor[:, 1].is_contiguous()
+    ):
         return tensor[:, 0], tensor[:, 1]
     # Anything else (incl. dense (nb, 1, bs, 2*hd)) is one opaque run.
     return tensor, None

@@ -194,3 +194,34 @@ def test_codec_accepts_the_mapped_tensors():
     assert codec.bytes_per_block == (
         DENSE_LAYERS * dense_bytes + SPARSE_LAYERS * sparse_bytes
     )
+
+
+class TestDimOneIsNotAlwaysTheKVAxis:
+    """A size-2 dim 1 means K/V only where the halves are each contiguous.
+
+    vLLM 0.31 hands each layer `(num_blocks, num_heads, block_size,
+    state_bytes)` with K and V interleaved in the last dim. A model with two
+    KV heads matches `shape[1] == 2` there while meaning nothing of the kind,
+    and slicing it would hand the codec two strided half-tensors described as
+    K and V. The failure is the dangerous direction: if a layout ever made
+    those slices contiguous, it would be a silent mis-split rather than an
+    error.
+    """
+
+    def test_a_031_style_view_with_two_heads_is_one_opaque_run(self):
+        # (num_blocks, num_heads=2, block_size, state_bytes), block-major.
+        view = torch.arange(2 * 2 * 4 * 8, dtype=torch.uint8).reshape(2, 2, 4, 8)
+        k, v = split_kv_tensor(view)
+        assert v is None
+        assert k is view
+
+    def test_a_real_kv_split_still_splits(self):
+        # The pre-0.31 shape whose stride order puts K/V outermost, so each
+        # half is contiguous: build it that way rather than asserting it.
+        kv = torch.arange(2 * 3 * 4 * 8, dtype=torch.uint8).reshape(2, 3, 4, 8)
+        view = kv.permute(1, 0, 2, 3)  # (3, 2, 4, 8), halves contiguous
+        assert view.shape[1] == 2
+        k, v = split_kv_tensor(view)
+        assert v is not None
+        assert k.is_contiguous() and v.is_contiguous()
+        assert torch.equal(k, kv[0]) and torch.equal(v, kv[1])

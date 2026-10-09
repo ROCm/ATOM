@@ -41,7 +41,10 @@ def _connector(**state):
 def test_nothing_pending_reports_nothing():
     # The one that keeps the others honest: a hook stuck at True would make
     # the scheduler wait for frees that are not coming.
-    assert _connector(scheduler=_Scheduler(leases=False)).has_pending_block_frees() is False
+    assert (
+        _connector(scheduler=_Scheduler(leases=False)).has_pending_block_frees()
+        is False
+    )
 
 
 def test_a_deferred_free_is_pending():
@@ -49,7 +52,9 @@ def test_a_deferred_free_is_pending():
 
 
 def test_a_release_in_flight_is_pending():
-    assert _connector(in_flight={"r0"}, scheduler=_Scheduler()).has_pending_block_frees()
+    assert _connector(
+        in_flight={"r0"}, scheduler=_Scheduler()
+    ).has_pending_block_frees()
 
 
 def test_a_pinned_boundary_block_is_pending():
