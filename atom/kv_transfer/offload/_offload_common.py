@@ -269,6 +269,13 @@ class OffloadWorkerMixin:
         # load could not supply, and needs a fence it can hold a preemption
         # against. See `take_load_error_blocks` / `wait_for_requests`.
         self._failed_load_blocks: set[int] = set()
+        # The same failures, named by request. vLLM 0.31 refuses a flat set of
+        # block ids for a model with more than one KV cache group (block ids
+        # are unique only within a group), so the request-level set is the only
+        # channel there. Kept alongside rather than instead of: on a single
+        # group the block set truncates to the first bad block and recomputes
+        # from there, where the request set discards the whole external prefix.
+        self._failed_load_reqs: set[str] = set()
         self._inflight_jobs: dict[str, set] = {}
 
     def close(self) -> None:
@@ -355,6 +362,14 @@ class OffloadWorkerMixin:
             self._failed_load_blocks.clear()
         return blocks
 
+    def take_load_error_reqs(self) -> set[str]:
+        """Drain the requests whose load failed, for the multi-group channel."""
+
+        with self._lock:
+            reqs = set(self._failed_load_reqs)
+            self._failed_load_reqs.clear()
+        return reqs
+
     def _record_load_error_blocks(self, req) -> None:
         """Record the block range a failed load was supposed to fill.
 
@@ -377,6 +392,12 @@ class OffloadWorkerMixin:
             or getattr(self, "block_size", 0)
             or 0
         )
+        # Named before the block arithmetic can decline: a load that failed
+        # with no usable range is still a failed load, and dropping it here
+        # would leave vLLM treating the external prefix as valid.
+        req_id = getattr(req, "req_id", None)
+        if req_id is not None:
+            self._failed_load_reqs.add(str(req_id))
         if load_spec is None or not block_ids or block_size <= 0:
             return
         start = max(0, int(load_spec.hbm_cached_tokens)) // block_size

@@ -309,6 +309,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._kda_dense_done: set[str] = set()
         self._kda_results: dict[str, Any] = {}
         self._kda_error_blocks: set[int] = set()
+        self._kda_error_reqs: set[str] = set()
         # Promises the scheduler half withdrew. Held here until the next
         # `get_finished`, which is the only hook that can release a park.
         self._abandoned_loads: set[str] = set()
@@ -1287,6 +1288,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             released.add(req_id)
             if not result.ok:
                 self._kda_error_blocks.update(result.error_block_ids)
+                self._kda_error_reqs.add(str(req_id))
                 self._worker_state_load_failed[req_id] = (
                     self._worker_state_load_failed.get(req_id, 0) + 1
                 )
@@ -1508,7 +1510,66 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._abandoned_error_blocks:
             blocks = set(blocks) | self._abandoned_error_blocks
             self._abandoned_error_blocks = set()
+        if self._multi_group_failures():
+            # vLLM 0.31 raises on a non-empty set here when the model has more
+            # than one KV cache group, because a flat block id cannot be mapped
+            # back to a request. The failures are not dropped: they go out as
+            # `failed_recving` from `get_transfer_results` instead. Draining
+            # above rather than returning early is deliberate -- the sets must
+            # not accumulate across steps and reappear once the group count
+            # changes.
+            return set()
         return blocks
+
+    def _multi_group_failures(self) -> bool:
+        """Whether this model must report load failures by request, not block.
+
+        One group is the common case and keeps the finer channel: vLLM
+        truncates `num_computed_tokens` to the first bad block and recomputes
+        from there, where a request-level failure discards the whole external
+        prefix. More than one group -- a hybrid model, or V4.1 once its state
+        images become their own groups -- has no choice.
+        """
+        # `getattr` on self, not just on the config: the base class sets
+        # `_kv_cache_config` in `__init__`, so a connector without it is one
+        # built past `__init__` -- a test fixture, never a served engine. Such
+        # a connector reads as single-group, which keeps the finer channel and
+        # leaves today's behaviour alone; the multi-group refusal it would miss
+        # cannot be reached without a real config.
+        config = getattr(self, "_kv_cache_config", None)
+        groups = getattr(config, "kv_cache_groups", None) or ()
+        return len(groups) > 1
+
+    def get_transfer_results(self, finished_req_ids):
+        """Sends, receives and receive failures, as vLLM 0.31 asks for them.
+
+        The base class derives this from `get_finished` with no failures, which
+        is right only while every failure can travel as a block id. It cannot
+        on a multi-group model, so the requests whose load failed are named
+        here -- and named on both paths, because a request in `failed_recving`
+        that vLLM also sees in `finished_recving` would otherwise be cached as
+        a good external hit.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+            KVConnectorTransferResults,
+        )
+
+        sending, recving = self.get_finished(finished_req_ids)
+        failed = set(self._worker.take_load_error_reqs())
+        if self._kda_error_reqs:
+            failed |= self._kda_error_reqs
+            self._kda_error_reqs = set()
+        if self._abandoned_loads:
+            failed |= {str(r) for r in self._abandoned_loads}
+        if not self._multi_group_failures():
+            # Single group: the block channel already carried them, and naming
+            # them twice would discard prefixes the block channel only trims.
+            failed = set()
+        return KVConnectorTransferResults(
+            finished_sending=set(sending or ()),
+            finished_recving=set(recving or ()) - failed,
+            failed_recving=failed,
+        )
 
     def build_connector_worker_meta(self) -> AtomOffloadWorkerMetadata | None:
         """Hand this rank's save and load-failure reports to the scheduler half.
