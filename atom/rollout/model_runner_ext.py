@@ -15,14 +15,22 @@ from aiter.dist.utils import get_distributed_init_method
 
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.rollout.capabilities import CapabilityProviderMixin
 from atom.rollout.memory_manager import MemoryManagerMixin
+from atom.rollout.rdma_weight_receiver import RDMAWeightReceiverMixin
 from atom.rollout.weight_updater import WeightUpdaterMixin
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
 
-class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
+class RLHFModelRunner(
+    ModelRunner,
+    WeightUpdaterMixin,
+    RDMAWeightReceiverMixin,
+    MemoryManagerMixin,
+    CapabilityProviderMixin,
+):
     """ModelRunner with RLHF extensions (weight sync + memory lifecycle + DP isolation).
 
     Used when ATOM is driven by an external RLHF framework (veRL or TorchSpec).
@@ -355,6 +363,11 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        # Refuse to serve mid-reload or after a partial one. Weights are applied
+        # in place, so without this a failed stream would keep serving from a
+        # mix of two versions -- visible much later as unexplained divergence
+        # rather than as an error here.
+        self.assert_weight_update_ready()
         result = super().forward(batch)
 
         if self._extract_mode and self._captured_hidden_states is not None:

@@ -67,7 +67,11 @@ def _bare_manager(cls, **kwargs):
     """A manager with its shared state set up and no engine processes spawned."""
     mgr = cls.__new__(cls)
     mgr._init_shared_state(
-        SimpleNamespace(dp_load_balance="round_robin"),
+        SimpleNamespace(
+            dp_load_balance="round_robin",
+            tp_world_size=1,
+            prefill_context_parallel_size=1,
+        ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
     )

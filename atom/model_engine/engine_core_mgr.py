@@ -9,6 +9,8 @@ import multiprocessing.shared_memory
 import os
 import pickle
 import queue
+import time
+import uuid
 import weakref
 from dataclasses import dataclass
 from threading import Lock, Thread
@@ -17,7 +19,14 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_CMD,
+    RpcResponseRouter,
+    RpcResult,
+    checked_timeout,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.engine_utility import FIRE_AND_FORGET_UTILITY_CMDS
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
@@ -185,6 +194,16 @@ class CoreManager:
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.utility_response_queue = queue.Queue()
+        # Generic collective RPCs are correlated by request id instead of by
+        # queue position, so several may be outstanding. Every other utility
+        # command keeps using utility_response_queue above.
+        self._rpc_router = RpcResponseRouter()
+        # Runner processes behind each engine -- EngineCore's own sizing -- so
+        # an engine that never answers still fails one result per rank. Read
+        # with defaults: managers are also built from bare stand-in configs.
+        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
+            config, "prefill_context_parallel_size", 1
+        )
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -684,7 +703,7 @@ class CoreManager:
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
-                        self.utility_response_queue.put_nowait(data)
+                        self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
@@ -1343,8 +1362,144 @@ class CoreManager:
         self._release_seq_load(req_id)
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
+
+    def _route_utility_response(self, dp_rank: int, data):
+        """Send a correlated reply to its own caller; everything else as before.
+
+        Only ``collective_rpc`` replies carry a request id, so every existing
+        utility command keeps the legacy shared-queue path untouched.
+        """
+        if not (isinstance(data, dict) and data.get("cmd") == COLLECTIVE_RPC_CMD):
+            self.utility_response_queue.put_nowait(data)
+            return
+        request_id = data.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            # Nobody can be waiting on it. Routing an unhashable id raises on
+            # this thread, which ends it, and on the shared queue the reply
+            # would become the next synchronous caller's.
+            logger.warning(
+                f"{self.label}: dropping collective_rpc reply with no usable "
+                f"request id from DP rank {dp_rank}"
+            )
+            return
+        if not self._rpc_router.route(request_id, (dp_rank, data)):
+            # The caller timed out and unregistered. Dropping is the point: on
+            # the shared queue this reply would have become the next caller's.
+            logger.warning(
+                f"{self.label}: dropping late collective_rpc reply {request_id} "
+                f"from DP rank {dp_rank}"
+            )
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        barrier: bool = False,
+        timeout: float = 300.0,
+    ) -> list[RpcResult]:
+        """Run *method* on every DP engine's every TP runner.
+
+        Returns replies in DP-major then TP-rank order. Every rank is
+        represented: a DP engine that did not answer in time contributes one
+        failed :class:`RpcResult` per TP rank rather than silently shortening
+        the list, because a caller checking coverage needs to know which ranks
+        are missing.
+
+        Never raises for a worker-side failure -- the failure travels in
+        ``RpcResult.error`` so the ranks that did succeed are still reported.
+        Raises up front for a timeout that is not a finite number of seconds,
+        and for a manager whose engines are not one DP rank each, which the
+        replies would otherwise be reported as.
+        """
+        timeout = checked_timeout(timeout)
+        unsupported = self._collective_rpc_unsupported()
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"{self.label}: collective_rpc needs one engine per DP rank, "
+                f"but {unsupported}"
+            )
+        request_id = uuid.uuid4().hex
+        engine_count = len(self.control_sockets)
+        deadline = time.monotonic() + timeout
+
+        with self._rpc_router.register(request_id) as replies:
+            self.broadcast_utility_command(
+                COLLECTIVE_RPC_CMD,
+                request_id=request_id,
+                method=method,
+                args=tuple(args),
+                kwargs=dict(kwargs or {}),
+                barrier=bool(barrier),
+                timeout=timeout,
+            )
+            by_dp_rank: dict[int, dict] = {}
+            while len(by_dp_rank) < engine_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+                if dp_rank in by_dp_rank:
+                    logger.warning(
+                        f"{self.label}: duplicate collective_rpc reply from "
+                        f"DP rank {dp_rank}, ignoring"
+                    )
+                    continue
+                by_dp_rank[dp_rank] = body
+
+        return self._flatten_dp_replies(request_id, method, engine_count, by_dp_rank)
+
+    def _collective_rpc_unsupported(self) -> str | None:
+        """Why this manager's engines are not one DP rank each, if they are not."""
+        pp_size = getattr(self, "pp_size", 1)
+        if pp_size > 1:
+            # One engine per stage, each holding a slice of the layers.
+            return f"its {pp_size} engines are pipeline stages"
+        return None
+
+    def _flatten_dp_replies(
+        self,
+        request_id: str,
+        method: str,
+        engine_count: int,
+        by_dp_rank: dict[int, dict],
+    ) -> list[RpcResult]:
+        """DP-major, TP-minor, with a placeholder for every absent rank."""
+        ranks = self._rpc_ranks_per_engine
+        flat: list[RpcResult] = []
+        for dp_rank in range(engine_count):
+            body = by_dp_rank.get(dp_rank)
+            if body is None:
+                error = (
+                    f"DP rank {dp_rank} did not answer {method!r} before the deadline"
+                )
+                flat.extend(
+                    RpcResult(request_id, tp, error=error) for tp in range(ranks)
+                )
+                continue
+            if body.get("error"):
+                # The engine failed before reaching its runners, so every one of
+                # them shares the reason.
+                flat.extend(
+                    RpcResult(request_id, tp, error=body["error"])
+                    for tp in range(ranks)
+                )
+                continue
+            for entry in body.get("results", []):
+                flat.append(
+                    RpcResult(
+                        request_id,
+                        entry.get("tp_rank", -1),
+                        value=entry.get("value"),
+                        error=entry.get("error"),
+                    )
+                )
+        return flat
 
     def broadcast_utility_command(self, cmd: str, **kwargs):
         payload = {"cmd": cmd, **kwargs}
@@ -1360,6 +1515,12 @@ class CoreManager:
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
     ):
+        if cmd in FIRE_AND_FORGET_UTILITY_CMDS:
+            raise ValueError(
+                f"{self.label}: {cmd!r} is fire-and-forget; its handler never "
+                f"answers, so waiting on it could only time out. Send it with "
+                f"broadcast_utility_command instead."
+            )
         # Drain any stale responses that might be left over
         while not self.utility_response_queue.empty():
             try:
@@ -1381,6 +1542,15 @@ class CoreManager:
                     f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
                     f"for command '{cmd}' (timeout={timeout}s)"
                 )
+        failed = [r for r in responses if isinstance(r, dict) and r.get("error")]
+        if failed:
+            # Callers read r["result"]; an error reply has none, and handing it
+            # back would turn a named failure into a KeyError somewhere else.
+            raise RuntimeError(
+                f"{self.label}: utility command {cmd!r} failed on {len(failed)} "
+                f"of {len(responses)} engine(s): "
+                + "; ".join(str(r["error"]) for r in failed)
+            )
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
@@ -1726,6 +1896,9 @@ class DisaggCoreManager(CoreManager):
             prefill_seqs.append(ps)
         prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
         self._send_request(0, prefill_payload)
+
+    def _collective_rpc_unsupported(self) -> str | None:
+        return "its two engines are the prefill and decode halves of one replica"
 
     def close(self):
         super().close()
