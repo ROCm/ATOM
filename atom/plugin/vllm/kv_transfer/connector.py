@@ -1174,11 +1174,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # Registration did not resolve the page planes on this half, so
                 # there is nothing to snapshot into. Dropping the stores costs
                 # boundaries; dereferencing None costs the step.
+                #
+                # Refuse them, do not merely drop them. The scheduler half
+                # records every offered boundary as in flight and clears it on
+                # a report; a store that returns neither a success nor a
+                # failure stays in flight for the life of the process, and
+                # `_offer_in_flight` then refuses to offer that prefix hash
+                # ever again. The tier would go on looking merely cold.
                 logger.warning(
                     "ATOM LMCache offload: %d V4.1 store(s) decided before the "
-                    "state tier was up; dropping them",
+                    "state tier was up; refusing them",
                     len(stores),
                 )
+                self._v41_refusals.extend(("leg_down", st.op_id) for st in stores)
                 return
             # Snapshot now, not at the flush. This runs inside `start_load_kv`,
             # which vLLM calls before the forward; `_flush_kda_stores` runs
