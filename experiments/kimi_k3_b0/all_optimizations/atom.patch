@@ -1,5 +1,5 @@
 diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
-index b013ea6b057d8ab8e2cf6f25c763b20f61f9ce65..2bd1c67439d0fa9466d5893422cd212b21035169 100644
+index b013ea6b0..2bd1c6743 100644
 --- a/atom/model_ops/attention_mla.py
 +++ b/atom/model_ops/attention_mla.py
 @@ -2539,6 +2539,10 @@ class MLAAttention(nn.Module):
@@ -25,7 +25,7 @@ index b013ea6b057d8ab8e2cf6f25c763b20f61f9ce65..2bd1c67439d0fa9466d5893422cd212b
                  page_size,
                  k_scale=self._k_scale,
 diff --git a/atom/model_ops/attentions/gdn_attn.py b/atom/model_ops/attentions/gdn_attn.py
-index e350d4acc91b8919e271887bae668e0694254892..b5b4f65e95caff04c167ee8d4c0116964da21f01 100644
+index e350d4acc..b5b4f65e9 100644
 --- a/atom/model_ops/attentions/gdn_attn.py
 +++ b/atom/model_ops/attentions/gdn_attn.py
 @@ -88,6 +88,7 @@ class GDNAttentionMetadata:
@@ -56,7 +56,7 @@ index e350d4acc91b8919e271887bae668e0694254892..b5b4f65e95caff04c167ee8d4c011696
              spec_token_indx=spec_token_indx,
              non_spec_token_indx=non_spec_token_indx,
 diff --git a/atom/model_ops/attentions/triton_mla.py b/atom/model_ops/attentions/triton_mla.py
-index 78d0d4fc723ccd5e9c2025c59039e7ad270895da..08604be9e37361cdaf3e0ccd74ca9ffb1a3f3af6 100644
+index 78d0d4fc7..08604be9e 100644
 --- a/atom/model_ops/attentions/triton_mla.py
 +++ b/atom/model_ops/attentions/triton_mla.py
 @@ -17,6 +17,36 @@ from .backends import AttentionBackend
@@ -128,7 +128,7 @@ index 78d0d4fc723ccd5e9c2025c59039e7ad270895da..08604be9e37361cdaf3e0ccd74ca9ffb
              "triton_block_table": torch.zeros(
                  self.max_bs,
 diff --git a/atom/model_ops/fla_ops/fused_sigmoid_gating.py b/atom/model_ops/fla_ops/fused_sigmoid_gating.py
-index 526c9dd0dd7f3f2a80ca6a583e5c78ed963c1d81..7888d432892e36ec1191c403c2971be7e209b3ed 100644
+index 526c9dd0d..7888d4328 100644
 --- a/atom/model_ops/fla_ops/fused_sigmoid_gating.py
 +++ b/atom/model_ops/fla_ops/fused_sigmoid_gating.py
 @@ -238,7 +238,7 @@ def fused_sigmoid_gating_delta_rule_update(
@@ -140,8 +140,111 @@ index 526c9dd0dd7f3f2a80ca6a583e5c78ed963c1d81..7888d432892e36ec1191c403c2971be7
  
      if cu_seqlens is not None and q.shape[0] != 1:
          raise ValueError(
+diff --git a/atom/model_ops/fp4_layout.py b/atom/model_ops/fp4_layout.py
+new file mode 100644
+index 000000000..98b9b5463
+--- /dev/null
++++ b/atom/model_ops/fp4_layout.py
+@@ -0,0 +1,97 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++
++"""MXFP4 GEMM backend and scale-layout contract."""
++
++from dataclasses import dataclass
++from enum import IntEnum
++
++import torch
++from aiter import dtypes
++from aiter.jit.utils.chip_info import get_gfx_runtime
++from aiter.ops.mx_scale_layout import (
++    mx_scale_buffer_shape as mxfp4_scale_buffer_shape,
++)
++from aiter.ops.mx_scale_layout import to_mx_scale_layout as to_mxfp4_scale_layout
++from aiter.utility.mx_types import MXScaleLayoutInt as MXScaleLayout
++
++from atom.utils import envs
++
++__all__ = [
++    "Fp4BackendKind",
++    "Fp4BackendSpec",
++    "MXScaleLayout",
++    "decode_fp4_backend_layout_code",
++    "mxfp4_scale_buffer_shape",
++    "resolve_current_fp4_backend_spec",
++    "resolve_fp4_backend_spec",
++    "to_mxfp4_scale_layout",
++]
++
++
++class Fp4BackendKind(IntEnum):
++    DEFAULT_AITER = 0
++    TRITON_PRESHUFFLE = 1
++    TRITON_NONSHUFFLE = 2
++
++
++@dataclass(frozen=True)
++class Fp4BackendSpec:
++    kind: Fp4BackendKind
++    weight_scale_layout: int
++    activation_scale_layout: int
++
++    @property
++    def backend_layout_code(self) -> int:
++        """One custom-op scalar carrying backend and both scale layouts."""
++        return (
++            int(self.kind)
++            | (int(self.activation_scale_layout) << 8)
++            | (int(self.weight_scale_layout) << 16)
++        )
++
++
++def resolve_fp4_backend_spec(
++    arch: str,
++    params_dtype: torch.dtype | None,
++    triton_gemm: bool,
++    nonshuffle_triton_gemm: bool,
++) -> Fp4BackendSpec | None:
++    if params_dtype != dtypes.fp4x2:
++        return None
++    if nonshuffle_triton_gemm:
++        kind = Fp4BackendKind.TRITON_NONSHUFFLE
++        layout = MXScaleLayout.ROW_MAJOR
++    elif triton_gemm:
++        kind = Fp4BackendKind.TRITON_PRESHUFFLE
++        layout = MXScaleLayout.AITER_E8M0
++    else:
++        kind = Fp4BackendKind.DEFAULT_AITER
++        layout = (
++            MXScaleLayout.OPUS_F4 if arch == "gfx1250" else MXScaleLayout.AITER_E8M0
++        )
++    return Fp4BackendSpec(kind, layout, layout)
++
++
++def resolve_current_fp4_backend_spec(
++    params_dtype: torch.dtype | None,
++) -> Fp4BackendSpec | None:
++    """Resolve once during module initialization/loading, never in forward."""
++    return resolve_fp4_backend_spec(
++        get_gfx_runtime(),
++        params_dtype,
++        envs.ATOM_USE_TRITON_GEMM,
++        envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM,
++    )
++
++
++def decode_fp4_backend_layout_code(
++    backend_layout_code: int,
++) -> tuple[Fp4BackendKind, int, int]:
++    if backend_layout_code < 0:
++        raise ValueError("MXFP4 custom op requires a resolved backend layout")
++    return (
++        Fp4BackendKind(backend_layout_code & 0xFF),
++        (backend_layout_code >> 8) & 0xFF,
++        (backend_layout_code >> 16) & 0xFF,
++    )
 diff --git a/atom/model_ops/kimi_k3/activations.py b/atom/model_ops/kimi_k3/activations.py
-index 442c3720db90f21705123f951c680cb25c7dc885..0c29bf5029e0b2bdbe23f1002bcc9dc4a06a48a2 100644
+index 442c3720d..0c29bf502 100644
 --- a/atom/model_ops/kimi_k3/activations.py
 +++ b/atom/model_ops/kimi_k3/activations.py
 @@ -19,6 +19,11 @@ try:
@@ -248,7 +351,7 @@ index 442c3720db90f21705123f951c680cb25c7dc885..0c29bf5029e0b2bdbe23f1002bcc9dc4
          x2,
          weight,
 diff --git a/atom/model_ops/kimi_k3/attention_residual.py b/atom/model_ops/kimi_k3/attention_residual.py
-index c523382b2e36869283f76a778869ffbcc10f1024..2a3ce58b45e19ca57c1dcbe42de6b725a1c6a2f4 100644
+index c523382b2..2a3ce58b4 100644
 --- a/atom/model_ops/kimi_k3/attention_residual.py
 +++ b/atom/model_ops/kimi_k3/attention_residual.py
 @@ -34,6 +34,8 @@ Four deliberate divergences from that reference:
@@ -291,89 +394,240 @@ index c523382b2e36869283f76a778869ffbcc10f1024..2a3ce58b45e19ca57c1dcbe42de6b725
      _attn_res_fused_kernel[(T,)](
          br,
          ps,
+diff --git a/atom/model_ops/layernorm.py b/atom/model_ops/layernorm.py
+index f55c3ec29..2e582df90 100644
+--- a/atom/model_ops/layernorm.py
++++ b/atom/model_ops/layernorm.py
+@@ -24,6 +24,11 @@ from torch import Tensor, nn
+ from torch.overrides import handle_torch_function, has_torch_function_unary
+ 
+ from atom.config import QuantizationConfig
++from atom.model_ops.fp4_layout import (
++    MXScaleLayout,
++    mxfp4_scale_buffer_shape,
++    resolve_current_fp4_backend_spec,
++)
+ from atom.model_ops.utils import atom_parameter
+ from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
+ from atom.utils import envs
+@@ -179,6 +184,7 @@ def _aiter_rms_quant_fake(
+     res1: torch.Tensor | None = None,
+     value_dtype: torch.dtype | None = None,
+     e8m0_scale: bool = False,
++    mxfp4_scale_layout: int = MXScaleLayout.AITER_E8M0,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     from aiter.utility.dtypes import fp8
+ 
+@@ -191,12 +197,12 @@ def _aiter_rms_quant_fake(
+         out = torch.empty((M, N), dtype=fp8, device=x.device)
+         scale = torch.empty((M, N // 32), dtype=torch.float8_e8m0fnu, device=x.device)
+     elif quant_type_value == _QV_PER_1X32:
+-        # MXFP4: out=(M, N/2) fp4x2; scale=(⌈M/256⌉*256, ⌈⌈N/32⌉/8⌉*8) UE8M0
+-        # bytes (kernel writes one uint8 per group; passing fp8_e8m0fnu
+-        # directly yields the matching byte layout — no fp32 view).
++        # MXFP4: the consumer contract determines the physical E8M0 buffer
++        # shape; the logical scale is always (M, ceil(N/32)).
+         out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
+-        scale_m = ((M + 255) // 256) * 256
+-        scale_n = ((((N + 31) // 32) + 7) // 8) * 8
++        scale_m, scale_n = mxfp4_scale_buffer_shape(
++            M, (N + 31) // 32, mxfp4_scale_layout
++        )
+         scale = torch.empty(
+             (scale_m, scale_n), dtype=torch.float8_e8m0fnu, device=x.device
+         )
+@@ -231,11 +237,20 @@ def _aiter_rms_quant(
+     res1: torch.Tensor | None = None,
+     value_dtype: torch.dtype | None = None,
+     e8m0_scale: bool = False,
++    mxfp4_scale_layout: int = MXScaleLayout.AITER_E8M0,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     from aiter import add_rmsnorm_quant, rmsnorm_quant
+ 
+     out, scale, out_res1 = _aiter_rms_quant_fake(
+-        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype, e8m0_scale
++        x,
++        weight,
++        eps,
++        quant_type_value,
++        transpose_scale,
++        res1,
++        value_dtype,
++        e8m0_scale,
++        mxfp4_scale_layout,
+     )
+     if _is_mxfp8(quant_type_value, value_dtype):
+         # The FP8 width is carried by `out`'s dtype and the UE8M0 format by
+@@ -243,17 +258,47 @@ def _aiter_rms_quant(
+         # the only thing left to state is that the scale stays row-major.
+         group_size, shuffle = 32, False
+     elif quant_type_value == _QV_PER_1X32:
+-        group_size, shuffle = 32, True
++        group_size, shuffle = 32, False
+     elif quant_type_value == _QV_PER_1X128:
+         group_size, shuffle = 128, transpose_scale
+     else:  # _QV_PER_TOKEN
+         group_size, shuffle = 0, False
+     if res1 is None:
+-        rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
++        if quant_type_value == _QV_PER_1X32 and not _is_mxfp8(
++            quant_type_value, value_dtype
++        ):
++            rmsnorm_quant(
++                out,
++                x,
++                scale,
++                weight,
++                eps,
++                group_size,
++                shuffle,
++                scale_layout=mxfp4_scale_layout,
++            )
++        else:
++            rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
+     else:
+-        add_rmsnorm_quant(
+-            out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
+-        )
++        if quant_type_value == _QV_PER_1X32 and not _is_mxfp8(
++            quant_type_value, value_dtype
++        ):
++            add_rmsnorm_quant(
++                out,
++                x,
++                res1,
++                out_res1,
++                scale,
++                weight,
++                eps,
++                group_size,
++                shuffle,
++                scale_layout=mxfp4_scale_layout,
++            )
++        else:
++            add_rmsnorm_quant(
++                out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
++            )
+     return out, scale, out_res1
+ 
+ 
+@@ -268,6 +313,7 @@ class RMSNorm(nn.Module):
+         fused_quant_emit_bf16: bool = False,
+         quant_config: QuantizationConfig | None = None,
+         prefix: str = "",
++        mxfp4_scale_layout: int | None = None,
+     ) -> None:
+         super().__init__()
+         self.dim = dim
+@@ -295,6 +341,17 @@ class RMSNorm(nn.Module):
+         params_dtype = layer_quant_config.quant_dtype
+         self.quant_type = quant_type
+         self.params_dtype = params_dtype
++        self._mxfp4_scale_layout_explicit = mxfp4_scale_layout is not None
++        fp4_backend_spec = resolve_current_fp4_backend_spec(params_dtype)
++        self.mxfp4_scale_layout = (
++            int(mxfp4_scale_layout)
++            if mxfp4_scale_layout is not None
++            else (
++                int(fp4_backend_spec.activation_scale_layout)
++                if fp4_backend_spec is not None
++                else MXScaleLayout.AITER_E8M0
++            )
++        )
+         # transpose_scale (column-major scale) only applies to per_1x128 with
+         # the preshuffle GEMM consumer; resolve the env once at init time so
+         # forward sees a hot static bool instead of an env lookup per call.
+@@ -357,6 +414,10 @@ class RMSNorm(nn.Module):
+ 
+         self.quant_type = online_quant_type
+         self.params_dtype = online_cfg.quant_dtype
++        if not self._mxfp4_scale_layout_explicit:
++            fp4_backend_spec = resolve_current_fp4_backend_spec(self.params_dtype)
++            if fp4_backend_spec is not None:
++                self.mxfp4_scale_layout = int(fp4_backend_spec.activation_scale_layout)
+         self._aiter_transpose_scale = (
+             self.quant_type.value == _QV_PER_1X128
+             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+@@ -514,6 +575,7 @@ class RMSNorm(nn.Module):
+                     ),
+                     self.params_dtype,
+                     self._aiter_e8m0_scale,
++                    self.mxfp4_scale_layout,
+                 )
+                 if batched:
+                     x = x.view(*lead, -1)
 diff --git a/atom/model_ops/linear.py b/atom/model_ops/linear.py
-index 458f5db2ce48911ab76acb4cd72db2d6936a61ea..d8824cc69b021edd6e8a168db06c0d0f96d22b74 100644
+index 458f5db2c..c6797aac8 100644
 --- a/atom/model_ops/linear.py
 +++ b/atom/model_ops/linear.py
-@@ -154,6 +154,61 @@ def per_1x128_e8m0_quant(
-     )
+@@ -29,6 +29,13 @@ from torch import nn
  
- 
-+def needs_compatible_mxfp4_preshuffle_backend(
-+    params_dtype: torch.dtype,
-+    weight_is_preshuffled: bool,
-+    *,
-+    arch: str | None = None,
-+) -> bool:
-+    """Whether the default GEMM cannot consume this stored MXFP4 layout.
-+
-+    gfx1250 Opus expects ``shuffle_scale_f4``, while ATOM stores preshuffled
-+    weights with ``e8m0_shuffle``. The AITER preshuffle GEMM reads the latter.
-+    """
-+    if params_dtype != dtypes.fp4x2 or not weight_is_preshuffled:
-+        return False
-+    if arch is None:
-+        from aiter.jit.utils.chip_info import get_gfx_runtime
-+
-+        arch = get_gfx_runtime()
-+    return arch == "gfx1250"
-+
-+
-+def can_fuse_mxfp4_activation_quant(
-+    params_dtype: torch.dtype,
-+    weight_is_preshuffled: bool,
-+    *,
-+    arch: str | None = None,
-+) -> bool:
-+    """Whether fused quant emits the activation-scale layout this GEMM reads."""
-+    if params_dtype != dtypes.fp4x2 or not weight_is_preshuffled:
-+        return False
-+    if use_fp4_non_shuffle_triton_gemm() or use_triton_gemm():
-+        return False
-+    return not needs_compatible_mxfp4_preshuffle_backend(
-+        params_dtype,
-+        weight_is_preshuffled,
-+        arch=arch,
-+    )
-+
-+
-+def _require_mxfp4_preshuffle_gemm() -> Callable:
-+    global gemm_afp4wfp4_preshuffle
-+
-+    if gemm_afp4wfp4_preshuffle is None:
-+        try:
-+            from aiter.ops.triton.gemm_afp4wfp4 import (
-+                gemm_afp4wfp4_preshuffle as preshuffle_gemm,
-+            )
-+        except ImportError as e:
-+            raise RuntimeError(
-+                "The stored MXFP4 layout requires "
-+                "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
-+            ) from e
-+        gemm_afp4wfp4_preshuffle = preshuffle_gemm
-+    return gemm_afp4wfp4_preshuffle
-+
-+
- def gemm_a4w4_quant_fake(
-     x: torch.Tensor,
-     x_scale: torch.Tensor,
-@@ -163,6 +218,7 @@ def gemm_a4w4_quant_fake(
+ from atom.config import QuantizationConfig, get_current_atom_config
+ from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
++from atom.model_ops.fp4_layout import (
++    Fp4BackendKind,
++    MXScaleLayout,
++    decode_fp4_backend_layout_code,
++    resolve_current_fp4_backend_spec,
++    to_mxfp4_scale_layout,
++)
+ from atom.model_ops.utils import (
+     atom_parameter,
+     normalize_e4m3fn_to_e4m3fnuz,
+@@ -163,6 +170,7 @@ def gemm_a4w4_quant_fake(
      params_dtype: torch.dtype,
      input_scale: torch.Tensor,
      output_size: int,
-+    needs_compatible_preshuffle_backend: bool,
++    backend_layout_code: int,
  ) -> torch.Tensor:
      return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
  
-@@ -178,6 +234,7 @@ def gemm_a4w4_quant(
+@@ -178,10 +186,25 @@ def gemm_a4w4_quant(
      params_dtype: torch.dtype,
      input_scale: torch.Tensor,
      output_size: int,
-+    needs_compatible_preshuffle_backend: bool,
++    backend_layout_code: int,
  ) -> torch.Tensor:
++    if params_dtype == dtypes.fp4x2:
++        backend_kind, activation_scale_layout, weight_scale_layout = (
++            decode_fp4_backend_layout_code(backend_layout_code)
++        )
++    else:
++        # Preserve the pre-existing non-MXFP4/per_1x32 behavior. These values
++        # are not consumed outside the MXFP4 branches.
++        backend_kind = Fp4BackendKind.DEFAULT_AITER
++        activation_scale_layout = MXScaleLayout.AITER_E8M0
++        weight_scale_layout = MXScaleLayout.AITER_E8M0
++
      # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
      # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
-@@ -217,14 +274,17 @@ def gemm_a4w4_quant(
+-    if params_dtype == dtypes.fp4x2 and use_fp4_non_shuffle_triton_gemm():
++    if (
++        params_dtype == dtypes.fp4x2
++        and backend_kind == Fp4BackendKind.TRITON_NONSHUFFLE
++    ):
+         if gemm_afp4wfp4 is None:
+             raise RuntimeError(
+                 "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
+@@ -192,7 +215,7 @@ def gemm_a4w4_quant(
+                 x,
+                 quant_dtype=params_dtype,
+                 scale=input_scale,
+-                shuffle=False,
++                scale_layout=activation_scale_layout,
+             )
+         else:
+             x_scale = x_scale.view(torch.float8_e8m0fnu)
+@@ -209,6 +232,8 @@ def gemm_a4w4_quant(
+             dtype=otype,
+             device=x.device,
+         )
++        # This legacy Triton entry point has a fixed row-major scale ABI; the
++        # explicit backend code above rejects every other layout.
+         y = gemm_afp4wfp4(
+             x.view(torch.uint8),
+             weight.view(torch.uint8),
+@@ -217,14 +242,17 @@ def gemm_a4w4_quant(
              otype,
              y,
          )
@@ -384,57 +638,215 @@ index 458f5db2ce48911ab76acb4cd72db2d6936a61ea..d8824cc69b021edd6e8a168db06c0d0f
      elif (
          params_dtype == dtypes.fp4x2
 -        and use_triton_gemm()
-         and not use_fp4_non_shuffle_triton_gemm()
+-        and not use_fp4_non_shuffle_triton_gemm()
 -        and gemm_afp4wfp4_preshuffle is not None
-+        and (
-+            needs_compatible_preshuffle_backend
-+            or (use_triton_gemm() and gemm_afp4wfp4_preshuffle is not None)
-+        )
++        and backend_kind == Fp4BackendKind.TRITON_PRESHUFFLE
      ):
-+        preshuffle_gemm = _require_mxfp4_preshuffle_gemm()
++        if gemm_afp4wfp4_preshuffle is None:
++            raise RuntimeError(
++                "ATOM_USE_TRITON_GEMM=1 requires "
++                "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
++            )
          m, _ = x.view(-1, x.size(-1)).shape
  
          y = torch.empty(
-@@ -255,7 +315,7 @@ def gemm_a4w4_quant(
+@@ -242,61 +270,64 @@ def gemm_a4w4_quant(
+             x, x_scale = quant_func(
+                 x,
+                 quant_dtype=params_dtype,
+-                shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
++                scale_layout=activation_scale_layout,
+             )
          else:
-             x_scale = x_scale[:m, ...].view(torch.uint8)
+             x_scale = x_scale.view(torch.float8_e8m0fnu)
+             x = x.view(torch.float4_e2m1fn_x2)
  
--        y = gemm_afp4wfp4_preshuffle(
-+        y = preshuffle_gemm(
+-        if m >= MXFP4_QUANT_BLOCK_SIZE:
+-            x_scale = x_scale.view(torch.uint8).view(
+-                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+-            )
+-        else:
+-            x_scale = x_scale[:m, ...].view(torch.uint8)
+-
+         y = gemm_afp4wfp4_preshuffle(
              x.view(torch.uint8),
              weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
-             x_scale,
-@@ -806,6 +866,7 @@ class LinearBase(nn.Module):
-         self.need_normalize_e4m3fn_to_e4m3fnuz = params_dtype == torch.float8_e4m3fnuz
-         self.quant_func = get_hip_quant(self.quant_type)
-         self.is_output_padded = False
-+        self._needs_compatible_mxfp4_preshuffle_backend = False
+-            x_scale,
+-            weight_scale.view(torch.uint8).view(
+-                weight_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
+-            ),
++            x_scale.view(torch.uint8),
++            weight_scale.view(torch.uint8),
+             y=y,
++            x_scale_layout=activation_scale_layout,
++            w_scale_layout=weight_scale_layout,
+         )
+     # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
+     # and use the backend ASM implementation.
+     else:
+         if x_scale is None:
+             quant_func = get_hip_quant(QuantType.per_1x32)
+-            x, x_scale = quant_func(
+-                x,
+-                quant_dtype=params_dtype,
+-                scale=input_scale,
+-                shuffle=True,
+-            )
++            if params_dtype == dtypes.fp4x2:
++                x, x_scale = quant_func(
++                    x,
++                    quant_dtype=params_dtype,
++                    scale=input_scale,
++                    scale_layout=activation_scale_layout,
++                )
++            else:
++                # Preserve the legacy MXFP8/non-FP4 per_1x32 call exactly.
++                x, x_scale = quant_func(
++                    x,
++                    quant_dtype=params_dtype,
++                    scale=input_scale,
++                    shuffle=True,
++                )
+         else:
+             x_scale = x_scale.view(torch.float8_e8m0fnu)
+             x = x.view(torch.float4_e2m1fn_x2)
  
-     @property
-     def weight_scale_row_group(self) -> int:
-@@ -1252,6 +1313,12 @@ class LinearBase(nn.Module):
-             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
-         ):
-             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-+        self._needs_compatible_mxfp4_preshuffle_backend = (
-+            needs_compatible_mxfp4_preshuffle_backend(
-+                self.params_dtype,
-+                getattr(self.weight, "is_shuffled", False),
+         m = x.view(-1, x.size(-1)).shape[0]
+-        y = torch.empty(
+-            (
+-                (m + MXFP4_QUANT_BLOCK_SIZE - 1)
+-                // MXFP4_QUANT_BLOCK_SIZE
+-                * MXFP4_QUANT_BLOCK_SIZE,
+-                output_size,
+-            ),
+-            dtype=otype,
+-            device=x.device,
+-        )
+-        y = gemm_a4w4(
+-            x,
+-            weight,
+-            x_scale,
+-            weight_scale,
+-            y,
+-        )
++        if params_dtype == dtypes.fp4x2:
++            y = gemm_a4w4(
++                x,
++                weight,
++                x_scale,
++                weight_scale,
++                dtype=otype,
++                a_scale_layout=activation_scale_layout,
++                b_scale_layout=weight_scale_layout,
 +            )
-+        )
++        else:
++            y = gemm_a4w4(
++                x,
++                weight,
++                x_scale,
++                weight_scale,
++                dtype=otype,
++            )
  
+     return y[:m, ...]
+ 
+@@ -656,6 +687,9 @@ class LinearBase(nn.Module):
+             self.register_parameter("bias", None)
+         self.quant_type = quant_type
+         self.params_dtype = params_dtype
++        # Cached contract for every MXFP4 forward. It is refreshed once after
++        # online quantization at load time, because that pass can change dtype.
++        self.fp4_backend_spec = resolve_current_fp4_backend_spec(params_dtype)
+         # E8M0 rather than FP32 128x128 block scales, for the weight and the
+         # activation quantized for it alike (QuantizationConfig decides).
+         self.blockscale_e8m0_scale = (
+@@ -1163,6 +1197,9 @@ class LinearBase(nn.Module):
+         # Re-quantize before process_weights if online quantization is enabled
+         if self.quant_config is not None and self.quant_config.online_quant:
+             self.online_quantize_weight()
++        # online_quantize_weight may have changed params_dtype. Resolve the
++        # final consumer exactly once before transforming checkpoint scales.
++        self.fp4_backend_spec = resolve_current_fp4_backend_spec(self.params_dtype)
+         if self.params_dtype == NVFP4_DTYPE:
+             raise RuntimeError(
+                 f"{self.prefix}: NVFP4 weights were not converted to MXFP4 by "
+@@ -1225,34 +1262,47 @@ class LinearBase(nn.Module):
+             w_q, w_s = self.quant_func(
+                 self.weight.data,
+                 quant_dtype=self.params_dtype,
+-                shuffle=False,
++                scale_layout=MXScaleLayout.ROW_MAJOR,
+             )
+             self.weight.data = w_q
+             self.weight_scale = atom_parameter(w_s)
+             # Only quantized 2D GEMM weights use aiter's preshuffle layout.
+             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
+             # quantized models must keep that tensor unshuffled here.
+-            if self.weight.dim() == 2 and not use_fp4_non_shuffle_triton_gemm():
++            if (
++                self.weight.dim() == 2
++                and self.fp4_backend_spec.kind != Fp4BackendKind.TRITON_NONSHUFFLE
++            ):
+                 shuffle_weights(self.weight)
+-            # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+         else:
+-            need_shuffle = weight_is_stored_preshuffled(
+-                self.quant_type,
+-                self.params_dtype,
+-                needs_preshuffled_weight=getattr(
+-                    self, "needs_preshuffled_weight", False
+-                ),
+-            )
++            if self.fp4_backend_spec is not None:
++                need_shuffle = (
++                    self.fp4_backend_spec.kind != Fp4BackendKind.TRITON_NONSHUFFLE
++                )
++            else:
++                need_shuffle = weight_is_stored_preshuffled(
++                    self.quant_type,
++                    self.params_dtype,
++                    needs_preshuffled_weight=getattr(
++                        self, "needs_preshuffled_weight", False
++                    ),
++                )
+             if need_shuffle and self.weight.dim() == 2:
+                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
+                 shuffle_weights(self.weight)
+-                # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+-        # shuffle weight scale once so no reshuffling for every gemm
+-        if self.quant_type.value == QuantType.per_1x32.value and (
+-            self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
++        # Convert a checkpoint/online-quant row-major scale exactly once, so no
++        # layout transform is left in the GEMM hot path.
++        if (
++            self.quant_type.value == QuantType.per_1x32.value
++            and self.fp4_backend_spec is not None
+         ):
++            self.weight_scale.data = to_mxfp4_scale_layout(
++                self.weight_scale.data,
++                self.fp4_backend_spec.weight_scale_layout,
++            )
++        elif self.quant_type.value == QuantType.per_1x32.value:
++            # Preserve MXFP8 and legacy non-FP4 per_1x32 behavior.
+             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+-
      def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
          # The other half of the shuffle decision `process_weights_after_loading`
-@@ -1490,6 +1557,7 @@ class LinearBase(nn.Module):
+         # takes, so it answers on the same terms `weight_is_stored_preshuffled`
+@@ -1490,6 +1540,11 @@ class LinearBase(nn.Module):
                      self.params_dtype,
                      getattr(self, "input_scale", None),
                      self.output_size,
-+                    self._needs_compatible_mxfp4_preshuffle_backend,
++                    (
++                        self.fp4_backend_spec.backend_layout_code
++                        if self.fp4_backend_spec is not None
++                        else -1
++                    ),
                  )
                  if self.bias is not None:
                      y += self.bias
 diff --git a/atom/model_ops/mamba_ops/causal_conv1d.py b/atom/model_ops/mamba_ops/causal_conv1d.py
-index 16df71bbdf618fbb2232eb68a832a9bbf55fd690..293762b03b0674159db1964bf35f321ad7acfc60 100644
+index 16df71bbd..293762b03 100644
 --- a/atom/model_ops/mamba_ops/causal_conv1d.py
 +++ b/atom/model_ops/mamba_ops/causal_conv1d.py
 @@ -621,6 +621,70 @@ def causal_conv1d_fn(
@@ -679,22 +1091,258 @@ index 16df71bbdf618fbb2232eb68a832a9bbf55fd690..293762b03b0674159db1964bf35f321a
      )
      query = query.squeeze(-1)
      key = key.squeeze(-1)
+diff --git a/atom/models/deepseek_v2.py b/atom/models/deepseek_v2.py
+index c9d1865df..2cfc82676 100644
+--- a/atom/models/deepseek_v2.py
++++ b/atom/models/deepseek_v2.py
+@@ -97,6 +97,7 @@ from atom.model_ops.embed_head import (
+     ReplicatedEmbedding,
+     VocabParallelEmbedding,
+ )
++from atom.model_ops.fp4_layout import mxfp4_scale_buffer_shape
+ from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+ from atom.model_ops.layernorm import LayerNorm, RMSNorm
+ from atom.model_ops.linear import (
+@@ -478,6 +479,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
+     shuffle: bool = True,
+     scale_shuffle_padding: bool = True,
+     output_unquantized_inp1: bool = False,
++    mxfp4_scale_layout: int | None = None,
+ ) -> tuple[
+     torch.Tensor,
+     torch.Tensor,
+@@ -492,7 +494,11 @@ def _fuse_rmsnorm_fp4_quant_fake(
+ 
+     scale_n_valid = (n1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+ 
+-    if scale_shuffle_padding:
++    if mxfp4_scale_layout is not None:
++        scale_m, scale_n = mxfp4_scale_buffer_shape(
++            m, scale_n_valid, mxfp4_scale_layout
++        )
++    elif scale_shuffle_padding:
+         scale_m = ((m + 255) // 256) * 256
+         scale_n = ((scale_n_valid + 7) // 8) * 8
+     else:
+@@ -513,15 +519,6 @@ def _fuse_rmsnorm_fp4_quant_fake(
+     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+ 
+ 
+-def _mxfp4_activation_quant_layout(num_tokens: int) -> tuple[bool, bool]:
+-    if use_fp4_non_shuffle_triton_gemm():
+-        return False, False
+-    if use_triton_gemm():
+-        should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
+-        return should_shuffle, should_shuffle
+-    return True, True
+-
+-
+ def _fused_rms_fp8_quant_fake(
+     x1: torch.Tensor,
+     x1_weight: torch.Tensor,
+@@ -578,6 +575,7 @@ def _fuse_rmsnorm_fp4_quant(
+     shuffle: bool = True,
+     scale_shuffle_padding: bool = True,
+     output_unquantized_inp1: bool = False,
++    mxfp4_scale_layout: int | None = None,
+ ) -> tuple[
+     torch.Tensor,
+     torch.Tensor,
+@@ -596,6 +594,7 @@ def _fuse_rmsnorm_fp4_quant(
+             res1=res1,
+             shuffle=shuffle,
+             scale_shuffle_padding=scale_shuffle_padding,
++            scale_layout=mxfp4_scale_layout,
+             output_unquantized_inp1=output_unquantized_inp1,
+         )
+     )
+@@ -683,6 +682,7 @@ def _fuse_rmsnorm_quant(
+     quant_type: int | None = None,
+     output_unquantized_inp1: bool = False,
+     transpose_scale: bool = False,
++    mxfp4_scale_layout: int | None = None,
+ ):
+     if dtype_quant == dtypes.fp4x2:
+         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
+@@ -697,6 +697,7 @@ def _fuse_rmsnorm_quant(
+                 shuffle,
+                 scale_shuffle_padding,
+                 output_unquantized_inp1,
++                mxfp4_scale_layout,
+             )
+         )
+     elif dtype_quant == dtypes.fp8 or dtype_quant == torch.bfloat16:
+@@ -2854,6 +2855,14 @@ class DeepseekV2MLAAttention(nn.Module):
+             and eff_dtype in (dtypes.fp8, dtypes.fp4x2)
+         ):
+             self.fuse_qknorm_quant = True
++        self.use_fused_qkv_norm_quant = (
++            self.fuse_qknorm_quant
++            and use_triton_gemm()
++            and (
++                self.quant_dtype != dtypes.fp4x2
++                or not use_fp4_non_shuffle_triton_gemm()
++            )
++        )
+ 
+     def forward(
+         self,
+@@ -2872,8 +2881,16 @@ class DeepseekV2MLAAttention(nn.Module):
+             else:
+                 hidden_states, hidden_states_scale = hidden_states
+ 
++        # q/k norm quant feeds q_b_proj, so only reuse the fused producer when
++        # its cached scheme still matches that consumer after online quant.
++        fuse_qknorm_quant = False
+         if self.q_lora_rank is not None:
+-            if self.fuse_qknorm_quant and use_triton_gemm():
++            fuse_qknorm_quant = (
++                self.fuse_qknorm_quant
++                and self.quant_dtype == self.q_b_proj.params_dtype
++                and self.qknorm_quant_type == self.q_b_proj.quant_type.value
++            )
++            if self.use_fused_qkv_norm_quant and fuse_qknorm_quant:
+                 q_c, q_c_scale, kv_c_normed, k_pe = (
+                     _fuse_qkv_a_proj_reduce_rmsnorm_quant(
+                         hidden_states,
+@@ -2906,13 +2923,21 @@ class DeepseekV2MLAAttention(nn.Module):
+                     dim=-1,
+                 )
+                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
+-                if self.fuse_qknorm_quant or self.fuse_qknorm:
+-                    q_shuffle = False
+-                    q_scale_shuffle_padding = False
+-                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
+-                        q_shuffle, q_scale_shuffle_padding = (
+-                            _mxfp4_activation_quant_layout(q_c.shape[0])
+-                        )
++                if fuse_qknorm_quant or self.fuse_qknorm:
++                    qknorm_dtype = (
++                        self.quant_dtype if fuse_qknorm_quant else torch.bfloat16
++                    )
++                    qknorm_quant_type = (
++                        self.qknorm_quant_type
++                        if fuse_qknorm_quant
++                        else QuantType.No.value
++                    )
++                    q_backend = self.q_b_proj.fp4_backend_spec
++                    mxfp4_scale_layout = (
++                        q_backend.activation_scale_layout
++                        if qknorm_dtype == dtypes.fp4x2 and q_backend is not None
++                        else None
++                    )
+                     (
+                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
+                         _,
+@@ -2926,13 +2951,14 @@ class DeepseekV2MLAAttention(nn.Module):
+                         self.kv_a_layernorm.weight,
+                         self.kv_a_layernorm.eps,
+                         None,
+-                        dtype_quant=self.quant_dtype,
+-                        shuffle=q_shuffle,
+-                        scale_shuffle_padding=q_scale_shuffle_padding,
++                        dtype_quant=qknorm_dtype,
++                        shuffle=False,
++                        scale_shuffle_padding=False,
+                         group_size=128,
+-                        quant_type=self.qknorm_quant_type,
++                        quant_type=qknorm_quant_type,
+                         output_unquantized_inp1=False,
+                         transpose_scale=True,
++                        mxfp4_scale_layout=mxfp4_scale_layout,
+                     )
+                 else:
+                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
+@@ -2943,7 +2969,7 @@ class DeepseekV2MLAAttention(nn.Module):
+                 [self.kv_lora_rank, self.qk_rope_head_dim],
+                 dim=-1,
+             )
+-        if not self.fuse_qknorm_quant and not self.fuse_qknorm:
++        if not fuse_qknorm_quant and not self.fuse_qknorm:
+             kv_c_normed = self.kv_a_layernorm(kv_c)
+             hidden_states_or_q_c_scale = None
+         if self.is_v32 and self.indexer is not None and not self.skip_topk:
+@@ -3061,6 +3087,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+             if uses_quantized_attn_input(attn_input_quant_config):
+                 self.quant_dtype = attn_input_quant_config.quant_dtype
+                 self.input_norm_quant_type = attn_input_quant_config.quant_type.value
++        self.input_quant_consumer_name = attn_input_proj_name
+         self.fuse_input_norm_quant = False
+         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
+         # DSA models (e.g., GLM-5/DeepSeek-V3.2): the indexer's wk/weights_proj GEMMs
+@@ -3168,12 +3195,19 @@ class DeepseekV2DecoderLayer(nn.Module):
+             weight = self.input_layernorm.weight
+             eps = self.input_layernorm.eps
+             if self.quant_dtype == dtypes.fp4x2:
+-                shuffle_input_norm_quant, scale_shuffle_padding = (
+-                    _mxfp4_activation_quant_layout(hidden_states.shape[0])
++                shuffle_input_norm_quant = False
++                scale_shuffle_padding = False
++                input_consumer = getattr(self.self_attn, self.input_quant_consumer_name)
++                input_backend = input_consumer.fp4_backend_spec
++                mxfp4_scale_layout = (
++                    input_backend.activation_scale_layout
++                    if input_backend is not None
++                    else None
+                 )
+             else:
+                 shuffle_input_norm_quant = True
+                 scale_shuffle_padding = True
++                mxfp4_scale_layout = None
+             if residual is None:
+                 residual = hidden_states
+                 (
+@@ -3196,6 +3230,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+                     quant_type=self.input_norm_quant_type,
+                     output_unquantized_inp1=self.emit_bf16_for_indexer,
+                     transpose_scale=True,
++                    mxfp4_scale_layout=mxfp4_scale_layout,
+                 )
+             else:
+                 (
+@@ -3218,6 +3253,7 @@ class DeepseekV2DecoderLayer(nn.Module):
+                     quant_type=self.input_norm_quant_type,
+                     output_unquantized_inp1=self.emit_bf16_for_indexer,
+                     transpose_scale=True,
++                    mxfp4_scale_layout=mxfp4_scale_layout,
+                 )
+ 
+             # v32 indexer layers: pass the bf16 mirror as the 3rd tuple slot so the
 diff --git a/atom/models/kimi_k3.py b/atom/models/kimi_k3.py
-index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a530977068622dccb 100644
+index 8729d883b..0e2cdfd5b 100644
 --- a/atom/models/kimi_k3.py
 +++ b/atom/models/kimi_k3.py
-@@ -44,8 +44,8 @@ from atom.model_ops.linear import (
+@@ -44,8 +44,6 @@ from atom.model_ops.linear import (
      MergedReplicatedLinear,
      ReplicatedLinear,
      RowParallelLinear,
 -    use_fp4_non_shuffle_triton_gemm,
 -    use_triton_gemm,
-+    can_fuse_mxfp4_activation_quant,
-+    weight_is_stored_preshuffled,
  )
  from atom.model_ops.mamba_ops.causal_conv1d import (
      causal_conv1d_fn,
-@@ -219,7 +219,7 @@ class KimiRMSNormGated(nn.Module):
+@@ -177,6 +175,20 @@ def _effective_layer_quant(
+     return cfg.quant_type, cfg.quant_dtype
+ 
+ 
++def _should_fuse_routed_norm_quant(
++    latent_moe_use_norm: bool,
++    quant_type: QuantType,
++    quant_dtype: torch.dtype | None,
++) -> bool:
++    return latent_moe_use_norm and (
++        (quant_type.value == QuantType.per_1x32.value and quant_dtype == dtypes.fp4x2)
++        or (
++            quant_type.value in (QuantType.per_1x128.value, QuantType.per_Token.value)
++            and quant_dtype == dtypes.fp8
++        )
++    )
++
++
+ class SituAndMul(nn.Module):
+     def __init__(
+         self,
+@@ -219,7 +231,7 @@ class KimiRMSNormGated(nn.Module):
          self.quant_type = quant_type
          self.quant_dtype = quant_dtype
  
@@ -703,7 +1351,7 @@ index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a53097706
          from atom.model_ops.kimi_k3 import rmsnorm_gated
  
          return rmsnorm_gated(
-@@ -229,6 +229,7 @@ class KimiRMSNormGated(nn.Module):
+@@ -229,6 +241,7 @@ class KimiRMSNormGated(nn.Module):
              self.variance_epsilon,
              quant_type=self.quant_type,
              quant_dtype=self.quant_dtype,
@@ -711,7 +1359,7 @@ index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a53097706
          )
  
  
-@@ -400,18 +401,20 @@ class KimiSparseMoeBlock(nn.Module):
+@@ -400,23 +413,12 @@ class KimiSparseMoeBlock(nn.Module):
                  quant_config, up_proj_prefix
              )
              latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
@@ -721,25 +1369,68 @@ index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a53097706
 -            # standalone quant path until the fused kernel supports both layouts.
 -            fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
 -                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
-+            # Fused RMSNorm emits preshuffled MXFP4 scales, but the compatible
-+            # backend needs row-major scales for routed M < 32.
-+            fp4_fused_quant_compatible = can_fuse_mxfp4_activation_quant(
-+                up_proj_quant_dtype,
-+                weight_is_stored_preshuffled(
-+                    up_proj_quant_type,
-+                    up_proj_quant_dtype,
-+                ),
-             )
-             self.fuse_routed_norm_quant = latent_moe_use_norm and (
-                 (
-                     up_proj_quant_type == QuantType.per_1x32
-                     and up_proj_quant_dtype == dtypes.fp4x2
+-            )
+-            self.fuse_routed_norm_quant = latent_moe_use_norm and (
+-                (
+-                    up_proj_quant_type == QuantType.per_1x32
+-                    and up_proj_quant_dtype == dtypes.fp4x2
 -                    and not fp4_triton_active
-+                    and fp4_fused_quant_compatible
+-                )
+-                or (
+-                    up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)
+-                    and up_proj_quant_dtype == dtypes.fp8
+-                )
++            # AITER RMSNorm+quant emits the explicit activation-scale layout
++            # cached by the routed up-projection's backend contract.
++            self.fuse_routed_norm_quant = _should_fuse_routed_norm_quant(
++                latent_moe_use_norm,
++                up_proj_quant_type,
++                up_proj_quant_dtype,
+             )
+             self.routed_expert_norm = (
+                 RMSNorm(
+@@ -425,6 +427,11 @@ class KimiSparseMoeBlock(nn.Module):
+                     fused_quant=self.fuse_routed_norm_quant,
+                     quant_config=quant_config,
+                     prefix=up_proj_prefix,
++                    mxfp4_scale_layout=(
++                        self.routed_expert_up_proj.fp4_backend_spec.activation_scale_layout
++                        if self.routed_expert_up_proj.fp4_backend_spec is not None
++                        else None
++                    ),
                  )
-                 or (
-                     up_proj_quant_type in (QuantType.per_1x128, QuantType.per_Token)
-@@ -1237,10 +1240,12 @@ class KimiKDAAttention(nn.Module):
+                 if latent_moe_use_norm
+                 else None
+@@ -833,14 +840,12 @@ class KimiFullAttention(nn.Module):
+         )
+         q_shuffle = False
+         q_scale_shuffle_padding = False
+-        if self.qknorm_dtype == dtypes.fp4x2:
+-            from atom.model_ops.linear import use_triton_gemm
+-            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+-
+-            if not use_triton_gemm():
+-                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+-                    q_c.shape[0]
+-                )
++        q_backend = self.q_b_proj.fp4_backend_spec
++        mxfp4_scale_layout = (
++            q_backend.activation_scale_layout
++            if self.qknorm_dtype == dtypes.fp4x2 and q_backend is not None
++            else None
++        )
+         (q, q_scale), _, kv, _ = _fuse_rmsnorm_quant(
+             q_c,
+             self.q_a_layernorm.weight,
+@@ -856,6 +861,7 @@ class KimiFullAttention(nn.Module):
+             quant_type=self.qknorm_quant_type_value,
+             output_unquantized_inp1=False,
+             transpose_scale=True,
++            mxfp4_scale_layout=mxfp4_scale_layout,
+         )
+         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
+         gate = self.g_proj(hidden_states, hidden_states_scale)
+@@ -1237,10 +1243,12 @@ class KimiKDAAttention(nn.Module):
          else:
              gate = self.f_b_proj(f_a_view.contiguous())
          gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
@@ -756,7 +1447,7 @@ index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a53097706
  
          conv_weights = self.conv_weight
          state_indices = kda_metadata.non_spec_state_indices_tensor
-@@ -1298,7 +1303,9 @@ class KimiKDAAttention(nn.Module):
+@@ -1298,7 +1306,9 @@ class KimiKDAAttention(nn.Module):
              # initial_state dtype; the gathered initial is allocated as such),
              # so no .to() cast is needed.
              ssm_state[state_indices] = last_state
@@ -767,7 +1458,7 @@ index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a53097706
          elif kda_metadata.num_decodes > 0:
              # Slice the per-token cache-slot indices once (used for both the
              # conv update and the fused recurrence below).
-@@ -1452,7 +1459,9 @@ class KimiKDAAttention(nn.Module):
+@@ -1452,7 +1462,9 @@ class KimiKDAAttention(nn.Module):
              out.zero_()
  
          normed = self.o_norm(
@@ -778,9 +1469,103 @@ index 8729d883b18d3b0d8751039bc7c5902c90b6a98a..b88a663d6ced138f031a1a3a53097706
          )
          # A fused per-token quant makes o_norm return (quantized, scale); feed it
          # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
+diff --git a/atom/models/kimi_k3_dspark.py b/atom/models/kimi_k3_dspark.py
+index 3feeba430..1c3e28ce4 100644
+--- a/atom/models/kimi_k3_dspark.py
++++ b/atom/models/kimi_k3_dspark.py
+@@ -450,14 +450,12 @@ class K3DSparkMLAAttention(nn.Module):
+         # degrades to a plain fused norm pair with q_scale None.
+         q_shuffle = False
+         q_scale_shuffle_padding = False
+-        if self.qknorm_dtype == dtypes.fp4x2:
+-            from atom.model_ops.linear import use_triton_gemm
+-            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
+-
+-            if not use_triton_gemm():
+-                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
+-                    q_lora.shape[0]
+-                )
++        q_backend = self.q_b_proj.fp4_backend_spec
++        mxfp4_scale_layout = (
++            q_backend.activation_scale_layout
++            if self.qknorm_dtype == dtypes.fp4x2 and q_backend is not None
++            else None
++        )
+         (q_c, q_scale), _, kv_c, _ = _fuse_rmsnorm_quant(
+             q_lora,
+             self.q_a_layernorm.weight,
+@@ -473,6 +471,7 @@ class K3DSparkMLAAttention(nn.Module):
+             quant_type=self.qknorm_quant_type_value,
+             output_unquantized_inp1=False,
+             transpose_scale=True,
++            mxfp4_scale_layout=mxfp4_scale_layout,
+         )
+         return self.mla_attn(q_c, kv_c, k_pe, positions, q_scale=q_scale)
+ 
+diff --git a/atom/plugin/sglang/models/deepseek_mla_forward.py b/atom/plugin/sglang/models/deepseek_mla_forward.py
+index 7dcf85257..d7d1d3079 100644
+--- a/atom/plugin/sglang/models/deepseek_mla_forward.py
++++ b/atom/plugin/sglang/models/deepseek_mla_forward.py
+@@ -21,7 +21,6 @@ from atom.model_ops.base_attention import Attention
+ from atom.model_ops.utils import dynamic_per_batched_tensor_quant
+ from atom.models.deepseek_v2 import (
+     _fuse_rmsnorm_quant,
+-    _mxfp4_activation_quant_layout,
+ )
+ from atom.models.utils import maybe_prefix
+ from atom.plugin.sglang.models.kv_cache_utils import is_fp8_kv_cache_dtype
+@@ -199,10 +198,10 @@ def _fuse_qk_rmsnorm_and_q_quant(
+     """Fuse q/k RMSNorm and q quant using ATOM's DeepSeek-V2 path."""
+ 
+     if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
+-        q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(q.shape[0])
++        spec = attn.q_b_proj.fp4_backend_spec
++        mxfp4_scale_layout = spec.activation_scale_layout if spec is not None else None
+     else:
+-        q_shuffle = False
+-        q_scale_shuffle_padding = False
++        mxfp4_scale_layout = None
+ 
+     (q_quantized, q_scale), q_normed, k_nope_normed, _ = _fuse_rmsnorm_quant(
+         q,
+@@ -213,12 +212,13 @@ def _fuse_qk_rmsnorm_and_q_quant(
+         attn.kv_a_layernorm.eps,
+         None,
+         dtype_quant=attn.quant_dtype,
+-        shuffle=q_shuffle,
+-        scale_shuffle_padding=q_scale_shuffle_padding,
++        shuffle=False,
++        scale_shuffle_padding=False,
+         group_size=128,
+         quant_type=_linear_quant_type_value(attn.q_b_proj),
+         output_unquantized_inp1=output_unquantized_q,
+         transpose_scale=True,
++        mxfp4_scale_layout=mxfp4_scale_layout,
+     )
+     return q_quantized, q_scale, q_normed, k_nope_normed
+ 
+diff --git a/atom/rollout/weight_updater.py b/atom/rollout/weight_updater.py
+index a6d945868..039e77736 100644
+--- a/atom/rollout/weight_updater.py
++++ b/atom/rollout/weight_updater.py
+@@ -890,6 +890,14 @@ class WeightUpdaterMixin:
+             self._await_readers_of(param)
+             shuffle_weights(param)
+ 
++        # Deliberately do not transform MXFP4 weight_scale here. The rollout
++        # update protocol ignores incoming scale tensors and does not provide a
++        # new row-major scale paired with this weight; the module therefore
++        # still owns the loader-prepared consumer-layout scale. Applying the
++        # load-time row-major -> consumer transform again would double-shuffle
++        # it. Supporting independently quantized MXFP4 updates requires syncing
++        # weight and row-major scale as one explicit protocol change.
++
+     def update_weights(
+         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
+     ) -> int:
 diff --git a/tests/model_ops/test_causal_conv1d_update.py b/tests/model_ops/test_causal_conv1d_update.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..51f1323631e20de24ed9d91dfff8471ec82ebb67
+index 000000000..51f132363
 --- /dev/null
 +++ b/tests/model_ops/test_causal_conv1d_update.py
 @@ -0,0 +1,173 @@
@@ -959,7 +1744,7 @@ index 0000000000000000000000000000000000000000..51f1323631e20de24ed9d91dfff8471e
 +    assert torch.equal(state[8], x.new_tensor([1, 1, 2]).expand(dim, -1))
 diff --git a/tests/model_ops/test_k3_causal_conv1d_prefill.py b/tests/model_ops/test_k3_causal_conv1d_prefill.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e2850da1381649217e4fa99cfdcb084dca9a0b1
+index 000000000..1e2850da1
 --- /dev/null
 +++ b/tests/model_ops/test_k3_causal_conv1d_prefill.py
 @@ -0,0 +1,147 @@
@@ -1112,7 +1897,7 @@ index 0000000000000000000000000000000000000000..1e2850da1381649217e4fa99cfdcb084
 +    assert torch.equal(candidate_state, reference_state.to(torch.bfloat16))
 diff --git a/tests/model_ops/test_kimi_k3_activations.py b/tests/model_ops/test_kimi_k3_activations.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..add2362b48712e3c40ffad9d65fdcb135ee2070c
+index 000000000..add2362b4
 --- /dev/null
 +++ b/tests/model_ops/test_kimi_k3_activations.py
 @@ -0,0 +1,110 @@
@@ -1228,7 +2013,7 @@ index 0000000000000000000000000000000000000000..add2362b48712e3c40ffad9d65fdcb13
 +    assert torch.equal(from_view, from_copy)
 diff --git a/tests/model_ops/test_kimi_k3_attention_residual.py b/tests/model_ops/test_kimi_k3_attention_residual.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8a96612f7deb6d67fa0272328611bec95542d7c
+index 000000000..d8a96612f
 --- /dev/null
 +++ b/tests/model_ops/test_kimi_k3_attention_residual.py
 @@ -0,0 +1,59 @@
@@ -1293,7 +2078,7 @@ index 0000000000000000000000000000000000000000..d8a96612f7deb6d67fa0272328611bec
 +    torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
 diff --git a/tests/model_ops/test_triton_mla_splits.py b/tests/model_ops/test_triton_mla_splits.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..baa133578a4ce5f7c2c0a7b8541714e1012895a5
+index 000000000..baa133578
 --- /dev/null
 +++ b/tests/model_ops/test_triton_mla_splits.py
 @@ -0,0 +1,115 @@
@@ -1412,98 +2197,201 @@ index 0000000000000000000000000000000000000000..baa133578a4ce5f7c2c0a7b8541714e1
 +    assert seen["splits"] == expected
 +    assert seen["logits"].shape[2] == expected
 +    assert seen["logits"].data_ptr() == logits.data_ptr()
+diff --git a/tests/test_mxfp4_layout_contract.py b/tests/test_mxfp4_layout_contract.py
+new file mode 100644
+index 000000000..49cf6ae6c
+--- /dev/null
++++ b/tests/test_mxfp4_layout_contract.py
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
++
++import inspect
++
++import pytest
++import torch
++from aiter import QuantType, dtypes
++
++if not torch.cuda.is_available():
++    pytest.skip("MXFP4 layout integration requires ROCm", allow_module_level=True)
++
++from atom.model_ops.fp4_layout import (
++    Fp4BackendKind,
++    MXScaleLayout,
++    decode_fp4_backend_layout_code,
++    resolve_fp4_backend_spec,
++)
++from atom.model_ops.layernorm import _aiter_rms_quant_fake
++from atom.model_ops.linear import gemm_a4w4_quant, gemm_a4w4_quant_fake
++from atom.models.deepseek_v2 import (
++    _fuse_rmsnorm_fp4_quant_fake,
++)
++from atom.models.kimi_k3 import _should_fuse_routed_norm_quant
++
++
++@pytest.mark.parametrize(
++    "arch,triton,nonshuffle,kind,layout",
++    [
++        ("gfx1250", False, False, Fp4BackendKind.DEFAULT_AITER, MXScaleLayout.OPUS_F4),
++        (
++            "gfx950",
++            False,
++            False,
++            Fp4BackendKind.DEFAULT_AITER,
++            MXScaleLayout.AITER_E8M0,
++        ),
++        (
++            "gfx1250",
++            True,
++            False,
++            Fp4BackendKind.TRITON_PRESHUFFLE,
++            MXScaleLayout.AITER_E8M0,
++        ),
++        (
++            "gfx1250",
++            True,
++            True,
++            Fp4BackendKind.TRITON_NONSHUFFLE,
++            MXScaleLayout.ROW_MAJOR,
++        ),
++    ],
++)
++def test_fp4_backend_layout_contract(arch, triton, nonshuffle, kind, layout):
++    spec = resolve_fp4_backend_spec(arch, dtypes.fp4x2, triton, nonshuffle)
++    assert spec is not None
++    assert (spec.kind, spec.activation_scale_layout, spec.weight_scale_layout) == (
++        kind,
++        layout,
++        layout,
++    )
++    assert decode_fp4_backend_layout_code(spec.backend_layout_code) == (
++        kind,
++        layout,
++        layout,
++    )
++
++
++def test_non_fp4_has_no_fp4_backend_contract():
++    assert resolve_fp4_backend_spec("gfx1250", dtypes.fp8, True, False) is None
++
++
++@pytest.mark.parametrize(
++    "layout,shape",
++    [
++        (MXScaleLayout.ROW_MAJOR, (5, 8)),
++        (MXScaleLayout.AITER_E8M0, (256, 8)),
++        (MXScaleLayout.OPUS_F4, (32, 8)),
++    ],
++)
++def test_fused_rmsnorm_fake_allocates_consumer_layout(layout, shape):
++    x = torch.empty((5, 256), device="cuda", dtype=torch.bfloat16)
++    weight = torch.empty((256,), device="cuda", dtype=torch.bfloat16)
++    _, scale, _ = _aiter_rms_quant_fake(
++        x,
++        weight,
++        1e-6,
++        QuantType.per_1x32.value,
++        False,
++        value_dtype=dtypes.fp4x2,
++        mxfp4_scale_layout=layout,
++    )
++    assert tuple(scale.shape) == shape
++
++
++@pytest.mark.parametrize(
++    "layout,shape",
++    [
++        (MXScaleLayout.ROW_MAJOR, (5, 8)),
++        (MXScaleLayout.AITER_E8M0, (256, 8)),
++        (MXScaleLayout.OPUS_F4, (32, 8)),
++    ],
++)
++def test_legacy_fused_rmsnorm_fake_uses_explicit_layout(layout, shape):
++    x = torch.empty((5, 256), device="cuda", dtype=torch.bfloat16)
++    weight = torch.empty((256,), device="cuda", dtype=torch.bfloat16)
++    _, scale, *_ = _fuse_rmsnorm_fp4_quant_fake(
++        x,
++        weight,
++        1e-6,
++        shuffle=False,
++        scale_shuffle_padding=False,
++        mxfp4_scale_layout=layout,
++    )
++    assert tuple(scale.shape) == shape
++
++
++def test_gemm_custom_op_carries_one_backend_layout_scalar():
++    assert gemm_a4w4_quant is not None
++    assert tuple(inspect.signature(gemm_a4w4_quant_fake).parameters)[-1] == (
++        "backend_layout_code"
++    )
++    assert "backend_layout_code" in str(torch.ops.aiter.gemm_a4w4_quant.default._schema)
++
++
++@pytest.mark.parametrize(
++    "quant_type,dtype,expected",
++    [
++        (QuantType.per_1x32, dtypes.fp4x2, True),
++        (QuantType.per_1x32, dtypes.fp8, False),
++        (QuantType.per_1x128, dtypes.fp8, True),
++        (QuantType.per_Token, dtypes.fp8, True),
++        (QuantType.per_Tensor, dtypes.fp8, False),
++    ],
++)
++def test_kimi_routed_norm_fusion_contract(quant_type, dtype, expected):
++    assert _should_fuse_routed_norm_quant(True, quant_type, dtype) is expected
++    assert not _should_fuse_routed_norm_quant(False, quant_type, dtype)
 diff --git a/tests/test_weight_sync_shuffle_layout.py b/tests/test_weight_sync_shuffle_layout.py
-index 88ea4c3733cc19dcf9bbfb8d992710edd6b99fae..ab63ff54d3b5456456baa572c4983c2dab2af71e 100644
+index 88ea4c373..3f35cc5c9 100644
 --- a/tests/test_weight_sync_shuffle_layout.py
 +++ b/tests/test_weight_sync_shuffle_layout.py
-@@ -33,6 +33,8 @@ from aiter import QuantType, dtypes
+@@ -31,6 +31,11 @@ if not torch.cuda.is_available():
+ from aiter import QuantType, dtypes
+ 
  from atom.model_ops import linear as linear_mod
++from atom.model_ops.fp4_layout import (
++    Fp4BackendKind,
++    Fp4BackendSpec,
++    MXScaleLayout,
++)
  from atom.model_ops.linear import (
      LinearBase,
-+    can_fuse_mxfp4_activation_quant,
-+    needs_compatible_mxfp4_preshuffle_backend,
      weight_is_stored_preshuffled,
- )
- from atom.rollout.weight_updater import WeightUpdaterMixin
-@@ -110,6 +112,47 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
-     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
- 
- 
-+def test_gfx1250_mxfp4_preshuffle_requires_compatible_backend():
-+    assert needs_compatible_mxfp4_preshuffle_backend(dtypes.fp4x2, True, arch="gfx1250")
-+
-+
-+def test_mxfp4_backend_override_is_layout_and_arch_specific():
-+    assert not needs_compatible_mxfp4_preshuffle_backend(
-+        dtypes.fp4x2, True, arch="gfx950"
-+    )
-+    assert not needs_compatible_mxfp4_preshuffle_backend(
-+        dtypes.fp4x2, False, arch="gfx1250"
-+    )
-+    assert not needs_compatible_mxfp4_preshuffle_backend(
-+        dtypes.fp8, True, arch="gfx1250"
-+    )
-+
-+
-+def test_fused_mxfp4_quant_rejects_m_dependent_gfx1250_layout(monkeypatch):
-+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
-+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
-+
-+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx1250")
-+    assert can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx950")
-+
-+
-+def test_fused_mxfp4_quant_rejects_triton_layouts(monkeypatch):
-+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: True)
-+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
-+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, True, arch="gfx950")
-+
-+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
-+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
-+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, False, arch="gfx950")
-+
-+
-+def test_fused_mxfp4_quant_is_dtype_and_layout_specific(monkeypatch):
-+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
-+    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
-+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp8, True, arch="gfx950")
-+    assert not can_fuse_mxfp4_activation_quant(dtypes.fp4x2, False, arch="gfx950")
-+
-+
- # ── the property: load and sync agree ─────────────────────────────────────
- 
- 
-@@ -153,6 +196,11 @@ def _updater_double():
- def _loader_shuffles(monkeypatch, case, *, dim=2):
-     calls = []
-     monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: calls.append(a))
-+    monkeypatch.setattr(
-+        linear_mod,
-+        "needs_compatible_mxfp4_preshuffle_backend",
-+        lambda *a, **k: False,
-+    )
-     # per_1x32 shuffles its scale through aiter at the end of the method; that
-     # is not what is under test and it wants a real e8m0 tensor.
+@@ -158,10 +163,39 @@ def _loader_shuffles(monkeypatch, case, *, dim=2):
      monkeypatch.setattr(
-@@ -162,6 +210,23 @@ def _loader_shuffles(monkeypatch, case, *, dim=2):
+         linear_mod.fp4_utils, "e8m0_shuffle", lambda scale: scale, raising=False
+     )
++    monkeypatch.setattr(
++        linear_mod, "to_mxfp4_scale_layout", lambda scale, _layout: scale
++    )
+     LinearBase.process_weights_after_loading(_linear_double(*case, dim=dim))
      return bool(calls)
  
  
-+def test_loader_caches_mxfp4_backend_capability(monkeypatch):
-+    module = _linear_double(QuantType.per_1x32, dtypes.fp4x2, False)
-+    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **k: None)
-+    monkeypatch.setattr(
-+        linear_mod.fp4_utils, "e8m0_shuffle", lambda scale: scale, raising=False
++def test_loader_converts_mxfp4_scale_to_resolved_backend(monkeypatch):
++    spec = Fp4BackendSpec(
++        Fp4BackendKind.DEFAULT_AITER,
++        MXScaleLayout.OPUS_F4,
++        MXScaleLayout.OPUS_F4,
 +    )
++    converted = []
++    monkeypatch.setattr(
++        linear_mod, "resolve_current_fp4_backend_spec", lambda _dtype: spec
++    )
++    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *_a, **_k: None)
 +    monkeypatch.setattr(
 +        linear_mod,
-+        "needs_compatible_mxfp4_preshuffle_backend",
-+        lambda *a, **k: True,
++        "to_mxfp4_scale_layout",
++        lambda scale, layout: converted.append((scale, layout)) or scale,
 +    )
++    module = _linear_double(QuantType.per_1x32, dtypes.fp4x2, False)
 +
 +    LinearBase.process_weights_after_loading(module)
 +
-+    assert module._needs_compatible_mxfp4_preshuffle_backend is True
++    assert module.fp4_backend_spec is spec
++    assert len(converted) == 1
++    assert converted[0][0].data_ptr() == module.weight_scale.data_ptr()
++    assert converted[0][1] == MXScaleLayout.OPUS_F4
 +
 +
  def _sync_shuffles(monkeypatch, case, *, dim=2):

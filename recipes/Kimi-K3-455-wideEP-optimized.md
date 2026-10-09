@@ -100,8 +100,10 @@ the preflight reports Triton 3.8, upgrade Triton; do not restore #6120.
 
 - [ATOM #2458](https://github.com/ROCm/ATOM/pull/2458): multi-row K3 gated
   RMSNorm pipeline.
-- [ATOM #2466](https://github.com/ROCm/ATOM/pull/2466): correct gfx1250 MXFP4
-  preshuffled weight/scale dispatch and unsafe fusion guard.
+- [ATOM #2505](https://github.com/ROCm/ATOM/pull/2505): bind MXFP4
+  producers and GEMMs through an explicit backend/layout contract.
+- [AITER #6294](https://github.com/ROCm/aiter/pull/6294): define the
+  row-major, AITER E8M0, and Opus F4 scale-layout ABI consumed by #2505.
 - [AITER #6097](https://github.com/ROCm/aiter/pull/6097): already in the pinned
   AITER base; fixes gfx1250 MXFP4 TDM fusion stability.
 - [AITER #6078](https://github.com/ROCm/aiter/pull/6078): use gfx1250's real
@@ -115,7 +117,8 @@ the preflight reports Triton 3.8, upgrade Triton; do not restore #6120.
 - [AITER #6131](https://github.com/ROCm/aiter/pull/6131): specialize the exact
   gfx1250 sigmoid top-k family.
 
-ATOM #2447 and the closed ATOM grouped-top-k candidate are deliberately absent.
+ATOM #2447, the closed #2466 compatibility bridge, and the closed ATOM
+grouped-top-k candidate are deliberately absent.
 AITER #6120 is also absent: it was closed after Triton 3.9 passed the exact
 production case `3/3` strict.
 

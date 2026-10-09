@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "generated_utc": "2026-10-09T00:55:00Z",
+  "generated_utc": "2026-10-09T03:36:43Z",
   "runtime_requirements": {
     "triton": {
       "minimum_version": "3.9",
@@ -13,11 +13,11 @@
     "atom": {
       "repository": "https://github.com/ROCm/ATOM.git",
       "base_sha": "a526f0d557eeed08396670249af58bd85fa57338",
-      "head_sha": "f07ccf50090f11b765e5e2473ea26a22423a1c6f",
-      "result_tree_sha": "bc9eb01762f6a46c0c9d43857c8352e90608221c",
+      "head_sha": "a876e3b2f394c86be60ec6c2f35dfc598a622777",
+      "result_tree_sha": "e873ef0ea665fe99177f034d72dfe7bd6df7561c",
       "pull_requests": {
         "2458": "9f20a70eae89c1e86126d6d9303dbbb93cd84bd7",
-        "2466": "b52cc831a1626c913c3dfb8435300cc32a795e9a"
+        "2505": "45fbbb51ba8e6efe8832eba0cf58238808578730"
       },
       "retained_local_candidates": [
         "KDA W8 recurrence launch",
@@ -28,26 +28,34 @@
       ],
       "excluded": [
         "ATOM PR #2447",
+        "closed ATOM PR #2466 compatibility bridge",
         "closed ATOM grouped-top-k candidate"
       ],
       "patch": {
         "path": "atom.patch",
-        "sha256": "2cc961463aca0396b4decca2b1ffb03410d988bc1a21e7dfa2066eae3c03193c",
+        "sha256": "73169042f3020ea048ba9354b7e39951f0cef648f9e9f93d1a6cfcbb4eddfcc5",
         "files": [
           "atom/model_ops/attention_mla.py",
           "atom/model_ops/attentions/gdn_attn.py",
           "atom/model_ops/attentions/triton_mla.py",
           "atom/model_ops/fla_ops/fused_sigmoid_gating.py",
+          "atom/model_ops/fp4_layout.py",
           "atom/model_ops/kimi_k3/activations.py",
           "atom/model_ops/kimi_k3/attention_residual.py",
+          "atom/model_ops/layernorm.py",
           "atom/model_ops/linear.py",
           "atom/model_ops/mamba_ops/causal_conv1d.py",
+          "atom/models/deepseek_v2.py",
           "atom/models/kimi_k3.py",
+          "atom/models/kimi_k3_dspark.py",
+          "atom/plugin/sglang/models/deepseek_mla_forward.py",
+          "atom/rollout/weight_updater.py",
           "tests/model_ops/test_causal_conv1d_update.py",
           "tests/model_ops/test_k3_causal_conv1d_prefill.py",
           "tests/model_ops/test_kimi_k3_activations.py",
           "tests/model_ops/test_kimi_k3_attention_residual.py",
           "tests/model_ops/test_triton_mla_splits.py",
+          "tests/test_mxfp4_layout_contract.py",
           "tests/test_weight_sync_shuffle_layout.py"
         ]
       }
@@ -55,8 +63,8 @@
     "aiter": {
       "repository": "https://github.com/ROCm/aiter.git",
       "base_sha": "e6ded2168ef43111c57d591dd310eccdfc27aaf1",
-      "head_sha": "02caecde2dbf3a2992619a7a561796fb40097e75",
-      "result_tree_sha": "7f192bf9ae27c19953993136bf1a30b9425a558a",
+      "head_sha": "ad7d4b4d73f39166525255010a8e4a3c78f53aaa",
+      "result_tree_sha": "1d7a04d1a8a056e6ae85b9c4b5872e38a227d16c",
       "base_includes": {
         "6097_head_sha": "a9b4e38e6acc14ffb6a9629529c694d06cfe5a3a",
         "6097_merge_sha": "c847570f0af101bef69de77d9f83e5fe2d06a8ee",
@@ -67,25 +75,51 @@
         "6115": "2ca6fff7e03254806201f8d1d57a4a1564b42ef6",
         "6121": "d6d87772477fb30fc96c424bf4bf9826f1058214",
         "6130": "4fa13d4e155d7392dc2276686903c3353c3326d1",
-        "6131": "01f69ac7748bce15b747fc88a43c60a77c8c8689"
+        "6131": "01f69ac7748bce15b747fc88a43c60a77c8c8689",
+        "6294": "61f544216b4f52b2a30e75235456a6e8bbeb0a03"
       },
       "patch": {
         "path": "aiter.patch",
-        "sha256": "2a8d2860ef44b3ac02fe265f74683b7548cc1a086b8770f9fe73cc6ac04f875f",
+        "sha256": "07301f9fa69d8915f2c66fb821dbaf3c0a12909b497a95cfd56e93c180bfbeb6",
         "files": [
+          "aiter/__init__.py",
+          "aiter/jit/utils/torch_guard.py",
           "aiter/ops/flydsl/gather_kv_b_proj.py",
           "aiter/ops/flydsl/gather_kv_b_proj_gfx1250.py",
           "aiter/ops/flydsl/grouped_moe_gfx1250.py",
           "aiter/ops/flydsl/kernels/gather_kv_b_proj_gfx1250.py",
           "aiter/ops/flydsl/kernels/moe_g2l_lut.py",
+          "aiter/ops/gemm_op_a4w4.py",
+          "aiter/ops/mx_scale_layout.py",
+          "aiter/ops/quant.py",
+          "aiter/ops/rmsnorm.py",
           "aiter/ops/topk.py",
+          "aiter/ops/triton/_gluon_kernels/gfx1250/gemm/basic/gemm_mxfp4.py",
+          "aiter/ops/triton/_gluon_kernels/gfx1250/quant/fused_mxfp4_quant.py",
+          "aiter/ops/triton/_triton_kernels/gemm/basic/gemm_afp4wfp4.py",
           "aiter/ops/triton/_triton_kernels/kimi_delta_attn/flash_kda.py",
           "aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py",
+          "aiter/ops/triton/_triton_kernels/quant/fused_mxfp4_quant.py",
           "aiter/ops/triton/configs/gfx1250/triton/attention/chunk_delta_attn/DEFAULT.json",
+          "aiter/ops/triton/gemm/basic/gemm_afp4wfp4.py",
           "aiter/ops/triton/moe/moe_routing/topk.py",
+          "aiter/ops/triton/quant/fused_mxfp4_quant.py",
+          "aiter/utility/mx_types.py",
+          "csrc/include/mx_quant_utils.h",
+          "csrc/include/quant.h",
+          "csrc/include/rmsnorm_quant.h",
+          "csrc/include/rocm_ops.hpp",
+          "csrc/kernels/quant_mxfp4.cu",
+          "csrc/kernels/rmsnorm_quant_kernels.cu",
+          "op_tests/test_f4gemm.py",
           "op_tests/test_flydsl_gather_kv_b_proj.py",
           "op_tests/test_flydsl_moe_aux.py",
-          "op_tests/test_gfx1250_exact_sigmoid_topk.py"
+          "op_tests/test_gfx1250_exact_sigmoid_topk.py",
+          "op_tests/test_mx_scale_layout_contract.py",
+          "op_tests/test_quant_mxfp4.py",
+          "op_tests/test_rmsnorm2dFusedAddQuant.py",
+          "op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py",
+          "op_tests/triton_tests/quant/test_fused_mxfp4_quant.py"
         ]
       }
     },
@@ -103,10 +137,10 @@
   "optional_experimental": {
     "mega_moe_tdm_tile_direct_route_reset": {
       "artifact": "experimental_mori_aiter.patch",
-      "base_head_sha": "02caecde2dbf3a2992619a7a561796fb40097e75",
-      "head_sha": "87e164d1a6325eeda178a546240a8518a6bc49c9",
-      "result_tree_sha": "3265ebfaf9a1cd0d587207626d14fbea05a07f1f",
-      "sha256": "31d6aa6e615007008692030ac3236055fec99427555a6ebf69e0f53571509d83",
+      "base_head_sha": "ad7d4b4d73f39166525255010a8e4a3c78f53aaa",
+      "head_sha": "10e550a5f2990e3f1523b276ef976edc71566266",
+      "result_tree_sha": "ccd6773a5fa38172be3c5cb4798c812b2bc0d2be",
+      "sha256": "5760a68d04d60b3f3866ab10d41ad22b534904c75f472bb0f1a431380b07b560",
       "files": [
         "aiter/configs/tuned_grouped_fmoe.csv",
         "aiter/ops/flydsl/grouped_moe_gfx1250.py",
@@ -127,17 +161,17 @@
   "integration": {
     "conflicts": [],
     "unable_to_integrate": [],
-    "note": "The required bundle uses latest AITER main and latest requested PR heads without the closed gather workaround; the five-file MegaMoE experiment remains separate and opt-in."
+    "note": "The required bundle uses explicit MXFP4 scale-layout contracts from AITER #6294 and ATOM #2505, latest requested optimization PR heads, and no retired workaround; the five-file MegaMoE experiment remains separate and opt-in."
   },
   "artifacts": {
     "atom.patch": {
-      "sha256": "2cc961463aca0396b4decca2b1ffb03410d988bc1a21e7dfa2066eae3c03193c"
+      "sha256": "73169042f3020ea048ba9354b7e39951f0cef648f9e9f93d1a6cfcbb4eddfcc5"
     },
     "aiter.patch": {
-      "sha256": "2a8d2860ef44b3ac02fe265f74683b7548cc1a086b8770f9fe73cc6ac04f875f"
+      "sha256": "07301f9fa69d8915f2c66fb821dbaf3c0a12909b497a95cfd56e93c180bfbeb6"
     },
     "experimental_mori_aiter.patch": {
-      "sha256": "31d6aa6e615007008692030ac3236055fec99427555a6ebf69e0f53571509d83"
+      "sha256": "5760a68d04d60b3f3866ab10d41ad22b534904c75f472bb0f1a431380b07b560"
     },
     "k3_bf16_hot_gfx1250_production_safe.csv": {
       "sha256": "196fe1af733b2e62681c779b280829580de440c4917db3a86924bc7a8261ad9f"
@@ -146,7 +180,7 @@
       "sha256": "29e81720ebead5001e22ad7de1ccf70eab3bdf3a5f61c8d006d92253d9a9e7cd"
     },
     "apply.sh": {
-      "sha256": "a418e1d762dd39e4a1fdcb5440a50d201eaae0e877697a88215fa23ccbc65dc0"
+      "sha256": "55b705f4841a96aefee126bea4de7ce483ddf855b0f4bd7b64a6ec01839c3554"
     }
   }
 }

@@ -1,5 +1,5 @@
 diff --git a/aiter/configs/tuned_grouped_fmoe.csv b/aiter/configs/tuned_grouped_fmoe.csv
-index e1ae0eb783c2afb453f3653363f2e2618d20fe74..102ce045daef75d4795f990108af04c991bef41f 100644
+index e1ae0eb78..102ce045d 100644
 --- a/aiter/configs/tuned_grouped_fmoe.csv
 +++ b/aiter/configs/tuned_grouped_fmoe.csv
 @@ -1,4 +1,10 @@
@@ -14,7 +14,7 @@ index e1ae0eb783c2afb453f3653363f2e2618d20fe74..102ce045daef75d4795f990108af04c9
  gfx1250,256,64,4096,2048,256,6,ActivationType.Swiglu,torch.bfloat16,torch.float8_e4m3fn,torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0,384,16,512,128,16,512,128,1,4,1,4,2,2,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,468.0528,0,0
  gfx1250,256,64,4096,2048,256,6,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0,384,16,512,128,16,512,128,1,4,1,4,2,2,1,1,0,,1,0,,-1,,,-1,,0,,0,grouped_gemm1_fp4_gugu,grouped_gemm2_fp4,468.0528,0,0
 diff --git a/aiter/ops/flydsl/grouped_moe_gfx1250.py b/aiter/ops/flydsl/grouped_moe_gfx1250.py
-index 203041e7f51a2d8a8f8eaca7389d0b8a06342ca9..16f97c507be1f2bbbbb11ef427295e5c2bf18713 100644
+index 203041e7f..16f97c507 100644
 --- a/aiter/ops/flydsl/grouped_moe_gfx1250.py
 +++ b/aiter/ops/flydsl/grouped_moe_gfx1250.py
 @@ -695,6 +695,7 @@ def _grouped_a8w4_tdm_moe(
@@ -58,7 +58,7 @@ index 203041e7f51a2d8a8f8eaca7389d0b8a06342ca9..16f97c507be1f2bbbbb11ef427295e5c
      )
      ep_psum_params = None
 diff --git a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py
-index 4bdfa22ec333654a8e75aaf6cdf7d088d8dad876..9188d155f7fed48b1d0f46d30d232ebb527ce631 100644
+index 4bdfa22ec..9188d155f 100644
 --- a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py
 +++ b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/mega_moe.py
 @@ -818,9 +818,7 @@ class MegaMoEGfx1250:
@@ -126,7 +126,7 @@ index 4bdfa22ec333654a8e75aaf6cdf7d088d8dad876..9188d155f7fed48b1d0f46d30d232ebb
              compact_masked_m=self._compact_masked_m,
              compact_psum=self._compact_psum,
 diff --git a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py
-index 4bf74280dedefa784ecdf101a8a3784fa57d4794..d26393730e7cc3e595254f4429ec4f5bf6b7d364 100644
+index 4bf74280d..d26393730 100644
 --- a/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py
 +++ b/aiter/ops/flydsl/kernels/mega_moe_gfx1250/types.py
 @@ -93,6 +93,11 @@ class Stage2ScatterContext:
@@ -143,7 +143,7 @@ index 4bf74280dedefa784ecdf101a8a3784fa57d4794..d26393730e7cc3e595254f4429ec4f5b
          if self.combine_quant_bits not in (0, 8, 4):
 diff --git a/op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py b/op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..0327c735c42e3f43a389695b47881f67d3053891
+index 000000000..0327c735c
 --- /dev/null
 +++ b/op_tests/multigpu_tests/test_kimi_k3_mori_ep_scatter_tile.py
 @@ -0,0 +1,369 @@
