@@ -36,6 +36,8 @@ translations, and GSM8K still scored **0.9621** over the full 1319.
 | take a profile | [Profiling](#profiling) |
 | try the optimization PR stack — **pending verification** | [Optimized source stack](#optimized-source-stack--pending-verification) |
 | you are on A0 silicon | [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon) |
+| find a tray's IP or BMC | [The rack: hosts and addresses](#the-rack-hosts-and-addresses) |
+| reboot a tray, or bring one back after any reboot | [Rebooting a tray](#rebooting-a-tray) → [perf_setup](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
 
 ### Measured on B0, `rocm/fw-bringup:gfx1250-atom-20260918-ep8`
 
@@ -64,6 +66,54 @@ translations, and GSM8K still scored **0.9621** over the full 1319.
 
 ---
 
+## The rack: hosts and addresses
+
+This page was written on one 18-tray HeliosM C-rack (`HELIOSM-DVT-CT1` …
+`CT18`, 4 × gfx1250 per tray). You reach the trays from a jump host.
+
+| | |
+|---|---|
+| Jump host | `nj-4050-genamd-console`, `10.223.239.5`. Not a GPU node. `/home` is NFS-shared with every tray |
+| Tray login | `root@<OS IP>`. CT1, CT2, CT3 and CT18 do not accept the shared SSH key and need the root password. Ask the rack owner; it is not written here |
+| Data plane | `enp1s0f1` on every tray. Its address **is** the SSH address, and it is the address to give ubench07 and RCCL |
+| Fabric | every tray checked reports the same `PPOD_ID` and `VPOD_ID 2` |
+| UALink switch management | `10.210.11.62` … `.73`: 12 × `Helios_switch` (DS6010, Redfish) |
+
+| Tray | OS / data-plane IP | BMC IP | BMC address from | `accel_id` |
+|---|---|---|---|---|
+| CT1 | 10.210.11.19 | 10.210.11.44 | in-band | 0–3 |
+| CT2 | 10.210.11.24 | 10.210.11.47 | in-band | 4–7 |
+| CT3 | 10.210.11.16 | 10.210.11.48 | in-band | 8–11 |
+| CT4 | 10.210.11.11 | 10.210.11.49 | login sheet | 12–15 |
+| CT5 | 10.210.11.17 | 10.210.11.50 | in-band | 16–19 |
+| CT6 | 10.210.11.15 | 10.210.11.51 | inferred | 20–23 |
+| CT7 | 10.210.11.23 | 10.210.11.53 | login sheet | 24–27 |
+| CT8 | 10.210.11.21 | 10.210.11.55 | login sheet | 28–31 |
+| CT9 | 10.210.11.27 | 10.210.11.57 | login sheet | 32–35 |
+| CT10 | 10.210.11.80 | 10.210.11.60 | login sheet, unverified | 36–39 |
+| CT11 | 10.210.11.26 | 10.210.11.61 | in-band | 40–43 |
+| CT12 | 10.210.11.22 | 10.210.11.59 | in-band | 44–47 |
+| CT13 | 10.210.11.14 | 10.210.11.58 | login sheet | 48–51 |
+| CT14 | 10.210.11.25 | 10.210.11.56 | in-band | 52–55 |
+| CT15 | 10.210.11.13 | 10.210.11.54 | in-band | 56–59 |
+| CT16 | 10.210.11.12 | 10.210.11.52 | login sheet | 60–63 |
+| CT17 | 10.210.11.18 | 10.210.11.46 | login sheet | 64–67 |
+| CT18 | 10.210.11.10 | 10.210.11.45 | in-band | 68–71 |
+
+- `accel_id` is 4 × (tray − 1) … +3. It is the same global numbering that
+  `amd-smi fabric` and the fabric's dmesg lines (`AccId:<n>`) use.
+- BMC addresses are DHCP leases, so re-derive one before resetting a tray (see
+  [Rebooting a tray](#rebooting-a-tray)). The "from" column means:
+  - *in-band*: read on the tray with `ipmitool lan print 1`, or matched by host-NIC MAC, on 2026-10-08/09.
+  - *login sheet*: the rack's login sheet; not re-checked.
+  - *inferred*: the only BMC left unassigned.
+  - CT10 and its listed BMC were both down when this was written.
+- CT10's OS address is `.80`. The `.60` that some lists give for its OS is its BMC.
+- Tray ownership changes daily. Check [Is the rack actually free?](#is-the-rack-actually-free)
+  before using or rebooting any tray.
+
+---
+
 ## Prerequisites
 
 **All four nodes in one fabric domain.** Wide EP requires identical `PPOD_ID`
@@ -86,6 +136,89 @@ are unpopulated, not measured. To actually measure the link, use ubench07 below.
 `amdgpu` is blacklisted on the kernel command line on these hosts, so after a
 reboot the driver is simply not loaded and **`/dev/kfd` does not exist**. That
 is configuration, not breakage.
+
+**Load it through `perf_setup`, not with a bare `modprobe`.**
+`perf_setup_BPC21.sh` is the platform's perf-setup script (AMD-internal; ask
+your AMD contact). It loads `amdgpu` itself and applies tuning that **every
+reboot discards**, including reboots nobody asked for (BMC watchdog, crash).
+Part of that tuning only works while `amdgpu` is still unloaded, so the order
+is fixed: reboot → `perf_setup` → anything else.
+
+| when | what `perf_setup_BPC21.sh -enable-csc` does |
+|---|---|
+| before the driver | enables the CSC feature; reverts the unvalidated PPT boost settings |
+| driver load | menu **D**: `modprobe amdgpu gpu_recovery=0 halt_if_hws_hang=1 mtype_local=0 noretry=1`. That is MTYPE=RW and XNACK off, plus the two bring-up parameters explained below |
+| after the driver | SOC PCC off, KLL chicken bits, FCLK BW DPM, `GFX_ICG_TCP_CTRL2=0x2` on every XCD, CPU governor `performance`, NUMA balancing off, **−82 mV** voltage offset, CSC DVO **25 mV** |
+
+**Why it is not optional.** Two data points from this rack:
+- Same image, same workload (DSR1 offline, one node): a tuned tray measured
+  14,713 tok/s/GPU and an untuned one 13,030. That is about 13%. They were two
+  different trays, so chip-to-chip variance is in that number too.
+- The tuning goes missing silently. One sweep of this rack found 8 of 9 trays had
+  been rebooted since their last `perf_setup`.
+
+⚠️ **If `amdgpu` is already loaded, `perf_setup` cannot fix it.** Its `modprobe`
+is then a no-op: MTYPE and XNACK stay at the defaults, and the pre-driver steps
+land too late. The report still says `D — MTYPE=RW, XNACK=disabled`. The only
+fix is another reboot. So do not "just modprobe" first.
+
+⚠️ **K3 note.** The K3 runs on this page document the bare `modprobe` shown at the
+end of this subsection, and do not record any `perf_setup` state. `perf_setup`
+changes MTYPE and XNACK, so run the
+[accuracy gate](#accuracy-gate--run-this-before-any-benchmark) after switching.
+
+**Running it.** The script reads its prompts from `/dev/tty`, so piping answers
+in does not work. Drive it with `expect`, and match each prompt **exactly**: a
+loose regex once answered the DVO prompt with `-82`.
+
+```bash
+# as root on the tray, from /root (the script writes its downloads and perf_env.sh to $PWD)
+lsmod | grep -c '^amdgpu '     # must print 0 -- otherwise reboot first
+lsmod | grep '^ifoe '          # must be loaded (see the ordering note below)
+cat > /root/run_perf_setup.exp <<'EOF'
+#!/usr/bin/expect -f
+set timeout 3600
+log_file -a /root/perf_setup_expect.log
+cd /root
+spawn ./perf_setup_BPC21.sh -enable-csc
+expect {
+    -ex {Choose [A-H]: }                                                { send -- "D\r";   exp_continue }
+    -ex {Voltage offset in mV [default -82, or 'skip' to not set it]: } { send -- "-82\r"; exp_continue }
+    -ex {CSC DVO offset in mV [default 25, or 'skip' to not set it]: }  { send -- "25\r";  exp_continue }
+    timeout { exit 2 }
+    eof
+}
+EOF
+chmod +x /root/perf_setup_BPC21.sh
+setsid -f nohup expect -f /root/run_perf_setup.exp > /root/perf_setup_run.out 2>&1 < /dev/null
+```
+
+It needs to reach AMD-internal hosts (it downloads its tuning scripts and tools)
+and takes 2–7 minutes. Over `ssh`, `pgrep -f perf_setup` also matches your own
+remote shell, so check progress by PID or with a `[p]erf_setup` pattern.
+
+**Verifying it.**
+
+```bash
+tail -32 $(ls -1t /opt/amd-apps/perf_setup_BPC21_report_*.log | head -1)   # Perf steps: 8 passed, 0 failed
+for p in mtype_local noretry gpu_recovery halt_if_hws_hang; do
+  echo "$p=$(cat /sys/module/amdgpu/parameters/$p)"; done                    # 0 1 0 1
+```
+
+- `Result: [PARTIAL]` with 8/8 perf steps passed is fine **when the only failure
+  is the TBP read**. That step SSHes to the tray's BMC with a default login, and
+  several trays reject it (CT1, CT2, CT5, CT12, CT14).
+- The `Could not read BKC version` and `restricted shell` warnings are normal.
+
+A tray is tuned **for this boot** only if both of these hold:
+- the newest `/opt/amd-apps/perf_setup_BPC21_report_*.log` is newer than `uptime -s`;
+- `mtype_local=0` and `noretry=1`.
+
+A driver loaded by hand with those two parameters passes the second check but
+not the first, and it is missing all the other tuning.
+
+**Without the script**, this loads the driver with the bring-up parameters but
+none of the tuning:
 
 ```bash
 lsmod | grep '^ifoe '                                    # must already be loaded
@@ -213,6 +346,26 @@ MNNVL is not in effect and the traffic silently fell back to TCP** — check
 The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
 `ACTIVE` for the same condition.
 
+**A later run reads much higher.** On 2026-10-09 the binaries were built with the
+trays' own `hipcc` (HIP 7.16, ROCm 10.1), every tray had just had `perf_setup`,
+and all four GPU pairs moved 1 GB transfers. Seven pairs were measured:
+CT1↔CT5, CT5↔CT12, CT12↔CT1, CT3↔CT11, CT11↔CT15, CT15↔CT3 and CT2↔CT3.
+
+| Direction | GB/s, 4-pair aggregate | per GPU |
+|---|---|---|
+| read | 5,772–5,797 | ~1.45 TB/s |
+| write | 6,219–6,228 | ~1.56 TB/s |
+| **bidirectional** | **10,942–10,981** | ~2.74 TB/s |
+
+That is 80–86% of the 1.8 TB/s uplink one way, and 76% of 3.6 TB/s
+bidirectionally. The spread across pairs was under 0.5%. To judge one pair,
+compare it against a known-good pair measured on the same day, not against
+either table.
+
+**Test every tray against two peers.** Use triangles: A↔B, B↔C, C↔A. A bad tray
+then fails both of its pairs, while a bad peer fails only one. A pair takes
+seconds. Pairs that share a tray must run one after the other.
+
 #### Three ways this wastes your afternoon
 
 1. **Aggregate mode takes every GPU on both nodes.** On a shared box, confirm
@@ -261,6 +414,33 @@ The suite's README says `ACCEL_STATE` must be `READY`; this firmware reports
 > training, not reachability. A whole rack can read `active` on every node while
 > no pair exchanges a single packet. Run `ualoe_p2p` before trusting it.
 
+#### Single-tray TDM gate (epcheck)
+
+ubench07 needs a peer. To check one tray on its own, use the `epcheck` image. It
+compiles three TDM/fabric micro-benchmarks, compares them against recorded
+baselines (±5%), and exits non-zero on any miss. It takes about 30 s.
+
+```bash
+# private image, ~373 GB unpacked: check free space on the docker root first.
+# Registry credentials come from your AMD contact.
+docker run --rm --device /dev/kfd --device /dev/dri --ipc=host --network host --privileged \
+  --cap-add SYS_PTRACE --security-opt seccomp=unconfined --security-opt label=disable \
+  --group-add video --shm-size 64g \
+  --entrypoint /opt/epcheck/epcheck.sh rocm/aigmodels-private:epcheck-gfx1250-20260806
+echo "exit=$?"
+```
+
+The line to read is `epsim mode0 grid=64` (MODE0, the per-warp TDM throughput
+gate; band 1467.8–1690.5).
+
+On 2026-10-09 six tuned trays (CT1, CT2, CT3, CT5, CT11, CT12) were checked:
+- **all passed MODE0**, at 1,584–1,623;
+- every one of them failed the same two items: `epsim mode9 grid=64 READ` at
+  757–770 against a floor of 835, and warp density at 0.87–0.92 against 0.95.
+
+So each run ends in `EPCHECK FAIL`. Identical misses on every tray point to a
+systematic difference from the reference node, not to six bad trays.
+
 **Other requirements**
 
 - A **gfx1250 bring-up image** with ATOM, aiter, mori and FlyDSL, built from an
@@ -308,6 +488,91 @@ done
 before any GPU counter moves. Filtering `docker ps` by your own container name
 is the specific mistake to avoid — it reports "nothing of mine is running",
 which is not the same question.
+
+## Rebooting a tray
+
+Reboot only a tray you have confirmed is free (see above). Every container on it,
+yours and everyone else's, stops (`Exited (255)`) and does not come back on its
+own. After any reboot, run [perf_setup](#after-a-reboot-load-the-driver-then-confirm-the-links-trained)
+before anything else.
+
+**When you have to.** With `gpu_recovery=0` a wedged GPU does not recover by
+itself; that is the point of the parameter. The signature:
+- `amdgpu …: MES(0, 0) failed to respond to msg=REMOVE_QUEUE` in dmesg;
+- engine processes `<defunct>`;
+- `/sys/class/kfd/kfd/proc` never drains;
+- kworkers stuck in `D` state.
+
+You usually get there by killing a hung engine, or when a multi-node job aborts
+and kills its engines. After an abort, check **every** participant. A tray whose
+engines are zombies but whose kfd list is empty has freed its GPUs and needs
+nothing.
+
+The other case is a host whose userland hangs: SSH authenticates (`ssh -v`
+shows `Entering interactive session`), but no command ever runs.
+
+**Record `boot_id` first** (`cat /proc/sys/kernel/random/boot_id`). A changed
+`boot_id` is the only reliable proof that the tray rebooted.
+
+| tray state | how | round trip measured here |
+|---|---|---|
+| OS healthy, nothing in `D` state | `systemctl reboot --no-wall` | ~3 min |
+| GPU wedged, `D`-state workers, or userland hung | BMC Redfish `ForceRestart` | ~2.5 min |
+| `ForceRestart` did not bring the GPUs back | Redfish `PowerCycle` | not tried here |
+
+Do not use `systemctl reboot` or Redfish `GracefulRestart` on a wedged GPU:
+shutdown blocks while unloading `amdgpu`.
+
+**The BMC** runs OpenBMC with Redfish and is reachable from the jump host.
+Addresses are in [The rack](#the-rack-hosts-and-addresses). Credentials come from
+the rack owner and are not written here. Before resetting, make sure the BMC
+belongs to the tray you mean. The Redfish `UUID` cannot tell you: it is an
+unfilled `$BOARD_UUID` placeholder.
+
+```bash
+B=<bmc-ip>
+# 1. on the tray: its own BMC address and MAC (in-band, via /dev/ipmi0)
+ipmitool lan print 1 | grep -E '^(IP Address|MAC Address) +:'
+# 2. from the jump host: the BMC must report the same eth0 MAC ...
+curl -sk -u "$BMC_CRED" https://$B/redfish/v1/Managers/bmc/EthernetInterfaces/eth0 | grep -o '"MACAddress": "[^"]*"'
+#    ... or, if the tray has no usable shell, compare its data-plane MAC
+#    (from a peer tray on the same subnet: ping <tray-ip>; ip neigh show <tray-ip>)
+curl -sk -u "$BMC_CRED" https://$B/redfish/v1/Systems/system/EthernetInterfaces/0 | grep -o '"MACAddress": "[^"]*"'
+# 3. reset; expect HTTP 200 and Base.1.13.0.Success
+curl -sk -u "$BMC_CRED" -X POST -H 'Content-Type: application/json' \
+  -d '{"ResetType":"ForceRestart"}' \
+  https://$B/redfish/v1/Systems/system/Actions/ComputerSystem.Reset
+```
+
+- Allowed `ResetType`s: `On`, `ForceOff`, `ForceOn`, `ForceRestart`,
+  `GracefulRestart`, `GracefulShutdown`, `PowerCycle`, `Nmi`.
+- The jump host is routed to the trays and has no ARP entries for them, so take
+  a tray's MAC from a peer tray.
+
+**Waiting for it.**
+
+```bash
+OLD=<boot_id before>
+until b=$(ssh -o ConnectTimeout=10 root@<tray-ip> cat /proc/sys/kernel/random/boot_id 2>/dev/null) \
+      && [ -n "$b" ] && [ "$b" != "$OLD" ]; do sleep 10; done
+```
+
+If nothing answers after about 10 minutes, read the BMC's event log over IPMI:
+`ipmitool -I lanplus -H <bmc-ip> -U … -P … sel elist last 20`.
+
+- Once, a `ForceRestart` was followed about 2 minutes later by `Watchdog2 … Hard
+  reset`: the watchdog the OS had armed fired while the tray was still booting,
+  and reset it a second time.
+- If the BMC does not answer either, the tray has probably lost power. That needs
+  someone at the rack.
+
+**Reading the boot logs.**
+
+| seen at boot | meaning |
+|---|---|
+| `mce: … CPU 0/48: Machine Check: 0 Bank 62: a0002000003d0800`, plus a BERT "previous boot" record for MSR `0xc00023e1` | noise. It appears after **any** warm reboot, healthy trays included, and was absent on boots that followed a rack-wide power-on |
+| `mana … Failed to query link config: -71` | noise; SSH runs over that NIC |
+| BERT `event severity: fatal`, `fru_text: Perr: CPU0`, bank 19 status `baa000000005080b` (the SEL's OEM records decode to `Perr: CPU0`) | **a real host crash**. Seen on CT1, CT2, CT12 and CT15. CT2 and CT12 were under load; CT15 crashed twice within 30 minutes. Keep a tray that repeats it out of long multi-node runs |
 
 ## Container
 
@@ -807,7 +1072,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
-| `/dev/kfd` missing after a reboot | `amdgpu` is blacklisted on the kernel command line; `modprobe` it — see [After a reboot](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
+| `/dev/kfd` missing after a reboot | `amdgpu` is blacklisted on the kernel command line. Load it with `perf_setup`; a bare `modprobe` skips the tuning. See [After a reboot](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
 | `accel_state` reads `unconfigured` | Links are still training after `modprobe`. Wait; do not re-`modprobe` |
 | A run dies with nothing in the log to explain it | Possibly a GPU recovery reset. Reload the driver with `gpu_recovery=0 halt_if_hws_hang=1` so the next one halts diagnosably |
 | Startup stops at `load RCCL version`, CPU spinning at ~110% | Intermittent `ncclCommInitRank` hang. Retry; allow ≥25 min. Looks identical to a bad fabric — rule that out with [ubench07](#validate-the-fabric-first--ubench07) once, then retry |
@@ -819,6 +1084,9 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `available KV budget (-NN GB)` on a config that booted an hour ago | Same cause, later symptom. Someone else's weights are loading. See [Is the rack actually free?](#is-the-rack-actually-free) |
 | Cross-node bandwidth ~4.5 GB/s instead of thousands | MNNVL not in effect, silently fell back to TCP. Set `NCCL_MNNVL_ENABLE=1` |
 | Log appears frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
+| Engine processes `<defunct>`, kfd process list never drains, dmesg `MES … failed to respond to msg=REMOVE_QUEUE` | GPU wedged; `gpu_recovery=0` keeps it that way by design. BMC `ForceRestart`, then `perf_setup`. See [Rebooting a tray](#rebooting-a-tray) |
+| `perf_setup` report says mode D, but `mtype_local` / `noretry` read `-1` | `amdgpu` was already loaded when it ran. Reboot, then run `perf_setup` before anything else |
+| A tray drops out mid-run; the next boot's BERT says `event severity: fatal`, `Perr: CPU0` | Host CPU fatal error, not the engine. See the boot-log table in [Rebooting a tray](#rebooting-a-tray) |
 
 ---
 
