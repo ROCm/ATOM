@@ -193,6 +193,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # Warmup also sweeps every tuned-GEMM M bucket up to the token budget:
+    # dummy prefills through the model, then each distinct linear shape called
+    # directly. aiter picks a GEMM kernel per padded M and FlyDSL compiles each
+    # one on first use, so without this a serving prefill stalls for seconds
+    # whenever a batch lands in a bucket warmup never touched. Prefill role only.
+    # See ModelRunner._warmup_gemm_m_buckets.
+    "ATOM_WARMUP_GEMM_M_BUCKETS": lambda: (
+        os.getenv("ATOM_WARMUP_GEMM_M_BUCKETS", "0") == "1"
+    ),
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
