@@ -471,6 +471,39 @@ def lmcache_replica_world_size(config) -> int:
     return max(1, pp_size * tp_size)
 
 
+def validate_lmcache_lookup_scope(cfg: Any, world_size: int) -> None:
+    """Reject lookup-server worker ids outside this replica-local world."""
+
+    world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    worker_ids = getattr(cfg, "lookup_server_worker_ids", None)
+    if worker_ids is None:
+        return
+    if not isinstance(worker_ids, (list, tuple)):
+        # Preserve the public configuration-error contract requested for invalid
+        # lookup scope values, rather than leaking Python container semantics.
+        raise ValueError(  # noqa: TRY004
+            "LMCache lookup_server_worker_ids must be a list or tuple of worker ids, "
+            f"got {type(worker_ids).__name__}"
+        )
+    if not worker_ids:
+        return
+    normalized = [
+        _strict_integer(f"LMCache lookup server worker id[{index}]", worker_id)
+        for index, worker_id in enumerate(worker_ids)
+    ]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            "LMCache lookup_server_worker_ids must not contain duplicate worker ids; "
+            f"got {normalized}"
+        )
+    invalid = [worker_id for worker_id in normalized if worker_id >= world_size]
+    if invalid:
+        raise ValueError(
+            "LMCache lookup_server_worker_ids must be within the replica-local "
+            f"world [0, {world_size}); got {normalized}"
+        )
+
+
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 
@@ -618,6 +651,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     )
     chunk_size = _strict_integer("LMCache chunk size", cfg.chunk_size, minimum=1)
     world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    validate_lmcache_lookup_scope(cfg, world_size)
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")
