@@ -997,18 +997,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # selection on this path at all -- `state_entry_views` hands over
         # `state_bytes[slot]` whole -- which the tests assert directly.
         arena = int(cache.backing.numel())
+        alignment = int(cache.geometry.alignment)
         moved = sum(unit_bytes) * num_blocks + int(cache.num_slots) * int(
             cache.geometry.state_bytes
         )
-        if moved != arena:
+        # Not equality: `paged_extents` rounds the PAGE region up to the
+        # geometry's alignment, so the two regions are separated by up to
+        # `alignment - 1` bytes that belong to neither leg. The slack is
+        # bounded and has to be, or the identity stops noticing a plane --
+        # the smallest index plane here is 2,112 B/block, so any missing one
+        # shorts the sum by far more than an alignment gap.
+        slack = arena - moved
+        if not 0 <= slack < alignment:
             raise ValueError(
                 "ATOM offload connector: DeepSeek-V4.1 arena does not balance: "
                 f"{len(planes)} PAGE planes x {num_blocks} blocks "
                 f"({sum(unit_bytes) * num_blocks} B) + {cache.num_slots} STATE "
-                f"slots x {int(cache.geometry.state_bytes)} B = {moved} B, but "
-                f"the pool holds {arena} B (short by {arena - moved}). A plane "
-                "missing from `v41_page_planes` is the usual cause; it would "
-                "otherwise offload nothing and restore stale bytes in its place."
+                f"slots x {int(cache.geometry.state_bytes)} B = {moved} B "
+                f"against a pool of {arena} B, a difference of {slack} B that "
+                f"is not the inter-region padding (which is under {alignment}). "
+                "A plane missing from `v41_page_planes` is the usual cause; it "
+                "would otherwise offload nothing and restore stale bytes in "
+                "its place."
             )
         self._v41_cache, self._v41_slots = cache, slots
         logger.info(
