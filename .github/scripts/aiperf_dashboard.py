@@ -5,7 +5,22 @@ import argparse
 import json
 import os
 import shlex
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "atomesh"))
+from interactivity import RECORDS_FILENAME, agentic_throughput  # noqa: E402
+
+
+def records_throughput(src):
+    """InferenceX's records-over-span throughput, or None without usable records."""
+    records = src.parent / RECORDS_FILENAME
+    if not records.is_file():
+        return None
+    try:
+        return agentic_throughput(records)
+    except (OSError, ValueError):
+        return None
 
 
 def dashboard_summary(data, src, conc, env, *, single_node=False):
@@ -30,6 +45,9 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
     # its internal warmup and requests cancelled during grace-period draining.
     cache_hit_tokens = total_tokens("total_usage_prompt_cache_read_tokens")
     cache_total_tokens = total_tokens("total_usage_prompt_tokens")
+    # Prefer the per-request records so the throughput matches InferenceX;
+    # AIPerf's time-sliced aggregates remain the fallback.
+    throughput = records_throughput(src) or {}
 
     payload = {
         "benchmark_backend": "atom",
@@ -74,9 +92,13 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
         "median_e2el_ms": pct("request_latency", "p50"),
         "p90_e2el_ms": pct("request_latency", "p90"),
         "p99_e2el_ms": pct("request_latency", "p99"),
-        "input_throughput": avg("input_token_throughput"),
-        "output_throughput": avg("output_token_throughput"),
-        "total_token_throughput": avg("total_token_throughput"),
+        "input_throughput": throughput.get("input_tput_tps")
+        or avg("input_token_throughput"),
+        "output_throughput": throughput.get("output_tput_tps")
+        or avg("output_token_throughput"),
+        "total_token_throughput": throughput.get("total_tput_tps")
+        or avg("total_token_throughput"),
+        "throughput_window_s": throughput.get("duration_s"),
         "successful_requests": avg("request_count"),
         "completed": avg("request_count"),
         "benchmark_duration_s": avg("benchmark_duration")
