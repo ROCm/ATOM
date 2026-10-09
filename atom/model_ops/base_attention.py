@@ -278,10 +278,6 @@ def _flydsl_pa_decode_num_seqs(
 _FLYDSL_PLAN_MAX_BATCH = 4096
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
 _FLYDSL_RUNTIME_PLANS: dict[tuple, object] = {}
-_FLYDSL_BUDGETS: dict[tuple, int] = {}
-_FLYDSL_UNIT_SCALES: dict[tuple, torch.Tensor] = {}
-# (builder id, role, batch) whose capture-owned plan budget has been decided.
-_FLYDSL_ROLE_DECIDED: set[tuple] = set()
 
 
 def flydsl_plan_matches(plan, num_seqs: int, num_kv_heads: int) -> bool:
@@ -330,18 +326,6 @@ def _flydsl_plan_scratch(
     return hit
 
 
-def _flydsl_storage_scale(scale, device):
-    """Return a tensor suitable for #5809's storage-key lookup."""
-    if isinstance(scale, torch.Tensor):
-        return scale
-    key = (device.type, device.index)
-    value = _FLYDSL_UNIT_SCALES.get(key)
-    if value is None:
-        value = torch.ones(1, dtype=torch.float32, device=device)
-        _FLYDSL_UNIT_SCALES[key] = value
-    return value
-
-
 def _flydsl_context_bound(max_context_length, block_tables, k_cache):
     """Clamp the scheduling bound to the rows addressable by this block table."""
     capacity = int(block_tables.shape[1]) * int(k_cache.shape[3])
@@ -376,21 +360,20 @@ def _flydsl_prepare_explicit_plan(
     *,
     q,
     k_cache,
-    v_cache,
     block_tables,
     context_lens,
-    k_scale,
-    v_scale,
     num_seqs,
     query_length,
     max_context_partition_num,
     sliding_window,
     max_context_length,
     existing_plan,
-    plan_owner=None,
     refresh_once_per_forward=False,
 ):
-    """Resolve #5809's offline budget and return its required explicit plan.
+    """Return the explicit plan aiter #5809 requires for this call.
+
+    Plans use aiter's default workgroup budget (2*CU); #5809 ships no tuned
+    budgets.
 
     ``refresh_once_per_forward``: the caller guarantees every call sharing this
     plan within one forward has identical lengths (MiniMax-M3 sparse decode:
@@ -399,16 +382,8 @@ def _flydsl_prepare_explicit_plan(
     instead of one per layer, in eager and in the captured graph alike.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
-    from aiter.ops.flydsl.pa_decode_tuning import (
-        get_cached_budget,
-        make_shape,
-        storage_key,
-    )
 
     device = q.device
-    props = torch.cuda.get_device_properties(device)
-    architecture = props.gcnArchName.split(":")[0]
-    num_cu = props.multi_processor_count
     num_kv_heads = int(k_cache.shape[1])
     window = max(int(sliding_window), 0)
     max_partitions = (
@@ -422,93 +397,12 @@ def _flydsl_prepare_explicit_plan(
     if context_bound < query_length:
         raise ValueError("max_context_length must cover every query token")
 
-    # A capture-owned plan is decided once per (role, batch), in the eager
-    # warmup before capture, then used as-is -- so capture and replay never
-    # look up a budget or record a second plan into the graph.
-    role = getattr(plan_owner, "flydsl_plan_role", None)
-    builder = getattr(plan_owner, "flydsl_plan_builder", None)
-    decided_key = (id(builder), role, num_seqs)
-    if existing_plan is not None and builder is not None and role is not None:
-        if (
-            decided_key in _FLYDSL_ROLE_DECIDED
-            or torch.cuda.is_current_stream_capturing()
-        ) and flydsl_plan_matches(existing_plan, num_seqs, num_kv_heads):
-            return existing_plan
-
-    # Only the dense/full planner has an offline-tuning contract today. Sparse
-    # and plugin calls used the old static path with a small partition cap and
-    # can expose a new row count every step; caching an exact lookup for each
-    # would grow without bound. Keep the official 2*CU fallback there, then let
-    # max_partitions reproduce the old bounded amount of parallel work.
-    if existing_plan is None and max_partitions < _FLYDSL_PA_MAX_PARTITIONS:
-        budget = 2 * num_cu
-    else:
-        shape = make_shape(
-            num_seqs,
-            context_bound,
-            query_length,
-            num_query_heads=int(q.shape[1]),
-            num_kv_heads=num_kv_heads,
-            head_dim=int(q.shape[2]),
-            page_size=int(k_cache.shape[3]),
-            dtype=str(q.dtype).removeprefix("torch."),
-            per_token=isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1,
-            trans_v=v_cache.ndim == 5,
-            window=window,
-        )
-        key_scale = _flydsl_storage_scale(k_scale, device)
-        value_scale = _flydsl_storage_scale(v_scale, device)
-        tensor_storage_key = storage_key(
-            q, k_cache, v_cache, key_scale, value_scale
-        )
-        budget_key = (
-            num_seqs,
-            context_bound,
-            query_length,
-            int(q.shape[1]),
-            num_kv_heads,
-            int(q.shape[1]) // num_kv_heads,
-            int(q.shape[2]),
-            int(k_cache.shape[3]),
-            str(q.dtype).removeprefix("torch."),
-            isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1,
-            v_cache.ndim == 5,
-            window,
-            architecture,
-            num_cu,
-            tensor_storage_key,
-        )
-        budget = _FLYDSL_BUDGETS.get(budget_key)
-        if budget is None:
-            budget = get_cached_budget(
-                shape,
-                architecture,
-                num_cu,
-                storage_key=tensor_storage_key,
-            )
-            _FLYDSL_BUDGETS[budget_key] = budget
-
-    capacity = min(
-        num_seqs * max_partitions,
-        max(num_seqs, (budget + num_kv_heads - 1) // num_kv_heads),
-    )
-    compatible = (
+    if (
         existing_plan is not None
         and flydsl_plan_matches(existing_plan, num_seqs, num_kv_heads)
         and int(existing_plan.sliding_window) == window
         and (window == 0 or int(existing_plan.query_length) == query_length)
-    )
-    if compatible and builder is not None and role is not None:
-        _FLYDSL_ROLE_DECIDED.add(decided_key)
-        if int(existing_plan.capacity) != capacity:
-            adopted = builder.adopt_flydsl_budget(
-                context_lens[:num_seqs], budget, role=role
-            )
-            if adopted is not None:
-                existing_plan = adopted
-                plan_owner.flydsl_work_plan = adopted
-        return existing_plan
-    if compatible and int(existing_plan.capacity) == capacity:
+    ):
         return existing_plan
 
     # Plans own GPU metadata and their scratch cache keeps them alive. Keying
@@ -525,7 +419,6 @@ def _flydsl_prepare_explicit_plan(
         num_kv_heads,
         query_length,
         max_partitions,
-        budget,
         window,
         device.index,
     )
@@ -541,19 +434,17 @@ def _flydsl_prepare_explicit_plan(
             lengths,
             num_kv_heads,
             max_partitions=max_partitions,
-            workgroup_budget=budget,
             sliding_window=window,
             query_length=query_length,
         )
         _FLYDSL_RUNTIME_PLANS[plan_key] = plan
         logger.info(
-            "flydsl tuned plan: batch=%d ql=%d context_bound=%d "
-            "kv_heads=%d budget=%d max_partitions=%d capacity=%d",
+            "flydsl plan: batch=%d ql=%d context_bound=%d "
+            "kv_heads=%d max_partitions=%d capacity=%d",
             num_seqs,
             query_length,
             context_bound,
             num_kv_heads,
-            budget,
             max_partitions,
             int(plan.capacity),
         )
@@ -593,7 +484,6 @@ def run_pa_decode(
     ps: bool = True,
     work_plan=None,
     max_context_length: int | None = None,
-    plan_owner=None,
     refresh_once_per_forward: bool = False,
 ):
     """Run the AITER paged-attention decode kernel.
@@ -699,24 +589,19 @@ def run_pa_decode(
             work_plan = None
 
         # aiter #5809 removed the static FlyDSL path: every decode now needs an
-        # explicit plan. Resolve the offline-tuned budget from the real tensor
-        # layout, and create a cached plan for call sites that historically did
-        # not opt into the dense variable-work planner.
+        # explicit plan. Create a cached one for call sites that historically
+        # did not opt into the dense variable-work planner.
         work_plan = _flydsl_prepare_explicit_plan(
             q=q,
             k_cache=k_cache,
-            v_cache=v_cache,
             block_tables=block_tables[:n],
             context_lens=context_lens,
-            k_scale=k_scale,
-            v_scale=v_scale,
             num_seqs=n,
             query_length=max_seqlen_q,
             max_context_partition_num=max_context_partition_num,
             sliding_window=sliding_window,
             max_context_length=max_context_length,
             existing_plan=work_plan,
-            plan_owner=plan_owner,
             refresh_once_per_forward=refresh_once_per_forward,
         )
         if work_plan is None:

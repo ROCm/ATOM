@@ -630,9 +630,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         context. The op cannot catch it: its guard compares batch and kv-head
         count, and neither changes.
         """
-        return self.refresh_flydsl_plan(
-            var["context_lens"].gpu[:running_bs], role="draft"
-        )
+        return self.refresh_flydsl_plan(var["context_lens"].gpu[:running_bs])
 
     def prepare_mtp_decode(
         self,
@@ -653,8 +651,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 "slot_mapping": slots,
                 "qsa_metadata": None,
                 "flydsl_work_plan": self._refreshed_flydsl_plan(var, running_bs),
-                "flydsl_plan_role": "draft",
-                "flydsl_plan_builder": self,
             }
         logical = var["qsa_logical_positions"].gpu[:running_bs]
         req_ids = var["qsa_token_to_req"].gpu[:running_bs]
@@ -676,8 +672,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         return {
             "slot_mapping": slots,
             "flydsl_work_plan": self._refreshed_flydsl_plan(var, running_bs),
-            "flydsl_plan_role": "draft",
-            "flydsl_plan_builder": self,
             "qsa_metadata": Qwen4ExpQSAMetadata(
                 tables,
                 slots,

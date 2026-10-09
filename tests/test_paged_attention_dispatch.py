@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -437,7 +438,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
@@ -453,7 +453,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", False)
         ctx = _fake_ctx(8)
@@ -485,7 +484,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
         ctx = SimpleNamespace(
@@ -507,9 +505,6 @@ class TestWorkPlanWiring:
         dispatch = inspect.getsource(run_pa_decode)
         assert "_flydsl_prepare_explicit_plan(" in dispatch
         assert "work_plan=work_plan" in dispatch
-        helper = inspect.getsource(_flydsl_prepare_explicit_plan)
-        assert "get_cached_budget(" in helper
-        assert "storage_key(" in helper
 
     def test_context_bound_is_clamped_to_block_table_capacity(self):
         import torch
@@ -610,7 +605,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
@@ -693,11 +687,8 @@ class TestWorkPlanWiring:
 
         assert sites, "nothing calls refresh_flydsl_plan; this test moved"
         minting = {(f, fn) for f, fn, mints in sites if mints}
-        # adopt_flydsl_budget mints too, but only from the op during the eager
-        # warmup that precedes a capture (see TestCaptureOwnedPlanBudget).
         assert minting == {
             ("aiter_attention.py", "build_for_cudagraph_capture"),
-            ("aiter_attention.py", "adopt_flydsl_budget"),
             ("gdn_attn.py", "build_for_cudagraph_capture"),
         }, f"plans may only be minted during capture, got {sorted(minting)}"
         assert len(sites) - len(minting) >= 4, "a runtime refresh site went missing"
@@ -728,7 +719,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         builder._flydsl_plan_unplanned = False
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
@@ -762,7 +752,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         builder._flydsl_plan_unplanned = False
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
@@ -898,7 +887,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
@@ -928,7 +916,6 @@ class TestWorkPlanWiring:
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", False)
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
@@ -947,215 +934,109 @@ class _Ctx:
         return _Ctx(len(range(*s.indices(self.shape[0]))))
 
 
-class _BudgetPlan:
-    """A plan whose capacity follows the budget the way aiter #5809 sizes it."""
+class _CountingPlan:
+    """A plan that counts in-place refreshes."""
 
-    def __init__(self, n, budget, max_partitions=256):
+    def __init__(self, n):
         import torch
 
         self.reduce_info = torch.empty((n, 1), device="meta")
         self.num_kv_heads = 1
-        self.max_partitions = max_partitions
-        self.capacity = min(n * max_partitions, max(n, budget))
-        self.budget = budget
+        self.max_partitions = 8
+        self.capacity = max(n, 512)
         self.sliding_window = 0
         self.query_length = 1
         self.refreshed = 0
 
 
-try:
-    _HAS_PA_TUNING = (
-        importlib.util.find_spec("aiter.ops.flydsl.pa_decode_tuning") is not None
-    )
-except ModuleNotFoundError:
-    _HAS_PA_TUNING = False
+@pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+class TestExplicitPlan:
+    """The plan every FlyDSL call gets when no capture-owned plan fits."""
 
-
-@pytest.mark.skipif(not _HAS_PA_TUNING, reason="needs aiter #5809 (pa_decode_tuning)")
-class TestCaptureOwnedPlanBudget:
-    """Target and draft tune to different budgets, and a plan's capacity is
-    fixed when it is built. One shared capture plan cannot carry both, and the
-    op must never look up a budget or mint a plan while a graph is capturing."""
-
-    NUM_CU = 256
-
-    def _setup(self, monkeypatch, budgets, capturing):
+    def _setup(self, monkeypatch):
         import torch
 
         from atom.model_ops import base_attention as ba
-        from atom.model_ops.attentions import aiter_attention as aa
+        from atom.utils import forward_context as fc
+
+        built = []
 
         def fake_plan(context_lens, num_kv_heads, **kw):
             plan = kw.get("plan")
             if plan is not None:
                 plan.refreshed += 1
                 return plan
-            return _BudgetPlan(
-                int(context_lens.shape[0]), kw.get("workgroup_budget", 2 * self.NUM_CU)
-            )
-
-        tuning = importlib.import_module("aiter.ops.flydsl.pa_decode_tuning")
-        lookups = []
-
-        def fake_budget(shape, architecture, num_cu, *, storage_key=None):
-            lookups.append(shape["ql"])
-            return budgets[shape["ql"]]
+            built.append(kw)
+            return _CountingPlan(int(context_lens.shape[0]))
 
         monkeypatch.setattr(
             importlib.import_module("aiter.ops.flydsl.pa_decode"),
             "plan_pa_decode",
             fake_plan,
         )
-        monkeypatch.setattr(tuning, "get_cached_budget", fake_budget)
-        monkeypatch.setattr(
-            tuning, "make_shape", lambda b, ctx, ql, **kw: {"b": b, "ql": ql}
-        )
-        monkeypatch.setattr(tuning, "storage_key", lambda *a: ("layout",))
+        monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
         monkeypatch.setattr(
             torch.cuda,
-            "get_device_properties",
-            lambda d: SimpleNamespace(
-                gcnArchName="gfx950:sramecc+", multi_processor_count=self.NUM_CU
-            ),
+            "current_stream",
+            lambda device=None: SimpleNamespace(cuda_stream=7),
         )
-        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capturing)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
-        monkeypatch.setattr(ba, "_FLYDSL_ROLE_DECIDED", set())
-        monkeypatch.setattr(ba, "_FLYDSL_BUDGETS", {})
-        builder = aa.AiterAttentionMetadataBuilder.__new__(
-            aa.AiterAttentionMetadataBuilder
-        )
-        builder._flydsl_kv_heads = 1
-        builder._flydsl_plans = {}
-        builder._flydsl_role_budgets = {}
-        builder._flydsl_plan_unplanned = False
-        return ba, builder, lookups
+        self._fc = fc
+        return ba, built
 
-    def _call(self, ba, builder, role, ql, n=16):
-        import torch
+    def _new_forward(self, monkeypatch):
+        ctx = SimpleNamespace()
+        monkeypatch.setattr(self._fc, "get_forward_context", lambda: ctx)
 
-        owner = SimpleNamespace(
-            flydsl_plan_role=role,
-            flydsl_plan_builder=builder,
-            flydsl_work_plan=builder.refresh_flydsl_plan(
-                _Ctx(n), create=True, role=role
-            ),
-        )
-        plan = ba._flydsl_prepare_explicit_plan(
-            q=torch.empty((n * ql, 16, 128), dtype=torch.bfloat16, device="meta"),
-            k_cache=torch.empty((64, 1, 8, 128, 16), device="meta"),
-            v_cache=torch.empty((64, 1, 8, 128, 16), device="meta"),
-            block_tables=torch.empty((n, 8), device="meta"),
-            context_lens=_Ctx(n),
-            k_scale=None,
-            v_scale=None,
-            num_seqs=n,
-            query_length=ql,
-            max_context_partition_num=8,
-            sliding_window=0,
-            max_context_length=1024,
-            existing_plan=owner.flydsl_work_plan,
-            plan_owner=owner,
-        )
-        return owner, plan
-
-    def test_target_and_draft_with_different_budgets_get_their_own_plans(
-        self, monkeypatch
-    ):
-        ba, builder, _ = self._setup(
-            monkeypatch, {4: 512, 1: 256}, capturing=lambda: False
-        )
-        owner_t, target = self._call(ba, builder, "target", 4)
-        owner_d, draft = self._call(ba, builder, "draft", 1)
-        assert target.capacity == 512 and draft.capacity == 256
-        assert target is not draft, "one capture plan cannot carry two budgets"
-        assert owner_d.flydsl_work_plan is draft, "capture must see the adopted plan"
-        assert builder.refresh_flydsl_plan(_Ctx(16), role="target") is target
-        assert builder.refresh_flydsl_plan(_Ctx(16), role="draft") is draft
-
-    def test_equal_budgets_keep_one_shared_plan(self, monkeypatch):
-        ba, builder, _ = self._setup(
-            monkeypatch, {4: 512, 1: 512}, capturing=lambda: False
-        )
-        _, target = self._call(ba, builder, "target", 4)
-        _, draft = self._call(ba, builder, "draft", 1)
-        assert target is draft, "same budget must keep #2366's single object"
-        assert len(builder._flydsl_plans) == 1
-
-    def test_capture_never_looks_up_or_mints_a_plan(self, monkeypatch):
-        ba, builder, lookups = self._setup(
-            monkeypatch, {4: 512, 1: 256}, capturing=lambda: True
-        )
-        _, target = self._call(ba, builder, "target", 4)
-        owner, draft = self._call(ba, builder, "draft", 1)
-        assert lookups == [], f"budget looked up during capture: {lookups}"
-        assert draft is owner.flydsl_work_plan is target
-        assert not ba._FLYDSL_RUNTIME_PLANS or all(
-            p is not draft for p in ba._FLYDSL_RUNTIME_PLANS.values()
-        )
-
-    def test_a_decided_role_is_not_looked_up_again(self, monkeypatch):
-        ba, builder, lookups = self._setup(
-            monkeypatch, {4: 512, 1: 256}, capturing=lambda: False
-        )
-        self._call(ba, builder, "draft", 1)
-        self._call(ba, builder, "draft", 1)
-        assert lookups == [1], f"decided role looked up again: {lookups}"
-
-    def _runtime_call(self, ba, refresh_once):
+    def _call(self, ba, refresh_once=False, existing_plan=None):
         import torch
 
         n = 16
         return ba._flydsl_prepare_explicit_plan(
             q=torch.empty((n, 16, 128), dtype=torch.bfloat16, device="meta"),
             k_cache=torch.empty((64, 1, 8, 16, 16), device="meta"),
-            v_cache=torch.empty((64, 1, 1, 128, 16), device="meta"),
             block_tables=torch.empty((n, 128), device="meta"),
             context_lens=_Ctx(n),
-            k_scale=None,
-            v_scale=None,
             num_seqs=n,
             query_length=1,
             max_context_partition_num=8,
             sliding_window=0,
             max_context_length=2048,
-            existing_plan=None,
+            existing_plan=existing_plan,
             refresh_once_per_forward=refresh_once,
         )
 
-    def _forward(self, monkeypatch):
-        import torch
+    def test_default_budget_needs_no_tuning_module(self, monkeypatch):
+        """#5809 ships no tuned budgets and its old tuner module is gone."""
+        ba, built = self._setup(monkeypatch)
+        monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.pa_decode_tuning", None)
+        self._new_forward(monkeypatch)
+        assert self._call(ba) is not None
+        assert built and "workgroup_budget" not in built[0], built
 
-        from atom.utils import forward_context as fc
-
-        ctx = SimpleNamespace()
-        monkeypatch.setattr(fc, "get_forward_context", lambda: ctx)
-        monkeypatch.setattr(
-            torch.cuda,
-            "current_stream",
-            lambda device=None: SimpleNamespace(cuda_stream=7),
-        )
+    def test_a_fitting_capture_plan_is_used_as_is(self, monkeypatch):
+        ba, built = self._setup(monkeypatch)
+        self._new_forward(monkeypatch)
+        captured = _CountingPlan(16)
+        assert self._call(ba, existing_plan=captured) is captured
+        assert built == [] and captured.refreshed == 0
 
     def test_sparse_plan_is_refreshed_once_per_forward(self, monkeypatch):
         """All sparse layers of one step share lengths, so one refresh serves 57."""
-        ba, _, _ = self._setup(monkeypatch, {1: 512}, capturing=lambda: False)
-        monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
-        self._forward(monkeypatch)
-        plans = [self._runtime_call(ba, True) for _ in range(57)]
+        ba, _ = self._setup(monkeypatch)
+        self._new_forward(monkeypatch)
+        plans = [self._call(ba, refresh_once=True) for _ in range(57)]
         assert all(p is plans[0] for p in plans)
         assert plans[0].refreshed == 0, "only the build may fill it in this forward"
-        self._forward(monkeypatch)  # next step: a new forward context
-        self._runtime_call(ba, True)
-        self._runtime_call(ba, True)
+        self._new_forward(monkeypatch)  # next step: a new forward context
+        self._call(ba, refresh_once=True)
+        self._call(ba, refresh_once=True)
         assert plans[0].refreshed == 1, "a new forward must refresh exactly once"
 
     def test_without_the_opt_in_every_call_refreshes(self, monkeypatch):
         """Dense eager / plugin callers do not promise shared lengths."""
-        ba, _, _ = self._setup(monkeypatch, {1: 512}, capturing=lambda: False)
-        monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
-        self._forward(monkeypatch)
-        plans = [self._runtime_call(ba, False) for _ in range(3)]
+        ba, _ = self._setup(monkeypatch)
+        self._new_forward(monkeypatch)
+        plans = [self._call(ba) for _ in range(3)]
         assert plans[0].refreshed == 2
 
 

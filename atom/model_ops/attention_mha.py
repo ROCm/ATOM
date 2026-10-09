@@ -631,7 +631,6 @@ class PagedAttentionImpl(nn.Module):
             # that never installed its own shares the other ubatch's.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
             max_context_length=attn_metadata.max_seqlen_k,
-            plan_owner=attn_metadata,
         )
 
         return o
