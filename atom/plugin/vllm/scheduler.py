@@ -223,16 +223,33 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
         if planner is None or num_new_tokens <= 0:
             return num_new_tokens
         interval = int(planner.state_interval)
+        block = int(planner.hash_block_size)
         start = int(num_computed_tokens)
         end = start + int(num_new_tokens)
-        # The last chunk of a prompt is exempt: decode walks its frontier to
-        # the next boundary one token at a time, so clipping it would only
-        # delay the prompt for a landing it reaches anyway.
-        if end >= int(request.num_prompt_tokens):
+        total = int(request.num_prompt_tokens)
+        if end >= total:
+            # The last chunk. Decode walks its frontier one token at a time,
+            # so every boundary ABOVE the prompt is reached anyway and
+            # clipping for those would only delay the prompt.
+            #
+            # The one below it is different, and it is the valuable one: the
+            # prompt-end anchor is the last block-aligned point at or before
+            # `total`, and once the frontier is past it nothing returns to it.
+            # A prompt whose length is not a whole number of blocks reaches it
+            # only if a chunk ends there, which is this clip.
+            anchor = (total // block) * block
+            if start < anchor < end:
+                return anchor - start
             return num_new_tokens
+        # Spacing, not a fixed ladder: the planner accepts any block-aligned
+        # frontier at least `interval` past the last one it stored, so aiming
+        # at the next multiple of the interval and settling for the next block
+        # boundary lands one either way.
         aligned = (end // interval) * interval
         if aligned <= start:
-            # The next boundary is past this chunk. Clipping would schedule
+            aligned = (end // block) * block
+        if aligned <= start:
+            # Even one block is past this chunk. Clipping would schedule
             # nothing; let it cross and let `boundary_passed` record that the
             # budget is too small to land.
             return num_new_tokens
@@ -240,9 +257,7 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
 
     _wrapped._atom_v41_prefill_aligned = True
     Scheduler._reserve_prefill_lookahead = _wrapped
-    logger.info(
-        "ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary."
-    )
+    logger.info("ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary.")
 
 
 def apply_vllm_v41_local_hit_cap_patch() -> None:

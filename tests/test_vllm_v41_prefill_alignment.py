@@ -16,14 +16,15 @@ from types import SimpleNamespace
 import pytest
 
 INTERVAL = 4096
+BLOCK = 256
 
 
 class FakeScheduler:
     """Only what the wrapper reads: a connector carrying a planner."""
 
-    def __init__(self, interval=INTERVAL):
+    def __init__(self, interval=INTERVAL, block=BLOCK):
         self.connector = SimpleNamespace(
-            _v41_planner=SimpleNamespace(state_interval=interval)
+            _v41_planner=SimpleNamespace(state_interval=interval, hash_block_size=block)
         )
 
 
@@ -58,20 +59,46 @@ def test_a_chunk_already_on_a_boundary_is_untouched():
     assert wrapper()(FakeScheduler(), request(), 0, INTERVAL) == INTERVAL
 
 
-def test_a_chunk_too_small_to_reach_a_boundary_is_left_alone():
-    """Clipping cannot extend a chunk, and must never schedule zero tokens.
+def test_a_chunk_short_of_the_interval_still_lands_on_a_block():
+    """The boundary grid is a minimum spacing, so a block boundary will do.
 
-    With the budget at or below the interval the first boundary is already out
-    of reach; crossing it and letting `boundary_passed` say so beats stalling
-    the request.
+    This used to run the chunk out to 4,090 and record a crossing. The planner
+    now accepts any block-aligned frontier far enough from the last one, so
+    stopping at 3,840 gives it something to land on at no cost: the tokens
+    between go in the next chunk either way.
     """
-    assert wrapper()(FakeScheduler(), request(), 0, 4090) == 4090
+    assert wrapper()(FakeScheduler(), request(), 0, 4090) == 3840
 
 
-def test_the_last_chunk_of_a_prompt_is_exempt():
-    """Decode walks the frontier to the next boundary one token at a time."""
+def test_a_chunk_too_small_for_even_one_block_is_left_alone():
+    """Clipping cannot extend a chunk, and must never schedule zero tokens."""
+    assert wrapper()(FakeScheduler(), request(), 0, 200) == 200
+
+
+def test_the_last_chunk_stops_on_the_prompt_anchor():
+    """The one boundary below the prompt that nothing else will reach.
+
+    Boundaries ABOVE the prompt are reached anyway -- decode walks the frontier
+    one token at a time -- so the last chunk used to be exempt entirely. The
+    anchor is different: it is the last block-aligned point at or before the
+    prompt end, and once the frontier passes it nothing returns to it. A prompt
+    of 5,000 tokens anchors at 4,864.
+    """
     w = wrapper()
-    assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 904
+    assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 4864 - 4096
+
+
+def test_a_last_chunk_already_past_the_anchor_is_left_alone():
+    """Clipping must not extend, and a chunk starting past the anchor cannot
+    reach it: the remaining tokens are the unaligned tail of the prompt."""
+    w = wrapper()
+    assert w(FakeScheduler(), request(prompt=5000), 4864, 136) == 136
+
+
+def test_a_block_aligned_prompt_anchors_at_its_own_end():
+    """No clip needed: the prompt end IS the anchor, and the chunk ends there."""
+    w = wrapper()
+    assert w(FakeScheduler(), request(prompt=4096 + 768), 4096, 768) == 768
 
 
 def test_a_mid_prompt_chunk_clips_from_its_own_start():

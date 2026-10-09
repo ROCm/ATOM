@@ -64,10 +64,18 @@ class FakeCache:
         offset = main_bytes
         for owner, rows in OWNER_ROWS.items():
             width = INDEX_ROW_BYTES
-            self.index_planes[owner] = self.backing.as_strided(
-                (num_pages, rows, width),
-                (rows * width, width, 1),
-                self.backing.storage_offset() + offset,
+            # A TUPLE per owner, as `PagedAttentionCache` builds it: an
+            # owner's index region can be more than one plane (the fp4 layout
+            # splits the data from its scale). This fake carried a bare tensor
+            # until the real cache grew the tuple, at which point iterating it
+            # sliced the tensor itself -- which is what a flat publisher does
+            # to the real cache too, only silently.
+            self.index_planes[owner] = (
+                self.backing.as_strided(
+                    (num_pages, rows, width),
+                    (rows * width, width, 1),
+                    self.backing.storage_offset() + offset,
+                ),
             )
             offset += num_pages * rows * width
         self.state_bytes = self.backing[paged:].view(num_slots, state_bytes)
@@ -77,7 +85,8 @@ class FakeCache:
         regions = [(self.page_bytes.data_ptr(), PAGE_BYTES)]
         regions += [
             (p.data_ptr(), p.stride(0) * p.element_size())
-            for p in self.index_planes.values()
+            for planes in self.index_planes.values()
+            for p in planes
         ]
         return regions
 
@@ -96,7 +105,7 @@ def test_the_main_page_leads_and_index_planes_follow_owner_order():
     cache = FakeCache()
     roles = [role for role, _ in v41_page_planes(cache)]
     assert roles == ["dsv41.page"] + [
-        f"dsv41.index_plane.{owner}" for owner in OWNER_ROWS
+        f"dsv41.index_plane.{owner}.0" for owner in OWNER_ROWS
     ]
 
 

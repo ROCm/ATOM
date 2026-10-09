@@ -203,8 +203,7 @@ class V41StateViews:
         values = [int(i) for i in ids]
         if len(values) != 1:
             raise ValueError(
-                "V4.1 state offload: an entry is one region, got "
-                f"{len(values)} ids"
+                "V4.1 state offload: an entry is one region, got " f"{len(values)} ids"
             )
         return values[0]
 
@@ -329,6 +328,14 @@ class V41BoundaryPlanner:
         # req_id -> the last frontier this request was swept at, so one step's
         # frontier is offered once even if the connector sweeps twice.
         self._swept: dict[str, int] = {}
+        # The last frontier this request had a boundary offered at. The grid
+        # is a MINIMUM SPACING from here, not a fixed ladder of multiples of
+        # `state_interval`: a chunk that ends a few tokens past a rung used to
+        # miss it and lose that boundary for good, where spacing lets the next
+        # block-aligned frontier serve instead. The store count per request is
+        # unchanged by that -- still about one per interval of progress -- so
+        # it buys coverage rather than bandwidth.
+        self._last_offered: dict[str, int] = {}
         self._counters: dict[str, int] = {
             "sweep_offered": 0,
             "sweep_stores": 0,
@@ -346,6 +353,15 @@ class V41BoundaryPlanner:
             # lost, and were once counted as passed -- which made a working
             # restore read like a budget problem.
             "restored_start": 0,
+            # The prompt-end anchor: the one boundary that makes a prompt
+            # shorter than `state_interval` reusable at all.
+            "anchor_stores": 0,
+            # Previously silent: a request skipped because it was preempted or
+            # had finished, and one the scheduler no longer knows. Both are
+            # real coverage losses and neither was counted, so the sweep's
+            # own numbers could not be made to add up.
+            "sweep_skipped": 0,
+            "sweep_unknown_request": 0,
             "stage_full": 0,
             # The guard on the hard contract. Must stay zero; anything else
             # means a snapshot was taken at a position the scheduler did not
@@ -358,7 +374,6 @@ class V41BoundaryPlanner:
             # questions: the connector pair measures the tier, this pair
             # measures what prefix caching costs on a model whose state the
             # block pool does not carry.
-            "local_cap_kept": 0,
             "local_cap_declined": 0,
         }
         self._last_stats_log = 0.0
@@ -420,16 +435,47 @@ class V41BoundaryPlanner:
             )
             return 0
         block_hashes = getattr(request, "block_hashes", None) or ()
-        boundary = (hit // self.state_interval) * self.state_interval
-        for _ in range(_MAX_CAP_DESCENT):
-            if boundary <= 0:
-                self._counters["cap_declined"] += 1
-                return 0
-            h = self.boundary_hash(block_hashes, boundary)
-            if h is not None and self._index.could_serve(h):
-                self._counters["cap_kept"] += 1
-                return min(hit, boundary)
-            boundary -= self.state_interval
+        # Descend the BLOCK grid, not the interval ladder. The store side
+        # offers any block-aligned frontier spaced an interval apart, plus the
+        # prompt-end anchor, so the boundaries that exist are not multiples of
+        # the interval -- an interval-stepped search walks straight past them
+        # and, for a prompt shorter than one interval, starts at zero.
+        #
+        # The descent is still bounded by `_MAX_CAP_DESCENT`, so the search
+        # reaches back `_MAX_CAP_DESCENT` blocks rather than that many
+        # intervals. That is the right span for this grid: the nearest stored
+        # boundary is at most one interval below the hit, and the step is
+        # chosen so the search covers an interval whenever the two are
+        # configured together (`state_interval % hash_block_size == 0` is
+        # checked at construction).
+        # Two phases, because the grid has two scales. Near the hit the
+        # boundaries are block-aligned and an interval apart but NOT at
+        # multiples of the interval -- the store side takes any block-aligned
+        # frontier far enough from the last, plus the prompt-end anchor -- so
+        # an interval-stepped search walks straight past them, and for a prompt
+        # shorter than one interval it starts at zero. Far from the hit, a
+        # block-stepped search would need `interval / block` lookups per
+        # interval of reach to cover the same span.
+        #
+        # So: walk the block grid for one interval, then the interval ladder
+        # for the rest of the budget. Near-field precision at the old reach,
+        # and at most `2 * _MAX_CAP_DESCENT` index lookups.
+        block = self.hash_block_size
+        boundary = (hit // block) * block
+        near = min(_MAX_CAP_DESCENT, max(1, self.state_interval // block))
+        for phase_step, phase_len in (
+            (block, near),
+            (self.state_interval, _MAX_CAP_DESCENT),
+        ):
+            for _ in range(phase_len):
+                if boundary <= 0:
+                    self._counters["cap_declined"] += 1
+                    return 0
+                h = self.boundary_hash(block_hashes, boundary)
+                if h is not None and self._index.could_serve(h):
+                    self._counters["cap_kept"] += 1
+                    return min(hit, boundary)
+                boundary -= phase_step
         self._counters["cap_declined"] += 1
         return 0
 
@@ -466,6 +512,24 @@ class V41BoundaryPlanner:
         self._counters["local_cap_declined"] += 1
         return 0
 
+    def _prompt_anchor(self, request) -> int:
+        """The last block-aligned point at or before the end of the prompt.
+
+        The single most valuable boundary a request has: a later request with
+        the same prompt reuses everything up to it. Without it a prompt shorter
+        than `state_interval` has no boundary at all -- `floor(N / interval)`
+        is zero -- so the tier stores nothing for it and `cap_hit` can only
+        return zero, which reads as a cold tier rather than as a prompt the
+        grid cannot express.
+
+        Block-aligned rather than the prompt end itself, because a boundary
+        needs a block hash to be keyed by and vLLM hashes whole blocks. The
+        frontier reaches this point only if a prefill chunk ends there, which
+        is what the scheduler patch arranges.
+        """
+        total = int(getattr(request, "num_prompt_tokens", 0) or 0)
+        return (total // self.hash_block_size) * self.hash_block_size
+
     def boundary_hash(self, block_hashes, boundary_tokens: int) -> int | None:
         """The prefix-hash key for the state committed at *boundary_tokens*."""
         if boundary_tokens <= 0 or boundary_tokens % self.hash_block_size:
@@ -498,6 +562,7 @@ class V41BoundaryPlanner:
         for req_id, frontier in (frontiers or {}).items():
             req_id = str(req_id)
             if req_id in skip_req_ids:
+                self._counters["sweep_skipped"] += 1
                 continue
             frontier = int(frontier)
             previous = self._swept.get(req_id)
@@ -519,8 +584,7 @@ class V41BoundaryPlanner:
                 self._counters["restored_start"] += 1 if frontier else 0
             else:
                 crossed = (
-                    frontier // self.state_interval
-                    - previous // self.state_interval
+                    frontier // self.state_interval - previous // self.state_interval
                 )
                 if frontier % self.state_interval:
                     self._counters["boundary_passed"] += max(0, crossed)
@@ -529,12 +593,25 @@ class V41BoundaryPlanner:
                     # offered.
                     self._counters["boundary_passed"] += max(0, crossed - 1)
             self._swept[req_id] = frontier
-            if frontier <= 0 or frontier % self.state_interval:
+            request = requests_by_id.get(req_id)
+            if frontier <= 0 or frontier % self.hash_block_size:
+                # Not a block boundary, so `boundary_hash` has no key for it
+                # whatever else is true. Nothing to count: these are most of
+                # the frontiers a decode produces.
+                continue
+            if request is None:
+                self._counters["sweep_unknown_request"] += 1
+                continue
+            is_anchor = (
+                req_id not in self._last_offered
+                and frontier == self._prompt_anchor(request)
+            )
+            spaced = frontier - self._last_offered.get(req_id, 0) >= self.state_interval
+            if not (spaced or is_anchor):
                 continue
             self._counters["sweep_offered"] += 1
-            request = requests_by_id.get(req_id)
-            if request is None:
-                continue
+            if is_anchor and not spaced:
+                self._counters["anchor_stores"] += 1
             prefix_hash = self.boundary_hash(
                 getattr(request, "block_hashes", None) or (), frontier
             )
@@ -547,6 +624,7 @@ class V41BoundaryPlanner:
             op_id = self._next_op_id
             self._next_op_id += 1
             self._pending_stores[op_id] = _PendingStore(prefix_hash)
+            self._last_offered[req_id] = frontier
             self._counters["sweep_stores"] += 1
             accepted.append(V41Store(op_id, prefix_hash, req_id, frontier))
         return accepted
@@ -648,6 +726,7 @@ class V41BoundaryPlanner:
         suppress every boundary of its new one.
         """
         self._swept.pop(str(req_id), None)
+        self._last_offered.pop(str(req_id), None)
 
     # -- observability ---------------------------------------------------
     def stats(self) -> dict[str, int]:

@@ -127,8 +127,8 @@ def test_a_claimed_reservation_stops_protecting_its_slot():
     """Otherwise every reservation shrinks the pool for good."""
     allocator = StateSlotAllocator(2)
     allocator.reserve("r0")
-    allocator.assign(["r0"], [4096])          # claimed: no longer a reservation
-    allocator.assign(["other"], [100])        # r0 gone from the batch
+    allocator.assign(["r0"], [4096])  # claimed: no longer a reservation
+    allocator.assign(["other"], [100])  # r0 gone from the batch
     assert allocator.reserve("r1") is not None
 
 
@@ -149,7 +149,7 @@ def test_release_unclaimed_leaves_a_request_that_actually_ran():
     """
     allocator = StateSlotAllocator(2)
     allocator.reserve("r0")
-    allocator.assign(["r0"], [4096])          # claimed -> no longer reserved
+    allocator.assign(["r0"], [4096])  # claimed -> no longer reserved
     assert allocator.release_unclaimed("r0") is False
     assert allocator.slot_for("r0") is not None
 

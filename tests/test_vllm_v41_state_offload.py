@@ -134,15 +134,29 @@ def test_a_hit_is_capped_to_the_claimed_boundary():
     assert planner.stats()["cap_kept"] == 1
 
 
-def test_the_cap_descends_in_whole_intervals():
-    """Only interval boundaries are stored, so only those may be returned."""
+def test_the_cap_reaches_a_boundary_several_intervals_below():
+    """Reach, which the near-field block scan must not cost.
+
+    The descent walks the block grid for one interval and then the interval
+    ladder, so a boundary three intervals down is still found -- a block-only
+    scan bounded by the same budget would stop one interval in.
+    """
     planner = make_planner()
     request = make_request()
     planner._index.note_stored(planner.boundary_hash(request.block_hashes, INTERVAL))
     planner.begin_lookup(request)
     capped = planner.cap_hit(SimpleNamespace(id="r0"), INTERVAL * 4 + 1)
     assert capped == INTERVAL
-    assert capped % INTERVAL == 0
+
+
+def test_the_cap_finds_a_boundary_that_is_not_a_multiple_of_the_interval():
+    """Near field: the anchor and any spaced boundary live off the ladder."""
+    planner = make_planner()
+    request = make_request()
+    off_ladder = INTERVAL + HASH_BLOCK
+    planner._index.note_stored(planner.boundary_hash(request.block_hashes, off_ladder))
+    planner.begin_lookup(request)
+    assert planner.cap_hit(SimpleNamespace(id="r0"), INTERVAL * 2) == off_ladder
 
 
 def test_a_cap_armed_for_another_request_declines():
@@ -178,7 +192,7 @@ def test_a_frontier_between_boundaries_is_not_offered():
 def test_stepping_over_a_boundary_is_counted_not_deferred():
     """The ring has already moved; there is no hole to come back to."""
     planner, views = make_planner(), FakeViews()
-    sweep(planner, views, 0)                          # fresh: starts at zero
+    sweep(planner, views, 0)  # fresh: starts at zero
     sweep(planner, views, INTERVAL)
     assert sweep(planner, views, INTERVAL * 3) != []  # lands on one
     assert planner.stats()["boundary_passed"] == 1  # stepped over 2*INTERVAL
@@ -192,7 +206,7 @@ def test_a_restored_requests_first_frontier_is_not_counted_as_lost():
     a budget problem and would send the next person tuning the wrong knob.
     """
     planner, views = make_planner(), FakeViews()
-    sweep(planner, views, INTERVAL * 3 + 7)   # arrives mid-prompt, restored
+    sweep(planner, views, INTERVAL * 3 + 7)  # arrives mid-prompt, restored
     assert planner.stats()["boundary_passed"] == 0
     assert planner.stats()["restored_start"] == 1
 
@@ -200,9 +214,9 @@ def test_a_restored_requests_first_frontier_is_not_counted_as_lost():
 def test_a_budget_that_straddles_boundaries_counts_every_one_it_passes():
     """From the second sighting on, a skipped boundary really is lost."""
     planner, views = make_planner(), FakeViews()
-    sweep(planner, views, 0)                   # fresh
-    sweep(planner, views, INTERVAL)            # lands, establishes a cursor
-    sweep(planner, views, INTERVAL * 4 + 7)    # skips 2..4 x INTERVAL
+    sweep(planner, views, 0)  # fresh
+    sweep(planner, views, INTERVAL)  # lands, establishes a cursor
+    sweep(planner, views, INTERVAL * 4 + 7)  # skips 2..4 x INTERVAL
     assert planner.stats()["boundary_passed"] == 3
     assert planner.stats()["restored_start"] == 0
 
@@ -230,7 +244,7 @@ def test_a_refused_snapshot_closes_the_quorum_as_a_failure():
     and, worse, leaves it unclaimed-but-not-disowned.
     """
     planner, views = make_planner(world_size=1), FakeViews()
-    store, = sweep(planner, views, INTERVAL)
+    (store,) = sweep(planner, views, INTERVAL)
     planner.absorb_reports({}, {store.op_id: 1})
     assert store.op_id not in planner._pending_stores
     assert not planner._index.could_serve(store.prefix_hash)
@@ -280,7 +294,7 @@ def test_a_skipped_request_is_not_offered():
 def test_a_boundary_is_claimed_only_once_every_rank_stored_it():
     planner = make_planner(world_size=4)
     views = FakeViews()
-    store, = sweep(planner, views, INTERVAL)
+    (store,) = sweep(planner, views, INTERVAL)
     planner.absorb_reports({store.op_id: 3}, {})
     assert not planner._index.could_serve(store.prefix_hash)
     planner.absorb_reports({store.op_id: 1}, {})
@@ -291,7 +305,7 @@ def test_one_rank_failing_disowns_the_whole_boundary():
     """A state stored on three of four ranks is one `cap_hit` would accept."""
     planner = make_planner(world_size=4)
     views = FakeViews()
-    store, = sweep(planner, views, INTERVAL)
+    (store,) = sweep(planner, views, INTERVAL)
     planner.absorb_reports({store.op_id: 3}, {store.op_id: 1})
     assert not planner._index.could_serve(store.prefix_hash)
 
@@ -300,7 +314,7 @@ def test_quorum_counts_failures_so_a_boundary_is_never_stranded():
     """A rank that could not write never sends a second report."""
     planner = make_planner(world_size=2)
     views = FakeViews(depth=2)
-    store, = sweep(planner, views, INTERVAL)
+    (store,) = sweep(planner, views, INTERVAL)
     planner.absorb_reports({}, {store.op_id: 2})
     assert store.op_id not in planner._pending_stores
 
@@ -312,7 +326,9 @@ def test_a_load_is_queued_only_for_a_claimed_boundary():
     planner = make_planner()
     request = make_request()
     assert planner.resolve_load(request, INTERVAL * 2) is False
-    planner._index.note_stored(planner.boundary_hash(request.block_hashes, INTERVAL * 2))
+    planner._index.note_stored(
+        planner.boundary_hash(request.block_hashes, INTERVAL * 2)
+    )
     assert planner.resolve_load(request, INTERVAL * 2) is True
     assert [load.req_id for load in planner.take_loads()] == ["r0"]
 
@@ -354,7 +370,7 @@ def decided(planner, views, frontier, req_id="r0"):
 def test_a_request_with_no_slot_is_refused_by_the_worker():
     """A decided boundary whose request never reached a batch row."""
     planner, views = make_planner(), FakeViews()
-    store, = decided(planner, views, INTERVAL)
+    (store,) = decided(planner, views, INTERVAL)
     leg = worker_leg(views, {})
     assert leg.snapshot_and_submit([store]) == {"worker_no_slot": [store.op_id]}
 
@@ -367,7 +383,7 @@ def test_a_cursor_that_disagrees_with_the_schedule_is_refused():
     was restored into would then refuse the request.
     """
     planner, views = make_planner(), FakeViews(committed={0: INTERVAL - 256})
-    store, = decided(planner, views, INTERVAL)
+    (store,) = decided(planner, views, INTERVAL)
     leg = worker_leg(views, {"r0": 0})
     assert leg.snapshot_and_submit([store]) == {"cursor_mismatch": [store.op_id]}
 
@@ -375,14 +391,14 @@ def test_a_cursor_that_disagrees_with_the_schedule_is_refused():
 def test_an_exhausted_staging_ring_refuses_rather_than_stalls():
     planner, views = make_planner(), FakeViews(depth=0)
     views.default_committed = INTERVAL
-    store, = decided(planner, views, INTERVAL)
+    (store,) = decided(planner, views, INTERVAL)
     leg = worker_leg(views, {"r0": 0})
     assert leg.snapshot_and_submit([store]) == {"stage_full": [store.op_id]}
 
 
 def test_a_refused_store_holds_no_staging_slab():
     planner, views = make_planner(), FakeViews(depth=1)
-    store, = decided(planner, views, INTERVAL)
+    (store,) = decided(planner, views, INTERVAL)
     leg = worker_leg(views, {})
     leg.snapshot_and_submit([store])
     # The slab was never taken, so releasing the op is a no-op and the ring is
@@ -451,9 +467,7 @@ def test_the_worker_reads_every_cursor_in_one_device_round_trip():
     """
     planner = make_planner()
     views = FakeViews(depth=4, committed={0: 1, 1: 2, 2: 3})
-    decided = [
-        sweep(planner, views, INTERVAL, req_id=r)[0] for r in ("a", "b", "c")
-    ]
+    decided = [sweep(planner, views, INTERVAL, req_id=r)[0] for r in ("a", "b", "c")]
     leg = worker_leg(views, {"a": 0, "b": 1, "c": 2})
     views.cursor_reads = 0
     refused = leg.snapshot_and_submit(decided)
@@ -475,3 +489,100 @@ def test_worker_refusals_reach_the_leg_s_own_stats_line():
     stats = planner.stats()
     assert stats["cursor_mismatch"] == 3
     assert stats["stage_full"] == 1
+
+
+# ---- the boundary grid: spacing, and the prompt-end anchor ---------------
+
+
+def _req(req_id, tokens):
+    """A request that knows its prompt length, so the anchor is reachable."""
+    r = make_request(req_id, tokens)
+    r.num_prompt_tokens = tokens
+    return r
+
+
+class TestAPromptShorterThanTheIntervalIsReusableAtAll:
+    """The gap this grid change exists to close.
+
+    `floor(N / interval)` is zero for every prompt below one interval, so the
+    old ladder offered nothing, `cap_hit` could only answer 0, and the tier
+    read as cold for a workload it simply could not express. Short prompts are
+    not a corner: a 1,000-token prompt at `state_interval` 8,192 is the common
+    case for chat.
+    """
+
+    def test_the_anchor_is_offered(self):
+        p = make_planner()
+        tokens = INTERVAL - HASH_BLOCK  # 768 at interval 1024
+        req = _req("r0", tokens)
+        stores = p.collect_frontier_stores({"r0": tokens}, {"r0": req})
+        assert [s.boundary for s in stores] == [tokens]
+        assert p._counters["anchor_stores"] == 1
+
+    def test_and_cap_hit_can_then_serve_it(self):
+        p = make_planner()
+        tokens = INTERVAL - HASH_BLOCK
+        req = _req("r0", tokens)
+        (store,) = p.collect_frontier_stores({"r0": tokens}, {"r0": req})
+        p.absorb_reports(stored={store.op_id: 1}, failed={})
+        p.begin_lookup(req)
+        assert p.cap_hit(SimpleNamespace(id="r0"), tokens) == tokens
+
+    def test_without_the_anchor_it_would_be_nothing(self):
+        """The negative control: same prompt, no prompt length to anchor on."""
+        p = make_planner()
+        tokens = INTERVAL - HASH_BLOCK
+        plain = make_request("r0", tokens)  # no num_prompt_tokens
+        assert p.collect_frontier_stores({"r0": tokens}, {"r0": plain}) == []
+
+
+class TestTheGridIsSpacingNotALadder:
+    def test_a_frontier_past_a_rung_still_lands(self):
+        """A chunk that overshoots used to lose the boundary for good.
+
+        The scheduler aims chunks at the grid, but it spends one token budget
+        across the whole step, so a prefill sharing a batch with decodes lands
+        a little past. On a fixed ladder that boundary is gone; on spacing the
+        next block-aligned frontier serves.
+        """
+        p = make_planner()
+        over = INTERVAL + HASH_BLOCK  # one block past the rung
+        req = _req("r0", INTERVAL * 8)
+        assert [
+            s.boundary for s in p.collect_frontier_stores({"r0": over}, {"r0": req})
+        ] == [over]
+
+    def test_but_two_boundaries_closer_than_the_interval_are_not_both_taken(self):
+        """Spacing is still spacing: the store count per request is what
+        prices the tier, and it must not grow with block granularity."""
+        p = make_planner()
+        req = _req("r0", INTERVAL * 8)
+        first = p.collect_frontier_stores({"r0": INTERVAL}, {"r0": req})
+        p.absorb_reports(stored={first[0].op_id: 1}, failed={})
+        soon = p.collect_frontier_stores({"r0": INTERVAL + HASH_BLOCK}, {"r0": req})
+        assert first and soon == []
+
+    def test_a_frontier_off_the_block_grid_is_never_offered(self):
+        """`boundary_hash` has no key for it, whatever the spacing says."""
+        p = make_planner()
+        req = _req("r0", INTERVAL * 8)
+        assert p.collect_frontier_stores({"r0": INTERVAL + 1}, {"r0": req}) == []
+
+
+class TestTheSilentBranchesAreCounted:
+    def test_a_skipped_request_is_counted(self):
+        p = make_planner()
+        req = _req("r0", INTERVAL * 8)
+        p.collect_frontier_stores({"r0": INTERVAL}, {"r0": req}, skip_req_ids={"r0"})
+        assert p._counters["sweep_skipped"] == 1
+
+    def test_a_request_the_scheduler_forgot_is_counted(self):
+        p = make_planner()
+        assert p.collect_frontier_stores({"r0": INTERVAL}, {}) == []
+        assert p._counters["sweep_unknown_request"] == 1
+
+    def test_the_dead_counter_is_gone(self):
+        # `local_cap_kept` could never increment: `cap_local_hit` returns 0
+        # unconditionally. A counter that is structurally zero reads as
+        # "measured and absent" rather than "not measured".
+        assert "local_cap_kept" not in make_planner()._counters
