@@ -9,13 +9,50 @@ from enum import IntEnum
 import torch
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.mx_scale_layout import (
-    mx_scale_buffer_shape as mxfp4_scale_buffer_shape,
-)
-from aiter.ops.mx_scale_layout import to_mx_scale_layout as to_mxfp4_scale_layout
-from aiter.utility.mx_types import MXScaleLayoutInt as MXScaleLayout
 
 from atom.utils import envs
+
+try:
+    from aiter.ops.mx_scale_layout import (
+        mx_scale_buffer_shape as mxfp4_scale_buffer_shape,
+    )
+    from aiter.ops.mx_scale_layout import to_mx_scale_layout as to_mxfp4_scale_layout
+    from aiter.utility.mx_types import MXScaleLayoutInt as MXScaleLayout
+
+    _EXPLICIT_MX_LAYOUT_SUPPORTED = True
+except ImportError:
+    # Keep unrelated models importable while the dependent AITER PR is absent.
+    # Any MXFP4 layer fails below before it can use this compatibility mirror.
+    from aiter.utility import fp4_utils
+
+    class MXScaleLayout:
+        ROW_MAJOR = 0
+        AITER_E8M0 = 1
+        OPUS_F4 = 2
+
+    def mxfp4_scale_buffer_shape(
+        rows: int, k_groups: int, layout: int
+    ) -> tuple[int, int]:
+        if layout == MXScaleLayout.ROW_MAJOR:
+            return rows, k_groups
+        if layout == MXScaleLayout.AITER_E8M0:
+            return ((rows + 255) // 256 * 256, (k_groups + 7) // 8 * 8)
+        if layout == MXScaleLayout.OPUS_F4:
+            return ((rows + 31) // 32 * 32, (k_groups + 3) // 4 * 4)
+        raise ValueError(f"unknown MXFP4 scale layout: {layout}")
+
+    def to_mxfp4_scale_layout(scale: torch.Tensor, layout: int) -> torch.Tensor:
+        if layout == MXScaleLayout.ROW_MAJOR:
+            return scale.contiguous()
+        if layout == MXScaleLayout.AITER_E8M0:
+            return fp4_utils.e8m0_shuffle(scale)
+        if layout == MXScaleLayout.OPUS_F4:
+            from aiter.ops.shuffle import shuffle_scale_f4
+
+            return shuffle_scale_f4(scale, intype=7)
+        raise ValueError(f"unknown MXFP4 scale layout: {layout}")
+
+    _EXPLICIT_MX_LAYOUT_SUPPORTED = False
 
 __all__ = [
     "Fp4BackendKind",
@@ -59,6 +96,11 @@ def resolve_fp4_backend_spec(
 ) -> Fp4BackendSpec | None:
     if params_dtype != dtypes.fp4x2:
         return None
+    if not _EXPLICIT_MX_LAYOUT_SUPPORTED:
+        raise RuntimeError(
+            "MXFP4 explicit scale layouts require an AITER build containing "
+            "ROCm/aiter#6294"
+        )
     if nonshuffle_triton_gemm:
         kind = Fp4BackendKind.TRITON_NONSHUFFLE
         layout = MXScaleLayout.ROW_MAJOR

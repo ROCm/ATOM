@@ -5,6 +5,9 @@ import inspect
 
 import pytest
 import torch
+
+pytest.importorskip("aiter")
+
 from aiter import QuantType, dtypes
 
 if not torch.cuda.is_available():
