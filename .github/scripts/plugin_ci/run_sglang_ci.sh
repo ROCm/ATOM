@@ -119,12 +119,43 @@ EOF
 docker rmi "atom_sglang_base:ci" 2>/dev/null || true
 docker rmi "atom_sglang:ci" 2>/dev/null || true
 
-# Some spur nodes point dockerd/buildkit at this path without mounting it.
-if [[ ! -d /mnt/m2m_nobackup/docker/tmp ]]; then
-  mkdir -p /mnt/m2m_nobackup/docker/tmp 2>/dev/null \
-    || sudo mkdir -p /mnt/m2m_nobackup/docker/tmp 2>/dev/null \
-    || true
-fi
+# Spur dockerd/buildkit uses this directory as TMPDIR. When the mount is
+# absent, reading the Dockerfile fails before any build step runs.
+ensure_buildkit_tmp() {
+  local target="/mnt/m2m_nobackup/docker/tmp"
+  if [[ -d "${target}" ]]; then
+    return 0
+  fi
+  echo "buildkit tmp ${target} is missing; creating it"
+  mkdir -p "${target}" 2>/dev/null || true
+  if [[ ! -d "${target}" ]] && command -v sudo >/dev/null 2>&1; then
+    sudo -n mkdir -p "${target}" || true
+    sudo -n chmod 1777 "${target}" 2>/dev/null || true
+  fi
+  if [[ ! -d "${target}" ]]; then
+    mkdir -p /tmp/docker-buildkit-tmp
+    local parent
+    parent="$(dirname "${target}")"
+    if [[ ! -d "${parent}" ]]; then
+      mkdir -p "${parent}" 2>/dev/null || sudo -n mkdir -p "${parent}" || true
+    fi
+    if [[ -d "${parent}" ]]; then
+      ln -sfn /tmp/docker-buildkit-tmp "${target}" 2>/dev/null \
+        || sudo -n ln -sfn /tmp/docker-buildkit-tmp "${target}" \
+        || true
+    fi
+  fi
+  [[ -d "${target}" ]]
+}
+
+run_docker_build() {
+  if ensure_buildkit_tmp; then
+    DOCKER_BUILDKIT=1 docker build "$@"
+  else
+    echo "buildkit tmp dir is still missing; using the legacy builder"
+    DOCKER_BUILDKIT=0 docker build "$@"
+  fi
+}
 
 BUILD_MODE="full"
 if docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
@@ -135,7 +166,7 @@ if docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
 fi
 
 if [[ "${BUILD_MODE}" = "fast" ]]; then
-  DOCKER_BUILDKIT=1 docker build --network=host \
+  run_docker_build --network=host \
     -t atom_sglang:ci \
     --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
     --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
@@ -145,7 +176,7 @@ if [[ "${BUILD_MODE}" = "fast" ]]; then
     --build-arg INSTALL_LM_EVAL=1 \
     -f Dockerfile.mod .
 else
-  DOCKER_BUILDKIT=1 docker build --pull --network=host \
+  run_docker_build --pull --network=host \
     --no-cache \
     -t atom_sglang_base:ci \
     --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
@@ -156,7 +187,7 @@ else
     --build-arg INSTALL_LM_EVAL=1 \
     -f Dockerfile.mod .
 
-  DOCKER_BUILDKIT=1 docker build --network=host \
+  run_docker_build --network=host \
     --no-cache \
     -t atom_sglang:ci \
     --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \

@@ -26,6 +26,30 @@ def _is_kimi_k3_owner(owner: Any) -> bool:
     return is_kimi_k3_config(getattr(model_config, "hf_config", None))
 
 
+def _kimi_k3_pool_latent_dims(pool: Any) -> tuple[int, int]:
+    """Return the K/V widths SGLang actually allocated.
+
+    0.5.19 hybrid pools are MHA buffers with ``head_dim`` / ``v_head_dim``.
+    0.5.20 allocates an ``MLATokenToKVPool`` whose latent width is
+    ``kv_cache_dim`` and which has no separate V head.
+    """
+    if hasattr(pool, "head_dim"):
+        k_dim = int(pool.head_dim)
+        return k_dim, int(getattr(pool, "v_head_dim", k_dim))
+    kv_dim = getattr(pool, "kv_cache_dim", None)
+    if kv_dim is None:
+        buffers = getattr(pool, "kv_buffer", None)
+        if buffers:
+            kv_dim = int(buffers[0].shape[-1])
+    if kv_dim is None:
+        raise RuntimeError(
+            "Kimi-K3 KV pool ABI mismatch: cannot read latent width from "
+            f"{type(pool).__name__}"
+        )
+    width = int(kv_dim)
+    return width, width
+
+
 def _kimi_k3_mem_fraction_already_restored(ctx: Any) -> bool:
     # 0.5.20: overrides_log is a method (not a property). Prefer the public
     # API; fall back to the private list for older trees / plain mocks.
@@ -216,14 +240,11 @@ def install_kimi_k3_pool_patch() -> None:
         full_pool = getattr(pool, "full_kv_pool", pool)
         if full_pool is None:
             raise RuntimeError("Kimi-K3 SGLang full-attention KV pool is missing")
-        if (
-            int(full_pool.head_dim) != KIMI_K3_MLA_CACHE_ENTRY_DIM
-            or int(full_pool.v_head_dim) != KIMI_K3_MLA_CACHE_ENTRY_DIM
-        ):
+        k_dim, v_dim = _kimi_k3_pool_latent_dims(full_pool)
+        if k_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM or v_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM:
             raise RuntimeError(
                 "Kimi-K3 KV pool ABI mismatch: "
-                f"K={full_pool.head_dim}, V={full_pool.v_head_dim}, "
-                "expected "
+                f"K={k_dim}, V={v_dim}, expected "
                 f"{KIMI_K3_MLA_CACHE_ENTRY_DIM}/{KIMI_K3_MLA_CACHE_ENTRY_DIM}"
             )
         req_pool = pools.req_to_token_pool
