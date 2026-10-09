@@ -122,6 +122,25 @@ def mla_dcp_sparse_prefill_uses_nonps(
     )
 
 
+def mla_dcp_sparse_prefill_mode(
+    uses_nonps: bool, persistent: bool, num_heads: int
+) -> tuple[bool, int]:
+    """(persistent, gathered width) for DCP sparse prefill.
+
+    The non-persistent gqa64 kernel overrides both: non-persistent, width 64.
+    """
+    return (False, 64) if uses_nonps else (persistent, num_heads)
+
+
+def mla_dcp_sparse_prefill_kv_splits(uses_nonps: bool, dcp_world_size: int) -> int:
+    """KV splits for DCP sparse prefill.
+
+    The non-persistent gqa64 kernel runs at one split: it writes O and LSE
+    directly, and it caps total_q * splits at 32768.
+    """
+    return 1 if uses_nonps else max(2, 16 // max(1, dcp_world_size))
+
+
 def dcp_prefill_merge_bf16_ok() -> bool:
     """Whether the DCP sparse-prefill partial merge may accumulate in bf16.
 

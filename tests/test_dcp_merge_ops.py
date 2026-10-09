@@ -57,6 +57,8 @@ from atom.config import (
 from atom.distributed.dcp_utils import (
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_kv_splits,
+    mla_dcp_sparse_prefill_mode,
     mla_dcp_sparse_prefill_uses_nonps,
 )
 
@@ -972,6 +974,25 @@ def test_sparse_prefill_nonps_gate(
     assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950) is expected
 
 
+@pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])
+def test_sparse_prefill_nonps_overrides_mode_and_width(persistent, width):
+    """The non-persistent gqa64 kernel runs non-persistent at exactly 64, whatever
+    the persistent table and the non-persistent pad table would pick; off, both
+    pass through untouched."""
+    assert mla_dcp_sparse_prefill_mode(True, persistent, width) == (False, 64)
+    assert mla_dcp_sparse_prefill_mode(False, persistent, width) == (persistent, width)
+
+
+@pytest.mark.parametrize("dcp", [2, 4, 8])
+def test_sparse_prefill_nonps_runs_one_split(dcp):
+    """One split for the non-persistent kernel, which caps total_q * splits at
+    32768 -- a full 16K chunk at the default splits would exceed it."""
+    assert mla_dcp_sparse_prefill_kv_splits(True, dcp) == 1
+    assert 16384 * mla_dcp_sparse_prefill_kv_splits(True, dcp) <= 32768
+    assert mla_dcp_sparse_prefill_kv_splits(False, dcp) == max(2, 16 // dcp)
+    assert 16384 * mla_dcp_sparse_prefill_kv_splits(False, 4) > 32768
+
+
 def test_gate_reason_is_human_readable():
     """The reason string is logged verbatim; it should name the actual cause."""
     reason = qrep_unsupported_reason(1, False)
@@ -1821,4 +1842,7 @@ def test_sparse_prefill_persistent_table_would_allow_gqa64():
     ), "persistent sparse prefill should reach gqa=64, not pad past it"
     assert (
         mla_dcp_sparse_prefill_num_heads(8, 8, HEAD_WIDTH_MIN, persistent=False) == 128
+    ), (
+        "the non-persistent pad table still pads 64 to 128; only the "
+        "non-persistent gqa64 kernel (mla_dcp_sparse_prefill_mode) runs at 64"
     )

@@ -59,6 +59,8 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_kv_splits,
+    mla_dcp_sparse_prefill_mode,
     mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
@@ -905,16 +907,20 @@ class MLAAttention(nn.Module):
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
             )
-            # Non-persistent kernel: exact 64-head width, no pad, no metadata.
             self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
                 self.kv_cache_dtype.startswith("fp8"),
                 self.dcp_persistent_supported,
             )
-            if self.dcp_sparse_prefill_nonps:
-                self.dcp_sparse_prefill_persistent = False
-                self.dcp_sparse_prefill_num_heads = 64
+            (
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
+            ) = mla_dcp_sparse_prefill_mode(
+                self.dcp_sparse_prefill_nonps,
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
+            )
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
         """Head padding for a DCP sparse prefill.
@@ -2255,10 +2261,13 @@ class MLAAttention(nn.Module):
                 # -- rebuild it here, or run non-persistent.
                 #
                 # Read from the same predicate the gathered pad width came from
-                # rather than re-deriving the gate: gqa=64 is correct only in
-                # persistent mode, so running one way while the width was chosen
-                # for the other silently miscomputes. The assert keeps the two
-                # spellings honest if either side gains a condition.
+                # rather than re-deriving the gate: on the persistent kernel set
+                # gqa=64 is correct only in persistent mode, so running one way
+                # while the width was chosen for the other silently miscomputes.
+                # The non-persistent gqa64 kernel (dcp_sparse_prefill_nonps) is
+                # the exception, and runs at 64 non-persistent by design. The
+                # assert keeps the two spellings honest if either side gains a
+                # condition.
                 sparse_dcp_persistent = (
                     dcp_sparse and self.dcp_sparse_prefill_persistent
                 )
@@ -2301,12 +2310,9 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    # Non-persistent: one split, O/LSE written directly
-                    # (the kernel caps total_q * splits at 32768).
-                    num_kv_splits=(
-                        1
-                        if dcp_sparse and self.dcp_sparse_prefill_nonps
-                        else max(2, 16 // max(1, self.dcp_world_size))
+                    num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
+                        dcp_sparse and self.dcp_sparse_prefill_nonps,
+                        self.dcp_world_size,
                     ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,

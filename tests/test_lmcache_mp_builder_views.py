@@ -130,6 +130,7 @@ def mla_builder_cls():
             get_dcp_world_size=lambda: 1,
             mla_dcp_decode_is_persistent=lambda *args, **kwargs: False,
             mla_dcp_sparse_prefill_is_persistent=lambda *args, **kwargs: False,
+            mla_dcp_sparse_prefill_uses_nonps=lambda *args, **kwargs: False,
         ),
         "atom.distributed.pcp_utils": _module(
             "atom.distributed.pcp_utils",
