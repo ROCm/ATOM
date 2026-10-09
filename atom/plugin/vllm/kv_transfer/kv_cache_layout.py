@@ -304,7 +304,12 @@ def split_kv_caches_by_group(
     for name, tensor in kv_caches.items():
         # An index cache rides with the layer that owns it and is named after
         # it; it is not a layer of its own and no group spec lists it.
-        base = name.removesuffix(INDEX_CACHE_SUFFIX)
+        # ``index_cache_owner`` covers both spellings. Stripping only
+        # ``.index_cache`` leaves GLM's ``<p>.indexer.k_cache`` unmapped, and
+        # a multi-group model then either refuses to boot or, if a later
+        # change guessed a group, would move that indexer under the wrong
+        # prefix hash.
+        base = index_cache_owner(name) or name
         group_id = owner.get(base)
         if group_id is None:
             unmapped.append(name)

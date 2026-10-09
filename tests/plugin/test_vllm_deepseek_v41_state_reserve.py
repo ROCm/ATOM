@@ -234,3 +234,40 @@ class TestInstallSite:
             "register_model must install the V4.1 STATE-tail patch; the "
             "platform hook is not guaranteed to run"
         )
+
+
+class TestLocalHitCapInstallSite:
+    """The local-hit cap has to be installed where V4.1's other patch is.
+
+    The platform hook it would naturally live in is not always activated:
+    measured on a V4.1 serve, `ATOMPlatform.check_and_update_config` ran zero
+    times while the model wrapper's own hook ran four. A scheduler chosen
+    there is a scheduler never chosen, and the symptom is prefix caching
+    silently going uncapped -- which is a dead engine on the first deep local
+    hit, not a slow one.
+    """
+
+    def test_register_model_wires_up_both_v41_scheduler_patches(self):
+        """Checked on the wiring, not on a call and not on the end state.
+
+        `register_model` is idempotent and this suite's other install-site
+        test replaces the installer before calling it, which consumes that one
+        shot -- so both "did it call?" and "is it installed?" answer a
+        question about the suite rather than about the code. What has to stay
+        true is that `register_model` is where these are installed, because
+        the platform hook that would otherwise carry them does not reliably
+        run. The patches' own behaviour is covered in
+        tests/test_vllm_v41_prefill_alignment.py.
+        """
+        import inspect
+
+        register = importlib.import_module("atom.plugin.vllm.register")
+        source = inspect.getsource(register.register_model)
+        for installer in (
+            "apply_vllm_v41_local_hit_cap_patch",
+            "apply_vllm_v41_prefill_alignment_patch",
+        ):
+            assert f"{installer}()" in source, (
+                f"register_model must install {installer}; the platform hook "
+                "is not guaranteed to run"
+            )

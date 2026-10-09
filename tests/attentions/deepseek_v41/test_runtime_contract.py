@@ -194,17 +194,12 @@ def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
     empty here and every connector was admitted without the question being
     asked -- a check that passes because it was never run.
     """
-    validate_runtime_config(vllm_plugin_config(kv_transfer_config=None))
-    # The allow-list is empty on this path, so every connector is refused --
-    # including `lmcache_mp`, which is admitted natively and means nothing
-    # here. A PAGE prefix restored without its CSA2 STATE kills the engine, so
-    # there is no partial transport worth admitting.
-    for connector in (
-        "AtomLMCacheOffloadConnector",
-        "LMCacheConnectorV1",
-        "lmcache_mp",
-        "NixlConnector",
-    ):
+    validate_runtime_config(
+        vllm_plugin_config(
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
+        )
+    )
+    for connector in ("LMCacheConnectorV1", "lmcache_mp", "NixlConnector"):
         with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
             validate_runtime_config(
                 vllm_plugin_config(kv_transfer_config={"kv_connector": connector})
@@ -463,3 +458,24 @@ def test_the_scorer_plane_fits_the_candidate_list_at_short_contexts():
     narrow = ScoreWorkspace(geo, 8192, columns, "cpu")
     with pytest.raises(ValueError, match="exceeds its workspace"):
         narrow.logits(8192, candidate_width)
+
+
+def test_prefix_caching_is_admitted_with_the_offload_connector():
+    """The connector is what makes reuse admissible, not a separate feature.
+
+    It stores the CSA2 state at the boundaries vLLM's hashes name and caps
+    every hit -- the block pool's own included -- to one it holds. Without it
+    there is nothing to cap against, so caching stays refused; with it the
+    refusal would be refusing the thing that makes it safe.
+    """
+    validate_runtime_config(
+        vllm_plugin_config(
+            enable_prefix_caching=True,
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"},
+        )
+    )
+
+
+def test_prefix_caching_without_the_connector_is_still_refused():
+    with pytest.raises(ValueError, match="prefix caching"):
+        validate_runtime_config(vllm_plugin_config(enable_prefix_caching=True))

@@ -1269,6 +1269,13 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])
 
+        # Same reason as forward_impl_sparse: attention writes the live rows
+        # only, and the rest of this allocation still holds whatever used it
+        # last. This path carries the 57 dense MLA layers of GLM-5.3 against
+        # the sparse path's 21, so leaving it undefined leaks far more of the
+        # residual stream than the sparse case that was fixed first.
+        if output_padded.shape[0] > num_actual_toks:
+            output_padded[num_actual_toks:].zero_()
         return output_padded
 
     def do_kv_cache_update(
@@ -1473,6 +1480,14 @@ class AttentionForVllmMLA(MLAAttention, AttentionLayerBase):
         # V up-projection
         self._v_up_proj(attn_out, out=output[:num_actual_toks])
 
+        # Define the CUDA-graph padding rows before handing the buffer on.
+        # Attention writes live rows only; the rest of this allocation still
+        # holds whatever used it last, and inside a captured graph the ops
+        # downstream cannot tell those rows from real ones. Leaving them
+        # undefined made prefix-cache reuse return wrong text on 16 of 48
+        # forced recompute widths; defining them made all 48 correct.
+        if output_padded.shape[0] > num_actual_toks:
+            output_padded[num_actual_toks:].zero_()
         return output_padded
 
     def calc_kv_scales(self, q, kv_c_normed, k_pe):

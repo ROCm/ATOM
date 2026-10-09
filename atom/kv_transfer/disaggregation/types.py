@@ -206,6 +206,28 @@ class PageRegion:
     view: Any = None
 
 
+@dataclass(frozen=True)
+class RecurrentPageGroup:
+    """One recurrent-state group's block-major pages and its own block id space.
+
+    A hybrid model's recurrent layers are block-major like PAGE KV -- one
+    snapshot row per block-table position -- but they live in a *different*
+    block id space (vLLM allocates mamba blocks separately) and only the block
+    holding the last state of a chunk is meaningful. Published apart from
+    ``pages`` for exactly those two reasons: a block id cannot be resolved
+    without knowing which space it counts in, and a transport that copied every
+    position would copy the null block vLLM parks in the skipped ones.
+    """
+
+    pages: tuple[PageRegion, ...]
+    # Positions in this group's own block table -- NOT ``KVTransferTensors.
+    # num_blocks``, which counts attention blocks.
+    num_blocks: int
+    # Tokens one snapshot covers. One chunk on every layout built so far, and
+    # what the MP server is told as ``tokens_per_block``.
+    tokens_per_block: int
+
+
 @dataclass
 class KVTransferTensors:
     """Physical PAGE, SLOT, and compressor-only staging region contract.
@@ -278,6 +300,11 @@ class KVTransferTensors:
     # neither field asks the connector to snapshot a complete live SLOT.
     paged_state_checkpoint_spec: object | None = None
     execute_paged_state_copies: Callable[..., None] | None = None
+    # Recurrent-state groups moved by the same block-addressed transport as
+    # ``pages``, in ordinal order. Empty on every attention-only layout, which
+    # is what keeps the PAGE-only transports unchanged. Appended for positional
+    # compatibility.
+    recurrent_page_groups: tuple[RecurrentPageGroup, ...] = ()
     # Same declaration for PAGE-backed native state checkpoint images. Kept
     # separate so future layouts can describe PAGE and recurrent-state
     # replication independently. Appended for positional compatibility.

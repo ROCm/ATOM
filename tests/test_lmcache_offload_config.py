@@ -382,3 +382,123 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+def _k3_config(head_dim):
+    """Kimi-K3 geometry as one process happens to see it.
+
+    ``config.json`` carries no ``head_dim`` for an MLA model, so each process
+    fills one in: vLLM's scheduler keeps transformers' ``hidden_size //
+    num_attention_heads`` (74) while the workers end up with the MLA head dim
+    ``qk_nope + qk_rope`` (192).
+    """
+
+    config = _config()
+    config.hf_config.head_dim = head_dim
+    config.hf_config.qk_nope_head_dim = 128
+    config.hf_config.qk_rope_head_dim = 64
+    config.hf_config.hidden_size = 7168
+    config.hf_config.num_attention_heads = 96
+    return config
+
+
+def test_page_namespace_survives_a_per_process_head_dim():
+    # The two halves disagreeing here used to hand the workers one namespace and
+    # every lookup another, so the tier stored and never loaded -- and said so
+    # only as a miss.
+    scheduler = offcfg.build_page_namespace(_k3_config(74), _lmcache_config(), 8)
+    worker = offcfg.build_page_namespace(_k3_config(192), _lmcache_config(), 8)
+
+    assert scheduler == worker
+
+
+def test_page_namespace_still_separates_real_geometries():
+    wide = _k3_config(192)
+    wide.hf_config.qk_nope_head_dim = 256
+
+    assert offcfg.build_page_namespace(
+        _k3_config(192), _lmcache_config(), 8
+    ) != offcfg.build_page_namespace(wide, _lmcache_config(), 8)
+
+
+def test_head_dim_falls_back_to_hidden_size_over_heads():
+    config = _config()
+    config.hf_config.head_dim = None
+    config.hf_config.qk_rope_head_dim = None
+
+    assert offcfg._canonical_head_dim(config.hf_config) == 7168 // 128
+
+
+def _dsv41_config():
+    """A DeepSeek-V4.1 config: compress ratios *and* per-request CSA2 state."""
+    config = _config()
+    config.hf_config.model_type = "deepseek_v41_text"
+    config.hf_config.sliding_window = 128
+    config.hf_config.candidate_block_size = 8
+    return config
+
+
+def test_deepseek_v41_gets_its_own_state_owning_layout():
+    assert offcfg.select_offload_layout(_dsv41_config()) == "dsv41"
+
+
+def test_deepseek_v4_still_resolves_to_hybrid():
+    # The regression guard for the V4.1 branch above: it is inserted ahead of
+    # the `compress_ratios` probe, and DSV4 answers that probe the same way.
+    config = _config()
+    config.hf_config.model_type = "deepseek_v4"
+    assert offcfg.select_offload_layout(config) == "hybrid"
+
+
+def test_offload_layout_override_cannot_downgrade_deepseek_v41():
+    # V4.1's window rings / compressor rings / Engram cursor are per-request
+    # state no stateless layout owns a tier for. `hybrid` is the dangerous one
+    # here, not `dense`: V4.1's geometry would resolve to it naturally.
+    for override in ("dense", "hybrid"):
+        config = _dsv41_config()
+        config.kv_transfer_config = {"offload_layout": override}
+        with pytest.raises(ValueError, match="owns no tier"):
+            offcfg.select_offload_layout(config)
+
+
+def test_page_namespace_separates_deepseek_v41_from_deepseek_v4():
+    # Same compress ratios, same byte-level geometry fields: without the
+    # distinct page_mode the two families would share one key space.
+    v4 = _config()
+    v4.hf_config.model_type = "deepseek_v4"
+    assert offcfg.build_page_namespace(
+        _dsv41_config(), _lmcache_config(), 4
+    ) != offcfg.build_page_namespace(v4, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda hf: setattr(hf, "sliding_window", 256),
+        lambda hf: setattr(hf, "candidate_block_size", 16),
+    ],
+)
+def test_page_namespace_tracks_deepseek_v41_geometry(mutate):
+    # Both fields move the bytes a stored object holds -- the window ring's
+    # size and the index plane's paging -- so neither may be invisible to the
+    # key space.
+    base = offcfg.build_page_namespace(_dsv41_config(), _lmcache_config(), 4)
+    moved = _dsv41_config()
+    mutate(moved.hf_config)
+    assert offcfg.build_page_namespace(moved, _lmcache_config(), 4) != base
+
+
+@pytest.mark.parametrize(
+    "model_type", ["deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"]
+)
+def test_every_v41_spelling_resolves_to_the_state_owning_layout(model_type):
+    """`atom.utils.selector._V41_TYPES` lists three; all three carry the state.
+
+    Matching only the text config's own type left the other two falling
+    through to the `compress_ratios` probe and resolving to `hybrid` -- which
+    is outside `_STATE_OWNING_LAYOUTS`, so a `dense` override would be
+    honoured on a model that has per-request state to lose.
+    """
+    config = _dsv41_config()
+    config.hf_config.model_type = model_type
+    assert offcfg.select_offload_layout(config) == "dsv41"

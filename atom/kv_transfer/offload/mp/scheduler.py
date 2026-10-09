@@ -191,13 +191,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         del timeout_s  # See abandon_save: no release without a report.
         return []
 
-    def _live_transfers(self) -> set[Any]:
-        """Dispatched operations still waiting for a terminal worker report."""
-        live: set[Any] = set(self._save_inflight.values())
-        live.update(self._save_operation_owner)
-        live.update(operation for _, operation in self._active_load_operations.values())
-        return live
-
     def _enforce_transfer_deadlines(self) -> None:
         """Fail-stop when a dispatched transfer never reports.
 
@@ -205,6 +198,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         such as a lost completion or a TP rank that never reports.
         """
         live = self._live_transfers()
+        # Same set, second consumer: a ride's source pin is owned by the
+        # recurrent leg and released by this reconciliation, not by a store
+        # report -- a ride issues no store.
+        self._retire_recurrent_rides(live)
         seen = self._transfer_seen_at
         for operation in [op for op in seen if op not in live]:
             del seen[operation]

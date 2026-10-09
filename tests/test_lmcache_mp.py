@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 from collections import deque
 from dataclasses import dataclass, replace
@@ -21,6 +22,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferTensors,
     LoadOperationId,
     PageRegion,
+    RecurrentPageGroup,
     SaveOperationId,
     SaveSourceGroupId,
 )
@@ -33,12 +35,21 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
+    RecurrentStateTransfer,
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import deployment, page_views, transfer
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.kv_transfer.offload.mp import worker as mp_worker
+
+
+def _step_event():
+    """A pooled interprocess event, as `start_load_kv` hands to a submit."""
+
+    from atom.kv_transfer.offload.mp.worker import _PooledIpcEvent
+
+    return _PooledIpcEvent(object())
 
 
 def _config(
@@ -145,16 +156,42 @@ def test_mp_scheduler_is_not_a_dense_transport_scheduler():
     )
 
 
-def test_mp_config_rejects_engine_driven_transfer(monkeypatch):
+def test_mp_config_rejects_engine_driven_transfer_when_state_rides_along(monkeypatch):
+    """Only the riding-along state blocks engine_driven.
+
+    LMCache's engine-driven transfer raises on more than one KV cache group
+    (`_single_group_block_ids`), and a recurrent group inside the PAGE object
+    is the only thing in this layout that makes a second one. `_config()`
+    omits the state pool size, which is the opt-in to riding along.
+    """
+
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", " EnGiNe_DrIvEn ")
-    with pytest.raises(NotImplementedError, match="multiple physical"):
+    with pytest.raises(NotImplementedError, match="single KV cache group"):
         deployment._validate_mp_config(_config())
 
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", "auto")
-    with pytest.raises(NotImplementedError, match="multiple physical"):
+    with pytest.raises(NotImplementedError, match="single KV cache group"):
         deployment._validate_mp_config(
             _config(extra={"lmcache.mp.mp_transfer_mode": " EnGiNe_DrIvEn "})
         )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"lmcache.mp.state_transport": "own-pool", "lmcache.mp.state_cpu_size_gb": 24},
+        {"lmcache.mp.state_cpu_size_gb": 24},
+    ],
+)
+def test_mp_config_allows_engine_driven_with_state_on_its_own_pool(monkeypatch, extra):
+    monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", " EnGiNe_DrIvEn ")
+    deployment._validate_mp_config(_config(extra=dict(extra)))
+    assert (
+        deployment._transfer_mode(
+            _config(extra={**extra, "lmcache.mp.mp_transfer_mode": "engine_driven"})
+        )
+        == "engine_driven"
+    )
 
 
 @pytest.mark.parametrize(
@@ -308,15 +345,50 @@ def test_auto_rank_collapse_distinguishes_glm52_mla_from_minimax_m3_gqa():
     assert deployment._tp_replication_factor(minimax) == 1
 
 
-def test_auto_rank_collapse_keeps_kimi_k3_per_rank():
-    # MLA KV is replicated, but the KDA checkpoint images stored in the same
-    # PAGE units hold TP-sharded heads.
-    k3 = _config(model_type="kimi_k3", tp=8)
+def _kimi_k3_config(**kwargs):
+    k3 = _config(model_type="kimi_k3", tp=8, **kwargs)
     k3.hf_config.text_config = SimpleNamespace(
-        model_type="kimi_linear", kv_lora_rank=512
+        model_type="kimi_linear",
+        kv_lora_rank=512,
+        num_attention_heads=16,
+        num_key_value_heads=4,
+        num_hidden_layers=2,
+        hidden_size=2048,
+        head_dim=128,
     )
+    return k3
 
-    assert deployment._tp_replication_factor(k3) == 1
+
+def test_auto_rank_collapse_keeps_kimi_k3_per_rank_while_state_rides_along():
+    # K3's MLA KV is replicated, but the KDA checkpoint images ride in the same
+    # PAGE units and hold TP-sharded heads, so the unit as a whole is not.
+    assert deployment._tp_replication_factor(_kimi_k3_config()) == 1
+
+
+def test_auto_rank_collapse_collapses_kimi_k3_when_state_has_its_own_pool():
+    """Under `own-pool` the PAGE unit is pure MLA again, and MLA is replicated.
+
+    Reading the model name instead of the transport is what once cost the whole
+    tier: `own-pool` is what the throughput runs use, so the config that most
+    wants one copy per TP group was the one refused it.
+    """
+    assert (
+        deployment._tp_replication_factor(
+            _kimi_k3_config(extra={"lmcache.mp.state_cpu_size_gb": 24})
+        )
+        == 8
+    )
+    assert (
+        deployment._tp_replication_factor(
+            _kimi_k3_config(
+                extra={
+                    "lmcache.mp.state_cpu_size_gb": 24,
+                    "lmcache.mp.state_transport": "mp",
+                }
+            )
+        )
+        == 1
+    )
 
 
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
@@ -966,6 +1038,11 @@ class _FakeEngineGroupInfo:
     engine_group_id: int
     layer_indices: tuple[int, ...]
     tokens_per_block: int
+    # Mirrors the real `EngineGroupInfo`'s defaults so a PAGE-only
+    # registration still reads back the values the server would apply.
+    sw_size_tokens: int = -1
+    recurrent_state: bool = False
+    extra_object_group_tag: int = 0
 
 
 class _WorkerFuture:
@@ -1054,6 +1131,24 @@ def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
     worker = mp_worker.LMCacheMPConnector(_config())
     worker._adapter = adapter
     worker.chunk_size = 8
+    # Both legs are submitted and polled on the connector's drain thread, off
+    # the model step. These tests are about the bookkeeping that submit
+    # produces, not about the hand-off, so settle each one before returning;
+    # the hand-off itself is covered by
+    # `test_worker_save_settles_off_the_step_thread`.
+    submit_save = worker._submit_save
+    submit_load = worker._submit_load
+
+    def settling_submit_save(*args, **kwargs):
+        submit_save(*args, **kwargs)
+        worker._settle_transfers()
+
+    def settling_submit_load(*args, **kwargs):
+        submit_load(*args, **kwargs)
+        worker._settle_transfers()
+
+    worker._submit_save = settling_submit_save  # type: ignore[method-assign]
+    worker._submit_load = settling_submit_load  # type: ignore[method-assign]
     return worker
 
 
@@ -1092,6 +1187,20 @@ def test_shell_forwards_close_and_tolerates_an_unregistered_worker():
     assert adapter.shutdown_called
 
 
+def _await_drain_stop(
+    worker: mp_worker.LMCacheMPConnector, timeout: float = 5.0
+) -> None:
+    """Wait out the drain thread after a fail-stop.
+
+    The transfer deadline is noticed on the save drain thread, which cannot stop
+    the engine, so it records the failure and exits; the next step is what
+    raises. Loads are still submitted and polled inline and have no thread.
+    """
+    drain = worker._drain_thread
+    if drain is not None:
+        drain.join(timeout=timeout)
+
+
 def _finish_load(
     worker: mp_worker.LMCacheMPConnector,
     operation_id: str,
@@ -1101,6 +1210,8 @@ def _finish_load(
     future = worker._pending_loads[operation_id].future
     future.value = result
     future.ready = True
+    # The drain thread is what notices; give it a round before the caller asks.
+    worker._settle_transfers()
 
 
 def _finish_save(
@@ -1112,6 +1223,57 @@ def _finish_save(
     future = worker._pending_saves[operation_id].future
     future.value = result
     future.ready = True
+    # The drain thread is what notices; give it a round before the caller asks.
+    worker._settle_transfers()
+
+
+def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
+    """Submitting and polling a save must not block the model step.
+
+    Both ends are HIP IPC calls -- `export_event` on submit, `from_ipc_handle`
+    on the poll that completes the future. Measured on an idle GPU they cost
+    microseconds, but under the rank's own kernel-launch pressure they cost
+    milliseconds each, and under TP rank collapse only the writer pays them, so
+    the whole TP group waits at the next collective.
+    """
+    released = threading.Event()
+    entered = threading.Event()
+    adapter = _WorkerAdapter()
+    real_submit = adapter.submit_store_request
+
+    def blocking_submit(request_id, op, event):
+        entered.set()
+        released.wait(5.0)
+        return real_submit(request_id, op, event)
+
+    adapter.submit_store_request = blocking_submit
+    # Deliberately not `_worker`: that wrapper settles each save, which is the
+    # very thing under test here.
+    worker = mp_worker.LMCacheMPConnector(_config())
+    worker._adapter = adapter
+    worker.chunk_size = 8
+    operation = SaveOperationId(req_id=77, generation=1)
+    worker._submit_save(
+        LMCacheReqMeta(
+            req_id=77,
+            token_ids=list(range(8)),
+            block_ids=[70, 71],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=operation,
+        ),
+        _step_event(),
+    )
+
+    assert entered.wait(5.0), "the drain thread never picked the save up"
+    # The step returned while the submit is still in flight on the drain thread.
+    assert worker._pending_saves == {}
+    assert worker.get_finished().finished_saving == set()
+
+    released.set()
+    worker._settle_transfers()
+    assert set(worker._pending_saves) == {"save:77:1"}
+    _finish_save(worker, "save:77:1")
+    assert worker.get_finished().finished_saving == {operation}
 
 
 def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules):
@@ -1131,7 +1293,7 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
         load_operation=operation,
     )
 
-    worker._submit_load(request, object())
+    worker._submit_load(request, _step_event())
     assert adapter.loads[0][0] == "atom-offload-dp0:5"
     submitted = adapter.loads[0][1]
     assert submitted.start == 0
@@ -1153,7 +1315,7 @@ def test_worker_reports_failed_load_from_future(fake_lmcache_modules):
         load_spec=LoadSpec(0, 8, can_load=True),
         load_operation=operation,
     )
-    worker._submit_load(request, object())
+    worker._submit_load(request, _step_event())
     _finish_load(worker, "load:6:4", result=False)
 
     output = worker.get_finished()
@@ -1176,7 +1338,7 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        object(),
+        _step_event(),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1186,7 +1348,7 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        object(),
+        _step_event(),
     )
 
     load_future = worker._pending_loads["load:10:1"].future
@@ -1229,7 +1391,7 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        object(),
+        _step_event(),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1239,7 +1401,7 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        object(),
+        _step_event(),
     )
 
     adapter.is_healthy = False
@@ -1287,7 +1449,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        object(),
+        _step_event(),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1297,7 +1459,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        object(),
+        _step_event(),
     )
 
     output = worker.get_finished()
@@ -1351,10 +1513,10 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
     worker = _worker(adapter)
     request = _unprovable_request(kind)
     if kind == "load":
-        worker._submit_load(request, object())
+        worker._submit_load(request, _step_event())
         pending = worker._pending_loads
     else:
-        worker._submit_save(request, object())
+        worker._submit_save(request, _step_event())
         pending = worker._pending_saves
 
     now[0] += worker._transfer_deadline_s - 1
@@ -1364,6 +1526,7 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
     assert len(pending) == 1
 
     now[0] += 2
+    _await_drain_stop(worker)
     with pytest.raises(transfer.LMCacheTransferUnprovable):
         worker.get_finished()
     assert len(pending) == 1
@@ -1376,12 +1539,13 @@ def test_worker_future_that_keeps_raising_is_bounded_by_the_deadline(
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
-    worker._submit_save(_unprovable_request("save"), object())
+    worker._submit_save(_unprovable_request("save"), _step_event())
     [pending] = worker._pending_saves.values()
     pending.future.query_error = ConnectionError("IPC context torn down")
 
     assert not worker.get_finished().finished_saving
     now[0] += worker._transfer_deadline_s
+    _await_drain_stop(worker)
     with pytest.raises(transfer.LMCacheTransferUnprovable):
         worker.get_finished()
 
@@ -1394,8 +1558,8 @@ def test_worker_invalid_descriptor_fails_before_transport(
     worker = _worker(adapter)
     load = replace(_unprovable_request("load"), block_ids=[100])
     save = replace(_unprovable_request("save"), block_ids=[100])
-    worker._submit_load(load, object())
-    worker._submit_save(save, object())
+    worker._submit_load(load, _step_event())
+    worker._submit_save(save, _step_event())
 
     output = worker.get_finished()
     assert not adapter.loads and not adapter.saves
@@ -1437,7 +1601,7 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
         save_operation=operation,
     )
 
-    worker._submit_save(request, object())
+    worker._submit_save(request, _step_event())
     assert adapter.saves[0][0] == "atom-offload-dp0:8"
     submitted = adapter.saves[0][1]
     assert submitted.start == 8
@@ -1460,9 +1624,10 @@ def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_mod
         save_operation=operation,
     )
 
-    worker._submit_save(request, object())
+    worker._submit_save(request, _step_event())
     future = worker._pending_saves["save:81:2"].future
     future.completed_ranges = [(8, 16)]
+    worker._settle_transfers()
     output = worker.get_finished()
 
     assert output.finished_saving == set()
@@ -1488,7 +1653,7 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
         save_operation=operation,
     )
 
-    worker._submit_save(request, object())
+    worker._submit_save(request, _step_event())
 
     assert adapter.saves == []
     output = worker.get_finished()
@@ -1499,7 +1664,7 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
         if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
     } == {((0, 8),)}
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
-        worker._submit_save(request, object())
+        worker._submit_save(request, _step_event())
 
 
 def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
@@ -1516,10 +1681,11 @@ def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
     writer = _worker(_WorkerAdapter())
     non_writer = _worker(_WorkerAdapter())
     non_writer._is_kv_writer = False
-    writer._submit_save(request, object())
-    non_writer._submit_save(request, object())
+    writer._submit_save(request, _step_event())
+    non_writer._submit_save(request, _step_event())
     writer_future = writer._pending_saves["save:91:1"].future
     writer_future.completed_ranges = [(0, 8)]
+    writer._settle_transfers()
 
     aggregator = KVOutputAggregator(world_size=2)
     first = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
@@ -1530,6 +1696,7 @@ def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
     } == {((0, 8),)}
 
     writer_future.completed_ranges = [(8, 16)]
+    writer._settle_transfers()
     second = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
     assert {
         completion.operation_id.ranges
@@ -1556,7 +1723,7 @@ def test_worker_tracks_two_load_generations_for_one_raw_request(
                 load_spec=LoadSpec(0, 8, can_load=True),
                 load_operation=operation,
             ),
-            object(),
+            _step_event(),
         )
 
     assert set(worker._pending_loads) == {"load:20:1", "load:20:2"}
@@ -1586,7 +1753,7 @@ def test_worker_tracks_two_save_generations_for_one_raw_request(
                 save_spec=SaveSpec(skip_leading_tokens=0),
                 save_operation=operation,
             ),
-            object(),
+            _step_event(),
         )
 
     assert set(worker._pending_saves) == {"save:21:1", "save:21:2"}
@@ -1611,7 +1778,7 @@ def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules)
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        object(),
+        _step_event(),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1621,7 +1788,7 @@ def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules)
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        object(),
+        _step_event(),
     )
 
     assert set(worker._pending_loads) == {"load:22:4"}
@@ -1654,7 +1821,7 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
     submit = worker._submit_load if kind == "load" else worker._submit_save
     operation_id = f"{kind}:23:6"
 
-    submit(request, object())
+    submit(request, _step_event())
     completed = (
         worker._completed_load_operations
         if kind == "load"
@@ -1662,7 +1829,7 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
     )
     assert operation_id not in completed
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-        submit(request, object())
+        submit(request, _step_event())
 
     if kind == "load":
         _finish_load(worker, operation_id)
@@ -1670,7 +1837,7 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
         _finish_save(worker, operation_id)
     worker.get_finished()
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-        submit(request, object())
+        submit(request, _step_event())
 
 
 @pytest.mark.parametrize("kind", ["load", "save"])
@@ -1703,12 +1870,12 @@ def test_worker_rejects_duplicate_while_operation_is_submitting(
 
     def submit_with_replay(*args):
         with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-            submit(request, object())
+            submit(request, _step_event())
         return original_adapter_submit(*args)
 
     monkeypatch.setattr(adapter, adapter_method_name, submit_with_replay)
 
-    submit(request, object())
+    submit(request, _step_event())
 
     submitting = (
         worker._submitting_loads if kind == "load" else worker._submitting_saves
@@ -1756,7 +1923,7 @@ def test_worker_terminal_operation_tombstones_are_bounded(
 
     submit = worker._submit_load if kind == "load" else worker._submit_save
     for generation in (1, 2, 3):
-        submit(request(generation), object())
+        submit(request(generation), _step_event())
         operation_id = f"{kind}:24:{generation}"
         if kind == "load":
             _finish_load(worker, operation_id)
@@ -1779,8 +1946,8 @@ def test_worker_terminal_operation_tombstones_are_bounded(
     assert list(order) == [f"{kind}:24:2", f"{kind}:24:3"]
 
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-        submit(request(3), object())
-    submit(request(1), object())
+        submit(request(3), _step_event())
+    submit(request(1), _step_event())
     pending = worker._pending_loads if kind == "load" else worker._pending_saves
     assert set(pending) == {f"{kind}:24:1"}
 
@@ -1808,8 +1975,8 @@ def test_worker_immediate_operation_tombstones_reject_replay(
         save_operation=save_operation,
     )
 
-    worker._submit_load(load_request, object())
-    worker._submit_save(save_request, object())
+    worker._submit_load(load_request, _step_event())
+    worker._submit_save(save_request, _step_event())
 
     assert worker._completed_load_operations == {"load:25:1"}
     assert list(worker._completed_load_operation_order) == ["load:25:1"]
@@ -1820,9 +1987,9 @@ def test_worker_immediate_operation_tombstones_reject_replay(
     assert output.finished_saving == {save_operation}
 
     with pytest.raises(RuntimeError, match="duplicate LMCache MP load"):
-        worker._submit_load(load_request, object())
+        worker._submit_load(load_request, _step_event())
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
-        worker._submit_save(save_request, object())
+        worker._submit_save(save_request, _step_event())
 
 
 def test_registers_multiple_layouts_as_views_of_one_engine_group(
@@ -2006,3 +2173,314 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+def _recurrent_transfer_tensors(
+    *, groups: int = 2, num_blocks: int = 2, tokens_per_block: int = 8
+) -> KVTransferTensors:
+    """The PAGE layout above plus `groups` recurrent groups of one plane each."""
+    transfer = _transfer_tensors()
+    recurrent = []
+    for ordinal in range(groups):
+        plane = torch.zeros(num_blocks, 1, 12, dtype=torch.uint8)
+        recurrent.append(
+            RecurrentPageGroup(
+                pages=(page_region(plane, semantic_role=f"kda.{ordinal}"),),
+                num_blocks=num_blocks,
+                tokens_per_block=tokens_per_block,
+            )
+        )
+    # `pages` is frozen only in the recurrent group; the container is a plain
+    # dataclass, so the test keeps the tensors alive by holding the transfer.
+    transfer.recurrent_page_groups = tuple(recurrent)
+    transfer._test_recurrent_planes = [
+        group.pages[0].view for group in transfer.recurrent_page_groups
+    ]
+    return transfer
+
+
+def test_recurrent_groups_register_after_every_page_plane():
+    """The plane order is the key space, so recurrent groups append to it.
+
+    Interleaving them would renumber the PAGE planes, and every object already
+    in the tier is addressed by those numbers.
+    """
+    views = page_views._build_cache_views(_recurrent_transfer_tensors(), num_blocks=2)
+    assert list(views.tensors)[:4] == [
+        "page.0.primary.0",
+        "page.1.primary.1",
+        "page.2.sidecar.0",
+        "page.3.sidecar.1",
+    ]
+    assert list(views.tensors)[4:] == [
+        "recurrent.0.4.kda.0",
+        "recurrent.1.5.kda.1",
+    ]
+    assert [group.tensor_indices for group in views.recurrent] == [(4,), (5,)]
+    assert [group.tokens_per_block for group in views.recurrent] == [8, 8]
+    assert [group.bytes_per_block for group in views.recurrent] == [12, 12]
+    # The attention block cost is unchanged: a recurrent snapshot is not part
+    # of a KV block and must not be billed as one.
+    assert views.bytes_per_block == 640
+
+
+def test_recurrent_group_geometry_is_checked_against_its_own_block_count():
+    transfer = _recurrent_transfer_tensors(groups=1, num_blocks=2)
+    # The attention groups still have two blocks; only the recurrent claim is
+    # wrong. Sizing it from the PAGE count would let this through.
+    transfer.recurrent_page_groups = (
+        RecurrentPageGroup(
+            pages=transfer.recurrent_page_groups[0].pages,
+            num_blocks=3,
+            tokens_per_block=8,
+        ),
+    )
+    with pytest.raises(ValueError, match=r"recurrent\[0\] view 4"):
+        page_views._build_cache_views(transfer, num_blocks=2)
+
+
+@pytest.mark.parametrize(("num_blocks", "tokens_per_block"), [(0, 8), (2, 0), (-1, 8)])
+def test_recurrent_group_refuses_a_non_positive_geometry(num_blocks, tokens_per_block):
+    transfer = _recurrent_transfer_tensors(groups=1)
+    transfer.recurrent_page_groups = (
+        RecurrentPageGroup(
+            pages=transfer.recurrent_page_groups[0].pages,
+            num_blocks=num_blocks,
+            tokens_per_block=tokens_per_block,
+        ),
+    )
+    with pytest.raises(ValueError, match="must.*be positive"):
+        page_views._build_cache_views(transfer, num_blocks=2)
+
+
+def test_each_recurrent_ordinal_gets_its_own_engine_group(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    """Ordinal `j` is engine group `1 + j`, one block wide, marked recurrent.
+
+    All three matter to the server: the group id is the address space, the
+    one-block window is what makes a retrieve restore the last snapshot only,
+    and `recurrent_state` is what tells it these are snapshots rather than KV.
+    """
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+
+    adapter = _WorkerAdapter()
+    monkeypatch.setattr(
+        mp_worker, "_make_worker_adapter", lambda _config, _rank: adapter
+    )
+    worker = mp_worker.LMCacheMPConnector(_config(model_type="ordinary_mha"))
+    worker.register_kv_caches(
+        {},
+        transfer_tensors=_recurrent_transfer_tensors(),
+        num_blocks=2,
+    )
+
+    assert [group.engine_group_id for group in adapter.groups] == [0, 0, 1, 2]
+    assert [group.recurrent_state for group in adapter.groups] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert [group.tokens_per_block for group in adapter.groups] == [4, 4, 8, 8]
+    assert [group.sw_size_tokens for group in adapter.groups] == [-1, -1, 8, 8]
+    assert [group.layer_indices for group in adapter.groups] == [
+        (0, 1),
+        (2, 3),
+        (4,),
+        (5,),
+    ]
+    assert worker._num_recurrent_groups == 2
+
+
+def test_save_nulls_every_recurrent_chunk_but_the_boundary(fake_lmcache_modules):
+    """A snapshot exists at the boundary only; the rest is the null block id.
+
+    The server drops an all-null chunk rather than copying it, so the earlier
+    chunks cost nothing and the boundary chunk carries the one live snapshot.
+    The null id is vLLM's null block, ``0``: LMCache tests a chunk for nullity
+    by asking whether any of its ids is truthy, so this value is what decides
+    whether the empty chunks are dropped or committed as garbage.
+    """
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 2
+    request = LMCacheReqMeta(
+        req_id=8,
+        token_ids=list(range(24)),
+        block_ids=[30, 31, 32, 33, 34, 35],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=8, generation=2),
+        recurrent_state=RecurrentStateTransfer(boundary_tokens=24, block_ids=(7, 9)),
+    )
+
+    worker._submit_save(request, _step_event())
+    submitted = adapter.saves[0][1]
+    assert submitted.start == 0 and submitted.end == 24
+    assert submitted.block_ids == [
+        [30, 31, 32, 33, 34, 35],
+        [0, 0, 7],
+        [0, 0, 9],
+    ]
+
+
+def test_load_carries_the_same_recurrent_lists_as_the_save(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 1
+    request = LMCacheReqMeta(
+        req_id=5,
+        token_ids=list(range(16)),
+        block_ids=[10, 11, 12, 13],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=0,
+            lmcache_cached_tokens=15,
+            can_load=True,
+            transfer_end_tokens=16,
+        ),
+        load_operation=LoadOperationId(req_id=5, generation=3),
+        recurrent_state=RecurrentStateTransfer(boundary_tokens=16, block_ids=(4,)),
+    )
+
+    worker._submit_load(request, _step_event())
+    submitted = adapter.loads[0][1]
+    assert submitted.block_ids == [[10, 11, 12, 13], [0, 4]]
+
+
+def test_a_registered_recurrent_group_refuses_a_page_only_request(
+    fake_lmcache_modules,
+):
+    """Shipping the KV without its state would restore someone else's state.
+
+    The load is rejected before anything is sent, which is reported as a
+    terminal load failure rather than left to time out.
+    """
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 1
+    operation = LoadOperationId(req_id=5, generation=3)
+    worker._submit_load(
+        LMCacheReqMeta(
+            req_id=5,
+            token_ids=list(range(8)),
+            block_ids=[10, 11],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=0,
+                lmcache_cached_tokens=7,
+                can_load=True,
+                transfer_end_tokens=8,
+            ),
+            load_operation=operation,
+        ),
+        _step_event(),
+    )
+    assert adapter.loads == []
+    assert worker.get_finished().failed_loading == {operation}
+
+
+def test_a_snapshot_taken_elsewhere_than_the_transfer_end_is_refused(
+    fake_lmcache_modules,
+):
+    """State from token 8 does not continue KV that ends at 16."""
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    worker._num_recurrent_groups = 1
+    with pytest.raises(ValueError, match="would not continue the KV"):
+        worker._recurrent_block_ids(
+            LMCacheReqMeta(
+                req_id=5,
+                token_ids=list(range(16)),
+                block_ids=[10, 11, 12, 13],
+                recurrent_state=RecurrentStateTransfer(
+                    boundary_tokens=8, block_ids=(4,)
+                ),
+            ),
+            0,
+            16,
+        )
+
+
+def test_recurrent_state_without_a_registered_group_is_refused(
+    fake_lmcache_modules,
+):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    with pytest.raises(ValueError, match="no recurrent group was registered"):
+        worker._recurrent_block_ids(
+            LMCacheReqMeta(
+                req_id=5,
+                token_ids=list(range(8)),
+                block_ids=[10, 11],
+                recurrent_state=RecurrentStateTransfer(
+                    boundary_tokens=8, block_ids=(4,)
+                ),
+            ),
+            0,
+            8,
+        )
+
+
+def _load_step(req_id: int) -> LMCacheOffloadMetadata:
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=req_id,
+            token_ids=list(range(16)),
+            block_ids=[100, 101, 102, 103],
+            load_spec=LoadSpec(0, 16, can_load=True),
+            load_operation=LoadOperationId(req_id=req_id, generation=1),
+        )
+    )
+    return metadata
+
+
+def test_step_event_is_reused_only_once_its_transfers_are_terminal(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    """Recording a fresh interprocess event costs ~1.3ms; re-recording ~20us.
+
+    The saving is only legitimate while no consumer still reads the event as
+    naming an earlier step, so the worker holds an event back until every
+    transfer that named it has reported.
+    """
+    created = []
+
+    class _FakeEvent:
+        def __init__(self, interprocess=False):
+            self.records = 0
+            created.append(self)
+
+        def record(self, stream=None):
+            self.records += 1
+
+    monkeypatch.setattr(mp_worker.torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+
+    worker.start_load_kv(_load_step(20))
+    worker.start_load_kv(_load_step(21))
+    # The first load is still outstanding, so its event cannot be re-recorded.
+    assert len(created) == 2
+    assert [event.records for event in created] == [1, 1]
+
+    for _, _, _, future in adapter.loads:
+        future.ready = True
+    # Terminal loads are noticed on the drain thread, so the event goes back to
+    # the pool a round later rather than inside `get_finished`.
+    worker._settle_transfers()
+    worker.get_finished()
+
+    worker.start_load_kv(_load_step(22))
+    assert len(created) == 2
+    assert sorted(event.records for event in created) == [1, 2]

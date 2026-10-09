@@ -48,6 +48,95 @@ class StateSlotAllocator:
         self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
+        # Keys bound by `reserve` that no batch has claimed yet, and the keys
+        # the last batch held. Together they are what a reservation may not
+        # evict. `_key_to_slot` is NOT that set: a finished request's entry
+        # stays in it until its slot is recycled, so treating every bound key
+        # as live makes the pool look full after `num_slots` requests and
+        # sends `_acquire` to its slot-0 fallback -- handing a live request's
+        # slot to a second tenant.
+        self._reserved: set = set()
+        self._last_active: set = set()
+
+    def slot_for(self, key):
+        """This key's slot, or None if it has none.
+
+        A reader that needs the slot outside a forward -- the offload leg
+        snapshotting a request's state -- must not create one by asking.
+        """
+        return self._key_to_slot.get(key)
+
+    def reserve(self, key):
+        """Bind *key* to a slot now, outside any batch. Idempotent.
+
+        A connector that restores per-request state has to write it before the
+        request is ever scheduled, and ``assign`` only runs from inside a
+        forward. Reserving is also what keeps the following ``assign`` from
+        reporting the slot as freshly allocated: that report means "reset me",
+        and resetting would zero the bytes the restore just wrote.
+
+        The reservation counts as a sighting, so a slot reserved this step is
+        not the eviction victim chosen by the next one.
+
+        Returns None when every slot belongs to the current batch or to
+        another reservation. That is a real condition, not a corner case:
+        reservations are for requests that are NOT in the batch, so
+        `batch + reservations` can exceed the pool even though vLLM caps
+        concurrency at its size. The caller must then decline the restore and
+        let the request recompute -- taking a slot anyway puts two requests on
+        one ring, which is how this was found (two requests straddling one
+        cursor by a token each).
+        """
+        self._step += 1
+        slot = self._key_to_slot.get(key)
+        if slot is None:
+            # Live = the last batch's keys plus reservations not yet claimed.
+            # A finished request's stale entry is deliberately NOT live: it is
+            # exactly what this reservation should be recycling.
+            slot = self._acquire_unused(self._last_active | self._reserved)
+            if slot is None:
+                return None
+            self._key_to_slot[key] = slot
+            self._slot_to_key[slot] = key
+        self._reserved.add(key)
+        self._last_seen[slot] = self._step
+        return slot
+
+    def release_unclaimed(self, key) -> bool:
+        """Release *key* only if it is a reservation no batch ever claimed.
+
+        That is the whole leak: `reserve` binds a slot for a request parked on
+        a restore, and only the `assign` that claims it clears the
+        reservation, so a request aborted before it ever reaches a forward
+        keeps its slot for good.
+
+        A request that *did* run is deliberately left alone. Its slot is
+        recycled by `_acquire`'s eviction exactly as before, and releasing it
+        eagerly instead measured -21% throughput: the slot churn tripled the
+        stores (16.5 to 59.5 per window) and cost 20% on ITL, because each
+        store is a 5 MiB device-to-host copy contending with decode. The leak
+        is real and the fix for it has to be this narrow.
+        """
+        if key not in self._reserved:
+            return False
+        self.release(key)
+        return True
+
+    def release(self, key) -> None:
+        """Give a reserved slot back, for a request that will never arrive.
+
+        Reservations are not otherwise reclaimed until the slot is the
+        least-recently-seen eviction victim, so a request that is cancelled
+        between its load and its first forward would hold one indefinitely.
+        """
+        self._reserved.discard(key)
+        slot = self._key_to_slot.pop(key, None)
+        if slot is None:
+            return
+        self._slot_to_key[slot] = None
+        self._last_seen[slot] = -1
+        if slot not in self._free:
+            self._free.append(slot)
 
     def assign(self, req_keys, num_computed):
         """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``.
@@ -79,7 +168,12 @@ class StateSlotAllocator:
             k = keys[i]
             slot = key_to_slot.get(k)
             if slot is None:
-                slot = self._acquire(active)
+                # Reserved-but-unclaimed slots are live too: one holds bytes a
+                # parked request's restore already wrote, and handing it to a
+                # batch member puts two requests on one ring. They are not in
+                # `active` because their request has no batch row yet -- which
+                # is the whole reason reservations exist.
+                slot = self._acquire(active | self._reserved)
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
                 reset.add(slot)
@@ -88,7 +182,35 @@ class StateSlotAllocator:
                 reset.add(slot)
             slots[i] = slot
             last_seen[slot] = step
+        # The batch now owns these: a reservation has been claimed, and the
+        # set a future reservation must not evict is this batch, not the
+        # accumulated history.
+        self._reserved -= active
+        self._last_active = active
         return np.asarray(slots, dtype=np.int32), reset
+
+    def _acquire_unused(self, live: set):
+        """A slot no live tenant holds, or None. Never a fallback victim.
+
+        `_acquire`'s slot-0 fallback is correct for `assign`, where vLLM has
+        already guaranteed the batch fits. A reservation has no such
+        guarantee, so here "no room" has to be sayable.
+        """
+        if self._free:
+            return self._free.pop()
+        victim, victim_seen = None, None
+        for s in range(self.num_slots):
+            if self._slot_to_key[s] in live:
+                continue
+            if victim_seen is None or self._last_seen[s] < victim_seen:
+                victim, victim_seen = s, self._last_seen[s]
+        if victim is None:
+            return None
+        old = self._slot_to_key[victim]
+        if old is not None:
+            self._key_to_slot.pop(old, None)
+        self._slot_to_key[victim] = None
+        return victim
 
     def _acquire(self, active: set) -> int:
         if self._free:

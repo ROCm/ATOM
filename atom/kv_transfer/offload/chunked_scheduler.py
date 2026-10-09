@@ -485,6 +485,109 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         adjusted = min(int(chunk), limit)
         return max(1, adjusted)
 
+    # ---- recurrent state riding the transfer object ----------------------
+    #: Installed by a connector whose model has recurrent KV cache groups
+    #: published to the same tier as the paged KV. It answers, for one
+    #: transfer's token range, which block holds the recurrent snapshot at its
+    #: end -- so the state and the KV it continues commit and restore as one
+    #: object. ``None`` from the hook means this range has no whole state, and
+    #: the transfer is then not emitted at all: a PAGE-only object on a model
+    #: with recurrent groups registered would restore a prefix whose recurrent
+    #: state is someone else's, and the transport refuses it.
+    _recurrent_state_hook = None
+
+    #: Installed alongside the hook above. Called with the set of save and load
+    #: operations the scheduler still considers live, so the recurrent leg can
+    #: give back the refcount shares of rides whose transfer is over. A save
+    #: leaves through several exits (terminal report, abandonment, stale-lease
+    #: reclaim, teardown) and a release wired to only some of them leaks on
+    #: the rest, so this is a reconciliation rather than a per-exit call.
+    _recurrent_retire_hook = None
+
+    def install_recurrent_state_hook(self, hook, retire_hook=None) -> None:
+        self._recurrent_state_hook = hook
+        self._recurrent_retire_hook = retire_hook
+
+    def _recurrent_state_for(self, seq, end: int, operation=None):
+        """This transfer's recurrent snapshot, or ``None`` if it has none.
+
+        ``(None, False)`` is not expressible here on purpose: with no hook
+        installed there are no recurrent groups, so ``None`` is the whole and
+        correct answer and the caller must not treat it as a refusal. Callers
+        therefore test ``self._recurrent_state_hook is not None`` first.
+
+        ``operation`` names the transfer that will carry the snapshot, and is
+        what the hook keys a save's source pin by. A load passes ``None``: its
+        destination blocks belong to the parked request, which vLLM holds for
+        longer than the transfer, so there is nothing to pin.
+        """
+        hook = self._recurrent_state_hook
+        return None if hook is None else hook(seq, int(end), operation=operation)
+
+    def _live_transfers(self) -> set:
+        """Dispatched operations still waiting for a terminal report."""
+        live: set = set(self._save_inflight.values())
+        live.update(self._save_operation_owner)
+        live.update(operation for _, operation in self._active_load_operations.values())
+        return live
+
+    def _retire_recurrent_rides(self, live_operations) -> None:
+        """Hand the recurrent leg the operations still in flight."""
+        hook = self._recurrent_retire_hook
+        if hook is not None:
+            hook(live_operations)
+
+    def log_save_lease_stats(
+        self, *, interval_s: float = 60.0, force: bool = False
+    ) -> None:
+        """Print what the dense save leg is still holding, once per *interval_s*.
+
+        The recurrent leg already ships its counters at INFO for the same
+        reason: a leg that reports nothing cannot be shown to be working.
+        These are the sets that decide whether a finished request's blocks go
+        back to the pool, so a pool that drains to zero free blocks with no
+        running request has its explanation in this line.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_save_lease_stats_log", 0.0)
+        if not force and now - last < interval_s:
+            return
+        self._last_save_lease_stats_log = now
+        stats = {
+            "save_inflight": len(self._save_inflight),
+            "save_owner": len(self._save_operation_owner),
+            "save_block_maps": len(self._save_operation_blocks),
+            "leases": len(self._save_lease_blocks),
+            "leased_blocks": sum(
+                len(blocks) for blocks in self._save_lease_blocks.values()
+            ),
+            "retry_blocked": len(self._save_retry_blocked),
+            "quiescent": len(self._save_quiescent),
+            "active_loads": len(self._active_load_operations),
+            "src_safe_released": self.total_source_safe_released_blocks,
+        }
+        logger.info(
+            "ATOM LMCache offload: save leases %s",
+            " ".join(f"{k}={v}" for k, v in stats.items()),
+        )
+
+    def reconcile_recurrent_rides(self) -> None:
+        """Give back the pins of rides whose transfer is over.
+
+        Called once per scheduler step by whoever drives the step, and it must
+        be called AFTER that step's saves are built: a pin taken for a save
+        that is emitted has to see its own operation in the live set, or it
+        would be released while the copy is still in flight.
+
+        The MP backend also reaches this from `_enforce_transfer_deadlines`,
+        but that path hangs off `process_completions`, which only ATOM's native
+        engine calls -- the vLLM plugin connector drives the scheduler from
+        `build_connector_meta` instead. A reconciliation installed on the
+        native path alone never runs under the plugin, and the pins leak the
+        whole pool away exactly as if it had never been installed.
+        """
+        self._retire_recurrent_rides(self._live_transfers())
+
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
         return True
@@ -504,6 +607,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         is_last_prefill: bool,
     ) -> LMCacheReqMeta | None:
         """Admit any layout-specific sources before advancing the watermark."""
+        recurrent = None
+        if self._recurrent_state_hook is not None:
+            # The same end the worker derives from ``token_ids``; computing it
+            # here rather than passing ``aligned`` keeps the two from drifting
+            # apart, which the worker would report as a boundary mismatch.
+            end = (int(aligned) // int(self.chunk_size)) * int(self.chunk_size)
+            recurrent = self._recurrent_state_for(seq, end, operation=operation)
+            if recurrent is None:
+                return None
         return LMCacheReqMeta(
             req_id=seq.id,
             token_ids=list(seq.token_ids[:aligned]),
@@ -511,6 +623,24 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
+            recurrent_state=recurrent,
+        )
+
+    def _save_source_is_backed(
+        self,
+        block_ids: list[int],
+        saved: int,
+        aligned: int,
+    ) -> bool:
+        """Whether the block table still covers every token the save claims."""
+
+        source_block_size = int(getattr(self, "virtual_block_size", self.block_size))
+        end_block = -(-int(aligned) // source_block_size)  # ceil div
+        if len(block_ids) < end_block:
+            return False
+        start_block = int(saved) // source_block_size
+        return all(
+            block_ids[index] is not None for index in range(start_block, end_block)
         )
 
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
@@ -610,6 +740,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
                 continue
+            transfer_end = (
+                lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
+            )
+            recurrent = None
+            if self._recurrent_state_hook is not None:
+                recurrent = self._recurrent_state_for(seq, transfer_end)
+                if recurrent is None:
+                    # No destination for the state this KV needs, so there is
+                    # no correct load to emit. Declined here, before the
+                    # operation is registered and the sequence is parked on
+                    # it -- a load skipped after that point is one nothing
+                    # ever completes. The prefix is recomputed instead, which
+                    # is a performance loss where the alternative is a wrong
+                    # answer.
+                    self._mark_load_skip(
+                        seq, "no_recurrent_state", hbm, lmc, need, chunk
+                    )
+                    self._clear_pending_load(sid)
+                    continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
@@ -632,9 +781,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             seq._load_operation = load_operation
             self._active_load_operations[sid] = (seq, load_operation)
             self._track_load_statistics(load_operation, lmc - hbm)
-            transfer_end = (
-                lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
-            )
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
@@ -642,6 +788,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     block_ids=list(seq.block_table),
                     load_spec=ls,
                     load_operation=load_operation,
+                    recurrent_state=recurrent,
                 )
             )
         meta.lookup_requests_in_step = [
@@ -711,6 +858,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 block_ids = list(
                     getattr(seq, "_offload_finished_block_ids", seq.block_table)
                 )
+            if not self._save_source_is_backed(block_ids, saved, aligned):
+                # The blocks holding [saved, aligned) are gone -- a preemption
+                # cleared this sequence's block table while the save was still
+                # queued. Emitting anyway ships a descriptor the worker cannot
+                # honour ("needs N blocks for [start, end), got 0") and kills
+                # the transfer; the tokens are simply not resident to read.
+                self.total_unbacked_saves += 1
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                logger.warning(
+                    "Offload save of seq %s covers [%d, %d) but its block table "
+                    "holds %d blocks; skipping (total unbacked_saves=%d)",
+                    seq.id,
+                    saved,
+                    aligned,
+                    len(block_ids),
+                    self.total_unbacked_saves,
+                )
+                continue
             try:
                 request = self._build_save_request(
                     seq, saved, aligned, save_operation, block_ids, is_last_prefill
