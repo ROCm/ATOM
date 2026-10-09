@@ -20,12 +20,6 @@ logger = logging.getLogger("atom")
 # turn any refactor into a capability change, and it would leak methods that are
 # not safe to call from outside.
 _ADVERTISED_METHODS = (
-    # Optional direct trainer-to-rollout transfer. These names are advertised
-    # only when a receiver mixin actually defines them (as #2298 does).
-    "init_rdma_weight_group",
-    "receive_weights_rdma",
-    "destroy_rdma_weight_group",
-    "get_weight_update_status",
     # hidden-state extraction
     "configure_hidden_states",
     # capability discovery itself
@@ -55,9 +49,6 @@ class CapabilityProviderMixin:
             features.add("vocab_masking")
         if self._holds_fp8_weights():
             features.add("fp8_weight_update")
-        if "receive_weights_rdma" in methods:
-            features.add("rdma_weight_receive")
-
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {

@@ -173,6 +173,7 @@ def test_the_broadcast_carries_the_full_request():
     assert kw["kwargs"] == {"k": "v"}
     assert kw["barrier"] is True
     assert kw["timeout"] == engine_budget(9)
+    assert time.time() < kw["deadline"] <= time.time() + 9
     assert kw["request_id"]
 
 
@@ -396,6 +397,13 @@ def test_sync_refuses_a_fire_and_forget_command_up_front():
     assert mgr.sent == [], "nothing may be sent for a call that cannot complete"
 
 
+def test_weight_updates_cannot_be_sent_without_a_finish_or_abort_owner():
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="must use.*sync"):
+        CoreManager.broadcast_utility_command(mgr, "update_weights_shm", is_last=False)
+    assert mgr.sent == []
+
+
 def test_sync_raises_the_cause_when_an_engine_reports_an_error():
     mgr = _mgr(2)
     mgr.broadcast_utility_command = _answering(
@@ -436,6 +444,7 @@ def test_a_complete_weight_sync_finishes_only_after_every_dp_engine_succeeds():
         "update_weights_ipc",
         "finish_weight_sync",
     ]
+    assert mgr.sent[1][1]["timeout"] == engine_budget(30.0)
 
 
 def test_a_nonfinal_bucket_stays_fenced_for_the_rest_of_its_sync():
@@ -532,7 +541,7 @@ def test_sync_returns_replies_in_dp_order():
     assert [r["result"] for r in replies] == ["dp0", "dp1"]
 
 
-def test_engines_get_a_shorter_deadline_than_their_caller():
+def test_engines_get_an_absolute_deadline_inside_their_callers():
     """The engine's per-rank account of a timeout arrived as the caller gave
     up, so it was dropped and the caller learned only that it had waited."""
     mgr = _mgr(1)
@@ -542,3 +551,4 @@ def test_engines_get_a_shorter_deadline_than_their_caller():
     mgr.broadcast_utility_command_sync("clear_kv_cache", timeout=60)
     ((_, kw),) = mgr.sent
     assert 0 < kw["timeout"] < 60
+    assert time.time() < kw["deadline"] <= time.time() + 60

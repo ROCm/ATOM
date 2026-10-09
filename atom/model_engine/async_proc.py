@@ -208,7 +208,7 @@ class AsyncIOProc:
         if self.rpc_output_addr is not None:
             self.rpc_queue = queue.Queue()
             t = threading.Thread(
-                target=self.send_output_to_socket,
+                target=self.send_rpc_output_to_socket,
                 args=(self.rpc_output_addr, self.rpc_queue),
                 daemon=True,
             )
@@ -275,6 +275,31 @@ class AsyncIOProc:
                 result = output_queue.get()
                 serialized_obj = pickle.dumps(result)
                 socket.send(serialized_obj)
+
+    def send_rpc_output_to_socket(self, addr: str, output_queue: queue.Queue):
+        """Send request id separately, so a corrupt body stays attributable."""
+        with ExitStack() as stack, zmq.Context() as ctx:
+            socket = stack.enter_context(
+                make_zmq_socket(ctx, addr, zmq.PUSH, linger=4000)
+            )
+            logger.debug(f"{self.label}: RPC output socket connected")
+            while True:
+                result = output_queue.get()
+                socket.send_multipart(self._serialize_rpc_result(result))
+
+    @staticmethod
+    def _serialize_rpc_result(result: RpcResult) -> list[bytes]:
+        """Serialize once; turn an unpicklable value into a picklable failure."""
+        try:
+            body = pickle.dumps(result)
+        except Exception as exc:  # noqa: BLE001 - report over the same channel
+            result = RpcResult(
+                result.request_id,
+                result.tp_rank,
+                error=f"unpicklable RPC result: {type(exc).__name__}: {exc}",
+            )
+            body = pickle.dumps(result)
+        return [result.request_id.encode("utf-8"), body]
 
     # Legacy call_func users still need the same shared-buffer barrier. The
     # generic path carries this decision explicitly in RpcPayload.barrier.
@@ -354,8 +379,9 @@ class AsyncIOProc:
         """Invoke one generic RPC, converting every outcome into a reply.
 
         Never raises and never returns ``None``: a missing or malformed method
-        name, a raising target, and an unpicklable return all become an
-        ``RpcResult`` carrying ``error``. Anything else would leave the caller
+        name and a raising target become an ``RpcResult`` carrying ``error``;
+        the RPC sender converts an unpicklable value before it writes the
+        socket. Anything else would leave the caller
         blocked in an untimed queue get, which is how a typo in a method name
         currently costs five minutes and reports a timeout instead of the typo.
         """
@@ -379,15 +405,6 @@ class AsyncIOProc:
             )
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
             return self._failure(payload, f"{type(exc).__name__}: {exc}")
-        try:
-            # The reply crosses a ZMQ socket, so an unpicklable value would kill
-            # the sender thread rather than fail this call. Find out here.
-            pickle.dumps(result)
-        except Exception as exc:  # noqa: BLE001 - same reason
-            return self._failure(
-                payload,
-                f"unpicklable result from {func_name!r}: {type(exc).__name__}: {exc}",
-            )
         return result
 
     def _failure(self, payload: RpcPayload, error: str) -> RpcResult:
@@ -409,6 +426,7 @@ def _alive(proc) -> bool:
 
 @dataclass(frozen=True)
 class _RpcReceiveError:
+    request_id: str
     error: str
 
 
@@ -627,12 +645,15 @@ class AsyncIOProcManager:
                 socks = poller.poll(timeout=1000)
                 if not socks:
                     continue
+                request_id_frame, body = output_socket.recv_multipart(copy=False)
+                request_id = bytes(request_id_frame).decode("utf-8", errors="replace")
                 try:
-                    obj = pickle.loads(output_socket.recv(copy=False))
+                    obj = pickle.loads(body)
                 except Exception as exc:
                     obj = _RpcReceiveError(
+                        request_id,
                         f"could not decode RPC reply from TP rank {worker_id}: "
-                        f"{type(exc).__name__}: {exc}"
+                        f"{type(exc).__name__}: {exc}",
                     )
                     logger.exception(obj.error)
                 self.rpc_outputs_queues[worker_id].put_nowait(obj)
@@ -695,8 +716,18 @@ class AsyncIOProcManager:
         # Reached from the utility handler too, with whatever timeout the
         # utility command carried.
         timeout = checked_timeout(timeout)
-        is_reserved = func_name in self._PROTOCOL_RPC_NAMES or (
-            func_name in UTILITY_MANAGED_RUNNER_METHODS and not allow_utility_managed
+        is_private = (
+            isinstance(func_name, str)
+            and func_name.startswith("_")
+            and not allow_utility_managed
+        )
+        is_reserved = (
+            is_private
+            or func_name in self._PROTOCOL_RPC_NAMES
+            or (
+                func_name in UTILITY_MANAGED_RUNNER_METHODS
+                and not allow_utility_managed
+            )
         )
         if is_reserved:
             # Each would break the protocol this path goes around. The workers'
@@ -784,6 +815,16 @@ class AsyncIOProcManager:
                     continue
             else:
                 if isinstance(reply, _RpcReceiveError):
+                    if reply.request_id != payload.request_id:
+                        logger.warning(
+                            "%s: dropping stale unreadable reply %s from rank %d "
+                            "while awaiting %s",
+                            self.label,
+                            reply.request_id,
+                            rank,
+                            payload.request_id,
+                        )
+                        continue
                     error = reply.error
                 elif not isinstance(reply, RpcResult):
                     error = (

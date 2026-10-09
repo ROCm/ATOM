@@ -70,6 +70,7 @@ class EngineCapabilities:
     data_parallel_size: int
     pipeline_parallel_size: int
     prefill_context_parallel_size: int
+    workers_per_engine: int
     kv_cache_dtype: str
     # Only what every rank reports. See the module docstring.
     methods: frozenset[str] = frozenset()
@@ -100,16 +101,17 @@ class EngineCapabilities:
         )
 
         parallel = getattr(config, "parallel_config", None)
+        tp_world_size = int(getattr(config, "tp_world_size", len(workers)))
+        pcp_size = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
         return cls(
             protocol_version=versions.pop(),
-            tp_world_size=int(getattr(config, "tp_world_size", len(workers))),
+            tp_world_size=tp_world_size,
             data_parallel_size=int(getattr(parallel, "data_parallel_size", 1) or 1),
             pipeline_parallel_size=int(
                 getattr(config, "pipeline_parallel_size", 1) or 1
             ),
-            prefill_context_parallel_size=int(
-                getattr(config, "prefill_context_parallel_size", 1) or 1
-            ),
+            prefill_context_parallel_size=pcp_size,
+            workers_per_engine=tp_world_size * pcp_size,
             kv_cache_dtype=str(getattr(config, "kv_cache_dtype", "auto")),
             methods=methods,
             features=features,

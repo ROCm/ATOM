@@ -27,9 +27,9 @@ class _Runner(WeightUpdaterMixin):
 
 
 @pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
-def test_a_failed_update_discards_every_piece_of_cross_bucket_state(path):
-    """The next IPC sync otherwise reused the failed sync's mapping, and FP8
-    shards and expert relayout entries crossed the same boundary."""
+def test_a_failed_update_discards_scratch_but_keeps_layout_recovery_state(path):
+    """IPC mappings and FP8 packed shards cannot cross syncs. An expert already
+    written row-major still needs its pending relayout entry to survive."""
     runner = _Runner()
     shm = None
     try:
@@ -48,4 +48,4 @@ def test_a_failed_update_discards_every_piece_of_cross_bucket_state(path):
 
     assert runner._ipc_buffer is None
     assert runner._packed_weight_accum == {}
-    assert runner._expert_relayout_pending == {}
+    assert set(runner._expert_relayout_pending) == {"old"}

@@ -126,19 +126,21 @@ class WeightUpdaterMixin:
             )
 
     def _discard_failed_weight_sync(self) -> None:
-        """Drop transport and cross-bucket scratch after a failed update.
+        """Drop reusable transport scratch after a failed update.
 
         The generic RPC path reports an exception without killing the worker,
         so this state now outlives a failed call unless it is explicitly
-        cleared. Parameters already written cannot be rolled back; the
-        EngineCore fences serving until a later complete sync succeeds.
+        cleared. Expert-relayout bookkeeping is recovery state rather than
+        scratch and deliberately survives. Parameters already written cannot
+        be rolled back; EngineCore fences serving until a complete sync.
         """
         if hasattr(self, "_ipc_buffer"):
             self._ipc_buffer = None
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
-        if hasattr(self, "_expert_relayout_pending"):
-            self._expert_relayout_pending.clear()
+        # Do not clear _expert_relayout_pending. A weight already written
+        # row-major still needs the later complete sync's finalizer to restore
+        # the layout its kernel reads, even if that sync does not touch it.
 
     def discard_failed_weight_sync(self) -> bool:
         """Worker RPC used to clear every peer after any one rank failed."""

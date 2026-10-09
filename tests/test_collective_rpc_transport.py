@@ -209,14 +209,16 @@ def test_a_raising_target_is_reported_not_propagated():
 
 
 def test_an_unpicklable_result_becomes_an_error():
-    """Otherwise the reply kills the sender thread instead of failing the call."""
+    """The sender serializes once and replaces a bad value without dying."""
     proc = _proc()
     out = proc._run_generic_rpc(
         proc.runners[0], "returns_unpicklable", (), {}, RpcPayload(request_id="r4")
     )
-    assert not out.ok
-    assert "unpicklable" in out.error
-    pickle.dumps(out)  # the error reply itself must survive the wire
+    request_id, body = proc._serialize_rpc_result(out)
+    wire = pickle.loads(body)
+    assert request_id == b"r4"
+    assert not wire.ok
+    assert "unpicklable" in wire.error
 
 
 # ── the payload contract ───────────────────────────────────────────────────
@@ -430,6 +432,16 @@ def test_names_the_engine_protocol_owns_are_refused(name):
 
 
 @pytest.mark.parametrize(
+    "name", ["_discard_failed_weight_sync", "_finalize_expert_weight_sync"]
+)
+def test_private_worker_methods_are_not_a_public_rpc_surface(name):
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="reserved"):
+        mgr.collective_rpc(name, RpcPayload("private"), timeout=5)
+    assert mgr.rpc_broadcast_mq.sent == []
+
+
+@pytest.mark.parametrize(
     "name",
     ["update_weights", "update_weights_from_shm", "update_weights_from_ipc"],
 )
@@ -466,9 +478,9 @@ def test_an_unreadable_reply_fails_one_call_without_ending_its_thread(monkeypatc
     mgr = _mgr(1)
 
     class _Socket:
-        def recv(self, copy=False):
+        def recv_multipart(self, copy=False):
             mgr.still_running = False
-            return b"not a pickle"
+            return [b"bad", b"not a pickle"]
 
         def close(self, linger=0):
             pass
@@ -491,6 +503,18 @@ def test_an_unreadable_reply_fails_one_call_without_ending_its_thread(monkeypatc
     mgr.still_running = True
     (result,) = mgr.collective_rpc("m", RpcPayload("bad"), timeout=5)
     assert "could not decode RPC reply from TP rank 0" in result.error
+
+
+def test_an_unreadable_late_reply_keeps_the_request_id_it_belongs_to():
+    mgr = _mgr(1)
+    mgr.rpc_outputs_queues[0].put_nowait(
+        async_proc_module._RpcReceiveError("old", "old body was corrupt")
+    )
+    _reply(mgr, 0, "new", value="right")
+
+    (result,) = mgr.collective_rpc("m", RpcPayload("new"), timeout=5)
+
+    assert result.value == "right"
 
 
 class _AnsweringMq:

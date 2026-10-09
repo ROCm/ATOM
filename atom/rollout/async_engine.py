@@ -56,7 +56,10 @@ class AsyncLLMEngine(LLMEngine):
 
         Note this stalls the affected DP rank's scheduling for the call's
         duration, since the handler runs in the EngineCore busy loop. That is
-        wanted for a weight swap; it is not free for anything else.
+        wanted for a weight swap; it is not free for anything else. A target
+        must not perform a cross-DP collective: engines enter this handler
+        independently, while peers may already be in the busy loop's DP state
+        all-reduce, and the two collectives would deadlock.
         """
         return self.core_mgr.collective_rpc(
             method,
@@ -123,6 +126,11 @@ class AsyncLLMEngine(LLMEngine):
         logger.info(f"AsyncLLMEngine wake_up: tags={tags}")
         self.core_mgr.broadcast_utility_command_sync("resume_memory", tags=tags)
         logger.info("AsyncLLMEngine wake_up: completed")
+
+    def get_weight_sync_status(self) -> list[dict]:
+        """Fence state for each DP engine, in DP-rank order."""
+        replies = self.core_mgr.broadcast_utility_command_sync("get_weight_sync_status")
+        return [reply["result"] for reply in replies]
 
     def load_weights(
         self,

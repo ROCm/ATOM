@@ -78,6 +78,7 @@ class _RunnerMgr:
 class _Engine:
     _has_pending_utility = True
     _is_rl_weights_offloaded = False
+    _weight_sync_fenced = False
     _rl_weights_inconsistent = False
 
 
@@ -129,6 +130,7 @@ def test_it_runs_through_the_real_dispatcher_and_answers():
     assert body["cmd"] == "collective_rpc"
     assert body["request_id"] == "x1"
     assert body["tp_world_size"] == 3
+    assert body["worker_world_size"] == 3
     assert [r["tp_rank"] for r in body["results"]] == [0, 1, 2]
     assert [r["value"] for r in body["results"]] == ["rank0", "rank1", "rank2"]
     assert all(r["error"] is None for r in body["results"])
@@ -320,6 +322,7 @@ def test_a_direct_update_that_fails_on_a_nonzero_rank_is_an_error(cmd, args):
         {"cmd": cmd, "error": "TP rank 1: ValueError: rejected q_proj"}
     ]
     assert h.runner_mgr.calls[-1][0] == "discard_failed_weight_sync"
+    assert h.runner_mgr.calls[-1][2] == 1.0
 
 
 @pytest.mark.parametrize(("cmd", "args"), _DIRECT_UPDATES)
@@ -381,12 +384,14 @@ def test_any_failed_bucket_fences_an_engine_that_was_awake():
     )
     engine = _Engine()
     engine._is_rl_weights_offloaded = False
+    engine._weight_sync_fenced = False
     engine._rl_weights_inconsistent = False
 
     _process_one(h, out, engine, "update_weights_ipc", {"is_last": False})
 
     assert engine._rl_weights_inconsistent
-    assert engine._is_rl_weights_offloaded
+    assert engine._weight_sync_fenced
+    assert not engine._is_rl_weights_offloaded
 
 
 def test_wake_up_cannot_unfence_a_failed_update_but_a_complete_sync_can():
@@ -395,19 +400,23 @@ def test_wake_up_cannot_unfence_a_failed_update_but_a_complete_sync_can():
     )
     engine = _Engine()
     engine._is_rl_weights_offloaded = False
+    engine._weight_sync_fenced = False
     engine._rl_weights_inconsistent = False
     _process_one(h, out, engine, "update_weights_shm", {"is_last": False})
 
-    _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
-    assert engine._is_rl_weights_offloaded
+    (resume,) = _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
+    assert "weight sync is fenced" in resume["error"]
+    assert engine._weight_sync_fenced
+    assert not engine._is_rl_weights_offloaded
     assert engine._rl_weights_inconsistent
 
     mgr._replies = _counts(4, 4)
     _process_one(h, out, engine, "update_weights_shm", {"is_last": True})
-    assert engine._is_rl_weights_offloaded
+    assert engine._weight_sync_fenced
     assert engine._rl_weights_inconsistent
 
     _process_one(h, out, engine, "finish_weight_sync", {})
+    assert not engine._weight_sync_fenced
     assert not engine._is_rl_weights_offloaded
     assert not engine._rl_weights_inconsistent
 
@@ -416,6 +425,7 @@ def test_a_global_abort_fences_an_engine_whose_local_update_succeeded():
     h, _, out = _handler(replies=_counts(4, 4))
     engine = _Engine()
     engine._is_rl_weights_offloaded = False
+    engine._weight_sync_fenced = False
     engine._rl_weights_inconsistent = False
 
     _process_one(h, out, engine, "update_weights_ipc", {"is_last": True})
@@ -423,36 +433,45 @@ def test_a_global_abort_fences_an_engine_whose_local_update_succeeded():
     # reports failure.
     _process_one(h, out, engine, "discard_failed_weight_sync", {})
 
-    assert engine._is_rl_weights_offloaded
+    assert engine._weight_sync_fenced
+    assert not engine._is_rl_weights_offloaded
     assert engine._rl_weights_inconsistent
+
+
+def test_weight_sync_status_explains_a_fence():
+    h, _, out = _handler(replies=_counts(4, 4))
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", {"is_last": False})
+    (status,) = _process_one(h, out, engine, "get_weight_sync_status", {})
+
+    assert status["result"] == {
+        "fenced": True,
+        "in_progress": True,
+        "failure": None,
+    }
 
 
 def test_every_answered_utility_command_stamps_the_callers_request_id():
     h, _, out = _handler()
     h._execute_utility_command("clear_kv_cache", {"request_id": "utility-1"})
     assert _responses(out) == [
-        {"cmd": "clear_kv_cache", "result": 7, "request_id": "utility-1"}
+        {"cmd": "clear_kv_cache", "result": "rank0", "request_id": "utility-1"}
     ]
 
 
-def _raise(exc):
-    def fail(*args, **kwargs):
-        raise exc
-
-    return fail
-
-
-def test_a_raising_handler_answers_before_the_engine_goes_down():
-    """A handler that raised escaped the busy loop with no reply, and the
-    caller waited out its timeout for an engine that was already gone."""
-    h, mgr, out = _handler()
-    mgr.call_func = _raise(RuntimeError("cannot release weights"))
-
-    with pytest.raises(RuntimeError, match="cannot release"):
-        h._execute_utility_command("release_memory", {"tags": ["weights"]})
-
+def test_a_memory_failure_on_a_nonzero_rank_is_answered():
+    h, _, out = _handler(
+        replies=[
+            RpcResult("m", 0, value=True),
+            RpcResult("m", 1, error="RuntimeError: cannot release weights"),
+        ]
+    )
+    h._execute_utility_command("release_memory", {"tags": ["weights"]})
     assert _responses(out) == [
-        {"cmd": "release_memory", "error": "RuntimeError: cannot release weights"}
+        {
+            "cmd": "release_memory",
+            "error": "TP rank 1: RuntimeError: cannot release weights",
+        }
     ]
 
 

@@ -190,6 +190,16 @@ transfer. Methods whose utility handlers own EngineCore state -- weight
 updates, memory release/resume and KV-cache clearing -- are rejected on this
 generic path. Pipeline-parallel and prefill/decode-disaggregated engines are
 also rejected because their engine processes are not one-to-one DP ranks.
+RPC targets must not perform cross-DP collectives: each EngineCore dequeues
+control work independently, so another DP engine may already be waiting in the
+busy loop's state all-reduce.
+
+Direct, SHM and IPC weight updates are fenced sessions. The first bucket stops
+serving; CoreManager clears the fence only after every DP engine completes the
+final bucket. Built-in senders abort from ``finally`` if iteration stops early,
+and asynchronous weight-update utility sends are rejected because they have no
+owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
+reports a fence, an in-progress session and its last failure.
 
 ## Sequence lifecycle
 

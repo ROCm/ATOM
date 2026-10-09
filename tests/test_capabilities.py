@@ -56,15 +56,13 @@ class _Runner(CapabilityProviderMixin):
     # Inherited by every RLHFModelRunner, quantised or not.
     _is_fp8_param = staticmethod(WeightUpdaterMixin._is_fp8_param)
 
-    def __init__(self, rank=0, methods=(), fp8=False, vocab=0, rdma=False):
+    def __init__(self, rank=0, methods=(), fp8=False, vocab=0):
         self.rank = rank
         self.config = _Config()
         self.model = _model(fp8)
         self._true_vocab_size = vocab
         for name in methods:
             setattr(self, name, lambda *a, **k: None)
-        if rdma:
-            self.receive_weights_rdma = lambda *a, **k: {}
 
 
 def _worker(rank, methods=(), features=(), version=None):
@@ -138,18 +136,6 @@ def test_fp8_is_claimed_by_the_weights_not_by_the_helper():
 
     bf16.model = None  # nothing loaded: nothing claimed, and no raise
     assert "fp8_weight_update" not in bf16.get_worker_capabilities()["features"]
-
-
-def test_the_rdma_lifecycle_is_advertised_only_when_the_receiver_exists():
-    lifecycle = (
-        "init_rdma_weight_group",
-        "receive_weights_rdma",
-        "destroy_rdma_weight_group",
-        "get_weight_update_status",
-    )
-    report = _Runner(methods=lifecycle, rdma=True).get_worker_capabilities()
-    assert set(lifecycle) <= set(report["methods"])
-    assert "rdma_weight_receive" in report["features"]
 
 
 def test_rdma_is_absent_until_the_receiver_exists():
@@ -247,6 +233,7 @@ def test_topology_comes_from_config_not_from_the_workers():
     assert caps.data_parallel_size == 2
     assert caps.pipeline_parallel_size == 3  # on Config, not parallel_config
     assert caps.prefill_context_parallel_size == 2
+    assert caps.workers_per_engine == 8
     assert caps.kv_cache_dtype == "fp8"
 
 

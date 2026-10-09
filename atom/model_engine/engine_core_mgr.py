@@ -42,6 +42,7 @@ from atom.utils import (
 )
 
 logger = logging.getLogger("atom")
+_WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
 
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
@@ -1422,6 +1423,7 @@ class CoreManager:
         request_id = uuid.uuid4().hex
         engine_count = len(self.control_sockets)
         deadline = time.monotonic() + timeout
+        worker_deadline = time.time() + engine_budget(timeout)
 
         with self._rpc_router.register(request_id) as replies:
             self.broadcast_utility_command(
@@ -1432,6 +1434,7 @@ class CoreManager:
                 kwargs=dict(kwargs or {}),
                 barrier=bool(barrier),
                 timeout=engine_budget(timeout),
+                deadline=worker_deadline,
             )
             by_dp_rank: dict[int, dict] = {}
             while len(by_dp_rank) < engine_count:
@@ -1500,6 +1503,11 @@ class CoreManager:
         return flat
 
     def broadcast_utility_command(self, cmd: str, **kwargs):
+        if cmd in WEIGHT_UPDATE_UTILITY_CMDS and "request_id" not in kwargs:
+            raise ValueError(
+                f"{self.label}: {cmd!r} must use "
+                f"broadcast_utility_command_sync so the sync is finished or aborted"
+            )
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
@@ -1528,10 +1536,15 @@ class CoreManager:
         # The global engine count on a coordinator, as the broadcast reaches.
         engine_count = len(self.control_sockets)
         deadline = time.monotonic() + timeout
+        worker_deadline = time.time() + engine_budget(timeout)
         by_dp_rank: dict[int, object] = {}
         with self._rpc_router.register(request_id) as replies:
             self.broadcast_utility_command(
-                cmd, request_id=request_id, timeout=engine_budget(timeout), **kwargs
+                cmd,
+                request_id=request_id,
+                timeout=engine_budget(timeout),
+                deadline=worker_deadline,
+                **kwargs,
             )
             while len(by_dp_rank) < engine_count:
                 remaining = deadline - time.monotonic()
@@ -1575,19 +1588,10 @@ class CoreManager:
             and bool(kwargs.get("is_last", True))
         )
         if is_complete_weight_sync:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self.broadcast_utility_command(
-                    "discard_failed_weight_sync", failed_cmd=cmd
-                )
-                raise TimeoutError(
-                    f"{self.label}: weight update {cmd!r} completed locally but "
-                    f"left no time to commit it across every DP engine"
-                )
             try:
                 self.broadcast_utility_command_sync(
                     FINISH_WEIGHT_SYNC_CMD,
-                    timeout=remaining,
+                    timeout=_WEIGHT_SYNC_FINISH_TIMEOUT_S,
                     completed_cmd=cmd,
                 )
             except Exception:
