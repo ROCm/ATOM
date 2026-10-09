@@ -21,12 +21,19 @@ from interactivity import (
 
 AGENTIC_BENCHMARK_KIND = "aiperf_agentic"
 
-# How each interactivity definition is spelled out in the markdown summary, so a
-# reader never has to guess which formula produced the number in the column.
+# How each definition behind the `interactivity` column is spelled out in the
+# markdown summary, so a reader never has to guess which formula produced it.
+# Header names follow InferenceX: "E2E Normalized Interactivity" includes TTFT,
+# plain "Interactivity" (its own column, P90_INTERACTIVITY_HEADER) does not.
 INTERACTIVITY_LABELS = {
     METHOD_P90_E2E: "P90 E2E Normalized",
     METHOD_MEDIAN_TPOT: "1 / median_tpot_s",
 }
+INTERACTIVITY_HEADERS = {
+    METHOD_P90_E2E: "P90 E2E Normalized Interactivity",
+    METHOD_MEDIAN_TPOT: "Interactivity (1 / median_tpot_s)",
+}
+P90_INTERACTIVITY_HEADER = "P90 Interactivity"
 
 RESULT_RE = re.compile(
     r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
@@ -828,6 +835,7 @@ SUMMARY_LAYOUT: list[tuple[str, bool]] = [
     ("ISL/OSL", False),
     ("Concurrency", True),
     (INTERACTIVITY_HEADER, True),
+    (P90_INTERACTIVITY_HEADER, True),
     ("TP", False),
     ("DCP", False),
     ("Spec", False),
@@ -865,10 +873,10 @@ def summary_headers(rows: list[dict[str, Any]]) -> list[str]:
     keeps the plain header; summary_note() carries the definitions instead.
     """
     methods = {interactivity_method(row) for row in rows}
-    label = INTERACTIVITY_LABELS.get(methods.pop()) if len(methods) == 1 else None
+    header = INTERACTIVITY_HEADERS.get(methods.pop()) if len(methods) == 1 else None
     headers = [header for header, _ in SUMMARY_LAYOUT]
-    if label:
-        headers[INTERACTIVITY_COLUMN] = f"{INTERACTIVITY_HEADER} ({label})"
+    if header:
+        headers[INTERACTIVITY_COLUMN] = header
     return headers
 
 
@@ -899,6 +907,8 @@ def summary_cells(row: dict[str, Any]) -> list[str]:
         ),
         string_value(row.get("max_concurrency"), default="--"),
         fmt(row.get("interactivity")),
+        # 1/p90(ITL) from the per-request records, so agentic rows only.
+        fmt(row.get("interactivity_p90_itl")),
         pd_label(resources["prefill_tp"], resources["decode_tp"]),
         pd_label(resources["prefill_dcp"], resources["decode_dcp"]),
         speculative_label(row) or "--",
