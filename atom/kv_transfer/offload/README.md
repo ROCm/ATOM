@@ -116,7 +116,7 @@ Four rules carry the module:
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker; per-NIC Store pools. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
-| `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots (HBM by default), with quarantine. |
+| `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
 | `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (Store lookups, digest-carrying requests) and worker (windowed put/get, startup probe). |
 
 The engine-side counterpart of the state tier lives outside this directory:
@@ -340,9 +340,9 @@ load: owners --batch_get_into--> run of slots of the registered pool --unpack (T
 
 A window whose slots are one run of the HBM pool is one chunk-major buffer, and
 the dense codec packs or unpacks it with one kernel and one stream sync
-(`direct_copy`). A window whose slots are scattered (held-back slots broke the
-region up) or a pool in host memory goes through the block GPU connector's
-staging buffer instead: pack, then a copy into each slot (and the reverse).
+(`direct_copy`). A window whose slots are scattered (quarantined slots broke
+the region up) goes through the block GPU connector's staging buffer instead:
+pack, then a copy into each slot (and the reverse).
 
 - One Store object is one (PP/TP rank, 256-token chunk): the dense codec's
   opaque bytes of that rank's layers, 16 blocks in one contiguous range
@@ -357,9 +357,6 @@ staging buffer instead: pack, then a copy into each slot (and the reverse).
   quarantined (below) leaves the rest working. A save packs a window (highest chunks
   first, like the dense tail-to-head order), then puts it; a load gets a
   window (lowest first), then unpacks it.
-- `mooncake_store.pool_device: cpu` puts the pool in pinned host memory instead
-  -- same code, D2H/H2D copies. Only for small pools: an ionic NIC registers
-  about 3 GiB of 4 KiB pages, shared by every process on it.
 
 ### Keys and lookup
 
@@ -490,7 +487,6 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.protocol` | `rdma` | Worker transfer protocol (`rdma` or `tcp`). Lookups always use tcp. |
 | `mooncake_store.local_hostname` | `ATOM_HOST_IP` / route IP | This host's reachable address for the Store clients. |
 | `mooncake_store.chunk_tokens` | 256 | Tokens per Store object; a multiple of the KV block size. |
-| `mooncake_store.pool_device` | `gpu` | Where the registered transfer pool lives (`gpu` or `cpu`). |
 | `mooncake_store.load_pool_mib` | 1024 | Load region per worker, MiB. |
 | `mooncake_store.save_pool_mib` | 256 | Save region per worker, MiB. |
 | `mooncake_store.lookup_batch_keys` | 8192 | Most keys per `batch_is_exist`. |

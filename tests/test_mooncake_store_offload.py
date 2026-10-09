@@ -344,13 +344,6 @@ def cluster(monkeypatch):
         "_new_replicate_config",
         lambda group_ids: SimpleNamespace(group_ids=list(group_ids)),
     )
-    # Pinned host memory needs a GPU runtime; plain host memory holds the same
-    # bytes and has an address the fake Store reads and writes.
-    monkeypatch.setattr(
-        pool_mod,
-        "_allocate_pool_tensor",
-        lambda nbytes, device: torch.empty((nbytes,), dtype=torch.uint8),
-    )
     # What closed pools kept for the life of the process, per test.
     monkeypatch.setattr(pool_mod, "_UNSETTLED_ALLOCATIONS", [])
     return cluster
@@ -539,7 +532,7 @@ def test_config_defaults_and_shared_master():
         }
     )
     assert (cfg.master, cfg.metadata, dict(cfg.pools)) == (MASTER, METADATA, {})
-    assert cfg.protocol == "rdma" and cfg.pool_device == "gpu"
+    assert cfg.protocol == "rdma"
     assert cfg.chunk_tokens == 256 and cfg.lookup_batch_keys == 8192
     assert (cfg.load_pool_bytes, cfg.save_pool_bytes) == (1024 << 20, 256 << 20)
     assert cfg.save_abandon_timeout_s == 300.0
@@ -618,7 +611,8 @@ def test_config_takes_the_launcher_worker_config(launcher_json):
         ({"master": "10.0.0.1:0"}, "host:port"),
         ({"metadata": ""}, "non-empty string"),
         ({"protocol": "ib"}, "protocol must be one of"),
-        ({"pool_device": "nvme"}, "pool_device must be one of"),
+        # Gone: the transfer pool is always in the worker GPU's HBM.
+        ({"pool_device": "cpu"}, "unknown Mooncake Store offload"),
         ({"chunk_tokens": 256.0}, "chunk_tokens must be an integer"),
         ({"chunk_tokens": 0}, "chunk_tokens must be positive"),
         ({"load_pool_mib": True}, "load_pool_mib must be an integer"),
@@ -899,7 +893,7 @@ def test_client_setup_and_registration_failures_name_the_cause(cluster):
     cluster.setup_rc = 0
     client = _client()
     client._store.register_rc = store_client.INVALID_PARAMS
-    with pytest.raises(RuntimeError, match="transparent huge pages"):
+    with pytest.raises(RuntimeError, match="HBM needs amdgpu peer memory"):
         client.register(0x1000, 4096)
 
 
