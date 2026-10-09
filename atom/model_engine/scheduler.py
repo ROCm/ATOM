@@ -568,6 +568,20 @@ class Scheduler:
         self.last_prompt_latency = 0.0
         self.delay_factor = config.scheduler_delay_factor
 
+        # Reserve projected decode growth before admitting fresh prefills.
+        # Existing partial prefills are already committed and bypass this gate.
+        self.reserve_decode_tokens = envs.ATOM_RESERVE_DECODE_TOKENS
+        self._reserve_decode_blocks = (
+            self.reserve_decode_tokens + self.block_manager.block_size - 1
+        ) // self.block_manager.block_size
+        if self.reserve_decode_tokens > 0:
+            logger.info(
+                "Projected-decode KV admission enabled: reserving %d tokens "
+                "(%d KV blocks) per running sequence",
+                self.reserve_decode_tokens,
+                self._reserve_decode_blocks,
+            )
+
         # Speculative decoding
         self.use_spec = config.speculative_config is not None
         self.mtp_k: int = (
@@ -796,7 +810,11 @@ class Scheduler:
             return prefillable, min(pending, budget)
         probed_tokens = 0
         slots = self.max_num_seqs - len(self.running)
-        for seq in self._waiting_prefills():
+        for hypothetical_new_prefills, seq in enumerate(self._waiting_prefills()):
+            if not self._kv_reservation_allows_new_prefill(
+                hypothetical_new_prefills=hypothetical_new_prefills
+            ):
+                break
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
                 cached = self._offload_prefill_start(seq)
@@ -890,6 +908,8 @@ class Scheduler:
             return True
         if not self.waiting:
             return False
+        if not self._kv_reservation_allows_new_prefill():
+            return False
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break
@@ -925,6 +945,23 @@ class Scheduler:
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
+
+    def _kv_reservation_allows_new_prefill(
+        self, *, hypothetical_new_prefills: int = 0
+    ) -> bool:
+        """Whether one more fresh prefill fits the projected decode reserve.
+
+        ``hypothetical_new_prefills`` is only for non-mutating queue probes. It
+        counts candidates that are not in ``running`` yet. Real admissions are
+        appended to ``running`` immediately and must not also be passed here.
+        """
+        if self._reserve_decode_blocks <= 0:
+            return True
+        total_blocks = self.block_manager.kv.num_blocks
+        if total_blocks <= 0:
+            return True
+        committed = len(self.running) + hypothetical_new_prefills
+        return (committed + 1) * self._reserve_decode_blocks <= total_blocks
 
     def _record_throughput(
         self, num_prompt_tokens: int = 0, num_generation_tokens: int = 0
@@ -980,6 +1017,7 @@ class Scheduler:
         """
         cap = self.max_num_batched_tokens
         total = 0
+        hypothetical_new_prefills = 0
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
@@ -994,7 +1032,12 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
+            if not self._kv_reservation_allows_new_prefill(
+                hypothetical_new_prefills=hypothetical_new_prefills
+            ):
+                break
             total += max(0, num_new_tokens)
+            hypothetical_new_prefills += 1
             if total >= cap:
                 return cap
         return total
@@ -1042,6 +1085,8 @@ class Scheduler:
         or checkpoint waits. ABORTED, remote-loading and statically rejected
         requests do not contribute.
         """
+        if not self._kv_reservation_allows_new_prefill():
+            return 0.0
         oldest_arrive = None
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
@@ -1564,11 +1609,13 @@ class Scheduler:
                 self._local_prefill_coalescing and not running_decode_batch
             ):
                 # Existence is sufficient during the hard protection window:
-                # fit probes cannot change its decision. Coalescer hold bounds
-                # start afterwards. With no decode, admission proceeds directly.
-                prefillable = (
-                    self._partial_prefill_count > 0
-                    or next(self._waiting_prefills(), None) is not None
+                # fit probes cannot change its decision. The reservation gate
+                # still applies to fresh work; partials are already committed.
+                # Coalescer hold bounds start afterwards. With no decode,
+                # admission proceeds directly.
+                prefillable = self._partial_prefill_count > 0 or (
+                    self._kv_reservation_allows_new_prefill()
+                    and next(self._waiting_prefills(), None) is not None
                 )
                 pending_tokens = 0
             elif self._local_prefill_coalescing:
@@ -1637,6 +1684,7 @@ class Scheduler:
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
+            and self._kv_reservation_allows_new_prefill()
         ):
             if prefix_waiters:
                 if prefix_bypass_left == 0:
