@@ -16,12 +16,14 @@ def _indptr_scan(
     pptr,
     eptr,
     tokens,
+    replay_start,
     DECODE: tl.constexpr,
     WINDOW: tl.constexpr,
     RATIO: tl.constexpr,
     TOPK: tl.constexpr,
     EXTEND: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_REPLAY_START: tl.constexpr = False,
 ):
     """One program: a running offset over the forward's whole token axis.
 
@@ -53,6 +55,10 @@ def _indptr_scan(
         pos = tl.load(positions + idx, mask=live, other=0).to(tl.int32)
         start = tl.load(cu + bid, mask=live, other=0)
         first = tl.maximum(pos - WINDOW + 1, 0)
+        if HAS_REPLAY_START:
+            # Bounded replay: no window row below the replay start was
+            # written this forward, so none is read.
+            first = tl.maximum(first, tl.load(replay_start + bid, mask=live, other=0))
         # Decode sees its own token; a prefill chunk sees only what its first
         # token already had, the rest arriving as the extend segment.
         history_end = (
@@ -82,11 +88,13 @@ def _indptr_scan_all(
     prefixes,
     extends,
     tokens,
+    replay_start,
     DECODE: tl.constexpr,
     WINDOW: tl.constexpr,
     RATIOS: tl.constexpr,
     TOPKS: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_REPLAY_START: tl.constexpr = False,
 ):
     # Ratios have independent scans, but share one launch. Each program owns
     # one output pair; no cross-program prefix or synchronization is needed.
@@ -99,12 +107,14 @@ def _indptr_scan_all(
                 prefixes[i],
                 extends[i],
                 tokens,
+                replay_start,
                 DECODE,
                 WINDOW,
                 RATIOS[i] or 1,
                 TOPKS[i],
                 not DECODE,
                 BLOCK,
+                HAS_REPLAY_START,
             )
 
 
@@ -125,6 +135,7 @@ def _indices(
     ring_start,
     layer_stride,
     plane,
+    replay_start,
     DECODE: tl.constexpr,
     ROWS_PER_PAGE: tl.constexpr,
     PAGE_ROWS: tl.constexpr,
@@ -137,6 +148,7 @@ def _indices(
     RUN_ROWS: tl.constexpr,
     PACKED: tl.constexpr,
     MAIN_ROW_BYTES: tl.constexpr,
+    HAS_REPLAY_START: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     # One program row per layer of the group. Everything a layer's indices
@@ -153,6 +165,8 @@ def _indices(
     start = tl.load(cu + batch)
     pos = tl.load(positions + t)
     first = tl.maximum(0, pos - WINDOW + 1)
+    if HAS_REPLAY_START:
+        first = tl.maximum(first, tl.load(replay_start + batch))
     history_end = pos + 1 if DECODE else tl.load(positions + start)
     window_count = tl.maximum(0, history_end - first)
     pbegin, pend = tl.load(pptr + t), tl.load(pptr + t + 1)
@@ -202,6 +216,8 @@ def fill_step_indptrs(step, geometry, buffers):
     reads at the capture's.
     """
     ratios = geometry.layer_ratios
+    # Bounded replay's per-request window start (`BatchStep.swa_replay_start`).
+    replay_start = getattr(step, "swa_replay_start", None)
     built = {}
     for ratio in ratios:
         prefix, extend = buffers[ratio]
@@ -216,11 +232,13 @@ def fill_step_indptrs(step, geometry, buffers):
             tuple(built[ratio][0] for ratio in ratios),
             tuple(built[ratio][1] for ratio in ratios),
             step.width,
+            step.batch_ids if replay_start is None else replay_start,
             DECODE=step.decode,
             WINDOW=geometry.window_size,
             RATIOS=ratios,
             TOPKS=tuple(built[ratio][2] for ratio in ratios),
             BLOCK=min(1024, triton.next_power_of_2(max(step.width, 1))),
+            HAS_REPLAY_START=replay_start is not None,
         )
     return built
 
@@ -241,6 +259,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
         # dereferences.
         raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
     plane = step.width * (topk + geometry.window_size)
+    replay_start = getattr(step, "swa_replay_start", None)
     prefix = torch.empty(
         layers * plane,
         dtype=torch.int64 if geometry.packed else torch.int32,
@@ -268,6 +287,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
             window.ring_start,
             stride,
             plane,
+            step.batch_ids if replay_start is None else replay_start,
             DECODE=step.decode,
             ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
             PAGE_ROWS=geometry.page_bytes
@@ -277,6 +297,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
             TOPK=topk,
             BLOCK=triton.next_power_of_2(max(topk, geometry.window_size)),
             WINDOW=geometry.window_size,
+            HAS_REPLAY_START=replay_start is not None,
             **window_constexprs(window),
         )
     return prefix.view(layers, plane), pptr, extend, eptr

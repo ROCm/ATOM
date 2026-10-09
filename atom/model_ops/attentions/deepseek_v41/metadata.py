@@ -86,6 +86,11 @@ class BatchStep:
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
+    # [requests] int32, or None: the lowest position whose window row a
+    # request's queries may read. Set only on a bounded-replay tail step
+    # (`models.deepseek_v41.bounded_replay`), whose late layers wrote no
+    # window row below the tail (SGLang's `swa_replay_start`).
+    swa_replay_start: torch.Tensor | None = None
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.

@@ -428,6 +428,15 @@ class Drafter(abc.ABC):
             # disjoint token slice — writing at row 0 unconditionally would make
             # the ubatches overwrite each other.
             off = ctx.ubatch_token_offset
+            # DeepSeek-V4.1 bounded replay runs late layers on a subset of
+            # the forward's rows; put each where the forward's row is. The
+            # skipped rows keep stale values, which nothing reads: the draft's
+            # window write takes each request's last ring_slots rows, and the
+            # tail is never shorter than that.
+            rows = getattr(ctx, "late_layer_tail_rows", None)
+            if rows is not None and tensor.shape[0] == rows.numel():
+                buffer.index_copy_(0, rows + off, tensor)
+                return
             buffer[off : off + tensor.shape[0]].copy_(tensor)
 
         return _hook

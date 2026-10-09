@@ -120,6 +120,22 @@ class MonoDraftModel(nn.Module):
 def install_mono_decode(
     model: nn.Module, atom_config, drafter, metadata_builder
 ) -> nn.Module:
+    """``_install_mono_decode``, then decoder SWA bounded replay for prefill
+    around it."""
+    from atom.models.deepseek_v41.bounded_replay import (
+        install_decoder_swa_bounded_replay,
+    )
+
+    return install_decoder_swa_bounded_replay(
+        _install_mono_decode(model, atom_config, drafter, metadata_builder),
+        model,
+        atom_config,
+    )
+
+
+def _install_mono_decode(
+    model: nn.Module, atom_config, drafter, metadata_builder
+) -> nn.Module:
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve. On the FP4 index plane ``metadata_builder`` lays the score

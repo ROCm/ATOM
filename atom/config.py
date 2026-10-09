@@ -1955,6 +1955,9 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). Off by default.
+    enable_decoder_swa_bounded_replay: bool = False
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
