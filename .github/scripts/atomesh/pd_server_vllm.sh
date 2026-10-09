@@ -59,7 +59,6 @@ from pathlib import Path
 
 import torch
 import vllm
-from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import MoRIIOConnector
 
 assert Path(vllm.__file__).is_relative_to(sys.argv[1]), vllm.__file__
 manifest = {
@@ -238,6 +237,10 @@ kv_transfer_config() {
   local role="$1"
   local http_port="$2"
   local lmcache_port="${3:-}"
+  if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
+    python3 "${ATOMESH_SCRIPT_DIR}/pd_mooncake_config.py" connector "${role}"
+    return
+  fi
   python3 - "${role}" "${NODE0_ADDR}" "${VLLM_DISCOVERY_PORT}" "${http_port}" \
     "${lmcache_port}" "${ATOMESH_VLLM_LMCACHE_MQ_TIMEOUT:-6000}" <<'PY'
 import json
@@ -292,6 +295,9 @@ start_vllm_server() {
     "${role}" "${ATOMESH_EXECUTION_PHASE}" "${SPEC_DECODE_ACCEPTANCE_LENGTH:-}" \
     "${!args_var}")" || return $?
   apply_role_env "ATOMESH_${prefix}_ENV_" "${host_ip}"
+  if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
+    prepare_mooncake_store "${role}"
+  fi
   if [[ "${SERVED_MODEL_NAME}" == "Kimi-K3" && "${AITER_SITUV2_A4W4:-}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/../k3-a4w4/check_aiter_paths.py"
   fi
@@ -347,6 +353,14 @@ start_decode() {
 }
 
 start_router() {
+  if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
+    start_logged_process router_pid "${RUNTIME_LOG_DIR}/mooncake-proxy.log" \
+      python3 "${ATOMESH_SCRIPT_DIR}/pd_mooncake_proxy.py" \
+      --host 0.0.0.0 --port "${ROUTER_PORT}" \
+      --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}" "${VLLM_MOONCAKE_BOOTSTRAP_PORT}" \
+      --decode "http://${decode_ips[0]}:${decode_ports[0]}"
+    return
+  fi
   router_pid=""
   echo "[router] vllm-router sidecar on :${ROUTER_PORT}, discovery :${VLLM_DISCOVERY_PORT}"
 }
@@ -355,4 +369,9 @@ if [[ -n "${ATOMESH_VLLM_SOURCE_SHA:-}" ]]; then
   install_native_vllm
 else
   apply_vllm_fork_overlay
+fi
+
+if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/pd_mooncake_runtime.sh"
+  install_mooncake
 fi

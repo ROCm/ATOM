@@ -1,0 +1,13 @@
+{
+  "suite": "vllm",
+  "case_names": "kimi-k3-mooncake-store-dspark3-tp8-dcp8-agentic-c16",
+  "run_model_benchmark": "true",
+  "publish_dashboard": "false",
+  "atomesh_slurm_submit_runner": "atomesh-cicd",
+  "atomesh_slurm_account": "amd-frameworks",
+  "atomesh_slurm_partition": "amd-spur",
+  "atomesh_1p1d_nodes": "pit2-p03-g10,pit2-p03-g12",
+  "atomesh_image": "rocm/atom-dev@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4",
+  "benchmark_concurrency": "16",
+  "eval_concurrency": "64"
+}

@@ -658,6 +658,7 @@ cleanup_processes() {
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
+  terminate_process_group "${mooncake_master_pid:-}"
   purge_lmcache_disk
   return "${rc}"
 }
@@ -1380,6 +1381,13 @@ run_workload_phase() {
       --output "${RUN_DIR}/pd-diagnostic/${ATOMESH_EXECUTION_PHASE}" \
       --phase "${ATOMESH_EXECUTION_PHASE}"
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
+    if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
+      python3 "${ATOMESH_SCRIPT_DIR}/pd_mooncake_probe.py" \
+        --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}" \
+        --decode "http://${decode_ips[0]}:${decode_ports[0]}" \
+        --router "http://127.0.0.1:${ROUTER_PORT}" --model "${SERVED_MODEL_NAME}" \
+        --output "${RUN_DIR}/mooncake-probe"
+    fi
     run_benchmark
   elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
     run_eval

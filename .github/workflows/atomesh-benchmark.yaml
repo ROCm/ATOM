@@ -1581,6 +1581,29 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Download pinned ROCm Mooncake wheel
+        if: ${{ matrix.vllm.mooncake.enabled == 1 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target=.github/scripts/atomesh/mooncake-dist
+          mkdir -p "${target}"
+          gh api repos/kvcache-ai/Mooncake/actions/artifacts/11593557642/zip > "${target}/wheel.zip"
+          python3 - "${target}" <<'PYWHEEL'
+          import hashlib, sys, zipfile
+          from pathlib import Path
+          target = Path(sys.argv[1])
+          name = "mooncake_transfer_engine_rocm-0.3.13-cp312-cp312-manylinux_2_35_x86_64.whl"
+          with zipfile.ZipFile(target / "wheel.zip") as archive:
+              wheel = archive.read(name)
+          assert hashlib.sha256(wheel).hexdigest() == "7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6"
+          (target / name).write_bytes(wheel)
+          PYWHEEL
+          curl -fsSL --retry 3 \
+            https://raw.githubusercontent.com/kvcache-ai/Mooncake/b140c1a904d53d24ed211d01ce9a87fc161cb432/scripts/e2e/python/verify_rocm_wheel.py \
+            -o "${target}/verify_rocm_wheel.py"
+
       - name: Cancel existing jobs on benchmark nodes
         if: ${{ github.event_name == 'schedule' && matrix.runner.slurm_submit_runner != 'atomesh-cicd' }}
         env:

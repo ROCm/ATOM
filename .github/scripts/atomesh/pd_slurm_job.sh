@@ -283,7 +283,7 @@ EOF
   if [[ "${rank}" -eq 0 && "${BACKEND}" == "atom" ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
-  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" ]]; then
+  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" && "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" != "1" ]]; then
     router_container="${container}-router"
     start_vllm_router "${router_container}" \
       "${rank_dir}/router${phase_suffix}.log" "${service_port_offset}" || return $?
@@ -649,7 +649,9 @@ pre_cleanup_nodes() {
   echo "=== pre-cleanup done ==="
 }
 
-pre_cleanup_nodes
+if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" != "1" ]]; then
+  pre_cleanup_nodes
+fi
 
 IPS=()
 for node in "${SELECTED_NODES[@]}"; do

@@ -824,152 +824,128 @@ models:
             benchmark_duration: 1200
             warmup_requests_per_lane: 1
 
-  # ATOM C16 acceptance with the InferenceX native DCP serving configuration.
+  # Native main: Mooncake direct P/D with a prefill-only CPU Store.
   Kimi-K3-MXFP4-vLLM-DSpark:
     backend: vllm
     image: vllm/vllm-openai-rocm:nightly@sha256:659b28319fef4ea0e3d8f33e25b4c35d6f663f5d818a5b2fa06dceaf859234e4
-    model_path: "${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3"
+    model_path: ${ATOMESH_MODEL_ROOT}/moonshotai/Kimi-K3
     precision: MXFP4
     env:
       common:
-        <<: *kimi_k3_vllm_env_common
-        ATOMESH_PRE_CLEAN_GPU: "1"
-        ATOMESH_STALE_CELL_IDS: "kimi-k3-mxfp4-vllm-dspark-kimi-k3-gsm8k-main-grouping-without-59164-dspark3-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-gsm8k-main-grouping-with-59164-dspark3-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-gsm8k-main-grouping-zeroing-range-dspark3-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-gsm8k-main-grouping-hook-tcp0-dspark3-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-gsm8k-main-grouping-range-tcp0-dspark3-tp8-dcp8-eager-vllm"
-        VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: "0"
-        AITER_SITUV2_A8W4: "0"
-        AITER_SITUV2_A4W4: "1"
-        AITER_FLYDSL_STAGE2_FP8: "1"
-        AITER_LOG_LEVEL: "WARNING"
-        VLLM_DCP_Q_REPLICATE: "0"
+        VLLM_USE_V1: '1'
+        VLLM_ROCM_USE_AITER: '1'
+        VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4: '0'
+        AITER_SITUV2_A8W4: '0'
+        AITER_BF16_FP8_MOE_BOUND: '0'
+        VLLM_ROCM_AITER_MLA_ASM_PADDING: asm
+        SAFETENSORS_FAST_GPU: '1'
+        VLLM_SSM_CONV_STATE_LAYOUT: DS
+        AITER_QUICK_REDUCE_QUANTIZATION: INT4
+        PYTHONHASHSEED: '42'
+        PREFIX_CACHING_HASH_ALGO: sha256
+        VLLM_USE_DIRECT_DCP_A2A: '0'
+        VLLM_USE_DIRECT_DCP_Q_GATHER: '0'
+        VLLM_USE_DIRECT_DCP_KV_GATHER: '0'
+        VLLM_ALLOW_DCP_FULL_CUDAGRAPH: '1'
+        VLLM_ENGINE_READY_TIMEOUT_S: '7200'
+        VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1200'
+        VLLM_SERVER_DEV_MODE: '1'
+        VLLM_DISABLE_REQUEST_ID_RANDOMIZATION: '1'
+        PYTHONNOUSERSITE: '1'
+        PYTHONDONTWRITEBYTECODE: '1'
+        HSA_ENABLE_SDMA: '1'
+        ATOMESH_PRE_CLEAN_GPU: '1'
+        AITER_SITUV2_A4W4: '1'
+        AITER_FLYDSL_STAGE2_FP8: '1'
+        AITER_LOG_LEVEL: WARNING
+        VLLM_DCP_Q_REPLICATE: '0'
+        ATOMESH_STALE_CELL_IDS: ''
+        ATOMESH_EVAL_ONLY: '0'
+        VLLM_USE_V2_MODEL_RUNNER: '1'
         VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
-        VLLM_SERVER_DEV_MODE: "1"
-        ATOMESH_EVAL_ONLY: "1"
-        ATOMESH_EVAL_REQUEST_TIMEOUT: "3600"
+        MC_MAX_CONCURRENT_REG_MR: '1'
+        MC_GID_INDEX: '1'
+        VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
       prefill:
-        VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
-        TORCH_NCCL_BLOCKING_WAIT: "0"
-        NCCL_BLOCKING_WAIT: "0"
+        VLLM_USE_BREAKABLE_CUDAGRAPH: '1'
+        TORCH_NCCL_BLOCKING_WAIT: '0'
+        NCCL_BLOCKING_WAIT: '0'
       decode:
-        VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
-        TORCH_NCCL_BLOCKING_WAIT: "0"
-        NCCL_BLOCKING_WAIT: "0"
+        VLLM_USE_BREAKABLE_CUDAGRAPH: '1'
+        TORCH_NCCL_BLOCKING_WAIT: '0'
+        NCCL_BLOCKING_WAIT: '0'
     vllm:
       served_model_name: Kimi-K3
       source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: 9b1b678b1784085dd0802f912856890f9a0c042e
-      diagnostic: 0
+        sha: bacbbe187885db62859f5a4a1443f8ec3006e987
+      mooncake:
+        enabled: 1
+        global_segment_size: 224.875GB
+        local_buffer_size: 1GB
     server:
       common_args:
-        # Forced mean length (including bonus) applies only to benchmark decode.
-        spec_decode_acceptance_length: ""
-        extra_args: >-
-          --moe-backend auto --load-format safetensors --gpu-memory-utilization 0.88
-          --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
-          --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576
-          --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128
-          --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384
-          --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
-          --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
-          --speculative-config '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":3,"method":"dspark","attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+        spec_decode_acceptance_length: 3.0
+        extra_args: --moe-backend auto --load-format safetensors --gpu-memory-utilization 0.88 --language-model-only
+          --max-num-seqs 80 --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len
+          1048576 --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128 --kv-cache-dtype fp8 --block-size
+          128 --max-num-batched-tokens 16384 --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
+          --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1 --speculative-config
+          '{"model":"${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark","num_speculative_tokens":3,"method":"dspark","attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
           --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4","re:.*\\.self_attn\\.(in_proj_qkvgfab|f_b_proj|o_proj|fused_qkv_a_proj|q_b_proj|g_proj)$":"fp8_per_channel","re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.mlp\\.(gate_up_proj|down_proj)$":"fp8_per_channel"}}'
+          --mamba-cache-mode align
     suites:
       vllm:
-        - &kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-main-grouping-without-59164-dspark3-tp8-dcp8-eager
-          topology: 1p1d
-          display_topology: 1P1D-TP8-DCP8
-          pd_worker_layout: multi_node
-          nodes: "${ATOMESH_1P1D_NODES}"
-          isl: [1048576]
-          osl: 1024
-          concurrency: [16]
-          prefill:
-            workers: 1
-            tp: 8
-            dcp: 8
-            extra_args: >-
-              --enforce-eager
-          decode:
-            workers: 1
-            tp: 8
-            dcp: 8
-            extra_args: >-
-              --enforce-eager
-          benchmark:
-            <<: *kimi_k3_vllm_aiperf
-            apply_chat_template: true
-            benchmark_duration: 180
-            warmup_requests_per_lane: 1
-            # Native K3 cold loading and graph capture can exceed 75 minutes.
-            wait_server_timeout: 10800
-          run_eval: true
-        - <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-main-grouping-hook-tcp0-dspark3-tp8-dcp8-eager
-          vllm:
-            source:
-              sha: 0d914cea5eead4425a8f2b71dfc51a4ddecbe7c6
-        - <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-gsm8k-connector-zeroing-dspark3-tp8-dcp8-eager
-          vllm:
-            source:
-              sha: 34735d6776b9c43086fdf5c6c6392d9de45f322f
-        - &mori_prefix_read_a
-          <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager
-          isl: [122881]
-          osl: 128
-          concurrency: [1]
-          run_eval: false
-          env:
-            common:
-              ATOMESH_PREFIX_AB: "1"
-              ATOMESH_PREFIX_VARIANT: "A"
-              ATOMESH_PREFIX_DURATION: "300"
-              ATOMESH_EVAL_ONLY: "0"
-              ATOMESH_STALE_CELL_IDS: ""
-          server:
-            common_args:
-              extra_args: &mori_prefix_no_spec_args >-
-                --moe-backend auto --load-format safetensors --gpu-memory-utilization 0.88
-                --language-model-only --max-num-seqs 80 --enable-auto-tool-choice
-                --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576
-                --stream-interval 1 --enable-prefix-caching --prefix-match-unit 128
-                --kv-cache-dtype fp8 --block-size 128 --max-num-batched-tokens 16384
-                --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
-                --attention-backend ROCM_AITER_MLA --dcp-comm-backend a2a --cp-kv-cache-interleave-size 1
-                --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4","re:.*\\.self_attn\\.(in_proj_qkvgfab|f_b_proj|o_proj|fused_qkv_a_proj|q_b_proj|g_proj)$":"fp8_per_channel","re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.mlp\\.(gate_up_proj|down_proj)$":"fp8_per_channel"}}'
-          vllm:
-            source:
-              sha: 34735d6776b9c43086fdf5c6c6392d9de45f322f
-        - &mori_prefix_read_b
-          <<: *mori_prefix_read_a
-          name: kimi-k3-mori-prefix-read-b-nospec-tp8-dcp8-eager
-          env:
-            common:
-              ATOMESH_PREFIX_AB: "1"
-              ATOMESH_PREFIX_VARIANT: "B"
-              ATOMESH_PREFIX_DURATION: "300"
-              ATOMESH_EVAL_ONLY: "0"
-              ATOMESH_STALE_CELL_IDS: ""
-          vllm:
-            source:
-              sha: d4a1acab353d2435221f2679e930b538a1bc686c
-        - <<: *mori_prefix_read_b
-          name: kimi-k3-mori-prefix-read-b-gsm8k-nospec-tp8-dcp8-eager
-          run_eval: true
-          env:
-            common:
-              ATOMESH_PREFIX_AB: "0"
-              ATOMESH_EVAL_ONLY: "1"
-              ATOMESH_STALE_CELL_IDS: ""
-          accuracy:
-            threshold: 0.94
+      - name: kimi-k3-mooncake-store-dspark3-tp8-dcp8-agentic-c16
+        topology: 1p1d
+        display_topology: 1P1D-TP8-DCP8
+        pd_worker_layout: multi_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 16
+        prefill:
+          workers: 1
+          tp: 8
+          dcp: 8
+          extra_args: --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'
+        decode:
+          workers: 1
+          tp: 8
+          dcp: 8
+          extra_args: --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_size":512,"custom_ops":["+fused_rms_norm_gated"],"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512]}'
+        benchmark:
+          kind: aiperf_agentic
+          aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+          scenario: inferencex-agentx-mvp
+          public_dataset: semianalysis_cc_traces_weka_062126
+          apply_chat_template: true
+          max_context_length: 1048576
+          num_dataset_entries: 393
+          benchmark_duration: 3600
+          warmup_requests_per_lane: 10
+          trace_idle_gap_cap_seconds: 300
+          warmup_grace_period: 1800
+          trajectory_start_min_ratio: 0.25
+          trajectory_start_max_ratio: 0.75
+          failed_request_threshold: 0.1
+          slice_duration: 1.0
+          cancel_drain_timeout: 300
+          http_tcp_user_timeout: 900000
+          dataset_weka_live_assistant_responses: 0
+          dataset_configuration_timeout: 1800
+          service_profile_configure_timeout: 1800
+          wait_server_timeout: 10800
+          wait_router_timeout: 600
+        run_eval: true
     accuracy:
       task: gsm8k
       fewshot: 5
-      eval_concurrency: [64]
-      threshold: 0.0
+      eval_concurrency:
+      - 64
+      threshold: 0.94
       max_gen_toks: 4096
 
   Kimi-K2.5-MXFP4:
