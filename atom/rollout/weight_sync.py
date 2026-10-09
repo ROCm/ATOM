@@ -5,10 +5,10 @@ import gc
 import logging
 import time
 import uuid
-from typing import Callable
+from collections.abc import Callable
+from multiprocessing import shared_memory
 
 import torch
-from multiprocessing import shared_memory
 
 from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD
 
