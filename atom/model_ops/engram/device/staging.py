@@ -22,6 +22,7 @@ from atom.model_ops.engram.device.hashing import (
     engram_snapshot_indices,
 )
 from atom.model_ops.engram.device.uva import uva_gather_into
+from atom.utils.forward_context import capture_breaks_mid_forward
 
 logger = logging.getLogger(__name__)
 
@@ -179,12 +180,23 @@ class EngramStaging:
         host = self.host
         self._snapshot(width)
         compute = torch.cuda.current_stream(host.device)
-        # Get the parent BEFORE entering the guard: waiting on ourselves
-        # would neither order the inputs nor join the graph capture.
-        self.stream.wait_stream(compute)
+        # The join is per layer and lazy -- `consume` waits on that layer's
+        # event where the layer needs its rows -- so the fork stays open
+        # across the whole forward. A frontend that ends a capture segment
+        # inside that span (vLLM's breakable graph breaks at every attention)
+        # would be ending it with work still on this stream, which
+        # `capture_end()` refuses as `hipErrorStreamCaptureUnjoined`. Issue on
+        # the compute stream instead: same work in the same order, with the
+        # prefetch no longer overlapping the layers that consume it.
+        forking = not capture_breaks_mid_forward()
+        issuing = self.stream if forking else compute
+        if forking:
+            # Get the parent BEFORE entering the guard: waiting on ourselves
+            # would neither order the inputs nor join the graph capture.
+            self.stream.wait_stream(compute)
         # past the fork: the side stream reads the snapshot, not the cursor
         self._advance_cursor(width)
-        with torch.cuda.stream(self.stream):
+        with torch.cuda.stream(issuing):
             for layer in host.layer_ids:
                 ids = engram_snapshot_indices(
                     self.uva.hash_tables,
@@ -218,7 +230,7 @@ class EngramStaging:
                 elif host._tp_group is None:
                     host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
                 # Ready means the complete embedding, including TP reassembly.
-                self.done[layer].record(self.stream)
+                self.done[layer].record(issuing)
 
     def consume(self, layer, width):
         host = self.host
