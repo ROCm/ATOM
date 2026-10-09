@@ -28,10 +28,11 @@ Protocol, per decode rank (every rank has its own pool and connector):
    returns their credits (``MSG_LANDING_CREDIT``) once the scatter finished.
 4. A request completes when every stage's write-done arrived, every landed
    slot it announced was received, and every scatter finished. A failed
-   request is reported only after all its stages ended (or after
-   ``ATOM_PD_MLA_LANDING_FAIL_WAIT_S``); READY slots that arrive for it later
-   are dropped and their credits returned, so a late write can only ever land
-   in its own stage's partition and is never scattered.
+   request is reported only after all its stages ended, never on a timer: a
+   stage still running may yet write the final KV pages directly (staged
+   path, index regions), and reporting the failure lets the scheduler reuse
+   them. READY slots that arrive after a stage ended are dropped and their
+   credits returned, so they never reach the KV cache.
 
 Credits never move between stages or ranks, so no slot is reused while a
 stage may still write it, and no side waits on another stream's progress.
@@ -66,6 +67,8 @@ MSG_LANDING_READY = b"landing_ready"
 MSG_LANDING_CREDIT = b"landing_credit"
 
 _STATS_INTERVAL_S = 30.0
+# A failed request still waiting on a stage this long is logged once.
+_STALL_LOG_S = 30.0
 # A finished request's stage addresses are kept this long so READY slots that
 # arrive after it finished can still be dropped with their credit returned.
 _TOMBSTONE_TTL_S = 600.0
@@ -173,6 +176,7 @@ class _Request:
     pending: int = 0
     failed: bool = False
     failed_at: float = 0.0
+    stall_logged: bool = False
 
 
 @dataclass
@@ -205,7 +209,6 @@ class LandingReceiver:
         mla_regions: list[int],
         send: Callable[[str, list], None],
         finish: Callable[[str, bool], None],
-        fail_wait_s: float,
     ) -> None:
         if not mla_regions:
             raise ValueError("MLA landing needs at least one MLA region")
@@ -219,7 +222,6 @@ class LandingReceiver:
         self.epoch = int.from_bytes(os.urandom(7), "big")
         self._send = send
         self._finish = finish
-        self._fail_wait_s = fail_wait_s
         self._region_bases = np.asarray(region_bases, dtype=np.int64)
         self._region_block_bytes = np.asarray(region_block_bytes, dtype=np.int64)
         self._is_mla = np.zeros(len(region_bases), dtype=bool)
@@ -491,18 +493,23 @@ class LandingReceiver:
     # -- sweep (main thread) ----------------------------------------------------
 
     def sweep(self) -> None:
-        """Report failed requests whose other stages never ended; log stats."""
+        """Log failed requests still waiting on a stage; log stats.
+
+        Such a request is never reported early: only a stage's write-done
+        proves its writes into the request's KV pages have ended.
+        """
         now = time.monotonic()
-        expired: list[str] = []
+        stalled: list[tuple[str, float, list[int]]] = []
         with self._lock:
-            for req_id, request in list(self._requests.items()):
+            for req_id, request in self._requests.items():
                 if (
                     request.failed
-                    and not request.pending
-                    and now - request.failed_at > self._fail_wait_s
+                    and not request.stall_logged
+                    and now - request.failed_at > _STALL_LOG_S
                 ):
-                    self._retire_locked(req_id, request)
-                    expired.append(req_id)
+                    request.stall_logged = True
+                    running = [pp for pp, s in request.streams.items() if not s.done]
+                    stalled.append((req_id, now - request.failed_at, running))
             for key, (at, _) in list(self._tombstones.items()):
                 if now - at > _TOMBSTONE_TTL_S:
                     del self._tombstones[key]
@@ -515,14 +522,14 @@ class LandingReceiver:
                     "batches": 0,
                 }
                 elapsed, self._stats_at = now - self._stats_at, now
-        for req_id in expired:
+        for req_id, waited, running in stalled:
             logger.error(
-                "[PD-LANDING] req %s: stages still running %ds after a failure; "
-                "reporting it failed",
+                "[PD-LANDING] req %s failed %.0fs ago and still waits for "
+                "stage(s) %s; it is reported once they end",
                 req_id,
-                self._fail_wait_s,
+                waited,
+                running,
             )
-            self._finish(req_id, True)
         if stats is not None and stats["slots"]:
             logger.info(
                 "[PD-LANDING] %.1fs: %d slots, %.2f GB landed (%.2f GB/s), "
@@ -600,7 +607,11 @@ class LandingReceiver:
                 or (region >= self._is_mla.size).any()
                 or not self._is_mla[region].all()
                 or (row_start < 0).any()
+                or (row_count <= 0).any()
                 or (row_start + row_count > rows).any()
+                # The scatter copies 4-byte words of the slot.
+                or (offset < 0).any()
+                or (offset % 4).any()
                 or (
                     offset
                     + row_count * self._region_block_bytes[region] // self.block_size

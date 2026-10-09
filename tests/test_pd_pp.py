@@ -706,11 +706,10 @@ def _make_connector(**overrides):
     )
     conn = object.__new__(mc.MooncakeConnector)
     conn._completion_lock = threading.Lock()
-    conn._dispatch_in_flight = set()
-    conn._deferred_failures = {}
     conn._fence_lock = threading.Lock()
     conn._pending_recv_expected = {}
     conn._pending_recv_stages = {}
+    conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
     conn._pending_recv = set()
     conn._pending_recv_blocks = {}
@@ -800,6 +799,30 @@ def test_failed_write_done_without_a_staging_row_is_a_noop():
     assert conn._record_write_done("r1", 0, 0, 0, success=False)
     assert conn._staging_free == []
     assert "r1" in conn.failed_recving
+
+
+def test_failed_write_done_waits_for_every_producer_rank():
+    """A failure is published, and stage-0 released, only with the last rank.
+
+    Producers are never cancelled: a stage still running may write the
+    request's pages after the scheduler reused them for the recompute.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sent = []
+    conn = _make_connector(
+        _release_targets={"r1": ("stage0", "t1", 1)},
+        _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
+    )
+    conn._pending_recv_expected["r1"] = 2
+    assert not conn._record_write_done("r1", 0, 0, 0, success=False)
+    assert not conn._record_write_done("r1", 0, 0, 0, success=False)  # resend
+    assert conn.failed_recving == set() and sent == []
+    assert conn._record_write_done("r1", 1, 0, 0)
+    assert conn.failed_recving == {"r1"} and conn.done_recving == set()
+    assert sent == [("stage0", mc.MSG_RELEASE)]
+    assert not conn._pending_recv_failed
 
 
 def test_write_done_pp_only_dedup():

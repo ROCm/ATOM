@@ -1779,8 +1779,12 @@ class ModelRunner:
                 "Reserving %.2fGB for P/D MLA landing", mla_landing_bytes / (1 << 30)
             )
             available_for_kv_budget -= mla_landing_bytes
-        # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv_budget, free)
+        # This prevents OOM when other processes share the GPU. The pools
+        # above are allocated after the KV cache, so free HBM must cover them
+        # too.
+        available_for_kv = min(
+            available_for_kv_budget, free - mla_staging_bytes - mla_landing_bytes
+        )
 
         torch.set_default_device(None)
 

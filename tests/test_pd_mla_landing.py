@@ -231,7 +231,6 @@ class _Dest:
             mla_regions=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
             finish=lambda req, failed: self.finished.append((req, failed)),
-            fail_wait_s=30,
         )
         pool = self.recv.pool
 
@@ -364,16 +363,38 @@ def test_items_out_of_range_fail_the_request_without_scattering():
     assert dest.credits() == [("stage0", [s0[0]])]
 
 
-def test_sweep_reports_a_failure_whose_other_stages_never_end(monkeypatch):
+@pytest.mark.parametrize(
+    "item",
+    [[0, 0, 1, -4], [0, 0, 0, 0], [0, 0, -1, 0], [0, 0, 1, 2]],
+    ids=["negative-offset", "no-rows", "negative-rows", "unaligned-offset"],
+)
+def test_malformed_items_fail_only_their_request(item):
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    before = [t.clone() for t in dest.regions]
+    dest.recv.on_ready(_ready("r", s0[0], 0, [item]))
+    dest.pump()
+    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    assert dest.finished == [("r", True)]
+    assert dest.recv.enabled
+    assert all(torch.equal(a, b) for a, b in zip(dest.regions, before))
+
+
+def test_sweep_never_reports_a_failure_while_a_stage_still_runs():
+    # Only a stage's write-done proves it stopped writing the request's
+    # pages; reporting the failure earlier lets the scheduler reuse them.
     dest = _Dest()
     dest.recv.advertise("stage0", 2)
     dest.recv.advertise("stage1", 2)
     dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
     dest.recv.stream_done("r", 1, 5, False, [])
+    dest.recv._requests["r"].failed_at -= 3600
+    dest.recv.sweep()
     dest.recv.sweep()
     assert dest.finished == []
-    dest.recv._requests["r"].failed_at -= 31
-    dest.recv.sweep()
+    assert dest.recv._requests["r"].stall_logged
+    dest.recv.stream_done("r", 0, 5, True, [])
     assert dest.finished == [("r", True)]
 
 
@@ -620,6 +641,97 @@ def test_small_transfers_keep_the_staged_path(monkeypatch):
     assert "_mla_landed" not in request
 
 
+def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
+    # Stage 1 finds no landing credit and writes the final KV page through
+    # the staged path while stage 0 fails. However long that write takes, the
+    # failure is reported only after stage 1's write-done, so the scheduler
+    # never recomputes into a page stage 1 may still overwrite.
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING_MIN_SLOTS", "1")
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS", "0")
+    dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
+    dest.recv.advertise("stage0", 2)
+    landing = dest.recv.advertise("stage1", 2)
+    dest.recv.begin("req", 5, [3], {0: "stage0", 1: "stage1"}, 2)
+    stage1 = _producer(mc, _source_regions(1, 8), staging_rows=16)
+    stage1.pp_rank = 1
+    stage1._landing_credits.sync("consumer:1", landing)
+    # Another request holds the stage's only credit.
+    assert stage1._landing_credits.acquire("consumer:1", landing["epoch"], 0) == 1
+    request = _request(1, 4, 0, dest.regions)
+    request["mla_landing"] = landing
+
+    started, resume = threading.Event(), threading.Event()
+
+    def slow_write(*args, **kwargs):
+        started.set()
+        assert resume.wait(timeout=10)
+        return stage1._nic.write(*args, **kwargs)
+
+    stage1._rdma_write_with_retry = slow_write
+    result = []
+    writer = threading.Thread(
+        target=lambda: result.append(
+            mc.MooncakeConnector._execute_block_transfer(
+                stage1, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
+            )
+        )
+    )
+    writer.start()
+    assert started.wait(timeout=10)
+    dest.recv.stream_done("req", 0, 5, False, [])
+    dest.recv._requests["req"].failed_at -= 3600
+    dest.recv.sweep()
+    assert dest.finished == []  # stage 1 is still writing page 3
+    resume.set()
+    writer.join(timeout=10)
+    assert result == [True]
+    assert [label for label, _ in stage1._nic.labels] == ["staged-mla"]
+    dest.recv.stream_done("req", 1, 5, True, request.get("_mla_landed", []))
+    assert dest.finished == [("req", True)]
+
+
+def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
+    # The slot's RDMA write finished but announcing it raised. The failure
+    # write-done must still list the slot, or the consumer never returns it
+    # and the stage loses the credit for good.
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING_MIN_SLOTS", "1")
+    dest = _Dest(num_regions=1, pool_slots=1, slot_rows=16)
+    landing = dest.recv.advertise("stage0", 1)
+    dest.recv.begin("req", 5, [3], {0: "stage0"}, 1)
+    new = _producer(mc, _source_regions(1, 8), staging_rows=16)
+    new._landing_credits.sync("consumer:1", landing)
+    request = _request(1, 4, 0, dest.regions)
+    request["mla_landing"] = landing
+
+    def unreachable(_path, _parts):
+        raise RuntimeError("notify socket gone")
+
+    new._send_on_socket = unreachable
+    with pytest.raises(RuntimeError):
+        mc.MooncakeConnector._execute_block_transfer(
+            new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
+        )
+    assert [label for label, _ in new._nic.labels] == ["landed-mla"]
+
+    # What _execute_transfer's handler then sends.
+    sent = []
+    new._send_on_socket = lambda _path, parts, repeat=1: sent.append(parts)
+    new._notify_transfer_result(request, success=False)
+    done = msgpack.loads(sent[0][1])
+    assert done["landed_slots"] == landing["slots"]
+    dest.recv.stream_done(
+        "req", done["pp_rank"], done["write_nonce"], False, done["landed_slots"]
+    )
+    assert dest.finished == [("req", True)]
+    for _addr, slots in dest.credits():
+        new._landing_credits.release("consumer:1", landing["epoch"], slots)
+    assert new._landing_credits.acquire("consumer:1", landing["epoch"], 0) == 0
+
+
 # ---------------------------------------------------------------------------
 # connector wiring
 # ---------------------------------------------------------------------------
@@ -655,6 +767,7 @@ def test_landing_requests_complete_through_the_receiver():
     conn._pending_recv_slots = {}
     conn._pending_recv_expected = {"r": 1}
     conn._pending_recv_stages = {}
+    conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {"r": 5}
     conn._release_targets = {}
     conn.done_recving = set()

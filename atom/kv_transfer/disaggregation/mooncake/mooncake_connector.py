@@ -808,6 +808,12 @@ class MooncakeConnector(KVConnectorBase):
         # notification more than once for reliability, so counting messages would
         # finalize early; we count distinct producer ranks instead.
         self._pending_recv_stages: dict[ReqId, set[tuple[int, int]]] = {}
+        # Requests one of whose producer ranks reported a failure. The failure
+        # is published only with the last rank's write-done, as success is:
+        # producers are never cancelled, so a rank still running (or not yet
+        # dispatched) may write the request's pages after the scheduler reuses
+        # them.
+        self._pending_recv_failed: set[ReqId] = set()
         # Per-request nonce for write-done corruption detection.
         self._pending_recv_nonce: dict[ReqId, int] = {}
         # PP-prefill: consumer stashes stage-0's release address per request, and
@@ -823,12 +829,6 @@ class MooncakeConnector(KVConnectorBase):
         self.done_recving: set[str] = set()
         self.failed_recving: set[str] = set()
         self._completion_lock = threading.Lock()
-        # Requests still being dispatched to producer PP stages, and failures
-        # that arrived mid-dispatch. Those producers are not cancelled, so a
-        # stage-0 failure must not reach the scheduler until every stage
-        # request is out.
-        self._dispatch_in_flight: set[ReqId] = set()
-        self._deferred_failures: dict[ReqId, tuple[int, int, int]] = {}
 
         # --- GPU memory fence: blocks pending coherence enforcement ---
         self._blocks_pending_fence: list[int] = []
@@ -1167,7 +1167,6 @@ class MooncakeConnector(KVConnectorBase):
             mla_regions=mla_regions,
             send=self._send_on_socket,
             finish=self._complete_recv,
-            fail_wait_s=envs.ATOM_PD_MLA_LANDING_FAIL_WAIT_S,
         )
         logger.info(
             "PD MLA landing: %d slots x %.1f MiB for %d MLA regions",
@@ -1462,9 +1461,6 @@ class MooncakeConnector(KVConnectorBase):
                     consumer_staging_pool_idx,
                 )
 
-            with self._completion_lock:
-                self._dispatch_in_flight.add(req_id)
-
             for stage, remote_addr in stage_addrs.items():
                 if stage == 0 and remote_pp_size > 1:
                     # stage-0 owns the block manager; it must not reuse the shared
@@ -1491,15 +1487,6 @@ class MooncakeConnector(KVConnectorBase):
                     off,
                     dst_block_ids[:10],
                 )
-
-            with self._completion_lock:
-                self._dispatch_in_flight.discard(req_id)
-                deferred = self._deferred_failures.pop(req_id, None)
-            if deferred is not None:
-                # A producer failed while later stages were still being
-                # dispatched. Every request is out now, so it is safe to
-                # publish the failure and let the scheduler fall back.
-                self._record_write_done(req_id, *deferred, success=False)
 
     # -----------------------------------------------------------------
     # Staging pool management
@@ -2371,6 +2358,11 @@ class MooncakeConnector(KVConnectorBase):
                     "landed-mla",
                     engine=engine,
                 )
+                if written:
+                    # Recorded before anything else can raise: the failure
+                    # write-done then still lists the slot (at index seq), and
+                    # the consumer returns it as a lost READY.
+                    request_data.setdefault("_mla_landed", []).append(slot)
             finally:
                 # Never hand the staging slot back while a gather may run.
                 stream.synchronize()
@@ -2394,7 +2386,6 @@ class MooncakeConnector(KVConnectorBase):
                 ],
             }
             self._send_on_socket(notify_path, [MSG_LANDING_READY, msgpack.dumps(ready)])
-            request_data.setdefault("_mla_landed", []).append(slot)
             credits.stats["landed"] += 1
         return True
 
@@ -2958,7 +2949,9 @@ class MooncakeConnector(KVConnectorBase):
         written their layers.  A ``write_nonce`` echoed from the write
         request is validated to catch corrupted or misrouted notifications.
         Only the message that completes the last distinct producer rank runs
-        slot scatter / block fence and marks the request done.  Returns True
+        slot scatter / block fence and marks the request done, or failed if
+        any rank reported a failure: an earlier failure would let the
+        scheduler reuse pages a rank still running then writes. Returns True
         when this was that final message.
 
         A request with MLA landing slots settles in ``LandingReceiver``
@@ -2985,31 +2978,25 @@ class MooncakeConnector(KVConnectorBase):
                 )
                 return False
             if not success:
-                if req_id in self._dispatch_in_flight:
-                    # Replayed by the dispatch loop once all stages are out.
-                    self._deferred_failures[req_id] = (pp_rank, tp_rank, write_nonce)
-                    return False
-                del self._pending_recv_expected[req_id]
-                self._pending_recv_stages.pop(req_id, None)
-                self._pending_recv_nonce.pop(req_id, None)
-                failed = True
-            else:
-                failed = False
-                stages = self._pending_recv_stages.setdefault(req_id, set())
-                stages.add((pp_rank, tp_rank))
-                if len(stages) < expected:
-                    logger.debug(
-                        "[CONSUMER] Write-done req %s rank (%d,%d) (%d/%d)",
-                        req_id,
-                        pp_rank,
-                        tp_rank,
-                        len(stages),
-                        expected,
-                    )
-                    return False
-                del self._pending_recv_expected[req_id]
-                self._pending_recv_stages.pop(req_id, None)
-                self._pending_recv_nonce.pop(req_id, None)
+                self._pending_recv_failed.add(req_id)
+            stages = self._pending_recv_stages.setdefault(req_id, set())
+            stages.add((pp_rank, tp_rank))
+            if len(stages) < expected:
+                logger.debug(
+                    "[CONSUMER] Write-done req %s rank (%d,%d) success=%s (%d/%d)",
+                    req_id,
+                    pp_rank,
+                    tp_rank,
+                    success,
+                    len(stages),
+                    expected,
+                )
+                return False
+            del self._pending_recv_expected[req_id]
+            self._pending_recv_stages.pop(req_id, None)
+            self._pending_recv_nonce.pop(req_id, None)
+            failed = req_id in self._pending_recv_failed
+            self._pending_recv_failed.discard(req_id)
 
         self._complete_recv(req_id, failed)
         return True
@@ -3022,6 +3009,7 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_expected.pop(req_id, None)
                 self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
+                self._pending_recv_failed.discard(req_id)
         if failed:
             # Return the staging row to the pool. The scatter is deliberately
             # skipped -- the bytes never landed -- but the row itself must not

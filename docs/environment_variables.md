@@ -548,4 +548,3 @@ Set on the decode side; the prefill side follows what each write request offers 
 | **ATOM_PD_MLA_LANDING_POOL_MB** | int | 256 | Landing pool per decode rank, in MiB, held back from the KV cache budget and split evenly across the prefill stages that send to the rank. |
 | **ATOM_PD_MLA_LANDING_MIN_SLOTS** | int | 2 | Prefill side: a transfer that fits in fewer landing slots than this keeps the staged per-page path. |
 | **ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS** | int | 10 | Prefill side: how long a send worker waits for a free landing slot before it sends the rest of the transfer through the staged per-page path. |
-| **ATOM_PD_MLA_LANDING_FAIL_WAIT_S** | int | 30 | Decode side: after one prefill stage reports a failure, how long the request waits for its other stages to end before it is reported failed anyway. Late landing slots of a finished request are dropped and returned, never scattered. |
