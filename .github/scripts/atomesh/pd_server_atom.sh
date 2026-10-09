@@ -7,6 +7,32 @@ NODE0_ADDR="${NODE0_ADDR:-127.0.0.1}"
 IPADDRS="${IPADDRS:-127.0.0.1}"
 RUN_DIR="${RUN_DIR:-/run_logs/slurm_job-${SLURM_JOB_ID:-local}}"
 
+# Servers start from this checkout, and `python -m` puts the working directory
+# first on sys.path, so its atom package shadows the image's editable install
+# (/app/ATOM). `image` launches the servers from / instead. PYTHONSAFEPATH would
+# also hide the checkout, but every subprocess inherits it, and scripts that
+# import modules beside themselves (e.g. aiter's JIT gen_instances.py) break.
+ATOMESH_ATOM_SOURCE="${ATOMESH_ATOM_SOURCE:-mounted}"
+case "${ATOMESH_ATOM_SOURCE}" in
+  mounted) ATOM_SOURCE_ENV=() ;;
+  image) ATOM_SOURCE_ENV=(--chdir=/) ;;
+  *)
+    echo "ERROR: ATOMESH_ATOM_SOURCE must be mounted or image, got '${ATOMESH_ATOM_SOURCE}'" >&2
+    exit 1
+    ;;
+esac
+atom_origin="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c \
+  'import importlib.util as u; s = u.find_spec("atom"); print(s.origin if s else "")')"
+atom_version="$(python3 -c \
+  'import importlib.metadata as m; print(m.version("atom"))' 2>/dev/null || echo unknown)"
+echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_origin:-<missing>} image_dist=${atom_version}"
+if [[ -z "${atom_origin}" ]] \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_origin}" != "${PWD}"/* ]]; } \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_origin}" == "${PWD}"/* ]]; }; then
+  echo "ERROR: atom resolves to '${atom_origin}', which does not match ATOMESH_ATOM_SOURCE=${ATOMESH_ATOM_SOURCE} (cwd ${PWD})" >&2
+  exit 1
+fi
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
@@ -825,7 +851,7 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -885,7 +911,7 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
 }
 
 # The aggregated server reads the `decode` service block and `env.decode`: it is
@@ -941,7 +967,7 @@ start_aggregated() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "SERVER" "${server_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
 }
 
 start_router() {
