@@ -37,7 +37,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.utils import upload_numpy
@@ -102,6 +101,10 @@ class LateLayerTail:
 def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs, cache):
     """``step`` cut down to each request's tail, with what the late layers read
     off the early ones carried over by row."""
+    # Triton-backed; imported here so the host-side helpers above import
+    # without it.
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+
     spans, indices, replay_start = late_layer_tail_layout(step, tail_len)
     device = step.positions.device
     token_indices = upload_numpy(indices, device)

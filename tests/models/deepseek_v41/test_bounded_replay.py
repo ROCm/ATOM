@@ -8,9 +8,6 @@ import numpy as np
 import pytest
 import torch
 
-# the index builders import Triton at module scope; the non-GPU job has none
-pytest.importorskip("triton")
-
 from atom.model_ops.attentions.deepseek_v41.metadata import (
     BatchStep,
     RequestSpan,
@@ -82,7 +79,7 @@ def test_refusals_name_their_reason(overrides, reason):
     assert reason in decoder_replay_unsupported(_config(**overrides))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels on GPU")
 def test_both_index_builders_floor_the_window_at_the_replay_start():
     """`_indptr_scan` counts each row's window from the same first position
     `_indices` writes it from; a drift between the two leaves holes or
@@ -124,7 +121,7 @@ def test_both_index_builders_floor_the_window_at_the_replay_start():
     assert counts[:24] == [0] * 24
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels on GPU")
 def test_a_replay_start_keeps_the_suffix_of_each_rows_window():
     """`_indices` writes what `_indptr_scan` reserved: with a replay start each
     row's window segment is the tail of the same row's segment without one."""
@@ -165,3 +162,44 @@ def test_a_replay_start_keeps_the_suffix_of_each_rows_window():
         first = max(position - geo.window_size + 1, 0, floor)
         assert len(kept) == max(history_end - first, 0)
         assert kept == whole[len(whole) - len(kept) :]
+
+
+def test_late_rows_land_back_at_their_forward_rows(monkeypatch):
+    """A replay's late-layer outputs and DSpark aux captures come back at the
+    forward rows of each request's tail, whatever the mix of lengths."""
+    pytest.importorskip("aiter")
+    from atom.models.deepseek_v41 import runtime
+    from atom.models.deepseek_v41.bounded_replay import LateLayerTail
+
+    lengths, tail_len, hidden = [3, 9, 5, 12], 4, 6
+    step = _step(lengths, [0, 50, 7, 100])
+    _, indices, _ = late_layer_tail_layout(step, tail_len)
+    rows = torch.from_numpy(indices)
+    total = sum(lengths)
+    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
+    torch.nn.Module.__init__(model)
+
+    def late(*state):
+        # the stage sees only the tail; tag each row with its forward row
+        kept = state[0].shape[1]
+        assert kept == rows.numel()
+        for buffer in model.aux_rows:
+            buffer[:kept] = rows[:, None].float() + 0.5
+        return rows[None, :, None].float().expand(1, kept, hidden).clone()
+
+    model.late = late
+    aux = torch.full((64, hidden), -1.0)
+    model.aux_rows = [aux]
+    metadata = SimpleNamespace(step=step)
+    monkeypatch.setattr(
+        runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+    )
+    state = tuple(torch.zeros(1, total, 2) for _ in range(5))
+    out = model._late_on_tail(state, LateLayerTail(rows, step), total)
+    assert out.shape == (total, hidden)
+    torch.testing.assert_close(out[rows], rows[:, None].float().expand(-1, hidden))
+    torch.testing.assert_close(
+        aux[rows], rows[:, None].float().expand(-1, hidden) + 0.5
+    )
+    # the step the late layers ran on is the forward's again afterwards
+    assert metadata.step is step
