@@ -13,6 +13,10 @@ from atom.utils import envs
 
 # Only Mooncake consumers grant landing slots.
 _LANDING_CONNECTORS = frozenset({"mooncake"})
+# One decode rank's landing pool, held back from the KV budget and split
+# evenly across the prefill stages that send to the rank.
+MLA_LANDING_SLOT_BYTES = 8 << 20
+MLA_LANDING_POOL_BYTES = 256 << 20
 
 
 def _mooncake_consumer_configured(config) -> bool:
@@ -27,13 +31,9 @@ def _mooncake_consumer_configured(config) -> bool:
 def mla_landing_pool_shape() -> tuple[int, int]:
     """``(slots, slot_bytes)`` of one decode rank's landing pool, or ``(0, 0)``."""
 
-    slot_bytes = envs.ATOM_PD_MLA_LANDING_SLOT_MB << 20
-    if not envs.ATOM_PD_MLA_LANDING or slot_bytes == 0:
+    if not envs.ATOM_PD_MLA_LANDING:
         return 0, 0
-    slots = (envs.ATOM_PD_MLA_LANDING_POOL_MB << 20) // slot_bytes
-    if slots == 0:
-        return 0, 0
-    return slots, slot_bytes
+    return MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES, MLA_LANDING_SLOT_BYTES
 
 
 def mla_landing_reserve_bytes(config) -> int:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.kv_transfer.disaggregation import pd_producer
 from atom.kv_transfer.disaggregation.pd_producer import (
     index_staging_pool_size,
     mla_staging_reserve_bytes,
@@ -137,10 +138,9 @@ def test_send_worker_count_defaults_to_sixteen():
 
 def test_mla_staging_slots_are_capped_by_pool_bytes(monkeypatch):
     slot = 8 << 20
-    monkeypatch.delenv("ATOM_PD_MLA_STAGING_POOL_MB", raising=False)
     assert mla_staging_slot_count(16, slot) == 16
-    assert mla_staging_slot_count(128, slot) == 32  # 256 MiB default cap
-    monkeypatch.setenv("ATOM_PD_MLA_STAGING_POOL_MB", "1")
+    assert mla_staging_slot_count(128, slot) == 32  # 256 MiB cap
+    monkeypatch.setattr(pd_producer, "MLA_STAGING_POOL_BYTES", 1 << 20)
     assert mla_staging_slot_count(128, slot) == 1  # never below one slot
 
 
@@ -159,12 +159,7 @@ def _mla_producer_config(workers, **overrides):
 
 
 def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
-    for name in (
-        "ATOM_PD_MLA_STAGING",
-        "ATOM_PD_MLA_STAGING_SLOT_MB",
-        "ATOM_PD_MLA_STAGING_POOL_MB",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
     assert mla_staging_reserve_bytes(_mla_producer_config(16)) == 128 << 20
     assert mla_staging_reserve_bytes(_mla_producer_config(128)) == 256 << 20
     # The connector rounds a slot down to whole pages, so the reserve bounds
@@ -191,7 +186,6 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
             {},
         ),
         ({}, {"ATOM_PD_MLA_STAGING": "0"}),
-        ({}, {"ATOM_PD_MLA_STAGING_SLOT_MB": "0"}),
     ],
 )
 def test_mla_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env):
