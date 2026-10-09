@@ -610,8 +610,9 @@ def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
     page, so a positional mover would hand one request another's rings.
     """
     return [("dsv41.page", cache.page_bytes)] + [
-        (f"dsv41.index_plane.{owner}", plane)
-        for owner, plane in cache.index_planes.items()
+        (f"dsv41.index_plane.{owner}.{i}", plane)
+        for owner, planes in cache.index_planes.items()
+        for i, plane in enumerate(planes)
     ]
 
 

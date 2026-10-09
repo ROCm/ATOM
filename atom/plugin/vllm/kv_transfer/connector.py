@@ -976,6 +976,39 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 f"published={unit_bytes}, cache regions={declared}, "
                 f"geometry.paged_bytes={paged_bytes}"
             )
+        # The arena has to balance, not just the PAGE side of it. Every check
+        # above compares the published planes against another statement of the
+        # PAGE unit, so all of them still pass if a plane is missing from both
+        # -- or if the STATE region the other leg moves is not the rest of the
+        # allocation. This is the one identity that spans both legs:
+        #
+        #     Sigma(published unit bytes) * pages + slots * state_bytes == arena
+        #
+        # The left side is what this connector will move; the right is what the
+        # cache was built to hold, from `paged_extents` and `state_fields`. A
+        # plane dropped from `v41_page_planes` shortens the left and nothing
+        # else, so it reads as a shortfall of exactly that plane.
+        #
+        # What it does NOT catch, stated so the next reader does not trust it
+        # too far: a field missing from `state_fields` moves both sides at once,
+        # because the STATE leg sends the entry as flat bytes sized from the
+        # same geometry. The guard for that is that there is no per-field
+        # selection on this path at all -- `state_entry_views` hands over
+        # `state_bytes[slot]` whole -- which the tests assert directly.
+        arena = int(cache.backing.numel())
+        moved = sum(unit_bytes) * num_blocks + int(cache.num_slots) * int(
+            cache.geometry.state_bytes
+        )
+        if moved != arena:
+            raise ValueError(
+                "ATOM offload connector: DeepSeek-V4.1 arena does not balance: "
+                f"{len(planes)} PAGE planes x {num_blocks} blocks "
+                f"({sum(unit_bytes) * num_blocks} B) + {cache.num_slots} STATE "
+                f"slots x {int(cache.geometry.state_bytes)} B = {moved} B, but "
+                f"the pool holds {arena} B (short by {arena - moved}). A plane "
+                "missing from `v41_page_planes` is the usual cause; it would "
+                "otherwise offload nothing and restore stale bytes in its place."
+            )
         self._v41_cache, self._v41_slots = cache, slots
         logger.info(
             "ATOM LMCache offload: DeepSeek-V4.1 PAGE unit = %d B/block over "
