@@ -351,6 +351,12 @@ class SGLangDeepseekMLAAttention(nn.Module):
 
         if fused_kv is not None:
             k, v = fused_kv
+            # gfx95 MHA_ONE_SHOT feeds these tensors to bf16 FMHA varlen.
+            # Leaving K/V in FP8 makes that kernel stride off the allocation
+            # (HSA memory aperture violation on the first MXFP4 prefill).
+            if k.dtype != q.dtype:
+                k = k.to(q.dtype)
+                v = v.to(q.dtype)
         else:
             kv = _unwrap_linear_output(attn.kv_b_proj(kv_a)).view(
                 -1, attn.num_local_heads, attn.qk_nope_head_dim + attn.v_head_dim

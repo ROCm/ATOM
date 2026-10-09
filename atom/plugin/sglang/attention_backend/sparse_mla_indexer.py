@@ -226,6 +226,9 @@ def _build_graph_query_ranges_kernel(
     req_id = token_id // TOKENS_PER_REQ
     req_base = req_id * CONTEXT_CAPACITY
     position = tl.load(positions_ptr + token_id)
+    # Replay can see a stale or padded position. Ends index the gathered
+    # K window, which is only CONTEXT_CAPACITY rows per request.
+    position = tl.minimum(tl.maximum(position, 0), CONTEXT_CAPACITY - 1)
     tl.store(starts_ptr + token_id, req_base)
     tl.store(ends_ptr + token_id, req_base + position + 1)
 
@@ -1414,6 +1417,11 @@ def sparse_attn_indexer_sglang_plugin_mode(
             cu_starts, cu_ends, int(num_tokens)
         )
         total_kv = _mtp_eager_total_kv(forward_batch)
+        # top_k_per_row_prefill indexes KV with these ends. A range past the
+        # gathered K is an out-of-bounds device read.
+        kv_limit = torch.tensor(total_kv, dtype=cu_ends.dtype, device=cu_ends.device)
+        cu_ends = torch.minimum(cu_ends, kv_limit)
+        cu_starts = torch.minimum(cu_starts, cu_ends)
         k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
         k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
         gather_indptr = _build_mtp_eager_gather_indptr(forward_batch)

@@ -309,7 +309,10 @@ def install_minimax_mono_plugin_refusal() -> None:
         return
     dispatch._config_refusal_native = dispatch._config_refusal
 
-    def _config_refusal(atom_config, text_config):
+    def _config_refusal(atom_config, text_config=None):
+        # Current mono dispatch calls this with atom_config only. Older
+        # SGLang tests still pass a text_config. Either way, plugin mode
+        # is unsupported and must refuse before cudagraph_mode is read.
         del atom_config, text_config
         return "plugin mode"
 

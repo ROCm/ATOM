@@ -119,6 +119,13 @@ EOF
 docker rmi "atom_sglang_base:ci" 2>/dev/null || true
 docker rmi "atom_sglang:ci" 2>/dev/null || true
 
+# Some spur nodes point dockerd/buildkit at this path without mounting it.
+if [[ ! -d /mnt/m2m_nobackup/docker/tmp ]]; then
+  mkdir -p /mnt/m2m_nobackup/docker/tmp 2>/dev/null \
+    || sudo mkdir -p /mnt/m2m_nobackup/docker/tmp 2>/dev/null \
+    || true
+fi
+
 BUILD_MODE="full"
 if docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
   LATEST_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${NIGHTLY_SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
@@ -184,20 +191,30 @@ else
 fi
 
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
-docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
-  -v "${REPO_ROOT}":/workspace \
-  ${MODEL_CACHE_MOUNT} \
-  -w /workspace \
-  --ipc=host --network=host --group-add video \
-  --shm-size=16G \
-  --privileged \
-  --cap-add=SYS_PTRACE \
-  -e HF_TOKEN="${HF_TOKEN:-}" \
-  --security-opt seccomp=unconfined \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  --name "${CONTAINER_NAME}" \
-  "${SGLANG_IMAGE_TAG}"
+start_sglang_container() {
+  local privileged_flag="$1"
+  docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+  # DEVICE_FLAG and MODEL_CACHE_MOUNT are flag strings, so they stay unquoted.
+  # shellcheck disable=SC2086
+  docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
+    -v "${REPO_ROOT}":/workspace \
+    ${MODEL_CACHE_MOUNT} \
+    -w /workspace \
+    --ipc=host --network=host --group-add video \
+    --shm-size=16G \
+    ${privileged_flag} \
+    --cap-add=SYS_PTRACE \
+    -e HF_TOKEN="${HF_TOKEN:-}" \
+    --security-opt seccomp=unconfined \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    --name "${CONTAINER_NAME}" \
+    "${SGLANG_IMAGE_TAG}"
+}
+if ! start_sglang_container --privileged; then
+  echo "docker run --privileged was denied; retrying with device mounts only"
+  start_sglang_container ""
+fi
 
 GPU_PREFLIGHT_KILL_DOCKER=1 bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
 
