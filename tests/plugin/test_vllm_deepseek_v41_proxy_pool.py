@@ -434,24 +434,58 @@ def test_the_profile_cache_patch_installs_without_a_v4_model():
     # it is the belt and this is the braces.
 
 
-def test_the_bind_stands_down_while_cudagraphs_are_being_captured():
-    """Capture is a third phase, distinct from serving and from profiling.
+def test_the_profile_cache_patch_reaches_the_runner_the_worker_builds():
+    """vLLM has two unrelated `GPUModelRunner` classes; patch both.
 
-    Measured at the bind: the capture forward arrives with
-    `num_gpu_blocks=64`, a 64-block proxy tensor, and the profiling flag
-    correctly False -- capture is not the memory profile, and the guard for
-    one does not cover the other. Binding there carves the STATE tail out of
-    a pool 3800x too small and raises "proxy pool is too small", which is true
-    of the capture's pool and silent about the one that will serve.
+    `GPUWorker` picks between `vllm.v1.worker.gpu_model_runner` and the V2
+    rewrite in `vllm.v1.worker.gpu.model_runner` on `use_v2_model_runner`.
+    They share no base class and no method objects, so the patch -- written
+    against the first name alone -- was inert on every V2 deployment: the
+    marker never ran, `_atom_v4_profiling_kv_cache` stayed False through the
+    profiling capture, and the bind could not tell the 64-block throwaway pool
+    from the serving one. Inert and applied look identical in the logs, which
+    is why this is asserted on the classes rather than on a log line.
     """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_profile_cache_patch,
+    )
+    from atom.plugin.vllm.gpu_model_runner_targets import gpu_model_runner_classes
+
+    classes = gpu_model_runner_classes()
+    assert classes, "no vLLM GPUModelRunner class resolved"
+    apply_vllm_v4_profile_cache_patch()
+    for runner_cls in classes:
+        assert getattr(
+            runner_cls.initialize_kv_cache, "_atom_v4_profile_cache_patched", False
+        ), f"{runner_cls.__module__}.{runner_cls.__qualname__} left unpatched"
+    # Idempotent: a second install must not stack a wrapper on a wrapper.
+    wrapped = [c.initialize_kv_cache for c in classes]
+    apply_vllm_v4_profile_cache_patch()
+    assert [c.initialize_kv_cache for c in classes] == wrapped
+
+
+def test_the_bind_does_not_read_whether_capturing_is_merely_permitted():
+    """`cudagraph_capturing_enabled` is a permission, not a phase.
+
+    It is declared `True` in `vllm/compilation/monitor.py` and set False only
+    when a capture phase ends, so in an eager run -- where no capture ever
+    happens -- it stays True for the life of the process. A bind guard keyed on
+    it therefore stood down on every forward, and the model served from the
+    private scratch cache: a healthy server emitting noise. Keyed the other
+    way it is just as wrong, since capture against the *serving* pool is
+    exactly when the bind must happen, or the captured graphs replay a scratch
+    cache.
+
+    Asserted on the source because the symptom is an absence: there is no
+    value this predicate could return that would make reading it correct.
+    """
+    import inspect
+
     import atom.plugin.vllm.deepseek_v41_bridge as bridge_mod
 
-    monitor = pytest.importorskip("vllm.compilation.monitor")
-    before = getattr(monitor, "cudagraph_capturing_enabled", False)
-    try:
-        monitor.cudagraph_capturing_enabled = True
-        assert bridge_mod._v41_cudagraph_capture_in_progress() is True
-        monitor.cudagraph_capturing_enabled = False
-        assert bridge_mod._v41_cudagraph_capture_in_progress() is False
-    finally:
-        monitor.cudagraph_capturing_enabled = before
+    source = inspect.getsource(bridge_mod)
+    assert "cudagraph_capturing_enabled" not in source, (
+        "the V4.1 bind must not gate on vLLM's capture permission flag; "
+        "the phase it needs to exclude is the profiling pool, which "
+        "_atom_v4_profiling_kv_cache names"
+    )
