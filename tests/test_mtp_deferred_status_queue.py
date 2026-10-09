@@ -96,6 +96,7 @@ def test_a_real_batch_still_carries_over_from_a_real_batch():
 
 def _processor() -> tokenIDProcessor:
     processor = object.__new__(tokenIDProcessor)
+    processor.runner = SimpleNamespace(h2d_groups={"input_ids": mock.Mock()})
     processor.input_ids = SimpleNamespace(
         np=np.zeros(8, dtype=np.int32),
         gpu=np.zeros(8, dtype=np.int32),

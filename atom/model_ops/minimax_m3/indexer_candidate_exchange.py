@@ -37,16 +37,15 @@ def _force(score, block, valid, local_start, INIT_BLOCKS: tl.constexpr):
     return tl.where(valid & (block >= local_start), 1e29, score)
 
 
-@triton.jit
+# Retain bounded alignment specialization for the score row stride.
+@triton.jit(do_not_specialize=["GLOBAL_BLOCKS"])
 def _local_topk(
     Scores,
     Keys,
     Lengths,
-    TOKENS: tl.constexpr,
-    HEADS: tl.constexpr,
     QUERY_LEN: tl.constexpr,
-    LOCAL_BLOCKS: tl.constexpr,
-    GLOBAL_BLOCKS: tl.constexpr,
+    LOCAL_BLOCKS,
+    GLOBAL_BLOCKS,
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
     TOPK: tl.constexpr,
@@ -68,13 +67,14 @@ def _local_topk(
     """
     row = tl.program_id(0)
     head = tl.program_id(1)
+    tokens = tl.num_programs(0)
     request = row // QUERY_LEN
     token = row % QUERY_LEN
     length = tl.load(Lengths + request)
     # Blocks this query token may attend, in global numbering.
     causal_blocks = (length - QUERY_LEN + token + 128) // 128
     local_start = tl.maximum(0, causal_blocks - LOCAL_KEEP)
-    s_row = Scores + (head * TOKENS + row) * LOCAL_BLOCKS
+    s_row = Scores + (head * tokens + row) * LOCAL_BLOCKS
 
     off = tl.arange(0, BLOCK_SIZE_K)
     local_valid = off < LOCAL_BLOCKS
@@ -93,10 +93,14 @@ def _local_topk(
         tile = tl.topk(_pack_score_key(score, block + 1, valid), BLOCK_SIZE_T)
         winners = tl.topk(tl.cat(winners, tile, can_reorder=True), BLOCK_SIZE_T)
     off_t = tl.arange(0, BLOCK_SIZE_T)
-    tl.store(Keys + (head * TOKENS + row) * TOPK + off_t, winners, mask=off_t < TOPK)
+    tl.store(
+        Keys + (head * tokens + row) * TOPK + off_t,
+        winners,
+        mask=off_t < TOPK,
+    )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SRC_STRIDE"])
 def _merge_topk(
     Keys,
     Indices,
@@ -106,7 +110,6 @@ def _merge_topk(
     SparseCtx,
     TABLE_STRIDE: tl.constexpr,
     SBT_STRIDE: tl.constexpr,
-    TOKENS: tl.constexpr,
     QUERY_LEN: tl.constexpr,
     TOPK: tl.constexpr,
     INIT_BLOCKS: tl.constexpr,
@@ -114,7 +117,7 @@ def _merge_topk(
     NUM_KV_HEADS: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     KEYS_PER_SHARD: tl.constexpr,
-    SRC_STRIDE: tl.constexpr,
+    SRC_STRIDE,
     ROW_STRIDE: tl.constexpr,
     REAL_CANDIDATES: tl.constexpr,
     CANDIDATES: tl.constexpr,
@@ -221,13 +224,14 @@ def local_candidate_keys(
         # function is correct for the topk its own guard admits (<= 512), rather
         # than only for the one value production happens to pass.
         width = max(16, triton.next_power_of_2(local), triton.next_power_of_2(topk))
-        width = min(width, 1024)
+        # Select medium rows in one tile; smaller streaming tiles avoid
+        # excessive padding work when a longer row crosses a tile boundary.
+        if width > 2048:
+            width = 1024
         _local_topk[(tokens, heads)](
             scores,
             keys,
             seq_lens,
-            TOKENS=tokens,
-            HEADS=heads,
             QUERY_LEN=max_query_len,
             LOCAL_BLOCKS=local,
             GLOBAL_BLOCKS=global_blocks,
@@ -298,7 +302,6 @@ def merge_candidate_keys(
             output[1],
             TABLE_STRIDE=block_table.stride(0),
             SBT_STRIDE=output[0].stride(0),
-            TOKENS=tokens,
             QUERY_LEN=max_query_len,
             TOPK=topk,
             INIT_BLOCKS=init_blocks,

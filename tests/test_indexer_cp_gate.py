@@ -13,7 +13,7 @@ They are separate on purpose and fail differently:
   is about to run the model implement the CP chain at all".
 
 The framework gate earns a test because it is not a documentation nicety. Every
-host -- native, vLLM, SGLang -- runs ATOM's own ``models/minimax_m3.py`` and
+host -- native, vLLM, SGLang -- runs ATOM's own ``models/minimax_m3/model.py`` and
 ``model_ops/linear.py``, so the flag widens the fused index-Q projection
 *underneath* whichever bridge is hosting it. A bridge that then reshapes on an
 assumed width reads 4x the rows it should. SGLang is exactly that bridge today,
@@ -121,7 +121,7 @@ def test_the_two_indexer_modes_do_not_share_a_compiled_artifact():
     """CP widens the fused QKV output, so it must key the compilation cache.
 
     ``index_q`` is this rank's one index head under TP and all of them under CP
-    (``minimax_m3.py`` picks the width, ``linear.py`` allocates it), which
+    (``minimax_m3/model.py`` picks the width, ``linear.py`` allocates it), which
     changes the traced graph and the captured buffer strides. Two runs of the
     same model and source otherwise hash identically, so without this factor
     the second mode loads the first mode's artifact and trips

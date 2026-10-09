@@ -205,6 +205,7 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
     gpu = torch.full_like(cpu, -777)
     builder.model_runner = SimpleNamespace(
         config=SimpleNamespace(max_model_len=8192),
+        use_mrope=True,
         forward_vars={
             "mrope_positions": SimpleNamespace(cpu=cpu, np=cpu.numpy(), gpu=gpu)
         },
@@ -215,19 +216,27 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
     width = k + 1
 
     def prepare(self, batch, running_bs, running_tokens, max_seqlen_q):
-        real = batch.total_tokens_num_decode
-        self._mrope_cpu_view(real)[:] = batch.positions
         return (
             SimpleNamespace(max_seqlen_q=max_seqlen_q),
-            self._copy_mrope_to_gpu(real),
+            self._build_mrope_decode_positions(
+                batch, batch.context_lens, max_seqlen_q, running_tokens=running_tokens
+            ),
         )
 
     monkeypatch.setattr(GDNAttentionMetadataBuilder, "prepare_decode", prepare)
     # Shrinking requests must not expose the previous batch's axis/tail data.
     for scheduled in (4, 3, 1):
         tokens = scheduled * width
-        expected = np.arange(3 * tokens).reshape(3, tokens) + 100
-        batch = SimpleNamespace(total_tokens_num_decode=tokens, positions=expected)
+        ends = np.arange(scheduled) * 100 + width
+        expected = np.tile(
+            np.concatenate([np.arange(end - width, end) for end in ends]), (3, 1)
+        )
+        batch = SimpleNamespace(
+            total_tokens_num_decode=tokens,
+            context_lens=ends,
+            req_ids=tuple(range(scheduled)),
+            mrope_position_deltas={},
+        )
         _, positions = builder.prepare_decode(batch, 4, 4 * width, width)
         reference = torch.from_numpy(expected)
         torch.testing.assert_close(positions, reference)
@@ -270,7 +279,10 @@ def test_draft_allocation_profile_does_not_require_qsa_pools():
     slots = torch.zeros(16, dtype=torch.int64)
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.model_runner = SimpleNamespace(
-        forward_vars={"slot_mapping": SimpleNamespace(gpu=slots)}
+        forward_vars={
+            "slot_mapping": SimpleNamespace(gpu=slots),
+            "context_lens": SimpleNamespace(gpu=torch.zeros(16, dtype=torch.int32)),
+        }
     )
     for positions in (torch.zeros(4), torch.zeros(3, 4)):
         metadata = builder.prepare_mtp_decode(4, 1, 16, positions)

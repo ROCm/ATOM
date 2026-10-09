@@ -556,7 +556,9 @@ jobs:
           fi
       
       - name: Run ATOM accuracy test
-        timeout-minutes: ${{ matrix.accuracy_timeout_minutes || 30 }}
+        # The step also launches the server, so it gets at least an hour: a
+        # cold weight load off a network share alone can take 30 minutes.
+        timeout-minutes: ${{ matrix.accuracy_timeout_minutes > 60 && matrix.accuracy_timeout_minutes || 60 }}
         env:
           MODEL_EXTRA_ARGS: ${{ matrix.extraArgs }}
           CLIENT_COMMAND: ${{ matrix.client_command || '' }}

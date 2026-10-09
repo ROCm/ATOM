@@ -348,6 +348,13 @@ class MultiConnector(KVConnectorBase):
 class MultiConnectorScheduler(KVConnectorSchedulerBase):
     """Scheduler-side composite connector."""
 
+    def bind_block_manager(self, block_manager: Any) -> None:
+        """Bind native checkpoint owners before any request can be admitted."""
+        for connector in self._connectors:
+            bind = getattr(connector, "bind_block_manager", None)
+            if callable(bind):
+                bind(block_manager)
+
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
         self.is_producer = any(
@@ -488,6 +495,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             fn = getattr(c, "source_blocks_released", None)
             if callable(fn):
                 fn(seq)
+
+    def waits_for_transfer_report(self, seq: Any) -> bool:
+        """True only if every sub still deferring this request waits for reports.
+
+        Clock-based reclaim is skipped only when no deferring sub would act on
+        it; a P/D send or an in-process save still gets its abandon path.
+        """
+        deferring = 0
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            deferring += 1
+            callback = getattr(connector, "waits_for_transfer_report", None)
+            if not callable(callback) or callback(seq) is not True:
+                return False
+        return deferring > 0
 
     def abandon_save(self, req_id: Any) -> None:
         # Reclamation of a stalled offload save (see
@@ -645,6 +669,25 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return None
             protected.update(blocks)
         return frozenset(protected)
+
+    def can_partially_deallocate_state(self, seq: Any) -> bool:
+        """True only if every sub still deferring this request guarantees it.
+
+        Fail-closed like ``protected_block_ids``: releasing the state slot is
+        safe only when no deferring sub still needs the request alive, and a
+        missing method is not approval. ``protected_block_ids`` narrows PAGE
+        blocks only, so it cannot stand in for a sub's state guarantee.
+        """
+        deferring = 0
+        for connector in self._connectors:
+            should_defer = getattr(connector, "should_defer_free", None)
+            if not callable(should_defer) or not should_defer(seq):
+                continue
+            deferring += 1
+            callback = getattr(connector, "can_partially_deallocate_state", None)
+            if not callable(callback) or callback(seq) is not True:
+                return False
+        return deferring > 0
 
     def activate_block_leases(self, seq: Any, block_ids) -> None:
         for connector in self._connectors:

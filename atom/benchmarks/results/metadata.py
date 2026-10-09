@@ -118,18 +118,45 @@ def performance_env():
 
 def installed_package(package):
     """Inspect the executing interpreter's installation, never the desired pin."""
+    result = {"version": None, "sha": None, "sha_source": None, "wheel_sha256": None}
     try:
         distribution = importlib.metadata.distribution(package)
+    except importlib.metadata.PackageNotFoundError:
+        return result
+    result["version"] = distribution.version
+    try:
         direct = json.loads(distribution.read_text("direct_url.json") or "{}")
-        commit = direct.get("vcs_info", {}).get("commit_id")
-        url = direct.get("url", "")
-        if not commit and url.startswith("file://"):
-            from urllib.parse import unquote, urlparse
+    except ValueError:
+        direct = {}
+    commit = direct.get("vcs_info", {}).get("commit_id")
+    if commit:
+        result.update(sha=commit, sha_source="direct_url_vcs")
+    url = direct.get("url", "")
+    if not commit and url.startswith("file://"):
+        from urllib.parse import unquote, urlparse
 
-            commit = git_sha(unquote(urlparse(url).path))
-        return {"version": distribution.version, "sha": commit}
-    except (importlib.metadata.PackageNotFoundError, ValueError):
-        return {"version": None, "sha": None}
+        source = Path(unquote(urlparse(url).path))
+        # A local wheel is a file, not an editable checkout. Never attribute
+        # the wheel to the Git repository containing its download directory.
+        if source.is_dir():
+            commit = git_sha(source)
+            if commit:
+                result.update(sha=commit, sha_source="local_git")
+    if not commit and re.sub(r"[-_.]+", "-", package).lower() == "amd-aiter":
+        # AITER wheels embed a Git abbreviation, e.g. 0.1.1.dev1+ga75ba53de.
+        # Retain it as an abbreviation; do not invent a full commit or use
+        # an unrelated checkout. Dirty/unknown version suffixes stay unknown.
+        match = re.search(r"\+g([0-9a-f]{7,40})$", distribution.version, re.IGNORECASE)
+        if match:
+            result.update(sha=match[1].lower(), sha_source="package_version")
+    if url.split("?", 1)[0].lower().endswith(".whl"):
+        archive = direct.get("archive_info", {})
+        digest = archive.get("hashes", {}).get("sha256")
+        if not digest and archive.get("hash", "").startswith("sha256="):
+            digest = archive["hash"].split("=", 1)[1]
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            result["wheel_sha256"] = digest.lower()
+    return result
 
 
 def hip_pci_ids():
@@ -272,6 +299,7 @@ def capture_config(model, server_argv, kind, concurrency, launch=None):
         model_revision = marker.read_text().strip()
     precision = os.environ.get("BENCHMARK_PRECISION")
     # Precision is intentionally not inferred from KV dtype or a display label.
+    aiter = installed_package("amd-aiter")
     return {
         "schema_version": SCHEMA_VERSION,
         "source": {
@@ -285,8 +313,10 @@ def capture_config(model, server_argv, kind, concurrency, launch=None):
         },
         "software": {
             "atom_sha": git_sha(Path.cwd()),
-            "aiter_sha": installed_package("amd-aiter")["sha"]
-            or git_sha(Path.cwd() / "aiter"),
+            "aiter_sha": aiter["sha"],
+            "aiter_sha_source": aiter["sha_source"],
+            "aiter_version": aiter["version"],
+            "aiter_wheel_sha256": aiter["wheel_sha256"],
             "image": os.environ.get("DOCKER_IMAGE"),
             "image_digest": os.environ.get("ATOM_IMAGE_DIGEST"),
             "harness_version": os.environ.get("ATOM_HARNESS_VERSION")

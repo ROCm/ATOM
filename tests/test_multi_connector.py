@@ -267,6 +267,40 @@ def _save_operation_meta(*operations):
     return meta
 
 
+def test_partial_state_deallocation_requires_an_explicit_capable_subconnector():
+    seq = SimpleNamespace(has_per_req_cache=True)
+    unsupported = SimpleNamespace(should_defer_free=lambda _seq: True)
+    declined = SimpleNamespace(
+        should_defer_free=lambda _seq: True,
+        can_partially_deallocate_state=lambda _seq: False,
+    )
+    inactive_capable = SimpleNamespace(
+        should_defer_free=lambda _seq: False,
+        can_partially_deallocate_state=lambda _seq: True,
+    )
+    capable = SimpleNamespace(
+        should_defer_free=lambda _seq: True,
+        can_partially_deallocate_state=lambda _seq: True,
+    )
+
+    inactive_unsupported = SimpleNamespace(should_defer_free=lambda _seq: False)
+
+    def allowed(*subs):
+        return _sched(list(subs)).can_partially_deallocate_state(seq)
+
+    assert allowed(unsupported, declined) is False
+    assert allowed(unsupported, inactive_capable) is False
+    # A deferring sub without the guarantee still needs the request alive, even
+    # though another deferring sub declares its own state safe (all, not any).
+    assert allowed(unsupported, capable) is False
+    assert allowed(capable, declined) is False
+    # Subs that no longer defer do not veto.
+    assert allowed(inactive_unsupported, capable) is True
+    assert allowed(capable, capable) is True
+    # Nothing deferring is not a guarantee either.
+    assert allowed(inactive_unsupported, inactive_capable) is False
+
+
 # ---------------------------------------------------------------------------
 # Scheduler-side
 # ---------------------------------------------------------------------------
@@ -959,3 +993,29 @@ def test_should_defer_free_holds_while_any_sub_claims_the_source():
     assert sched.should_defer_free(seq) is True, "the send still claims it"
     producer.defer = False
     assert sched.should_defer_free(seq) is False
+
+
+def test_waits_for_transfer_report_needs_every_deferring_sub():
+    """Clock reclaim is skipped only if no deferring sub would act on it."""
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    def sub(defers, waits=None):
+        fields = {"should_defer_free": lambda _seq: defers}
+        if waits is not None:
+            fields["waits_for_transfer_report"] = lambda _seq: waits
+        return SimpleNamespace(**fields)
+
+    def multi(*subs):
+        connector = object.__new__(MultiConnectorScheduler)
+        connector._connectors = list(subs)
+        return connector
+
+    seq = object()
+    assert multi(sub(True, True), sub(False)).waits_for_transfer_report(seq)
+    assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
+    assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
+    assert not multi(sub(False, True)).waits_for_transfer_report(seq)

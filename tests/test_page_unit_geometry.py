@@ -323,3 +323,93 @@ class TestPageUnitViewsStopAtTheImage:
         stub, _ = self.build(image_bytes=80)  # more than the 72 B on offer
         with pytest.raises(RuntimeError, match="disagree"):
             stub.page_unit_views([0, 1, 2])
+
+
+class TestLmcacheMpNativeLayoutReadsThePageUnitImage:
+    """`lmcache_mp` stores a K3 checkpoint image through the MLA PAGE regions.
+
+    `KimiMLAGDN*MetadataBuilder.get_kv_transfer_tensors` publishes the MLA
+    builder's regions with the checkpoint contract on top, and refuses at
+    runtime if they are not `_page_unit_regions`. Here: a real `MlaKvPool`'s
+    published regions ARE those regions, and an image written through
+    `page_unit_views` (the unit-major, row-minor stream the copy plan uses) is
+    exactly what `build_native_state_mp_layout`'s per-ordinal aliases read back.
+    """
+
+    def test_published_regions_alias_the_image_unit_by_unit(self):
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        from atom.kv_transfer.offload.mp.native_state_layout import (
+            build_native_state_mp_layout,
+        )
+        from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+        from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+
+        blocks, block_size = 8, 4
+        pool = MlaKvPool(
+            layers=3, block_size=block_size, entry_dim=6, kv_dtype=torch.float16
+        )
+        pool.allocate(blocks, "cpu")
+        unit_bytes = 3 * block_size * 6 * 2
+        image_bytes = 2 * unit_bytes + unit_bytes // 2
+        spec = PagedStateCheckpointSpec(
+            unit_bytes, image_bytes, "kda-test", image_bytes
+        )
+        stub = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                block_size=block_size,
+                state_runtime=SimpleNamespace(checkpoint_spec=spec),
+            ),
+            kv_pool=pool,
+            _page_unit_region_cache=None,
+        )
+        for name in (
+            "_page_unit_kv_cache",
+            "_page_unit_index_cache",
+            "_page_unit_regions",
+            "page_unit_views",
+        ):
+            method = getattr(PageUnitGeometryMixin, name)
+            setattr(stub, name, method.__get__(stub, type(stub)))
+
+        # What `AiterMLAMetadataBuilder.get_kv_transfer_tensors` publishes.
+        pages = [
+            page_region(t, semantic_role=role) for role, t in pool.region_tensors()
+        ]
+        bases, sizes = stub._page_unit_regions()
+        assert [(p.region.base_addr, p.region.unit_bytes) for p in pages] == list(
+            zip(bases.tolist(), sizes.tolist(), strict=True)
+        )
+
+        transfer = KVTransferTensors(
+            pages=pages,
+            paged_state_checkpoint_spec=spec,
+            execute_paged_state_copies=lambda *args, **kwargs: None,
+            paged_state_region_count=len(pages),
+        )
+        transfer.set_block_count(blocks)
+        layout = build_native_state_mp_layout(
+            transfer, block_size=block_size, chunk_size=block_size
+        )
+
+        units = [5, 1, 6]  # not a range: an image's units are not consecutive
+        image = torch.randint(0, 256, (image_bytes,), dtype=torch.uint8)
+        at = 0
+        for view in stub.page_unit_views(units):
+            dst = view.reshape(-1).view(torch.uint8)
+            dst.copy_(image[at : at + dst.numel()])
+            at += dst.numel()
+        assert at == image_bytes
+
+        ordinal = {
+            index: group.engine_group_id - 1
+            for group in layout.kernel_groups
+            for index in group.tensor_indices
+        }
+        read = torch.cat(
+            [
+                layout.tensors[index][units[ordinal[index]]].flatten()
+                for index in range(len(pages), len(layout.tensors))
+            ]
+        )
+        torch.testing.assert_close(read, image, rtol=0, atol=0)

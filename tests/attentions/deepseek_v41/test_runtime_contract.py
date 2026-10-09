@@ -9,9 +9,9 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
 
 def _runtime_pieces():
@@ -117,6 +117,24 @@ def test_unimplemented_modes_fail_before_loading(override):
         validate_runtime_config(runtime_config(**override))
 
 
+def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+    validate_runtime_config(
+        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
+    )
+    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                runtime_config(kv_transfer_config={"kv_connector": connector})
+            )
+    with pytest.raises(ValueError, match="RapidServe"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "lmcache_mp"},
+                enable_rapidserve=True,
+            )
+        )
+
+
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
     from atom.models.deepseek_v41 import runtime
@@ -125,7 +143,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
     cache.backing.fill_(57)
     before = cache.backing.clone()
-    step = cache.begin_step([])
+    step = begin_step(cache, [])
     metadata = SimpleNamespace(
         step=step,
         cache=cache,
@@ -163,7 +181,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
 
     geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
-    step = cache.begin_step([RequestSpan(0, 0, 0, 1, 0, (0,))], plans={})
+    step = begin_step(cache, [PagedRequest(0, 0, 0, 1, 0, (0,))], plans={})
     memos = {name: getattr(step, name) for name in ("selected", "candidates")}
     for name, memo in memos.items():
         memo["what the last forward worked out"] = name
