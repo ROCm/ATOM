@@ -301,12 +301,6 @@ class AsyncIOProc:
             body = pickle.dumps(result)
         return [result.request_id.encode("utf-8"), body]
 
-    # Legacy call_func users still need the same shared-buffer barrier. The
-    # generic path carries this decision explicitly in RpcPayload.barrier.
-    _BARRIER_FUNCS: ClassVar[frozenset[str]] = frozenset(
-        {"update_weights_from_ipc", "update_weights_from_shm"}
-    )
-
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
@@ -316,7 +310,7 @@ class AsyncIOProc:
             )
             if payload is None:
                 call_args, call_kwargs = args, {}
-                need_barrier = func_name in self._BARRIER_FUNCS
+                need_barrier = False
             else:
                 call_args = payload.args
                 call_kwargs = payload.call_kwargs()

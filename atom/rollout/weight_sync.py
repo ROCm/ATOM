@@ -10,6 +10,8 @@ from typing import Callable
 import torch
 from multiprocessing import shared_memory
 
+from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD
+
 logger = logging.getLogger("atom")
 
 
@@ -41,7 +43,7 @@ def _abort_weight_sync(core_mgr, path: str) -> None:
     """Best-effort close of a sync whose sender stopped before its last bucket."""
     try:
         core_mgr.broadcast_utility_command_sync(
-            "discard_failed_weight_sync",
+            DISCARD_WEIGHT_SYNC_CMD,
             timeout=30.0,
             failed_cmd=path,
             error=f"{path} sender abandoned the sync before its final bucket",

@@ -21,6 +21,8 @@ import zmq.asyncio
 from atom.config import Config
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
+    DISCARD_WEIGHT_SYNC_CMD,
+    FINISH_WEIGHT_SYNC_CMD,
     RpcResponseRouter,
     RpcResult,
     checked_timeout,
@@ -28,7 +30,6 @@ from atom.model_engine.collective_rpc import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
-    FINISH_WEIGHT_SYNC_CMD,
     FIRE_AND_FORGET_UTILITY_CMDS,
     WEIGHT_UPDATE_UTILITY_CMDS,
 )
@@ -1560,9 +1561,7 @@ class CoreManager:
         missing = sorted(set(range(engine_count)) - set(by_dp_rank))
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-                self.broadcast_utility_command(
-                    "discard_failed_weight_sync", failed_cmd=cmd
-                )
+                self.broadcast_utility_command(DISCARD_WEIGHT_SYNC_CMD, failed_cmd=cmd)
             raise TimeoutError(
                 f"{self.label}: no reply to utility command {cmd!r} from DP "
                 f"rank(s) {missing} within {timeout}s"
@@ -1573,9 +1572,7 @@ class CoreManager:
                 # An engine whose local TP ranks all succeeded has no local
                 # reason to discard its packed/expert/IPC scratch. Once any DP
                 # engine failed, every engine belongs to the abandoned sync.
-                self.broadcast_utility_command(
-                    "discard_failed_weight_sync", failed_cmd=cmd
-                )
+                self.broadcast_utility_command(DISCARD_WEIGHT_SYNC_CMD, failed_cmd=cmd)
             # Callers read r["result"]; an error reply has none, and handing it
             # back would turn a named failure into a KeyError somewhere else.
             raise RuntimeError(
@@ -1595,9 +1592,7 @@ class CoreManager:
                     completed_cmd=cmd,
                 )
             except Exception:
-                self.broadcast_utility_command(
-                    "discard_failed_weight_sync", failed_cmd=cmd
-                )
+                self.broadcast_utility_command(DISCARD_WEIGHT_SYNC_CMD, failed_cmd=cmd)
                 raise
         return responses
 

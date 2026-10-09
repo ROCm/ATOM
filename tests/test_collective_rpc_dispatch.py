@@ -279,9 +279,7 @@ def test_a_direct_update_runs_on_every_rank(cmd, args):
     ],
 )
 def test_the_shared_buffer_updates_keep_their_barrier(cmd, barrier):
-    """On the call_func path, _BARRIER_FUNCS held every rank until all had read
-    the caller's buffer. Moving these updates to the generic path must not
-    quietly drop that."""
+    """Shared-buffer updates explicitly wait until every TP rank has read it."""
     h, mgr, _ = _handler(replies=_counts(4, 4))
     h._execute_utility_command(cmd, dict(_DIRECT_UPDATES)[cmd])
     ((_, payload, _),) = mgr.calls

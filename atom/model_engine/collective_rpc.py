@@ -19,6 +19,8 @@ from dataclasses import dataclass
 # The utility-command name the dispatch layer registers. Shared so the manager
 # that sends it and the handler that receives it cannot drift apart.
 COLLECTIVE_RPC_CMD = "collective_rpc"
+DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
+FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
 
 # These methods have an EngineUtilityHandler command that owns engine state
 # around the worker call. Driving the worker method directly would bypass that
@@ -28,7 +30,7 @@ UTILITY_MANAGED_RUNNER_METHODS = frozenset(
         "update_weights",
         "update_weights_from_shm",
         "update_weights_from_ipc",
-        "discard_failed_weight_sync",
+        DISCARD_WEIGHT_SYNC_CMD,
         "release_memory",
         "resume_memory",
         "clear_kv_cache",

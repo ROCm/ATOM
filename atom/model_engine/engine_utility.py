@@ -9,6 +9,8 @@ from typing import ClassVar
 
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
+    DISCARD_WEIGHT_SYNC_CMD,
+    FINISH_WEIGHT_SYNC_CMD,
     RpcPayload,
     checked_timeout,
 )
@@ -23,9 +25,6 @@ FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
-_DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
-FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
-
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
@@ -84,7 +83,7 @@ class EngineUtilityHandler:
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",
-        _DISCARD_WEIGHT_SYNC_CMD: "_handle_discard_failed_weight_sync",
+        DISCARD_WEIGHT_SYNC_CMD: "_handle_discard_failed_weight_sync",
         FINISH_WEIGHT_SYNC_CMD: "_handle_finish_weight_sync",
         "get_weight_sync_status": "_handle_get_weight_sync_status",
         "release_memory": "_handle_release_memory",
@@ -160,7 +159,7 @@ class EngineUtilityHandler:
                             f"{self.label}: weight update failed; serving stays "
                             f"fenced until a complete sync succeeds: {reply['error']}"
                         )
-                elif cmd == _DISCARD_WEIGHT_SYNC_CMD:
+                elif cmd == DISCARD_WEIGHT_SYNC_CMD:
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
                     self._weight_sync_failure = str(
@@ -375,7 +374,7 @@ class EngineUtilityHandler:
         payload = RpcPayload(request_id=f"{cmd}-discard-{uuid.uuid4().hex}")
         try:
             replies = self.runner_mgr.utility_rpc(
-                "discard_failed_weight_sync", payload, timeout=timeout
+                DISCARD_WEIGHT_SYNC_CMD, payload, timeout=timeout
             )
             failed = [r for r in replies if not r.ok]
             if failed:
@@ -384,11 +383,11 @@ class EngineUtilityHandler:
                     f"TP rank(s)"
                 )
                 logger.error(f"{self.label}: {error}")
-                return {"cmd": _DISCARD_WEIGHT_SYNC_CMD, "error": error}
+                return {"cmd": DISCARD_WEIGHT_SYNC_CMD, "error": error}
         except Exception as exc:
             logger.exception(f"{self.label}: {cmd} cleanup could not be broadcast")
-            return self._error_reply(_DISCARD_WEIGHT_SYNC_CMD, exc)
-        return {"cmd": _DISCARD_WEIGHT_SYNC_CMD, "result": True}
+            return self._error_reply(DISCARD_WEIGHT_SYNC_CMD, exc)
+        return {"cmd": DISCARD_WEIGHT_SYNC_CMD, "result": True}
 
     def _handle_discard_failed_weight_sync(self, args: dict) -> dict:
         """Clear abandoned update scratch on every TP rank of this engine."""

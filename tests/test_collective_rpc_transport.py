@@ -268,21 +268,6 @@ def test_the_barrier_is_driven_by_the_payload_not_the_name():
     assert barrier.waits == 0
 
 
-def test_the_legacy_shared_buffer_methods_keep_their_barrier():
-    """Existing call_func users do not carry a payload flag, so their method
-    names remain the compatibility contract."""
-
-    class _W:
-        def update_weights_from_ipc(self, *args):
-            return "done"
-
-    barrier = _Barrier()
-    proc = _proc(runners=[_W()], barrier=barrier)
-    primary, _ = _drive(proc, [("update_weights_from_ipc", [None, {}, True, None])])
-    assert primary == ["done"]
-    assert barrier.waits == 1
-
-
 # ── the untouched path ─────────────────────────────────────────────────────
 
 
