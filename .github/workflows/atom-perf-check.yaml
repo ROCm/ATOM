@@ -283,10 +283,27 @@ jobs:
           # halves hand ownership back as they go, but a job that died early
           # never got the chance, so the debris outlives it and lands on
           # whoever schedules here next. Clear it before checkout, not after.
+          #
+          # No --privileged. The container's root already carries CAP_CHOWN,
+          # which is all a chown over a bind mount needs, and these runners run
+          # a docker authorization plugin that refuses the flag outright:
+          #
+          #   authorization denied by plugin spur-authz: denied [P1]: --privileged
+          #
+          # The `|| true` then swallowed it, so this step reported success while
+          # doing nothing at all and the debris it exists to clear went on to
+          # kill the next job's checkout. Five of the ten cells of run
+          # 37909731003 died that way, before a line of this workflow ran.
           if [ -d "${GITHUB_WORKSPACE}" ]; then
-            docker run --rm -v "${GITHUB_WORKSPACE}":/workspace -w /workspace --privileged \
-              rocm/atom-dev:latest bash -lc \
-              "chown -R $(id -u):$(id -g) /workspace" || true
+            if ! docker run --rm -v "${GITHUB_WORKSPACE}":/workspace -w /workspace \
+                   rocm/atom-dev:latest bash -lc \
+                   "chown -R $(id -u):$(id -g) /workspace"; then
+              # Still not fatal -- a workspace that was already clean does not
+              # need this, and failing here would turn a healthy runner's
+              # transient docker hiccup into a lost cell. But it is said out
+              # loud, because the next step is the one that pays for it.
+              echo "::warning::could not reclaim ${GITHUB_WORKSPACE}; if checkout fails next, this is why"
+            fi
           fi
 
       - uses: actions/checkout@v4
