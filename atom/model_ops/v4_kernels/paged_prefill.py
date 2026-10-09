@@ -648,6 +648,16 @@ def sparse_attn_v4_paged_prefill(
     if unified_kv_rope is not None:
         # Native fp8 prefill (op4): 2buff fp8 prefix pool + op-quantized fp8 Q
         # and extend K fed directly. No dequant of the prefix, no torch quant.
+        #
+        # `out` must be forwarded here, exactly as the bf16 opus and Triton
+        # branches below do. Dropping it does not just cost an allocation: the
+        # mixed prefill+decode path hands `out` a slice of its combined output
+        # buffer, and when the kernel ignores it `_attn_core` falls back to
+        # `out.copy_(res)` — a full [T, H, 512] bf16 device-to-device copy of
+        # the prefill half, on every layer. Measured on V4-Pro tp8 with
+        # kv-cache fp8: 61 copies/step of 252 MiB, 5.98 ms/step, 42% of mixed's
+        # entire per-step overhead. Silent, because the caller only sees
+        # `_attn_core` return `out` after the copy.
         from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
         # aiter's asm kernel is signature-compatible with the OPUS one, so the
@@ -675,13 +685,13 @@ def sparse_attn_v4_paged_prefill(
             and q_packed.shape[1] == _PREFILL_ASM_HEADS
         ):
             try:
-                return mla_sparse_prefill_fp8_asm(*args)
+                return mla_sparse_prefill_fp8_asm(*args, out=out)
             except RuntimeError:
                 # The ASM path has stricter runtime dtype/shape constraints;
                 # OPUS covers configurations it cannot serve.
                 pass
 
-        return pa_sparse_prefill_fp8_opus(*args)  # [S, H, head_dim] bf16
+        return pa_sparse_prefill_fp8_opus(*args, out=out)  # [S, H, head_dim] bf16
     # Backend selection: prefer OPUS when available; fall back to Triton on
     # import failure, env override, or runtime error (e.g. unsupported GPU).
     # OPUS covers both archs: gfx950 from source, gfx1250 from a prebuilt code
