@@ -576,6 +576,21 @@ class RMSNormGated(nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
+        # The gate activation, as a name, for callers that introspect the
+        # module instead of the math. vLLM 0.31's Qwen GDN Triton warmup
+        # (model_executor/warmup/qwen_triton_warmup.py) reads
+        # `layer.norm.activation` to build its kernel config; 0.29 hard-coded
+        # "silu" there instead, so ATOM's module never needed to say so and
+        # 0.31 raised AttributeError during compile_or_warm_up_model, taking
+        # down every TP rank of the Qwen3.5-397B cell.
+        #
+        # "silu" is a statement of fact about this class, not a value chosen to
+        # silence the warmup: both forward paths apply silu to the gate
+        # unconditionally (`out = norm(x) * silu(z)` when norm_before_gate,
+        # else `norm(x * silu(z))`), and there is no setting that changes it.
+        # It is also exactly what 0.29 assumed, so the warmup compiles the same
+        # kernel config it did before.
+        self.activation = "silu"
         self.reset_parameters()
 
         # Determine if we should use fused FP8 group quantization
