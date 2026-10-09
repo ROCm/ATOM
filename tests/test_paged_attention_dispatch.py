@@ -957,8 +957,6 @@ class TestExplicitPlan:
         import torch
 
         from atom.model_ops import base_attention as ba
-        from atom.utils import forward_context as fc
-
         built = []
 
         def fake_plan(context_lens, num_kv_heads, **kw):
@@ -967,7 +965,9 @@ class TestExplicitPlan:
                 plan.refreshed += 1
                 return plan
             built.append(kw)
-            return _CountingPlan(int(context_lens.shape[0]))
+            plan = _CountingPlan(int(context_lens.shape[0]))
+            plan.max_partitions = kw.get("max_partitions") or 256
+            return plan
 
         monkeypatch.setattr(
             importlib.import_module("aiter.ops.flydsl.pa_decode"),
@@ -980,62 +980,161 @@ class TestExplicitPlan:
             "current_stream",
             lambda device=None: SimpleNamespace(cuda_stream=7),
         )
-        self._fc = fc
+        self.capturing = False
+        monkeypatch.setattr(
+            torch.cuda, "is_current_stream_capturing", lambda: self.capturing
+        )
         return ba, built
 
-    def _new_forward(self, monkeypatch):
-        ctx = SimpleNamespace()
-        monkeypatch.setattr(self._fc, "get_forward_context", lambda: ctx)
-
-    def _call(self, ba, refresh_once=False, existing_plan=None):
+    def _call(self, ba, owner=None, existing_plan=None, cap=8):
         import torch
 
         n = 16
         return ba._flydsl_prepare_explicit_plan(
             q=torch.empty((n, 16, 128), dtype=torch.bfloat16, device="meta"),
             k_cache=torch.empty((64, 1, 8, 16, 16), device="meta"),
-            block_tables=torch.empty((n, 128), device="meta"),
             context_lens=_Ctx(n),
             num_seqs=n,
             query_length=1,
-            max_context_partition_num=8,
+            plan_partition_cap=cap,
             sliding_window=0,
-            max_context_length=2048,
+            context_bound=2048,
             existing_plan=existing_plan,
-            refresh_once_per_forward=refresh_once,
+            plan_step_owner=owner,
         )
 
     def test_default_budget_needs_no_tuning_module(self, monkeypatch):
         """#5809 ships no tuned budgets and its old tuner module is gone."""
         ba, built = self._setup(monkeypatch)
         monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.pa_decode_tuning", None)
-        self._new_forward(monkeypatch)
         assert self._call(ba) is not None
         assert built and "workgroup_budget" not in built[0], built
 
     def test_a_fitting_capture_plan_is_used_as_is(self, monkeypatch):
         ba, built = self._setup(monkeypatch)
-        self._new_forward(monkeypatch)
         captured = _CountingPlan(16)
         assert self._call(ba, existing_plan=captured) is captured
         assert built == [] and captured.refreshed == 0
 
-    def test_sparse_plan_is_refreshed_once_per_forward(self, monkeypatch):
+    def test_sparse_plan_is_refreshed_once_per_step(self, monkeypatch):
         """All sparse layers of one step share lengths, so one refresh serves 57."""
         ba, _ = self._setup(monkeypatch)
-        self._new_forward(monkeypatch)
-        plans = [self._call(ba, refresh_once=True) for _ in range(57)]
+        step = SimpleNamespace()
+        plans = [self._call(ba, owner=step) for _ in range(57)]
         assert all(p is plans[0] for p in plans)
-        assert plans[0].refreshed == 0, "only the build may fill it in this forward"
-        self._new_forward(monkeypatch)  # next step: a new forward context
-        self._call(ba, refresh_once=True)
-        self._call(ba, refresh_once=True)
-        assert plans[0].refreshed == 1, "a new forward must refresh exactly once"
+        assert plans[0].refreshed == 0, "only the build may fill it in this step"
+        step = SimpleNamespace()  # next step: the builder makes new metadata
+        self._call(ba, owner=step)
+        self._call(ba, owner=step)
+        assert plans[0].refreshed == 1, "a new step must refresh exactly once"
+
+    def test_the_forward_context_is_not_the_step(self, monkeypatch):
+        """The vLLM plugin never sets ATOM's ForwardContext for this model.
+
+        A mark kept there outlives the step, and every later eager step would
+        run on the first step's lengths.
+        """
+        from atom.utils import forward_context as fc
+
+        ba, _ = self._setup(monkeypatch)
+        stale = SimpleNamespace()
+        monkeypatch.setattr(fc, "get_forward_context", lambda: stale)
+        plan = self._call(ba, owner=SimpleNamespace())
+        self._call(ba, owner=SimpleNamespace())
+        self._call(ba, owner=SimpleNamespace())
+        assert plan.refreshed == 2, "each step's metadata must refresh once"
+
+    def test_capture_records_its_own_refresh(self, monkeypatch):
+        """Warmup and capture share one metadata object and stream.
+
+        If the capture pass found the warmup's mark, no refresh would be
+        recorded and every replay would run on the warmup's dummy lengths.
+        """
+        ba, _ = self._setup(monkeypatch)
+        step = SimpleNamespace()
+        plan = self._call(ba, owner=step)  # warmup: builds it
+        self._call(ba, owner=step)
+        assert plan.refreshed == 0
+        self.capturing = True  # capture forward, same metadata
+        self._call(ba, owner=step)
+        self._call(ba, owner=step)
+        assert plan.refreshed == 1, "capture must record exactly one refresh"
+
+    def test_dense_runtime_plan_takes_the_aiter_ceiling(self, monkeypatch):
+        """Same ceiling as the capture-owned plans; sparse keeps its cap."""
+        ba, built = self._setup(monkeypatch)
+        assert self._call(ba, cap=None).max_partitions == 256
+        assert built[-1].get("max_partitions") is None, built[-1]
+        self._call(ba, cap=8)
+        assert built[-1].get("max_partitions") == 8, built[-1]
+
+    @staticmethod
+    def _call_kwargs(relpath, func):
+        """Keyword arguments of every call to ``func`` in an atom source file."""
+        import ast
+        import pathlib
+
+        import atom
+
+        src = (pathlib.Path(atom.__file__).parent / relpath).read_text()
+        calls = [
+            {k.arg: k.value for k in node.keywords}
+            for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.Call)
+            and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
+            == func
+        ]
+        assert calls, f"{relpath} no longer calls {func}; test moved"
+        return calls
+
+    def test_static_cap_callers_pass_their_split_count(self):
+        """Who keeps a static plan ceiling is a choice, not an invariant.
+
+        Sparse keeps it because each row's selected context is a bounded topk
+        window; the vLLM bridge keeps it until it is measured at aiter's
+        default. A later measurement may change either; this pins the current
+        choice so a change is deliberate. (The SGLang bridge computes in bf16,
+        which FlyDSL rejects, so it never plans.)
+        """
+        for relpath in (
+            "model_ops/minimax_m3/sparse_attn.py",
+            "plugin/vllm/attention/layer_mha.py",
+        ):
+            for kw in self._call_kwargs(relpath, "run_pa_decode"):
+                assert getattr(kw.get("plan_partition_cap"), "id", None) == (
+                    "max_context_partition_num"
+                ), f"{relpath}: plan cap is not the static split count"
+
+    def test_both_sparse_decode_sites_scope_refresh_to_the_step(self):
+        """Native and vLLM must hand their per-step decode metadata down.
+
+        Checks the argument only. That ``decode_md`` is built fresh every step
+        is the builders' doing: ``make_sparse_decode_metadata`` from
+        ``AiterAttentionMetadataBuilder.prepare_decode`` (native) and
+        ``MinimaxM3SparseAttentionMetadataBuilder.build`` (vLLM).
+        """
+        for relpath in (
+            "model_ops/attention_mha.py",
+            "plugin/vllm/attention/minimax_m3_attnetion.py",
+        ):
+            for kw in self._call_kwargs(relpath, "minimax_m3_sparse_attn_decode_asm"):
+                assert getattr(kw.get("plan_step_owner"), "id", None) == (
+                    "decode_md"
+                ), f"{relpath}: sparse decode does not pass its step metadata"
+
+    def test_step_scoped_and_per_call_plans_do_not_share(self, monkeypatch):
+        """A per-call caller of the same shape must not touch the step's plan."""
+        ba, _ = self._setup(monkeypatch)
+        step = SimpleNamespace()
+        sparse = self._call(ba, owner=step)
+        other = self._call(ba)  # e.g. a draft layer: same shape, no owner
+        assert other is not sparse
+        self._call(ba, owner=step)
+        assert sparse.refreshed == 0, "the step's plan was refreshed by another"
 
     def test_without_the_opt_in_every_call_refreshes(self, monkeypatch):
         """Dense eager / plugin callers do not promise shared lengths."""
         ba, _ = self._setup(monkeypatch)
-        self._new_forward(monkeypatch)
         plans = [self._call(ba) for _ in range(3)]
         assert plans[0].refreshed == 2
 
@@ -1083,6 +1182,91 @@ class TestPlanBatchLimit:
             exp_sums=meta(n, 1, 8, 16),
             max_logits=meta(n, 1, 8, 16),
             temporary_output=meta(n, 1, 8, 16, 128),
+        )
+        assert seen, "gluon was not called"
+
+    def test_dense_call_leaves_the_plan_ceiling_to_aiter(self, monkeypatch):
+        """The static split count must not become the runtime plan's ceiling."""
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        n = 4
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL_PLAN", True)
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def record(**kw):
+            seen.update(kw)
+            raise _Stop
+
+        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", record)
+        meta = lambda *shape: torch.empty(shape, device="meta")  # noqa: E731
+        with pytest.raises(_Stop):
+            ba.run_pa_decode(
+                output=meta(n, 16, 128),
+                q=meta(n, 16, 128),
+                k_cache=meta(8, 1, 8, 16, 16),
+                v_cache=meta(8, 1, 1, 128, 16),
+                context_lens=meta(n),
+                block_tables=meta(n, 8),
+                softmax_scale=1.0,
+                max_seqlen_q=1,
+                max_context_partition_num=8,
+                context_partition_size=256,
+                compute_type=torch.bfloat16,
+                q_scale=None,
+                k_scale=None,
+                v_scale=None,
+                exp_sums=meta(n, 1, 8, 16),
+                max_logits=meta(n, 1, 8, 16),
+                temporary_output=meta(n, 1, 8, 16, 128),
+            )
+        assert seen["plan_partition_cap"] is None, seen
+
+    def test_bound_below_the_query_window_takes_gluon(self, monkeypatch):
+        """An all-padding step (max_seqlen_k 0) must not raise in the worker."""
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        n = 4
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL_PLAN", True)
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
+
+        def no_flydsl(**kw):
+            raise AssertionError("routed to FlyDSL with a bound below the query")
+
+        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", no_flydsl)
+        seen = []
+        monkeypatch.setattr(
+            torch.ops.aiter, "pa_decode_gluon", lambda *a, **kw: seen.append(1)
+        )
+        meta = lambda *shape: torch.empty(shape, device="meta")  # noqa: E731
+        ba.run_pa_decode(
+            output=meta(n * 4, 16, 128),
+            q=meta(n * 4, 16, 128),
+            k_cache=meta(8, 1, 8, 16, 16),
+            v_cache=meta(8, 1, 1, 128, 16),
+            context_lens=meta(n),
+            block_tables=meta(n, 8),
+            softmax_scale=1.0,
+            max_seqlen_q=4,
+            max_context_partition_num=8,
+            context_partition_size=256,
+            compute_type=torch.bfloat16,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+            exp_sums=meta(n, 1, 8, 64),
+            max_logits=meta(n, 1, 8, 64),
+            temporary_output=meta(n, 1, 8, 64, 128),
+            max_context_length=0,
         )
         assert seen, "gluon was not called"
 

@@ -1315,6 +1315,7 @@ def minimax_m3_sparse_attn_decode_asm(
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+    plan_step_owner=None,
 ) -> None:
     """Block-sparse decode attention over the page-16 SHUFFLE KV cache.
 
@@ -1338,9 +1339,13 @@ def minimax_m3_sparse_attn_decode_asm(
             topk_idx, block_table, seq_lens, block_page_stride=block_page_stride
         )
 
-    # Every sparse layer of one decode step selects the same per-row lengths
-    # (checked: 0 differences over 9,000 C15 steps x 56 layer pairs), so the
-    # FlyDSL plan is refreshed by the first sparse layer only.
+    # Every sparse layer of one decode step selects the same per-row lengths:
+    # the local tail block is always selected, so a row's length depends only
+    # on its seq_len (checked: 0 differences over 9,000 C15 steps x 56 layer
+    # pairs). This holds while all sparse layers share topk / init / local
+    # blocks, as MiniMax-M3 does; a per-layer selection config would break it.
+    # With the step's metadata as ``plan_step_owner`` the FlyDSL plan is
+    # refreshed by the first sparse layer only.
     _sparse_pa_per_row(
         q,
         k_cache,
@@ -1352,7 +1357,7 @@ def minimax_m3_sparse_attn_decode_asm(
         output,
         k_scale,
         v_scale,
-        refresh_plan_once=True,
+        plan_step_owner=plan_step_owner,
     )
 
 
@@ -1368,7 +1373,7 @@ def _sparse_pa_per_row(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
-    refresh_plan_once: bool = False,
+    plan_step_owner=None,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and Gluon else.
 
@@ -1459,7 +1464,10 @@ def _sparse_pa_per_row(
         sinks=None,
         sliding_window=-1,
         ps=True,
-        refresh_once_per_forward=refresh_plan_once,
+        plan_step_owner=plan_step_owner,
+        # Sparse keeps its small static cap: each row's selected context is a
+        # bounded topk window, unlike the dense planner's long-tail lengths.
+        plan_partition_cap=max_context_partition_num,
     )
 
 

@@ -836,7 +836,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
-            # Plans are only ever minted during cudagraph capture, where the
+            # This builder mints plans only during cudagraph capture, where the
             # batch is a ladder rung and the cost lands at startup. aiter's
             # planner takes batch as a tl.constexpr, so a new value is a kernel
             # specialization -- 65-72 ms cold -- and a plan that is never freed

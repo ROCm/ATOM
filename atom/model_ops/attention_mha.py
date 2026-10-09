@@ -1679,6 +1679,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=v_scale,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            plan_step_owner=decode_md,
         )
         self._index_q = None
         self._index_q_cache_key_info = None

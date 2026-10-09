@@ -344,15 +344,12 @@ def _flydsl_context_bound(max_context_length, block_tables, k_cache):
     return min(bound, capacity)
 
 
-def _flydsl_forward_refreshed() -> set:
-    """Runtime-plan keys already refreshed in the current forward."""
-    from atom.utils.forward_context import get_forward_context
-
-    ctx = get_forward_context()
-    refreshed = getattr(ctx, "_flydsl_refreshed_plans", None)
+def _flydsl_step_refreshed(step_owner) -> set:
+    """Runtime-plan marks already refreshed in the step ``step_owner`` spans."""
+    refreshed = getattr(step_owner, "_flydsl_refreshed_plans", None)
     if refreshed is None:
         refreshed = set()
-        ctx._flydsl_refreshed_plans = refreshed
+        step_owner._flydsl_refreshed_plans = refreshed
     return refreshed
 
 
@@ -360,42 +357,39 @@ def _flydsl_prepare_explicit_plan(
     *,
     q,
     k_cache,
-    block_tables,
     context_lens,
     num_seqs,
     query_length,
-    max_context_partition_num,
+    plan_partition_cap,
     sliding_window,
-    max_context_length,
+    context_bound,
     existing_plan,
-    refresh_once_per_forward=False,
+    plan_step_owner=None,
 ):
     """Return the explicit plan aiter #5809 requires for this call.
 
     Plans use aiter's default workgroup budget (2*CU); #5809 ships no tuned
-    budgets.
+    budgets. ``plan_partition_cap`` None takes aiter's default partition
+    ceiling, as the capture-owned plans do.
 
-    ``refresh_once_per_forward``: the caller guarantees every call sharing this
-    plan within one forward has identical lengths (MiniMax-M3 sparse decode:
-    all sparse layers of a step select the same per-row lengths), so the plan
-    is refreshed by the first such call only -- one planner launch per step
-    instead of one per layer, in eager and in the captured graph alike.
+    ``plan_step_owner``: an object the caller creates fresh every step (its
+    per-step metadata) and whose calls all share identical lengths (MiniMax-M3
+    sparse decode: every sparse layer of a step selects the same per-row
+    lengths). The plan is then refreshed by the first such call only -- one
+    planner launch per step instead of one per layer, in eager and in the
+    captured graph alike. None refreshes on every call.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
     device = q.device
     num_kv_heads = int(k_cache.shape[1])
     window = max(int(sliding_window), 0)
-    max_partitions = (
-        int(existing_plan.max_partitions)
-        if existing_plan is not None
-        else int(max_context_partition_num)
-    )
-    context_bound = _flydsl_context_bound(
-        max_context_length, block_tables, k_cache
-    )
-    if context_bound < query_length:
-        raise ValueError("max_context_length must cover every query token")
+    if existing_plan is not None:
+        max_partitions = int(existing_plan.max_partitions)
+    elif plan_partition_cap is not None:
+        max_partitions = int(plan_partition_cap)
+    else:
+        max_partitions = None
 
     if (
         existing_plan is not None
@@ -411,7 +405,9 @@ def _flydsl_prepare_explicit_plan(
     # actual serialization boundary: calls on one stream may safely refresh and
     # reuse the same plan, while TBO's concurrent streams must not share it.
     # The remaining dimensions are bounded execution shapes, independent of
-    # allocator addresses.
+    # allocator addresses. A step-scoped plan is kept apart from per-call ones:
+    # a per-call caller of the same shape in between would otherwise leave the
+    # remaining step-scoped calls on its lengths.
     stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
     plan_key = (
         stream_id,
@@ -421,14 +417,19 @@ def _flydsl_prepare_explicit_plan(
         max_partitions,
         window,
         device.index,
+        plan_step_owner is not None,
     )
     plan = _FLYDSL_RUNTIME_PLANS.get(plan_key)
     lengths = context_lens[:num_seqs]
-    if refresh_once_per_forward:
-        refreshed = _flydsl_forward_refreshed()
-        if plan is not None and plan_key in refreshed:
+    if plan_step_owner is not None:
+        # Capture runs an eager warmup and the capture forward with the same
+        # metadata and stream; keying on the capture state makes the capture
+        # pass record its own refresh, so every replay re-plans.
+        refreshed = _flydsl_step_refreshed(plan_step_owner)
+        mark = (plan_key, torch.cuda.is_current_stream_capturing())
+        if plan is not None and mark in refreshed:
             return plan
-        refreshed.add(plan_key)
+        refreshed.add(mark)
     if plan is None:
         plan = plan_pa_decode(
             lengths,
@@ -445,7 +446,7 @@ def _flydsl_prepare_explicit_plan(
             query_length,
             context_bound,
             num_kv_heads,
-            max_partitions,
+            int(plan.max_partitions),
             int(plan.capacity),
         )
     else:
@@ -484,7 +485,8 @@ def run_pa_decode(
     ps: bool = True,
     work_plan=None,
     max_context_length: int | None = None,
-    refresh_once_per_forward: bool = False,
+    plan_step_owner=None,
+    plan_partition_cap: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -523,6 +525,15 @@ def run_pa_decode(
     # rows). Gluon has no such bound.
     if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
         flydsl_seqs = None
+    # Resolved only on the FlyDSL path, so a deployment with FlyDSL off pays
+    # nothing. A bound below the query window (e.g. an all-padding step) is
+    # outside FlyDSL's contract; gluon takes it.
+    if flydsl_seqs:
+        context_bound = _flydsl_context_bound(
+            max_context_length, block_tables, k_cache
+        )
+        if context_bound < max_seqlen_q:
+            flydsl_seqs = None
     # Inside the guard, not before it: this runs 63 times per decode step and
     # attention is a piecewise split op, so graph replay does not elide it. A
     # deployment that never enables FlyDSL should pay nothing here.
@@ -557,10 +568,6 @@ def run_pa_decode(
     if flydsl_seqs:
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
-        max_context_length = _flydsl_context_bound(
-            max_context_length, block_tables, k_cache
-        )
-
         n = flydsl_seqs
         # Handed in by the caller off the ForwardContext it already holds, not
         # re-read from the thread-local one: under TBO a worker thread that
@@ -594,28 +601,23 @@ def run_pa_decode(
         work_plan = _flydsl_prepare_explicit_plan(
             q=q,
             k_cache=k_cache,
-            block_tables=block_tables[:n],
             context_lens=context_lens,
             num_seqs=n,
             query_length=max_seqlen_q,
-            max_context_partition_num=max_context_partition_num,
+            plan_partition_cap=plan_partition_cap,
             sliding_window=sliding_window,
-            max_context_length=max_context_length,
+            context_bound=context_bound,
             existing_plan=work_plan,
-            refresh_once_per_forward=refresh_once_per_forward,
+            plan_step_owner=plan_step_owner,
         )
-        if work_plan is None:
-            es, ml, tmp = exp_sums[:n], max_logits[:n], temporary_output[:n]
-        else:
-            nkv = k_cache.shape[1]
-            es, ml, tmp = _flydsl_plan_scratch(
-                work_plan,
-                max_seqlen_q,
-                q.shape[-2] // nkv,
-                q.shape[-1],
-                output.dtype,
-                context_lens.device,
-            )
+        es, ml, tmp = _flydsl_plan_scratch(
+            work_plan,
+            max_seqlen_q,
+            q.shape[-2] // k_cache.shape[1],
+            q.shape[-1],
+            output.dtype,
+            context_lens.device,
+        )
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
@@ -640,7 +642,7 @@ def run_pa_decode(
             sinks=sinks,
             sliding_window=0,
             work_plan=work_plan,
-            max_context_length=max_context_length,
+            max_context_length=context_bound,
         )
 
     return torch.ops.aiter.pa_decode_gluon(
