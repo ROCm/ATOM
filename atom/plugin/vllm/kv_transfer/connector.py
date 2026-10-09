@@ -1978,6 +1978,34 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return True
         return bool(self._deferred_frees or self._releases_in_flight)
 
+    def has_pending_block_frees(self) -> bool:
+        """Blocks a transfer still in flight is about to hand back (vLLM 0.31).
+
+        vLLM asks this when an allocation just failed, immediately before it
+        would preempt a running request to make room (`Scheduler.schedule`,
+        0.31). True means "wait a step, these are coming back"; the default
+        False means every such moment costs a preemption that one step would
+        have avoided.
+
+        Three sources, and the third is the one a reader would miss: a save
+        holds its source blocks by refcount with the request already finished
+        and its table returned, so nothing in vLLM's view of that request says
+        those blocks are spoken for. `has_pending_push_work` does not count
+        them -- it answers a different question (is the engine owed a step at
+        all) and a lease does not owe one, because the next request's step
+        drains it.
+        """
+        if self._deferred_frees or self._releases_in_flight:
+            return True
+        if self._kda_planner is not None and self._kda_planner.has_pending_work():
+            return True
+        scheduler = self._scheduler
+        return bool(
+            scheduler is not None
+            and getattr(scheduler, "has_active_save_leases", None) is not None
+            and scheduler.has_active_save_leases()
+        )
+
     # Steps a promised load may go undispatched before it is called out. Loads
     # are emitted on the step after the promise, so anything past a handful of
     # steps is already wrong; the margin is only so a busy scheduler does not
@@ -2296,9 +2324,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                     self._scheduler.activate_block_leases(seq, frozenset(protected))
                     self._seqs.drop(req_id)
                     # False: vLLM frees the table now, and the refcounts taken
-                    # above keep exactly the blocks the save still reads.
-                    # `has_pending_work()` already counts `_save_lease_blocks`,
-                    # so the engine keeps stepping until they are handed back.
+                    # above keep exactly the blocks the save still reads. They
+                    # are reported through `has_pending_block_frees` so an
+                    # allocation that just failed waits for them instead of
+                    # preempting; `reclaim_stale_leases` bounds the wait if the
+                    # save never reports.
                     return False, None
                 # vLLM will not ask a second time -- it holds the blocks until
                 # the connector names the id in `finished_sending`, and

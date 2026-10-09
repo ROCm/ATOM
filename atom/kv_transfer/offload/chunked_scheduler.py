@@ -1011,6 +1011,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._save_lease_at.setdefault(lease_key, time.monotonic())
             self.total_leased_source_blocks += len(added)
 
+    def has_active_save_leases(self) -> bool:
+        """Whether any block lease is still held for a save in flight.
+
+        These blocks are protected by a refcount rather than by vLLM holding
+        the request, so nothing about the request's state says they exist. The
+        connector reports them to vLLM as pending frees: they are precisely
+        "blocks a pending transfer will release", which is what lets the
+        scheduler wait a step instead of preempting a running request to make
+        room.
+        """
+        return bool(self._save_lease_blocks)
+
     def take_source_safe_releases(self) -> list[frozenset]:
         """Drain block-ID sets whose lease became source-safe since the last poll."""
         out = self._pending_source_safe_releases
