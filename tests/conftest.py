@@ -12,6 +12,7 @@
 # import here is a declared dependency, so a plain CPU runner has them.
 
 import dataclasses
+import logging
 import sys
 from itertools import count
 from pathlib import Path
@@ -156,6 +157,27 @@ def reset_sequence_counter():
     Sequence.counter = count()
     yield
     Sequence.counter = count()
+
+
+@pytest.fixture(autouse=True)
+def capture_atom_logs_without_root_propagation(request):
+    """Keep ``caplog`` useful after the production logger stops propagating.
+
+    Pytest's capture handler normally lives on the root logger. Tests that ask
+    for ``caplog`` need that same handler attached directly to ``atom`` now
+    that production records intentionally stop at ATOM's own handler.
+    """
+    if "caplog" not in request.fixturenames:
+        yield
+        return
+
+    caplog = request.getfixturevalue("caplog")
+    atom_logger = logging.getLogger("atom")
+    atom_logger.addHandler(caplog.handler)
+    try:
+        yield
+    finally:
+        atom_logger.removeHandler(caplog.handler)
 
 
 def _duplicated_atom_classes():
