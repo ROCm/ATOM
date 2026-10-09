@@ -558,6 +558,24 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # crashes profile_run:
             #     spec_hidden_states = pre_hc_hidden_states[: ...]
             #     TypeError: 'NoneType' object is not subscriptable
+            #
+            # KNOWN DIVERGENCE on vLLM 0.31, latent today. This binds the hook
+            # to the INSTANCE, but model runner V2 decides whether to widen the
+            # drafter's hidden buffer by hc_mult from the CLASS, before the
+            # target exists: _target_feeds_hc_residual() in
+            # vllm/v1/worker/gpu/spec_decode/speculator.py does
+            # `hasattr(get_model_cls(...), "get_mtp_target_hidden_states")`.
+            # The class-level test is False, so the buffer is sized for
+            # `hidden`, while the V2 runner then finds the method on the
+            # instance and feeds it the (T, hc_mult * hidden) pre-hc residual.
+            # DeepSeek-V4 is in ROCM_DEFAULT_MRV1_ARCHITECTURES, so it runs V1
+            # on ROCm and this does not fire; it would under
+            # VLLM_USE_V2_MODEL_RUNNER=1, or if V1 became unsupported for a
+            # config. Making the two agree means exposing the method on the
+            # registered class for the V4 architectures only -- the condition
+            # above is per-instance, and a wider exposure is exactly the
+            # profile_run crash this comment opens with. Not done here because
+            # no CI cell runs V4 under V2, so the change would ship unmeasured.
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
