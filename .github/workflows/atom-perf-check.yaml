@@ -39,7 +39,8 @@ name: ATOM Perf Check (PR)
 # runners -- 297s median against a 369s DeepSeek-V4-Pro cell, measured from 31
 # jobs of ATOM Benchmark run 35121706150 -- and this job pays it three times.
 # The trade is a 20.2% slower benchmark and absolute numbers that no longer
-# line up with the dashboard; the net is about 12 minutes off a DeepSeek job.
+# line up with the dashboard; the net is about 13 minutes off a DeepSeek job at
+# c=32 and 9 at c=256, measured rather than projected.
 # Clear the variable to measure on real weights. Full rationale, measurements
 # and caveats live next to the append point in perf_check_half.sh.
 #
@@ -102,9 +103,12 @@ env:
   # prompts and identical output lengths. Workload sampling contributes nothing
   # to the delta at either length -- the shorter window averages run-level
   # noise (thermal, clock, scheduling) over less time, and nothing else.
-  # Whether that alone widens the spread past the +-1.8 this check documents is
-  # not yet measured at x4; a run whose levels wander further than that is the
-  # signal to put this back.
+  #
+  # Measured since: on mi355-gpu-41 three readings of one commit spanned 0.34
+  # points, and in CI the shipped matrix gave -1.1 to +2.4 across ten A/A
+  # readings. RESIDUAL_SPREAD_PCT follows that at 2.5. The linearity holds at
+  # this level too -- one wave took 78.01s and four took 311.60s, 0.13% off
+  # four times the first.
   #
   # What it does not touch: the CONC * 2 `--num-warmups` atom_test.sh runs
   # before the measured window, and server launch and teardown -- 325s per
@@ -129,9 +133,16 @@ env:
   # The residual it leaves is not resolved. Two A/A runs at 1 gave -1.66% and
   # +0.07% on identical code, against -0.21% for a single run at 10: the spread
   # between two runs of the same setting (1.73 points) is larger than the gap
-  # between settings, so n=2 cannot separate them. Both sit inside the +-1.8
-  # RESIDUAL_SPREAD_PCT this check already documents. Raise this back to 10 if
-  # a run shows levels wandering further than that.
+  # between settings, so n=2 cannot separate them. Both sit inside the +-2.5
+  # RESIDUAL_SPREAD_PCT this check documents.
+  #
+  # One cell argues against this setting and is not yet explained:
+  # GLM-5.2-FP8 at c=256 read +2.4% and +2.1% on identical code in runs
+  # 37892302140 and 37913287573, with TTFT and TPOT agreeing both times. A bias
+  # that repeats in one direction is not the spread this constant covers -- it
+  # is the second-half advantage the warmup exists to remove, still present at
+  # this length for that cell. Raise this to 10 for that entry, or for all of
+  # them, once a run has shown whether the longer warmup removes it.
   #
   # Not PERF_-prefixed like the others: workflow-level env is inherited
   # straight into every step, and perf_check_half.sh reads this name, so
@@ -260,6 +271,27 @@ jobs:
             docker image prune -af --filter "until=720h" || true
             docker builder prune -af --filter "until=720h" || true
             docker system df || true
+
+            # The 30-day filter can exclude everything there is. pit2-p03-g24
+            # sat at 100% of 28T with 53 images, 849.7GB, none of them active
+            # and none of them older than 30 days: the guard above correctly
+            # said the disk was short and then reclaimed 0B, three runs in a
+            # row, while every cell scheduled there died in the model download.
+            #
+            # So escalate only when the first pass left the disk genuinely
+            # critical, and escalate by narrowing the window rather than
+            # dropping it -- `-a` already restricts this to images no container
+            # is using, and anything it removes is re-pullable. Still a cost to
+            # whoever pulls next on this runner, which is why it is tied to
+            # "about to fail anyway" rather than to the 500 GiB comfort mark.
+            available_kb="$(df -Pk "${docker_root}" 2>/dev/null | awk 'NR == 2 {print $4}' || true)"
+            critical_kb=$((200 * 1024 * 1024))
+            if [ "${available_kb:-0}" -lt "${critical_kb}" ]; then
+              echo "Still under 200 GiB free -- pruning unused images older than 24h"
+              docker image prune -af --filter "until=24h" || true
+              docker builder prune -af --filter "until=24h" || true
+              docker system df || true
+            fi
           else
             echo "Docker root has at least 500 GiB free"
           fi
