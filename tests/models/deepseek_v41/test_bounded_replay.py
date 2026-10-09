@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Decoder SWA bounded replay (`models/deepseek_v41/bounded_replay.py`)."""
 
+from itertools import pairwise
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
+# the index builders import Triton at module scope; the non-GPU job has none
+pytest.importorskip("triton")
+
+from atom.model_ops.attentions.deepseek_v41.metadata import (
+    BatchStep,
+    RequestSpan,
+)
 from atom.models.deepseek_v41.bounded_replay import (
     decoder_replay_unsupported,
     late_layer_start,
@@ -48,11 +55,11 @@ def test_tail_layout_keeps_each_requests_last_rows():
 
 
 def _config(**overrides):
-    config = dict(
-        num_hidden_layers=40,
-        kv_source_layer_ids=[2, 8, 14, 20],
-        engram_layer_ids=[1, 14],
-    )
+    config = {
+        "num_hidden_layers": 40,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "engram_layer_ids": [1, 14],
+    }
     config.update(overrides)
     return SimpleNamespace(**config)
 
@@ -80,19 +87,19 @@ def test_both_index_builders_floor_the_window_at_the_replay_start():
     """`_indptr_scan` counts each row's window from the same first position
     `_indices` writes it from; a drift between the two leaves holes or
     overruns in the prefix plane."""
-    from atom.model_ops.attentions.deepseek_v41.indices import _indices, _indptr_scan
+    from atom.model_ops.attentions.deepseek_v41.indices import _indptr_scan
 
     window, tokens = 128, 40
     # two prefill requests whose tails start at positions 500 and 90; the
     # second keeps its whole history (replay start 0)
     lengths, starts, floors = [24, 16], [500, 90], [500, 0]
     batches = torch.tensor(
-        sum(([b] * n for b, n in enumerate(lengths)), []),
+        [b for b, n in enumerate(lengths) for _ in range(n)],
         dtype=torch.int32,
         device="cuda",
     )
     positions = torch.tensor(
-        sum((list(range(s, s + n)) for s, n in zip(starts, lengths)), []),
+        [p for s, n in zip(starts, lengths) for p in range(s, s + n)],
         dtype=torch.int32,
         device="cuda",
     )
@@ -144,7 +151,7 @@ def test_a_replay_start_keeps_the_suffix_of_each_rows_window():
         step.indptrs = fill_step_indptrs(step, geo, cache.indptr_buffers)
         prefix, pptr, _, _ = cache.attention_indices(spec, step)
         bounds = pptr.tolist()
-        return [prefix[a:b].tolist() for a, b in zip(bounds, bounds[1:])]
+        return [prefix[a:b].tolist() for a, b in pairwise(bounds)]
 
     step = begin_step(cache, requests)
     full = segments(step)

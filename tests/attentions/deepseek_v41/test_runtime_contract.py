@@ -135,7 +135,6 @@ def test_lmcache_mp_is_the_only_kv_transfer_admitted():
         )
 
 
-
 def _attach_uncompiled_stages(model):
     """The runtime model's two compiled layer stages, built bare and run
     uncompiled, for a model assembled without its constructor."""
@@ -149,6 +148,7 @@ def _attach_uncompiled_stages(model):
         stage.__dict__["owner"] = model
         stage.first = stage.last = len(model.layers)
         setattr(model, name, stage)
+
 
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     PagedAttentionCache, DeepseekV41RuntimeModel = _runtime_pieces()
