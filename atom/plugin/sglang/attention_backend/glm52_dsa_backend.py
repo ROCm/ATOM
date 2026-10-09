@@ -338,7 +338,14 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                     f"Missing GLM target-verify graph metadata for batch size {bs}"
                 )
             total_tokens = bs * draft_token_num
-            positions = forward_batch.positions[:total_tokens]
+            positions = getattr(forward_batch, "positions", None)
+            if not torch.is_tensor(positions):
+                graph_runner = getattr(self.model_runner, "graph_runner", None)
+                buffers = getattr(graph_runner, "buffers", None)
+                positions = getattr(buffers, "positions", None)
+            if not torch.is_tensor(positions):
+                raise RuntimeError("GLM target-verify graph replay requires positions")
+            positions = positions[:total_tokens]
             metadata_batch = SimpleNamespace(
                 forward_mode=forward_mode,
                 actual_forward_mode=getattr(
