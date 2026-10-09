@@ -318,7 +318,7 @@ class CoreManager:
                 f"Enable dp attention, using {local_engine_count} data parallel ranks"
             )
             # Under DP-attention every TP rank becomes its own DP rank.
-            config.parallel_config.data_parallel_size = config.attention_dp_size
+            config.parallel_config.data_parallel_size *= config.tensor_parallel_size
             config.parallel_config.data_parallel_size_local = local_engine_count
             if multinode:
                 config.parallel_config.data_parallel_rank *= config.tensor_parallel_size
