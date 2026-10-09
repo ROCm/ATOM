@@ -1589,7 +1589,10 @@ jobs:
           set -euo pipefail
           target=.github/scripts/atomesh/mooncake-dist
           mkdir -p "${target}"
-          gh api repos/kvcache-ai/Mooncake/actions/artifacts/11593557642/zip > "${target}/wheel.zip"
+          curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/kvcache-ai/Mooncake/actions/artifacts/11593557642/zip \
+            -o "${target}/wheel.zip"
           python3 - "${target}" <<'PYWHEEL'
           import hashlib, sys, zipfile
           from pathlib import Path
