@@ -1303,6 +1303,11 @@ class KimiKDAAttention(nn.Module):
             ssm_state[state_indices] = last_state
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
+            assert kda_out.dtype == fused_in.dtype, (
+                "KDA output dtype must match the former fused_in-backed output "
+                f"buffer: got {kda_out.dtype} vs {fused_in.dtype}"
+            )
+            assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
             out = kda_out.squeeze(0)
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
