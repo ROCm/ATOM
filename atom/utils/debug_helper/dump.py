@@ -100,6 +100,8 @@ def _tensor_fields(obj) -> dict:
     Returns {} for plain tensors/tuples — there is nothing extra to say about
     those beyond what `_output_tensor` already picked.
     """
+    if isinstance(obj, torch.Tensor):
+        return {}
     if isinstance(obj, (tuple, list)):
         for item in obj:
             if not isinstance(item, torch.Tensor):
@@ -111,7 +113,17 @@ def _tensor_fields(obj) -> dict:
     for name in getattr(obj, "__dataclass_fields__", ()) or dir(obj):
         if name.startswith("_"):
             continue
-        val = getattr(obj, name, None)
+        # A non-dataclass state object is walked via `dir()`, which surfaces
+        # properties that raise on access (`Tensor.imag` on a real dtype, a
+        # lazily-built view whose backing buffer is unbound). A dump helper
+        # must never be the thing that kills the forward pass.
+        # Blind catch + silent skip on purpose: the raising property is not the
+        # subject of the dump, and logging one line per attribute per layer per
+        # forward would bury the dump it is meant to support.
+        try:
+            val = getattr(obj, name, None)
+        except Exception:  # noqa: BLE001, S112
+            continue
         if isinstance(val, torch.Tensor):
             out[name] = val.detach().cpu()
     return out
@@ -155,6 +167,11 @@ def install_block_forward_hooks(model: torch.nn.Module) -> int:
         one_shot_fname = base + ".pt"
 
         def _hook(_mod, args, output):
+            # A D2H copy is illegal mid-capture and aborts the whole graph.
+            # CUDAGraph replay reruns the captured kernels without invoking
+            # Python hooks anyway, so there is nothing to dump on this path.
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                return
             if one_shot:
                 if os.path.exists(one_shot_fname):
                     return

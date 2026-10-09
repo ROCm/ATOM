@@ -1,0 +1,845 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""CPU tests for M3/dense PAGE early block release."""
+
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+import torch
+from conftest import MockConfig
+
+from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+from atom.kv_transfer.disaggregation.types import (
+    ConnectorCompletion,
+    KVConnectorOutput,
+    SaveOperationId,
+    SaveSourceGroupId,
+)
+from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import (
+    BlockGPUConnector,
+    _TransferChunk,
+    _TransferGroup,
+)
+from atom.kv_transfer.offload.dense.connector import (
+    DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
+    DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+    DENSE_PAGE_STORE_CHANNEL,
+    DenseOffloadConnector,
+    DenseOffloadScheduler,
+)
+from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.sequence import Sequence
+
+
+def _config(role="kv_producer", *, block_size=4):
+    return SimpleNamespace(
+        kv_transfer_config={"kv_role": role},
+        kv_cache_block_size=block_size,
+        decode_context_parallel_size=1,
+        tensor_parallel_size=1,
+    )
+
+
+def _early_release_scheduler(monkeypatch, role="kv_producer", *, chunk_size=8):
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(chunk_size=chunk_size),
+    )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
+    scheduler = DenseOffloadScheduler(_config(role))
+    assert scheduler._early_release is True
+    return scheduler
+
+
+def _seq(req_id, num_prompt_tokens, num_blocks):
+    return SimpleNamespace(
+        id=req_id,
+        num_cached_tokens=0,
+        num_prompt_tokens=num_prompt_tokens,
+        token_ids=list(range(num_prompt_tokens)),
+        block_table=list(range(num_blocks)),
+    )
+
+
+def _source_safe(operation, *ranges):
+    return ConnectorCompletion(
+        DENSE_PAGE_SOURCE_SAFE_CHANNEL,
+        SaveSourceGroupId(operation, tuple(ranges)),
+        True,
+    )
+
+
+def _store_terminal(operation, succeeded=True):
+    return ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, succeeded)
+
+
+def _source_quiescent(operation):
+    return ConnectorCompletion(DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True)
+
+
+def _finish_and_lease(scheduler, seq):
+    scheduler.request_finished(seq)
+    protected = scheduler.protected_block_ids(seq)
+    assert protected is not None
+    scheduler.activate_block_leases(seq, protected)
+    return protected
+
+
+def _resident_sequence(scheduler, req_id, num_prompt_tokens, num_blocks):
+    """Build a real hashed prefix so late-save admission can reacquire it."""
+    bm = BlockManager(
+        MockConfig(
+            num_kvcache_blocks=max(32, num_blocks + 8),
+            kv_cache_block_size=4,
+            enable_prefix_caching=True,
+        )
+    )
+    seq = Sequence(list(range(num_prompt_tokens)), 4, id=req_id)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    table = list(seq.block_table)
+    bm.hash_blocks(seq, num_prompt_tokens, start_tokens=0)
+    scheduler.bind_block_manager(bm)
+    return bm, seq, table
+
+
+class TestBlockPoolLeaseOwnership:
+    def test_12_block_request_releases_b9_through_b12_immediately(self, seq_factory):
+        bm = BlockManager(MockConfig(num_kvcache_blocks=16, kv_cache_block_size=1))
+        seq = seq_factory(list(range(12)))
+        bm.allocate(seq)
+        protected = frozenset(seq.block_table[:8])
+        unprotected = list(seq.block_table[8:])
+
+        bm.deallocate_partial(seq, protected)
+
+        assert bm.kv.num_used == 8
+        assert not seq.block_table
+        for block_id in protected:
+            assert bm.kv.block(block_id).ref_count == 1
+        for block_id in unprotected:
+            assert bm.kv.block(block_id).ref_count == 0
+
+        bm.free_leased_blocks(protected)
+        assert bm.kv.num_used == 0
+
+
+class TestSourceSafeBoundary:
+    def test_worker_reports_source_safe_and_store_failure_separately(self):
+        worker = DenseOffloadConnector.__new__(DenseOffloadConnector)
+        worker._early_release = True
+        worker._lock = threading.Lock()
+        worker._done_save = set()
+        worker._done_load = set()
+        worker._failed_load = set()
+        worker._connector_completions = set()
+        operation = SaveOperationId("r", 6)
+        identity = SaveSourceGroupId(operation, ((0, 8),))
+
+        worker._source_group_safe(identity)
+        worker._record_store_terminal(
+            SimpleNamespace(save_operation=operation, req_id="r"), False
+        )
+        output = worker.get_finished()
+
+        assert output.finished_saving == {operation}
+        assert output.connector_completions == {
+            ConnectorCompletion(DENSE_PAGE_SOURCE_SAFE_CHANNEL, identity, True),
+            ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, False),
+        }
+
+    def test_gpu_connector_reports_only_after_staging_group_fence(self):
+        codec = SimpleNamespace(device=torch.device("cpu"), bytes_per_block=4)
+        reported = []
+        order = []
+
+        def report(identity):
+            order.append("source_safe")
+            reported.append(identity)
+
+        connector = BlockGPUConnector(
+            codec,
+            4,
+            chunk_size=8,
+            source_safe_callback=report,
+        )
+        memory_obj = SimpleNamespace()
+        group = _TransferGroup(
+            chunks=[
+                _TransferChunk(memory_obj, 0, 8, [10, 11], torch.empty(0), 8),
+                _TransferChunk(memory_obj, 8, 16, [12, 13], torch.empty(0), 8),
+            ],
+            nbytes=16,
+        )
+        state = SimpleNamespace(pack_stream=None, copy_stream=None)
+        connector._prepare_transfer = lambda *args, **kwargs: (state, [group])
+
+        def run_pipeline(*_args, stage_b_enqueued=None, **_kwargs):
+            order.append("fenced")
+            stage_b_enqueued(group, None)
+
+        connector._run_staged_pipeline = run_pipeline
+        operation = SaveOperationId("r", 7)
+
+        with connector.track_save_source(operation):
+            connector.batched_from_gpu([memory_obj], [0], [8])
+            order.append("returned")
+
+        assert order == ["fenced", "source_safe", "source_safe", "returned"]
+        assert reported == [
+            SaveSourceGroupId(operation, ((0, 8),)),
+            SaveSourceGroupId(operation, ((8, 16),)),
+        ]
+
+    def test_save_staging_is_tail_to_head_with_exact_object_range_mapping(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
+        codec = SimpleNamespace(device=torch.device("cpu"), bytes_per_block=1)
+        reported = []
+        connector = BlockGPUConnector(
+            codec,
+            block_size=1,
+            chunk_size=2,
+            source_safe_callback=reported.append,
+        )
+        memory_objs = [
+            SimpleNamespace(name=f"m{index}", tensor=torch.empty(2, dtype=torch.uint8))
+            for index in range(4)
+        ]
+        starts = [0, 2, 4, 6]
+        ends = [2, 4, 6, 8]
+        scheduled = []
+
+        def capture_pipeline(_state, groups, **kwargs):
+            stage_b_enqueued = kwargs["stage_b_enqueued"]
+            for group in groups:
+                assert len(group.chunks) == 1
+                chunk = group.chunks[0]
+                scheduled.append(
+                    (chunk.start, chunk.end, chunk.block_ids, chunk.memory_obj)
+                )
+                stage_b_enqueued(group, None)
+
+        connector._run_staged_pipeline = capture_pipeline
+        operation = SaveOperationId("tail-first", 1)
+
+        with connector.track_save_source(operation):
+            connector.batched_from_gpu(
+                memory_objs,
+                starts,
+                ends,
+                block_ids=list(range(1, 9)),
+            )
+
+        assert scheduled == [
+            (6, 8, [7, 8], memory_objs[3]),
+            (4, 6, [5, 6], memory_objs[2]),
+            (2, 4, [3, 4], memory_objs[1]),
+            (0, 2, [1, 2], memory_objs[0]),
+        ]
+        assert reported == [
+            SaveSourceGroupId(operation, ((6, 8),)),
+            SaveSourceGroupId(operation, ((4, 6),)),
+            SaveSourceGroupId(operation, ((2, 4),)),
+            SaveSourceGroupId(operation, ((0, 2),)),
+        ]
+        # CacheEngine.store retains these lists for its later key/object
+        # batched_put. The connector must not mutate them while reversing only
+        # the actual GPU-to-staging schedule.
+        assert memory_objs == [
+            scheduled[3][3],
+            scheduled[2][3],
+            scheduled[1][3],
+            scheduled[0][3],
+        ]
+        assert starts == [0, 2, 4, 6]
+        assert ends == [2, 4, 6, 8]
+
+    def test_load_staging_remains_head_to_tail(self, monkeypatch):
+        monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
+        codec = SimpleNamespace(device=torch.device("cpu"), bytes_per_block=1)
+        connector = BlockGPUConnector(codec, block_size=1, chunk_size=2)
+        memory_objs = [
+            SimpleNamespace(tensor=torch.empty(2, dtype=torch.uint8)) for _ in range(4)
+        ]
+        scheduled = []
+
+        def capture_pipeline(_state, groups, **_kwargs):
+            scheduled.extend(
+                (chunk.start, chunk.end, chunk.block_ids)
+                for group in groups
+                for chunk in group.chunks
+            )
+
+        connector._run_staged_pipeline = capture_pipeline
+        connector.batched_to_gpu(
+            memory_objs,
+            [0, 2, 4, 6],
+            [2, 4, 6, 8],
+            block_ids=list(range(1, 9)),
+        )
+
+        assert scheduled == [
+            (0, 2, [1, 2]),
+            (2, 4, [3, 4]),
+            (4, 6, [5, 6]),
+            (6, 8, [7, 8]),
+        ]
+
+    def test_pipeline_exception_never_claims_source_safe(self):
+        codec = SimpleNamespace(device=torch.device("cpu"), bytes_per_block=4)
+        reported = []
+        connector = BlockGPUConnector(
+            codec,
+            4,
+            chunk_size=8,
+            source_safe_callback=reported.append,
+        )
+        group = _TransferGroup([], 0)
+        state = SimpleNamespace(pack_stream=None, copy_stream=None)
+        connector._prepare_transfer = lambda *args, **kwargs: (state, [group])
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("copy failed")
+
+        connector._run_staged_pipeline = fail
+        with (
+            connector.track_save_source(SaveOperationId("r", 8)),
+            pytest.raises(RuntimeError, match="copy failed"),
+        ):
+            connector.batched_from_gpu([object()], [0], [8])
+        assert reported == []
+
+
+class TestIncrementalLeaseRelease:
+    def test_b1_b2_release_while_b3_b8_remain_protected(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 100, 48, 12)
+        scheduler.update_state_after_alloc(seq)
+
+        seq.num_cached_tokens = 8
+        op1 = scheduler.build_connector_meta().requests[0].save_operation
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        assert protected == frozenset(table[:2])
+        bm.deallocate_partial(seq, protected)
+
+        assert scheduler.connector_completion(_source_safe(op1, (0, 8))) is None
+        released = scheduler.take_source_safe_releases()
+        assert released == [frozenset(table[:2])]
+        bm.free_leased_blocks(released[0])
+        assert scheduler.protected_block_ids(seq) == frozenset()
+
+        assert scheduler.connector_completion(_store_terminal(op1)) is True
+        op2 = scheduler.build_connector_meta().requests[0].save_operation
+        assert scheduler.protected_block_ids(seq) == frozenset(table[2:8])
+        assert scheduler.connector_completion(_source_safe(op2, (8, 32))) is None
+        assert scheduler.take_source_safe_releases() == [frozenset(table[2:8])]
+        scheduler.connector_completion(_store_terminal(op2))
+        assert scheduler.protected_block_ids(seq) == frozenset()
+
+    def test_final_pending_save_survives_request_block_table_clear(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 101, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        assert protected == frozenset()
+        assert scheduler.has_pending_work() is True
+
+        bm.deallocate_partial(seq, protected)
+        assert list(seq.block_table) == []
+        assert bm.kv.num_used == 0
+        request = scheduler.build_connector_meta().requests[0]
+        assert request.block_ids == table
+        assert request.token_ids == list(range(32))
+        assert scheduler.protected_block_ids(seq) == frozenset(table)
+        assert bm.kv.num_used == 8
+
+    def test_late_acquire_stops_at_first_evicted_hash_gap(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 102, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        bm.deallocate_partial(seq, protected)
+
+        # Reuse the fifth block for unrelated content. The first four blocks
+        # remain canonical, but the save must not splice blocks after this gap.
+        bm.kv.allocate(table[4])
+        [request] = scheduler.build_connector_meta().requests
+        assert request.token_ids == list(range(16))
+        assert request.block_ids[:4] == table[:4]
+        assert request.save_spec.skip_leading_tokens == 0
+        assert scheduler.protected_block_ids(seq) == frozenset(table[:4])
+
+    def test_late_acquire_trims_claims_in_token_order(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        released = []
+        scheduler._block_manager = SimpleNamespace(
+            enable_prefix_caching=True,
+            acquire_offload_prefix=lambda *_args: (
+                [1, 33, 65, -1],
+                12,
+                (1, 33, 65),
+            ),
+            free_leased_blocks=lambda blocks: released.append(tuple(blocks)),
+        )
+        seq = _seq(104, num_prompt_tokens=16, num_blocks=4)
+
+        target, block_ids, protected = scheduler._late_save_source(seq, 0, 16)
+
+        assert target == 8
+        assert block_ids[:2] == [1, 33]
+        assert protected == frozenset({1, 33})
+        assert released == [(65,)]
+
+    def test_late_acquire_finds_a_multimodal_prefix(self, monkeypatch):
+        """BlockManager seeds a multimodal chain with cache_seed; reacquiring
+        must use the same seed or block 0 never matches."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm = BlockManager(
+            MockConfig(
+                num_kvcache_blocks=24, kv_cache_block_size=4, enable_prefix_caching=True
+            )
+        )
+        seq = Sequence(list(range(16)), 4, id=107)
+        seq.cache_seed = 424242
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        table = list(seq.block_table)
+        bm.hash_blocks(seq, 16, start_tokens=0)
+        scheduler.bind_block_manager(bm)
+        bm.deallocate(seq)
+
+        block_ids, available, claimed = bm.acquire_offload_prefix(seq, 0, 16)
+        assert available == 16
+        assert block_ids == table
+        assert sorted(claimed) == sorted(table)
+
+    def test_late_acquire_with_nothing_resident_retires_the_request(
+        self, monkeypatch, caplog
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 103, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        bm.deallocate_partial(seq, protected)
+        bm.kv.allocate(table[0])  # evict the first block: nothing is savable
+
+        assert scheduler.build_connector_meta().requests == []
+        assert str(seq.id) not in scheduler._save_tracker
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.protected_block_ids(seq) == frozenset()
+        assert bm.kv.num_used == 1
+        assert scheduler.get_statistics()["truncated_late_saves"] == 1
+        assert any("truncated_late_saves=1" in r.getMessage() for r in caplog.records)
+
+    def test_late_save_persists_the_short_tail_of_a_long_request(self, monkeypatch):
+        """The tail after earlier saves is stored however short it is."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 105, 32, 8)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 24
+        [first] = scheduler.build_connector_meta().requests
+        scheduler.save_finished(first.save_operation)
+        seq.num_cached_tokens = 32
+        protected = _finish_and_lease(scheduler, seq)
+        bm.deallocate_partial(seq, protected)
+
+        [tail] = scheduler.build_connector_meta().requests
+        assert tail.save_spec.skip_leading_tokens == 24
+        assert tail.token_ids == list(range(32))
+        assert tail.block_ids[6:8] == table[6:8]
+
+    def test_unbound_teardown_leases_the_blocks_its_final_save_reads(self, monkeypatch):
+        """No BlockManager (the vLLM plugin): vLLM frees every unleased block at
+        teardown and the table is not cleared, so the final save must read only
+        blocks the teardown lease kept."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(106, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0].save_operation
+        seq.num_cached_tokens = 16
+        leased = _finish_and_lease(scheduler, seq)
+        scheduler.save_finished(first)
+
+        [final] = scheduler.build_connector_meta().requests
+        start = final.save_spec.skip_leading_tokens // 4
+        end = len(final.token_ids) // 4
+        assert final.block_ids[start:end] == [2, 3]
+        assert set(final.block_ids[start:end]) <= leased
+
+    def test_without_prefix_caching_teardown_leases_the_final_save_source(
+        self, monkeypatch
+    ):
+        """With prefix caching off nothing is hash-indexed, so reacquiring would
+        find nothing and silently drop the final save; teardown leases the
+        unemitted suffix instead and the save reads those blocks."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm = BlockManager(
+            MockConfig(
+                num_kvcache_blocks=24,
+                kv_cache_block_size=4,
+                enable_prefix_caching=False,
+            )
+        )
+        scheduler.bind_block_manager(bm)
+        seq = Sequence(list(range(16)), 4, id=108)
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        table = list(seq.block_table)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+        leased = _finish_and_lease(scheduler, seq)
+        assert leased == frozenset(table)
+        bm.deallocate_partial(seq, leased)
+
+        [final] = scheduler.build_connector_meta().requests
+        assert final.save_spec.skip_leading_tokens == 0
+        assert final.block_ids[:4] == table
+        assert scheduler.get_statistics()["truncated_late_saves"] == 0
+
+    def test_a_request_deferred_whole_saves_from_the_table_it_still_owns(
+        self, monkeypatch
+    ):
+        """`protected_block_ids` runs before the scheduler decides. A request
+        whose state cannot be released partially is deferred whole and keeps
+        its table, so its final save reads that table instead of taking a
+        second claim on every block through the hash index."""
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        bm, seq, table = _resident_sequence(scheduler, 109, 16, 4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+        scheduler.request_finished(seq)
+        assert scheduler.protected_block_ids(seq) is not None
+        # Deferred whole: no deallocate_partial, no activate_block_leases.
+        monkeypatch.setattr(
+            bm,
+            "acquire_offload_prefix",
+            lambda *_args: pytest.fail("reacquired a table the request owns"),
+        )
+
+        [final] = scheduler.build_connector_meta().requests
+        assert final.block_ids[:4] == table
+
+
+class TestTPQuorum:
+    def test_one_incomplete_rank_prevents_logical_group_release(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(200, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+        completion = _source_safe(operation, (0, 8))
+        aggregator = KVOutputAggregator(world_size=2)
+
+        first = aggregator.aggregate(
+            [KVConnectorOutput(connector_completions={completion}), KVConnectorOutput()]
+        )
+        assert scheduler.process_completions(first).finished_saving == set()
+        assert scheduler.take_source_safe_releases() == []
+
+        second = aggregator.aggregate(
+            [KVConnectorOutput(), KVConnectorOutput(connector_completions={completion})]
+        )
+        assert scheduler.process_completions(second).finished_saving == set()
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+
+
+class TestStoreOutcomeSeparation:
+    def test_pre_submit_failure_retries_only_after_tp_source_quorum(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(299, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0]
+
+        scheduler.connector_completion(_store_terminal(first.save_operation, False))
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler._save_tracker[str(seq.id)][1] == 8
+
+        scheduler.connector_completion(_source_quiescent(first.save_operation))
+        retry = scheduler.build_connector_meta().requests[0]
+        assert retry.save_operation != first.save_operation
+        assert retry.save_spec.skip_leading_tokens == 0
+        assert retry.token_ids == first.token_ids
+
+    def test_retired_pre_submit_failure_releases_lease_without_retry(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(298, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        assert _finish_and_lease(scheduler, seq) == frozenset({0, 1})
+        seq.block_table.clear()
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_source_quiescent(operation))
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is False
+
+    def test_mixed_tp_outcome_waits_for_all_source_quiescent_reports(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(296, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+        aggregator = KVOutputAggregator(world_size=2)
+
+        first = aggregator.aggregate(
+            [
+                KVConnectorOutput(
+                    connector_completions={
+                        _source_quiescent(operation),
+                        _store_terminal(operation, False),
+                    }
+                ),
+                KVConnectorOutput(),
+            ]
+        )
+        scheduler.process_completions(first)
+        assert scheduler.take_source_safe_releases() == []
+
+        second = aggregator.aggregate(
+            [
+                KVConnectorOutput(),
+                KVConnectorOutput(
+                    connector_completions={
+                        _source_quiescent(operation),
+                        _store_terminal(operation),
+                    }
+                ),
+            ]
+        )
+        scheduler.process_completions(second)
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        assert scheduler.build_connector_meta().requests == []
+
+    def test_retired_failure_also_releases_unemitted_suffix(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(295, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        seq.num_cached_tokens = 16
+        assert _finish_and_lease(scheduler, seq) == frozenset({0, 1, 2, 3})
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+        scheduler.connector_completion(_source_quiescent(operation))
+
+        released = scheduler.take_source_safe_releases()
+        assert sorted(block for group in released for block in group) == [0, 1, 2, 3]
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is False
+
+    def test_post_submit_failure_after_all_source_safe_retires_without_lease(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(294, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        scheduler.connector_completion(_source_safe(operation, (0, 16)))
+        # Every source block is already safe, so teardown leases nothing.
+        assert _finish_and_lease(scheduler, seq) == frozenset()
+        seq.block_table.clear()
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+
+        assert scheduler._save_tracker == {}
+        assert scheduler._save_retry_blocked == {}
+        assert scheduler._save_previous_owner == {}
+        assert scheduler._save_operation_blocks == {}
+        assert scheduler._save_operation_owner == {}
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is False
+
+    def test_live_post_submit_failure_retries_once_all_source_groups_are_safe(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(293, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        first = scheduler.build_connector_meta().requests[0]
+
+        scheduler.connector_completion(_store_terminal(first.save_operation, False))
+        assert scheduler.build_connector_meta().requests == []
+        scheduler.connector_completion(_source_safe(first.save_operation, (0, 8)))
+
+        retry = scheduler.build_connector_meta().requests[0]
+        assert retry.save_operation != first.save_operation
+        assert retry.save_spec.skip_leading_tokens == 0
+        assert retry.token_ids == first.token_ids
+        assert first.save_operation not in scheduler._save_operation_blocks
+
+    def test_post_submit_failure_keeps_lease_until_stall_reclaim(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(297, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+
+        scheduler.connector_completion(_store_terminal(operation, False))
+        assert scheduler.take_source_safe_releases() == []
+        assert scheduler.build_connector_meta().requests == []
+        assert scheduler.has_pending_work() is True
+        scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
+        assert scheduler.reclaim_stale_leases(1) == [frozenset({0, 1})]
+        assert scheduler._save_retry_blocked == {}
+        assert scheduler.has_pending_work() is False
+
+    def test_commit_failure_after_source_safe_releases_without_success_stats(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(300, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+
+        scheduler.connector_completion(_source_safe(operation, (0, 8)))
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        scheduler.connector_completion(_store_terminal(operation, succeeded=False))
+
+        assert scheduler.total_save_requests == 0
+        assert scheduler.total_saved_tokens == 0
+        assert scheduler.blocks_waiting_for_store() == 0
+
+    def test_source_safe_blocks_are_observable_while_store_is_pending(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(301, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+
+        scheduler.connector_completion(_source_safe(operation, (0, 8)))
+        assert scheduler.get_statistics()["blocks_waiting_for_store"] == 2
+        scheduler.connector_completion(_store_terminal(operation))
+        assert scheduler.get_statistics()["blocks_waiting_for_store"] == 0
+        assert scheduler.total_save_requests == 1
+        assert scheduler.total_saved_tokens == 8
+
+
+class TestNoDoubleFree:
+    def test_timeout_drops_an_unemitted_finished_save_before_freeing(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(399, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        scheduler.build_connector_meta()
+        _finish_and_lease(scheduler, seq)
+        scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
+
+        assert scheduler.reclaim_stale_leases(1) == [frozenset({0, 1})]
+        assert str(seq.id) not in scheduler._save_tracker
+        assert scheduler.has_pending_work() is False
+
+    def test_late_completions_after_timeout_reclaim_are_noops(self, monkeypatch):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(400, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+        scheduler._save_lease_at[id(seq)] = time.monotonic() - 10
+
+        assert scheduler.reclaim_stale_leases(1) == [frozenset({0, 1})]
+        scheduler.connector_completion(_source_safe(operation, (0, 8)))
+        scheduler.connector_completion(_store_terminal(operation))
+        assert scheduler.take_source_safe_releases() == []
+        assert scheduler.total_abnormal_lease_reclaims == 2
+        assert scheduler.total_save_requests == 0
+
+    def test_duplicate_and_stale_source_completions_do_not_double_release(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(401, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+        completion = _source_safe(operation, (0, 8))
+
+        scheduler.connector_completion(completion)
+        scheduler.connector_completion(completion)
+        scheduler.connector_completion(
+            _source_safe(SaveOperationId(seq.id, 999), (0, 8))
+        )
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+        assert scheduler.take_source_safe_releases() == []
+
+    def test_abandon_then_late_store_completion_does_not_release_twice(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        seq = _seq(402, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, seq)
+
+        scheduler.abandon_save(str(seq.id))
+        released = scheduler.take_source_safe_releases()
+        scheduler.connector_completion(_store_terminal(operation))
+        assert scheduler.take_source_safe_releases() == []
+        assert released == [frozenset({0, 1})]
+
+    def test_request_id_reuse_cannot_attach_an_old_lease_to_new_blocks(
+        self, monkeypatch
+    ):
+        scheduler = _early_release_scheduler(monkeypatch, chunk_size=8)
+        old = _seq(403, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(old)
+        old.num_cached_tokens = 8
+        old_operation = scheduler.build_connector_meta().requests[0].save_operation
+        _finish_and_lease(scheduler, old)
+        scheduler.connector_completion(_store_terminal(old_operation, succeeded=False))
+
+        new = _seq(403, num_prompt_tokens=16, num_blocks=4)
+        new.block_table = [10, 11, 12, 13]
+        scheduler.update_state_after_alloc(new)
+        new.num_cached_tokens = 8
+        new_operation = scheduler.build_connector_meta().requests[0].save_operation
+
+        assert scheduler.protected_block_ids(new) == frozenset({10, 11})
+        assert scheduler.take_source_safe_releases() == []
+        scheduler.connector_completion(_source_quiescent(old_operation))
+        assert scheduler._save_inflight[str(new.id)] == new_operation
+        assert scheduler._save_tracker[str(new.id)][0] is new
+        assert scheduler.take_source_safe_releases() == [frozenset({0, 1})]
+
+
+class TestEarlyReleaseDefaultsOn:
+    def test_supported_layout_uses_exact_source_protection(self, monkeypatch):
+        monkeypatch.setattr(
+            offcfg,
+            "build_lmcache_config",
+            lambda _config=None: SimpleNamespace(chunk_size=8),
+        )
+        monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
+        scheduler = DenseOffloadScheduler(_config())
+        seq = _seq(500, num_prompt_tokens=16, num_blocks=4)
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 8
+        scheduler.build_connector_meta()
+
+        assert scheduler._early_release is True
+        assert scheduler.protected_block_ids(seq) == frozenset({0, 1})
+        assert scheduler.should_defer_free(seq) is True

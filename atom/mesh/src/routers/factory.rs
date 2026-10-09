@@ -99,6 +99,16 @@ impl RouterFactory {
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
 
+        // Workers are registered before the router is built, but the P/D policy
+        // OnceLocks are only filled just above -- so the init call made during
+        // registration found them empty and skipped. Seed the trees here, after
+        // the policies exist, or cache_aware starts with no tree: it falls back
+        // to random placement and never inserts, so affinity never forms.
+        let prefill_workers = ctx.worker_registry.get_prefill_workers();
+        let decode_workers = ctx.worker_registry.get_decode_workers();
+        ctx.policy_registry
+            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+
         let router = PDRouter::new(ctx).await?;
 
         Ok(Box::new(router))
@@ -125,6 +135,17 @@ impl RouterFactory {
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
+
+        // Workers are registered before the router is built, but the P/D policy
+        // OnceLocks are only filled just above -- so the init call made during
+        // registration found them empty and skipped. Seed the trees here, after
+        // the policies exist, or cache_aware starts with no tree: it falls back
+        // to random placement and never inserts, so affinity never forms.
+        let prefill_workers = ctx.worker_registry.get_prefill_workers();
+        let decode_workers = ctx.worker_registry.get_decode_workers();
+        ctx.policy_registry
+            .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+
         let router = GrpcPDRouter::new(ctx).await?;
 
         Ok(Box::new(router))

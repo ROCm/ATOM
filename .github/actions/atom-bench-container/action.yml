@@ -15,6 +15,10 @@ inputs:
   model-path:
     description: HF model id / path to download into the container.
     required: true
+  runner:
+    description: Job runner label; forwarded so runner-specific container env can be applied.
+    required: false
+    default: ""
   env-vars:
     description: Newline-separated KEY=VAL model env vars (written to an env-file).
     required: false
@@ -43,6 +47,7 @@ runs:
       with:
         container-name: ${{ inputs.container-name }}
         base-image: ${{ inputs.image }}
+        runner: ${{ inputs.runner }}
         env-vars: ${{ inputs.env-vars }}
         hf-token: ${{ inputs.hf-token }}
         network-host: "true"

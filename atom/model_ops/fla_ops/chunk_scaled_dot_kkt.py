@@ -66,37 +66,41 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
 
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+    _p_beta_0 = (i_t * BT) + tl.arange(0, BT)
+    b_beta = tl.load(
+        beta + bos * H + i_h + _p_beta_0 * (H), mask=(_p_beta_0 < (T)), other=0.0
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+        _p_k_0 = (i_t * BT) + tl.arange(0, BT)
+        _p_k_1 = (i_k * BK) + tl.arange(0, BK)
+        b_k = tl.load(
+            k
+            + (bos * Hg + i_h // (H // Hg)) * K
+            + _p_k_0[:, None] * (Hg * K)
+            + _p_k_1[None, :] * (1),
+            mask=(_p_k_0[:, None] < (T)) & (_p_k_1[None, :] < (K)),
+            other=0.0,
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_beta[:, None]
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
 
     if USE_G:
-        p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        _p_g_0 = (i_t * BT) + tl.arange(0, BT)
+        b_g = tl.load(g + bos * H + i_h + _p_g_0 * (H), mask=(_p_g_0 < (T)), other=0.0)
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * exp(b_g_diff)
 
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+    _p_A_0 = (i_t * BT) + tl.arange(0, BT)
+    _p_A_1 = (0) + tl.arange(0, BT)
+    tl.store(
+        A + (bos * H + i_h) * BT + _p_A_0[:, None] * (BT * H) + _p_A_1[None, :] * (1),
+        b_A.to(A.dtype.element_ty),
+        mask=(_p_A_0[:, None] < (T)) & (_p_A_1[None, :] < (BT)),
     )
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_scaled_dot_kkt_fwd(

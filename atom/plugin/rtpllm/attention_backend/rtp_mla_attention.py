@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import inspect
+import threading
 from types import MethodType
 from typing import Optional
 
 import torch
+
+# Thread-local cache for GLM-5.2 IndexShare: "full" layers write their computed
+# topk_indices here; "shared" layers (indexer=None) read it back so they can
+# still run sparse MLA with the most recently computed top-k.
+_indexshare_cache: threading.local = threading.local()
 
 
 def _resolve_index_topk(attn) -> int:
@@ -84,7 +90,11 @@ def _use_rtp_sparse_attn_indexer(indexer: object | None) -> None:
             )
             self.topk_indices_buffer = buffer
         self.sparse_kv_indices_buffer = self.topk_indices_buffer
-        return original_forward(hidden_states, *args, **kwargs)
+        result = original_forward(hidden_states, *args, **kwargs)
+        # GLM-5.2 IndexShare: publish the freshly computed topk so that
+        # subsequent "shared" layers (indexer=None) can reuse it.
+        _indexshare_cache.last_topk_buffer = self.topk_indices_buffer
+        return result
 
     indexer.forward = MethodType(_forward_with_topk_buffer, indexer)
     indexer._atom_rtp_topk_buffer_patched = True
@@ -184,6 +194,13 @@ class RTPMLAAttention:
         if explicit_topk_indices is not None:
             return explicit_topk_indices
         if self.indexer is None:
+            # GLM-5.2 IndexShare: "shared" layer has no indexer of its own.
+            # Reuse the topk_indices that the most recent "full" layer computed.
+            # Use the cached buffer's own column count as index_topk to avoid
+            # calling _resolve_index_topk (which needs indexer.index_topk).
+            cached = getattr(_indexshare_cache, "last_topk_buffer", None)
+            if cached is not None and cached.numel() > 0:
+                return cached[: query.shape[0], :]
             return None
 
         if not _should_emit_topk_indices(self):

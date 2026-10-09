@@ -12,12 +12,100 @@ Deliberately pure ``torch`` — no AITER, no ``atom.config`` — so the model
 loader's unit tests can exercise the real layout on a plain CPU runner.
 """
 
+from dataclasses import dataclass
+from enum import Enum, auto
+
 import torch
 
 # Which dimension of a single expert slot a shard is sharded along, before the
 # `is_transposed` flip.  `w1`/`w3` are the two halves of the gate_up projection
 # (column-parallel, output dim); `w2` is the down projection (row-parallel).
 _SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+
+
+class SharedExpertMode(Enum):
+    NONE = auto()
+    LEGACY_AITER = auto()
+    LOCAL_REPLICA = auto()
+    EPLB_ROUTED = auto()
+
+
+@dataclass(frozen=True)
+class MoEExpertLayout:
+    mode: SharedExpertMode
+    num_routed: int
+    num_fused_shared_experts: int
+    num_logical: int
+    num_redundant: int
+    num_physical: int
+    physical_per_rank: int
+
+    @classmethod
+    def make(
+        cls,
+        *,
+        num_routed: int,
+        num_fused_shared_experts: int,
+        num_configured_redundant: int,
+        ep_size: int,
+        use_all2all: bool,
+        eplb_enabled: bool,
+    ) -> "MoEExpertLayout":
+        if num_fused_shared_experts == 0:
+            mode = SharedExpertMode.NONE
+        elif not use_all2all:
+            mode = SharedExpertMode.LEGACY_AITER
+        elif eplb_enabled:
+            mode = SharedExpertMode.EPLB_ROUTED
+        else:
+            mode = SharedExpertMode.LOCAL_REPLICA
+        shared_is_routed = mode is SharedExpertMode.EPLB_ROUTED
+        num_logical = num_routed + (num_fused_shared_experts if shared_is_routed else 0)
+        num_redundant = num_configured_redundant
+        if shared_is_routed:
+            num_redundant += -(num_logical + num_redundant) % ep_size
+        num_routed_physical = num_logical + num_redundant
+        num_physical = num_routed_physical
+        if mode is SharedExpertMode.LOCAL_REPLICA:
+            num_physical += num_fused_shared_experts * ep_size
+        physical_per_rank = num_physical // ep_size
+        return cls(
+            mode=mode,
+            num_routed=num_routed,
+            num_fused_shared_experts=num_fused_shared_experts,
+            num_logical=num_logical,
+            num_redundant=num_redundant,
+            num_physical=num_physical,
+            physical_per_rank=physical_per_rank,
+        )
+
+    @property
+    def routed_physical_per_rank(self) -> int:
+        if self.mode is SharedExpertMode.LOCAL_REPLICA:
+            return self.physical_per_rank - self.num_fused_shared_experts
+        return self.physical_per_rank
+
+    @property
+    def num_routed_physical(self) -> int:
+        if self.mode is SharedExpertMode.LOCAL_REPLICA:
+            ep_size = self.num_physical // self.physical_per_rank
+            return self.num_physical - self.num_fused_shared_experts * ep_size
+        return self.num_physical
+
+    @property
+    def shared_is_routed(self) -> bool:
+        return self.mode is SharedExpertMode.EPLB_ROUTED
+
+    @property
+    def uses_dispatch_remap(self) -> bool:
+        return self.mode is SharedExpertMode.LOCAL_REPLICA
+
+    @property
+    def uses_all2all_fusion(self) -> bool:
+        return self.mode in (
+            SharedExpertMode.LOCAL_REPLICA,
+            SharedExpertMode.EPLB_ROUTED,
+        )
 
 
 def determine_expert_map(

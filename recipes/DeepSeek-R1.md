@@ -66,6 +66,10 @@ Tips on server configuration:
 - `--num-speculative-tokens 1` is more conservative with lower overhead per step.
 - Set `AITER_LOG_LEVEL=WARNING` before starting to suppress aiter kernel log noise.
 - Clear compile cache before restarting: `rm -rf /root/.cache/atom/*`
+- With DP attention + EP, the MoE all2all wire format can be narrowed (both
+  opt-in, default off): `ATOM_MORI_FP4_DISPATCH=1` sends FP4 instead of bf16 on
+  dispatch, `ATOM_MORI_COMBINE_QUANT=fp8_blockwise` sends FP8 blockwise on
+  combine. See [environment variables](../docs/environment_variables.md). 
 
 ## Performance baseline
 

@@ -241,6 +241,9 @@ jobs:
           if [ -d "/shared_nfs/huggingface_models" ]; then
             MODEL_CACHE_MOUNT="-v /shared_nfs/huggingface_models:/models"
             MODEL_CACHE_DESC="/shared_nfs/huggingface_models (shared host path)"
+          elif [ -d "/shared_nfs/models" ]; then
+            MODEL_CACHE_MOUNT="-v /shared_nfs/models:/models"
+            MODEL_CACHE_DESC="/shared_nfs/models (shared host path)"
           elif [ -d "/it-share/models" ]; then
             MODEL_CACHE_MOUNT="-v /it-share/models:/models"
             MODEL_CACHE_DESC="/it-share/models (shared host path)"
@@ -351,6 +354,8 @@ jobs:
             model_dir="/models/${model_dir#/models/}"
           elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
             model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
+          elif [[ "${model_dir}" = /shared_nfs/models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then
@@ -375,6 +380,8 @@ jobs:
             model_dir="/models/${model_dir#/models/}"
           elif [[ "${model_dir}" = /shared_nfs/huggingface_models/* ]]; then
             model_dir="/models/${model_dir#/shared_nfs/huggingface_models/}"
+          elif [[ "${model_dir}" = /shared_nfs/models/* ]]; then
+            model_dir="/models/${model_dir#/shared_nfs/models/}"
           elif [[ "${model_dir}" = /it-share/models/* ]]; then
             model_dir="/models/${model_dir#/it-share/models/}"
           elif [[ "${model_dir}" = /data/models/* ]]; then

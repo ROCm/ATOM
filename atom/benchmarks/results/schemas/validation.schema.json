@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "complete",
+    "measurement_valid",
+    "missing",
+    "exit_code",
+    "validity",
+    "requested_full"
+  ],
+  "properties": {
+    "complete": {
+      "type": "boolean"
+    },
+    "measurement_valid": {
+      "type": "boolean"
+    },
+    "submission_eligible": {
+      "type": "boolean"
+    },
+    "missing": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "exit_code": {
+      "type": "integer"
+    },
+    "validity": {
+      "type": "object"
+    },
+    "requested_full": {
+      "type": "boolean"
+    }
+  }
+}

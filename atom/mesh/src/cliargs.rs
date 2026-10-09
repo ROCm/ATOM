@@ -199,6 +199,9 @@ pub enum Commands {
 
 #[derive(Parser, Debug, Clone)]
 pub struct CliArgs {
+    #[cfg(feature = "ext-proc")]
+    #[command(flatten)]
+    pub ext_proc: crate::ext_proc::ExtProcConfig,
     // ==================== Worker Configuration ====================
     /// Host address to bind the router server
     #[arg(long, default_value = "0.0.0.0", help_heading = "Worker Configuration")]
@@ -214,7 +217,12 @@ pub struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "Routing Policy")]
+    #[arg(
+        long,
+        default_value = "cache_aware",
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "Routing Policy"
+    )]
     pub policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -259,11 +267,19 @@ pub struct CliArgs {
     pub decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "PD Disaggregation")]
+    #[arg(
+        long,
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "PD Disaggregation"
+    )]
     pub prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash"], help_heading = "PD Disaggregation")]
+    #[arg(
+        long,
+        value_parser = ["random", "round_robin", "dp_sticky", "cache_aware", "power_of_two", "prefix_hash"],
+        help_heading = "PD Disaggregation"
+    )]
     pub decode_policy: Option<String>,
 
     /// ATOM-only policy for mapping selected prefill DP ranks to decode DP ranks
@@ -502,6 +518,7 @@ impl CliArgs {
         match policy_str {
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
+            "dp_sticky" => PolicyConfig::DpSticky,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
@@ -585,7 +602,11 @@ impl CliArgs {
         }
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
-        RouterConfig::builder()
+        let builder = RouterConfig::builder();
+        #[cfg(feature = "ext-proc")]
+        let builder = builder.ext_proc(self.ext_proc.clone());
+
+        builder
             .mode(mode)
             .backend(self.backend.into())
             .atom_pd_rank_mapping_policy(atom_pd_rank_mapping_policy)
@@ -694,9 +715,72 @@ impl CliArgs {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_policy_accepts_dp_sticky() {
+        let args = CliArgs::default();
+        assert!(matches!(
+            args.parse_policy("dp_sticky"),
+            PolicyConfig::DpSticky
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_dp_sticky_as_main_policy() {
+        let cli = Cli::try_parse_from(["atomesh", "launch", "--policy", "dp_sticky"])
+            .expect("dp_sticky should be accepted as a main policy");
+
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+
+        assert_eq!(args.policy, "dp_sticky");
+        assert!(matches!(
+            args.parse_policy(&args.policy),
+            PolicyConfig::DpSticky
+        ));
+    }
+
+    #[test]
+    fn cli_accepts_dp_sticky_for_pd_specific_policies() {
+        let cli = Cli::try_parse_from([
+            "atomesh",
+            "launch",
+            "--pd-disaggregation",
+            "--prefill-policy",
+            "dp_sticky",
+            "--decode-policy",
+            "dp_sticky",
+        ])
+        .expect("dp_sticky should be accepted for PD-specific policies");
+
+        let args = match cli.command {
+            Some(Commands::Launch { args }) => args,
+            None => cli.router_args,
+        };
+
+        assert_eq!(args.prefill_policy.as_deref(), Some("dp_sticky"));
+        assert_eq!(args.decode_policy.as_deref(), Some("dp_sticky"));
+        assert!(matches!(
+            args.parse_policy(args.prefill_policy.as_deref().unwrap()),
+            PolicyConfig::DpSticky
+        ));
+        assert!(matches!(
+            args.parse_policy(args.decode_policy.as_deref().unwrap()),
+            PolicyConfig::DpSticky
+        ));
+    }
+}
+
 impl Default for CliArgs {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "ext-proc")]
+            ext_proc: Default::default(),
             host: "0.0.0.0".to_string(),
             port: 30000,
             worker_urls: Vec::new(),

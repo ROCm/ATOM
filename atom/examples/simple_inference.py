@@ -89,6 +89,7 @@ def main():
         print(f"Completion: {output['text']!r}")
 
     llm.print_mtp_statistics()
+    llm.close()
 
 
 if __name__ == "__main__":

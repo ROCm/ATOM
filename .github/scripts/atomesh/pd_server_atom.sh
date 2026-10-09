@@ -16,6 +16,7 @@ ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
 DECODE_SINGLE_NODE_PD=0
+PACKED_NODES_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
   single_node)
     SINGLE_NODE_PD=1
@@ -26,12 +27,17 @@ case "${ATOMESH_PD_WORKER_LAYOUT}" in
   decode_single_node)
     DECODE_SINGLE_NODE_PD=1
     ;;
+  packed_nodes)
+    PACKED_NODES_PD=1
+    ;;
 esac
 
 xP="${xP:-1}"
 yD="${yD:-1}"
 PREFILL_TP_SIZE="${PREFILL_TP_SIZE:-8}"
 DECODE_TP_SIZE="${DECODE_TP_SIZE:-8}"
+PREFILL_DCP_SIZE="${PREFILL_DCP_SIZE:-1}"
+DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
 DECODE_ENABLE_DP="${DECODE_ENABLE_DP:-false}"
 
@@ -91,7 +97,7 @@ done
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
-if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
+if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PACKED_NODES_PD}" == "1" ]]; then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -109,6 +115,8 @@ HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
+SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
+STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
 EXTRA_SERVER_ARGS="${EXTRA_SERVER_ARGS:-}"
 PREFILL_EXTRA_SERVER_ARGS="${PREFILL_EXTRA_SERVER_ARGS:-}"
 DECODE_EXTRA_SERVER_ARGS="${DECODE_EXTRA_SERVER_ARGS:-}"
@@ -125,6 +133,14 @@ has_cli_flag() {
   local args="$1"
   local flag="$2"
   [[ " ${args} " == *" ${flag} "* ]]
+}
+
+is_agentic_dpa() {
+  [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]] \
+    && {
+      has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
+        || has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"
+    }
 }
 
 ISL_LIST="${ISL_LIST:-8192}"
@@ -158,6 +174,10 @@ SWEBENCH_AGENT_TIMEOUT="${SWEBENCH_AGENT_TIMEOUT:-21600}"
 SWEBENCH_SCORE_TIMEOUT="${SWEBENCH_SCORE_TIMEOUT:-7200}"
 SWEBENCH_MAX_WORKERS="${SWEBENCH_MAX_WORKERS:-4}"
 SWEBENCH_EVAL_TIMEOUT="${SWEBENCH_EVAL_TIMEOUT:-900}"
+# The host daemon is shared with every other job on the node: refuse to start
+# without image headroom, and hand the pulled images back when the run ends.
+SWEBENCH_MIN_DISK_GB="${SWEBENCH_MIN_DISK_GB:-150}"
+SWEBENCH_PRUNE_IMAGES="${SWEBENCH_PRUNE_IMAGES:-true}"
 
 WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-5000}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
@@ -168,6 +188,7 @@ AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
 AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
+AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
 AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-1800}"
@@ -219,7 +240,7 @@ dump_launch_info() {
   echo "  ${role} launch info"
   echo "========================================"
   echo "--- environment ---"
-  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|UCX_)' | sort || true
+  env | grep -E '^(HIP_|HSA_|AITER_|ATOM_|RCCL_|NCCL_|CUDA_|MOONCAKE_|MORI_|UCX_)' | sort || true
   echo "--- command ---"
   printf '%q ' "$@"
   echo ""
@@ -234,8 +255,36 @@ apply_prefixed_env() {
   while IFS='=' read -r name raw; do
     [[ "${name}" == "${prefix}"* ]] || continue
     value="${raw//\$\{ROLE_IP\}/${role_ip}}"
+    value="${value//\$\{HANDSHAKE_PORT\}/${HANDSHAKE_PORT}}"
     export "${name#${prefix}}=${value}"
   done < <(env)
+}
+
+# Names the last apply_role_env() exported for a role.
+ROLE_ENV_NAMES=()
+
+# Both servers are launched from this one shell, so a variable exported for one
+# role stays in the environment the next role inherits. Only names the two roles
+# both define get overwritten; a prefill-only name reaches decode unchanged --
+# VLLM_PP_LAYER_PARTITION from a pp4 prefill aborts a pp1 decode's model build
+# with "len(partitions)=4 does not match pp_size=1". Drop the previous role's
+# names before applying this one's.
+apply_role_env() {
+  local prefix="$1"
+  local role_ip="$2"
+  local name
+  for name in ${ROLE_ENV_NAMES[@]+"${ROLE_ENV_NAMES[@]}"}; do
+    unset "${name}"
+  done
+  ROLE_ENV_NAMES=()
+  while IFS='=' read -r name _; do
+    [[ "${name}" == "${prefix}"* ]] || continue
+    ROLE_ENV_NAMES+=("${name#${prefix}}")
+  done < <(env)
+  # A name the common block also sets was just unset with the previous role's,
+  # so put the common value back before the role overrides it.
+  apply_prefixed_env "ATOMESH_ENV_" "${role_ip}"
+  apply_prefixed_env "${prefix}" "${role_ip}"
 }
 
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
@@ -245,6 +294,12 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+
+# GPU timing is opt-in; agentic reports need it on both service roles.
+if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+  export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+  export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+fi
 
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"
 
@@ -265,6 +320,56 @@ if [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ips+=("${IP_ARRAY[0]}")
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  # PP size is not a top-level env var on this launcher; parse it from extra_args.
+  _pp_from_args() {
+    local args="$1"
+    if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
+      echo "${BASH_REMATCH[1]}"
+    else
+      echo 1
+    fi
+  }
+  PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
+  DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
+  prefill_nodes=()
+  prefill_gpus=()
+  decode_nodes=()
+  decode_gpus=()
+  packed_node=0
+  packed_used=0
+  place_packed_worker() {
+    local width="$1"
+    local -n placed_nodes="$2"
+    local -n placed_gpus="$3"
+    if (( width > 8 )); then
+      echo "ERROR: packed_nodes workers must fit on one 8-GPU node" >&2
+      exit 2
+    fi
+    if (( packed_used + width > 8 )); then
+      packed_node=$((packed_node + 1))
+      packed_used=0
+    fi
+    placed_nodes+=("${packed_node}")
+    placed_gpus+=("$(seq -s, "${packed_used}" "$((packed_used + width - 1))")")
+    packed_used=$((packed_used + width))
+  }
+  for idx in $(seq 0 $((xP - 1))); do
+    place_packed_worker "$((PREFILL_PP_SIZE * PREFILL_TP_SIZE))" prefill_nodes prefill_gpus
+    prefill_ips+=("${IP_ARRAY[${prefill_nodes[$idx]}]:-}")
+    prefill_ports+=("$((PREFILL_PORT + idx))")
+    prefill_args+=(--prefill "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}")
+  done
+  for idx in $(seq 0 $((yD - 1))); do
+    place_packed_worker "$((DECODE_PP_SIZE * DECODE_TP_SIZE))" decode_nodes decode_gpus
+    decode_ips+=("${IP_ARRAY[${decode_nodes[$idx]}]:-}")
+    decode_ports+=("$((DECODE_PORT + idx))")
+    decode_args+=(--decode "http://${decode_ips[$idx]}:${decode_ports[$idx]}")
+  done
+  if (( packed_node + 1 != ${#IP_ARRAY[@]} )); then
+    echo "ERROR: packed_nodes needs $((packed_node + 1)) node(s), got ${#IP_ARRAY[@]}" >&2
+    exit 2
+  fi
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   for idx in $(seq 0 $((xP - 1))); do
     prefill_port=$((PREFILL_PORT + idx))
@@ -308,33 +413,81 @@ else
   done
 fi
 
-prefill_parallel=(-tp "${PREFILL_TP_SIZE}")
+prefill_parallel=(
+  -tp "${PREFILL_TP_SIZE}"
+  --decode-context-parallel-size "${PREFILL_DCP_SIZE}"
+)
 if [[ "${PREFILL_ENABLE_DP}" == "true" ]]; then
   prefill_parallel+=("--enable-dp-attention")
 fi
 
-decode_parallel=(-tp "${DECODE_TP_SIZE}")
+decode_parallel=(
+  -tp "${DECODE_TP_SIZE}"
+  --decode-context-parallel-size "${DECODE_DCP_SIZE}"
+)
 if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
 
+# AgentX captures every query-token count the engine can produce, i.e. the dense
+# range [2, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
+# defaults to 2 * CONC. Concurrencies whose in-flight window is wider than
+# 2 * CONC pin seqs explicitly via cudagraph_max_num_seqs.
+auto_cudagraph_capture_sizes() {
+  local role="$1"
+  local seqs="$2"
+  local conc spec graph_max
+  spec="${NUM_SPEC_TOKENS:-0}"
+  [[ "${spec}" =~ ^[0-9]+$ ]] || spec=0
+  if [[ ! "${seqs}" =~ ^[0-9]+$ ]]; then
+    conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
+    [[ "${conc}" =~ ^[0-9]+$ ]] || conc=1
+    seqs=$(( 2 * conc ))
+  fi
+  graph_max=$(( seqs * (1 + spec) ))
+  if (( graph_max < 2 )); then
+    graph_max=2
+  fi
+  echo "[${role}] cudagraph auto range 2..${graph_max} (seqs=${seqs} spec=${spec})" >&2
+  echo "[$(seq -s, 2 "${graph_max}")]"
+}
+
 build_cudagraph_args() {
-  local value="$1"
+  local role="$1"
   local -n out="$2"
-  case "${value:-}" in
+  local prefix="${role^^}"
+  local sizes_var="${prefix}_CUDAGRAPH"
+  local mode_var="${prefix}_CUDAGRAPH_MODE"
+  local level_var="${prefix}_COMPILATION_LEVEL"
+  local seqs_var="${prefix}_CUDAGRAPH_MAX_NUM_SEQS"
+  local mode="${!mode_var:-}"
+  local level="${!level_var:-}"
+  case "${!sizes_var:-}" in
     ""|none|None|NONE|false|False|FALSE|off|Off|OFF|disabled|Disabled|DISABLED)
       out=()
       ;;
+    auto|Auto|AUTO)
+      out=(
+        --cudagraph-capture-sizes
+        "$(auto_cudagraph_capture_sizes "${role}" "${!seqs_var:-}")"
+      )
+      ;;
     *)
-      out=(--cudagraph-capture-sizes "${value}")
+      out=(--cudagraph-capture-sizes "${!sizes_var}")
       ;;
   esac
+  if [[ -n "${mode}" ]]; then
+    out+=(--cudagraph-mode "${mode}")
+  fi
+  if [[ -n "${level}" ]]; then
+    out+=(--level "${level}")
+  fi
 }
 
 prefill_cudagraph_args=()
 decode_cudagraph_args=()
-build_cudagraph_args "${PREFILL_CUDAGRAPH:-}" prefill_cudagraph_args
-build_cudagraph_args "${DECODE_CUDAGRAPH:-}" decode_cudagraph_args
+build_cudagraph_args prefill prefill_cudagraph_args
+build_cudagraph_args decode decode_cudagraph_args
 
 build_server_cache_env() {
   local role="$1"
@@ -392,7 +545,21 @@ fi
 if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
 fi
-
+spec_decode_acceptance_for_server="${SPEC_DECODE_ACCEPTANCE_LENGTH}"
+if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" && "${EVAL_TASK}" == "gsm8k" ]]; then
+  spec_decode_acceptance_for_server=""
+  echo "[runtime] omitting spec-decode-acceptance-length for gsm8k eval phase"
+fi
+if [[ -n "${spec_decode_acceptance_for_server}" ]]; then
+  server_common+=(
+    --spec-decode-acceptance-length "${spec_decode_acceptance_for_server}"
+  )
+fi
+if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
+  server_common+=(
+    --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
+  )
+fi
 wait_http() {
   local url="$1"
   local name="$2"
@@ -452,7 +619,14 @@ start_logged_process() {
   local log_file="$2"
   shift 2
 
-  if command -v setsid >/dev/null 2>&1; then
+  if [[ "${PACKED_NODES_PD:-0}" == "1" ]]; then
+    echo "[runtime] logging ${log_file} (file-only, packed layout)"
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$@" >"${log_file}" 2>&1 &
+    else
+      "$@" >"${log_file}" 2>&1 &
+    fi
+  elif command -v setsid >/dev/null 2>&1; then
     setsid "$@" > >(tee "${log_file}") 2>&1 &
   else
     "$@" > >(tee "${log_file}") 2>&1 &
@@ -491,12 +665,44 @@ terminate_process_group() {
   wait "${pid}" 2>/dev/null || true
 }
 
+# LMCache's disk tier lives on a host bind mount, so unlike the container's own
+# /tmp it survives `docker run --rm`. Every concurrency runs as its own job, and
+# a tier left behind would both serve the previous job's KV and hold its
+# LMCACHE_MAX_LOCAL_DISK_SIZE of disk per rank. Start empty, leave nothing.
+lmcache_disk_dir=""
+
+reset_lmcache_disk() {
+  local dir="${LMCACHE_LOCAL_DISK:-}"
+  [[ -n "${dir}" && "${dir}" != "/" ]] || return 0
+  # The repository working directory is read-only in the container. Resolve
+  # relative paths under the writable logs, isolated by job, phase and node rank.
+  if [[ "${dir}" != /* ]]; then
+    dir="${RUNTIME_LOG_DIR}/rank-${NODE_RANK}/${dir#./}"
+  fi
+  export LMCACHE_LOCAL_DISK="${dir}"
+  # Several prefill workers can share this shell, so only the first one empties
+  # the tier; a later one would delete a running worker's cache underneath it.
+  [[ "${lmcache_disk_dir}" != "${dir}" ]] || return 0
+  lmcache_disk_dir="${dir}"
+  rm -rf -- "${dir}"
+  mkdir -p -- "${dir}"
+  echo "[lmcache] disk tier ${dir} reset (${LMCACHE_MAX_LOCAL_DISK_SIZE:-0}GiB per rank)"
+}
+
+purge_lmcache_disk() {
+  [[ -n "${lmcache_disk_dir}" ]] || return 0
+  rm -rf -- "${lmcache_disk_dir}"
+  echo "[lmcache] disk tier ${lmcache_disk_dir} removed"
+  lmcache_disk_dir=""
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
+  purge_lmcache_disk
   return "${rc}"
 }
 
@@ -531,7 +737,12 @@ start_prefill() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${PREFILL_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${PREFILL_DP_BASE_PORT}}"
-  apply_prefixed_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  local visible_devices="${6:-}"
+  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
+  reset_lmcache_disk
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -547,7 +758,7 @@ start_prefill() {
   else
     prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
-  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${PREFILL_CUDAGRAPH:-none}"
+  echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -568,7 +779,11 @@ start_decode() {
   local handshake_port="${3:-${HANDSHAKE_PORT}}"
   local dp_master_port="${4:-${DECODE_DP_MASTER_PORT}}"
   local dp_base_port="${5:-${DECODE_DP_BASE_PORT}}"
-  apply_prefixed_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  local visible_devices="${6:-}"
+  apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+  if [[ -n "${visible_devices}" ]]; then
+    export HIP_VISIBLE_DEVICES="${visible_devices}"
+  fi
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -599,7 +814,7 @@ start_decode() {
   else
     decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
   fi
-  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${DECODE_CUDAGRAPH:-none}"
+  echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -617,6 +832,7 @@ start_decode() {
 
 start_router() {
   echo "[router] prefill=${prefill_args[*]} decode=${decode_args[*]}"
+  local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
   case "${ATOM_PD_RANK_MAPPING_POLICY}" in
     none|idx2idx) ;;
     *)
@@ -625,24 +841,47 @@ start_router() {
       ;;
   esac
 
+  local router_policy="${ROUTER_POLICY}"
   local -a router_rank_mapping_args=()
   if [[ "${ATOM_PD_RANK_MAPPING_POLICY}" != "none" ]] \
     && has_cli_flag "${PREFILL_EXTRA_SERVER_ARGS}" "--enable-dp-attention" \
     && has_cli_flag "${DECODE_EXTRA_SERVER_ARGS}" "--enable-dp-attention"; then
     router_rank_mapping_args=(
       --atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}"
-      --dp-aware
     )
   fi
+  local -a router_dp_aware_args=()
+  if is_agentic_dpa; then
+    # Respect explicit cache-aware routing for DPA workloads.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_policy="dp_sticky"
+    fi
+    router_dp_aware_args=(--dp-aware)
+  elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
+    router_dp_aware_args=(--dp-aware)
+  fi
+  local -a router_policy_args=(--policy "${router_policy}")
+  if [[ "${router_policy}" == "cache_aware" ]]; then
+    # Keep the InferenceX defaults, with a case-level absolute-load override.
+    router_policy_args+=(
+      --prefill-policy cache_aware --decode-policy cache_aware
+      --cache-threshold 0.8
+      --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
+      --balance-rel-threshold 2.0
+      --eviction-interval 300
+    )
+    router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
+  fi
   local -a router_cmd=(
-    /usr/local/bin/atomesh launch
+    "${mesh_binary}" launch
     --host 0.0.0.0
     --port "${ROUTER_PORT}"
     --pd-disaggregation
     "${prefill_args[@]}"
     "${decode_args[@]}"
-    --policy "${ROUTER_POLICY}"
+    "${router_policy_args[@]}"
     "${router_rank_mapping_args[@]}"
+    "${router_dp_aware_args[@]}"
     --backend atom
     --log-level info
     --disable-circuit-breaker
@@ -667,8 +906,10 @@ run_benchmark() {
     rm -rf "${bench_root}"
     mkdir -p "${bench_root}"
     git clone --depth 1 --filter=blob:none --sparse "${bench_repo_url}" "${bench_repo_dir}"
-    git -C "${bench_repo_dir}" sparse-checkout set utils/bench_serving
   fi
+  # The compatibility entrypoint imports infx from the repository root.
+  # Update cached checkouts too: older runs only populated utils/bench_serving.
+  git -C "${bench_repo_dir}" sparse-checkout set utils/bench_serving infx
   IFS=',' read -r -a isls <<< "${ISL_LIST}"
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
   local safe_model="${MODEL_NAME//\//-}"
@@ -692,6 +933,7 @@ run_benchmark() {
         --ignore-eos \
         --save-result \
         --percentile-metrics='ttft,tpot,itl,e2el' \
+        --metric-percentiles='90,99' \
         --result-dir="${RUN_DIR}/benchmark_results" \
         --result-filename="${result_file}"
     done
@@ -723,94 +965,49 @@ ensure_aiperf() {
 }
 
 write_aiperf_dashboard_json() {
-  local aiperf_json="$1"
-  local out_json="$2"
-  local conc="$3"
-  python3 - "${aiperf_json}" "${out_json}" "${conc}" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-conc = int(sys.argv[3])
-data = json.loads(src.read_text(encoding="utf-8"))
-
-
-def avg(name):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get("avg")
-    return value
-
-
-def pct(name, key):
-    value = data.get(name)
-    if isinstance(value, dict):
-        return value.get(key)
-    return None
-
-
-payload = {
-    "benchmark_backend": "atom",
-    "benchmark_model_name": os.environ.get("MODEL_NAME")
-    or data.get("model")
-    or data.get("model_id"),
-    "backend": "atom",
-    "benchmark_kind": os.environ.get("BENCHMARK_KIND") or "aiperf_agentic",
-    "scenario": os.environ.get("AIPERF_SCENARIO"),
-    "public_dataset": os.environ.get("AIPERF_PUBLIC_DATASET"),
-    "topology": os.environ.get("TOPOLOGY") or data.get("topology"),
-    "display_topology": os.environ.get("DISPLAY_TOPOLOGY")
-    or data.get("display_topology"),
-    "precision": os.environ.get("PRECISION") or data.get("precision"),
-    "random_input_len": int(
-        data.get("max_context_length")
-        or os.environ.get("AIPERF_MAX_CONTEXT_LENGTH")
-        or 0
-    ),
-    "random_output_len": 1024,
-    "max_concurrency": conc,
-    "random_range_ratio": "",
-    "request_throughput": avg("request_throughput"),
-    "mean_ttft_ms": avg("time_to_first_token"),
-    "median_ttft_ms": pct("time_to_first_token", "p50"),
-    "p99_ttft_ms": pct("time_to_first_token", "p99"),
-    "mean_itl_ms": avg("inter_token_latency"),
-    "median_itl_ms": pct("inter_token_latency", "p50"),
-    "p99_itl_ms": pct("inter_token_latency", "p99"),
-    "mean_e2el_ms": avg("request_latency"),
-    "median_e2el_ms": pct("request_latency", "p50"),
-    "p99_e2el_ms": pct("request_latency", "p99"),
-    "input_throughput": avg("input_token_throughput"),
-    "output_throughput": avg("output_token_throughput"),
-    "total_token_throughput": avg("total_token_throughput"),
-    "successful_requests": avg("request_count"),
-    "completed": avg("request_count"),
-    "benchmark_duration_s": avg("benchmark_duration")
-    or data.get("benchmark_duration_s"),
-    "total_input_tokens": avg("total_usage_prompt_tokens"),
-    "total_output_tokens": avg("total_usage_completion_tokens"),
+  python3 "${ATOMESH_SCRIPT_DIR}/../aiperf_dashboard.py" "$@"
 }
 
-payload = {key: value for key, value in payload.items() if value is not None}
-dst.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-print(f"[aiperf] dashboard json: {dst}")
-PY
+write_aiperf_chrome_trace() {
+  local out_dir="$1"
+  local generator="${ATOMESH_SCRIPT_DIR}/../generate_aiperf_traces.py"
+  local jsonl="${out_dir}/profile_export.jsonl"
+  if [[ ! -f "${jsonl}" ]]; then
+    echo "[aiperf] skip chrome trace: ${jsonl} was not produced"
+    return 0
+  fi
+  if [[ ! -f "${generator}" ]]; then
+    echo "[aiperf] skip chrome trace: ${generator} not found"
+    return 0
+  fi
+  echo "[aiperf] converting ${jsonl} to Perfetto/Chrome trace"
+  python3 "${generator}" "${out_dir}" \
+    || echo "[aiperf] WARNING: chrome trace conversion failed for ${out_dir}" >&2
 }
 
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
 
+  if is_agentic_dpa; then
+    export AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true
+  else
+    unset AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID
+  fi
+
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
+  local -a report_args=(
+    --model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}"
+    --mesh "127.0.0.1:${PROMETHEUS_PORT}"
+  )
   local idx
   for idx in "${!prefill_ips[@]}"; do
     server_metrics_args+=("http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/metrics")
+    report_args+=(--prefill "${prefill_ips[$idx]}:${prefill_ports[$idx]}")
   done
   for idx in "${!decode_ips[@]}"; do
     server_metrics_args+=("http://${decode_ips[$idx]}:${decode_ports[$idx]}/metrics")
+    report_args+=(--decode "${decode_ips[$idx]}:${decode_ports[$idx]}")
   done
 
   local conc
@@ -823,9 +1020,14 @@ run_aiperf_agentic_benchmark() {
     local aiperf_json="${out_dir}/profile_export_aiperf.json"
     local dashboard_json="${RUN_DIR}/benchmark_results/${result_file}"
     local -a unsafe_args=()
+    local -a chat_template_args=()
     if (( AIPERF_BENCHMARK_DURATION < 900 )) \
       || [[ "${AIPERF_UNSAFE_OVERRIDE}" == "1" || "${AIPERF_UNSAFE_OVERRIDE}" == "true" ]]; then
       unsafe_args+=(--unsafe-override)
+    fi
+    if [[ "${AIPERF_APPLY_CHAT_TEMPLATE}" == "1" \
+      || "${AIPERF_APPLY_CHAT_TEMPLATE}" == "true" ]]; then
+      chat_template_args+=(--apply-chat-template)
     fi
 
     echo "[aiperf] ${result_file}"
@@ -836,6 +1038,8 @@ run_aiperf_agentic_benchmark() {
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
+      python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
+      --output "${out_dir}/metrics" "${report_args[@]}" -- \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
@@ -858,6 +1062,7 @@ run_aiperf_agentic_benchmark() {
       --no-gpu-telemetry \
       --tokenizer "${MODEL_PATH}" \
       --tokenizer-trust-remote-code \
+      "${chat_template_args[@]}" \
       --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
       --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
       --slice-duration "${AIPERF_SLICE_DURATION}" \
@@ -871,6 +1076,7 @@ run_aiperf_agentic_benchmark() {
       return 1
     fi
     write_aiperf_dashboard_json "${aiperf_json}" "${dashboard_json}" "${conc}"
+    write_aiperf_chrome_trace "${out_dir}"
   done
 }
 
@@ -915,6 +1121,8 @@ run_swebench_lite_eval() {
   SWEBENCH_SCORE_TIMEOUT="${SWEBENCH_SCORE_TIMEOUT}" \
   SWEBENCH_MAX_WORKERS="${SWEBENCH_MAX_WORKERS}" \
   SWEBENCH_EVAL_TIMEOUT="${SWEBENCH_EVAL_TIMEOUT}" \
+  SWEBENCH_MIN_DISK_GB="${SWEBENCH_MIN_DISK_GB}" \
+  SWEBENCH_PRUNE_IMAGES="${SWEBENCH_PRUNE_IMAGES}" \
     bash "${runner}" \
       --output-dir "${result_dir}" \
       --model-name "${MODEL_NAME}" \
@@ -1027,6 +1235,7 @@ run_eval() {
       --num_fewshot "${EVAL_FEWSHOT}" \
       "${limit_arg[@]}" \
       "${eval_extra_args[@]}" \
+      --log_samples \
       --output_path "${result_dir}"
 
     python3 - "${result_dir}" "${eval_conc}" <<'PY'
@@ -1068,10 +1277,10 @@ run_benchmark_and_eval() {
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
-    && "${EVAL_TASK}" == "swebench_lite" \
+    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
-    # Agentic performance cases require a fresh prefix-cache state. Run their
-    # trace benchmark before the independent SWE-bench workload.
+    # Agentic performance cases require a fresh prefix/state-cache state. Run
+    # their trace benchmark before any independent accuracy workload.
     run_benchmark
     run_eval
   else
@@ -1099,6 +1308,63 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pid}" "${decode_pid}"
+elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
+  worker_pids=()
+  declare -A local_worker_pid=()
+  # Save the base handshake port; each worker overrides it so
+  # apply_role_env expands ${HANDSHAKE_PORT} to the per-worker value.
+  PACKED_BASE_HANDSHAKE_PORT="${HANDSHAKE_PORT}"
+  for idx in "${!prefill_nodes[@]}"; do
+    [[ "${prefill_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${prefill_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_prefill "prefill-rank-${NODE_RANK}-worker-${idx}" "${prefill_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((PREFILL_DP_MASTER_PORT + idx * 400))" "$((PREFILL_DP_BASE_PORT + idx * 400))" \
+      "${prefill_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["prefill-${idx}"]="${server_pid}"
+  done
+  for idx in "${!decode_nodes[@]}"; do
+    [[ "${decode_nodes[$idx]}" -eq "${NODE_RANK}" ]] || continue
+    gpu_start="${decode_gpus[$idx]%%,*}"
+    export HANDSHAKE_PORT="$((PACKED_BASE_HANDSHAKE_PORT + gpu_start))"
+    start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_ports[$idx]}" \
+      "${HANDSHAKE_PORT}" \
+      "$((DECODE_DP_MASTER_PORT + idx * 400))" "$((DECODE_DP_BASE_PORT + idx * 400))" \
+      "${decode_gpus[$idx]}"
+    worker_pids+=("${server_pid}")
+    local_worker_pid["decode-${idx}"]="${server_pid}"
+  done
+  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    for idx in "${!prefill_ips[@]}"; do
+      wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
+        "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["prefill-${idx}"]:-}"
+    done
+    for idx in "${!decode_ips[@]}"; do
+      wait_http "http://${decode_ips[$idx]}:${decode_ports[$idx]}/health" \
+        "decode-${decode_ips[$idx]}:${decode_ports[$idx]}" \
+        "${WAIT_SERVER_TIMEOUT}" "${local_worker_pid["decode-${idx}"]:-}"
+    done
+    start_router
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/v1/models" "router" "${WAIT_ROUTER_TIMEOUT}"
+    run_benchmark_and_eval
+  else
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
+    # Monitor all local workers while waiting for the router to shut down.
+    for pid in "${worker_pids[@]}"; do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        set +e; wait "${pid}"; rc=$?; set -e
+        [[ "${rc}" -eq 0 ]] && rc=1
+        echo "[wait][FAIL] packed worker ${pid} exited early rc=${rc}" >&2
+        exit "${rc}"
+      fi
+    done
+    wait_router_closed
+  fi
+  cleanup_processes "${router_pid:-}" "${worker_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
   for idx in $(seq 0 $((xP - 1))); do

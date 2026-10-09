@@ -11,8 +11,9 @@ under test.
 import importlib
 import sys
 from types import ModuleType
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from atom.plugin import prepare as plugin_prepare
 
@@ -118,9 +119,12 @@ def _run_init_aiter_dist(
         config.plugin_config.is_plugin_mode
     ), "Make sure ATOM is running in plugin mode"
 
-    if config.plugin_config.is_vllm:
-        if mock_init_tp is not None and mock_init_tp(tensor_parallel_size):
-            return
+    if (
+        config.plugin_config.is_vllm
+        and mock_init_tp is not None
+        and mock_init_tp(tensor_parallel_size)
+    ):
+        return
 
     if config.plugin_config.is_vllm:
         dp_master_ip = config.parallel_config.data_parallel_master_ip
@@ -375,3 +379,33 @@ def test_register_custom_attention_uses_aiter_name():
     assert recorded["backend_name"] == "aiter"
     assert isinstance(backend, _FakeBackend)
     assert backend.runner == "runner"
+
+
+def test_sglang_plugin_registration_does_not_require_kimi_k3_pool_modules():
+    from atom.plugin.sglang import register
+
+    register_processor = MagicMock()
+    apply_load_config_patch = MagicMock()
+
+    with (
+        patch.object(register, "_install_model_config_quant_patch"),
+        patch.object(register, "_install_loader_quant_patch"),
+        patch.object(register, "_register_tc_piecewise_attention_split_ops"),
+        patch.object(register, "_install_decode_graph_forward_context_patch"),
+        patch.object(register, "apply_prefill_compile_only_patch"),
+        patch.object(register, "apply_triton_kernel_retention_patch"),
+        patch.object(
+            register,
+            "register_kimi_k3_text_only_processor",
+            register_processor,
+        ),
+        patch.dict(sys.modules, {"atom.plugin.sglang.kimi_k3_bridge": None}),
+        patch(
+            "atom.plugin.sglang.runtime.apply_load_config_patch",
+            apply_load_config_patch,
+        ),
+    ):
+        register.register_plugin()
+
+    register_processor.assert_called_once_with()
+    apply_load_config_patch.assert_called_once_with()

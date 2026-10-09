@@ -96,7 +96,7 @@
 
 ## Speculative Decoding / MTP
 
-- **Low acceptance rate:** Check `SpecStats` in scheduler logs. Distribution shows how many draft tokens (0..k) were accepted per step
+- **Low acceptance rate:** Check the `[MTP Stats]` lines in the engine log (emitted by the spec section of `EngineStats`, `model_engine/engine_stats.py`), or read them on demand from `/debug/mtp_stats`. Distribution shows how many draft tokens (0..k) were accepted per step
 - **0% acceptance with correct output:** The MTP model produces all-zero hidden states → weight loading issue. **Diagnose:** Print `logits[0].float().norm()` in `EagleProposer.propose()`. If `0.0`:
   1. Check `fc.weight` dtype — BF16 checkpoint weight may be silently quantized to FP8 if `ColumnParallelLinear` lacks the correct `prefix` argument (see [Weight Loading](#weight-loading--quantization))
   2. Check `loaded_weights_record` from `load_model()` — is the weight present?
@@ -141,7 +141,8 @@
 | Core manager | `model_engine/engine_core_mgr.py` | ZMQ orchestration, DP dispatch |
 | Engine core | `model_engine/engine_core.py` | Per-DP-rank busy loop |
 | Model runner | `model_engine/model_runner.py` | CUDA graph capture/replay, forward dispatch |
-| Scheduler | `model_engine/scheduler.py` | Batch scheduling, preemption, SpecStats |
+| Scheduler | `model_engine/scheduler.py` | Batch scheduling, preemption |
+| Engine stats | `model_engine/engine_stats.py` | MTP acceptance, prefix-cache hits, throughput line |
 | Block manager | `model_engine/block_manager.py` | KV cache block allocation |
 | Forward context | `utils/forward_context.py` | Module-level global, attn/DP metadata |
 | Compilation | `utils/backends.py` | VllmBackend, CompilerManager |

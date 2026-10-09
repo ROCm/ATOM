@@ -54,6 +54,7 @@ export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export ATOM_HOST_IP=${PREFILL_IP}
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 
@@ -93,6 +94,7 @@ export PYTHONUNBUFFERED=1
 export AITER_LOG_LEVEL=WARNING
 export AITER_BF16_FP8_MOE_BOUND=0
 export ATOM_MOE_GU_ITLV=1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export ATOM_HOST_IP=${DECODE_IP}
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 

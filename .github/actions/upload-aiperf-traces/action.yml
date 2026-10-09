@@ -1,0 +1,105 @@
+name: Upload AIPerf Perfetto traces
+description: >-
+  Convert profile_export.jsonl files into Chrome/Perfetto traces and upload
+  them as a workflow artifact. No-ops when no AIPerf exports are present.
+
+inputs:
+  result-dir:
+    description: Directory to scan for profile_export.jsonl
+    required: true
+  artifact-name:
+    description: GitHub Actions artifact name
+    required: true
+  output-dir:
+    description: Directory to write generated traces
+    required: false
+    default: aiperf-traces
+  run-url:
+    description: Workflow run URL for the Job Summary download links
+    required: false
+    default: ""
+  retention-days:
+    description: Artifact retention in days
+    required: false
+    default: "30"
+
+outputs:
+  has_traces:
+    description: Whether any Chrome traces were generated
+    value: ${{ steps.convert.outputs.has_traces }}
+  artifact-url:
+    description: Artifact download URL when traces were uploaded
+    value: ${{ steps.upload.outputs.artifact-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Convert AIPerf exports to Chrome traces
+      id: convert
+      shell: bash
+      env:
+        RESULT_DIR: ${{ inputs.result-dir }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        RUN_URL: ${{ inputs.run-url }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUTPUT_DIR}"
+        if [[ -d "${RESULT_DIR}" ]]; then
+          extra=()
+          if [[ -n "${RUN_URL}" ]]; then
+            extra+=(--run-url "${RUN_URL}")
+          fi
+          if ! python3 "${GITHUB_WORKSPACE}/.github/scripts/generate_aiperf_traces.py" \
+            "${RESULT_DIR}" \
+            --output-dir "${OUTPUT_DIR}" \
+            --index "${OUTPUT_DIR}/TRACE_INDEX.md" \
+            "${extra[@]}"; then
+            echo "::warning::AIPerf chrome-trace conversion reported errors"
+          fi
+        else
+          echo "skip chrome traces: ${RESULT_DIR} does not exist"
+        fi
+        has_traces=false
+        if [[ -n "$(find "${OUTPUT_DIR}" -type f \( -name '*.trace.json' -o -name '*.trace.json.gz' \) -print -quit)" ]]; then
+          has_traces=true
+        fi
+        echo "has_traces=${has_traces}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Perfetto traces
+      if: ${{ steps.convert.outputs.has_traces == 'true' }}
+      id: upload
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.output-dir }}/
+        if-no-files-found: ignore
+        retention-days: ${{ inputs.retention-days }}
+
+    - name: Publish Perfetto trace download links
+      if: ${{ steps.convert.outputs.has_traces == 'true' }}
+      shell: bash
+      env:
+        ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        RUN_URL: ${{ inputs.run-url }}
+      run: |
+        set -euo pipefail
+        {
+          echo
+          echo "### AIPerf Chrome Traces (Perfetto)"
+          echo
+          if [[ -n "${ARTIFACT_URL}" ]]; then
+            echo "Download [\`${ARTIFACT_NAME}\`](${ARTIFACT_URL})."
+          elif [[ -n "${RUN_URL}" ]]; then
+            echo "Download artifact \`${ARTIFACT_NAME}\` from [this run](${RUN_URL})."
+          else
+            echo "Download artifact \`${ARTIFACT_NAME}\` from this workflow run."
+          fi
+          echo
+          echo "Open the \`.trace.json.gz\` file in [Perfetto UI](https://ui.perfetto.dev) (\`Open trace file\`) or gunzip it and load \`chrome://tracing\`."
+          echo
+          if [[ -f "${OUTPUT_DIR}/TRACE_INDEX.md" ]]; then
+            cat "${OUTPUT_DIR}/TRACE_INDEX.md"
+          fi
+        } >> "${GITHUB_STEP_SUMMARY}"

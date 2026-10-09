@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 from contextlib import contextmanager
 from typing import Any
 
 import torch
 
 from atom.plugin.sglang.models.minimax_m3 import SGLangATOMMiniMaxM3Attention
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -749,6 +749,12 @@ def _patch_sglang_eagle3_state_lifecycle() -> None:
 
     def pool_indexed_future_store(self, future_indices, payload):
         ret = original_future_store(self, future_indices, payload)
+        # FutureMap is shared by ordinary generation and speculative decoding.
+        # Do not create/copy EAGLE3-only state for non-EAGLE payloads: a tiny
+        # CPU-to-GPU copy here synchronizes the forward stream and defeats
+        # SGLang's overlap scheduler after every prefill.
+        if not hasattr(payload, state_attr):
+            return ret
         indices = future_indices
         if not torch.is_tensor(indices) or indices.numel() == 0:
             return ret
@@ -1029,7 +1035,7 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
 def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
     """Optionally broadcast SGLang EAGLE3 verify outputs across TP ranks."""
 
-    if os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") != "1":
+    if not envs.ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST:
         return
 
     try:

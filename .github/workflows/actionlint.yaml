@@ -29,7 +29,7 @@ jobs:
           ACTIONLINT_VERSION: "1.7.7"
         run: |
           set -euo pipefail
-          curl -fsSL \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
             "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
             -o actionlint.tar.gz
           tar -xzf actionlint.tar.gz actionlint

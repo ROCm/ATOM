@@ -6,8 +6,10 @@ from typing import Optional
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
+
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
@@ -25,7 +27,22 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # layout (set by the vLLM plugin under DP+EP); disable it there.
     if dp_size > 1 and config.moe_ep_flatten_tp_across_dp:
         return False
-    if dp_size > 1 and _has_module("mori") and config.enable_dp_attention:
+    # Only the selected MoRI transport needs this switch; the TP fusion is a
+    # different mechanism, and an explicitly selected RCCL/none backend must
+    # not be inferred from the mere presence of the ``mori`` Python package.
+    # EPLB always fuses, otherwise the env decides.
+    requested_all2all = getattr(config, "moe_all2all_backend", "auto")
+    mori_selected = (
+        requested_all2all in {"auto", "mori"}
+        and not envs.ATOM_DISABLE_MORI_EP
+        and _has_module("mori")
+    )
+    if (
+        dp_size > 1
+        and mori_selected
+        and config.enable_dp_attention
+        and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
+    ):
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:
@@ -471,3 +488,40 @@ def rocm_aiter_grouped_topk(
             routed_scaling_factor,
             num_fused_shared_experts,
         )
+
+
+def mm_topk(
+    ids: torch.Tensor | None,
+    gating_output: torch.Tensor,
+    bias: torch.Tensor,
+    bias_alt: torch.Tensor,
+    hash_table: torch.Tensor | None,
+    vocab_size: int,
+    renormalize: bool,
+    scaling: float,
+    out_ids: torch.Tensor,
+    out_weights: torch.Tensor,
+    *,
+    image_mask: torch.Tensor | None = None,
+) -> None:
+    """Fused two-bias routing from #2149, with an optional explicit image mask.
+
+    V4 uses above-vocabulary IDs and may supply a text hash table. An explicit
+    mask replaces sentinel detection; without hashing, IDs/vocabulary are unused.
+    Output views may have a wider row stride for fused shared-expert columns.
+    """
+    from atom.model_ops.triton_mm_topk import mm_topk_triton
+
+    mm_topk_triton(
+        ids,
+        gating_output,
+        bias,
+        bias_alt,
+        hash_table,
+        vocab_size,
+        renormalize,
+        scaling,
+        out_ids,
+        out_weights,
+        image_mask=image_mask,
+    )

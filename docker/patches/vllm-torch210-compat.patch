@@ -1,8 +1,8 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 48c0270e2..155dcd70a 100644
+index 64de3baa9f..ca77beb049 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -1087,11 +1087,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+@@ -1211,11 +1211,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
      WITH_SOABI)
  
    # Set TORCH_TARGET_VERSION for stable ABI compatibility.
@@ -17,7 +17,7 @@ index 48c0270e2..155dcd70a 100644
  
    # Needed to use cuda/hip APIs from C-shim
    if(VLLM_GPU_LANG STREQUAL "CUDA")
-@@ -1312,11 +1312,11 @@ define_extension_target(
+@@ -1452,11 +1452,11 @@ define_extension_target(
    WITH_SOABI)
  
  # Set TORCH_TARGET_VERSION for stable ABI compatibility.
@@ -33,7 +33,7 @@ index 48c0270e2..155dcd70a 100644
  # Needed to use cuda/hip APIs from C-shim
  if(VLLM_GPU_LANG STREQUAL "CUDA")
 diff --git a/csrc/libtorch_stable/cuda_view.cu b/csrc/libtorch_stable/cuda_view.cu
-index 7bf826747..5788692b7 100644
+index 7bf8267470..5788692b7b 100644
 --- a/csrc/libtorch_stable/cuda_view.cu
 +++ b/csrc/libtorch_stable/cuda_view.cu
 @@ -2,6 +2,7 @@
@@ -123,11 +123,11 @@ index 7bf826747..5788692b7 100644
 +                                  layout);
  }
 diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
-index cf821a54b..f10ddd36a 100644
+index 0e133a3773..ba8e8ff4ca 100644
 --- a/vllm/utils/torch_utils.py
 +++ b/vllm/utils/torch_utils.py
-@@ -807,7 +807,13 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
-         assert cpu_tensor.is_pinned(), "CPU tensor must be pinned"
+@@ -898,7 +898,13 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
+             cpu_tensor = pinned
          return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
      elif current_platform.is_cuda_alike():
 -        return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)

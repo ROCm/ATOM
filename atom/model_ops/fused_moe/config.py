@@ -1,9 +1,11 @@
 import logging
-from typing import Union, NamedTuple, ClassVar, TYPE_CHECKING
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Union
+
 import torch
 
 if TYPE_CHECKING:
+    from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
     from atom.model_ops.moe import FusedMoEParallelConfig
 
 logger = logging.getLogger("atom")
@@ -304,11 +306,17 @@ class FusedMoEConfig:
 
     num_local_experts: int
     moe_parallel_config: "FusedMoEParallelConfig"
+    expert_layout: "MoEExpertLayout"
 
     # The activation type.
     in_dtype: torch.dtype | str | None = None
     # activation quant type -- to differentiate triton aiter mxfp4 kernels
     a_quant_dtype: torch.dtype | str | None = None
+    # MXFP4 experts take MXFP8 activations (A8W4) at every token count rather
+    # than aiter's per-arch default (A4W4 on gfx950's separated gate/up layout).
+    # aiter has A8W4 kernels only for interleaved gate/up rows, so this also
+    # interleaves the weights.
+    mxfp4_fp8_activations: bool = False
 
     static_scale: torch.Tensor | None = None
 
@@ -357,3 +365,37 @@ class FusedMoEConfig:
     @property
     def use_mori_kernels(self):
         return self.moe_parallel_config.use_mori_kernels
+
+    @property
+    def use_rccl_kernels(self):
+        return self.moe_parallel_config.use_rccl_kernels
+
+
+def moe_kernel_token_capacity(
+    atom_config,
+    *,
+    dp_size: int,
+    use_all2all: bool,
+    dp_logical_ratio: int = 1,
+) -> int:
+    """Token rows MoE kernels must reserve for this rank.
+
+    DP-attention + TP MoE all-gathers hidden states across DP ranks before
+    routing. AITER fused-shared-expert topK metadata is a single preallocated
+    ``[T, topk+shared]`` buffer, so ``T`` must cover the gathered width:
+    ``max_num_batched_tokens * dp_size`` (times the simulated-DP repeat).
+    All2all/EP keeps tokens local, so the per-rank scheduler budget is enough.
+
+    ``repeat_rows`` also runs alone in ``forward_impl`` (the single-real-rank
+    path, with no gather to ride along with), so the simulated-DP repeat
+    applies at ``dp_size == 1`` too.
+    """
+    tokens = atom_config.max_num_batched_tokens
+    if use_all2all:
+        return tokens
+    repeat = max(int(dp_logical_ratio), 1)
+    if atom_config.enable_dp_attention and dp_size > 1:
+        return tokens * dp_size * repeat
+    if dp_size == 1:
+        return tokens * repeat
+    return tokens

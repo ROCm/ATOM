@@ -3,10 +3,20 @@
 
 """Tests for reasoning/thinking content separation."""
 
+import tracemalloc
+from typing import ClassVar
+
+import pytest
+
 from atom.entrypoints.openai.reasoning import (
+    ReasoningChannel,
     ReasoningFilter,
+    prompt_starts_in_reasoning,
     separate_reasoning,
 )
+from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
+from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
 # ============================================================================
 # separate_reasoning() Tests
@@ -77,24 +87,70 @@ class TestSeparateReasoning:
         assert reasoning == "thinking only"
         assert content == ""
 
-    def test_whitespace_after_thinking(self):
+    def test_whitespace_after_thinking_survives(self):
+        """It used to be trimmed here and delivered by the streaming path.
+
+        The newline a model writes before its answer is not a marker this
+        dialect declares, and only markers may be removed -- the same rule
+        `ToolCallParser.parse` states one stage later, after a trailing
+        `.strip()` there cost a code-block answer its final newline.
+        """
         text = "<think>thought</think>\n\nThe answer."
         reasoning, content = separate_reasoning(text)
-        assert content == "The answer."
+        assert content == "\n\nThe answer."
+        assert reasoning == "thought"
 
     def test_no_think_start_tag(self):
         """MiniMax M2.7 pattern: model doesn't generate <think>, only </think>.
-        The chat template injects <think> as part of the prompt."""
+
+        The chat template injects <think> into the prompt, which is what
+        `starts_thinking` carries -- the text itself cannot say so, and this
+        used to be inferred from the bare `</think>`. Inferring it is what the
+        streaming path cannot do without waiting for an end marker that may
+        never come, so the two disagreed; the caller answers it once now.
+        """
         text = "The user wants hello world...\n</think>\n\nprint('Hello')"
-        reasoning, content = separate_reasoning(text)
-        assert reasoning == "The user wants hello world..."
-        assert content == "print('Hello')"
+        reasoning, content = separate_reasoning(text, starts_thinking=True)
+        assert reasoning == "The user wants hello world...\n"
+        assert content == "\n\nprint('Hello')"
 
     def test_no_think_start_tag_empty_content(self):
         text = "Reasoning only\n</think>"
-        reasoning, content = separate_reasoning(text)
-        assert reasoning == "Reasoning only"
+        reasoning, content = separate_reasoning(text, starts_thinking=True)
+        assert reasoning == "Reasoning only\n"
         assert content == ""
+
+    def test_an_unopened_end_tag_is_text_when_the_prompt_did_not_open_one(self):
+        """The other side of the same switch, and the reason it is a switch.
+
+        Unseeded, nothing opened a reasoning channel, so a stray `</think>`
+        is a string the model wrote. Claiming it as a delimiter is a guess,
+        and the guess is what made an ordinary answer wait for an end marker
+        that was never coming.
+        """
+        text = "The user wants hello world...\n</think>\n\nprint('Hello')"
+        reasoning, content = separate_reasoning(text)
+        assert reasoning is None
+        assert content == text
+
+    def test_streaming_and_non_streaming_agree_on_a_truncated_trace(self):
+        """Same prompt, same output, same split -- whether streamed or not.
+
+        A reasoning model stopped at `max_tokens` emits no end marker. Seeded,
+        both paths must call the whole thing reasoning; the streaming path did
+        while this one called it content, so a client reading `content` saw
+        the trace and a client reading `delta.content` saw nothing.
+        """
+        raw = "Let me consider whether the user wants a GLM parser. " * 4
+        reasoning, content = separate_reasoning(raw, starts_thinking=True)
+
+        rf = ReasoningFilter(starts_thinking=True)
+        segments = rf.process(raw) + rf.flush()
+        streamed_reasoning = "".join(s for f, s in segments if f == "reasoning_content")
+        streamed_content = "".join(s for f, s in segments if f == "content")
+
+        assert (reasoning or "") == streamed_reasoning
+        assert content == streamed_content
 
 
 # ============================================================================
@@ -185,3 +241,403 @@ class TestReasoningFilter:
         results.extend(rf.flush())
         content = "".join(t for f, t in results if f == "content")
         assert "Hi" in content
+
+
+class TestTheChannelEndsAtWhicheverCloserComesFirst:
+    """One rule, where there were three branches and one of them lost data.
+
+    Driven through a `ReasoningChannel` naming the channel dialect, because
+    that is now what decides these markers mean anything: a model resolves to
+    one dialect at startup and both delivery modes read that one. Asked of the
+    module-level helpers instead, this would be asserting the old behaviour --
+    every dialect tried in turn on one path and the union of their markers on
+    the other, which is the divergence the channel exists to remove.
+
+    A channel format can leave the think channel by *opening* another one, so
+    `<|close|>think<|sep|>` and `<|open|>response<|sep|>` both end it. The
+    branch for the second returned `reasoning=None` and discarded everything
+    ahead of the marker: a single byte between the two was enough to reach
+    it, and the chain of thought then appeared in neither field.
+
+    And all three were ungated, so a model that merely *quotes* one of these
+    tokens had the text before it deleted -- the inference `parse_tool_calls`
+    was changed to stop making, in the half still making it.
+    """
+
+    THINK_END = "<|close|>think<|sep|>"
+    RESPONSE = "<|open|>response<|sep|>"
+    K3 = ReasoningChannel(dialect=resolve_dialect(THINK_END)[0], starts_open=True)
+    K3_CLOSED = ReasoningChannel(dialect=K3.dialect, starts_open=False)
+
+    def test_a_byte_between_the_markers_keeps_the_reasoning(self):
+        text = f"my reasoning{self.THINK_END}\n{self.RESPONSE}the answer"
+        reasoning, content = self.K3.split(text)
+        assert reasoning == "my reasoning"
+        assert "the answer" in content
+
+    def test_opening_the_response_channel_ends_the_reasoning(self):
+        text = f"my reasoning{self.RESPONSE}the answer"
+        reasoning, content = self.K3.split(text)
+        assert reasoning == "my reasoning"
+        assert content == "the answer"
+
+    @pytest.mark.parametrize("marker_attr", ["THINK_END", "RESPONSE"])
+    def test_a_quoted_token_does_not_open_a_channel_that_was_closed(self, marker_attr):
+        """It stays content. Whether the *token* survives is a separate
+        question -- `<|open|>response<|sep|>` is framing this format wraps
+        every answer in, so it is removed on both delivery paths, while
+        `<|close|>think<|sep|>` is a channel delimiter and only means anything
+        once a channel is open."""
+        marker = getattr(self, marker_attr)
+        text = f"The K3 format uses {marker} to open the answer."
+        reasoning, content = self.K3_CLOSED.split(text)
+        assert reasoning is None
+        assert content == self.K3_CLOSED.dialect.strip_framing(text)
+        assert "The K3 format uses" in content and "to open the answer." in content
+
+    @pytest.mark.parametrize("chunk", [1, 3, 999])
+    def test_the_streaming_filter_closes_on_the_same_markers(self, chunk):
+        """It knew only the explicit close, so a K3 answer that goes straight
+        to the response channel -- its own docs call that the common path --
+        streamed entirely as `reasoning_content` with an empty `content`."""
+        text = f"{self.RESPONSE}Hello world"
+        f = self.K3.stream()
+        segs = []
+        for i in range(0, len(text), chunk):
+            segs += f.process(text[i : i + chunk])
+        segs += f.flush()
+        assert "".join(s for k, s in segs if k == "content") == "Hello world"
+        assert "".join(s for k, s in segs if k == "reasoning_content") == ""
+
+
+class TestTheDialectIsReadFromWhicheverEvidenceExists:
+    """A rendered prompt and a template source are both evidence, and only one
+    of them is always available.
+
+    Kimi-K3 ships neither a Jinja `chat_template` nor an encoder under the path
+    the loader searches, so `chat_template_source` returns `""` for it. Reading
+    only the source therefore fell back to the inline-`<think>` dialect and a
+    K3 answer came back as `reasoning_content` with `content` empty -- while
+    the *tool-call* format resolved correctly, because that one reads the
+    rendered probe. One model, two answers to "what does this speak", from two
+    different pieces of evidence.
+    """
+
+    K3_PROMPT = "<|im_system|>you are helpful<|im_end|><|open|>think<|sep|>"
+    QWEN_SOURCE = "{% if enable_thinking %}<think>{% endif %}...</think>"
+
+    def test_the_render_answers_when_the_source_cannot(self):
+        dialect, stated = resolve_dialect("", self.K3_PROMPT)
+        assert dialect.think_end_marker == "<|close|>think<|sep|>"
+        assert stated, "a named dialect must not be reported as a fallback"
+
+    def test_the_source_still_answers_when_there_is_one(self):
+        dialect, stated = resolve_dialect(self.QWEN_SOURCE, "...<think>")
+        assert dialect.think_end_marker == "</think>" and stated
+
+    def test_neither_falls_back_and_says_so(self):
+        dialect, stated = resolve_dialect("", "")
+        assert dialect.think_end_marker == "</think>"
+        assert not stated, "a fallback must be reported as one"
+
+    ANSWER = (
+        "The user wants the capital.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>Paris.<|close|>response<|sep|><|end_of_msg|>"
+    )
+
+    def _channel(self):
+        dialect, _ = resolve_dialect("", self.K3_PROMPT)
+        return ReasoningChannel(dialect=dialect, starts_open=True)
+
+    def test_a_k3_answer_is_split_by_the_dialect_it_resolved_to(self):
+        """The consequence, end to end: the fallback returned `content: ''`."""
+        reasoning, content = self._channel().split(self.ANSWER)
+        assert reasoning == "The user wants the capital."
+        assert "Paris." in content
+
+    @pytest.mark.parametrize("chunk", [1, 5, 999])
+    def test_and_both_delivery_modes_agree_through_the_whole_pipeline(self, chunk):
+        """Reasoning *and* the tool parser, because the channel framing is the
+        latter's to remove.
+
+        The reasoning split used to strip it as well, which made the two paths
+        agree only by way of a third stage and only when a K3 parser had been
+        resolved -- and it truncated at `<|end_of_msg|>` rather than removing
+        it, deleting anything after that token on one path alone.
+        """
+        channel = self._channel()
+        reasoning, rest = channel.split(self.ANSWER)
+        content, _ = parse_tool_calls(rest, None, KimiK3Parser)
+
+        filt, parser = channel.stream(), ToolCallStreamParser(parser_cls=KimiK3Parser)
+        streamed_reasoning, streamed_content = [], []
+        segments = []
+        for i in range(0, len(self.ANSWER), chunk):
+            segments += filt.process(self.ANSWER[i : i + chunk])
+        segments += filt.flush()
+        for field, seg in segments:
+            if field == "reasoning_content":
+                streamed_reasoning.append(seg)
+            else:
+                streamed_content += [
+                    d for k, d in parser.process(seg) if k == "content"
+                ]
+        streamed_content += [d for k, d in parser.flush() if k == "content"]
+
+        assert "".join(streamed_reasoning) == reasoning
+        assert "".join(streamed_content) == content == "Paris."
+
+
+class TestTheReasoningStageAgreesWithItselfWithoutHelp:
+    """`.split()` and `.stream()` must produce the same bytes on their own.
+
+    Not "the same bytes once the tool parser has had them". The reasoning
+    split used to remove Kimi-K3's channel framing itself, which the streaming
+    filter has no step for -- so the two agreed only because a *third* stage
+    removed it on the streamed path too, and only when a K3 parser had been
+    resolved. Asserted here without a tool parser, which is the only way to
+    see it: with one, both paths come out identical either way.
+    """
+
+    SHAPES: ClassVar[list[str]] = [
+        "",
+        "reasoning only",
+        "reason</think>answer",
+        "reason<|close|>think<|sep|>answer",
+        "reason<|close|>think<|sep|><|open|>response<|sep|>Paris.",
+        (
+            "reason<|close|>think<|sep|><|open|>response<|sep|>Paris."
+            "<|close|>response<|sep|><|end_of_msg|>"
+        ),
+        "reason</think>answer<|end_of_msg|>and more",
+        "</think>",
+        "<|close|>think<|sep|>",
+    ]
+
+    @pytest.mark.parametrize("source", ["<think></think>", "<|open|>think<|sep|>"])
+    @pytest.mark.parametrize("starts_open", [True, False])
+    @pytest.mark.parametrize("chunk", [1, 4, 999])
+    def test_the_two_modes_agree_byte_for_byte(self, source, starts_open, chunk):
+        dialect, _ = resolve_dialect(source)
+        channel = ReasoningChannel(dialect=dialect, starts_open=starts_open)
+        for text in self.SHAPES:
+            filt = channel.stream()
+            segments = []
+            for i in range(0, len(text), chunk):
+                segments += filt.process(text[i : i + chunk])
+            segments += filt.flush()
+            streamed = (
+                "".join(x for k, x in segments if k == "reasoning_content") or None,
+                "".join(x for k, x in segments if k == "content"),
+            )
+            assert streamed == channel.split(text), (
+                f"{dialect.think_end_marker!r} starts_open={starts_open} "
+                f"chunk={chunk} text={text!r}: {streamed} != {channel.split(text)}"
+            )
+
+    @pytest.mark.parametrize("source", ["<think></think>", "<|open|>think<|sep|>"])
+    @pytest.mark.parametrize("starts_open", [True, False])
+    def test_and_neither_loses_a_byte_it_did_not_declare(self, source, starts_open):
+        """Everything the model wrote comes back, minus this dialect's own
+        markers and nothing else."""
+        dialect, _ = resolve_dialect(source)
+        channel = ReasoningChannel(dialect=dialect, starts_open=starts_open)
+        declared = (
+            dialect.output_open_marker,
+            *dialect.end_markers,
+            *dialect.content_framing,
+        )
+        for text in self.SHAPES:
+            reasoning, content = channel.split(text)
+            rebuilt = (reasoning or "") + content
+            remainder = text
+            for marker in declared:
+                if marker:
+                    remainder = remainder.replace(marker, "", 1)
+            assert len(rebuilt) >= len(remainder) - 1, (
+                f"{text!r} -> {rebuilt!r}: bytes went missing that no marker "
+                "accounts for"
+            )
+
+
+class TestTheDialectsAsRegistered:
+    """The properties above are checked on dialects; these check the registry.
+
+    A property test that builds its own dialect proves the mechanism and
+    nothing about what any model is actually served with. The channel format's
+    answer framing was declared in exactly one place, and blanking it there
+    left every mechanism test green while a Kimi-K3 client got
+    `<|open|>response<|sep|>` in its content.
+    """
+
+    def test_the_channel_dialect_declares_the_framing_it_wraps_answers_in(self):
+        dialect, _ = resolve_dialect("<|open|>think<|sep|>")
+        framed = "<|open|>response<|sep|>Hi there.<|close|>response<|sep|>"
+        assert ReasoningChannel(dialect=dialect).split(framed) == (None, "Hi there.")
+
+    def test_minimax_m3_resolves_to_its_own_tags(self):
+        """`<mm:think>`, not `<think>`.
+
+        MiniMax-M3's template sets `think_begin_token = '<mm:think>'`, and no
+        dialect declared either literal -- so it fell through to the inline
+        `<think>` entry, matched nothing, and delivered the whole chain of
+        thought as `content` with `reasoning_content: null` on both delivery
+        paths. On `/v1/messages`, where reasoning is dropped by default, that
+        put the trace inside the client's text block.
+        """
+        source = (
+            "{%- set think_begin_token = '<mm:think>' -%}"
+            "{%- set think_end_token = '</mm:think>' -%}"
+        )
+        dialect, stated = resolve_dialect(source)
+        assert (dialect.think_end_marker, stated) == ("</mm:think>", True)
+        channel = ReasoningChannel(dialect=dialect, starts_open=True)
+        assert channel.split("Reasoning.</mm:think>The answer.") == (
+            "Reasoning.",
+            "The answer.",
+        )
+        # And the prompt marker, which is what seeds `starts_open` in the
+        # first place: the template ends the generation prompt with the
+        # opener under `thinking_mode == "enabled"`.
+        assert prompt_starts_in_reasoning("]~b]ai\n<mm:think>")
+        assert dialect.output_open_marker == "<mm:think>"
+
+    def test_and_it_does_not_steal_the_generic_think_template(self):
+        """The two marker sets must not shadow each other."""
+        dialect, _ = resolve_dialect("<think></think>")
+        assert dialect.think_end_marker == "</think>"
+
+    def test_and_the_inline_think_dialect_declares_none(self):
+        dialect, _ = resolve_dialect("<think></think>")
+        assert dialect.content_framing == (), (
+            "a dialect that wraps nothing must declare nothing, or it deletes "
+            "literals out of ordinary answers"
+        )
+
+
+class TestTheRenderedPromptIsNotCopiedToReadItsEnd:
+    """`prompt_starts_in_reasoning` looks at the last twenty bytes of the
+    largest string the server handles.
+
+    It spelled that `prompt.rstrip()`, which copies the whole rendered prompt
+    -- system prompt, tool schemas and the entire history -- once per request,
+    on the event loop. Measured 4.8 us at 512 KB against 0.43 us for the
+    offset form.
+
+    Asserted in bytes allocated, not seconds: a copy is a fact about the
+    allocator, so this says the same thing on any machine and cannot go flaky.
+    `begin_of_markup` carries the twin of this test.
+    """
+
+    SMALL_KB = 16
+    LARGE_KB = 512
+
+    @staticmethod
+    def _peak_bytes(prompt: str) -> int:
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            prompt_starts_in_reasoning(prompt)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def _prompt(self, kb: int) -> str:
+        return ("You are a helpful assistant. " * (kb * 1024 // 29)) + "<think>\n"
+
+    def test_the_answer_is_unchanged(self):
+        assert prompt_starts_in_reasoning(self._prompt(64)) is True
+        assert prompt_starts_in_reasoning("just an ordinary prompt\n") is False
+        assert prompt_starts_in_reasoning("") is False
+        assert prompt_starts_in_reasoning("   \n\t ") is False
+
+    def test_trailing_whitespace_is_still_stepped_over(self):
+        assert prompt_starts_in_reasoning("<think>") is True
+        assert prompt_starts_in_reasoning("<think>  \n\t\n ") is True
+        assert prompt_starts_in_reasoning("<think> x ") is False
+
+    def test_it_allocates_no_more_for_a_prompt_32x_larger(self):
+        small = self._peak_bytes(self._prompt(self.SMALL_KB))
+        large = self._peak_bytes(self._prompt(self.LARGE_KB))
+        assert large < small + 4096, (
+            f"{self.LARGE_KB} KB allocated {large} bytes against {small} for "
+            f"{self.SMALL_KB} KB; the prompt is being copied to read its end"
+        )
+
+
+class TestNonReasoningOutputIsNotWithheld:
+    """A stream that never opens a reasoning channel must still reach the client.
+
+    The shapes are PR #1961's, kept verbatim. They came off an observed
+    production stall -- 1.5-2.4% of requests on a Claude-Code agent corpus
+    returned HTTP 200 and then zero body bytes until the client's 600s read
+    timeout, while the engine decoded to `max_tokens` -- and an observed shape
+    is worth more than one invented to fit the rule.
+
+    The rule itself is `TestBoundedWithhold` in
+    `test_stream_marker_properties.py`, which asks it of every registered
+    dialect crossed with every format, against a control with the trigger
+    characters neutralised. These are the point cases beside that axis, and
+    they pass here for a structural reason rather than a patched one: the
+    buffer-and-threshold state machine #1961 fixes (`len(self.buf) > 100 and
+    "<" not in self.buf`, which withheld everything for as long as the answer
+    contained a `<` anywhere -- and code is full of them) no longer exists.
+    `MarkerScanner` releases whatever cannot begin a declared marker, so there
+    is no threshold to tune and nowhere for the defect to live.
+
+    Measured against a scanner mutated to withhold anything containing a `<`:
+    the first two catch it, the last three are feature guards and correctly do
+    not, and `test_token_by_token_code_output_streams` does not either -- it
+    asserts only that *something* was emitted, and under partial withholding
+    something still is. Said out loud because a test that cannot fail reads
+    like one that can. `TestBoundedWithhold` is where the discrimination
+    lives: it compares the first content byte's offset against the same text
+    with its trigger characters neutralised.
+    """
+
+    @staticmethod
+    def _emit(chunks):
+        f = ReasoningFilter()
+        out = []
+        for c in chunks:
+            out.extend(f.process(c))
+        return out
+
+    def test_angle_bracket_in_plain_output_does_not_withhold_forever(self):
+        # A '<' that is not a reasoning marker: the classic case is code.
+        text = "Here is the fix:\n\nif (a < b) { return a; }\n" + "x" * 200
+        emitted = self._emit([text])
+        assert emitted, "nothing was emitted: the stream would stall"
+        assert "".join(t for f, t in emitted if f == "content").startswith(
+            "Here is the fix:"
+        )
+
+    def test_html_like_output_does_not_withhold_forever(self):
+        emitted = self._emit(["<div class='x'>hello</div>\n" + "y" * 200])
+        assert emitted, "nothing was emitted: the stream would stall"
+
+    def test_token_by_token_code_output_streams(self):
+        # The real shape: many small chunks, one of which contains '<'.
+        chunks = ["Sure. ", "Use ", "a < b ", "to compare. "] + [
+            "word " for _ in range(60)
+        ]
+        assert self._emit(chunks), "nothing was emitted: the stream would stall"
+
+    def test_a_real_think_block_still_separates(self):
+        # The fix must not cost the feature it guards.
+        out = self._emit(["<think>", "pondering", "</think>", "answer"])
+        assert ("reasoning_content", "pondering") in out
+        assert ("content", "answer") in out
+
+    def test_partial_end_marker_is_still_held_back(self):
+        # A marker split across chunks must not leak as content.
+        out = self._emit(["<think>", "abc", "</thi"])
+        assert not any("</thi" in t for _, t in out), "leaked a partial marker"
+
+    def test_template_injected_opener_still_reaches_end_marker(self):
+        f = ReasoningFilter(starts_thinking=True)
+        out = []
+        for c in ["reasoning here", "</think>", "final"]:
+            out.extend(f.process(c))
+        assert ("reasoning_content", "reasoning here") in out
+        assert ("content", "final") in out

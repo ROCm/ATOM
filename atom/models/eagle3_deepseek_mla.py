@@ -36,7 +36,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import Config
-from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_mla import MLAModules, qrep_tp_override
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
@@ -83,6 +83,10 @@ class Eagle3DeepseekMLAAttention(nn.Module):
 
         self.scaling = self.qk_head_dim**-0.5
 
+        # No-op unless QREP is on (see qrep_tp_override); the draft shares the
+        # target's DCP group, so this is all the wiring QREP needs here.
+        q_qrep_override = qrep_tp_override(tp_size)
+
         attn_input_size = self.hidden_size * 2  # dual input: cat(embed, fc_out)
 
         self.q_a_proj = ReplicatedLinear(
@@ -97,6 +101,7 @@ class Eagle3DeepseekMLAAttention(nn.Module):
             self.num_heads * self.qk_head_dim,
             bias=False,
             prefix=f"{prefix}.q_b_proj",
+            **q_qrep_override,
         )
 
         self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -382,11 +387,13 @@ class Eagle3DeepseekMLAModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         return self.lm_head(hidden_states)
 
-    def compute_draft_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def compute_draft_ids(
+        self, hidden_states: torch.Tensor, *, out: torch.Tensor
+    ) -> torch.Tensor:
         """Greedy draft token ids via distributed argmax — avoids all-gathering
         the full [N, vocab] logits every draft step. Token-identical to
         compute_logits(...).argmax(-1); norm handling mirrors compute_logits.
         """
         if not self.norm_output:
             hidden_states = self.norm(hidden_states)
-        return self.lm_head.compute_argmax_token(hidden_states)
+        return self.lm_head.compute_argmax_token(hidden_states, out=out)

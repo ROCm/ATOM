@@ -88,7 +88,7 @@ Eager baseline: 0.785 / 0.785. All cudagraph results within ±0.030 stderr.
 - 238 `activation_scale` checkpoint tensors are silently dropped during
   load (harmless — the FP8 GEMM dequantizes weights and ignores
   per-channel input scale).
-- `compute_block_bytes` logs a cosmetic 100% pool-size mismatch at boot.
+- Sub-pool sizing logs a cosmetic 100% pool-size mismatch at boot.
 - `--max-model-len` must accommodate the Mistral chat template
   (~540 tokens).
 - TP > 1 needs `iommu=pt amd_iommu=on` on the host kernel cmdline.

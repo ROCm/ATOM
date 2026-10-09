@@ -4,20 +4,20 @@
 import argparse
 import json
 
-from PIL import Image
 from transformers import AutoProcessor
 
 from atom import SamplingParams
 from atom.model_engine.arg_utils import EngineArgs
+from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
 parser = FlexibleArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description=(
         "Generic image+text multimodal offline inference using the native ATOM engine.\n"
-        "The current ATOM multimodal path is validated with Qwen3.5 models, but\n"
-        "the script itself only relies on the model's Hugging Face processor and\n"
-        "chat template."
+        "Validated with Qwen3.5 and Kimi-K3. The script relies on the model's\n"
+        "Hugging Face processor and chat template. Media normalization and native\n"
+        "input preparation are shared with online serving."
     ),
 )
 
@@ -60,51 +60,33 @@ def main():
     # Load processor (handles media preprocessing and chat template)
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
-    images = [Image.open(path).convert("RGB") for path in args.image]
-
-    # Build chat messages. Image parts intentionally precede text so Qwen-style
-    # templates emit image placeholders in the same order as the media tensors.
-    messages = [
+    # The nth image marker refers to the nth entry in multi_modal_data["image"].
+    conversation = [
         {
             "role": "user",
             "content": [
-                *({"type": "image", "image": image} for image in images),
+                *({"type": "image"} for _ in args.image),
                 {"type": "text", "text": args.prompt},
             ],
         }
     ]
 
-    # Apply chat template to get text with image placeholders.
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        **chat_template_kwargs,
-    )
-    print(f"Formatted prompt (first 500 chars): {text[:500]}")
-
-    # Process text + images to get input_ids, pixel_values, image_grid_thw.
-    inputs = processor(
-        text=[text],
-        images=images,
-        return_tensors="pt",
-    )
-
-    input_ids = inputs["input_ids"][0].tolist()
-    print(f"Input token count: {len(input_ids)}")
-
-    # Build multimodal data dict
-    multimodal_data = {
-        "pixel_values": inputs["pixel_values"],
-        "image_grid_thw": inputs["image_grid_thw"],
-    }
-
-    print(f"pixel_values shape: {multimodal_data['pixel_values'].shape}")
-    print(f"image_grid_thw: {multimodal_data['image_grid_thw']}")
-
-    # Create engine
+    # Create the engine first: the architecture-specific input builders are
+    # selected from its resolved config.
     engine_args = EngineArgs.from_cli_args(args)
     llm = engine_args.create_engine()
+
+    input_ids, multimodal_data = prepare_multimodal_inputs(
+        llm.io_processor.config,
+        processor,
+        conversation,
+        {"image": args.image},
+        chat_template_kwargs,
+    )
+
+    print(f"Input token count: {len(input_ids)}")
+    print(f"pixel_values shape: {multimodal_data['pixel_values'].shape}")
+    print(f"image_grid_thw: {multimodal_data['image_grid_thw']}")
 
     sampling_params = SamplingParams(
         temperature=args.temperature, max_tokens=args.max_tokens

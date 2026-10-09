@@ -1,0 +1,25 @@
+name: Validate dashboard data
+description: Verify dashboard data was not reduced while publishing a benchmark result.
+
+inputs:
+  data-path:
+    description: Path to data.js on the gh-pages branch.
+    required: true
+  min-entries:
+    description: Minimum number of run entries expected after publishing.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        DATA_PATH: ${{ inputs.data-path }}
+        MIN_ENTRIES: ${{ inputs.min-entries }}
+      run: |
+        set -euo pipefail
+        DATA_FILE="$RUNNER_TEMP/dashboard-data.js"
+        git show "gh-pages:${DATA_PATH}" > "$DATA_FILE"
+        python3 "$GITHUB_WORKSPACE/.github/scripts/prepare_dashboard_data.py" \
+          "$DATA_FILE" \
+          --min-entries "$MIN_ENTRIES"

@@ -10,6 +10,10 @@ runners:
     gpu_arch: MI355
     gpu_count: 8
 
+  spur-runner-mi355x-8gpu:
+    gpu_arch: MI355
+    gpu_count: 8
+
   linux-atom-mi355-1:
     gpu_arch: MI355
     gpu_count: 1

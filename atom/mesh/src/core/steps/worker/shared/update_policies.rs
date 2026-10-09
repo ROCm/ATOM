@@ -125,6 +125,30 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                 }
             }
 
+            // PD mode keeps separate prefill/decode policy instances, and those
+            // own their own radix trees. Without this they never get a tree:
+            // select_worker then falls through to random placement and never
+            // inserts, so cache affinity can never build up.
+            // Query the registry rather than filtering `all_workers`: registration
+            // is a background job, so the model-scoped list here can lag behind.
+            // Gate on get_*_policy() (which falls back to the default) instead of
+            // the OnceLock, otherwise a not-yet-set P/D policy silently skips
+            // seeding and cache_aware ends up routing at random forever.
+            // `init_workers` is idempotent, so re-running per registration is safe.
+            let prefill_workers = app_context.worker_registry.get_prefill_workers();
+            let decode_workers = app_context.worker_registry.get_decode_workers();
+            let prefill_is_ca =
+                app_context.policy_registry.get_prefill_policy().name() == "cache_aware";
+            let decode_is_ca =
+                app_context.policy_registry.get_decode_policy().name() == "cache_aware";
+            if (prefill_is_ca && !prefill_workers.is_empty())
+                || (decode_is_ca && !decode_workers.is_empty())
+            {
+                app_context
+                    .policy_registry
+                    .init_pd_cache_aware_policies(&prefill_workers, &decode_workers);
+            }
+
             if !updated_models.contains(&model_id) {
                 updated_models.push(model_id);
             }

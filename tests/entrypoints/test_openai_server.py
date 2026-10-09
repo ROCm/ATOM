@@ -21,7 +21,6 @@ import socket
 import subprocess
 import sys
 import time
-from typing import List, Optional
 
 import pytest
 import requests
@@ -82,8 +81,8 @@ class RemoteATOMServer:
         self,
         model: str,
         host: str = HOST,
-        port: Optional[int] = None,
-        extra_args: Optional[List[str]] = None,
+        port: int | None = None,
+        extra_args: list[str] | None = None,
         timeout: int = TIMEOUT,
     ):
         self.model = model
@@ -91,7 +90,7 @@ class RemoteATOMServer:
         self.port = port or _find_free_port()
         self.base_url = f"http://{self.host}:{self.port}"
         self.timeout = timeout
-        self.proc: Optional[subprocess.Popen] = None
+        self.proc: subprocess.Popen | None = None
 
         cmd = [
             sys.executable,
@@ -192,6 +191,18 @@ class TestHealthAndModels:
         assert len(data["data"]) == 1
         assert data["data"][0]["id"] == MODEL
         assert data["data"][0]["owned_by"] == "atom"
+
+    def test_metrics(self, base_url):
+        r = requests.get(f"{base_url}/metrics")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/plain")
+        assert "atom:metrics_snapshot_available" in r.text
+        assert "atom:requests_running" in r.text
+        assert "vllm:" not in r.text
+
+        head = requests.head(f"{base_url}/metrics")
+        assert head.status_code == 200
+        assert head.content == b""
 
 
 # ---------------------------------------------------------------------------

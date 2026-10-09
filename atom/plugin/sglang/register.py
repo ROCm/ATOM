@@ -1,6 +1,16 @@
 import logging
 import os
 
+from atom.plugin.sglang.models.kimi_k3_processor import (
+    register_kimi_k3_text_only_processor,
+)
+from atom.plugin.sglang.patches.prefill_compile_only_patch import (
+    apply_prefill_compile_only_patch,
+)
+from atom.plugin.sglang.patches.triton_kernel_retention_patch import (
+    apply_triton_kernel_retention_patch,
+)
+
 logger = logging.getLogger("atom.plugin.sglang.register")
 
 
@@ -119,13 +129,98 @@ def _install_decode_graph_forward_context_patch() -> None:
     DecodeCudaGraphRunner._atom_forward_context_patched = True
 
 
+def _register_tc_piecewise_attention_split_ops() -> None:
+    """Keep ATOM attention kernels outside captured piecewise subgraphs."""
+
+    from sglang.srt.compilation.compilation_config import SPLIT_OPS
+
+    # Qwen3.5 uses native returning ops for dynamic compile-only prefill and
+    # decode CUDA Graphs. Padded piecewise prefill keeps graph-stable mutating
+    # ops. Both variants must remain split boundaries so per-batch attention
+    # metadata stays live.
+    for op_name in (
+        "aiter.unified_attention_with_output_base",
+        "aiter.unified_attention_with_output_base.default",
+        "aiter.linear_attention_with_output_base",
+        "aiter.linear_attention_with_output_base.default",
+        "aiter.sglang_qwen35_attention_with_stable_output",
+        "aiter.sglang_qwen35_attention_with_stable_output.default",
+        "aiter.sglang_qwen35_linear_attention_with_stable_output",
+        "aiter.sglang_qwen35_linear_attention_with_stable_output.default",
+    ):
+        if op_name not in SPLIT_OPS:
+            SPLIT_OPS.append(op_name)
+
+
+def _keep_atom_full_attn_for_native_qwen4_exp() -> None:
+    """0.5.20 replaces hybrid full-attn with QwenSparseAttnBackend for Flash.
+
+    Native ATOM still owns QSA compute and allocates CUDA-graph buffers in
+    ATOMAttnBackendForSgl.out_graph. Skip the upstream swap.
+    """
+    try:
+        from sglang.srt.layers.attention.qsa import config as qsa_config
+    except Exception:  # noqa: BLE001 - 0.5.17 has no qsa.config
+        return
+    original = getattr(qsa_config, "is_qwen_qsa", None)
+    if original is None or getattr(qsa_config, "_atom_keep_full_attn", False):
+        return
+
+    def is_qwen_qsa_for_atom(hf_config):
+        arches = getattr(hf_config, "architectures", None) or []
+        model_type = str(getattr(hf_config, "model_type", "") or "")
+        text = getattr(hf_config, "text_config", None)
+        text_mt = str(getattr(text, "model_type", "") or "")
+        if (
+            any("Qwen4Exp" in str(a) for a in arches)
+            or model_type.startswith("qwen4_exp")
+            or text_mt.startswith("qwen4_exp")
+        ):
+            from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
+                note_qwen4_exp_loaded,
+            )
+
+            note_qwen4_exp_loaded()
+            logger.info(
+                "Keep ATOMAttnBackendForSgl as hybrid full-attn for Native "
+                "Qwen4Exp; skip SGLang QwenSparseAttnBackend"
+            )
+            return False
+        return original(hf_config)
+
+    qsa_config.is_qwen_qsa = is_qwen_qsa_for_atom
+    qsa_config._atom_keep_full_attn = True
+
+
 def register_plugin() -> None:
     """Install ATOM patches that must run before SGLang parses server args."""
 
     _ensure_aiter_gpu_archs_env()
     _install_model_config_quant_patch()
     _install_loader_quant_patch()
+    _register_tc_piecewise_attention_split_ops()
     _install_decode_graph_forward_context_patch()
+    apply_prefill_compile_only_patch()
+    apply_triton_kernel_retention_patch()
+    from atom.plugin.sglang.attention_backend.gdn_replayssm import (
+        install_sglang_replayssm_commit,
+    )
+    from atom.plugin.sglang.patches.qwen4_exp_recognition_patch import (
+        apply_qwen4_exp_recognition_patch,
+    )
+    from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
+        apply_qwen4_exp_rocm_patch,
+    )
+
+    # 0.5.20 recognizes Flash. This call only installs MTP draft-arch and
+    # HC hidden-width adapters that upstream still does not provide.
+    apply_qwen4_exp_recognition_patch()
+    # EP decode asm MoE and HIP topk=1 Triton tree/verify. Plugin-only;
+    # keeps Ling's Flash MTP adapter off atom/model_ops and eagle3_llama.
+    apply_qwen4_exp_rocm_patch()
+    _keep_atom_full_attn_for_native_qwen4_exp()
+    install_sglang_replayssm_commit()
+    register_kimi_k3_text_only_processor()
 
     try:
         from atom.plugin.sglang.runtime import apply_load_config_patch

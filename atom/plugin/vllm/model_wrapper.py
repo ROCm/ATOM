@@ -3,7 +3,6 @@ import importlib
 import json
 import logging
 import os
-import types
 from collections.abc import Iterable
 
 import torch
@@ -33,6 +32,7 @@ from vllm.model_executor.models.interfaces_base import (
 from vllm.sequence import IntermediateTensors
 
 import atom  # noqa: F401
+from atom.model_ops.embed_head import empty_token_ids
 from atom.plugin.config import (
     _generate_atom_config_from_vllm_config,
     generate_atom_config_for_plugin_mode,
@@ -156,7 +156,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "atom.plugin.vllm.models.qwen3_5:Qwen3_5ForConditionalGeneration_",
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration_",
     "KimiK3ForConditionalGeneration": (
-        "atom.plugin.vllm.models.kimi_k3:KimiK3ForCausalLM"
+        "atom.plugin.vllm.models.kimi_k3:KimiK3ForConditionalGeneration_"
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
@@ -164,7 +164,12 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
     "Eagle3LlamaModel": "atom.models.eagle3_llama:Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla:Eagle3DeepseekMLAModel",
+    "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkDraft",
 }
+
+# DSpark drafts ship as their own checkpoint, so like EAGLE3 they are built from
+# the draft's hf_config and their layers are numbered past the target's.
+_DSPARK_DRAFT_ARCHS: frozenset[str] = frozenset({"K3DSparkModel"})
 
 
 def _normalize_atom_model_arch(model_arch: str) -> str:
@@ -264,7 +269,7 @@ def _select_model_arch(vllm_config: VllmConfig) -> str:
         model_tag = getattr(
             getattr(vllm_config, "compilation_config", None), "model_tag", None
         )
-    if model_tag in {"eagle_head", "draft_model", "drafter"}:
+    if model_tag in {"eagle_head", "draft_model", "drafter", "dspark_head"}:
         logger.info(
             f"Use draft model architecture {draft_arch} for speculative tag {model_tag}"
         )
@@ -360,12 +365,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.vllm_config = vllm_config
         self.is_mtp = False
         self.is_eagle3 = False
+        self.is_dspark = False
         self._mtp_target_hidden_states = None
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config is not None:
             spec_method = speculative_config.method
             self.is_mtp = spec_method == "mtp"
             self.is_eagle3 = spec_method == "eagle3"
+            self.is_dspark = spec_method == "dspark"
 
         main_model_arch = vllm_config.model_config.architectures[0]
         selected_model_arch = _select_model_arch(vllm_config)
@@ -380,14 +387,23 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             and selected_model_arch != main_model_arch
             and _is_eagle3_draft_arch(selected_model_arch)
         )
-        self.is_spec_draft_model = self.is_mtp_draft_model or self.is_eagle3_draft_model
+        self.is_dspark_draft_model = (
+            self.is_dspark and selected_model_arch in _DSPARK_DRAFT_ARCHS
+        )
+        # Both are standalone checkpoints configured off their own hf_config.
+        self._is_standalone_draft = (
+            self.is_eagle3_draft_model or self.is_dspark_draft_model
+        )
+        self.is_spec_draft_model = self.is_mtp_draft_model or self._is_standalone_draft
 
-        if self.is_eagle3_draft_model and draft_hf_config is None:
-            raise ValueError("EAGLE3 draft model config is missing hf_config")
+        if self._is_standalone_draft and draft_hf_config is None:
+            raise ValueError(
+                f"{selected_model_arch} draft model config is missing hf_config"
+            )
 
         self.config = (
             draft_hf_config
-            if self.is_eagle3_draft_model
+            if self._is_standalone_draft
             else vllm_config.model_config.hf_config
         )
         self.text_config = (
@@ -403,9 +419,22 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             main_atom_config = get_current_atom_config()
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
             self.atom_config.hf_config = main_atom_config.hf_config
-        elif self.is_eagle3_draft_model:
+        elif self._is_standalone_draft:
             self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
-            self.atom_config.hf_config = draft_hf_config
+            # Prefer ATOM's normalized copy: building the atom_config ran
+            # `hf_config_override`, which maps a standalone draft's checkpoint
+            # field names onto the canonical ones the ATOM model reads (e.g.
+            # DSpark's `mask_token_id` -> `dspark_noise_token_id`). vLLM's own
+            # copy never sees that.
+            atom_spec_config = getattr(self.atom_config, "speculative_config", None)
+            normalized_hf_config = getattr(
+                atom_spec_config, "draft_model_hf_config", None
+            )
+            self.atom_config.hf_config = (
+                normalized_hf_config
+                if self.is_dspark_draft_model and normalized_hf_config is not None
+                else draft_hf_config
+            )
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
             # root HF config so --hf-overrides survive without losing multimodal
@@ -462,12 +491,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # with the draft model's atom_config so that the correct forward context
             # can be registered
             with use_custom_atom_config(self.atom_config):
-                if self.is_eagle3_draft_model:
+                if self._is_standalone_draft:
                     target_layer_num = vllm_config.model_config.get_num_layers(
                         vllm_config.parallel_config
                     )
                     logger.info(
-                        "Construct EAGLE3 draft with layer_offset=%s",
+                        "Construct %s draft with layer_offset=%s",
+                        model_arch,
                         target_layer_num,
                     )
                     self.model = model_cls(
@@ -477,7 +507,16 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     self.model = model_cls(self.atom_config)
         else:
-            self.model = model_cls(self.atom_config)
+            if model_arch == "KimiK3ForConditionalGeneration":
+                # Kimi-K3's inner class inherits vLLM SupportsQuant. Passing
+                # VllmConfig lets that protocol apply its quant mapper and
+                # packed-module mappings before the vision modules are built.
+                self.model = model_cls(
+                    self.atom_config,
+                    vllm_config=vllm_config,
+                )
+            else:
+                self.model = model_cls(self.atom_config)
 
         num_patched_post_load_hooks = _patch_required_act_dtype_post_load_hooks(
             self.model,
@@ -491,11 +530,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
-            self._adapt_mtp_layers_for_vllm()
+            self._enable_mtp_input_masking_for_vllm()
         if self.is_eagle3_draft_model:
             self._enable_eagle3_draft_interface()
-        elif self.is_eagle3 and self._eagle3_uses_aux_hidden_state():
+        elif (self.is_eagle3 and self._eagle3_uses_aux_hidden_state()) or (
+            # DSpark targets are tapped through the same SupportsEagle3 surface.
+            self.is_dspark
+            and not self.is_dspark_draft_model
+        ):
             self._enable_eagle3_target_interface()
+        if self.is_mtp:
+            self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
             self._expose_spec_decode_attrs()
@@ -720,13 +765,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     f"static_forward_context, skipping"
                 )
 
-    def get_mtp_target_hidden_states(self):
+    def _get_mtp_target_hidden_states(self):
         """Return the target hidden state that vLLM should feed to MTP.
 
         DeepSeek V4 target forward returns the pre-hc_head mHC residual
         `[num_tokens, hc, hidden]`; vLLM's generic hidden state path would
         otherwise feed the post-logits hidden shape expected by older MTP
         models.
+
+        Exposed under its public name only on MTP targets (see `__init__`):
+        vLLM decides whether to override the drafter's input by testing for the
+        attribute alone, so any speculator carrying it would be fed this.
         """
         # Prefer the persistent in-graph residual buffer on the native V4 model.
         # It is refreshed by a captured `copy_` every forward (including FULL
@@ -743,50 +792,39 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             hidden_states = hidden_states.flatten(1)
         return hidden_states
 
-    def _adapt_mtp_layers_for_vllm(self) -> None:
-        """Install vLLM-only MTP input masking without changing model code."""
+    def _enable_mtp_input_masking_for_vllm(self) -> None:
+        """Turn on the MTP predictor's position-0 input-embedding mask.
+
+        This used to be installed by rebinding every draft layer's ``forward``
+        to a wrapper that zeroed ``inputs_embeds`` and then re-called the
+        original with a hardcoded five-argument list. That wrapper silently
+        rotted the moment the layer signature grew: the fused FP8 prologue
+        added ``eh_input_quant``, and every vLLM-plugin MTP run died in
+        ``profile_run`` with ``DeepSeekMultiTokenPredictorLayer.forward() takes
+        from 5 to 6 positional arguments but 7 were given``. It also could not
+        see the fused path at all, where the embedding never materializes as a
+        tensor the layer receives.
+
+        So the mask lives in the predictors now (``mask_pos0_inputs_embeds``),
+        which own the embedding lookup on both the fused and unfused paths and
+        cannot fall out of sync with their own layers.
+        """
         if not self.is_mtp_draft_model:
             return
 
-        inner_model = getattr(self.model, "model", None)
-        layers = (
-            getattr(inner_model, "layers", None) if inner_model is not None else None
-        )
-        if layers is None:
-            return
-
-        layer_iter = layers.values() if isinstance(layers, nn.ModuleDict) else layers
-        for layer in layer_iter:
-            if getattr(layer, "_atom_vllm_mtp_masked", False):
-                continue
-
-            layer.forward = types.MethodType(
-                self._make_vllm_mtp_layer_forward(layer.forward),
-                layer,
+        predictor = getattr(self.model, "model", None)
+        if predictor is None or not hasattr(predictor, "mask_pos0_inputs_embeds"):
+            # Only archs listed in _MTP_MASK_INPUT_ARCH get here, and both of
+            # them expose the flag. Reaching this means the arch list and the
+            # models drifted apart -- fail loudly rather than silently serve an
+            # unmasked draft, which is how the old wrapper's breakage stayed
+            # hidden until an accuracy job crashed.
+            raise RuntimeError(
+                f"MTP input masking requested for {self.model_arch}, but its "
+                f"predictor {type(predictor).__name__} does not support "
+                "mask_pos0_inputs_embeds"
             )
-            layer._atom_vllm_mtp_masked = True
-
-    @staticmethod
-    def _make_vllm_mtp_layer_forward(original_forward):
-        @functools.wraps(original_forward)
-        def masked_forward(
-            self_layer,
-            input_ids,
-            positions,
-            previous_hidden_states,
-            inputs_embeds,
-            spec_step_index=0,
-        ):
-            inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
-            return original_forward(
-                input_ids,
-                positions,
-                previous_hidden_states,
-                inputs_embeds,
-                spec_step_index,
-            )
-
-        return masked_forward
+        predictor.mask_pos0_inputs_embeds = True
 
     def _eagle3_uses_aux_hidden_state(self) -> bool:
         vllm_spec_config = getattr(self.vllm_config, "speculative_config", None)
@@ -1017,9 +1055,9 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 draft_hf_config = getattr(
                     draft_model_config, "hf_config", draft_model_config
                 )
-        if self.is_eagle3_draft_model:
-            # EAGLE3 drafts are standalone checkpoints, so we need both the draft
-            # hf_config and the draft checkpoint path
+        if self._is_standalone_draft:
+            # EAGLE3 and DSpark drafts are their own checkpoints, so the loader
+            # needs both the draft hf_config and the draft checkpoint path.
             spec_config = getattr(self.vllm_config, "speculative_config", None)
             draft_model_config = getattr(spec_config, "draft_model_config", None)
             if draft_model_config is not None:
@@ -1030,7 +1068,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     draft_model_config, "model", None
                 ) or getattr(spec_config, "model", None)
             if not draft_model_path:
-                raise ValueError("EAGLE3 draft model path is missing.")
+                raise ValueError(f"{self.model_arch} draft model path is missing.")
 
         loaded_weights_record = load_model_in_plugin_mode(
             model=self.model,
@@ -1071,8 +1109,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         vLLM's ``LLMBaseProposer._greedy_sample`` calls this (when
         ``use_local_argmax_reduction`` is enabled) in place of
         ``compute_logits(...).argmax(-1)``. Bridge it to the draft model's
-        ``compute_draft_ids``, which returns ``[N]`` int64 token ids and is
-        token-identical to ``compute_logits(...).argmax(-1)``.
+        ``compute_draft_ids``, which is token-identical to
+        ``compute_logits(...).argmax(-1)`` but answers into int32 storage the
+        caller owns -- so supply it here and widen, because vLLM's caller was
+        written against that op's int64 return.
 
         Every arch delivers the ``O(2*tp)`` behaviour vLLM enables this flag
         for: each rank reduces its own logit shard to ``(max_val, global_idx)``
@@ -1084,7 +1124,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             hidden_states = _deepseek_v4_mtp_unflatten_hidden_states(
                 hidden_states, self.model
             )
-        return self.model.compute_draft_ids(hidden_states)
+        ids = empty_token_ids(hidden_states)
+        return self.model.compute_draft_ids(hidden_states, out=ids).to(torch.long)
 
 
 class ATOMForCausalLM(ATOMModelBase, VllmModelForTextGeneration): ...

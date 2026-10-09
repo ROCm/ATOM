@@ -37,10 +37,16 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `tensor_parallel_size` | `int` | `1` | Number of tensor-parallel GPUs (1 — 8) |
 | `enforce_eager` | `bool` | `False` | Disable compilation and CUDA graphs; run in eager mode |
 | `parallel_config` | `ParallelConfig` | `ParallelConfig()` | Data-parallel configuration (see Section 4) |
-| `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1 |
+| `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1. The FP4 sparse indexer requires exactly 64 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`; its runtime also takes `"fp4"` (the official E2M1 + E8M0 arithmetic in the row-group scorer's page-8 layout, values and scales in two planes, which needs `candidate_block_size` 8) and refuses any other format before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
+| `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
+| `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
+| `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
+| `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -49,7 +55,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `load_dummy` | `Optional[str]` | `None` | Dummy-weight mode (no checkpoint read): `None` off; `"empty"` skip load (uninitialized, legacy); `"zero"` all-zero; `"xavier"` xavier for bf16, constant target magnitude for fp4/fp8 |
 | `enable_expert_parallel` | `bool` | `False` | Enable Expert Parallelism for MoE models |
 | `master_addr` | `str` | `"127.0.0.1"` | Master address for distributed communication |
-| `graph_bs` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
+| `capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; derived from `compilation_config` during init |
 | `enable_dp_attention` | `bool` | `False` | Enable data-parallel attention |
 | `dp_load_balance` | `str` | `"least_requests"` | DP request-routing strategy: `"round_robin"` (legacy), `"least_requests"` (default; fewest in-flight requests, ties broken by lighter in-flight prompt-token load), or `"least_tokens"` (lowest `sum_prompt_tokens + ATOM_DP_LB_REQ_EQUIV * num_reqs`). Only effective when >1 DP rank. See distributed guide §2 |
 | `torch_dtype` | `torch.dtype` | *(computed)* | Inferred from `hf_config.torch_dtype`; falls back to `torch.bfloat16` |
@@ -64,8 +70,8 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 |---|---|---|
 | `hf_config` | `PretrainedConfig` | Loaded automatically via `get_hf_config(model)` |
 | `generation_config` | `GenerationConfig` | Loaded automatically via `get_generation_config(model)` |
-| `per_req_cache_equiv_blocks` | `int` | Number of KV cache block equivalents reserved per request for the per-request stateful-attention cache (currently GDN recurrent state; future stateful attentions plug in via `AttentionMetadataBuilder.compute_per_req_cache_bytes()`); computed by `ModelRunner.get_num_blocks()` |
-| `num_per_req_cache_groups` | `int` | Number of per-request slot groups available (= `max_num_seqs` for stateful-attention models, 0 otherwise); computed by `ModelRunner.get_num_blocks()` |
+| `pool_entries` | `dict[str, int]` | Entries sized for each cache class the attention builders declared via `AttentionMetadataBuilder.sub_pool_specs()` — the paged KV blocks, plus per-request STATE classes (GDN recurrent state, the DeepSeek-V4 compressor ring and sliding-window pool). Computed by `ModelRunner.get_num_blocks()` in the runner subprocess and carried to the engine process, where each consumer looks up the class it declared |
+| `pool_entries_per_req` | `dict[str, int]` | Per-request multiplicity of each class, so a consumer can turn an entry count into a request count (`entries // entries_per_req`); same origin as `pool_entries` |
 
 ## Compilation configuration (`CompilationConfig`)
 
@@ -87,7 +93,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `level` | `int` | `0` | Compilation level (see table above); must be 0 — 3 |
 | `use_cudagraph` | `bool` | `True` | Whether to use CUDA graphs |
 | `cudagraph_capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; overrides `cuda_graph_sizes` when set |
-| `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1,2,4,8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
+| `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1..8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
@@ -253,11 +259,11 @@ Defined in `atom/config.py`. Controls data parallelism. Environment variables
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `data_parallel_size` | `int` | `1` | Number of data-parallel groups; overridden by `ATOM_DP_SIZE` env var |
-| `data_parallel_size_local` | `int` | `1` | Number of local data-parallel groups |
-| `data_parallel_rank` | `int` | `0` | Rank within the data-parallel group; overridden by `ATOM_DP_RANK` |
+| `data_parallel_size_local` | `int \| None` | `None` → `data_parallel_size` | DP ranks on **this** node. Defaults to the global size, i.e. single-node. Set it lower to give a node one slice of a multi-node run; also reaches MoRI as `gpu_per_node`. Overridden by `ATOM_DP_SIZE_LOCAL` |
+| `data_parallel_rank` | `int` | `0` | First **global** DP rank owned by this node; overridden by `ATOM_DP_RANK` |
 | `data_parallel_rank_local` | `Optional[int]` | `None` | Local rank within the data-parallel group (SPMD mode); overridden by `ATOM_DP_RANK_LOCAL` |
 | `data_parallel_master_port` | `int` | `29500` | Port used by the data-parallel master for process group initialization |
-| `data_parallel_base_port` | `int` | `get_open_port()` | Base port for data-parallel communication (dynamically assigned) |
+| `data_parallel_base_port` | `int` | `0` | Model-runner TCPStore port; automatically bound for single-node runs, explicitly shared across nodes |
 | `data_parallel_master_ip` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 
 **Computed property:**
@@ -353,11 +359,14 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
+| `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
+| `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
-| `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`) |
+| `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
+| `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`); the FP4 sparse indexer requires exactly 64 |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
-| `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |
+| `--cudagraph-capture-sizes` | | `str` | `"[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"` (every batch of 1..8: a padded one runs the next size's step) | CUDA graph capture sizes as a Python list string |
 | `--level` | | `int` | `3` | Compilation level (0 — 3) |
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
@@ -366,6 +375,8 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--method` | | `str` | `None` | Speculative method; choices: `mtp` |
 | `--num-speculative-tokens` | | `int` | `1` | Number of speculative tokens per iteration |
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
+| `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between rungs of the per-request state checkpoint ladder; must be a multiple of the prefix-cache hash block size. `0` turns checkpointing off entirely; **`-1` turns off only the ladder**, leaving the prompt-end anchor and the demand rung as the placements. Prompts shorter than one interval publish no rung. A rung also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one — which is most of what `-1` buys back |
+| `--state-checkpoint-demand` / `--no-state-checkpoint-demand` | | `bool` | on | Let a prefix hit that was refused for want of a checkpoint place a rung of its own. Off leaves the prompt-end anchor as the only placement. `ATOM_STATE_CHECKPOINT_DEMAND=0` overrides this without touching a launch script |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |

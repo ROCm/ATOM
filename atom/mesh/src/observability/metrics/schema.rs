@@ -365,7 +365,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::ROUTER_TTFT_SECONDS,
         kind: MetricKind::Histogram,
-        help: "Time to first token by router_type, backend_type, model, endpoint (gRPC only)",
+        help: "Time to first generated output by router_type, backend_type, model, endpoint; HTTP measures ingress to first generated SSE payload",
         status: MetricStatus::Active,
     },
     MetricSpec {
@@ -377,7 +377,7 @@ pub const METRIC_INVENTORY: &[MetricSpec] = &[
     MetricSpec {
         name: names::ROUTER_TOKENS_TOTAL,
         kind: MetricKind::Counter,
-        help: "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only)",
+        help: "Total observed tokens by router_type, backend_type, model, endpoint, token_type",
         status: MetricStatus::Active,
     },
     MetricSpec {

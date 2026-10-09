@@ -1,0 +1,1 @@
+{"request_id": "r5", "session_id": "s1", "turn_index": 2, "phase": "profiling", "status": "error", "start_ns": "1700000018000000000", "end_ns": "1700000019000000000", "input_tokens": 128, "output_tokens": 0, "expected_output_tokens": 16, "ttft_s": 0.1, "e2el_s": 1, "native_itl_s": 0.05, "error": "fixture failure"}

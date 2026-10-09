@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/utils/__init__.py — pure functions only (no GPU / ZMQ required)
 
-from atom.utils import (
-    is_valid_ipv6_address,
-    split_host_port,
-    join_host_port,
-    get_tcp_uri,
-    get_device_indices,
-    _is_torch_equal_or_newer,
-    split_zmq_path,
-    make_zmq_path,
-)
-
 import pytest
+
+from atom.utils import (
+    _is_torch_equal_or_newer,
+    get_device_indices,
+    get_tcp_uri,
+    is_valid_ipv6_address,
+    join_host_port,
+    make_zmq_path,
+    split_host_port,
+    split_zmq_path,
+)
 
 # ── IPv6 validation ────────────────────────────────────────────────────────
 

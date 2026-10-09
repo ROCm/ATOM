@@ -109,9 +109,9 @@ def test_online_quant_config_from_additional_config(monkeypatch):
 
 
 def test_generate_atom_config_requires_plugin_mode(monkeypatch):
-    import atom.plugin.config as config_module
-    import atom.plugin as plugin_module
     import atom.config as atom_config_module
+    import atom.plugin as plugin_module
+    import atom.plugin.config as config_module
 
     monkeypatch.setattr(plugin_module, "is_vllm", lambda: False, raising=False)
     monkeypatch.setattr(plugin_module, "is_sglang", lambda: False, raising=False)

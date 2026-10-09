@@ -13,7 +13,7 @@ use axum::{
 };
 use bytes::Bytes;
 use pyo3::{
-    types::{PyAnyMethods, PyBool, PyDict, PyDictMethods, PyList, PyListMethods, PyTypeMethods},
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyList, PyListMethods, PyTypeMethods},
     Bound, IntoPyObject, Py, PyAny, PyResult, Python,
 };
 use serde::Serialize;

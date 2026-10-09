@@ -41,12 +41,56 @@ docker exec -it atom_mesh bash
 
 All remaining commands are run **inside the container**.
 
+## RDMA rails and HCA registration
+
+By default, each Mooncake worker registers GPU memory on its GPU-local HCA.
+Keep this default when the producer and consumer use matching, mutually
+reachable rails, as in a two-node deployment with same-index GPU rank mapping.
+
+For cross-rail transfers, such as prefill on physical GPUs `0,1` and decode on
+`4,5` on a rail-separated fabric, enable alternate HCA registration on the
+**decode** workers. Add these fields to the consumer's Mooncake
+`--kv-transfer-config`:
+
+```json
+{
+  "kv_role": "kv_consumer",
+  "kv_connector": "mooncake",
+  "handshake_port": 6301,
+  "ib_enable_alternate_hca": true,
+  "ib_hca_count": 8
+}
+```
+
+Set `MC_ENABLE_DEST_DEVICE_AFFINITY=1` in both server environments before
+starting them, as shown below. It lets the Mooncake initiator select a
+destination HCA reachable from its local rail. The router does not register
+GPU memory and does not need this setting.
+
+- `ib_enable_alternate_hca` defaults to `false`. When enabled, ATOM keeps the
+  GPU-local HCA first and adds available HCAs from indices `0` through
+  `ib_hca_count - 1`, skipping missing devices and duplicates.
+- `ib_hca_count` defaults to `8` and must be positive when automatic alternate
+  HCA selection is enabled. It is an index range to scan, not a guarantee that
+  eight HCAs will be selected. Automatic selection checks `rdmaN`, then
+  `ionic_N`, for each physical GPU/HCA index; GPU masking is resolved through
+  `HIP_VISIBLE_DEVICES` or `CUDA_VISIBLE_DEVICES`.
+- An explicit `ib_device` in the connector config, or
+  `ATOM_MOONCAKE_IB_DEVICE` in the environment, overrides automatic selection.
+  Comma-separated lists are trimmed and deduplicated; the first device is used
+  for RDMA-local IP selection. Use device names and a GPU/HCA mapping appropriate
+  to your fabric.
+- Alternate registration requires GPU memory to be registrable on the selected
+  HCAs. It does not fix driver-level GPU memory registration failures.
+  `protocol: "tcp"` bypasses RDMA device selection entirely.
+
 ## Quick Start
 
 ### Step 1: Start Producer (prefill node)
 
 ```bash
 AITER_LOG_LEVEL=WARNING \
+MC_ENABLE_DEST_DEVICE_AFFINITY=1 \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-R1/ \
   --kv_cache_dtype fp8 \
@@ -64,6 +108,7 @@ python -m atom.entrypoints.openai_server \
 
 ```bash
 AITER_LOG_LEVEL=WARNING \
+MC_ENABLE_DEST_DEVICE_AFFINITY=1 \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-R1/ \
   --kv_cache_dtype fp8 \
@@ -111,6 +156,7 @@ export LOCAL_IP=<this-node-ip>
 AITER_BF16_FP8_MOE_BOUND=0 \
 ATOM_MOE_GU_ITLV=1 \
 AITER_LOG_LEVEL=WARNING \
+MC_ENABLE_DEST_DEVICE_AFFINITY=1 \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-V4-Pro/ \
   --kv_cache_dtype fp8 \
@@ -130,6 +176,7 @@ python -m atom.entrypoints.openai_server \
 AITER_BF16_FP8_MOE_BOUND=0 \
 ATOM_MOE_GU_ITLV=1 \
 AITER_LOG_LEVEL=WARNING \
+MC_ENABLE_DEST_DEVICE_AFFINITY=1 \
 python -m atom.entrypoints.openai_server \
   --model /data/models/DeepSeek-V4-Pro/ \
   --kv_cache_dtype fp8 \
@@ -230,6 +277,13 @@ python -m atom.entrypoints.openai_server ... -tp 2 ...
 Set `NODE_IP` to this node's address. Prefill is the `kv_producer`, decode the
 `kv_consumer`; they coordinate through mooncake on the shared `handshake_port`.
 
+The decode example enables alternate HCA registration for the cross-rail
+GPU `0,1` → GPU `4,5` layout described in
+[RDMA rails and HCA registration](#rdma-rails-and-hca-registration).
+If the GPU-local HCAs are already mutually reachable, omit
+`ib_enable_alternate_hca` and `ib_hca_count` to keep local-only registration.
+NUMA binding controls CPU and memory locality; it does not select RDMA rails.
+
 **Prefill (GPU 0,1 → node 0):**
 
 ```bash
@@ -239,6 +293,7 @@ export ATOM_NUMA_BIND=1
 export ATOM_NUMA_NODE="0"
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export HIP_VISIBLE_DEVICES=0,1
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export PYTHONUNBUFFERED=1
 export ATOM_HOST_IP=${NODE_IP}
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
@@ -264,6 +319,7 @@ export ATOM_NUMA_BIND=1
 export ATOM_NUMA_NODE="1"
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export HIP_VISIBLE_DEVICES=4,5
+export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 export PYTHONUNBUFFERED=1
 export ATOM_HOST_IP=${NODE_IP}
 export LD_LIBRARY_PATH=/opt/venv/lib/python3.10/site-packages/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
@@ -277,7 +333,7 @@ python3 -m atom.entrypoints.openai_server \
     -tp 2 \
     --kv_cache_dtype fp8 \
     --gpu-memory-utilization 0.75 \
-    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301}'
+    --kv-transfer-config '{"kv_role":"kv_consumer","kv_connector":"mooncake","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}'
 ```
 
 **Router (atomesh):**

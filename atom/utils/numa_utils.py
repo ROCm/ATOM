@@ -51,8 +51,15 @@ def _physical_index(gpu_id: int) -> int:
     the visible-device mask, so a logical worker id must be translated back to
     the physical device it actually drives.
     """
-    visible = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
-        "CUDA_VISIBLE_DEVICES"
+    # ROCR first: it filters the device table before HIP sees it, so when both
+    # are set HIP's indices are already relative to the filtered list. A recipe
+    # that sets ROCR alone (the only correct way to split across NUMA nodes --
+    # setting both cuts the count twice) would otherwise fall through to the
+    # identity mapping and bind every rank to node 0.
+    visible = (
+        os.environ.get("ROCR_VISIBLE_DEVICES")
+        or os.environ.get("HIP_VISIBLE_DEVICES")
+        or os.environ.get("CUDA_VISIBLE_DEVICES")
     )
     if not visible:
         return gpu_id

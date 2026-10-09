@@ -16,6 +16,7 @@ from atom.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    resolve_prompt_token_ids,
 )
 
 # ============================================================================
@@ -198,6 +199,37 @@ class TestChatCompletionRequest:
         assert req.max_tokens == 32
         assert req.get_max_tokens() == 32
 
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_tokens_rejected(self, value):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": value,
+            }
+        )
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            req.get_max_tokens()
+
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_completion_tokens_rejected(self, value):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_completion_tokens": value,
+            }
+        )
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            req.get_max_tokens()
+
+    def test_max_tokens_of_one_allowed(self):
+        req = ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 1,
+            }
+        )
+        assert req.get_max_tokens() == 1
+
     def test_n_greater_than_one(self):
         req = ChatCompletionRequest.model_validate(
             {
@@ -264,6 +296,13 @@ class TestCompletionRequest:
         assert req.max_tokens == 8192
         assert req.max_completion_tokens == 16
         assert req.get_max_tokens() == 16
+
+    @pytest.mark.parametrize("field", ["max_tokens", "max_completion_tokens"])
+    @pytest.mark.parametrize("value", [-5, -1, 0])
+    def test_non_positive_max_tokens_rejected(self, field, value):
+        req = CompletionRequest.model_validate({"prompt": "Hello world", field: value})
+        with pytest.raises(ValueError, match="max_tokens must be at least 1"):
+            req.get_max_tokens()
 
     def test_extra_fields_ignored(self):
         req = CompletionRequest.model_validate(
@@ -356,3 +395,38 @@ class TestResponseModels:
             error={"message": "Not found", "type": "invalid_request_error", "code": 404}
         )
         assert err.error["message"] == "Not found"
+
+
+# ============================================================================
+# Pre-tokenized prompts (PD decode reuses the prefill node's token ids)
+# ============================================================================
+
+
+class TestPromptTokenIds:
+    """Prompt ID validation and text-input precedence."""
+
+    def test_both_locations_agreeing_is_fine(self):
+        ids = [9, 9]
+        assert resolve_prompt_token_ids(ids, {"prompt_token_ids": ids}) == ids
+
+    @pytest.mark.parametrize(
+        "prompt_ids,kv_ids,error",
+        [
+            ([], None, "empty"),
+            (None, [], "empty"),
+            (None, "5,6", "non-negative integers"),
+            (None, [-1], "non-negative integers"),
+            (None, ["a"], "non-negative integers"),
+        ],
+    )
+    def test_invalid_ids_are_rejected(self, prompt_ids, kv_ids, error):
+        with pytest.raises(ValueError, match=error):
+            resolve_prompt_token_ids(prompt_ids, {"prompt_token_ids": kv_ids})
+
+    def test_completion_prompt_or_tokens_prefers_ids(self):
+        request = CompletionRequest(prompt="ignored", prompt_token_ids=[1, 2])
+        assert request.get_prompt_or_tokens() == [1, 2]
+
+    def test_completion_requires_one_of_the_two(self):
+        with pytest.raises(ValueError, match="'prompt' or 'prompt_token_ids'"):
+            CompletionRequest().get_prompt_or_tokens()

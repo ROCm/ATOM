@@ -22,8 +22,8 @@ def prefill_scheduler():
 
 @pytest.fixture
 def seq_factory():
-    from atom.sampling_params import SamplingParams
     from atom.model_engine.sequence import Sequence
+    from atom.sampling_params import SamplingParams
 
     def make(token_ids, block_size=4):
         return Sequence(token_ids, block_size, sampling_params=SamplingParams())
@@ -58,7 +58,7 @@ def test_has_requests_true_after_add(prefill_scheduler, seq_factory):
 def test_schedule_returns_none_when_no_block_table(prefill_scheduler, seq_factory):
     """Sequences without a block_table (not yet assigned by decode) are not scheduled."""
     seq = seq_factory([1, 2, 3, 4])
-    assert seq.block_table == []
+    assert len(seq.block_table) == 0
     prefill_scheduler.add(seq)
 
     result = prefill_scheduler.schedule()
@@ -181,3 +181,41 @@ def test_postprocess_returns_empty_regardless_of_input(prefill_scheduler, seq_fa
 def test_no_block_manager(prefill_scheduler):
     """PrefillScheduler must never create a BlockManager."""
     assert prefill_scheduler.block_manager is None
+
+
+# ── engine_stats (throughput) ─────────────────────────────────────────────
+
+
+def test_throughput_section_follows_enable_log_stats(seq_factory):
+    """Prefill side enables only the throughput section, gated on the config
+    flag; spec and cache are always off here (no drafter, no BlockManager)."""
+    from atom.model_engine.scheduler import PrefillScheduler
+
+    on = PrefillScheduler(MockConfig(enable_log_stats=True)).engine_stats
+    assert on.throughput_enabled is True
+    assert on.spec_enabled is False
+    assert on.cache_enabled is False
+
+    off = PrefillScheduler(MockConfig(enable_log_stats=False)).engine_stats
+    assert off.throughput_enabled is False
+
+
+def test_schedule_records_prompt_throughput(seq_factory):
+    """schedule() feeds this tick's prefill tokens into the throughput section.
+
+    The default 10s wall-clock interval means maybe_log does not fire (or
+    reset) here, so the accumulated prompt-token count survives to assert on.
+    """
+    from atom.model_engine.scheduler import PrefillScheduler
+
+    sched = PrefillScheduler(MockConfig(enable_log_stats=True))
+    seq = seq_factory([10, 20, 30, 40])
+    seq.block_table = [0, 1]
+    seq.num_cached_tokens = 0
+    sched.add(seq)
+
+    sched.schedule()
+
+    assert sched.engine_stats.num_prompt_tokens == 4
+    # Prefill produces no sampled tokens.
+    assert sched.engine_stats.num_generation_tokens == 0

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, DpStickyPolicy, LoadBalancingPolicy, PowerOfTwoPolicy,
+    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -17,6 +17,7 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+            PolicyConfig::DpSticky => Arc::new(DpStickyPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -52,6 +53,7 @@ impl PolicyFactory {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
+            "dp_sticky" | "dpsticky" => Some(Arc::new(DpStickyPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
@@ -71,6 +73,9 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin);
         assert_eq!(policy.name(), "round_robin");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::DpSticky);
+        assert_eq!(policy.name(), "dp_sticky");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
@@ -93,6 +98,8 @@ mod tests {
         assert!(PolicyFactory::create_by_name("RANDOM").is_some());
         assert!(PolicyFactory::create_by_name("round_robin").is_some());
         assert!(PolicyFactory::create_by_name("RoundRobin").is_some());
+        assert!(PolicyFactory::create_by_name("dp_sticky").is_some());
+        assert!(PolicyFactory::create_by_name("DpSticky").is_some());
         assert!(PolicyFactory::create_by_name("power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
@@ -130,6 +137,7 @@ mod tests {
         let configs = vec![
             ("random", PolicyConfig::Random),
             ("round_robin", PolicyConfig::RoundRobin),
+            ("dp_sticky", PolicyConfig::DpSticky),
             (
                 "power_of_two",
                 PolicyConfig::PowerOfTwo {
@@ -176,6 +184,8 @@ mod tests {
             ("Random", "random"),
             ("round_robin", "round_robin"),
             ("roundrobin", "round_robin"),
+            ("dp_sticky", "dp_sticky"),
+            ("dpsticky", "dp_sticky"),
             ("power_of_two", "power_of_two"),
             ("poweroftwo", "power_of_two"),
             ("cache_aware", "cache_aware"),

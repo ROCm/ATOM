@@ -51,50 +51,80 @@ def _fused_merge_recompute_kernel(
         T_seq = T
 
     Ai16_base = Ai16_ptr + (bos * H + i_h) * 16
-    p_Ai11 = tl.make_block_ptr(
-        Ai16_base, (T_seq, 16), (H * 16, 1), (i_t * 64, 0), (16, 16), (1, 0)
-    )
-    p_Ai22 = tl.make_block_ptr(
-        Ai16_base, (T_seq, 16), (H * 16, 1), (i_t * 64 + 16, 0), (16, 16), (1, 0)
-    )
-    p_Ai33 = tl.make_block_ptr(
-        Ai16_base, (T_seq, 16), (H * 16, 1), (i_t * 64 + 32, 0), (16, 16), (1, 0)
-    )
-    p_Ai44 = tl.make_block_ptr(
-        Ai16_base, (T_seq, 16), (H * 16, 1), (i_t * 64 + 48, 0), (16, 16), (1, 0)
-    )
 
-    b_Ai11 = tl.load(p_Ai11, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai22 = tl.load(p_Ai22, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai33 = tl.load(p_Ai33, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai44 = tl.load(p_Ai44, boundary_check=(0, 1)).to(tl.float32)
+    _p_Ai11_0 = (i_t * 64) + tl.arange(0, 16)
+    _p_Ai11_1 = (0) + tl.arange(0, 16)
+    b_Ai11 = tl.load(
+        Ai16_base + _p_Ai11_0[:, None] * (H * 16) + _p_Ai11_1[None, :] * (1),
+        mask=(_p_Ai11_0[:, None] < (T_seq)) & (_p_Ai11_1[None, :] < (16)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_Ai22_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    _p_Ai22_1 = (0) + tl.arange(0, 16)
+    b_Ai22 = tl.load(
+        Ai16_base + _p_Ai22_0[:, None] * (H * 16) + _p_Ai22_1[None, :] * (1),
+        mask=(_p_Ai22_0[:, None] < (T_seq)) & (_p_Ai22_1[None, :] < (16)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_Ai33_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_Ai33_1 = (0) + tl.arange(0, 16)
+    b_Ai33 = tl.load(
+        Ai16_base + _p_Ai33_0[:, None] * (H * 16) + _p_Ai33_1[None, :] * (1),
+        mask=(_p_Ai33_0[:, None] < (T_seq)) & (_p_Ai33_1[None, :] < (16)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_Ai44_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_Ai44_1 = (0) + tl.arange(0, 16)
+    b_Ai44 = tl.load(
+        Ai16_base + _p_Ai44_0[:, None] * (H * 16) + _p_Ai44_1[None, :] * (1),
+        mask=(_p_Ai44_0[:, None] < (T_seq)) & (_p_Ai44_1[None, :] < (16)),
+        other=0.0,
+    ).to(tl.float32)
 
     A_base = A_ptr + (bos * H + i_h) * BT
-    p_A21 = tl.make_block_ptr(
-        A_base, (T_seq, BT), (H * BT, 1), (i_t * 64 + 16, 0), (16, 16), (1, 0)
-    )
-    p_A31 = tl.make_block_ptr(
-        A_base, (T_seq, BT), (H * BT, 1), (i_t * 64 + 32, 0), (16, 16), (1, 0)
-    )
-    p_A32 = tl.make_block_ptr(
-        A_base, (T_seq, BT), (H * BT, 1), (i_t * 64 + 32, 16), (16, 16), (1, 0)
-    )
-    p_A41 = tl.make_block_ptr(
-        A_base, (T_seq, BT), (H * BT, 1), (i_t * 64 + 48, 0), (16, 16), (1, 0)
-    )
-    p_A42 = tl.make_block_ptr(
-        A_base, (T_seq, BT), (H * BT, 1), (i_t * 64 + 48, 16), (16, 16), (1, 0)
-    )
-    p_A43 = tl.make_block_ptr(
-        A_base, (T_seq, BT), (H * BT, 1), (i_t * 64 + 48, 32), (16, 16), (1, 0)
-    )
 
-    b_A21 = tl.load(p_A21, boundary_check=(0, 1)).to(tl.float32)
-    b_A31 = tl.load(p_A31, boundary_check=(0, 1)).to(tl.float32)
-    b_A32 = tl.load(p_A32, boundary_check=(0, 1)).to(tl.float32)
-    b_A41 = tl.load(p_A41, boundary_check=(0, 1)).to(tl.float32)
-    b_A42 = tl.load(p_A42, boundary_check=(0, 1)).to(tl.float32)
-    b_A43 = tl.load(p_A43, boundary_check=(0, 1)).to(tl.float32)
+    _p_A21_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    _p_A21_1 = (0) + tl.arange(0, 16)
+    b_A21 = tl.load(
+        A_base + _p_A21_0[:, None] * (H * BT) + _p_A21_1[None, :] * (1),
+        mask=(_p_A21_0[:, None] < (T_seq)) & (_p_A21_1[None, :] < (BT)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_A31_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_A31_1 = (0) + tl.arange(0, 16)
+    b_A31 = tl.load(
+        A_base + _p_A31_0[:, None] * (H * BT) + _p_A31_1[None, :] * (1),
+        mask=(_p_A31_0[:, None] < (T_seq)) & (_p_A31_1[None, :] < (BT)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_A32_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_A32_1 = (16) + tl.arange(0, 16)
+    b_A32 = tl.load(
+        A_base + _p_A32_0[:, None] * (H * BT) + _p_A32_1[None, :] * (1),
+        mask=(_p_A32_0[:, None] < (T_seq)) & (_p_A32_1[None, :] < (BT)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_A41_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_A41_1 = (0) + tl.arange(0, 16)
+    b_A41 = tl.load(
+        A_base + _p_A41_0[:, None] * (H * BT) + _p_A41_1[None, :] * (1),
+        mask=(_p_A41_0[:, None] < (T_seq)) & (_p_A41_1[None, :] < (BT)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_A42_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_A42_1 = (16) + tl.arange(0, 16)
+    b_A42 = tl.load(
+        A_base + _p_A42_0[:, None] * (H * BT) + _p_A42_1[None, :] * (1),
+        mask=(_p_A42_0[:, None] < (T_seq)) & (_p_A42_1[None, :] < (BT)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_A43_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_A43_1 = (32) + tl.arange(0, 16)
+    b_A43 = tl.load(
+        A_base + _p_A43_0[:, None] * (H * BT) + _p_A43_1[None, :] * (1),
+        mask=(_p_A43_0[:, None] < (T_seq)) & (_p_A43_1[None, :] < (BT)),
+        other=0.0,
+    ).to(tl.float32)
 
     b_Ai21 = -tl.dot(
         tl.dot(b_Ai22, b_A21, input_precision="ieee"), b_Ai11, input_precision="ieee"
@@ -129,49 +159,76 @@ def _fused_merge_recompute_kernel(
     beta_base = beta_ptr + bos * H + i_h
     g_base = g_cumsum_ptr + bos * H + i_h
 
-    p_k1 = tl.make_block_ptr(
-        k_base, (T_seq, K), (Hg * K, 1), (i_t * 64, 0), (16, K), (1, 0)
-    )
-    p_k2 = tl.make_block_ptr(
-        k_base, (T_seq, K), (Hg * K, 1), (i_t * 64 + 16, 0), (16, K), (1, 0)
-    )
-    p_k3 = tl.make_block_ptr(
-        k_base, (T_seq, K), (Hg * K, 1), (i_t * 64 + 32, 0), (16, K), (1, 0)
-    )
-    p_k4 = tl.make_block_ptr(
-        k_base, (T_seq, K), (Hg * K, 1), (i_t * 64 + 48, 0), (16, K), (1, 0)
-    )
+    _p_k1_0 = (i_t * 64) + tl.arange(0, 16)
+    _p_k1_1 = (0) + tl.arange(0, K)
+    b_k1 = tl.load(
+        k_base + _p_k1_0[:, None] * (Hg * K) + _p_k1_1[None, :] * (1),
+        mask=(_p_k1_0[:, None] < (T_seq)) & (_p_k1_1[None, :] < (K)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_k2_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    _p_k2_1 = (0) + tl.arange(0, K)
+    b_k2 = tl.load(
+        k_base + _p_k2_0[:, None] * (Hg * K) + _p_k2_1[None, :] * (1),
+        mask=(_p_k2_0[:, None] < (T_seq)) & (_p_k2_1[None, :] < (K)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_k3_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_k3_1 = (0) + tl.arange(0, K)
+    b_k3 = tl.load(
+        k_base + _p_k3_0[:, None] * (Hg * K) + _p_k3_1[None, :] * (1),
+        mask=(_p_k3_0[:, None] < (T_seq)) & (_p_k3_1[None, :] < (K)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_k4_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_k4_1 = (0) + tl.arange(0, K)
+    b_k4 = tl.load(
+        k_base + _p_k4_0[:, None] * (Hg * K) + _p_k4_1[None, :] * (1),
+        mask=(_p_k4_0[:, None] < (T_seq)) & (_p_k4_1[None, :] < (K)),
+        other=0.0,
+    ).to(tl.float32)
 
-    b_k1 = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
-    b_k2 = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
-    b_k3 = tl.load(p_k3, boundary_check=(0, 1)).to(tl.float32)
-    b_k4 = tl.load(p_k4, boundary_check=(0, 1)).to(tl.float32)
+    _p_beta1_0 = (i_t * 64) + tl.arange(0, 16)
+    b_beta1 = tl.load(
+        beta_base + _p_beta1_0 * (H), mask=(_p_beta1_0 < (T_seq)), other=0.0
+    ).to(tl.float32)
+    _p_beta2_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    b_beta2 = tl.load(
+        beta_base + _p_beta2_0 * (H), mask=(_p_beta2_0 < (T_seq)), other=0.0
+    ).to(tl.float32)
+    _p_beta3_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    b_beta3 = tl.load(
+        beta_base + _p_beta3_0 * (H), mask=(_p_beta3_0 < (T_seq)), other=0.0
+    ).to(tl.float32)
+    _p_beta4_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    b_beta4 = tl.load(
+        beta_base + _p_beta4_0 * (H), mask=(_p_beta4_0 < (T_seq)), other=0.0
+    ).to(tl.float32)
 
-    p_beta1 = tl.make_block_ptr(beta_base, (T_seq,), (H,), (i_t * 64,), (16,), (0,))
-    p_beta2 = tl.make_block_ptr(
-        beta_base, (T_seq,), (H,), (i_t * 64 + 16,), (16,), (0,)
+    _p_g1_0 = (i_t * 64) + tl.arange(0, 16)
+    b_g1 = tl.exp(
+        tl.load(g_base + _p_g1_0 * (H), mask=(_p_g1_0 < (T_seq)), other=0.0).to(
+            tl.float32
+        )
     )
-    p_beta3 = tl.make_block_ptr(
-        beta_base, (T_seq,), (H,), (i_t * 64 + 32,), (16,), (0,)
+    _p_g2_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    b_g2 = tl.exp(
+        tl.load(g_base + _p_g2_0 * (H), mask=(_p_g2_0 < (T_seq)), other=0.0).to(
+            tl.float32
+        )
     )
-    p_beta4 = tl.make_block_ptr(
-        beta_base, (T_seq,), (H,), (i_t * 64 + 48,), (16,), (0,)
+    _p_g3_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    b_g3 = tl.exp(
+        tl.load(g_base + _p_g3_0 * (H), mask=(_p_g3_0 < (T_seq)), other=0.0).to(
+            tl.float32
+        )
     )
-
-    b_beta1 = tl.load(p_beta1, boundary_check=(0,)).to(tl.float32)
-    b_beta2 = tl.load(p_beta2, boundary_check=(0,)).to(tl.float32)
-    b_beta3 = tl.load(p_beta3, boundary_check=(0,)).to(tl.float32)
-    b_beta4 = tl.load(p_beta4, boundary_check=(0,)).to(tl.float32)
-
-    p_g1 = tl.make_block_ptr(g_base, (T_seq,), (H,), (i_t * 64,), (16,), (0,))
-    p_g2 = tl.make_block_ptr(g_base, (T_seq,), (H,), (i_t * 64 + 16,), (16,), (0,))
-    p_g3 = tl.make_block_ptr(g_base, (T_seq,), (H,), (i_t * 64 + 32,), (16,), (0,))
-    p_g4 = tl.make_block_ptr(g_base, (T_seq,), (H,), (i_t * 64 + 48,), (16,), (0,))
-
-    b_g1 = tl.exp(tl.load(p_g1, boundary_check=(0,)).to(tl.float32))
-    b_g2 = tl.exp(tl.load(p_g2, boundary_check=(0,)).to(tl.float32))
-    b_g3 = tl.exp(tl.load(p_g3, boundary_check=(0,)).to(tl.float32))
-    b_g4 = tl.exp(tl.load(p_g4, boundary_check=(0,)).to(tl.float32))
+    _p_g4_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    b_g4 = tl.exp(
+        tl.load(g_base + _p_g4_0 * (H), mask=(_p_g4_0 < (T_seq)), other=0.0).to(
+            tl.float32
+        )
+    )
 
     b_rhs_w1 = b_k1 * b_beta1[:, None] * b_g1[:, None]
     b_rhs_w2 = b_k2 * b_beta2[:, None] * b_g2[:, None]
@@ -195,41 +252,65 @@ def _fused_merge_recompute_kernel(
     )
 
     w_base = w_ptr + (bos * H + i_h) * K
-    p_w1 = tl.make_block_ptr(
-        w_base, (T_seq, K), (H * K, 1), (i_t * 64, 0), (16, K), (1, 0)
+    _p_w1_0 = (i_t * 64) + tl.arange(0, 16)
+    _p_w1_1 = (0) + tl.arange(0, K)
+    tl.store(
+        w_base + _p_w1_0[:, None] * (H * K) + _p_w1_1[None, :] * (1),
+        b_w1.to(w_ptr.dtype.element_ty),
+        mask=(_p_w1_0[:, None] < (T_seq)) & (_p_w1_1[None, :] < (K)),
     )
-    p_w2 = tl.make_block_ptr(
-        w_base, (T_seq, K), (H * K, 1), (i_t * 64 + 16, 0), (16, K), (1, 0)
+    _p_w2_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    _p_w2_1 = (0) + tl.arange(0, K)
+    tl.store(
+        w_base + _p_w2_0[:, None] * (H * K) + _p_w2_1[None, :] * (1),
+        b_w2.to(w_ptr.dtype.element_ty),
+        mask=(_p_w2_0[:, None] < (T_seq)) & (_p_w2_1[None, :] < (K)),
     )
-    p_w3 = tl.make_block_ptr(
-        w_base, (T_seq, K), (H * K, 1), (i_t * 64 + 32, 0), (16, K), (1, 0)
+    _p_w3_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_w3_1 = (0) + tl.arange(0, K)
+    tl.store(
+        w_base + _p_w3_0[:, None] * (H * K) + _p_w3_1[None, :] * (1),
+        b_w3.to(w_ptr.dtype.element_ty),
+        mask=(_p_w3_0[:, None] < (T_seq)) & (_p_w3_1[None, :] < (K)),
     )
-    p_w4 = tl.make_block_ptr(
-        w_base, (T_seq, K), (H * K, 1), (i_t * 64 + 48, 0), (16, K), (1, 0)
+    _p_w4_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_w4_1 = (0) + tl.arange(0, K)
+    tl.store(
+        w_base + _p_w4_0[:, None] * (H * K) + _p_w4_1[None, :] * (1),
+        b_w4.to(w_ptr.dtype.element_ty),
+        mask=(_p_w4_0[:, None] < (T_seq)) & (_p_w4_1[None, :] < (K)),
     )
-    tl.store(p_w1, b_w1.to(w_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_w2, b_w2.to(w_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_w3, b_w3.to(w_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_w4, b_w4.to(w_ptr.dtype.element_ty), boundary_check=(0, 1))
 
     v_base = v_ptr + (bos * H + i_h) * V
-    p_v1 = tl.make_block_ptr(
-        v_base, (T_seq, V), (H * V, 1), (i_t * 64, 0), (16, V), (1, 0)
-    )
-    p_v2 = tl.make_block_ptr(
-        v_base, (T_seq, V), (H * V, 1), (i_t * 64 + 16, 0), (16, V), (1, 0)
-    )
-    p_v3 = tl.make_block_ptr(
-        v_base, (T_seq, V), (H * V, 1), (i_t * 64 + 32, 0), (16, V), (1, 0)
-    )
-    p_v4 = tl.make_block_ptr(
-        v_base, (T_seq, V), (H * V, 1), (i_t * 64 + 48, 0), (16, V), (1, 0)
-    )
 
-    b_v1 = tl.load(p_v1, boundary_check=(0, 1)).to(tl.float32)
-    b_v2 = tl.load(p_v2, boundary_check=(0, 1)).to(tl.float32)
-    b_v3 = tl.load(p_v3, boundary_check=(0, 1)).to(tl.float32)
-    b_v4 = tl.load(p_v4, boundary_check=(0, 1)).to(tl.float32)
+    _p_v1_0 = (i_t * 64) + tl.arange(0, 16)
+    _p_v1_1 = (0) + tl.arange(0, V)
+    b_v1 = tl.load(
+        v_base + _p_v1_0[:, None] * (H * V) + _p_v1_1[None, :] * (1),
+        mask=(_p_v1_0[:, None] < (T_seq)) & (_p_v1_1[None, :] < (V)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_v2_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    _p_v2_1 = (0) + tl.arange(0, V)
+    b_v2 = tl.load(
+        v_base + _p_v2_0[:, None] * (H * V) + _p_v2_1[None, :] * (1),
+        mask=(_p_v2_0[:, None] < (T_seq)) & (_p_v2_1[None, :] < (V)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_v3_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_v3_1 = (0) + tl.arange(0, V)
+    b_v3 = tl.load(
+        v_base + _p_v3_0[:, None] * (H * V) + _p_v3_1[None, :] * (1),
+        mask=(_p_v3_0[:, None] < (T_seq)) & (_p_v3_1[None, :] < (V)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_v4_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_v4_1 = (0) + tl.arange(0, V)
+    b_v4 = tl.load(
+        v_base + _p_v4_0[:, None] * (H * V) + _p_v4_1[None, :] * (1),
+        mask=(_p_v4_0[:, None] < (T_seq)) & (_p_v4_1[None, :] < (V)),
+        other=0.0,
+    ).to(tl.float32)
 
     b_rhs_u1 = b_v1 * b_beta1[:, None]
     b_rhs_u2 = b_v2 * b_beta2[:, None]
@@ -253,22 +334,34 @@ def _fused_merge_recompute_kernel(
     )
 
     u_base = u_ptr + (bos * H + i_h) * V
-    p_u1 = tl.make_block_ptr(
-        u_base, (T_seq, V), (H * V, 1), (i_t * 64, 0), (16, V), (1, 0)
+    _p_u1_0 = (i_t * 64) + tl.arange(0, 16)
+    _p_u1_1 = (0) + tl.arange(0, V)
+    tl.store(
+        u_base + _p_u1_0[:, None] * (H * V) + _p_u1_1[None, :] * (1),
+        b_u1.to(u_ptr.dtype.element_ty),
+        mask=(_p_u1_0[:, None] < (T_seq)) & (_p_u1_1[None, :] < (V)),
     )
-    p_u2 = tl.make_block_ptr(
-        u_base, (T_seq, V), (H * V, 1), (i_t * 64 + 16, 0), (16, V), (1, 0)
+    _p_u2_0 = (i_t * 64 + 16) + tl.arange(0, 16)
+    _p_u2_1 = (0) + tl.arange(0, V)
+    tl.store(
+        u_base + _p_u2_0[:, None] * (H * V) + _p_u2_1[None, :] * (1),
+        b_u2.to(u_ptr.dtype.element_ty),
+        mask=(_p_u2_0[:, None] < (T_seq)) & (_p_u2_1[None, :] < (V)),
     )
-    p_u3 = tl.make_block_ptr(
-        u_base, (T_seq, V), (H * V, 1), (i_t * 64 + 32, 0), (16, V), (1, 0)
+    _p_u3_0 = (i_t * 64 + 32) + tl.arange(0, 16)
+    _p_u3_1 = (0) + tl.arange(0, V)
+    tl.store(
+        u_base + _p_u3_0[:, None] * (H * V) + _p_u3_1[None, :] * (1),
+        b_u3.to(u_ptr.dtype.element_ty),
+        mask=(_p_u3_0[:, None] < (T_seq)) & (_p_u3_1[None, :] < (V)),
     )
-    p_u4 = tl.make_block_ptr(
-        u_base, (T_seq, V), (H * V, 1), (i_t * 64 + 48, 0), (16, V), (1, 0)
+    _p_u4_0 = (i_t * 64 + 48) + tl.arange(0, 16)
+    _p_u4_1 = (0) + tl.arange(0, V)
+    tl.store(
+        u_base + _p_u4_0[:, None] * (H * V) + _p_u4_1[None, :] * (1),
+        b_u4.to(u_ptr.dtype.element_ty),
+        mask=(_p_u4_0[:, None] < (T_seq)) & (_p_u4_1[None, :] < (V)),
     )
-    tl.store(p_u1, b_u1.to(u_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_u2, b_u2.to(u_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_u3, b_u3.to(u_ptr.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_u4, b_u4.to(u_ptr.dtype.element_ty), boundary_check=(0, 1))
 
 
 def fused_merge_recompute(

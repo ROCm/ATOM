@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any
 
 import torch
@@ -22,14 +23,14 @@ RTPForwardContext = None
 
 
 class _NoopWeightManager:
-    def update(self, req):  # noqa: ANN001
+    def update(self, req):
         return None
 
 
 class _NoopModelWeightsLoader:
     _py_eplb = None
 
-    def load_lora_weights(self, adapter_name, lora_path, device):  # noqa: ANN001
+    def load_lora_weights(self, adapter_name, lora_path, device):
         logger.warning(
             "No-op model_weights_loader received load_lora_weights(%s, %s, %s); "
             "external plugin mode uses ATOM model weights path only.",
@@ -37,13 +38,12 @@ class _NoopModelWeightsLoader:
             lora_path,
             device,
         )
-        return None
 
 
 class _ATOMGlm5AttnPyObj:
     """Container returned to RTP CudaGraphRunner for replay-time hooks."""
 
-    def __init__(self, runtime: "_ATOMGlm5MoeRuntime") -> None:
+    def __init__(self, runtime: _ATOMGlm5MoeRuntime) -> None:
         self._runtime = runtime
         self.is_cuda_graph = False
         self._rtp_mla_layers: list[Any] = []
@@ -96,7 +96,7 @@ class _ATOMGlm5AttnPyObj:
     def fmha_params(self):
         return None
 
-    def prepare_cuda_graph(self, attn_inputs) -> None:  # noqa: ANN001
+    def prepare_cuda_graph(self, attn_inputs) -> None:
         for layer in self._rtp_mla_layers:
             prepare = getattr(layer, "prepare_cuda_graph", None)
             if callable(prepare):
@@ -193,13 +193,25 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         device = self._get_model_device()
         dtype = self._get_model_dtype()
         kv_cache = getattr(self, "kv_cache", None)
+        _kv_tags = list(getattr(kv_cache, "group_tags", None) or []) if kv_cache else []
+        _kv_tag = _kv_tags[0] if _kv_tags else "full"
+        if kv_cache is not None and hasattr(kv_cache, "get_seq_size_per_block"):
+            _raw_seq = int(kv_cache.get_seq_size_per_block(_kv_tag))
+            _raw_kseq = int(kv_cache.get_kernel_seq_size_per_block(_kv_tag))
+        else:
+            _raw_seq = (
+                int(getattr(kv_cache, "seq_size_per_block", 0)) if kv_cache else 0
+            )
+            _raw_kseq = (
+                int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
+                if kv_cache
+                else 0
+            )
         seq_size_per_block = (
-            int(getattr(kv_cache, "seq_size_per_block", 0))
-            or int(os.getenv("SEQ_SIZE_PER_BLOCK", "0") or 0)
-            or 1
+            _raw_seq or int(os.getenv("SEQ_SIZE_PER_BLOCK", "0") or 0) or 1
         )
         kernel_seq_size_per_block = (
-            int(getattr(kv_cache, "kernel_seq_size_per_block", 0))
+            _raw_kseq
             or int(os.getenv("KERNEL_SEQ_SIZE_PER_BLOCK", "0") or 0)
             or seq_size_per_block
         )
@@ -356,7 +368,7 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
             return self._build_token_positions(input_lengths_i32, starts)
 
         sequence_lengths_plus_1 = getattr(
-            attn_inputs, "sequence_lengths_plus_1_d", None
+            attn_inputs, "sequence_lengths_plus_1_device", None
         )
         if sequence_lengths_plus_1 is not None and sequence_lengths_plus_1.numel() > 0:
             seq_plus_one_i32 = sequence_lengths_plus_1.to(
@@ -388,7 +400,7 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
         self, attn_inputs: Any, model_device: torch.device
     ) -> torch.Tensor | None:
         sequence_lengths_plus_1 = getattr(
-            attn_inputs, "sequence_lengths_plus_1_d", None
+            attn_inputs, "sequence_lengths_plus_1_device", None
         )
         if sequence_lengths_plus_1 is None or sequence_lengths_plus_1.numel() == 0:
             return None
@@ -447,15 +459,15 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
             getattr(attn_inputs, "is_prefill", False)
         )
         if graph_decode:
-            # RTP CudaGraphRunner refreshes sequence_lengths_plus_1_d before
-            # replay, but not position_ids. Build decode positions from the
+            # RTP CudaGraphRunner refreshes sequence_lengths_plus_1_device before
+            # replay, but not combo_position_ids. Build decode positions from the
             # refreshed RTP length tensors so RoPE advances on every replay.
             positions = self._build_graph_decode_positions(
                 attn_inputs=attn_inputs,
                 model_device=model_device,
             )
         if positions is None or positions.numel() == 0:
-            positions = getattr(attn_inputs, "position_ids", None)
+            positions = getattr(attn_inputs, "combo_position_ids", None)
         if positions is None or positions.numel() == 0:
             positions = self._extract_combo_positions(
                 inputs=inputs, model_device=model_device
@@ -507,14 +519,12 @@ class _ATOMGlm5MoeRuntime(GptModelBase):
                     positions = positions[..., -token_num:].contiguous()
                 else:
                     raise ValueError(
-                        "GLM5 RTP plugin position_ids/token_num mismatch "
-                        f"(position_ids_tokens={pos_tokens}, token_num={token_num})."
+                        "GLM5 RTP plugin combo_position_ids/token_num mismatch "
+                        f"(combo_position_ids_tokens={pos_tokens}, token_num={token_num})."
                     )
         return positions
 
-    def forward(
-        self, inputs: PyModelInputs, fmha_impl=None
-    ) -> PyModelOutputs:  # noqa: ANN001
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
         is_cuda_graph = bool(getattr(fmha_impl, "is_cuda_graph", False))
         if is_cuda_graph:
             inputs.attention_inputs.is_cuda_graph = True
@@ -573,16 +583,32 @@ class ATOMGlm5Moe(DeepSeekV2):
     """GLM5 model class that starts ATOM runtime in rtp-llm plugin mode."""
 
     @staticmethod
+    def _get_external_packages_from_args() -> list[str]:
+        option_name = "--external_model_packages"
+        argv = sys.argv[1:]
+        raw_value = ""
+
+        for idx, token in enumerate(argv):
+            if token == option_name:
+                if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
+                    raw_value = argv[idx + 1]
+                break
+            if token.startswith(f"{option_name}="):
+                raw_value = token.split("=", 1)[1]
+                break
+
+        if not raw_value:
+            return []
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+    @staticmethod
     def _is_external_plugin_mode() -> bool:
-        modules = os.getenv("RTP_LLM_EXTERNAL_MODEL_PACKAGES", "")
-        return "atom.plugin.rtpllm.models" in modules
+        target = "atom.plugin.rtpllm.models"
+        return target in ATOMGlm5Moe._get_external_packages_from_args()
 
     @classmethod
     def _create_config(cls, ckpt_path: str):
-        config = super()._create_config(ckpt_path)
-        # ATOM sparse MLA reads the FP8 KV cache through aiter's 576-token layout.
-        config.attn_config.mla_use_aiter_fp8_layout = True
-        return config
+        return super()._create_config(ckpt_path)
 
     def support_cuda_graph(self) -> bool:
         if os.getenv("ENABLE_CUDA_GRAPH", "1") == "0":
@@ -731,7 +757,7 @@ class ATOMGlm5Moe(DeepSeekV2):
         old_default_dtype = torch.get_default_dtype()
         try:
             old_default_device = torch.get_default_device()
-        except Exception:
+        except AttributeError:
             old_default_device = None
 
         torch.set_default_device(target_device)

@@ -21,10 +21,7 @@ use crate::{
     reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser},
     routers::{
         prepare::{
-            parser_factory_lookup::{
-                check_reasoning_parser_availability, check_tool_parser_availability,
-                create_reasoning_parser, create_tool_parser,
-            },
+            parser_factory_lookup::{check_reasoning_parser_availability, create_reasoning_parser},
             response_context::{ProtocolRequest, ResponseContext},
             tool_constraints::{generate_tool_call_id, get_history_tool_calls_count},
         },
@@ -36,7 +33,10 @@ use crate::{
         },
     },
     tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder},
-    tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser},
+    tool_parser::{
+        registry::{check_tool_parser_availability, create_tool_parser},
+        ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser,
+    },
 };
 
 pub(crate) struct ChatStreamConfig {
