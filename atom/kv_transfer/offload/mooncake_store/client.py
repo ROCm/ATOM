@@ -200,10 +200,9 @@ class MooncakeStoreClient:
             raise RuntimeError(
                 f"Mooncake Store could not register {int(nbytes)} bytes at "
                 f"{int(ptr):#x} ({describe(rc)}) on {self.rdma_devices or 'tcp'}. "
-                "Host memory must be transparent huge pages -- an ionic NIC "
-                "registers only about 3 GiB of 4 KiB pages -- and HBM needs "
-                "amdgpu peer memory (MOONCAKE_DISABLE_HIP_DMABUF=1 without dmabuf "
-                "support); MC_MAX_MR_SIZE splits large buffers into several MRs."
+                "HBM needs amdgpu peer memory (MOONCAKE_DISABLE_HIP_DMABUF=1 "
+                "without dmabuf support); MC_MAX_MR_SIZE splits large buffers into "
+                "several MRs."
             )
 
     def unregister(self, ptr: int) -> None:

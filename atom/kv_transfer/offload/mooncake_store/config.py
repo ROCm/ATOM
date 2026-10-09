@@ -27,7 +27,6 @@ from atom.kv_transfer.offload.mooncake_store.nic import (
 KEY_PREFIX = "mooncake_store."
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
-_POOL_DEVICES = ("gpu", "cpu")
 _FIELDS = (
     "master",
     "metadata",
@@ -37,7 +36,6 @@ _FIELDS = (
     "protocol",
     "local_hostname",
     "chunk_tokens",
-    "pool_device",
     "load_pool_mib",
     "save_pool_mib",
     "lookup_batch_keys",
@@ -66,8 +64,6 @@ class MooncakeStoreOffloadConfig:
     protocol: str
     local_hostname: str
     chunk_tokens: int
-    # Where the registered transfer pool lives: "gpu" (GPUDirect) or "cpu".
-    pool_device: str
     load_pool_mib: int
     save_pool_mib: int
     # Most keys one `batch_is_exist` call carries.
@@ -169,11 +165,6 @@ def parse_mooncake_store_config(
         local_hostname=_text("mooncake_store.local_hostname", local_hostname),
         chunk_tokens=offcfg._strict_integer(
             "mooncake_store.chunk_tokens", values.get("chunk_tokens", 256), minimum=1
-        ),
-        pool_device=_choice(
-            "mooncake_store.pool_device",
-            values.get("pool_device", "gpu"),
-            _POOL_DEVICES,
         ),
         load_pool_mib=offcfg._strict_integer(
             "mooncake_store.load_pool_mib", values.get("load_pool_mib", 1024), minimum=1

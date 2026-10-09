@@ -11,8 +11,8 @@ GPU connector and the dense codec. What changes is where a packed chunk goes:
   --``batch_put_from``--> the Store owners;
 * load: owners --``batch_get_into``--> a pool slot --copy, unpack--> KV blocks.
 
-With the pool in HBM (the default) the NIC reads and writes GPU memory
-directly; no byte passes through host memory.
+The pool is in the worker GPU's HBM: the NIC reads and writes GPU memory
+directly, and no byte passes through host memory.
 
 Completion protocol, per worker and operation:
 
@@ -221,7 +221,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 lookup_batch_keys=cfg.lookup_batch_keys,
             )
             pool = TransferSlotPool(
-                device=device if cfg.pool_device == "gpu" else "cpu",
+                device=device,
                 chunk_bytes=gpu_connector.gpu_staging_chunk_bytes,
                 save_bytes=cfg.save_pool_bytes,
                 load_bytes=cfg.load_pool_bytes,
