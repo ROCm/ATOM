@@ -1138,7 +1138,7 @@ models:
               decode_max_num_seqs: 80
               max_num_batched_tokens: 32768
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 2.78
               extra_args: >-
