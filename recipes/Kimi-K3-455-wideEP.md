@@ -38,6 +38,7 @@ translations, and GSM8K still scored **0.9621** over the full 1319.
 | you are on A0 silicon | [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon) |
 | find a tray's IP or BMC | [The rack: hosts and addresses](#the-rack-hosts-and-addresses) |
 | reboot a tray, or bring one back after any reboot | [Rebooting a tray](#rebooting-a-tray) → [perf_setup](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
+| AC-cycle a tray with helicop (the standard full reboot) | [With helicop](#with-helicop-ac-cycle-then-power-on) |
 
 ### Measured on B0, `rocm/fw-bringup:gfx1250-atom-20260918-ep8`
 
@@ -109,6 +110,8 @@ This page was written on one 18-tray HeliosM C-rack (`HELIOSM-DVT-CT1` …
   - *inferred*: the only BMC left unassigned.
   - CT10 and its listed BMC were both down when this was written.
 - CT10's OS address is `.80`. The `.60` that some lists give for its OS is its BMC.
+- helicop's rack file (`rack/MissionM.rack`, see [With helicop](#with-helicop-ac-cycle-then-power-on))
+  lists the same OS and BMC addresses for all 18 trays.
 - Tray ownership changes daily. Check [Is the rack actually free?](#is-the-rack-actually-free)
   before using or rebooting any tray.
 
@@ -519,15 +522,17 @@ shows `Entering interactive session`), but no command ever runs.
 | OS healthy, nothing in `D` state | `systemctl reboot --no-wall` | ~3 min |
 | GPU wedged, `D`-state workers, or userland hung | BMC Redfish `ForceRestart` | ~2.5 min |
 | `ForceRestart` did not bring the GPUs back | Redfish `PowerCycle` | not tried here |
+| a cold boot, or nothing above brought the tray back | helicop: AC-cycle the whole tray, BMC included, then power on. See [With helicop](#with-helicop-ac-cycle-then-power-on) | 7½–9 min to SSH |
 
 Do not use `systemctl reboot` or Redfish `GracefulRestart` on a wedged GPU:
 shutdown blocks while unloading `amdgpu`.
 
 **The BMC** runs OpenBMC with Redfish and is reachable from the jump host.
 Addresses are in [The rack](#the-rack-hosts-and-addresses). Credentials come from
-the rack owner and are not written here. Before resetting, make sure the BMC
-belongs to the tray you mean. The Redfish `UUID` cannot tell you: it is an
-unfilled `$BOARD_UUID` placeholder.
+the rack owner and are not written here. SSH to the BMC's own shell is
+`admin@<bmc-ip>` on port **2200**; port 22 on the BMC address is proxied to the
+host OS. Before resetting, make sure the BMC belongs to the tray you mean. The
+Redfish `UUID` cannot tell you: it is an unfilled `$BOARD_UUID` placeholder.
 
 ```bash
 B=<bmc-ip>
@@ -570,9 +575,163 @@ If nothing answers after about 10 minutes, read the BMC's event log over IPMI:
 
 | seen at boot | meaning |
 |---|---|
-| `mce: … CPU 0/48: Machine Check: 0 Bank 62: a0002000003d0800`, plus a BERT "previous boot" record for MSR `0xc00023e1` | noise. It appears after **any** warm reboot, healthy trays included, and was absent on boots that followed a rack-wide power-on |
+| `mce: … CPU 0/48: Machine Check: 0 Bank 62: a0002000003d0800`, plus a BERT "previous boot" record for MSR `0xc00023e1` | noise. It appears after **any** warm reboot, healthy trays included. It was absent after cold boots: a rack-wide power-on, and a helicop AC cycle (6 of 6 trays) |
 | `mana … Failed to query link config: -71` | noise; SSH runs over that NIC |
-| BERT `event severity: fatal`, `fru_text: Perr: CPU0`, bank 19 status `baa000000005080b` (the SEL's OEM records decode to `Perr: CPU0`) | **a real host crash**. Seen on CT1, CT2, CT12 and CT15. CT2 and CT12 were under load; CT15 crashed twice within 30 minutes. Keep a tray that repeats it out of long multi-node runs |
+| BERT `event severity: fatal`, `fru_text: Perr: CPU0`, bank 19 status `baa000000005080b` (the SEL's OEM records decode to `Perr: CPU0`) | **a real host crash**. Seen on CT1, CT2, CT3, CT12 and CT15. CT2 and CT12 were under load. CT15 crashed twice within 30 minutes, and later once while idle, about 4 minutes after `perf_setup` finished on a fresh boot from an AC cycle. Keep a tray that repeats it out of long multi-node runs |
+
+### With helicop: AC cycle, then power on
+
+`helicop` is the Helios bring-up team's controller for MI455X boards. It is
+AMD-internal; ask your AMD contact for it. It is a Bash tool that drives a tray's
+host and BMC over SSH. Its reboot is the standard one on these racks: **an AC
+cycle of the whole tray, BMC included, then a power-on.** That is a cold boot.
+It is also the method to reach for when a `ForceRestart` did not bring a tray
+back. Validated with helicop v0.39 on CT1, CT2, CT3, CT5, CT11 and CT15
+(2026-10-09).
+
+**Setup, once.**
+- helicop lives on an internal GitLab that the jump host cannot reach, so copy
+  the repo in as an archive.
+- Its `rack/MissionM.rack` describes this rack, one line per tray:
+  `CTnn root:<pw>@<OS IP> admin:<pw>@<BMC IP>:2200`. The passwords are in plain
+  text, so run `chmod -R go-rwx` on your copy.
+- The file has a `jump` line. Comment it out when running on the jump host
+  itself, which reaches the trays directly.
+- helicop pipes privileged BMC commands through `sudo -S` itself.
+- Copy the lines for the trays you need into `hosts.cfg` in the helicop
+  directory, then `chmod 600` it. The first field becomes an alias, so passwords
+  stay off the command line and out of `ps`: `./helicop CT03`.
+- Two settings keep helicop from stalling on this rack. Keep both outside the
+  helicop tree:
+
+```bash
+H=<helicop dir>; mkdir -p ~/hc/bin
+# 1. the power-stage polls cannot succeed here (see below): 5 tries instead of 250, 3 s apart
+sed -E 's/^(power_stage_poll_attempts *= *).*/\15/' $H/settings.cfg > ~/hc/settings.cfg
+# 2. keep-alives and a connect timeout. Without them, helicop's persistent SSH connection
+#    to a host that just lost power blocks its next command for minutes
+cat > ~/hc/ssh_config <<'EOF'
+Host *
+    ConnectTimeout 10
+    ServerAliveInterval 5
+    ServerAliveCountMax 3
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+Include /etc/ssh/ssh_config
+EOF
+printf '#!/bin/sh\nexec /usr/bin/ssh -F %s "$@"\n' ~/hc/ssh_config > ~/hc/bin/ssh && chmod +x ~/hc/bin/ssh
+export PATH=~/hc/bin:$PATH HELICOP_SETTINGS_FILE=~/hc/settings.cfg
+```
+
+**The sequence.** It takes two helicop sessions per tray, because the AC cycle
+takes the BMC down with the host.
+
+| | do | what happens | took here |
+|---|---|---|---|
+| 0 | check the tray is [free](#is-the-rack-actually-free); record `boot_id`; `sync` | | |
+| 1 | `./helicop CT03` → `ac_cycle` → type `confirm` → `quit` | The BMC runs `gpioset gpiochip3 20=1` (line `VIRTUAL_RESEAT`). helicop prints `AC cycle issued — BMC connection lost after 1s` and returns straight to the menu | seconds |
+| 2 | wait | The BMC comes back on the same address (6 of 6 trays) and its uptime restarts. Then wait **2 more minutes** (see the pitfalls) | 2¾–3 min |
+| 3 | `./helicop CT03` → `prep_machine auto upto 13` → `quit` | Step 10 powers the host on. Step 13 waits for host SSH | 4½–6 min |
+| 4 | check that `boot_id` changed, then run [perf_setup](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) | | 2–7 min |
+
+From the AC cycle to host SSH took 7½–9 min.
+
+- **`upto 13` is required.** Step 19 (`CheckAmdgpuLoad`) has a fix that loads
+  `amdgpu`. After that, `perf_setup` can no longer apply its pre-driver tuning.
+- **Step 10 needs an `f` from you.** `auto` pauses at the first FAIL that has no
+  fix (step 06 here) and stays paused.
+  - Answer `s` to the FAILs that have no fix.
+  - Answer `f` at `Suggested fix: PerformDcPowerOn`. That sends `ipmitool power on`.
+  - The restore policy is `always-on`, so the host also comes up without the
+    `f`, but later: about 3½ min after the BMC returns instead of just over 2.
+
+**Expected FAILs on this rack.** On this BMC firmware (OpenBMC 26.8.4,
+`m1120-wcs`), helicop cannot read the CPLD power-stage register.
+- `i2cget` is not on the `admin` account's `PATH`.
+- Called by its full path, it fails to read address `0x20` on bus 4 and on bus 8.
+
+So every step that polls the stage fails, although the power commands
+themselves work. Check the power state yourself instead:
+- the power state: Redfish `PowerState` (`/redfish/v1/Systems/system`), or
+  `ipmitool power status` on the BMC;
+- the reboot itself: `boot_id`.
+
+| step | shows | answer |
+|---|---|---|
+| Detect EVT revision (`ac_cycle` [02], `prep_machine` [03]) | WARN `unrecognised revision byte 0xEMPTY` | — |
+| [05] Check PLDM version | WARN `26.11.58 > 26.11.2`: newer than helicop's pin | — |
+| [06] Detect BIOS PIN | FAIL after about 50 s: `no Anacapa_BIOS_* object found` (a Helios-P name) | `s` |
+| [07] Check SBIOS version | WARN `no sbios_version_heliosm in best_known_config.cfg` | — |
+| [08] Detect HPM CPLD version | WARN `i2cdump failed` | — |
+| [09] Wait for power-on (snapshot) | FAIL `I2C read failed (bus 4, dev 0x20)` | `s` |
+| [10] Wait for power stage 4 | FAIL `0x??`. Its fix then shows `DC power-on issued … expected 0x12` as a FAIL, **but the power-on was sent**. Step 10 then fails once more | `f`, then `s` |
+| [13] Wait for host boot | PASS `SSH connection established` | — |
+
+**Driving it with `expect`.** The menu and the FAIL prompts read from the
+terminal. This driver runs one program per session. Start it from the helicop
+directory:
+
+```tcl
+#!/usr/bin/expect -f
+# hc.exp <alias> ac|on     ac: ac_cycle     on: prep_machine auto upto 13
+set alias [lindex $argv 0]; set mode [lindex $argv 1]
+set timeout 2400; match_max 200000
+spawn ./helicop $alias
+set fixed 0
+proc to_menu {} {
+    global fixed
+    expect {
+        -ex {Type "confirm" to proceed} { send "confirm\r"; exp_continue }
+        -re {nfo: $} {
+            # a FAIL prompt. It ends in "[i]nfo: ", with colour codes inside the brackets
+            set b $expect_out(buffer)
+            if {[string first "running fix: PerformDcPowerOn" $b] >= 0} { set fixed 1 }
+            if {!$fixed && [string first "Suggested fix: " $b] >= 0 && [string first "PerformDcPowerOn" $b] >= 0} {
+                set fixed 1; send "f\r"
+            } else { send "s\r" }
+            exp_continue
+        }
+        -ex {Press Enter to continue...} { send "\r"; exp_continue }
+        -ex {Program [options]: }        { return }
+        -re {assword: ?$}                { send "\003"; exit 4 }
+        timeout { exit 2 }
+        eof     { exit 3 }
+    }
+}
+to_menu
+if {$mode eq "ac"} { send "ac_cycle\r" } else { send "prep_machine auto upto 13\r" }
+to_menu
+send "quit\r"; expect eof
+```
+
+```bash
+cd <helicop dir>        # with PATH and HELICOP_SETTINGS_FILE exported as in the setup
+T=CT03; TRAY=10.210.11.16; B=10.210.11.48
+OLD=$(ssh root@$TRAY cat /proc/sys/kernel/random/boot_id); ssh root@$TRAY sync
+expect -f ~/hc/hc.exp $T ac
+sleep 30; until curl -sk -m 8 -o /dev/null https://$B/redfish/v1/; do sleep 10; done; sleep 120
+expect -f ~/hc/hc.exp $T on
+[ "$(ssh root@$TRAY cat /proc/sys/kernel/random/boot_id)" != "$OLD" ] && echo rebooted   # now perf_setup
+```
+
+**Pitfalls.**
+- **Do not substitute `dc_power_off` followed by `prep_machine`.** That cycles
+  only the host's DC power. On CT2 the host was still unreachable 7 minutes after
+  the power-on. An AC cycle then brought it up in 3½.
+- **Session 2 can spin at step 01** (`waiting for BMC SSH … attempt n/250`).
+  - Cause: the session's first login to the BMC failed. Its retry then logs in as
+    `root` with the `admin` account's password, which this BMC rejects every time.
+  - Cost: 250 attempts take about an hour.
+  - Fix: Ctrl-C and start session 2 again.
+  - Seen on 2 of 6 trays whose session 2 started within the BMC's first minute.
+    Both passed when started again about 4 minutes later, hence the 2-minute wait.
+- `pkill -f 'helicop CT03'` also matches the shell that runs it. Use
+  `pkill -f '[h]elicop CT03'`.
+- Other people run helicop against this rack too. Check
+  `pgrep -af '[h]elicop'` on the jump host first: two sessions acting on one tray
+  will fight.
+- The rack-mode screen (`./helicop rack/MissionM.rack`) offers the same steps as
+  routines (`PowerManagement ▸ AC_Cycle`, `DC_PowerOn`). It was not used here.
 
 ## Container
 
@@ -1087,6 +1246,9 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | Engine processes `<defunct>`, kfd process list never drains, dmesg `MES … failed to respond to msg=REMOVE_QUEUE` | GPU wedged; `gpu_recovery=0` keeps it that way by design. BMC `ForceRestart`, then `perf_setup`. See [Rebooting a tray](#rebooting-a-tray) |
 | `perf_setup` report says mode D, but `mtype_local` / `noretry` read `-1` | `amdgpu` was already loaded when it ran. Reboot, then run `perf_setup` before anything else |
 | A tray drops out mid-run; the next boot's BERT says `event severity: fatal`, `Perr: CPU0` | Host CPU fatal error, not the engine. See the boot-log table in [Rebooting a tray](#rebooting-a-tray) |
+| helicop power steps FAIL with `0x??` or `I2C read failed (bus 4, dev 0x20)` | Expected on this rack: the CPLD stage register cannot be read on this BMC firmware. The power commands still work. Check Redfish `PowerState` and `boot_id`. See [With helicop](#with-helicop-ac-cycle-then-power-on) |
+| helicop `prep_machine` spins at step 01 `waiting for BMC SSH` after an AC cycle | Its first BMC login failed, and the retry (as `root`) never succeeds. Ctrl-C, then start the session again 2 min after the BMC is back |
+| Host never reaches the OS after `dc_power_off` and a power-on | Seen once (CT2). AC-cycle the tray with helicop instead |
 
 ---
 
