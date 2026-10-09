@@ -123,3 +123,31 @@ class TestTheExperimentalGateIsClosedByDefault:
         monkeypatch.setenv(atom_platform._V41_EXPERIMENTAL_CUDAGRAPH_ENV, "1")
         monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
         assert atom_platform._breakable_cudagraph_available() is False
+
+
+def test_the_forward_context_does_not_open_atoms_side_stream_fork():
+    """`in_hipgraph` gates a fork that only ATOM's own capture loop may take.
+
+    `side_stream` forks to a side stream when `in_hipgraph` is true. Its
+    contract is ATOM's capture loop -- the window where ATOM owns the thread
+    and the capture -- which natively coincides with "a graph is recording"
+    and under the plugin does not: vLLM captures on its own thread, and a fork
+    opened there ends with
+
+        HIP error: attempt to terminate a thread-local capture sequence
+        from another thread
+
+    at `capture_end()`. So the plugin's forward context reports False, and
+    this test is what keeps a future edit from "fixing" it back to
+    `_v41_capture_active()` because the name reads like a status.
+    """
+    import inspect
+
+    from atom.plugin.vllm import deepseek_v41_bridge as bridge
+
+    source = inspect.getsource(bridge)
+    assert "in_hipgraph=False," in source, (
+        "the V4.1 plugin forward context must not report in_hipgraph true: it "
+        "gates ATOM's side-stream fork, which vLLM's capture cannot end"
+    )
+    assert "in_hipgraph=_v41_capture_active()" not in source

@@ -921,12 +921,28 @@ def atom_deepseek_v41_forward_context(
         atom_config=atom_config,
         context=context,
         num_tokens=running_tokens,
-        # True only while a breakable capture is recording: the step work
-        # above ran in an eager break, so the segments around it may be
-        # captured. Read at capture time, which is the only time this code
-        # runs -- a replay reruns the break and nothing else -- so it labels
-        # the kernels being recorded, which is exactly what it is for.
-        in_hipgraph=_v41_capture_active(),
+        # False on this path, and not because nothing is being captured.
+        #
+        # `in_hipgraph` reads as "a graph is recording" but its one consumer
+        # for V4.1 is `side_stream`, whose contract is narrower: it forks to a
+        # side stream *only inside ATOM's own capture loop*, the window where
+        # ATOM owns the thread and the capture. Natively the two coincide, so
+        # the flag can stand for both. Under the plugin they come apart --
+        # vLLM runs the capture, on its own thread, and a fork opened by this
+        # flag then cannot be ended where it began:
+        #
+        #     capture_end() -> HIP error: attempt to terminate a thread-local
+        #     capture sequence from another thread
+        #
+        # Measured, with `ATOM_DSV41_SIDE_STREAMS` at its default 0: the
+        # compressor and indexer streams are None and never forked, and the
+        # one that did fork is the MoE's `alt_stream`, which takes the same
+        # gate.
+        #
+        # So this reports the thing the consumer actually asks about. If a
+        # second consumer ever wants "a graph is recording", it should ask
+        # `_v41_capture_active()` directly rather than widen this.
+        in_hipgraph=False,
     )
     try:
         yield step_positions
