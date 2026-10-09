@@ -312,7 +312,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             from atom.model_ops.minimax_m3.index_topk import (
                 SPARSE_BLOCK_SIZE as _M3_SPARSE_BLOCK_SIZE,
             )
-            from atom.model_ops.minimax_m3.index_topk import index_score_work_map_size
+            from atom.model_ops.minimax_m3.index_topk import (
+                index_score_work_map_capacity,
+            )
 
             # Indexer CP shards the context round-robin, so a rank scores
             # ceil(blocks / world) of it and every bound below is that local one.
@@ -340,7 +342,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             self._index_score_num_idx_heads = (
                 self._index_score_cp_world if indexer_cp_enabled() else num_head_k
             )
-            rows = index_score_work_map_size(
+            # CAPACITY, not the exact size at `max_bs`: aiter's grid is
+            # non-monotonic in the batch, so a buffer sized for the largest
+            # batch can be too small for a smaller one -- at max_block 256 a
+            # batch of 8 needs 256 rows and a batch of 7 needs 455. This buffer
+            # is persistent and captured, so it has to serve every batch.
+            rows = index_score_work_map_capacity(
                 self.max_bs,
                 self._index_score_max_block,
                 max_qlen,
@@ -479,7 +486,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     self._num_idx_heads * ub_max_bs * max_seqlen_qo, **i32_kwargs
                 )
                 from atom.model_ops.minimax_m3.index_topk import (
-                    index_score_work_map_size,
+                    index_score_work_map_capacity,
                 )
 
                 # The CP pair has to match the one `_build_ubatch_metadata`
@@ -488,7 +495,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 # the one a CP rank writes -- 64 rows against 128 at bs=8,
                 # max_block=64 -- and the build rejects the buffer outright
                 # ("work_map: expected packed [at least N, 2] int32").
-                rows = index_score_work_map_size(
+                rows = index_score_work_map_capacity(
                     ub_max_bs,
                     self._index_score_max_block,
                     max_seqlen_qo,

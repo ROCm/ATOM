@@ -152,6 +152,48 @@ class TestTheAiterDependencyIsDeferred:
             m.index_score_config.cache_clear()
 
 
+# The shape the non-monotonicity shows up at: at max_block 256 a batch of 8
+# needs 256 grid rows while a batch of 7 needs 455.
+CAPACITY_SHAPE = {"max_block": 256, "max_query_len": 1, "num_idx_heads": 1}
+
+
+class TestPersistentWorkMapCapacity:
+    """A captured buffer must serve EVERY batch, not just the largest one.
+
+    aiter's grid is non-monotonic in the batch, which is the whole reason it
+    ships a separate capacity API. Sizing the persistent buffer with the exact
+    size at `max_bs` therefore under-allocates for some smaller live batch, and
+    the build rejects it at that step -- after capture, on a real request.
+    """
+
+    def test_the_exact_size_really_is_non_monotonic(self):
+        # Self-validating: if aiter ever makes the grid monotonic, the tests
+        # below stop proving anything and this one says so.
+        sizes = [m.index_score_work_map_size(b, **CAPACITY_SHAPE) for b in range(1, 33)]
+        assert any(
+            sizes[i] > sizes[i + 1] for i in range(len(sizes) - 1)
+        ), "the grid is monotonic now; this whole class can go"
+
+    @pytest.mark.parametrize("max_batch", [8, 17, 32])
+    def test_capacity_covers_every_batch_below_it(self, max_batch):
+        cap = m.index_score_work_map_capacity(max_batch, **CAPACITY_SHAPE)
+        worst = max(
+            m.index_score_work_map_size(b, **CAPACITY_SHAPE)
+            for b in range(1, max_batch + 1)
+        )
+        assert cap >= worst, f"capacity {cap} < worst exact size {worst}"
+
+    def test_the_exact_size_would_not_have(self):
+        # The bug this guards: at max_block 256 a batch of 8 needs 256 rows and
+        # a batch of 7 needs 455, so `size(8)` is not a buffer a batch of 7 fits.
+        assert m.index_score_work_map_size(7, **CAPACITY_SHAPE) > (
+            m.index_score_work_map_size(8, **CAPACITY_SHAPE)
+        )
+
+    def test_empty_batch_asks_for_nothing(self):
+        assert m.index_score_work_map_capacity(0, **CAPACITY_SHAPE) == 0
+
+
 # ---------------------------------------------------------------------------
 # Kernel behaviour. Needs a GPU and triton.
 # ---------------------------------------------------------------------------
@@ -192,6 +234,30 @@ def _inputs(qlens, prefixes, heads, device):
         "num_kv_heads": heads,
         "sm_scale": HEAD_DIM**-0.5,
     }
+
+
+@gpu
+def test_a_capacity_buffer_serves_the_batch_the_exact_size_would_not():
+    """End to end: build into one persistent buffer at both batches.
+
+    Also pins the half this relies on but does not control -- aiter accepts an
+    OVERSIZED `out` and hands back a `[rows, 2]` view of it, so the caller does
+    not slice and `decode_index_score`'s exact-row check still sees the right
+    shape.
+    """
+    shape = CAPACITY_SHAPE
+    buf = torch.empty(
+        (m.index_score_work_map_capacity(8, **shape), 2),
+        dtype=torch.int32, device="cuda",
+    )  # fmt: skip
+    for batch in (8, 7):
+        lens = torch.full(
+            (batch,), shape["max_block"] * SPARSE_BLOCK_SIZE,
+            dtype=torch.int32, device="cuda",
+        )  # fmt: skip
+        built = m.build_index_score_work_map(lens, out=buf, **shape)
+        assert built.shape[0] == m.index_score_work_map_size(batch, **shape)
+        assert built.data_ptr() == buf.data_ptr(), "aiter copied instead of slicing"
 
 
 @gpu

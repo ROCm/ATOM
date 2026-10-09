@@ -386,6 +386,35 @@ def index_score_work_map_size(
     )
 
 
+def index_score_work_map_capacity(
+    max_batch, max_block, max_query_len, num_idx_heads, cp_world=1, cp_rank=0,
+):  # fmt: skip
+    """Rows a PERSISTENT buffer needs to serve every batch up to ``max_batch``.
+
+    NOT :func:`index_score_work_map_size` at ``max_batch``. aiter documents the
+    exact grid as non-monotonic in the bounds and says a caller sizing a
+    persistent ``[rows, 2]`` buffer for a cudagraph must use this instead --
+    and it really is non-monotonic: at ``max_block=256`` a batch of 8 needs 256
+    rows while a batch of 7 needs 455, so a buffer sized at the larger batch is
+    rejected by the smaller one with "work_map: expected packed [at least 455,
+    2] int32".
+
+    The exact size stays the right thing for VALIDATING a map that was handed
+    in, which is what `decode_index_score` does with it. Only allocation moves.
+
+    0 for an empty batch, so a caller can skip the allocation.
+    """
+    if max_batch <= 0:
+        return 0
+    return _flydsl("minimax_m3_index_score_work_map_capacity")(
+        max_batch,
+        max_block,
+        max_query_len,
+        num_idx_heads,
+        index_score_config(cp_world, cp_rank),
+    )
+
+
 def index_score_work_map_for_forward(owner, phase, seq_lens, **kw):
     """:func:`build_index_score_work_map`, hoisted to once per forward.
 
