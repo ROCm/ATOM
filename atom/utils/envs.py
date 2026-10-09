@@ -683,6 +683,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # --- BLASST sparse attention ---
+    # BLASST skips a K/V tile when its per-tile max score falls more than
+    # log(threshold) below the running softmax max, eliding that tile's V load
+    # and P@V matmul. Prefill only; decode is always dense.
+    #
+    # These apply to whichever prefill path reaches the Triton
+    # unified_attention 2D kernel -- NOT only ATOM_USE_UNIFIED_ATTN=1.
+    # dispatch_backend picks that path when `ATOM_USE_UNIFIED_ATTN or
+    # use_flash_layout`, so a flash-layout model reaches it with the env var
+    # still at its default.
+    #
+    # 0 (the default) disables block skipping entirely, which is what makes the
+    # feature inert until asked for -- not the env var above.
+    #
+    # Set the threshold directly. Takes precedence over the ALPHA/BETA/SPARSITY
+    # fit below whenever it is > 0.
+    "ATOM_BLASST_THRESHOLD": lambda: float(os.getenv("ATOM_BLASST_THRESHOLD", "0")),
+    # Or derive it per sequence length from a calibrated fit,
+    #   threshold = alpha * exp(beta * sparsity) / seqlen
+    # ALPHA and BETA are calibration inputs -- ATOM ships no tool that produces
+    # them; see docs/environment_variables.md "Calibrating". They are model-
+    # AND GPU-specific. There is deliberately no default fit: a wrong one costs
+    # accuracy silently rather than failing.
+    "ATOM_BLASST_ALPHA": lambda: float(os.getenv("ATOM_BLASST_ALPHA", "0")),
+    "ATOM_BLASST_BETA": lambda: float(os.getenv("ATOM_BLASST_BETA", "0")),
+    # Target fraction of K/V tiles to skip, in [0, 1). Used only with ALPHA/BETA.
+    "ATOM_BLASST_SPARSITY": lambda: float(os.getenv("ATOM_BLASST_SPARSITY", "0")),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
