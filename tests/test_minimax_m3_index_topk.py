@@ -29,12 +29,9 @@ pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
 from atom.model_ops.minimax_m3 import index_topk as m
 from atom.model_ops.minimax_m3.index_topk import (
-    DECODE_SCORE_MIN_BLOCKS,
-    DECODE_SCORE_TARGET_GRID,
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
     PREFILL_TOPK_MIN_BLOCK_SIZE_K,
     SPARSE_BLOCK_SIZE,
-    _decode_score_chunks,
     _prefill_topk_block_size_k,
     _require_packable,
 )
@@ -71,70 +68,6 @@ class TestPrefillTileWidth:
         # tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T) in the kernel.
         for mb in (1, 2, 15, 16, 17, 4096):
             assert _prefill_topk_block_size_k(mb) >= TOPK
-
-
-class TestDecodeScoreChunks:
-    """A grid dim, so: shape-constant, positive, and never past the blocks."""
-
-    @pytest.mark.parametrize("batch", [1, 2, 7, 8, 50, 64, 256, 1024])
-    @pytest.mark.parametrize("max_block", [1, 2, 63, 64, 256, 800, 8192])
-    def test_bounds_and_coverage(self, batch, max_block):
-        # Not a power of two: it is a grid dim, not a tile, so nothing indexes
-        # it with tl.arange. What has to hold is that the chunks cover every
-        # block and that none of them is empty by construction.
-        n = _decode_score_chunks(batch, max_block)
-        assert 1 <= n <= max_block
-        # Two bounds, one per end of the batch range.
-        assert n <= max(1, -(-max_block // DECODE_SCORE_MIN_BLOCKS))
-        assert batch * n <= max(DECODE_SCORE_TARGET_GRID, batch)
-        chunk_blocks = -(-max_block // n)
-        assert chunk_blocks * n >= max_block
-        assert chunk_blocks * (n - 1) < max_block
-
-    def test_the_ceiling_binds_at_high_batch(self):
-        """The floor alone would return the same count at every batch.
-
-        Asserted against a literal rather than DECODE_SCORE_TARGET_GRID: a bound
-        read from the constant moves with it, so raising the constant back out
-        of range would satisfy the assertion instead of failing it.
-        """
-        assert _decode_score_chunks(8, 8192) > _decode_score_chunks(128, 8192)
-        assert _decode_score_chunks(128, 8192) * 128 <= 16384
-
-    @pytest.mark.parametrize("batch", [1, 64])
-    def test_an_empty_bound_still_gives_a_grid(self, batch):
-        """`cdiv(max_block, cdiv(max_block, chunks))` divides by its own inner
-        result, which is zero when there is nothing to score. The exception
-        lands outside any kernel launch, so on tp>1 one rank raises and the
-        rest wait in the next collective -- the shape a hang takes."""
-        assert _decode_score_chunks(batch, 0) == 1
-
-    def test_shrinks_with_batch(self):
-        # A larger batch must not buy more chunks per request: the grid is
-        # (request, chunk), so that would multiply into a pointless grid.
-        prev = _decode_score_chunks(1, 4096)
-        for batch in (2, 4, 16, 64, 256, 4096):
-            cur = _decode_score_chunks(batch, 4096)
-            assert cur <= prev
-            prev = cur
-
-    @pytest.mark.parametrize("max_block", [3, 5, 64, 800, 2464, 8192, 65534])
-    @pytest.mark.parametrize("batch", [1, 8, 64])
-    def test_a_chunk_walks_at_least_min_blocks(self, batch, max_block):
-        """The floor is the whole point of the split rule: a chunk down to one
-        block pays the query-tile load, which sits outside the block loop, for
-        a single block of work. Deleting the clamp must turn this red."""
-        n = _decode_score_chunks(batch, max_block)
-        assert -(-max_block // n) >= DECODE_SCORE_MIN_BLOCKS
-
-    @pytest.mark.parametrize("max_block,want_chunks", [(1, 1), (2, 1), (4, 2)])
-    def test_the_floor_is_a_target_not_a_guarantee(self, max_block, want_chunks):
-        """Right above MIN_BLOCKS the floor cannot hand out a second full
-        chunk: max_block=4 splits into 2 chunks of 2, under the floor. Nothing
-        is wrong with that -- 2 blocks still amortize the query tile -- but the
-        floor is a target, so `test_a_chunk_walks_at_least_min_blocks` skips
-        this range rather than asserting something untrue about it."""
-        assert _decode_score_chunks(1, max_block) == want_chunks
 
 
 class TestPackableBound:
@@ -562,3 +495,176 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+# ---------------------------------------------------------------------------
+# The decode score kernel, and the hoist that makes it worth having.
+# ---------------------------------------------------------------------------
+def _score_oracle(idx_q, cache, block_table, seq_lens, max_query_len, heads, sm_scale):
+    """Block scores in fp32 on the device, straight from the definition.
+
+    `[heads, batch*max_query_len, nblk]`, NaN wherever the kernel is not
+    required to write (`blk >= ceil(seq_len/128)`). Deliberately a transcription
+    rather than a second kernel: there is one decode scorer now, so the only
+    honest anchor is the rule it is supposed to implement.
+    """
+    batch = seq_lens.shape[0]
+    dev, p = idx_q.device, SPARSE_BLOCK_SIZE
+    nblk = -(-int(seq_lens.max()) // p)
+    out = torch.full(
+        (heads, batch * max_query_len, nblk), float("nan"), dtype=torch.float32,
+        device=dev,
+    )  # fmt: skip
+    # The kernel folds log2(e) into the scale and works in base 2; the selection
+    # is invariant to that, but a score comparison is not.
+    scale = sm_scale * 1.4426950408889634
+    tok = torch.arange(max_query_len, device=dev).repeat_interleave(heads)
+    within = torch.arange(p, device=dev)
+    for b in range(batch):
+        length = int(seq_lens[b])
+        q = idx_q[b * max_query_len : (b + 1) * max_query_len].reshape(-1, HEAD_DIM)
+        cuts = length - max_query_len + tok + 1  # one causal cutoff per column
+        for blk in range(-(-length // p)):
+            # K is lifted to Q's dtype before fp32, not the other way round, so
+            # an fp8 cache reproduces the kernel's rounding instead of skipping it.
+            k = cache[int(block_table[b, blk])].to(idx_q.dtype).float()
+            z = (k @ q.float().T) * scale
+            z = z.masked_fill((blk * p + within)[:, None] >= cuts[None, :], -torch.inf)
+            out[:, b * max_query_len : (b + 1) * max_query_len, blk] = (
+                z.amax(0).reshape(max_query_len, heads).T
+            )
+    return out
+
+
+@gpu
+class TestDecodeScoreAgainstTheDefinition:
+    """The decode scorer against `_score_oracle`, not against another kernel.
+
+    This used to compare two kernels -- flydsl against the Triton one it beat --
+    and assert on the SELECTION rather than the scores, because two accumulation
+    orders may legally reorder blocks that tie. The Triton kernel is gone, so
+    both halves of that change: the anchor is the definition, and scores are now
+    comparable directly (with a tolerance, not bit-for-bit).
+    """
+
+    @staticmethod
+    def _run(kw, work_map, max_block):
+        return m.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            kw["max_seq_len"], TOPK, INIT, LOCAL, kw["num_kv_heads"],
+            kw["sm_scale"], emit_sparse_block_table=True,
+            max_query_len=kw["max_query_len"],
+            index_score_work_map=work_map, index_score_max_block=max_block,
+        )  # fmt: skip
+
+    @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+    @pytest.mark.parametrize("max_query_len", [1, 8])
+    @pytest.mark.parametrize("ragged", [False, True], ids=["uniform", "ragged"])
+    def test_the_scores_are_the_ones_the_definition_asks_for(
+        self, ragged, max_query_len, fp8
+    ):
+        batch, heads = 6, 2
+        prefixes = [8192, 1024, 65536, 256, 16384, 512] if ragged else [8192] * batch
+        kw = _inputs([max_query_len] * batch, prefixes, heads, "cuda")
+        if fp8:
+            kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
+        max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        work_map = m.build_index_score_work_map(
+            kw["seq_lens"],
+            max_block=max_block,
+            max_query_len=max_query_len,
+            num_idx_heads=heads,
+        )
+        score = m.decode_index_score(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            max_block, max_query_len, heads, kw["sm_scale"], work_map,
+        )  # fmt: skip
+        want = _score_oracle(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            max_query_len, heads, kw["sm_scale"],
+        )  # fmt: skip
+        assert score.shape == want.shape
+        # Only where the kernel is required to write: the oracle marks the rest
+        # NaN, and the kernel leaves those slots alone by design.
+        live = ~torch.isnan(want)
+        # Both sides carry -inf for a fully-masked block; subtracting them gives
+        # NaN, so compare those positions by equality and the rest by tolerance.
+        neg_inf = want == -torch.inf
+        assert torch.equal(score[live & neg_inf], want[live & neg_inf])
+        finite = live & ~neg_inf
+        assert torch.allclose(score[finite], want[finite], rtol=2e-2, atol=2e-2)
+
+    def test_a_map_built_for_a_wider_bound_still_agrees(self):
+        """What a cudagraph replay does: score to `max_model_len`, not to the
+        batch's longest request. The extra columns must not move the answer."""
+        batch, heads = 4, 2
+        kw = _inputs([1] * batch, [4096, 8192, 1024, 2048], heads, "cuda")
+        narrow = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        wide = 4 * narrow
+        work_map = m.build_index_score_work_map(
+            kw["seq_lens"], max_block=wide, max_query_len=1, num_idx_heads=heads
+        )
+        wide_idx, _, _ = self._run(kw, work_map, wide)
+        narrow_idx, _, _ = self._run(kw, None, narrow)
+        rows = heads * batch
+        assert torch.equal(
+            torch.sort(wide_idx.reshape(rows, TOPK), dim=1).values,
+            torch.sort(narrow_idx.reshape(rows, TOPK), dim=1).values,
+        )
+
+    def test_a_map_built_for_another_bound_is_refused(self):
+        """The one failure here that would otherwise be silent: the row count
+        IS the grid, so a mismatched map is not a short map, it is the kernel
+        reading rows that mean a different (request, chunk)."""
+        kw = _inputs([1] * 4, [8192] * 4, 2, "cuda")
+        max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        work_map = m.build_index_score_work_map(
+            kw["seq_lens"], max_block=2 * max_block, max_query_len=1, num_idx_heads=2
+        )
+        with pytest.raises(AssertionError, match="different bounds"):
+            self._run(kw, work_map, 0)
+
+
+@gpu
+class TestIndexScoreWorkMapHoist:
+    """One build per decode step, not one per sparse layer.
+
+    `make_work_map` is ~15 tiny device ops and costs ~120us whatever the shape
+    -- launch floor, not work -- against a score kernel of 17-250us. Rebuilding
+    it per layer is the failure that makes the whole substitution a net loss
+    while every correctness test still passes.
+
+    Every call path builds it in a metadata builder, one step upstream of this
+    module. What is testable here is the half that lives here: given a map the
+    op uses it as handed over and does not rebuild.
+
+    The op does build one when none arrives -- there is no second scorer to fall
+    back to any more, so declining would mean raising. That is the slow-but-
+    correct path, and the count below is what keeps it from quietly becoming the
+    fast path's behaviour too.
+    """
+
+    @pytest.mark.parametrize("hoisted", [True, False])
+    def test_it_builds_exactly_when_the_caller_did_not(self, monkeypatch, hoisted):
+        kw = _inputs([1] * 4, [8192] * 4, 2, "cuda")
+        max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
+        real = m.build_index_score_work_map
+        work_map = real(
+            kw["seq_lens"], max_block=max_block, max_query_len=1, num_idx_heads=2
+        )
+        builds = []
+
+        def counted(*a, **k):
+            builds.append(1)
+            return real(*a, **k)
+
+        monkeypatch.setattr(m, "build_index_score_work_map", counted)
+        idx, _, _ = m.minimax_m3_index_topk_decode(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            kw["max_seq_len"], TOPK, INIT, LOCAL, 2, kw["sm_scale"],
+            emit_sparse_block_table=True, max_query_len=1,
+            index_score_work_map=work_map if hoisted else None,
+            index_score_max_block=max_block if hoisted else 0,
+        )  # fmt: skip
+        assert idx.shape == (2, 4, TOPK)
+        assert len(builds) == (0 if hoisted else 1)

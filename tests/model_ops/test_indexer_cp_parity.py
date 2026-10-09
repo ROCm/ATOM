@@ -36,7 +36,10 @@ aiter = pytest.importorskip("aiter", reason="requires the AITER runtime")
 pytest.importorskip("triton", reason="requires Triton")
 
 from atom.distributed.indexer_cp import _exchange_via_all_gather
-from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+from atom.model_ops.minimax_m3.index_topk import (
+    build_index_score_work_map,
+    minimax_m3_index_topk_decode,
+)
 from atom.model_ops.minimax_m3.indexer_candidate_exchange import (
     local_candidate_keys,
     merge_candidate_keys,
@@ -98,14 +101,41 @@ def _tp_reference(idx_q, cache, block_table, lens, max_seq_len, topk, init, loca
     ]
 
 
-def _cp_candidates(idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q):
+def _shard_score(idx_q, cache, block_table, lens, max_seq_len, r, q, pad):
+    """One rank's shard scores, with a map built ``pad`` blocks wider than needed.
+
+    That width is not an embellishment: the map's row count IS the scorer's grid
+    and a captured decode cannot move its grid, so production bounds the map by
+    the MODEL length while the batch is whatever it is. ``pad > 0`` is that case
+    -- the shard carries dead trailing blocks, which the selector must rank below
+    every real one. ``pad == 0`` is the batch-tight bound.
+    """
+    blocks = (max_seq_len + BLOCK - 1) // BLOCK
+    local = (blocks + WORLD - 1) // WORLD
+    work_map = build_index_score_work_map(
+        lens,
+        max_block=local + pad,
+        max_query_len=q,
+        num_idx_heads=WORLD,
+        cp_world=WORLD,
+        cp_rank=r,
+    )
+    scores = indexer_context_scores(
+        idx_q, cache, block_table, lens, max_seq_len, r, WORLD, q, SCALE,
+        work_map=work_map, max_block=local + pad,
+    )  # fmt: skip
+    assert scores.shape[2] == local + pad, "the scorer ignored the bound it was given"
+    return scores
+
+
+def _cp_candidates(
+    idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q, pad=0
+):
     """Every shard's packed candidate keys, [rank][heads, tokens, topk]."""
     blocks = (max_seq_len + BLOCK - 1) // BLOCK
     return [
         local_candidate_keys(
-            indexer_context_scores(
-                idx_q, cache, block_table, lens, max_seq_len, r, WORLD, q, SCALE
-            ),
+            _shard_score(idx_q, cache, block_table, lens, max_seq_len, r, q, pad),
             lens,
             topk,
             r,
@@ -155,6 +185,7 @@ def _assert_chain_matches_tp(
     transport,
     seed,
     cache_dtype=torch.bfloat16,
+    pad=0,
 ):
     idx_q, cache, block_table, lens, _ = _inputs(
         batch, max_seq_len, q, cache_dtype, seed
@@ -163,7 +194,7 @@ def _assert_chain_matches_tp(
         idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q
     )
     keys = _cp_candidates(
-        idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q
+        idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q, pad
     )
     for head in range(WORLD):
         got = merge_candidate_keys(
@@ -174,15 +205,30 @@ def _assert_chain_matches_tp(
             assert torch.equal(a, b), f"head {head} {name} diverged from the TP path"
 
 
+# The two bounds a shard can be scored against, tight and model-length-padded.
+# Everything downstream of the score is shared, so parametrizing here subjects
+# the padded case -- the one production actually captures -- to the same
+# exactness claim as the tight one.
+#
+# Both arms now run the same kernel, and so does `_tp_reference`: there is one
+# decode scorer left. That makes this file's parity claim a claim about the
+# CHAIN around it (shard, reduce, exchange, merge), not about the score, and
+# leaves it blind to a mistake the scorer makes on both sides. That gap is
+# covered by `test_the_shard_scores_match_the_definition` below, which is
+# anchored on torch rather than on a second kernel.
+SCORERS = pytest.mark.parametrize("pad", [0, 3], ids=["tight", "padded"])
+
+
 # ───────────────────────────────────────────────────────────── exactness ──
 
 
 @needs_gpu
+@SCORERS
 @pytest.mark.parametrize("transport", ["all_to_all", "all_gather"])
 @pytest.mark.parametrize("max_query_len", [1, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 512, 4096, 16384])
 def test_cp_selection_is_identical_to_the_tp_path(
-    transport, max_query_len, max_seq_len
+    transport, max_query_len, max_seq_len, pad
 ):
     """The exactness claim the feature is sold on, over both transports.
 
@@ -191,6 +237,11 @@ def test_cp_selection_is_identical_to_the_tp_path(
     are pure padding and the merge has to rank that padding below every real
     key. ``max_query_len=4`` is spec decode (EAGLE3 with 3 draft tokens), where
     each query token carries its own causal cutoff.
+
+    That corner is also where the scorer leaves the most behind: it writes only
+    the blocks a request has, so an empty shard's row is uninitialized memory
+    start to finish. Correct only because `_pack_score_key` sends masked lanes
+    to key 0, and this is the test that says so.
     """
     _assert_chain_matches_tp(
         batch=8,
@@ -201,12 +252,14 @@ def test_cp_selection_is_identical_to_the_tp_path(
         local=2,
         transport=transport,
         seed=17,
+        pad=pad,
     )
 
 
 @needs_gpu
+@SCORERS
 @pytest.mark.parametrize("init, local", [(0, 0), (1, 2), (2, 4)])
-def test_forced_blocks_survive_the_round_trip(init, local):
+def test_forced_blocks_survive_the_round_trip(init, local, pad):
     """Sink and sliding-window blocks are pinned twice, and must be.
 
     A forced block that loses its own shard's top-k never reaches the merge to
@@ -222,12 +275,14 @@ def test_forced_blocks_survive_the_round_trip(init, local):
         local=local,
         transport="all_to_all",
         seed=23,
+        pad=pad,
     )
 
 
 @needs_gpu
+@SCORERS
 @pytest.mark.parametrize("topk", [4, 16])
-def test_parity_holds_across_top_k(topk):
+def test_parity_holds_across_top_k(topk, pad):
     """topk sizes the exchange payload and both kernels' selection width."""
     _assert_chain_matches_tp(
         batch=6,
@@ -238,32 +293,24 @@ def test_parity_holds_across_top_k(topk):
         local=2,
         transport="all_to_all",
         seed=29,
+        pad=pad,
     )
 
 
 @needs_gpu
+@SCORERS
 @pytest.mark.parametrize("max_query_len", [1, 4])
-def test_parity_holds_on_an_fp8_index_cache(max_query_len):
-    """The one dtype where the two paths do NOT share a dot formulation.
+def test_parity_holds_on_an_fp8_index_cache(max_query_len, pad):
+    """``--index-cache-dtype fp8`` is what recipes/MiniMax-M3.md runs.
 
-    ``--index-cache-dtype fp8`` is what recipes/MiniMax-M3.md runs, and it is
-    the only input that makes the CP scorer and the native selector compute the
-    score differently rather than identically: the native kernel has a dedicated
-    fp8 branch that casts the QUERY DOWN to fp8 and multiplies in fp8
-    (``index_topk.py`` ``if k.dtype.is_fp8()``), while ``_context_score`` casts
-    the KEY UP with a plain ``.to(q.dtype)`` and multiplies in bf16. Nothing
-    guarantees a priori that two different products rank 512 blocks the same
-    way, which is why this is a separate test and not another parametrize case
-    on the bf16 one.
-
-    Measured before it was written, in the discriminating regime (65536 ctx =
-    512 blocks, top-16, so the selection actually excludes something): zero
-    divergence in top-k indices, sparse_bt and sparse_ctx over 25,600 rows
-    across 40 seeds, both fp8 containers and both query lengths. That is past
-    the ~1-per-25k rate at which ``_pack_score_key`` says fp8 blocks tie on one
-    fp32 score. The test pins the result rather than the reasoning: if either
-    side's dot changes, this fails instead of silently shifting which blocks
-    attention reads.
+    It used to be the one dtype where the two sides did not share a dot
+    formulation -- the old Triton ``_context_score`` cast the KEY UP to bf16
+    while the native selector's fp8 branch cast the QUERY DOWN -- and this test
+    existed to show that two different products still ranked 512 blocks the same
+    way. Both sides run the same kernel now, so it no longer pins that. What it
+    still pins is the shard/exchange/merge chain under fp8, where the scores are
+    closer together than in bf16 and ties are ~1 per 25k rows; `_pack_score_key`
+    has to break them identically on both sides.
 
     ``aiter.dtypes.fp8`` rather than a hardcoded ``float8_e4m3fn`` because the
     two ROCm archs disagree on which one is native, and this must test the
@@ -279,6 +326,7 @@ def test_parity_holds_on_an_fp8_index_cache(max_query_len):
         transport="all_to_all",
         seed=37,
         cache_dtype=aiter.dtypes.fp8,
+        pad=pad,
     )
 
 
@@ -291,8 +339,61 @@ def test_both_transports_deliver_the_same_tensor():
     below the threshold -- and only in the arm nobody benchmarked.
     """
     idx_q, cache, block_table, lens, _ = _inputs(4, 4096, 1, torch.bfloat16, 31)
-    keys = _cp_candidates(idx_q, cache, block_table, lens, 4096, 16, 1, 2, 1)
+    keys = _cp_candidates(idx_q, cache, block_table, lens, 4096, 16, 1, 2, 1, pad=0)
     for head in range(WORLD):
         a2a = _exchange(keys, head, "all_to_all")
         gathered = _exchange(keys, head, "all_gather")
         assert torch.equal(a2a, gathered), f"transports disagree for head {head}"
+
+
+@needs_gpu
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, "fp8"])
+@pytest.mark.parametrize("max_query_len", [1, 4])
+def test_the_shard_scores_match_the_definition(max_query_len, cache_dtype):
+    """The anchor the rest of this file no longer has.
+
+    Every other test here compares the CP chain against `_tp_reference`, and
+    both now run the same scorer, so a mistake inside it cancels. This one is
+    anchored on torch: score a shard, then check each live column against the
+    max over that block's 128 tokens of q.k*scale, causal-masked -- with the
+    round-robin remap ``global = local*WORLD + rank`` done here rather than
+    assumed, since that remap is the one thing CP adds to the score.
+
+    Compared in the kernel's base-2 units, and only where it is required to
+    write: the scorer leaves every block past a request's length untouched.
+    """
+    dtype = aiter.dtypes.fp8 if cache_dtype == "fp8" else cache_dtype
+    max_seq_len, batch = 4096, 4
+    idx_q, cache, block_table, lens, blocks = _inputs(
+        batch, max_seq_len, max_query_len, dtype, 41
+    )
+    local = (blocks + WORLD - 1) // WORLD
+    scale = SCALE * 1.4426950408889634
+    within = torch.arange(BLOCK, device="cuda")
+    for rank in range(WORLD):
+        got = _shard_score(
+            idx_q, cache, block_table, lens, max_seq_len, rank, max_query_len, 0
+        )
+        for b in range(batch):
+            length = int(lens[b])
+            rows = slice(b * max_query_len, (b + 1) * max_query_len)
+            q = idx_q[rows].reshape(-1, BLOCK).float()  # [S*H, D], col = tok*H+head
+            cuts = (
+                length
+                - max_query_len
+                + torch.arange(max_query_len, device="cuda").repeat_interleave(WORLD)
+                + 1
+            )
+            for p in range(local):
+                gp = p * WORLD + rank  # this rank owns global block gp
+                if gp * BLOCK >= length:
+                    break  # past the request: the kernel need not have written
+                k = cache[int(block_table[b, gp])].to(idx_q.dtype).float()
+                z = (k @ q.T) * scale
+                z = z.masked_fill(
+                    (gp * BLOCK + within)[:, None] >= cuts[None, :], -torch.inf
+                )
+                want = z.amax(0).reshape(max_query_len, WORLD).T
+                assert torch.allclose(
+                    got[:, rows, p], want, rtol=2e-2, atol=2e-2
+                ), f"rank {rank} request {b} local block {p} (global {gp})"
