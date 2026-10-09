@@ -16,6 +16,7 @@ from interactivity import (
     METHOD_MEDIAN_TPOT,
     METHOD_P90_E2E,
     agentic_interactivity,
+    agentic_throughput,
     locate_records,
 )
 
@@ -174,10 +175,10 @@ def interactivity_value(payload: dict[str, Any]) -> float | None:
     return None
 
 
-def apply_agentic_interactivity(
+def apply_agentic_record_metrics(
     path: Path, payload: dict[str, Any], fields: dict[str, Any]
 ) -> None:
-    """Set both interactivity definitions from the per-request AIPerf records.
+    """Set interactivity and token throughput from the per-request AIPerf records.
 
     Agentic traces run a ~1M-token prefill per turn, so 1000/median_TPOT sees
     only the decode phase and hides the prefill cost entirely. The InferenceX
@@ -189,6 +190,10 @@ def apply_agentic_interactivity(
     The same pass also yields the plain 1/p90(ITL) number InferenceX plots as
     "Interactivity", stored alongside as ``interactivity_p90_itl`` so the
     dashboard can offer both as x-axes for the same point.
+
+    The records also replace AIPerf's time-sliced token throughput with
+    InferenceX's records-over-span definition (see interactivity.py), so the
+    per-GPU numbers line up with the ones InferenceX publishes.
     """
     if string_value(payload.get("benchmark_kind")) != AGENTIC_BENCHMARK_KIND:
         payload.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
@@ -210,6 +215,20 @@ def apply_agentic_interactivity(
         )
         payload["interactivity_method"] = METHOD_MEDIAN_TPOT
         return
+
+    try:
+        throughput = agentic_throughput(records)
+    except (OSError, ValueError) as exc:
+        print(
+            f"WARNING: cannot compute record-span throughput from {records}: "
+            f"{exc}; keeping AIPerf's time-sliced throughput",
+            file=sys.stderr,
+        )
+    else:
+        payload["input_throughput"] = throughput["input_tput_tps"]
+        payload["output_throughput"] = throughput["output_tput_tps"]
+        payload["total_token_throughput"] = throughput["total_tput_tps"]
+        payload["throughput_window_s"] = throughput["duration_s"]
 
     try:
         result = agentic_interactivity(records)
@@ -486,7 +505,7 @@ def enrich_payload(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
     )
-    apply_agentic_interactivity(path, enriched, fields)
+    apply_agentic_record_metrics(path, enriched, fields)
     enriched.setdefault("interactivity", interactivity_value(enriched))
     resources = topology_resources(enriched, fields)
     total_gpu = resources["total_gpu"]
