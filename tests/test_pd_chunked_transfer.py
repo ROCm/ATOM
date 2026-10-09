@@ -26,6 +26,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     KVTransferRegion,
     KVTransferTensors,
+    PageRegion,
 )
 
 
@@ -539,7 +540,9 @@ def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
         )
         regions.append(swa_region)
         transfer = KVTransferTensors(
-            block_regions=[KVTransferRegion(ctypes.addressof(pages), len(pages), 4)],
+            pages=[
+                PageRegion(KVTransferRegion(ctypes.addressof(pages), len(pages), 4))
+            ],
             slot_regions=[],
             swa_block_regions=[swa_region],
             num_slots=len(slots) // 4,
@@ -749,6 +752,9 @@ def test_dcp_chunked_descriptors_relayout_each_destination_page_once():
 @pytest.mark.parametrize(
     "handoff",
     [
+        None,
+        [],
+        "invalid",
         {},
         {"first_token_id": "42"},
         {"first_token_id": -1},
