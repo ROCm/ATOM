@@ -13,11 +13,11 @@
     "atom": {
       "repository": "https://github.com/ROCm/ATOM.git",
       "base_sha": "a526f0d557eeed08396670249af58bd85fa57338",
-      "head_sha": "a876e3b2f394c86be60ec6c2f35dfc598a622777",
-      "result_tree_sha": "e873ef0ea665fe99177f034d72dfe7bd6df7561c",
+      "head_sha": "66cd49c4860560e6a4e9543abd8f4d2eb90da7b5",
+      "result_tree_sha": "a7b5156882017df16249299f7ad70132376337d2",
       "pull_requests": {
         "2458": "9f20a70eae89c1e86126d6d9303dbbb93cd84bd7",
-        "2505": "45fbbb51ba8e6efe8832eba0cf58238808578730"
+        "2505": "07c382b179f50c76121f95c86d2aad97fb76b596"
       },
       "retained_local_candidates": [
         "KDA W8 recurrence launch",
@@ -33,7 +33,7 @@
       ],
       "patch": {
         "path": "atom.patch",
-        "sha256": "73169042f3020ea048ba9354b7e39951f0cef648f9e9f93d1a6cfcbb4eddfcc5",
+        "sha256": "16731df5e737abfd0ddf1323809c7ee9f7dde4dfa64901930a773b32068a534a",
         "files": [
           "atom/model_ops/attention_mla.py",
           "atom/model_ops/attentions/gdn_attn.py",
@@ -165,7 +165,7 @@
   },
   "artifacts": {
     "atom.patch": {
-      "sha256": "73169042f3020ea048ba9354b7e39951f0cef648f9e9f93d1a6cfcbb4eddfcc5"
+      "sha256": "16731df5e737abfd0ddf1323809c7ee9f7dde4dfa64901930a773b32068a534a"
     },
     "aiter.patch": {
       "sha256": "07301f9fa69d8915f2c66fb821dbaf3c0a12909b497a95cfd56e93c180bfbeb6"
@@ -180,7 +180,7 @@
       "sha256": "29e81720ebead5001e22ad7de1ccf70eab3bdf3a5f61c8d006d92253d9a9e7cd"
     },
     "apply.sh": {
-      "sha256": "55b705f4841a96aefee126bea4de7ce483ddf855b0f4bd7b64a6ec01839c3554"
+      "sha256": "f266a85e593558ee9adf7bab07e2e0dc9a6dc095452629ce4a969aafccc18741"
     }
   }
 }
