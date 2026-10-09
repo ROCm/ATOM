@@ -862,6 +862,11 @@ models:
               ATOM_AUTO_NUMA_BIND: "0"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              # AgentX throughput band (CONC 16 up): with prefill and decode on
+              # one server, a ready prefill waits four decode passes, and the
+              # PrefillDelayer coalesces queued prefill for up to 5 s.
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
 
