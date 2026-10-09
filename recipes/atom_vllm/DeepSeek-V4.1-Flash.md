@@ -191,13 +191,47 @@ does not survive it. With it:
   first replay reads freed memory. Symptom: `illegal memory access`, reported
   asynchronously inside an unrelated `copy_to_gpu`. Fixed by `_dummy_cache`.
 
-**What still blocks it.** With all of the above, V4.1 captures and serves
-without raising, and the answers degenerate into noise after the first few
-tokens (measured: 8/8 prompts, greedy, against an eager arm that answers all 8
-correctly). The attention is what stays behind: its kernels are launched with
-per-step host values -- the batch's longest KV extent among them -- which a
-capture freezes at whatever length it recorded while every decode step grows
-past it.
+**What still blocks it, on vLLM 0.28.** With all of the above, V4.1 captures
+and serves without raising, and the answers degenerate into noise after the
+first few tokens (measured: 8/8 prompts, greedy, against an eager arm that
+answers all 8 correctly). The attention is what stays behind: its kernels are
+launched with per-step host values -- the batch's longest KV extent among
+them -- which a capture freezes at whatever length it recorded while every
+decode step grows past it.
+
+**What blocks it on 0.31 is different and earlier: capture does not finish.**
+The attention was given a caller-owned output buffer and its own eager break,
+which is what the decorator requires. With that break in place the capture
+dies; without it the capture completes and the answers are noise again, which
+is how we know the break is necessary rather than optional:
+
+    capture_end() -> HIP error: attempt to terminate a thread-local capture
+                     sequence from another thread  (hipErrorStreamCaptureWrongThread)
+
+The message names a thread and the thread is not the problem. Measured at the
+segment boundary: `_begin_segment` and `_end_segment` run on the same thread
+and the same stream every time, and the capture object has one instance per
+rank, so no nesting. What the paired trace does show is the first
+`_end_segment` raising inside `capture_end()` -- it never reaches
+`self._capturing = False`, so the context manager's `__exit__` ends an
+already-dead graph and reports *that*, hiding the first failure.
+
+Eight explanations were tested and refuted, each by measurement, so that
+nobody re-walks them: the compressor/indexer side streams (off by default,
+`ATOM_DSV41_SIDE_STREAMS=0`); `in_hipgraph` opening ATOM's fork gate under a
+foreign capture; the MoE's dual-stream overlap
+(`ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0`, verified to take effect, still
+crashes); an exception inside either eager-break body (both wrapped whole,
+neither raises); unsynchronised staging left on another stream (device-wide
+`torch.cuda.synchronize()` at the end of the eager body, still crashes); the
+cudagraph mode and the path that sets it (explicit
+`--compilation-config '{"cudagraph_mode":"PIECEWISE"}'`, still crashes); and
+0.31's new wrapper nesting sharing one `_capturing` flag (one instance per
+rank, so not that).
+
+What is left is inside vLLM's own capture bookkeeping: why the first
+`capture_end()` fails. That is the question to hand upstream, and it is the
+reason the gate below stays shut on 0.31 -- not caution, a crash.
 
 The ordinary remedy, an eager break on the attention op the way vLLM does for
 `unified_attention_with_output`, **does not apply as a decoration**: the
