@@ -109,3 +109,50 @@ def test_prepare_model_rtpllm_glm5_reapplies_mla_attention_patch():
     fake_atom_config.quant_config.remap_layer_name.assert_called_once()
     fake_model_cls.assert_called_once_with(atom_config=fake_atom_config)
     assert result is fake_model
+
+
+def test_prepare_model_rtpllm_qwen4_exp_disables_vision_and_skips_mla():
+    fake_hf = _Obj(architectures=["Qwen4ExpForConditionalGeneration"])
+    fake_atom_config = _Obj(
+        hf_config=fake_hf,
+        plugin_config=_Obj(is_plugin_mode=True),
+        quant_config=_Obj(
+            exclude_layers=[],
+            remap_layer_name=MagicMock(),
+        ),
+        multimodal_config=object(),
+    )
+    fake_model = MagicMock(name="FakeQwen4Exp")
+    fake_model_cls = MagicMock(return_value=fake_model)
+
+    fake_register = MagicMock()
+    fake_register._ATOM_SUPPORTED_MODELS = {
+        "Qwen4ExpForConditionalGeneration": fake_model_cls
+    }
+    fake_register.register_ops_to_sglang = MagicMock()
+    fake_register.init_aiter_dist = MagicMock()
+    fake_register.set_attn_cls = MagicMock()
+
+    fake_config_mod = MagicMock()
+    fake_config_mod.generate_atom_config_for_plugin_mode = MagicMock(
+        return_value=fake_atom_config
+    )
+    fake_rtpllm_attention_backend = MagicMock()
+
+    with patch.dict(
+        sys.modules,
+        {
+            "atom.plugin.register": fake_register,
+            "atom.plugin.config": fake_config_mod,
+            "atom.plugin.rtpllm.attention_backend": fake_rtpllm_attention_backend,
+        },
+    ):
+        result = plugin_prepare.prepare_model(
+            config=_Obj(model_config=_Obj()), engine="rtpllm"
+        )
+
+    fake_rtpllm_attention_backend.apply_attention_mla_rtpllm_patch.assert_not_called()
+    assert fake_atom_config.multimodal_config is None
+    assert fake_hf._multimodal_config is None
+    fake_model_cls.assert_called_once_with(atom_config=fake_atom_config)
+    assert result is fake_model

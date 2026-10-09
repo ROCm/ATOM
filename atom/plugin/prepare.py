@@ -123,6 +123,27 @@ def _prepare_model_atom_rtpllm(
         )
 
         apply_attention_mla_rtpllm_patch()
+    if model_arch == "Qwen4ExpForConditionalGeneration":
+        # RTP plugin has no image inputs in this first bring-up. Drop the
+        # vision tower so Flash stays on the text path (GDN / QSA / PLE).
+        atom_config.multimodal_config = None
+        hf_config = getattr(atom_config, "hf_config", None)
+        if hf_config is not None:
+            hf_config._multimodal_config = None
+        if str(getattr(atom_config, "kv_cache_dtype", "bf16")).lower() not in {
+            "auto",
+            "bf16",
+            "bfloat16",
+        }:
+            logger.info(
+                "rtp-llm plugin: force Qwen4Exp kv_cache_dtype=bf16 "
+                "(QSA requires BF16 KV, was %s)",
+                atom_config.kv_cache_dtype,
+            )
+            atom_config.kv_cache_dtype = "bf16"
+        logger.info(
+            "rtp-llm plugin: disable Qwen4Exp vision tower (text-only serving)"
+        )
 
     # init aiter dist for using aiter custom collective ops
     init_aiter_dist(config=atom_config)

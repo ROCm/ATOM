@@ -17,6 +17,7 @@ from atom.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGenerationTextOnly,
 )
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
+from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
 logger = logging.getLogger("atom")
@@ -33,6 +34,8 @@ _ATOM_SUPPORTED_MODELS = {
     "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3SparseForConditionalGeneration,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
+    # Qwen3.8-Flash-Next is native ATOM; SGLang and RTP-LLM both reuse it.
+    "Qwen4ExpForConditionalGeneration": Qwen4ExpForConditionalGeneration,
 }
 
 if is_sglang():

@@ -2211,3 +2211,151 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         )
         attn_metadata.plugin_metadata = plugin_md
         return attn_metadata
+
+
+@dataclass(frozen=True)
+class RTPForwardQwen4ExpHybridContext(RTPForwardQwen35HybridContext):
+    """Qwen3.5 hybrid metadata plus Flash QSA / PLE addressing."""
+
+    @staticmethod
+    def _hf_text_config() -> Any:
+        atom_config = get_current_atom_config()
+        hf = getattr(atom_config, "hf_config", None)
+        return getattr(hf, "text_config", hf)
+
+    @classmethod
+    def _attach_qsa_metadata(
+        cls,
+        attn_metadata: AttentionMetaData,
+        *,
+        positions: torch.Tensor,
+        cg_bufs: dict | None,
+    ) -> None:
+        from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpQSAMetadata
+        from atom.model_ops.qwen4_exp.ops.qsa import qsa_compressed_slots
+
+        plugin_md = getattr(attn_metadata, "plugin_metadata", None)
+        if plugin_md is None:
+            attn_metadata.qsa_metadata = None
+            return
+        hf = cls._hf_text_config()
+        compress_ratio = int(getattr(hf, "indexer_compress_ratio", 4) or 4)
+        num_tokens = int(plugin_md.num_actual_tokens)
+        batch_size = int(plugin_md.num_prefills or plugin_md.num_decodes)
+        if num_tokens <= 0 or batch_size <= 0:
+            attn_metadata.qsa_metadata = None
+            return
+        device = positions.device
+        query_start_loc = plugin_md.query_start_loc
+        slot_mapping = plugin_md.slot_mapping[:num_tokens]
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture and cg_bufs is not None:
+            token_to_req = cg_bufs["qsa_token_to_req"][:num_tokens]
+            logical = cg_bufs["qsa_logical_positions"][:num_tokens]
+            compressed = cg_bufs["qsa_compressed_slots"][:num_tokens]
+            if int(num_tokens) == batch_size:
+                token_to_req.copy_(cg_bufs["seq_id_i32"][:num_tokens])
+            else:
+                lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(
+                    dtype=torch.int64
+                )
+                token_to_req.copy_(
+                    torch.repeat_interleave(
+                        torch.arange(batch_size, device=device, dtype=torch.int32),
+                        lengths,
+                    )
+                )
+            logical.copy_(positions[:num_tokens].to(dtype=torch.int64))
+        else:
+            lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(dtype=torch.int64)
+            token_to_req = torch.repeat_interleave(
+                torch.arange(batch_size, device=device, dtype=torch.int32),
+                lengths,
+            ).contiguous()
+            logical = positions[:num_tokens].to(dtype=torch.int64).contiguous()
+            compressed = torch.empty(num_tokens, device=device, dtype=torch.int64)
+        qsa_compressed_slots(slot_mapping, logical, compress_ratio, compressed)
+        attn_metadata.qsa_metadata = Qwen4ExpQSAMetadata(
+            block_tables=plugin_md.block_table,
+            slot_mapping=slot_mapping,
+            compressed_slot_mapping=compressed,
+            token_to_req=token_to_req,
+            logical_positions=logical,
+            seq_lens=plugin_md.seq_lens[:batch_size],
+            max_seq_len=int(plugin_md.max_seq_len),
+        )
+
+    @classmethod
+    def _attach_ple_metadata(
+        cls,
+        attn_metadata: AttentionMetaData,
+        *,
+        runtime: Any,
+        cg_bufs: dict | None,
+    ) -> None:
+        from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
+
+        hf = cls._hf_text_config()
+        if not getattr(hf, "ple_layer_ids", None):
+            attn_metadata.ple_metadata = None
+            return
+        conv_state = getattr(runtime, "_ple_conv_state", None)
+        ngram_state = getattr(runtime, "_ple_ngram_state", None)
+        gdn = getattr(attn_metadata, "gdn_metadata", None)
+        plugin_md = getattr(attn_metadata, "plugin_metadata", None)
+        if conv_state is None or ngram_state is None or gdn is None or plugin_md is None:
+            attn_metadata.ple_metadata = None
+            return
+        slots = gdn.non_spec_state_indices_tensor
+        if slots is None:
+            attn_metadata.ple_metadata = None
+            return
+        batch_size = int(plugin_md.num_prefills or plugin_md.num_decodes)
+        is_prefill = int(plugin_md.num_prefills) > 0
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture and cg_bufs is not None:
+            has_initial = cg_bufs["ple_has_initial_state"][:batch_size]
+            has_initial.fill_(True)
+        else:
+            has_initial = torch.ones(
+                batch_size, device=slots.device, dtype=torch.bool
+            )
+            if is_prefill:
+                prefix = getattr(plugin_md, "rtp_has_prefix", False)
+                if not prefix:
+                    has_initial.fill_(False)
+        attn_metadata.ple_metadata = Qwen4ExpPLEMetadata(
+            query_start_loc=plugin_md.query_start_loc[: batch_size + 1],
+            ngram_state=ngram_state,
+            state_indices_in=slots[:batch_size],
+            state_indices_out=slots[:batch_size],
+            has_initial_state=has_initial,
+            conv_state=conv_state,
+            num_accepted_tokens=getattr(gdn, "num_accepted_tokens", None),
+        )
+
+    @classmethod
+    def build(
+        cls,
+        model: Any,
+        runtime: Any,
+        inputs: Any,
+        positions: torch.Tensor,
+        layer_maps: RTPForwardContext.LayerMaps | None = None,
+        cg_max_seq_len: int = 0,
+        cg_bufs: dict | None = None,
+    ) -> RTPForwardQwen4ExpHybridContext:
+        ctx = super().build(
+            model=model,
+            runtime=runtime,
+            inputs=inputs,
+            positions=positions,
+            layer_maps=layer_maps,
+            cg_max_seq_len=cg_max_seq_len,
+            cg_bufs=cg_bufs,
+        )
+        cls._attach_qsa_metadata(
+            ctx.attn_metadata, positions=positions, cg_bufs=cg_bufs
+        )
+        cls._attach_ple_metadata(ctx.attn_metadata, runtime=runtime, cg_bufs=cg_bufs)
+        return ctx
