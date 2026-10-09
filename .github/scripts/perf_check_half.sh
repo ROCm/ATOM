@@ -123,13 +123,34 @@ else
   model_path="${MODEL_PATH}"
 fi
 
+# Which interface NCCL bootstraps over. Pinned to loopback because this check
+# is single-node by construction -- the whole reason both commits run in one
+# job is that Actions cannot pin two jobs to one machine -- so there is no
+# peer off this host for NCCL to reach, and loopback is both correct and
+# immune to how the host's other interfaces behave.
+#
+# Not a preference. On the MI355X runners, a plain socket bound to the host's
+# own 10.13.x address cannot connect to itself:
+#
+#   connect 10.13.0.151 FAILED EHOSTUNREACH [Errno 113] No route to host
+#   connect 127.0.0.1   OK
+#
+# NCCL picks that interface by default and every rank dies in bootstrap, which
+# surfaces much later as "remote process exited or there was a network error"
+# at the first collective. Ten of ten GPU jobs died that way in run
+# 37773100052, across two runners, before a model had loaded.
+#
+# Set NCCL_SOCKET_IFNAME in the environment to override.
+NCCL_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
+
 echo "========== ${HALF}: launching server =========="
+echo "${HALF}: NCCL_SOCKET_IFNAME=${NCCL_IFNAME}"
 # Piped through stdin so the container's bash parses the quoting in ARGS
 # exactly once. Substituting ARGS into a `bash -lc "..."` string instead
 # collides single-quoted JSON values with the outer quotes and strips them
 # (argparse then rejects the value). Mirrors benchmark-tmpl.yml.
 echo ".github/scripts/atom_test.sh launch ${model_path} ${LAUNCH_ARGS}" \
-  | docker exec -i "$CONTAINER" bash -l
+  | docker exec -i -e NCCL_SOCKET_IFNAME="${NCCL_IFNAME}" "$CONTAINER" bash -l
 
 echo "========== ${HALF}: running benchmark =========="
 # ISL/OSL/CONC/RANDOM_RANGE_RATIO are read by atom_test.sh itself, under
@@ -140,6 +161,7 @@ echo "========== ${HALF}: running benchmark =========="
 # with "ISL: unbound variable". Passing them explicitly removes the dependency
 # on how the container was created.
 docker exec \
+  -e NCCL_SOCKET_IFNAME="${NCCL_IFNAME}" \
   -e RESULT_FILENAME="${RESULT_FILENAME}" \
   -e SERVER_ARGS="${LAUNCH_ARGS}" \
   -e BENCH_EXTRA_ARGS="${BENCH_ARGS}" \
