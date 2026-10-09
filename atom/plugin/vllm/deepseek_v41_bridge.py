@@ -475,23 +475,6 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
     return DeepseekV41MetadataBuilder(runner)
 
 
-def _v41_cudagraph_capture_in_progress() -> bool:
-    """Whether vLLM is capturing right now.
-
-    A predicate over another engine's internals, so anything it raises means
-    "cannot tell" -- and the safe answer to that is False, which leaves the
-    bind to the checks that follow rather than skipping it on a guess. Same
-    shape as `_is_vllm_decode_graph_phase` in the V4 bridge.
-    """
-    try:
-        # The same module the V4 bridge reads, rather than a second guess at
-        # where this flag lives.
-        import vllm.compilation.monitor as vllm_monitor
-    except Exception:  # noqa: BLE001
-        return False
-    return bool(getattr(vllm_monitor, "cudagraph_capturing_enabled", False))
-
-
 def bind_deepseek_v41_proxy_cache(
     model,
     builder,
@@ -511,17 +494,20 @@ def bind_deepseek_v41_proxy_cache(
     if not isinstance(proxy.kv_cache, torch.Tensor) or proxy.kv_cache.numel() == 0:
         return False
     if getattr(proxy, "_atom_v4_profiling_kv_cache", False):
-        # The memory profile runs with a placeholder pool.
-        return False
-    if _v41_cudagraph_capture_in_progress():
-        # So does cudagraph capture, and that is a different phase: measured
-        # here, the capture forward arrives with `num_gpu_blocks=64` and a
-        # 64-block proxy tensor, while the profiling flag is correctly False.
-        # Binding there carved the STATE tail out of a pool 3800x too small
-        # and raised "proxy pool is too small" -- true of the capture's pool,
-        # silent about the one that will serve. Returning False is the
-        # caller's existing signal to run on a private scratch cache, which
-        # is what a captured dummy batch wants anyway.
+        # The memory profile runs with a placeholder pool -- 64 blocks, where
+        # the serving one has 246218 -- and its cudagraph capture runs against
+        # that same pool. Binding there carves the STATE tail out of a pool
+        # 3800x too small and reports it as the pool being too small, which is
+        # true of the placeholder and says nothing about the one that serves.
+        #
+        # This flag was once read while nothing set it: the patch that flips it
+        # wrapped `vllm.v1.worker.gpu_model_runner.GPUModelRunner` while the
+        # worker had instantiated the unrelated V2 runner, so it stayed False
+        # through profiling. The repair for that belongs where the flag is set.
+        # A guard here keyed on "is vLLM capturing" instead would be keyed on
+        # the wrong question twice over: capture against the *serving* pool is
+        # exactly when the bind must happen, or the captured graphs replay a
+        # scratch cache.
         return False
     ptr = proxy.kv_cache.untyped_storage().data_ptr()
     if getattr(model, "_atom_v41_proxy_cache_ptr", None) == ptr:
