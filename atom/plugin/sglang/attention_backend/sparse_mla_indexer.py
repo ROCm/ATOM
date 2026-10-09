@@ -1278,6 +1278,8 @@ def sparse_attn_indexer_sglang_plugin_mode(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1291,7 +1293,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
 ) -> torch.Tensor:
     from atom.plugin.sglang.models.base_model_wrapper import get_current_forward_batch
 
-    del kv_cache, total_seq_lens
+    del kv_cache, total_seq_lens, dcp_sparse_kv_indptr_buffer, dcp_owned_counts_buffer
     forward_batch = get_current_forward_batch()
     if forward_batch is None or forward_batch.forward_mode.is_idle():
         return torch.zeros_like(weights, dtype=torch.float32)
@@ -1470,6 +1472,8 @@ def sparse_attn_indexer_sglang_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1483,6 +1487,8 @@ def sparse_attn_indexer_sglang_fake(
 ) -> torch.Tensor:
     del (
         hidden_states,
+        dcp_sparse_kv_indptr_buffer,
+        dcp_owned_counts_buffer,
         k_cache_prefix,
         kv_cache,
         q_input,
