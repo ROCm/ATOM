@@ -1445,3 +1445,61 @@ def test_the_seed_is_pinned_on_every_phase(workspace, fake_docker):
     ]
     assert len(benchmark_calls) == 3, benchmark_calls
     assert all("--seed=0" in line for line in benchmark_calls), benchmark_calls
+
+
+# ------------------------------------------------- which image was this ---
+# The digest is the only thing tying a run to anything outside itself, and a
+# cell that died before it had one must not be able to erase it for the rest.
+
+
+def _digest_of(tmp_path, *bodies):
+    sys.path.insert(0, str(SCRIPTS))
+    from pick_image_digest import pick
+
+    paths = []
+    for i, body in enumerate(bodies):
+        p = tmp_path / f"{i}.json"
+        p.write_text(body)
+        paths.append(str(p))
+    return pick(paths)
+
+
+def test_a_dead_cell_does_not_erase_the_digest(tmp_path):
+    """Run 37922341753 reported `unknown` with six cells measured.
+
+    A cell that failed in `Start container` still writes provenance, because
+    that step is `if: always()`, but never reached the pin -- so it records an
+    empty digest. Reading the first file found let that one speak for all ten.
+    """
+    assert (
+        _digest_of(
+            tmp_path,
+            '{"image_digest": ""}',
+            '{"image_digest": "rocm/atom-dev@sha256:4d23"}',
+            '{"image_digest": "rocm/atom-dev@sha256:4d23"}',
+        )
+        == "rocm/atom-dev@sha256:4d23"
+    )
+
+
+def test_two_images_are_reported_rather_than_picked(tmp_path):
+    """Disagreement breaks the premise, so it cannot be resolved silently.
+
+    The whole comparison rests on both halves running one image. If the cells
+    say otherwise, the run has to say so where a reader sees it.
+    """
+    out = _digest_of(
+        tmp_path,
+        '{"image_digest": "rocm/atom-dev@sha256:aaaa"}',
+        '{"image_digest": "rocm/atom-dev@sha256:bbbb"}',
+    )
+    assert out.startswith("MIXED:")
+    assert "aaaa" in out and "bbbb" in out
+
+
+def test_unreadable_provenance_says_nothing_rather_than_unknown(tmp_path):
+    """A half-written file is not evidence of anything, including absence."""
+    assert _digest_of(
+        tmp_path, "not json at all", '{"image_digest": "x@sha256:1"}'
+    ) == ("x@sha256:1")
+    assert _digest_of(tmp_path, "not json at all") == ""
