@@ -93,6 +93,22 @@ class WeightsMapper:
     def get_rename_mapper(self) -> "WeightsMapper":
         """Return the mapper variant suitable for quantization config names.
 
+        Called by vLLM, not by ATOM: a repo-wide grep finds no caller here
+        beyond `tests/test_weight_name_rewrite.py`, because this is one of the
+        methods vLLM duck-types on whatever a model exposes as
+        `hf_to_vllm_mapper`. ATOM's vLLM plugin models publish their own
+        `WeightsMapper` under that name (e.g.
+        `atom/plugin/vllm/models/qwen3_5.py`, `hf_to_vllm_mapper =
+        hf_to_atom_mapper`), so these three vLLM 0.31 call sites land here:
+
+        * `model_executor/model_loader/utils.py` and
+          `model_executor/models/interfaces.py` --
+          `quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_rename_mapper())`
+        * `lora/worker_manager.py` -- LoRA weight-name parsing.
+
+        Renamed from `get_unstacked_mapper` to follow vLLM's own rename; the
+        name is part of that external contract, so it is not ours to choose.
+
         Consumers that *name* modules rather than load them (vLLM's
         quantization config layer lists, LoRA name parsing) cannot act on a
         `None` mapping — "do not load this weight" would silently shrink an
