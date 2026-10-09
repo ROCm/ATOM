@@ -644,7 +644,10 @@ models:
         # block must restate the key, because a YAML merge key loses to an
         # explicit `env:` on the same node.
         ATOM_ENABLE_REPLAYSSM: "0"
-      prefill: {}
+      prefill:
+        # Compile every FlyDSL bpreshuffle GEMM before serving; otherwise each
+        # first-seen M bucket stalls the prefill for seconds mid-benchmark.
+        ATOM_WARMUP_GEMM_M_BUCKETS: "1"
       decode: {}
     server:
       common_args:

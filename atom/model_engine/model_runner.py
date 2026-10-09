@@ -152,6 +152,23 @@ mono_decode_installers = {
 }
 
 
+def gemm_m_buckets(max_m: int) -> list[int]:
+    """Token counts that land on every tuned-GEMM row reachable for M <= max_m.
+
+    Mirrors aiter's fine `getPaddedM` level: next power of two below 16, then
+    multiples of 16 / 32 / 64 / 128 up to 256 / 1024 / 4096 / beyond. Its
+    coarse fallback (next power of two) is itself a bucket boundary, so a
+    batch of any size resolves to the same kernel as one of these.
+    """
+    buckets = [m for m in (1, 2, 4, 8) if m <= max_m]
+    for step, upper in ((16, 256), (32, 1024), (64, 4096), (128, max_m)):
+        start = (buckets[-1] // step + 1) * step if buckets else step
+        buckets.extend(range(start, min(upper, max_m) + 1, step))
+    if max_m > 0 and buckets[-1] != max_m:
+        buckets.append(max_m)
+    return buckets
+
+
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
 ) -> int:
@@ -1347,16 +1364,28 @@ class ModelRunner:
                 f"Using {num_seqs} seq(s) with length {seq_len} for warmup."
             )
 
+        total_tokens_num = self._warmup_prefill([seq_len] * num_seqs)
+        torch.cuda.empty_cache()
+        logger.info(
+            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
+        )
+
+        if envs.ATOM_WARMUP_GEMM_M_BUCKETS:
+            self._warmup_gemm_m_buckets(
+                warmup_max_tokens, max_model_len, min_seqs, total_tokens_num
+            )
+
+    def _warmup_prefill(self, seq_lens: list[int]) -> int:
         seqs = [
             Sequence(
                 [0] * seq_len,
                 block_size=self.block_size,
             )
-            for _ in range(num_seqs)
+            for seq_len in seq_lens
         ]
         seqs = {seq.id: seq for seq in seqs}
 
-        num_scheduled_tokens = np.array([seq_len] * num_seqs, dtype=np.int32)
+        num_scheduled_tokens = np.array(seq_lens, dtype=np.int32)
         total_tokens_num = int(num_scheduled_tokens.sum())
 
         dummy_batch = ScheduledBatch(
@@ -1364,16 +1393,119 @@ class ModelRunner:
             num_scheduled_tokens=num_scheduled_tokens,
             total_tokens_num=total_tokens_num,
             total_tokens_num_prefill=total_tokens_num,
-            total_seqs_num=num_seqs,
-            total_seqs_num_prefill=num_seqs,
+            total_seqs_num=len(seq_lens),
+            total_seqs_num_prefill=len(seq_lens),
             is_dummy_run=True,
         )
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
+        return total_tokens_num
+
+    def _warmup_gemm_m_buckets(
+        self, max_tokens: int, max_model_len: int, min_seqs: int, done_tokens: int
+    ):
+        """Compile every M-bucketed prefill GEMM before serving, in two passes.
+
+        Dummy prefills through the whole model cover MoE, the dense MLP and the
+        GEMMs ahead of attention; they start at 16 so no DCP rank sees an empty
+        shard, and add max_tokens - 1 for Triton's divisibility specialization.
+        A dummy run returns from attention before its projections, so each
+        distinct linear shape (plus the MLA q_proj row view used under DCP) is
+        then called directly, which also covers the buckets below 16.
+        """
+        start_time = time.time()
+        buckets = gemm_m_buckets(max_tokens)
+        model_sizes = sorted(
+            {m for m in buckets + [max_tokens - 1] if m >= max(16, min_seqs)}
+            - {done_tokens}
+        )
+        for m in model_sizes:
+            num_seqs = max(min_seqs, -(-m // max_model_len))
+            seq_lens = [m // num_seqs] * num_seqs
+            for i in range(m % num_seqs):
+                seq_lens[i] += 1
+            self._warmup_prefill(seq_lens)
+        model_elapsed = time.time() - start_time
+
+        # Other tuned tables also key exact M at multiples of 8 up to 512.
+        linear_sizes = sorted(
+            {m for m in buckets + [max_tokens - 1] if m >= 1}
+            | set(range(8, min(512, max_tokens) + 1, 8))
+        )
+        linears = self._distinct_prefill_linears()
+        with torch.inference_mode():
+            for prefix, linear in linears:
+                reduce_results = linear.reduce_results
+                linear.reduce_results = False
+                try:
+                    for m in linear_sizes:
+                        linear(
+                            torch.zeros(
+                                m,
+                                linear.input_size,
+                                dtype=self.config.torch_dtype,
+                                device=self.device,
+                            )
+                        )
+                except (
+                    AssertionError,
+                    IndexError,
+                    KeyError,
+                    NotImplementedError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as e:
+                    # A layer whose forward needs inputs this cannot fake (a
+                    # pre-quantized x, a fused caller) is left to compile on
+                    # first use rather than failing startup.
+                    logger.warning(
+                        f"{self.label}: warmup_gemm_m_buckets skipped {prefix}: {e}"
+                    )
+                finally:
+                    linear.reduce_results = reduce_results
         torch.cuda.empty_cache()
         logger.info(
-            f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
+            f"{self.label}: warmup_gemm_m_buckets {time.time() - start_time:.2f} "
+            f"seconds: model {len(model_sizes)} sizes in {model_elapsed:.2f}s "
+            f"(max {max_tokens}), {len(linears)} distinct linears x "
+            f"{len(linear_sizes)} sizes"
         )
+
+    def _distinct_prefill_linears(self):
+        """One (prefix, layer) per distinct linear GEMM shape in the model,
+        plus the prefill-only q_proj row views that MLA builds under DCP
+        query replication."""
+        from atom.model_ops.linear import LinearBase
+
+        candidates = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, LinearBase):
+                candidates.append((name, module))
+            if getattr(module, "qrep_enabled", False) and hasattr(
+                module, "_local_q_proj"
+            ):
+                candidates.append((f"{name}._local_q_proj", module._local_q_proj()))
+        distinct = {}
+        for name, linear in candidates:
+            weight = getattr(linear, "weight", None)
+            # Fused-away shells (e.g. KDA b_proj / f_a_proj) keep a 0-element
+            # weight and never run; a conv kept as a LinearBase (q_conv1d) has
+            # a 3-D weight and is no GEMM.
+            if weight is None or weight.numel() == 0 or weight.dim() != 2:
+                continue
+            key = (
+                type(linear).__name__,
+                linear.quant_type.value,
+                str(linear.params_dtype),
+                tuple(weight.shape),
+                str(weight.dtype),
+                linear.input_size,
+                linear.bias is not None,
+                linear.native_a8_group_rows,
+            )
+            distinct.setdefault(key, (name, linear))
+        return list(distinct.values())
 
     def allocate_forward_vars(self):
         config = self.config
