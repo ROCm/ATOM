@@ -3,7 +3,6 @@
 
 import logging
 import threading
-import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TypeAlias
@@ -340,7 +339,7 @@ class UBatchWrapper(nn.Module):
                     )
                 results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
-                traceback.print_exc()
+                logger.exception("[TBO] ubatch %d graph capture failed", idx)
                 errors[idx] = e
 
         saved_ctx = getattr(_forward_context_local, "ctx", None)
