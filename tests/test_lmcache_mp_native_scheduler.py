@@ -142,6 +142,23 @@ def test_native_scheduler_explicitly_guarantees_partial_state_deallocation(
     assert scheduler.can_partially_deallocate_state(seq) is True
 
 
+def test_native_scheduler_refuses_pp(monkeypatch):
+    def connect(_config, **_kwargs):
+        raise AssertionError("must not connect")
+
+    monkeypatch.setattr(mp_scheduler, "_make_scheduler_adapter", connect)
+    config = SimpleNamespace(
+        kv_cache_block_size=4,
+        pipeline_parallel_size=2,
+        kv_transfer_config={
+            "kv_role": "offload",
+            "kv_connector_extra_config": {"lmcache.chunk_size": 8},
+        },
+    )
+    with pytest.raises(NotImplementedError, match="native-state.*does not support PP"):
+        NativeStateLMCacheMPConnectorScheduler(config)
+
+
 def sequence(request_id=1, *, count=24, computed=16, token_offset=0):
     seq = Sequence(
         list(range(token_offset, token_offset + count)),

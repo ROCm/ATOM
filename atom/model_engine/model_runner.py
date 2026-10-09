@@ -772,6 +772,13 @@ class ModelRunner:
             ),
         )
 
+        # Before the weights load fragments this GPU's NUMA node: an offload L1
+        # over a Mooncake Store must be all huge pages.
+        from atom.kv_transfer.offload._offload_common import (
+            reserve_l1_before_weights_load,
+        )
+
+        reserve_l1_before_weights_load(config)
         self._build_and_load_model(model_class)
 
         # Optional debug instrumentation; no-op when env vars unset.

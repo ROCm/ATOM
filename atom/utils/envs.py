@@ -1025,6 +1025,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rejected as not implemented). A kv_connector_extra_config
     # "lmcache.mp.mp_transfer_mode" takes precedence.
     "LMCACHE_MP_TRANSFER_MODE": lambda: os.getenv("LMCACHE_MP_TRANSFER_MODE", "auto"),
+    # In-process offload with a Mooncake Store L2 (mooncakestore:// remote).
+    # The RDMA device each worker's Store client uses, comma-separated by GPU
+    # ordinal, or a single device for every GPU. Unset: the GPU's NIC in the
+    # PCI tree.
+    "ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES": lambda: os.getenv(
+        "ATOM_LMCACHE_MOONCAKE_RDMA_DEVICES", ""
+    ),
+    # The RDMA devices of the Store owners on this node; without
+    # ATOM_LMCACHE_MOONCAKE_POOLS, a worker whose own device is among them
+    # fails startup (per-NIC pools share the stages' NICs on purpose).
+    "ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES": lambda: os.getenv(
+        "ATOM_LMCACHE_MOONCAKE_OWNER_RDMA_DEVICES", ""
+    ),
+    # Per-NIC Store pools, a JSON object keyed by RDMA device:
+    # {"rdma0": {"master": "host:port", "metadata": "http://host:port/metadata"}}.
+    # A worker uses the pool of its own device, whose owners serve on that
+    # device too. Unset: the master in LMCACHE_EXTRA_CONFIG.
+    "ATOM_LMCACHE_MOONCAKE_POOLS": lambda: os.getenv("ATOM_LMCACHE_MOONCAKE_POOLS", ""),
 }
 
 
@@ -1057,6 +1075,10 @@ def __getattr__(name: str):
 #   FLA_TRIL_PRECISION             — FLA ops library
 # VLLM_PP_LAYER_PARTITION         — vLLM legacy (still active in models/utils.py)
 # VLLM_USE_MODELSCOPE             — vLLM legacy (benchmarks)
+# MC_NUM_QP_PER_EP,
+#   MOONCAKE_CONFIG_PATH          — Mooncake; with a mooncakestore:// LMCache
+#                                   remote, kv_transfer/offload/mooncake_store_l2.py
+#                                   requires the first to be 1 and the second unset.
 # LMCACHE_EC_PIN_TIMEOUT_SEC      — LMCache library's own source-pin timeout;
 #                                   read in kv_transfer/offload/_offload_common.py
 #                                   (offload_save_abandon_timeout_s) to derive the

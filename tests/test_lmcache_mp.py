@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import sys
 import types
 from collections import deque
@@ -38,6 +39,7 @@ from atom.kv_transfer.offload.metadata import (
 from atom.kv_transfer.offload.mp import deployment, page_views, transfer
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp import stage_servers as mp_stage_servers
 from atom.kv_transfer.offload.mp import worker as mp_worker
 
 
@@ -46,6 +48,8 @@ def _config(
     model_type: str = "test_model",
     tp: int = 2,
     pp: int = 1,
+    pp_rank: int = 0,
+    layers: int = 2,
     dcp: int = 1,
     pcp: int = 1,
     dp: int = 1,
@@ -59,7 +63,7 @@ def _config(
 ) -> SimpleNamespace:
     hf_config = SimpleNamespace(
         model_type=model_type,
-        num_hidden_layers=2,
+        num_hidden_layers=layers,
         num_attention_heads=16,
         num_key_value_heads=4,
         hidden_size=2048,
@@ -84,6 +88,7 @@ def _config(
             data_parallel_size=dp,
             data_parallel_size_local=dp if dp_local is None else dp_local,
             data_parallel_rank=dp_rank,
+            pipeline_parallel_rank=pp_rank,
         ),
         kv_transfer_config={
             "kv_connector": "lmcache_mp",
@@ -96,7 +101,6 @@ def _config(
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"pp": 2}, "does not support PP"),
         ({"dcp": 2}, "does not support DCP"),
         ({"pcp": 2}, "does not support PCP"),
         ({"dp": 2, "dp_local": 1}, "only within one host"),
@@ -191,7 +195,7 @@ def test_worker_adapter_normalizes_transfer_mode(
         deployment, "_model_namespace", lambda _config, **_kwargs: "test"
     )
 
-    adapter = deployment._make_worker_adapter(_config(extra=extra), rank=1)
+    adapter = deployment._make_worker_adapter(_config(extra=extra), tp_rank=1)
 
     assert adapter.transfer_mode == expected
 
@@ -2006,3 +2010,1080 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+# ---------------------------------------------------------------------------
+# Pipeline parallelism: one LMCache kv rank group per PP stage
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_parallel_config(monkeypatch):
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    return adapter_module
+
+
+def _with_draft(config, layers: int = 1):
+    config.speculative_config = SimpleNamespace(
+        method="mtp",
+        draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=layers),
+    )
+    return config
+
+
+def _stage_strategies(*, pp, tp, **kwargs):
+    """Every (pp_rank, tp_rank) worker strategy of one replica."""
+    return {
+        (pp_rank, tp_rank): deployment._parallel_strategy(
+            _config(pp=pp, pp_rank=pp_rank, tp=tp, layers=8, **kwargs), tp_rank
+        )
+        for pp_rank in range(pp)
+        for tp_rank in range(tp)
+    }
+
+
+def test_mp_config_accepts_pp():
+    assert deployment._validate_mp_config(_config(tp=1, pp=4, layers=8)) == (1, 4)
+
+
+def test_parallel_strategy_gives_each_pp4_tp1_stage_its_own_worker(
+    fake_parallel_config,
+):
+    strategies = _stage_strategies(pp=4, tp=1, kv_lora_rank=512)
+
+    assert {key[0]: s.worker_id for key, s in strategies.items()} == {
+        0: 0,
+        1: 1,
+        2: 2,
+        3: 3,
+    }
+    assert {s.world_size for s in strategies.values()} == {4}
+    assert {s.tp_size for s in strategies.values()} == {1}
+
+
+def test_parallel_strategy_collapses_mla_tp_ranks_inside_each_pp_stage(
+    fake_parallel_config,
+):
+    strategies = _stage_strategies(pp=2, tp=4, kv_lora_rank=512)
+
+    assert {key: s.worker_id for key, s in strategies.items()} == {
+        (pp_rank, tp_rank): pp_rank for pp_rank in range(2) for tp_rank in range(4)
+    }
+    assert {s.world_size for s in strategies.values()} == {2}
+    assert {s.tp_size for s in strategies.values()} == {4}
+
+
+def test_parallel_strategy_keeps_sharded_tp_ranks_inside_each_pp_stage(
+    fake_parallel_config,
+):
+    strategies = _stage_strategies(pp=2, tp=2)
+
+    assert {key: s.worker_id for key, s in strategies.items()} == {
+        (0, 0): 0,
+        (0, 1): 1,
+        (1, 0): 2,
+        (1, 1): 3,
+    }
+    assert {s.world_size for s in strategies.values()} == {4}
+
+
+@pytest.mark.parametrize("pp_rank", [-1, 2])
+def test_parallel_strategy_rejects_pp_rank_outside_the_pipeline(
+    fake_parallel_config, pp_rank
+):
+    with pytest.raises(ValueError, match="PP rank|pipeline_parallel_rank"):
+        deployment._parallel_strategy(_config(pp=2, pp_rank=pp_rank, layers=8), 0)
+
+
+def test_parallel_strategy_rejects_tp_rank_outside_the_stage(fake_parallel_config):
+    with pytest.raises(ValueError, match=r"TP rank 2 is outside \[0, 2\)"):
+        deployment._parallel_strategy(_config(pp=2, pp_rank=1, layers=8), 2)
+
+
+@pytest.mark.parametrize(
+    ("pp", "tp", "kv_lora_rank"),
+    [(4, 1, 512), (2, 4, 512), (2, 2, None)],
+)
+def test_scheduler_adapter_world_size_matches_every_worker(
+    fake_parallel_config, monkeypatch, pp, tp, kv_lora_rank
+):
+    """The server resolves a lookup's layout by ``(model_name, world_size)``."""
+
+    class AtomMPSchedulerAdapter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_parallel_config.AtomMPSchedulerAdapter = AtomMPSchedulerAdapter
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    workers = _stage_strategies(pp=pp, tp=tp, kv_lora_rank=kv_lora_rank)
+    world_size = {s.world_size for s in workers.values()}
+    # Every stage builds a scheduler; only the head's looks up, with no worker
+    # id, so only its world size reaches the server.
+    schedulers = {
+        deployment._make_scheduler_adapter(
+            _config(
+                pp=pp,
+                pp_rank=pp_rank,
+                tp=tp,
+                layers=8,
+                kv_lora_rank=kv_lora_rank,
+                extra={"lmcache.mp.l2": "none"},
+            )
+        )
+        .kwargs["parallel_config"]
+        .world_size
+        for pp_rank in range(pp)
+    }
+
+    assert schedulers == world_size
+    assert {s.worker_id for s in workers.values()} == set(range(world_size.pop()))
+
+
+@pytest.fixture
+def stage_namespace(monkeypatch):
+    """Namespace of a config whose PAGE namespace sees only the PP x TP world."""
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    monkeypatch.setattr(
+        deployment.offcfg, "build_lmcache_config", lambda _kvc: object()
+    )
+    monkeypatch.setattr(
+        deployment.offcfg,
+        "build_page_namespace",
+        lambda _config, _lmcache_cfg, world: f"page-w{world}",
+    )
+    return deployment._model_namespace
+
+
+def test_pp4_tp1_and_pp1_tp4_do_not_share_a_namespace(stage_namespace):
+    pp4 = stage_namespace(_config(tp=1, pp=4, layers=8))
+    tp4 = stage_namespace(_config(tp=4, pp=1, layers=8))
+
+    # Both PAGE namespaces see world 4; only the stage layout tells them apart.
+    assert pp4.startswith("page-w4::lmcache-mp-v3::pp-")
+    assert tp4 == "page-w4::lmcache-mp-v3"
+    assert pp4 != tp4
+
+
+def test_layer_partition_changes_the_namespace(stage_namespace, monkeypatch):
+    config = _config(tp=1, pp=4, layers=8)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,2,2,2")
+    even = stage_namespace(config)
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,2,2,1")
+    skewed = stage_namespace(config)
+
+    assert even != skewed
+
+
+def test_draft_layers_on_the_last_stage_change_the_namespace(stage_namespace):
+    plain = stage_namespace(_config(tp=1, pp=4, layers=8))
+    with_draft = stage_namespace(_with_draft(_config(tp=1, pp=4, layers=8)))
+
+    assert plain != with_draft
+
+
+def test_every_pp_stage_shares_one_namespace(stage_namespace):
+    namespaces = {
+        stage_namespace(_with_draft(_config(tp=1, pp=4, pp_rank=rank, layers=8)))
+        for rank in range(4)
+    }
+
+    assert len(namespaces) == 1
+
+
+def test_pp_stage_layout_counts_draft_layers_on_the_last_stage(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "3,2,2,1")
+    layout = deployment._pp_stage_layout(
+        _with_draft(_config(tp=1, pp=4, layers=8, kv_lora_rank=512))
+    )
+
+    assert layout == {
+        "pp_size": 4,
+        "spans": [[0, 3], [3, 5], [5, 7], [7, 8]],
+        "draft_layers": 1,
+        "draft_shares_target_pool": True,
+        "stage_layers": [3, 2, 2, 2],
+    }
+
+
+def _pp_with_draft(**extra):
+    # 2/2/2/2 target layers plus one draft layer on the last stage.
+    return _with_draft(_config(tp=1, pp=4, layers=8, extra=extra))
+
+
+@pytest.fixture
+def even_partition(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "2,2,2,2")
+
+
+def _no_probe(_url, **_kwargs):
+    raise AssertionError("must not probe the LMCache HTTP frontend")
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            lambda: _pp_with_draft(**{"lmcache.mp.l2": "present"}), id="uneven-layers"
+        ),
+        # Equal layer counts do not prove equal PAGE layouts: GLM-5.2's index
+        # cache has rows only for non-"shared" indexer layers.
+        pytest.param(
+            lambda: _config(tp=1, pp=4, layers=8, extra={"lmcache.mp.l2": "present"}),
+            id="even-layers",
+        ),
+    ],
+)
+def test_l2_guard_refuses_pp_with_an_l2(even_partition, monkeypatch, config):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+    with pytest.raises(NotImplementedError, match="4 PP stages cannot use"):
+        deployment._validate_pp_l2_layouts(config())
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            lambda: _pp_with_draft(**{"lmcache.mp.l2": " None "}), id="l1-only-server"
+        ),
+        pytest.param(
+            lambda: _pp_with_draft(
+                **{
+                    "lmcache.mp.l2": "present",
+                    "lmcache.mp.server_per_rank_layouts": True,
+                }
+            ),
+            id="per-rank-layout-server",
+        ),
+        pytest.param(
+            lambda: _with_draft(_config(extra={"lmcache.mp.l2": "present"})),
+            id="no-pp",
+        ),
+    ],
+)
+def test_l2_guard_allows_layouts_the_server_cannot_confuse(
+    even_partition, monkeypatch, config
+):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+    deployment._validate_pp_l2_layouts(config())
+
+
+class _FakeOpener:
+    """Stands in for ``urllib.request.build_opener`` and records its use."""
+
+    def __init__(self, respond):
+        self.respond = respond
+        self.handlers = []
+        self.opened = []
+
+    def build_opener(self, *handlers):
+        self.handlers.extend(handlers)
+        return self
+
+    def open(self, url, timeout):
+        self.opened.append((url, timeout))
+        return self.respond(url)
+
+
+def test_l2_guard_auto_refuses_an_unreachable_server(even_partition, monkeypatch):
+    import urllib.error
+    import urllib.request
+
+    def unreachable(_url):
+        raise urllib.error.URLError("connection refused")
+
+    opener = _FakeOpener(unreachable)
+    monkeypatch.setattr(urllib.request, "build_opener", opener.build_opener)
+    config = _pp_with_draft(**{"lmcache.mp.host": "tcp://cache-host"})
+
+    with pytest.raises(NotImplementedError, match="cannot list the server's L2"):
+        deployment._validate_pp_l2_layouts(config)
+    assert opener.opened == [("http://cache-host:8080/config/adapters", 5.0)]
+
+
+def test_l2_guard_probe_bypasses_environment_proxies(even_partition, monkeypatch):
+    import io
+    import json
+    import urllib.request
+
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
+    opener = _FakeOpener(lambda _url: io.BytesIO(json.dumps({"adapters": []}).encode()))
+    monkeypatch.setattr(urllib.request, "build_opener", opener.build_opener)
+
+    deployment._validate_pp_l2_layouts(_pp_with_draft())
+
+    (handler,) = opener.handlers
+    assert isinstance(handler, urllib.request.ProxyHandler)
+    assert handler.proxies == {}
+
+
+@pytest.mark.parametrize(
+    ("adapters", "refused"),
+    [([], False), ([{"type_name": "mooncake_store", "primary": True}], True)],
+)
+def test_l2_guard_auto_reads_the_server_adapter_list(
+    even_partition, monkeypatch, adapters, refused
+):
+    import io
+    import json
+    import urllib.request
+
+    def respond(url):
+        assert url == "http://cache-http:9090/config/adapters"
+        return io.BytesIO(json.dumps({"adapters": adapters}).encode())
+
+    opener = _FakeOpener(respond)
+    monkeypatch.setattr(urllib.request, "build_opener", opener.build_opener)
+    config = _pp_with_draft(**{"lmcache.mp.http_url": "cache-http:9090/"})
+
+    if refused:
+        with pytest.raises(NotImplementedError, match="mooncake_store"):
+            deployment._validate_pp_l2_layouts(config)
+    else:
+        deployment._validate_pp_l2_layouts(config)
+
+
+@pytest.mark.parametrize(
+    ("extra", "error"),
+    [
+        ({"lmcache.mp.l2": "maybe"}, ValueError),
+        ({"lmcache.mp.server_per_rank_layouts": "yes"}, TypeError),
+    ],
+)
+def test_l2_guard_rejects_bad_settings(even_partition, extra, error):
+    with pytest.raises(error, match=next(iter(extra))):
+        deployment._validate_pp_l2_layouts(_pp_with_draft(**extra))
+
+
+def test_adapter_factories_apply_the_l2_guard_before_connecting(
+    even_partition, fake_parallel_config, monkeypatch
+):
+    def connect(**_kwargs):
+        raise AssertionError("must not connect")
+
+    fake_parallel_config.AtomMPSchedulerAdapter = connect
+    fake_parallel_config.AtomMPWorkerAdapter = connect
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    config = _pp_with_draft(**{"lmcache.mp.l2": "present"})
+
+    with pytest.raises(NotImplementedError, match="cannot use an LMCache L2"):
+        deployment._make_scheduler_adapter(config)
+    with pytest.raises(NotImplementedError, match="cannot use an LMCache L2"):
+        deployment._make_worker_adapter(config, 0)
+
+
+def test_worker_registers_with_its_pp_stage_worker_id(
+    fake_lmcache_modules, monkeypatch
+):
+    class AtomMPWorkerAdapter(_WorkerAdapter):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+
+    sys.modules["lmcache.integration.atom"].AtomMPWorkerAdapter = AtomMPWorkerAdapter
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    monkeypatch.setattr(
+        deployment, "_model_namespace", lambda _config, **_kwargs: "test"
+    )
+    logged = []
+    monkeypatch.setattr(
+        mp_worker.logger, "info", lambda message, *args: logged.append(message % args)
+    )
+
+    worker = mp_worker.LMCacheMPConnector(
+        _config(
+            model_type="ordinary_mha",
+            tp=1,
+            pp=4,
+            pp_rank=2,
+            layers=8,
+            extra={"lmcache.mp.l2": "none"},
+        )
+    )
+    worker.register_kv_caches({}, transfer_tensors=_transfer_tensors(), num_blocks=2)
+
+    parallel = worker._adapter.kwargs["parallel_config"]
+    assert (parallel.worker_id, parallel.world_size) == (2, 4)
+    assert worker._adapter.registered is not None
+    assert "pp_rank=2 kv_worker_id=2/4" in logged[-1]
+
+
+# ---------------------------------------------------------------------------
+# lmcache.mp.stage_servers: one LMCache server per group of PP stages
+# ---------------------------------------------------------------------------
+
+_URL_A = "tcp://127.0.0.1:25555"
+_URL_B = "tcp://127.0.0.1:25556"
+_TWO_GROUPS = [
+    {"url": "127.0.0.1:25555", "pp_ranks": [0, 1]},
+    {"url": _URL_B, "pp_ranks": [2, 3]},
+]
+
+
+def _staged(*, groups=None, pp=4, pp_rank=0, tp=1, extra=None, **kwargs):
+    return _config(
+        pp=pp,
+        pp_rank=pp_rank,
+        tp=tp,
+        layers=8,
+        extra={
+            "lmcache.mp.stage_servers": _TWO_GROUPS if groups is None else groups,
+            "lmcache.mp.l2": "none",
+            **(extra or {}),
+        },
+        **kwargs,
+    )
+
+
+def test_stage_servers_parse_two_numa_groups():
+    servers = deployment._stage_servers(_staged())
+
+    assert servers == (
+        deployment._StageServer(_URL_A, 0, 1),
+        deployment._StageServer(_URL_B, 2, 3),
+    )
+    assert [server.num_stages for server in servers] == [2, 2]
+    assert deployment._stage_server_for(_staged(), 3) == servers[1]
+
+
+def test_stage_servers_absent_keeps_the_single_server():
+    config = _config(tp=1, pp=4, layers=8)
+
+    assert deployment._stage_servers(config) is None
+    assert deployment._stage_server_for(config, 2) is None
+    assert deployment._server_urls(config) == ["tcp://localhost:5555"]
+
+
+@pytest.mark.parametrize(
+    ("groups", "extra", "kwargs", "error", "message"),
+    [
+        ([{"url": "a:1", "pp_ranks": [0, 1, 2, 3]}], {}, {}, ValueError, "at least 2"),
+        ("a:1,b:2", {}, {}, ValueError, "at least 2"),
+        (
+            [{"url": "a:1", "pp_ranks": [0]}, {"url": "b:2", "pp_ranks": [2, 3]}],
+            {},
+            {},
+            ValueError,
+            "starting at 1",
+        ),
+        (
+            [{"url": "a:1", "pp_ranks": [0, 1]}, {"url": "b:2", "pp_ranks": [1, 2, 3]}],
+            {},
+            {},
+            ValueError,
+            "starting at 2",
+        ),
+        (
+            [{"url": "a:1", "pp_ranks": [2, 3]}, {"url": "b:2", "pp_ranks": [0, 1]}],
+            {},
+            {},
+            ValueError,
+            "starting at 0",
+        ),
+        (
+            [{"url": "a:1", "pp_ranks": [0, 2]}, {"url": "b:2", "pp_ranks": [1, 3]}],
+            {},
+            {},
+            ValueError,
+            "consecutive",
+        ),
+        (
+            [{"url": "a:1", "pp_ranks": [0, 1]}, {"url": "b:2", "pp_ranks": [2, 3, 4]}],
+            {},
+            {},
+            ValueError,
+            r"outside \[0, 4\)",
+        ),
+        (
+            [{"url": "a:1", "pp_ranks": [0, 1]}, {"url": "b:2", "pp_ranks": [2]}],
+            {},
+            {},
+            ValueError,
+            r"covers PP stages \[0, 3\)",
+        ),
+        (
+            [{"url": "a:1", "pp_ranks": []}, {"url": "b:2", "pp_ranks": [0, 1, 2, 3]}],
+            {},
+            {},
+            ValueError,
+            "non-empty list of ints",
+        ),
+        (
+            [
+                {"url": "a:1", "pp_ranks": [False]},
+                {"url": "b:2", "pp_ranks": [1, 2, 3]},
+            ],
+            {},
+            {},
+            ValueError,
+            "non-empty list of ints",
+        ),
+        (
+            [
+                {"url": "a:1", "pp_ranks": [0, 1]},
+                {"url": "tcp://a:1", "pp_ranks": [2, 3]},
+            ],
+            {},
+            {},
+            ValueError,
+            "repeats a url",
+        ),
+        (
+            [
+                {"url": "a:1", "pp_ranks": [0, 1], "numa": 0},
+                {"url": "b:2", "pp_ranks": [2, 3]},
+            ],
+            {},
+            {},
+            ValueError,
+            r"unknown keys \['numa'\]",
+        ),
+        (
+            [{"url": " ", "pp_ranks": [0, 1]}, {"url": "b:2", "pp_ranks": [2, 3]}],
+            {},
+            {},
+            ValueError,
+            "url must be non-empty",
+        ),
+        (["a:1", "b:2"], {}, {}, TypeError, "must be an object"),
+        (None, {"lmcache.mp.host": "tcp://x"}, {}, ValueError, "lmcache.mp.host"),
+        (None, {"lmcache.mp.port": 1}, {}, ValueError, "lmcache.mp.port"),
+        (None, {"lmcache.mp.server_urls": "x:1"}, {}, ValueError, "server_urls"),
+        (None, {"lmcache.mp.http_url": "x:8080"}, {}, ValueError, "http_url"),
+        (None, {}, {"dp": 2}, NotImplementedError, "does not support DP"),
+    ],
+)
+def test_stage_servers_reject_invalid_layouts(groups, extra, kwargs, error, message):
+    with pytest.raises(error, match=message):
+        deployment._stage_servers(_staged(groups=groups, extra=extra, **kwargs))
+
+
+def _staged_strategies(*, pp, tp, groups, **kwargs):
+    return {
+        (pp_rank, tp_rank): deployment._parallel_strategy(
+            _staged(pp=pp, pp_rank=pp_rank, tp=tp, groups=groups, **kwargs), tp_rank
+        )
+        for pp_rank in range(pp)
+        for tp_rank in range(tp)
+    }
+
+
+def test_stage_servers_give_each_group_its_own_kv_world(fake_parallel_config):
+    strategies = _staged_strategies(pp=4, tp=1, groups=_TWO_GROUPS, kv_lora_rank=512)
+
+    assert {key[0]: (s.worker_id, s.world_size) for key, s in strategies.items()} == {
+        0: (0, 2),
+        1: (1, 2),
+        2: (0, 2),
+        3: (1, 2),
+    }
+
+
+def test_stage_servers_collapse_mla_tp_ranks_per_one_stage_group(
+    fake_parallel_config,
+):
+    groups = [{"url": "a:1", "pp_ranks": [0]}, {"url": "b:2", "pp_ranks": [1]}]
+    strategies = _staged_strategies(pp=2, tp=8, groups=groups, kv_lora_rank=512)
+
+    assert {(s.worker_id, s.world_size) for s in strategies.values()} == {(0, 1)}
+
+
+def test_stage_servers_keep_sharded_tp_ranks_inside_each_group(
+    fake_parallel_config,
+):
+    strategies = _staged_strategies(pp=4, tp=4, groups=_TWO_GROUPS)
+
+    for stages in ((0, 1), (2, 3)):
+        group = [s for key, s in strategies.items() if key[0] in stages]
+        assert sorted(s.worker_id for s in group) == list(range(8))
+        assert {s.world_size for s in group} == {8}
+
+
+def test_stage_server_namespaces_split_by_group(stage_namespace):
+    def namespace(pp_rank, groups=None):
+        config = _with_draft(_staged(pp_rank=pp_rank, groups=groups))
+        return stage_namespace(
+            config,
+            stage_server=deployment._stage_server_for(config, pp_rank),
+        )
+
+    group_a = {namespace(0), namespace(1)}
+    group_b = {namespace(2), namespace(3)}
+    single = stage_namespace(_with_draft(_config(tp=1, pp=4, layers=8)))
+    other_split = namespace(
+        1,
+        [{"url": "a:1", "pp_ranks": [0]}, {"url": "b:2", "pp_ranks": [1, 2, 3]}],
+    )
+
+    assert len(group_a) == len(group_b) == 1
+    (a,) = group_a
+    (b,) = group_b
+    assert a == f"{single}::stages-0-1"
+    assert b == f"{single}::stages-2-3"
+    assert len({a, b, single, other_split}) == 4
+    assert "@" not in a + b
+
+
+def test_worker_routes_to_its_stage_group_server(fake_parallel_config, monkeypatch):
+    class AtomMPWorkerAdapter:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_parallel_config.AtomMPWorkerAdapter = AtomMPWorkerAdapter
+    monkeypatch.setattr(
+        deployment,
+        "_model_namespace",
+        lambda _config, *, checkpoint_spec=None, stage_server=None: (
+            f"ns-{stage_server.first_pp_rank}-{stage_server.last_pp_rank}"
+        ),
+    )
+
+    adapter = deployment._make_worker_adapter(_staged(pp_rank=2), 0)
+
+    assert adapter.server_url == _URL_B
+    assert adapter.model_name == "ns-2-3"
+    assert (adapter.parallel_config.worker_id, adapter.parallel_config.world_size) == (
+        0,
+        2,
+    )
+    assert adapter.mq_timeout == 300.0
+
+
+@dataclass(frozen=True)
+class _LookupKey:
+    num_kv_readers: int = 1
+
+
+@pytest.fixture
+def scheduler_adapter_spy(fake_parallel_config, monkeypatch):
+    """``AtomMPSchedulerAdapter`` stand-in recording construction and shutdown."""
+
+    class Spy:
+        opened = []  # noqa: RUF012
+        chunk_by_url = {}  # noqa: RUF012
+        unreachable = set()  # noqa: RUF012
+
+        def __init__(self, **kwargs):
+            if kwargs["server_url"] in self.unreachable:
+                raise ConnectionError(kwargs["server_url"])
+            self.kwargs = kwargs
+            self.lmcache_tokens_per_chunk = self.chunk_by_url.get(
+                kwargs["server_url"], 256
+            )
+            self.closed = False
+            self.opened.append(self)
+
+        def _create_key(self, *_args, **_kwargs):
+            return _LookupKey()
+
+        def shutdown(self):
+            self.closed = True
+
+    fake_parallel_config.AtomMPSchedulerAdapter = Spy
+    monkeypatch.setattr(
+        deployment,
+        "_model_namespace",
+        lambda _config, *, checkpoint_spec=None, stage_server=None: (
+            f"ns-{stage_server.first_pp_rank}-{stage_server.last_pp_rank}"
+        ),
+    )
+    return Spy
+
+
+def test_scheduler_opens_one_lookup_adapter_per_stage_server(scheduler_adapter_spy):
+    adapter = deployment._make_scheduler_adapter(_staged(tp=4, kv_lora_rank=512))
+
+    assert isinstance(adapter, mp_stage_servers._StageServersSchedulerAdapter)
+    assert adapter.lmcache_tokens_per_chunk == 256
+    assert [
+        (
+            spy.kwargs["server_url"],
+            spy.kwargs["model_name"],
+            spy.kwargs["parallel_config"].world_size,
+            spy.kwargs["mq_timeout"],
+        )
+        for spy in scheduler_adapter_spy.opened
+    ] == [(_URL_A, "ns-0-1", 2, 30.0), (_URL_B, "ns-2-3", 2, 30.0)]
+    # MLA collapse: one read lock per TP consumer, on every server.
+    assert {
+        spy._create_key([], 0, 0, "r", None).num_kv_readers
+        for spy in scheduler_adapter_spy.opened
+    } == {4}
+
+
+def test_scheduler_stage_adapters_share_one_chunk_size(scheduler_adapter_spy):
+    scheduler_adapter_spy.chunk_by_url[_URL_B] = 512
+
+    with pytest.raises(ValueError, match="share one chunk size"):
+        deployment._make_scheduler_adapter(_staged())
+    assert [spy.closed for spy in scheduler_adapter_spy.opened] == [True, True]
+
+
+def test_scheduler_closes_opened_stage_adapters_when_one_fails(
+    scheduler_adapter_spy,
+):
+    scheduler_adapter_spy.unreachable.add(_URL_B)
+
+    with pytest.raises(ConnectionError):
+        deployment._make_scheduler_adapter(_staged())
+    assert [spy.closed for spy in scheduler_adapter_spy.opened] == [True]
+
+
+class _StageServer:
+    """One stage server's scheduler adapter."""
+
+    def __init__(self, *results, chunk=4):
+        self.lmcache_tokens_per_chunk = chunk
+        self.results = deque(results)
+        self.submissions = []
+        self.polls = 0
+        self.freed = []
+        self.cleaned = []
+        self.ended = []
+        self.closed = False
+        self.submit_error = None
+        self.poll_error = None
+        self.end_error = None
+        self.shutdown_error = None
+
+    def maybe_submit_lookup_request(self, request_id, token_ids):
+        self.submissions.append(request_id)
+        if self.submit_error is not None:
+            raise self.submit_error
+
+    def check_lookup_result(self, request_id):
+        self.polls += 1
+        if self.poll_error is not None:
+            raise self.poll_error
+        return self.results.popleft() if self.results else None
+
+    def free_lookup_locks(self, token_ids, start, end, request_id):
+        self.freed.append((start, end))
+
+    def cleanup_lookup_result(self, request_id):
+        self.cleaned.append(request_id)
+
+    def end_session(self, request_id):
+        self.ended.append(request_id)
+        if self.end_error is not None:
+            raise self.end_error
+
+    def shutdown(self):
+        self.closed = True
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
+
+
+@pytest.fixture
+def stage_clock(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(mp_stage_servers.time, "monotonic", lambda: clock.now)
+    return clock
+
+
+@pytest.fixture
+def stage_warnings(monkeypatch):
+    logged = []
+    monkeypatch.setattr(
+        mp_stage_servers.logger,
+        "warning",
+        lambda message, *args, **_kwargs: logged.append(message % args),
+    )
+    return logged
+
+
+def _fan_out(*servers):
+    return mp_stage_servers._StageServersSchedulerAdapter(
+        list(servers), [_URL_A, _URL_B][: len(servers)]
+    )
+
+
+def test_fan_out_equal_hits_free_nothing(stage_clock):
+    a, b = _StageServer(8), _StageServer(8)
+    adapter = _fan_out(a, b)
+
+    adapter.maybe_submit_lookup_request("r", list(range(12)))
+
+    assert adapter.check_lookup_result("r") == 8
+    assert a.freed == b.freed == []
+    assert a.submissions == b.submissions == ["r"]
+
+
+def test_fan_out_answers_the_shortest_hit_and_frees_longer_tails(stage_clock):
+    a, b = _StageServer(12), _StageServer(4)
+    adapter = _fan_out(a, b)
+    adapter.maybe_submit_lookup_request("r", list(range(16)))
+
+    assert adapter.check_lookup_result("r") == 4
+    assert a.freed == [(4, 12)]
+    assert b.freed == []
+    # Cached: neither server is asked again and nothing is freed twice.
+    assert adapter.check_lookup_result("r") == 4
+    assert (a.polls, b.polls, a.freed) == (1, 1, [(4, 12)])
+
+
+def test_fan_out_waits_for_every_server(stage_clock):
+    a, b = _StageServer(12), _StageServer(None, 4)
+    adapter = _fan_out(a, b)
+    adapter.maybe_submit_lookup_request("r", list(range(16)))
+
+    assert adapter.check_lookup_result("r") is None
+    assert a.freed == b.freed == []
+    assert adapter.check_lookup_result("r") == 4
+    # A answered on the first poll and is not asked again.
+    assert (a.polls, b.polls) == (1, 2)
+    assert a.freed == [(4, 12)]
+
+
+def test_fan_out_unknown_request_is_a_miss(stage_clock):
+    assert _fan_out(_StageServer(), _StageServer()).check_lookup_result("x") == 0
+
+
+def test_fan_out_submit_failure_is_a_miss_until_the_retry_window_ends(
+    stage_clock, stage_warnings
+):
+    a, b = _StageServer(12), _StageServer()
+    b.submit_error = ConnectionError("B down")
+    adapter = _fan_out(a, b)
+
+    adapter.maybe_submit_lookup_request("r1", list(range(16)))
+    assert adapter.check_lookup_result("r1") == 0
+    assert a.freed == [(0, 12)]
+    assert any(_URL_B in message for message in stage_warnings)
+
+    # Inside the window: answered at once, no RPC to either server.
+    stage_clock.now += mp_stage_servers._STAGE_SERVER_RETRY_S - 1
+    adapter.maybe_submit_lookup_request("r2", list(range(16)))
+    assert adapter.check_lookup_result("r2") == 0
+    assert (a.submissions, b.submissions) == (["r1"], ["r1"])
+    adapter.cleanup_lookup_result("r2")
+    assert a.freed == [(0, 12)]
+
+    # After it, B is contacted again.
+    stage_clock.now += 2
+    b.submit_error = None
+    a.results.append(8)
+    b.results.append(8)
+    adapter.maybe_submit_lookup_request("r3", list(range(16)))
+    assert adapter.check_lookup_result("r3") == 8
+    assert b.submissions == ["r1", "r3"]
+
+
+def test_fan_out_retry_window_doubles_while_a_server_keeps_failing(
+    stage_clock, stage_warnings
+):
+    a, b = _StageServer(), _StageServer()
+    b.submit_error = TimeoutError("B hung")
+    adapter = _fan_out(a, b)
+    base = mp_stage_servers._STAGE_SERVER_RETRY_S
+    cap = mp_stage_servers._STAGE_SERVER_MAX_RETRY_S
+
+    def probe(request_id):
+        adapter.maybe_submit_lookup_request(request_id, list(range(16)))
+        adapter.cleanup_lookup_result(request_id)
+        return b.submissions.count(request_id)
+
+    # Every probe that fails doubles the next window, up to the cap.
+    window, probes = base, 0
+    while True:
+        probes += 1
+        assert probe(f"p{probes}") == 1
+        stage_clock.now += window - 1
+        assert probe(f"skip{probes}") == 0
+        stage_clock.now += 2
+        if window == cap:
+            break
+        window = min(window * 2, cap)
+    assert probes == 5  # 30, 60, 120, 240, 300
+
+    # One answered lookup resets the window to the base.
+    b.submit_error = None
+    a.results.append(4)
+    b.results.append(4)
+    adapter.maybe_submit_lookup_request("ok", list(range(16)))
+    assert adapter.check_lookup_result("ok") == 4
+    b.submit_error = TimeoutError("B hung again")
+    assert probe("again") == 1
+    stage_clock.now += base + 1
+    assert probe("after-base") == 1
+
+
+def test_fan_out_poll_failure_is_a_miss_and_skips_the_server(
+    stage_clock, stage_warnings
+):
+    a, b = _StageServer(12), _StageServer()
+    b.poll_error = TimeoutError("B hung")
+    adapter = _fan_out(a, b)
+    adapter.maybe_submit_lookup_request("r", list(range(16)))
+
+    assert adapter.check_lookup_result("r") == 0
+    assert a.freed == [(0, 12)]
+    assert any(_URL_B in message for message in stage_warnings)
+
+    # The request's later lock releases reach only the live server.
+    adapter.free_lookup_locks(list(range(16)), 0, 4, "r")
+    assert b.freed == []
+    adapter.maybe_submit_lookup_request("r2", list(range(16)))
+    assert adapter.check_lookup_result("r2") == 0
+    assert b.submissions == ["r"]
+
+
+def test_fan_out_cleanup_of_an_unanswered_lookup_frees_the_answered_servers(
+    stage_clock,
+):
+    a, b = _StageServer(12), _StageServer()
+    adapter = _fan_out(a, b)
+    adapter.maybe_submit_lookup_request("r", list(range(16)))
+    assert adapter.check_lookup_result("r") is None
+
+    adapter.cleanup_lookup_result("r")
+
+    assert a.freed == [(0, 12)]
+    assert b.freed == []
+    assert a.cleaned == b.cleaned == ["r"]
+    assert adapter.check_lookup_result("r") == 0
+
+
+def test_fan_out_cleanup_of_a_reconciled_lookup_frees_nothing(stage_clock):
+    a, b = _StageServer(12), _StageServer(8)
+    adapter = _fan_out(a, b)
+    adapter.maybe_submit_lookup_request("r", list(range(16)))
+    assert adapter.check_lookup_result("r") == 8
+
+    adapter.cleanup_lookup_result("r")
+
+    assert a.freed == [(8, 12)]
+    assert b.freed == []
+
+
+def test_fan_out_end_session_and_shutdown_reach_every_server(
+    stage_clock, stage_warnings
+):
+    a, b = _StageServer(), _StageServer()
+    a.end_error = ConnectionError("A down")
+    a.shutdown_error = ConnectionError("A down")
+    adapter = _fan_out(a, b)
+
+    adapter.end_session("r")
+    adapter.shutdown()
+
+    assert a.ended == b.ended == ["r"]
+    assert a.closed and b.closed
+    assert len(stage_warnings) == 2
+
+
+def test_fan_out_rejects_mismatched_chunk_sizes():
+    with pytest.raises(ValueError, match="share one chunk size"):
+        _fan_out(_StageServer(chunk=4), _StageServer(chunk=8))
+
+
+def test_stage_server_locks_through_the_scheduler_are_released_once(
+    stage_clock, monkeypatch
+):
+    monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
+    a, b = _StageServer(16), _StageServer(12)
+    adapter = _fan_out(a, b)
+    client = mp_lookup._MPLookupClient(
+        adapter, config=_config(), timeout=10.0, poll_interval=0.01
+    )
+
+    assert client.lookup(list(range(16)), "req") == 12
+    assert a.freed == [(12, 16)]
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id="req",
+            token_ids=list(range(16)),
+            block_ids=[1, 2],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=4,
+                lmcache_cached_tokens=12,
+                can_load=True,
+                transfer_end_tokens=8,
+            ),
+        )
+    )
+    scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
+        mp_scheduler.LMCacheMPConnectorScheduler
+    )
+    scheduler._lookup_client = client
+    monkeypatch.setattr(
+        ChunkedOffloadSchedulerBase, "build_connector_meta", lambda _self: metadata
+    )
+
+    scheduler.build_connector_meta()
+    client.clear_lookup_status("req")
+
+    assert a.freed == [(12, 16), (0, 4), (8, 12)]
+    assert b.freed == [(0, 4), (8, 12)]
+    # With the worker's own [4, 8), each server's hit is released exactly once.
+    for server, server_hit in ((a, 16), (b, 12)):
+        covered = sorted([*server.freed, (4, 8)])
+        assert all(prev[1] == nxt[0] for prev, nxt in itertools.pairwise(covered))
+        assert (covered[0][0], covered[-1][1]) == (0, server_hit)
+
+
+def test_l2_guard_skips_single_stage_groups(monkeypatch):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+    groups = [{"url": "a:1", "pp_ranks": [0]}, {"url": "b:2", "pp_ranks": [1]}]
+
+    deployment._validate_pp_l2_layouts(
+        _staged(pp=2, groups=groups, extra={"lmcache.mp.l2": "present"})
+    )
+
+
+def test_l2_guard_refuses_a_multi_stage_group_with_an_l2(monkeypatch):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+    groups = [{"url": "a:1", "pp_ranks": [0]}, {"url": "b:2", "pp_ranks": [1, 2, 3]}]
+
+    with pytest.raises(NotImplementedError, match="3 PP stages on tcp://b:2"):
+        deployment._validate_pp_l2_layouts(
+            _staged(groups=groups, extra={"lmcache.mp.l2": "present"})
+        )
+
+
+def test_l2_guard_auto_needs_each_multi_stage_entry_http_url(monkeypatch):
+    monkeypatch.setattr(deployment, "_fetch_l2_adapters", _no_probe)
+
+    with pytest.raises(ValueError, match="entry's http_url"):
+        deployment._validate_pp_l2_layouts(_staged(extra={"lmcache.mp.l2": "auto"}))
+
+
+def test_l2_guard_auto_probes_every_multi_stage_entry(monkeypatch):
+    probed = []
+    monkeypatch.setattr(
+        deployment,
+        "_fetch_l2_adapters",
+        lambda url, **_kwargs: probed.append(url) or [],
+    )
+    groups = [
+        {"url": "a:1", "pp_ranks": [0, 1], "http_url": "a:8080/"},
+        {"url": "b:2", "pp_ranks": [2, 3], "http_url": "http://b:8081"},
+    ]
+
+    deployment._validate_pp_l2_layouts(
+        _staged(groups=groups, extra={"lmcache.mp.l2": "auto"})
+    )
+
+    assert probed == [
+        "http://a:8080/config/adapters",
+        "http://b:8081/config/adapters",
+    ]

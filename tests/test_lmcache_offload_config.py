@@ -382,3 +382,46 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+def _pp_config(*, pp_size: int, num_hidden: int, draft_layers: int | None = None):
+    spec = None
+    if draft_layers is not None:
+        spec = SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(num_nextn_predict_layers=draft_layers)
+        )
+    return SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        hf_config=SimpleNamespace(num_hidden_layers=num_hidden),
+        speculative_config=spec,
+    )
+
+
+def test_pp_stage_layer_counts_follow_the_partition_and_add_the_draft(monkeypatch):
+    # GLM-5.2 prefill: 78 target layers split 20/20/20/18, MTP on the last stage.
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "20,20,20,18")
+    config = _pp_config(pp_size=4, num_hidden=78, draft_layers=1)
+
+    assert offcfg.pp_stage_layer_spans(config) == [
+        (0, 20),
+        (20, 40),
+        (40, 60),
+        (60, 78),
+    ]
+    assert offcfg.speculative_draft_layer_count(config) == 1
+    assert offcfg.pp_stage_layer_counts(config) == [20, 20, 20, 19]
+
+
+def test_pp_stage_layer_counts_without_pp_or_draft(monkeypatch):
+    # A partition meant for a PP launch must not break a PP1 config.
+    monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", "20,20,20,18")
+
+    assert offcfg.pp_stage_layer_counts(_pp_config(pp_size=1, num_hidden=78)) == [78]
+    assert offcfg.pp_stage_layer_counts(
+        _pp_config(pp_size=1, num_hidden=78, draft_layers=3)
+    ) == [81]
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION")
+    assert offcfg.pp_stage_layer_counts(_pp_config(pp_size=2, num_hidden=78)) == [
+        39,
+        39,
+    ]

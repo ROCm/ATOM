@@ -23,6 +23,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
+    _reject_native_state_pp,
     _storage_kv_transfer_config,
     _tp_replication_factor,
     _validate_mp_config,
@@ -75,6 +76,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
+        _reject_native_state_pp(config)
         self._native_saves: dict[str, _NativePending] = {}
         self._native_loads: dict[str, _NativePending] = {}
         self._native_layout = None

@@ -471,15 +471,50 @@ def lmcache_replica_world_size(config) -> int:
     return max(1, pp_size * tp_size)
 
 
+def pp_stage_layer_spans(config) -> list[tuple[int, int]]:
+    """Return each PP stage's ``[start, end)`` slice of the target model layers.
+
+    Follows ``get_pp_indices``, so ``VLLM_PP_LAYER_PARTITION`` applies.
+    """
+    num_hidden_layers = int(config.hf_config.num_hidden_layers)
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size <= 1:
+        return [(0, num_hidden_layers)]
+
+    from atom.models.utils import get_pp_indices
+
+    return [
+        get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+        for pp_rank in range(pp_size)
+    ]
+
+
+def speculative_draft_layer_count(config) -> int:
+    """Return the number of draft KV layers spec decode binds, 0 without one."""
+    spec = getattr(config, "speculative_config", None)
+    if spec is None:
+        return 0
+    draft_hf = getattr(spec, "draft_model_hf_config", None)
+    return int(getattr(draft_hf, "num_nextn_predict_layers", 1) or 0)
+
+
+def pp_stage_layer_counts(config) -> list[int]:
+    """Return the number of KV layers each PP stage binds.
+
+    The last PP stage binds the draft KV layers (spec decode) on top of its
+    target-model slice.
+    """
+    counts = [end - start for start, end in pp_stage_layer_spans(config)]
+    counts[-1] += speculative_draft_layer_count(config)
+    return counts
+
+
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 
     Give each stage a share proportional to its bound layer count so all
     stages reach the same token horizon. Loads are all-or-nothing across
     stages, so unequal horizons waste the longer stage's extra capacity.
-
-    The last PP stage binds the draft KV layer (spec decode), so its
-    layer count is one more than its target-model slice.
     """
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size <= 1:
@@ -489,9 +524,6 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
     if configured <= 0:
         return
 
-    from atom.models.utils import get_pp_indices
-
-    num_hidden_layers = int(config.hf_config.num_hidden_layers)
     pp_rank = int(
         getattr(
             getattr(config, "parallel_config", None),
@@ -499,17 +531,9 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
             0,
         )
     )
-    start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
-    local_layers = end - start
-
-    spec = getattr(config, "speculative_config", None)
-    draft_layers = 0
-    if spec is not None:
-        draft_hf = getattr(spec, "draft_model_hf_config", None)
-        draft_layers = int(getattr(draft_hf, "num_nextn_predict_layers", 1) or 0)
-    total_layers = num_hidden_layers + draft_layers
-    if pp_rank == pp_size - 1:
-        local_layers += draft_layers
+    stage_layers = pp_stage_layer_counts(config)
+    local_layers = stage_layers[pp_rank]
+    total_layers = sum(stage_layers)
 
     if local_layers <= 0 or total_layers <= 0:
         return

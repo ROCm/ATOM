@@ -513,6 +513,19 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return False
         return deferring > 0
 
+    def keeps_save_reports_after_abandon(self, seq: Any) -> bool:
+        """True if a sub still needs this request's save reports after an abandon.
+
+        A sub that waits for transfer reports (LMCache MP) treats
+        `abandon_save` as a no-op and releases its lease only on the save's
+        terminal report, so the PP save quorum must keep delivering it.
+        """
+        for connector in self._connectors:
+            callback = getattr(connector, "waits_for_transfer_report", None)
+            if callable(callback) and callback(seq) is True:
+                return True
+        return False
+
     def abandon_save(self, req_id: Any) -> None:
         # Reclamation of a stalled offload save (see
         # `DenseOffloadConnector.abandon_save`). Only the offload sub tracks

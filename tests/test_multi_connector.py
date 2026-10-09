@@ -1019,3 +1019,27 @@ def test_waits_for_transfer_report_needs_every_deferring_sub():
     assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
     assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
     assert not multi(sub(False, True)).waits_for_transfer_report(seq)
+
+
+def test_keeps_save_reports_after_abandon_if_any_sub_waits_for_them():
+    """An LMCache MP leg next to a stalled P/D send still needs its reports."""
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    def multi(*subs):
+        connector = object.__new__(MultiConnectorScheduler)
+        connector._connectors = list(subs)
+        return connector
+
+    send = SimpleNamespace(should_defer_free=lambda _seq: True)
+    mp = SimpleNamespace(waits_for_transfer_report=lambda _seq: True)
+    in_process = SimpleNamespace(waits_for_transfer_report=lambda _seq: False)
+
+    seq = object()
+    assert multi(send, mp).keeps_save_reports_after_abandon(seq)
+    assert not multi(send, mp).waits_for_transfer_report(seq)
+    assert not multi(send, in_process).keeps_save_reports_after_abandon(seq)
+    assert not multi(send).keeps_save_reports_after_abandon(seq)
