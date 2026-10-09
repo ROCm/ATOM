@@ -17,6 +17,10 @@ from atom.utils import envs
 _PD_TRANSFER_CONNECTORS = frozenset({"mooncake", "moriio"})
 # Only Mooncake consumes DSA index staging callbacks / pool slots.
 _INDEX_STAGING_CONNECTORS = frozenset({"mooncake"})
+# MLA staging: one slot of this size per send worker, the pool capped in bytes
+# so a large ``num_worker_threads`` makes workers share slots.
+MLA_STAGING_SLOT_BYTES = 8 << 20
+MLA_STAGING_POOL_BYTES = 256 << 20
 
 
 def _canonical(connector: dict, *, path: str) -> str | None:
@@ -110,12 +114,11 @@ def send_worker_count(connector: dict) -> int:
 def mla_staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
     """MLA staging slots for one producer: one per send worker, capped in bytes.
 
-    ``ATOM_PD_MLA_STAGING_POOL_MB`` bounds the pool, so a large
+    ``MLA_STAGING_POOL_BYTES`` bounds the pool, so a large
     ``num_worker_threads`` makes workers share slots instead of growing HBM.
     """
 
-    pool_bytes = envs.ATOM_PD_MLA_STAGING_POOL_MB << 20
-    return min(num_send_workers, max(1, pool_bytes // slot_bytes))
+    return min(num_send_workers, max(1, MLA_STAGING_POOL_BYTES // slot_bytes))
 
 
 def mla_staging_reserve_bytes(config) -> int:
@@ -124,19 +127,19 @@ def mla_staging_reserve_bytes(config) -> int:
     An upper bound of what ``MooncakeConnector`` allocates after the KV cache
     is sized: every Mooncake producer entry on an MLA model without producer
     DCP gets a pool of at most ``mla_staging_slot_count`` slots of
-    ``ATOM_PD_MLA_STAGING_SLOT_MB``.
+    ``MLA_STAGING_SLOT_BYTES``.
     """
 
-    slot_bytes = envs.ATOM_PD_MLA_STAGING_SLOT_MB << 20
     if (
         not envs.ATOM_PD_MLA_STAGING
-        or slot_bytes == 0
         or getattr(config, "decode_context_parallel_size", 1) > 1
         or not getattr(getattr(config, "hf_config", None), "kv_lora_rank", None)
     ):
         return 0
-    pool_bytes = envs.ATOM_PD_MLA_STAGING_POOL_MB << 20
     return sum(
-        min(send_worker_count(connector) * slot_bytes, max(pool_bytes, slot_bytes))
+        min(
+            send_worker_count(connector) * MLA_STAGING_SLOT_BYTES,
+            max(MLA_STAGING_POOL_BYTES, MLA_STAGING_SLOT_BYTES),
+        )
         for connector in _producer_connectors(config, _INDEX_STAGING_CONNECTORS)
     )

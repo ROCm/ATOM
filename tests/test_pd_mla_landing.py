@@ -516,8 +516,8 @@ def _landed_vs_per_token(
 ):
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_MIN_SLOTS", "1")
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS", str(credit_wait_ms))
+    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+    monkeypatch.setattr(mc, "MLA_LANDING_CREDIT_WAIT_S", credit_wait_ms / 1000)
     num_regions = 3
     regions = _source_regions(num_regions, 40)
     rng = np.random.default_rng(dcp_size * 10 + dcp_rank + num_src)
@@ -622,7 +622,7 @@ def test_landing_falls_back_to_staged_pages_without_credits(monkeypatch):
 def test_small_transfers_keep_the_staged_path(monkeypatch):
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_MIN_SLOTS", "2")
+    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 2)
     regions = _source_regions(1, 8)
     new = _producer(mc, regions, staging_rows=512)
     dst = [torch.zeros((8, PAGE_BYTES), dtype=torch.uint8)]
@@ -648,8 +648,8 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     # never recomputes into a page stage 1 may still overwrite.
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_MIN_SLOTS", "1")
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS", "0")
+    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+    monkeypatch.setattr(mc, "MLA_LANDING_CREDIT_WAIT_S", 0)
     dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
     dest.recv.advertise("stage0", 2)
     landing = dest.recv.advertise("stage1", 2)
@@ -698,7 +698,7 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
     # and the stage loses the credit for good.
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_MIN_SLOTS", "1")
+    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
     dest = _Dest(num_regions=1, pool_slots=1, slot_rows=16)
     landing = dest.recv.advertise("stage0", 1)
     dest.recv.begin("req", 5, [3], {0: "stage0"}, 1)
@@ -852,6 +852,7 @@ def _config(transfer, dcp=4, kv_lora_rank=512):
 
 
 def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch):
+    from atom.kv_transfer.disaggregation import pd_landing
     from atom.kv_transfer.disaggregation.pd_landing import (
         mla_landing_pool_shape,
         mla_landing_reserve_bytes,
@@ -864,8 +865,9 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch):
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
     assert mla_landing_reserve_bytes(_config(consumer)) == 0
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "1")
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_SLOT_MB", "8")
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_POOL_MB", "100")
+    assert mla_landing_pool_shape() == (32, 8 << 20)
+    # A pool that is not a whole number of slots keeps only the whole slots.
+    monkeypatch.setattr(pd_landing, "MLA_LANDING_POOL_BYTES", 100 << 20)
     assert mla_landing_pool_shape() == (12, 8 << 20)
     assert mla_landing_reserve_bytes(_config(consumer)) == 96 << 20
     multi = {"kv_connector": "multi", "connectors": [consumer]}
@@ -873,5 +875,3 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch):
     assert mla_landing_reserve_bytes(_config(producer)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING_SLOT_MB", "0")
-    assert mla_landing_reserve_bytes(_config(consumer)) == 0

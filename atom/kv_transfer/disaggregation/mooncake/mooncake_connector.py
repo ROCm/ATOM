@@ -34,6 +34,8 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
+    MLA_LANDING_CREDIT_WAIT_S,
+    MLA_LANDING_MIN_SLOTS,
     MSG_LANDING_CREDIT,
     MSG_LANDING_READY,
     LandingCredits,
@@ -42,6 +44,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_landing import mla_landing_pool_shape
 from atom.kv_transfer.disaggregation.pd_producer import (
+    MLA_STAGING_SLOT_BYTES,
     mla_staging_slot_count,
     send_worker_count,
 )
@@ -1183,7 +1186,7 @@ class MooncakeConnector(KVConnectorBase):
         so its MLA bytes cannot be sent as whole blocks. The pool lets a send
         worker gather those tokens into destination page order on the GPU and
         send them page-contiguous. One slot per send worker, capped by
-        ``ATOM_PD_MLA_STAGING_POOL_MB``; ``mla_staging_reserve_bytes`` holds
+        ``MLA_STAGING_POOL_BYTES``; ``mla_staging_reserve_bytes`` holds
         the pool back from the KV cache budget.
         """
         if (
@@ -1193,9 +1196,8 @@ class MooncakeConnector(KVConnectorBase):
             or not envs.ATOM_PD_MLA_STAGING
         ):
             return None
-        slot_mb = envs.ATOM_PD_MLA_STAGING_SLOT_MB
         views = tt.block_tensor_views
-        if slot_mb == 0 or len(views) != len(tt.block_regions):
+        if len(views) != len(tt.block_regions):
             return None
         token_views: dict[int, torch.Tensor] = {}
         for region_idx, (region, view) in enumerate(zip(tt.block_regions, views)):
@@ -1211,7 +1213,7 @@ class MooncakeConnector(KVConnectorBase):
         if not token_views:
             return None
         widest = max(tt.block_regions[idx].unit_bytes for idx in token_views)
-        slot_bytes = max(widest, (slot_mb << 20) // widest * widest)
+        slot_bytes = max(widest, MLA_STAGING_SLOT_BYTES // widest * widest)
         pool_size = mla_staging_slot_count(self._num_send_workers, slot_bytes)
         device = next(iter(token_views.values())).device
         self._mla_staging = torch.empty(
@@ -2274,7 +2276,7 @@ class MooncakeConnector(KVConnectorBase):
         partition the consumer advertised. Each slot is one RDMA descriptor,
         followed by ``MSG_LANDING_READY`` on the write-done socket, so the
         consumer sees every READY before this stage's write-done. Without a
-        free slot within ``ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS`` the rest goes
+        free slot within ``MLA_LANDING_CREDIT_WAIT_S`` the rest goes
         out through the staged per-page path; slots are split only at page
         boundaries, so the rest is whole pages. See ``mla_landing.py``.
         """
@@ -2289,7 +2291,7 @@ class MooncakeConnector(KVConnectorBase):
             min(self._mla_staging.shape[1], landing_slot_bytes),
             self.block_size,
         )
-        if len(slots) < envs.ATOM_PD_MLA_LANDING_MIN_SLOTS:
+        if len(slots) < MLA_LANDING_MIN_SLOTS:
             return self._execute_staged_mla_regions(
                 target,
                 plan,
@@ -2310,9 +2312,8 @@ class MooncakeConnector(KVConnectorBase):
             "tcp", request_data["notify_host"], request_data["notify_port"]
         )
         credits = self._landing_credits
-        wait_s = envs.ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS / 1000
         for seq, items in enumerate(slots):
-            slot = credits.acquire(target, epoch, wait_s)
+            slot = credits.acquire(target, epoch, MLA_LANDING_CREDIT_WAIT_S)
             if slot is None:
                 first_pages = [len(dst_block_ids)] * len(regions)
                 for rest in slots[seq:]:

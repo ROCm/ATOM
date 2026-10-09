@@ -20,7 +20,7 @@ Protocol, per decode rank (every rank has its own pool and connector):
    all its requests to that rank. A send worker takes a credit, gathers rows
    into its staging slot, writes the slot to ``base + slot * slot_bytes`` and
    sends ``MSG_LANDING_READY`` (request, nonce, stage, seq, slot, items). With
-   no credit within ``ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS`` it sends the rest
+   no credit within ``MLA_LANDING_CREDIT_WAIT_S`` it sends the rest
    of the transfer through the staged path. Write-done then lists the slot of
    every READY it sent (``landed_slots``), so a lost READY is detected and its
    slot still returned.
@@ -65,6 +65,13 @@ logger = logging.getLogger("atom")
 
 MSG_LANDING_READY = b"landing_ready"
 MSG_LANDING_CREDIT = b"landing_credit"
+
+# Prefill: a transfer needing fewer landing slots than this keeps the staged
+# per-page path; the scatter round trip would not pay off.
+MLA_LANDING_MIN_SLOTS = 2
+# Prefill: how long a send worker waits for a free landing slot before it
+# sends the rest of the transfer through the staged per-page path.
+MLA_LANDING_CREDIT_WAIT_S = 0.010
 
 _STATS_INTERVAL_S = 30.0
 # A failed request still waiting on a stage this long is logged once.
