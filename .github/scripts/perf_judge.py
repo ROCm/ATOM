@@ -83,8 +83,23 @@ NONMONOTONIC_MARGIN_PCT = 3.0  # interior level this far outside its neighbours
 # +1.84, two of the three on the same machines as before. What is left is
 # spread rather than bias, so this is the median and RESIDUAL_SPREAD_PCT is
 # how far a single level wandered from it.
+#
+# Re-measured in CI on the shipped matrix (run 37892302140, base and head both
+# on code that touches only .github, so every delta is noise): -0.1 and +0.4 on
+# DeepSeek-V4-Pro-mtp3 at c=32/256, +0.1 on DeepSeek-V4-Pro c=256, +0.2 on
+# Kimi-K3 c=32, and +2.4 on GLM-5.2-FP8 c=256 -- the last with TTFT -2.3 and
+# TPOT -2.4 agreeing, so it is a real difference between two runs of identical
+# code rather than a measurement artefact. 2.4 is 2.13 points off the bias
+# below, past the 1.8 this used to claim, so the figure follows the data.
+#
+# What it costs, stated where the number lives: the gate needs both levels at
+# or under DOWN_EPS_PCT and their mean at or under FAMILY_MEDIAN_PCT, so a
+# regression is only reliably caught at about -4.4% on both levels, against
+# -3.8% if the spread really were 1.8. A positive excursion like GLM's does not
+# invent a regression -- it hides one, which is the safer direction to be wrong
+# in for an advisory check, and the nightly covers what this cannot.
 MEASURED_RESIDUAL_BIAS_PCT = 0.27
-RESIDUAL_SPREAD_PCT = 1.8
+RESIDUAL_SPREAD_PCT = 2.5
 
 # --- Baseline sanity (crimson only) ----------------------------------------
 BASELINE_SANITY_PCT = -25.0  # base this far under main's recent median
