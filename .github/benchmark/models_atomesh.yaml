@@ -618,14 +618,15 @@ models:
       # each PP stage's 256-token KV chunks between its GPU and the Store, and
       # the launcher starts the Store's master and owners on the prefill node
       # (pd_server_atom.sh: MOONCAKE_STORE) and hands the prefill workers
-      # ATOM_KV_OFFLOAD=mooncake_store. Dispatch-only, never scheduled: they
-      # need an image with Mooncake Store (mooncake_master, mooncake_client and
-      # mooncake.store, e.g. rocm/atom-dev:mooncake-store-20261002; the CI image
-      # builds Mooncake with WITH_STORE=OFF, which the launcher refuses before
-      # it starts anything), so dispatch with suite=mooncake_store and an
-      # explicit atomesh_image. The owner sizes and NICs fit pit2-p03 (TW
-      # MI355X) nodes only: about 1.5 TiB per NUMA node, NUMA1's NICs named
-      # rdma4-7 (Spur MI350X hosts name theirs ionic_N). Their own
+      # ATOM_KV_OFFLOAD=mooncake_store. Dispatch-only, never scheduled
+      # (suite=mooncake_store). They need an image with Mooncake Store
+      # (mooncake_master, mooncake_client and mooncake.store): the release
+      # image builds Mooncake WITH_STORE=ON, but an image built before that
+      # lacks it, which the launcher refuses before it starts anything; pass
+      # one with the Store as atomesh_image (e.g.
+      # rocm/atom-dev:mooncake-store-20261002). The owner sizes and NICs fit
+      # pit2-p03 (TW MI355X) nodes only: about 1.5 TiB per NUMA node, NUMA1's
+      # NICs named rdma4-7 (Spur MI350X hosts name theirs ionic_N). Their own
       # display_topology keeps them off the nightly cells' dashboard series.
       mooncake_store:
         - &glm52_agentic_mcstore_cpp4_dcp4
