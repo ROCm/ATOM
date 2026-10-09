@@ -9,7 +9,7 @@ Prepared 2026-10-09 from conversation `01a0fa86-ce65-7343-b850-a07a2d9d6b9c`.
 - P8/D8, TP8/DCP8, Kimi-K3 + DSpark3, FP8 KV, mamba align, Model Runner V2, FULL_AND_PIECEWISE. Direct RDMA sender uses one thread per rank, retaining C16 clients.
 - P: MultiConnector(MooncakeConnector producer, MooncakeStoreConnector both); D: MooncakeConnector consumer. No LMCache. Embedded CPU Store: 224.875 GiB/rank × 8 = 1799 GiB, plus 1 GiB/rank local buffer; no SSD offload. Store is owned by this job only.
 - Official Mooncake example proxy with harness health/models adapter. Its rank-0 process and master are scoped to the serving container.
-- Same account/QoS `amd-frameworks`/`amd-frameworks-qos`, runner `atomesh-cicd`, partition `amd-spur`; g10/g12 selected from the existing pool based on inspection `37905319765` (08:30 UTC). No cancellation of other jobs or cleanup of other cases.
+- Same account/QoS `amd-frameworks`/`amd-frameworks-qos`, runner `atomesh-cicd`, partition `amd-spur`; g12/g13 selected from the existing pool based on inspection `37952706738` (15:35 UTC). No cancellation of other jobs or cleanup of other cases.
 
 ## Execution and interpretation
 
@@ -24,3 +24,11 @@ This is a current-main feasibility/performance exploration, not a controlled tra
 `contract.json`, `inputs.json`, `matrix.json`, both connector JSON files, and `dry-run.log` specify the reviewable experiment. `preflight.json` records successful matrix and shell checks. Harness checks: 8 matrix tests and 4 behavioral probe tests passed; Ruff and shell/YAML syntax passed. Existing vLLM Mooncake tests: 101 passed; 12 worker tests could not initialize the CPU-only accelerator fixture (`torch.accelerator.current_device_index`), not a ROCm runtime result. The full raw log is retained.
 
 Primary-source research and the unmerged DSpark Store/DCP tail risks are in `research.md`. The passing ROCm wheel build does not itself prove K3 + DSpark + C16 works.
+
+## Resume after the infrastructure failure
+
+Run [37906592218](https://github.com/ROCm/ATOM/actions/runs/37906592218), Slurm6095, failed before model startup. Both GPU preflights passed; rank1 aborted when the peer-state reader raised NFS `ESTALE`, and rank0 was stopped during native build setup. Actions failed, Slurm was cancelled after the rank failure, and the workload failed. Both cleanup queries returned zero with empty task-container lists. There is no transfer, Store-reuse, performance, or accuracy result.
+
+The retry adds four bounded read attempts only for `ESTALE` (0.1/0.2/0.4-second delays). Persistent read faults, invalid records, run ownership checks, and real peer failures retain their original exit semantics. CPU fault injection reproduced exit2 before this change and passed after it; cleanup-state, job-result, Store-probe, and matrix suites total 23 passing tests. This validates error handling, not the availability of the remote NFS service.
+
+The retry uses g12/g13 because g10 is now occupied. Local matrix comparison differs only in the node pair. vLLM source, Mooncake wheel, model parameters, account, QoS, GPU count, Store gate, C16 performance window, and natural GSM8K phase are unchanged. Evidence is under `/app/test_scripts/dspark_pd/mooncake-rocm-c16-20261009/retry-estale/`; the original failure is archived separately.

@@ -1,16 +1,25 @@
 """Read only this run's peer failure and cleanup acknowledgements."""
 
 import argparse
+import errno
 import json
 import sys
+import time
 from pathlib import Path
 
 
 def load(path):
-    try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
-        return None
+    for attempt in range(4):
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            if error.errno != errno.ESTALE or attempt == 3:
+                raise
+            # Reopen the shared NFS marker after a short bounded delay.
+            print(f"Retrying stale peer-state read: {path}", file=sys.stderr)
+            time.sleep(0.1 * (2**attempt))
 
 
 def matches(value, job_id, token):
