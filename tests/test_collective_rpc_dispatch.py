@@ -345,9 +345,9 @@ def _asleep_after(cmd, is_last, **kw):
 
 
 @pytest.mark.parametrize("cmd", ["update_weights_shm", "update_weights_ipc"])
-def test_the_last_bucket_landing_on_every_rank_wakes_the_engine(cmd):
-    assert not _asleep_after(cmd, True, replies=_counts(4, 4))
-    assert _asleep_after(cmd, False, replies=_counts(4, 4)), "not before the last"
+def test_even_the_last_local_bucket_waits_for_a_global_finish(cmd):
+    assert _asleep_after(cmd, True, replies=_counts(4, 4))
+    assert _asleep_after(cmd, False, replies=_counts(4, 4))
 
 
 @pytest.mark.parametrize("cmd", ["update_weights_shm", "update_weights_ipc"])
@@ -404,8 +404,27 @@ def test_wake_up_cannot_unfence_a_failed_update_but_a_complete_sync_can():
 
     mgr._replies = _counts(4, 4)
     _process_one(h, out, engine, "update_weights_shm", {"is_last": True})
+    assert engine._is_rl_weights_offloaded
+    assert engine._rl_weights_inconsistent
+
+    _process_one(h, out, engine, "finish_weight_sync", {})
     assert not engine._is_rl_weights_offloaded
     assert not engine._rl_weights_inconsistent
+
+
+def test_a_global_abort_fences_an_engine_whose_local_update_succeeded():
+    h, _, out = _handler(replies=_counts(4, 4))
+    engine = _Engine()
+    engine._is_rl_weights_offloaded = False
+    engine._rl_weights_inconsistent = False
+
+    _process_one(h, out, engine, "update_weights_ipc", {"is_last": True})
+    # This is the later command CoreManager sends after a different DP engine
+    # reports failure.
+    _process_one(h, out, engine, "discard_failed_weight_sync", {})
+
+    assert engine._is_rl_weights_offloaded
+    assert engine._rl_weights_inconsistent
 
 
 def test_every_answered_utility_command_stamps_the_callers_request_id():

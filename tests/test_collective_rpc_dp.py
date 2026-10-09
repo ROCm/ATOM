@@ -420,6 +420,39 @@ def test_a_timeout_cleans_update_scratch_on_every_dp_engine_too():
     assert mgr.sent[-1][0] == "discard_failed_weight_sync"
 
 
+def test_a_complete_weight_sync_finishes_only_after_every_dp_engine_succeeds():
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(
+        mgr,
+        [
+            {"cmd": "update_weights_ipc", "result": 3},
+            {"cmd": "update_weights_ipc", "result": 3},
+        ],
+    )
+
+    mgr.broadcast_utility_command_sync("update_weights_ipc", timeout=5, is_last=True)
+
+    assert [cmd for cmd, _ in mgr.sent] == [
+        "update_weights_ipc",
+        "finish_weight_sync",
+    ]
+
+
+def test_a_nonfinal_bucket_stays_fenced_for_the_rest_of_its_sync():
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(
+        mgr,
+        [
+            {"cmd": "update_weights_shm", "result": 3},
+            {"cmd": "update_weights_shm", "result": 3},
+        ],
+    )
+
+    mgr.broadcast_utility_command_sync("update_weights_shm", timeout=5, is_last=False)
+
+    assert [cmd for cmd, _ in mgr.sent] == ["update_weights_shm"]
+
+
 def test_sync_still_returns_every_reply_when_all_succeed():
     mgr = _mgr(2)
     replies = [{"cmd": "clear_kv_cache", "result": True}] * 2

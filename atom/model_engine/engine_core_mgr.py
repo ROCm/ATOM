@@ -28,6 +28,7 @@ from atom.model_engine.collective_rpc import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
+    FINISH_WEIGHT_SYNC_CMD,
     FIRE_AND_FORGET_UTILITY_CMDS,
     WEIGHT_UPDATE_UTILITY_CMDS,
 )
@@ -1569,6 +1570,31 @@ class CoreManager:
                 f"of {len(responses)} engine(s): "
                 + "; ".join(str(r["error"]) for r in failed)
             )
+        is_complete_weight_sync = cmd == "update_weights" or (
+            cmd in {"update_weights_shm", "update_weights_ipc"}
+            and bool(kwargs.get("is_last", True))
+        )
+        if is_complete_weight_sync:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.broadcast_utility_command(
+                    "discard_failed_weight_sync", failed_cmd=cmd
+                )
+                raise TimeoutError(
+                    f"{self.label}: weight update {cmd!r} completed locally but "
+                    f"left no time to commit it across every DP engine"
+                )
+            try:
+                self.broadcast_utility_command_sync(
+                    FINISH_WEIGHT_SYNC_CMD,
+                    timeout=remaining,
+                    completed_cmd=cmd,
+                )
+            except Exception:
+                self.broadcast_utility_command(
+                    "discard_failed_weight_sync", failed_cmd=cmd
+                )
+                raise
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):

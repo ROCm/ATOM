@@ -18,6 +18,8 @@ FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
+_DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
+FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
 
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
@@ -68,7 +70,8 @@ class EngineUtilityHandler:
         "update_weights": "_handle_update_weights",
         "update_weights_shm": "_handle_update_weights_shm",
         "update_weights_ipc": "_handle_update_weights_ipc",
-        "discard_failed_weight_sync": "_handle_discard_failed_weight_sync",
+        _DISCARD_WEIGHT_SYNC_CMD: "_handle_discard_failed_weight_sync",
+        FINISH_WEIGHT_SYNC_CMD: "_handle_finish_weight_sync",
         "release_memory": "_handle_release_memory",
         "resume_memory": "_handle_resume_memory",
         "clear_kv_cache": "_handle_clear_kv_cache",
@@ -107,6 +110,12 @@ class EngineUtilityHandler:
         while True:
             try:
                 cmd, args = utility_queue.get_nowait()
+                if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                    # Local success is not global success: another DP engine
+                    # can still fail this bucket. Stay fenced until CoreManager
+                    # explicitly finishes a complete sync on every engine.
+                    engine._rl_weights_inconsistent = True
+                    engine._is_rl_weights_offloaded = True
                 reply = self._execute_utility_command(cmd, args)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
@@ -128,22 +137,25 @@ class EngineUtilityHandler:
                             logger.info(f"{self.label}: engine exited sleep mode")
                 elif cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     failed = isinstance(reply, dict) and bool(reply.get("error"))
-                    is_complete = cmd == "update_weights" or (
-                        args.get("is_last", True) if isinstance(args, dict) else True
-                    )
                     if failed:
-                        engine._rl_weights_inconsistent = True
-                        engine._is_rl_weights_offloaded = True
                         logger.error(
                             f"{self.label}: weight update failed; serving stays "
                             f"fenced until a complete sync succeeds: {reply['error']}"
                         )
-                    elif is_complete:
-                        engine._rl_weights_inconsistent = False
-                        engine._is_rl_weights_offloaded = False
-                        logger.info(
-                            f"{self.label}: engine exited sleep mode (weights updated)"
-                        )
+                elif cmd == _DISCARD_WEIGHT_SYNC_CMD:
+                    engine._rl_weights_inconsistent = True
+                    engine._is_rl_weights_offloaded = True
+                    logger.error(
+                        f"{self.label}: global weight sync aborted; serving stays "
+                        f"fenced until a complete sync succeeds"
+                    )
+                elif cmd == FINISH_WEIGHT_SYNC_CMD:
+                    engine._rl_weights_inconsistent = False
+                    engine._is_rl_weights_offloaded = False
+                    logger.info(
+                        f"{self.label}: globally complete weight sync committed; "
+                        f"engine exited sleep mode"
+                    )
             except queue.Empty:
                 engine._has_pending_utility = False
                 break
@@ -337,11 +349,11 @@ class EngineUtilityHandler:
                     f"TP rank(s)"
                 )
                 logger.error(f"{self.label}: {error}")
-                return {"cmd": "discard_failed_weight_sync", "error": error}
+                return {"cmd": _DISCARD_WEIGHT_SYNC_CMD, "error": error}
         except Exception as exc:
             logger.exception(f"{self.label}: {cmd} cleanup could not be broadcast")
-            return self._error_reply("discard_failed_weight_sync", exc)
-        return {"cmd": "discard_failed_weight_sync", "result": True}
+            return self._error_reply(_DISCARD_WEIGHT_SYNC_CMD, exc)
+        return {"cmd": _DISCARD_WEIGHT_SYNC_CMD, "result": True}
 
     def _handle_discard_failed_weight_sync(self, args: dict) -> dict:
         """Clear abandoned update scratch on every TP rank of this engine."""
@@ -349,6 +361,12 @@ class EngineUtilityHandler:
             args.get("failed_cmd", "weight update"),
             args.get("timeout", _DIRECT_UPDATE_TIMEOUT_S),
         )
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_finish_weight_sync(self, args: dict) -> dict:
+        """Acknowledge CoreManager's globally successful complete sync."""
+        reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "result": True}
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
