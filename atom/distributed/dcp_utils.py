@@ -107,17 +107,10 @@ def mla_dcp_sparse_prefill_is_persistent(
 def mla_dcp_sparse_prefill_uses_nonps(
     dcp_world_size: int, gathered_heads: int, fp8_qkv: bool, is_gfx950: bool
 ) -> bool:
-    """Whether DCP sparse prefill runs aiter's non-persistent fp8 gqa64 kernel.
+    """Whether DCP sparse prefill uses the non-persistent fp8 gqa64 MLA kernel.
 
-    aiter#6132 adds `mla_a8w8_qh64_qseqlen1_gqaratio64`: fp8 q and KV, exactly
-    64 query heads, one query per row (sparse prefill rows always are), gfx950,
-    page_size 1. Non-persistent means no work metadata, so the per-full-layer
-    `get_mla_metadata_v1` rebuild goes away. Opt-in via
-    ``ATOM_DCP_SPARSE_PREFILL_NONPS`` because an aiter without the kernel
-    raises at the first long prefill instead of falling back.
-
-    Shared by the attention layer (mode, width, splits) and the metadata
-    builder (skip the step-level plan), so the two cannot disagree.
+    Applies with fp8 q/KV, 64 gathered heads, gfx950 and page_size 1. It needs
+    no work metadata, so the per-layer `get_mla_metadata_v1` rebuild is skipped.
     """
     return (
         envs.ATOM_DCP_SPARSE_PREFILL_NONPS

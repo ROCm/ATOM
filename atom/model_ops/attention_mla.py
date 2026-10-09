@@ -905,8 +905,7 @@ class MLAAttention(nn.Module):
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
             )
-            # aiter's non-persistent fp8 gqa64 kernel serves the gathered width
-            # exactly, so it replaces both the persistent mode and the pad.
+            # Non-persistent kernel: exact 64-head width, no pad, no metadata.
             self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
                 dcp_world_size,
                 self.num_heads * dcp_world_size,
@@ -2302,9 +2301,8 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    # The non-persistent gqa64 kernel writes O and LSE directly
-                    # at one split; it also caps total_q * splits at 32768,
-                    # which a 16K chunk at the usual 4 would exceed.
+                    # Non-persistent: one split, O/LSE written directly
+                    # (the kernel caps total_q * splits at 32768).
                     num_kv_splits=(
                         1
                         if dcp_sparse and self.dcp_sparse_prefill_nonps

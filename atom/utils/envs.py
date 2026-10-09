@@ -356,10 +356,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
-    # DCP sparse (DSA) prefill on aiter's non-persistent fp8 gqa64 qlen1 MLA
-    # kernel (aiter#6132) instead of the persistent one: no work-metadata
-    # rebuild per full-index layer and no step-level plan. Needs an aiter that
-    # carries the kernel; without it the first long prefill raises. Off by default.
+    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
+    # needs no work metadata. Off by default.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: os.getenv(
         "ATOM_DCP_SPARSE_PREFILL_NONPS", "0"
     )

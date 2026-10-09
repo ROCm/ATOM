@@ -447,8 +447,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
 
-        # Same predicate the attention layer uses: when DCP sparse prefill runs
-        # the non-persistent kernel, nothing reads the step-level plan below.
         self.dcp_sparse_prefill_nonps = (
             self.is_sparse
             and mla_dcp_sparse_prefill_uses_nonps(
@@ -1911,8 +1909,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             if self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
-            # Skipped only for the non-persistent DCP sparse prefill, which
-            # reads no work plan (see mla_dcp_sparse_prefill_uses_nonps).
+            # The non-persistent DCP sparse prefill reads no work plan.
             if not self.dcp_sparse_prefill_nonps:
                 get_mla_metadata_v1(
                     attn_metadata.sparse_cu_seqlens_q,
