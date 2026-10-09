@@ -10,11 +10,9 @@ nothing is cached here. Each slot exposes ``.tensor``, a contiguous uint8 view
 of exactly one chunk, so the block GPU connector copies to and from it as it
 would any staged object.
 
-On the GPU (the default) the NIC reads and writes HBM directly and the copies
-on either side of it are device-to-device. ``pool_device: cpu`` puts the pool
-in pinned host memory instead -- the same code, with D2H/H2D copies -- which
-only suits a small pool: an ionic NIC registers about 3 GiB of 4 KiB pages,
-shared by every process on it.
+The allocation sits on the worker's GPU: the NIC reads and writes the HBM
+directly (GPUDirect RDMA), and the copies on either side of it are
+device-to-device.
 """
 
 from __future__ import annotations
@@ -74,13 +72,6 @@ def _round_up(value: int, multiple: int) -> int:
     return -(-int(value) // multiple) * multiple
 
 
-def _allocate_pool_tensor(nbytes: int, device: torch.device) -> torch.Tensor:
-    """The pool's backing memory: HBM on a GPU device, else pinned host memory."""
-    if device.type == "cpu":
-        return torch.empty((nbytes,), dtype=torch.uint8, pin_memory=True)
-    return torch.empty((nbytes,), dtype=torch.uint8, device=device)
-
-
 class TransferSlotPool:
     """Chunk slots of one registered allocation, handed out per transfer window.
 
@@ -120,7 +111,9 @@ class TransferSlotPool:
                 )
         self._capacity = capacity
         self.nbytes = (capacity["save"] + capacity["load"]) * self.slot_stride
-        backing = _allocate_pool_tensor(self.nbytes + _BASE_ALIGN, self.device)
+        backing = torch.empty(
+            (self.nbytes + _BASE_ALIGN,), dtype=torch.uint8, device=self.device
+        )
         offset = (-int(backing.data_ptr())) % _BASE_ALIGN
         self._backing = backing
         self._buffer = backing[offset : offset + self.nbytes]
