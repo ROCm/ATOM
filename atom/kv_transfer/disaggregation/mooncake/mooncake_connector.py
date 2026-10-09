@@ -462,9 +462,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         # Consumer side: queue for remote KV loading
         if params.get("do_remote_prefill"):
-            assert not self.is_producer, (
-                "Only the decode (consumer) side handles do_remote_prefill"
-            )
+            assert (
+                not self.is_producer
+            ), "Only the decode (consumer) side handles do_remote_prefill"
             self._reqs_need_recv[seq.id] = (seq, list(seq.block_table), slot_index)
             params["do_remote_prefill"] = False
             params["local_slot_index"] = slot_index
@@ -526,9 +526,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                 drafts = getattr(seq, "spec_token_ids", None)
                 params["prefill_handoff"] = {
                     "first_token_id": int(seq.output_tokens[0]),
-                    "draft_token_ids": [int(x) for x in drafts]
-                    if drafts is not None
-                    else [],
+                    "draft_token_ids": (
+                        [int(x) for x in drafts] if drafts is not None else []
+                    ),
                     "prefix_cache_hit_tokens": getattr(
                         seq, "prefix_cache_hit_tokens", 0
                     ),
@@ -2838,7 +2838,7 @@ class MooncakeConnector(KVConnectorBase):
                 if success:
                     try:
                         PrefillHandoff.from_wire(req_id, handoff)
-                    except ValueError:
+                    except (TypeError, ValueError):
                         success = False
                         handoff = None
                 stages = self._pending_recv_stages.setdefault(req_id, set())

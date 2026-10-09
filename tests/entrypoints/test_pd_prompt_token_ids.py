@@ -355,7 +355,9 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("multi", [False, True])
-def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(monkeypatch, enabled, multi):
+def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
+    monkeypatch, enabled, multi
+):
     sub = {
         "kv_connector": "mooncake",
         "kv_role": "kv_producer",
@@ -363,9 +365,9 @@ def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(monkeypatch,
         "handshake_port": 6401,
     }
     config = SimpleNamespace(
-        kv_transfer_config={"kv_connector": "multi", "connectors": [sub]}
-        if multi
-        else sub,
+        kv_transfer_config=(
+            {"kv_connector": "multi", "connectors": [sub]} if multi else sub
+        ),
         tensor_parallel_size=4,
         pipeline_parallel_size=3,
         parallel_config=SimpleNamespace(data_parallel_size=2),
