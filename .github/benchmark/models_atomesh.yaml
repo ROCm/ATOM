@@ -1075,7 +1075,7 @@ models:
           server:
             common_args:
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 1
@@ -1109,7 +1109,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 2
@@ -1226,7 +1226,7 @@ models:
           server:
             common_args:
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
           prefill:
             workers: 1
@@ -1260,7 +1260,7 @@ models:
             common_args:
               decode_max_num_seqs: 1024
               method: eagle3
-              draft_model: "${ATOMESH_MODEL_ROOT}/MiniMax-M3-EAGLE3"
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3"
               num_speculative_tokens: 3
               online_quant_config: '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*.gate.*", "*.block_sparse_moe.experts*"]}'
           prefill:
