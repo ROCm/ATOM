@@ -97,6 +97,7 @@ from atom.model_ops.embed_head import (
     ReplicatedEmbedding,
     VocabParallelEmbedding,
 )
+from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -1966,22 +1967,24 @@ def sparse_attn_indexer(
 
             flydsl_pa_mqa_logits_fp4(
                 padded_q_decode_tokens,
-                q_fp4_scale[:num_decode_tokens].reshape(
-                    batch_size, next_n, *q_fp4_scale.shape[1:]
-                ),
+                q_fp4_scale[:num_decode_tokens],
                 kv_cache,
                 indexer_module.k_cache.kv_cache_scale,
-                attn_metadata.block_tables,
-                weights_mqa[:num_padded_tokens],
-                decode_metadata.context_lens,
-                max_model_len,
+                weights=weights_mqa[:num_padded_tokens],
+                max_seq_len=max_model_len,
                 weight_scale=weights_scale,
-                next_n=next_n,
-                block_k=FP4_MQA_BLOCK_K,
                 kv_block_size=runner_block_size,
                 out=logits,
-                cta_info=decode_metadata.indexer_fp4_cta_info,
-                total_ctas=decode_metadata.indexer_fp4_n_ctas,
+                **Fp4MqaRaggedMetadata(
+                    decode_metadata.cu_seqlens_q[: batch_size + 1],
+                    next_n,
+                    attn_metadata.block_tables,
+                ).kernel_args(
+                    decode_metadata.index_row_ends[:num_rows],
+                    heads=padded_q_decode_tokens.shape[-2],
+                    page_size=runner_block_size,
+                    max_seq_len=max_model_len,
+                ),
             )
         else:
             deepgemm_fp8_paged_mqa_logits(

@@ -8,7 +8,7 @@ so it is testable without a GPU.
 """
 
 from atom.models.minimax_m3.mono.config import (
-    BLOCKS,
+    DENSE_INTER,
     HEAD_DIM,
     HIDDEN,
     INTER,
@@ -22,8 +22,11 @@ from atom.models.minimax_m3.mono.config import (
     SPARSE_BLOCK,
     TOP_K,
     TOPK_BLOCKS,
-    WAVES,
 )
+from atom.mono.plan.check import RegionDecl
+from atom.mono.plan.execution import BLOCKS, WAVES
+from atom.mono.plan.layout import DIAG_WORDS, PAIR_BYTES, pair_layout
+from atom.mono.plan.trace import Space
 
 H = LOCAL_Q_HEADS
 SPLIT_KEYS = 256  # one gluon context partition per split task
@@ -51,13 +54,13 @@ SCORE_COPIES = 8
 
 
 def _layout(items, align=256):
-    """Byte offsets of (value, tag) pair regions, 8 bytes per pair."""
-    off, out = 0, {}
-    for name, pairs in items:
-        out[name] = off
-        off += (pairs * 8 + align - 1) // align * align
-    out["_bytes"] = off
-    return out
+    """``pair_layout``'s byte offsets, each region on an ``align`` boundary, and
+    ``_bytes``: the whole, a multiple of ``align``."""
+    regions = pair_layout(items, align)
+    end = max(o + n for o, n in regions.values())
+    return {name: o for name, (o, _) in regions.items()} | {
+        "_bytes": (end + align - 1) // align * align
+    }
 
 
 # plain words, not pairs: the selected pages then the context length, as the
@@ -101,6 +104,18 @@ SCRATCH = _layout(
         ("mid8p", MOE_SLOTS * INTER * MAX_TOKENS // 8),
         ("midsp", MOE_SLOTS * INTER // 32 * MAX_TOKENS // 2),
         ("ugdone", (TOP_K * MAX_TOKENS + 1) * UG_PER_SLOT // 2),
+        # dense layers (dense_post): the post-attention norm's per-token FP8 rows
+        # as plain words, each row's scale (its pair is the flag), and the MLP's
+        # bf16 mid pairs
+        ("dx8", HIDDEN // 4 * MAX_TOKENS // 2),
+        ("dxs", MAX_TOKENS),
+        ("dmid", DENSE_INTER // 2 * MAX_TOKENS),
+        # and (S > 2) each mid row's per-token FP8 as plain words, then its scale
+        ("dmid8", DENSE_INTER // 4 * MAX_TOKENS // 2),
+        ("dmids", MAX_TOKENS),
+        # a debug build's wait records, one a CTA; last, so the regions above
+        # keep their offsets in every build
+        ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
     ]
 )
 SCRATCH_BYTES = SCRATCH["_bytes"]
@@ -108,7 +123,16 @@ SCRATCH_BYTES = SCRATCH["_bytes"]
 
 def sym_layout(npes: int):
     """Per-rank symmetric buffer: attn / ffn partial regions, [src rank][token][HIDDEN],
-    and the peers' index-selection candidates (``sel_cp``)."""
+    and the peers' index-selection candidates (``sel_cp``).
+
+    K4 pushes a layer's attention partials into every peer's ``attn`` region and
+    its FFN partials into the ``ffn`` region, then polls its own. Regions are
+    reused by every layer (the mailbox tag tells a layer's pairs from an earlier
+    layer's) and no rank can overwrite a peer's unread pairs: to push layer L's
+    FFN partials a rank must have passed layer L's attention reduce, which needs
+    every peer's layer-L attention push, and a peer only pushes that after it
+    finished reading layer L-1's FFN region. So ranks are at most half a layer
+    apart and the two regions double-buffer each other."""
     rows = npes * MAX_TOKENS * HIDDEN // 2
     # a_ag / ffn_ag: the finished attention / FFN all-reduce rows, each written by
     # its owner rank (the reduce-scatter + all-gather form, S >= AG_RS_FROM)
@@ -125,6 +149,104 @@ def sym_layout(npes: int):
             ("sel_cp", SEL_LONG_PAIRS * MAX_TOKENS),
         ]
     )
+
+
+def mailbox_regions(
+    tokens: int, index_heads: int, fuse_k1: bool, index_topk: bool = True
+) -> list[RegionDecl]:
+    """The fused layer kernel's mailbox regions for a build: each one's space and
+    the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
+    the kernel enters, in order: k1.norm (S > 2), k1.gemv, k1.head, k1.score,
+    select_long, split, merge (S > 1), o, router, ug, down). Without
+    ``index_topk`` (a build reusing a selection) the indexer's regions are gone."""
+    S, P = Space.SCRATCH, Space.PEER
+    regions = []
+    if fuse_k1:
+        regions += [
+            RegionDecl("k1.qkv", S, "k1.gemv"),
+            RegionDecl("k1.hdone", S, "k1.head"),
+            # the residual: the norm tasks' past two tokens, else the GEMV tasks'
+            RegionDecl("k1.rdone", S, "k1.norm" if tokens > 2 else "k1.gemv"),
+        ]
+        if index_topk:
+            regions.append(RegionDecl("iscore", S, "k1.score"))
+        if tokens > 2:
+            regions.append(RegionDecl("k1.x8s", S, "k1.norm"))
+    if index_topk:
+        regions.append(
+            RegionDecl("sel_cp", P, "select_long", exchange=True)
+            if index_heads > 1
+            else RegionDecl("sel_long", S, "select_long", exchange=True)
+        )
+    regions += [RegionDecl(n, S, "split") for n in ("sp_o", "sp_m", "sp_l")]
+    if tokens > 1:
+        regions.append(RegionDecl("attnq_s", S, "merge"))
+    regions.append(RegionDecl("attn", P, "o", exchange=True))
+    regions.append(
+        RegionDecl("a_ag", P, "o") if tokens >= AG_RS_FROM else RegionDecl("a", S, "o")
+    )
+    regions.append(RegionDecl("scores", S, "router"))
+    if wide_moe(tokens):
+        regions += [RegionDecl("xndone", S, "router"), RegionDecl("ugdone", S, "ug")]
+    else:
+        regions += [RegionDecl(n, S, "router") for n in ("xn8", "xsc")]
+        regions.append(RegionDecl("mid", S, "ug"))
+    regions.append(RegionDecl("sel", S, "ug"))  # the routing record (tests)
+    regions.append(RegionDecl("ffn", P, "down", exchange=True))
+    if tokens >= AG_RS_FROM:
+        regions.append(RegionDecl("ffn_ag", P, "down", exchange=True))
+    return regions
+
+
+def dense_mailbox_regions(tokens: int) -> list[RegionDecl]:
+    """The dense layer kernel's (dense_post) mailbox regions: each one's space and
+    the one stage that puts it. Stages, in order: merge (S > 1: the attention
+    output's FP8), o, norm (S > 2), ug, mq (S > 2: the mids' FP8), down."""
+    S, P = Space.SCRATCH, Space.PEER
+    regions = []
+    if tokens > 1:
+        regions.append(RegionDecl("attnq_s", S, "merge"))
+    regions.append(RegionDecl("attn", P, "o", exchange=True))
+    regions.append(
+        RegionDecl("a_ag", P, "o") if tokens >= AG_RS_FROM else RegionDecl("a", S, "o")
+    )
+    if tokens > 2:
+        regions.append(RegionDecl("dxs", S, "norm"))
+    regions.append(RegionDecl("dmid", S, "ug"))
+    if tokens > 2:
+        regions.append(RegionDecl("dmids", S, "mq"))
+    regions.append(RegionDecl("ffn", P, "down", exchange=True))
+    if tokens >= AG_RS_FROM:
+        regions.append(RegionDecl("ffn_ag", P, "down", exchange=True))
+    return regions
+
+
+def diag_region_names(tokens: int, index_heads: int) -> list[str]:
+    """Every region a debug step's layer kernels may record a wait on (they share
+    one ``diag`` record, a region named by its ``region_id``): K4's full table,
+    then the dense kernel's own regions."""
+    names = [d.name for d in mailbox_regions(tokens, index_heads, fuse_k1=True)]
+    return names + [
+        d.name for d in dense_mailbox_regions(tokens) if d.name not in names
+    ]
+
+
+def dense_stage_bases(tokens: int):
+    """Task t of a dense_post stage runs on CTA (base + t) % BLOCKS: the o tasks
+    past the merge tasks (S > 1), then the norm (S > 2) and gate / up tasks on the
+    CTAs the o tasks leave (they start the gate / up weights at once), the mid
+    quant (S > 2) and down tasks after them."""
+    o = tokens if tokens > 1 else 0
+    ug = (o + N_O) % BLOCKS
+    down = (ug + N_DENSE_UG) % BLOCKS
+    return {
+        "merge": 0,
+        "o": o,
+        "norm": ug,
+        "ug": ug,
+        "mq": down,
+        "down": down,
+    }
 
 
 def stage_bases(tokens: int):
@@ -213,6 +335,11 @@ MID_ROW = INTER // 4 + 4
 MIDSC_ROW = INTER // 32 + 4
 # and the o stage's FP8 attention rows (512 words: the same 16-way conflict)
 O_ROW = O_K // 4 + 4
+# the dense layers' (dense_post) per-token FP8 rows: the gate / up input and the
+# down stage's mids
+DX_ROW = HIDDEN // 4 + 4
+DMID_ROW = DENSE_INTER // 4 + 4
+N_DENSE_UG = DENSE_INTER // UG_ROWS  # gate / up tasks, UG_ROWS mid columns each
 
 
 def pool_words(tokens: int) -> int:

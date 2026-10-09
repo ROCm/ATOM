@@ -7,6 +7,7 @@ import triton.language as tl
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_BLOCK_SIZE_K,
     DECODE_TOPK_NUM_WARPS,
+    PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _decode_score_chunks,
     _launch_select,
@@ -218,5 +219,8 @@ def select_global_blocks(
             DECODE_TOPK_BLOCK_SIZE_K,
             DECODE_TOPK_NUM_WARPS,
             True,
+            # This path's cache has its blocks back to back, so the stride
+            # equals the pages a block fills.
+            block_page_stride=PAGES_PER_SPARSE_BLOCK,
         )
     return indices, *output

@@ -12,7 +12,12 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_prefill,
 )
 from atom.model_ops.deepseek_v41.compressor import Compressor
-from atom.model_ops.deepseek_v41.paged_scoring import score_topk_paged
+from atom.model_ops.deepseek_v41.paged_scoring import (
+    quantize_query_fp4,
+    score_topk_paged,
+    score_topk_quantized,
+)
+from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.layernorm import DualRMSNormMXFP8, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -55,34 +60,48 @@ class Indexer(nn.Module):
         """The BF16 index key. Whatever the plane stores it as is the cache's."""
         return rope(self.k_norm(self.wk(latent)), positions)
 
+    def write_keys(self, latent, cache, step, rope):
+        """This layer's index keys, from the compressed latent, into the plane.
+
+        The FP4 plane's writer takes the key before its norm and does the norm
+        and the RoPE itself, bit for bit `project_keys`.
+        """
+        spec = self.spec
+        if cache.geometry.index_fp4:
+            cache.write_index_fp4(
+                spec.kv_owner, step, self.wk(latent)[0], spec.ratio, self.k_norm, rope
+            )
+            return
+        positions = step.plans[spec.ratio].key_rope_positions_gpu
+        index = self.project_keys(latent, rope, positions)
+        cache.write_index(spec.kv_owner, step, index, spec.ratio)
+
     @property
     def weights_scale(self):
         return self.head_dim**-0.5 * self.heads**-0.5
 
-    def project_query(self, qr, qr_scale, rope, positions):
-        """The index query, left on the grid its reader rounds it to.
-
-        The published model FP4-rounds both sides whatever it holds; the one
-        scorer here quantizes the query itself, so rounding first would round
-        twice. `qr` arrives quantized, so this GEMM reuses that pair rather
-        than quantizing the tensor a second time.
-        """
-        return rope(
-            self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim)),
-            positions,
-        )
-
     def project(self, hidden, qr, qr_scale, cache, step, rope):
-        """Everything `score` needs that the index plane does not hold.
+        """Everything `score` needs that the index plane does not hold: the
+        index query and the head weights.
+
+        The query is left on the grid its reader rounds it to. The published
+        model FP4-rounds both sides whatever it holds; the FP8 scorer quantizes
+        the query itself, so rounding first would round twice, and on the FP4
+        plane one kernel rotates and quantizes it (`quantize_query_fp4`). `qr`
+        arrives quantized, so this GEMM reuses that pair rather than quantizing
+        the tensor a second time.
 
         Apart from `score` so that a compressor's join has somewhere to sit
         that is neither before this nor after the plane is read.
         """
         positions = cache.rope_positions(step)
-        return (
-            self.project_query(qr, qr_scale, rope, positions)[0],
-            self.weights_proj(hidden)[0],
+        query = self.wq_b(qr, x_scale=qr_scale).unflatten(
+            -1, (self.heads, self.head_dim)
         )
+        weights = self.weights_proj(hidden)[0]
+        if cache.geometry.index_fp4:
+            return quantize_query_fp4(query[0], rope, positions), weights
+        return rope(query, positions)[0], weights
 
     def score(self, query, weights, cache, step):
         """This layer's top-k rows, out of the paged plane, into `step`.
@@ -94,23 +113,92 @@ class Indexer(nn.Module):
         First reader of the index plane, into which a boundary crossed in this
         same forward writes a row that `visible` already counts.
         """
+        if cache.geometry.index_fp4:
+            # `project` quantized the query; the scorer scales the weights
+            self.score_quantized(
+                query, weights, cache, step, weight_scale=self.weights_scale
+            )
+            return
+        self._publish(
+            *score_topk_paged(
+                query,
+                weights,
+                *self._plane(cache, step),
+                topk=self.topk,
+                weights_scale=self.weights_scale,
+                workspace=cache.workspace,
+                **self._bounds(cache, step),
+            ),
+            step,
+        )
+
+    def score_quantized(self, query, scaled, cache, step, weight_scale=1.0):
+        """`score` from the query already quantized (`score_topk_quantized`):
+        the mono decode's K1 computes it and the scaled head weights, an FP4
+        `project` the query alone (the kernel applies `weight_scale`)."""
         spec = self.spec
-        source = spec.candidate_source
-        selected, chosen = score_topk_paged(
-            query,
-            weights,
+        ragged = self._ragged(cache, step)
+        self._publish(
+            *score_topk_quantized(
+                query,
+                scaled,
+                cache.index_units[spec.kv_owner],
+                # FP4 reads the PAGE table (by request) or the candidates' table
+                (
+                    None
+                    if cache.geometry.index_fp4
+                    else cache.unit_tiles(step, spec.ratio)
+                ),
+                step.visible[spec.ratio],
+                topk=self.topk,
+                workspace=cache.workspace,
+                weight_scale=weight_scale,
+                ragged=ragged,
+                **self._bounds(cache, step),
+            ),
+            step,
+        )
+
+    def _ragged(self, cache, step):
+        """A FULL layer's FP4 rows, a request's rows one sequence
+        (`Fp4MqaRaggedMetadata`) off its PAGE table, prefill and decode alike;
+        None anywhere else."""
+        geometry = cache.geometry
+        spec = self.spec
+        if not (geometry.index_fp4 and spec.candidate_source is None):
+            return None
+        return Fp4MqaRaggedMetadata(
+            step.cu_seqlens_q,
+            step.max_q_len,
+            step.block_tables,
+            geometry.index_blocks_per_page(spec.ratio),
+        )
+
+    def _plane(self, cache, step):
+        spec = self.spec
+        return (
             cache.index_units[spec.kv_owner],
             cache.unit_tiles(step, spec.ratio),
             step.visible[spec.ratio],
-            topk=self.topk,
-            weights_scale=self.weights_scale,
-            candidates=None if source is None else step.candidates[source],
-            block_size=self.block_size,
-            candidate_count=self.topk_blocks if spec.produces_candidates else 0,
         )
-        step.selected[spec.layer_id] = selected.unsqueeze(0)
+
+    def _bounds(self, cache, step):
+        spec = self.spec
+        source = spec.candidate_source
+        return {
+            "candidates": (
+                None
+                if source is None
+                else cache.candidate_blocks(step, source, spec.ratio)
+            ),
+            "block_size": self.block_size,
+            "candidate_count": self.topk_blocks if spec.produces_candidates else 0,
+        }
+
+    def _publish(self, selected, chosen, step):
+        step.selected[self.spec.layer_id] = selected.unsqueeze(0)
         if chosen is not None:
-            step.candidates[spec.layer_id] = chosen
+            step.candidates[self.spec.layer_id] = chosen
 
 
 class Attention(nn.Module):
@@ -198,10 +286,7 @@ class Attention(nn.Module):
         values, scores = self.compressor.project(hidden)
         latent = cache.compress(owner, self.compressor, values, scores, step, rope)
         if latent is not None:
-            index = self.indexer.project_keys(
-                latent, rope, step.plans[self.spec.ratio].key_rope_positions_gpu
-            )
-            cache.write_index(owner, step, index, self.spec.ratio)
+            self.indexer.write_keys(latent, cache, step, rope)
 
     def project_qkv(self, hidden, hidden_scale=None):
         """The one GEMM the query and the KV latent both come out of.

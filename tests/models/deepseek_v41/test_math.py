@@ -93,6 +93,62 @@ def test_mhc_coefficient_norm_epsilon_is_not_sinkhorn_epsilon(reference):
         mhc.predict_mixes(x, fn.bfloat16(), scale, base)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the seam is a GPU kernel")
+def test_delayed_seam_matches_the_reference_block(reference):
+    """`pre_delayed` against the pinned Block: the owed post (`hc_post`), the
+    next gates (`hc_mixes`), the collapse with the CARRIED pre-mix (`hc_pre`)
+    and the sublayer's RMSNorm, at the model's hidden size (the kernel's
+    tuned shape). BF16 outputs may differ by an ULP, the FP32 gates barely."""
+    _mhc()
+    from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
+
+    torch.manual_seed(31)
+    rows, hc, hidden, dev = 12, 4, 5120, "cuda"
+    stub = SimpleNamespace(
+        norm_eps=1e-20, hc_mult=hc, hc_sinkhorn_iters=20, hc_eps=1e-6
+    )
+    fn = torch.randn(hc * (hc + 2), hc * hidden, device=dev) * 0.01
+    scale = torch.rand(3, device=dev) + 0.5
+    base = torch.randn(hc * (hc + 2), device=dev) * 0.2
+
+    def streams():
+        return torch.randn(1, rows, hc, hidden, device=dev).bfloat16()
+
+    residual, sublayer = streams(), torch.randn(1, rows, hidden, device=dev).bfloat16()
+    carried, post, comb = reference.Block.hc_mixes(stub, streams(), fn, scale, base)
+    norm_weight = (1 + 0.1 * torch.randn(hidden, device=dev)).bfloat16()
+    ref_norm = reference.RMSNorm(hidden, stub.norm_eps)
+    ref_norm.weight = nn.Parameter(norm_weight)
+
+    expected = reference.Block.hc_post(stub, sublayer, residual, post, comb)
+    next_pre, next_post, next_comb = reference.Block.hc_mixes(
+        stub, expected, fn, scale, base
+    )
+    normed = ref_norm(reference.Block.hc_pre(stub, expected, carried))
+    actual = pre_delayed(
+        residual,
+        carried,
+        fn,
+        scale,
+        base,
+        norm_weight,
+        rms_eps=stub.norm_eps,
+        hc_eps=stub.hc_eps,
+        sinkhorn_iters=stub.hc_sinkhorn_iters,
+        post_mult=2.0,
+        norm_eps=stub.norm_eps,
+        sublayer_output=sublayer,
+        post_mix=post,
+        combination=comb,
+    )
+    # An ULP at the streams' unit scale: both round the collapse to BF16 before
+    # the norm, so a cancelling element can carry that ULP into a small value.
+    for got, want in zip(actual[:2], (expected, normed)):
+        torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-8)
+    for got, want in zip(actual[2:], (next_pre, next_post, next_comb)):
+        torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-4)
+
+
 def test_router_image_bias_only_changes_selection(reference):
     torch.manual_seed(22)
     args = reference.ModelArgs(

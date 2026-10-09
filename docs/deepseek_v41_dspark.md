@@ -11,7 +11,8 @@ and throughput require validation for the deployment workload.
 
 ## Supported configuration
 
-DSpark requires BF16 KV, the FP8 index plane and text requests. Tensor
+DSpark requires BF16 KV and text requests. The index plane is FP8 by default
+or FP4. Tensor
 parallelism follows the model's dimension-divisibility checks, with no TP4-only
 admission gate. Configuration tests cover TP1/2/4/8; the GPU benchmark evidence
 covers TP2 and TP4 without EP at level 3 FULL. See the

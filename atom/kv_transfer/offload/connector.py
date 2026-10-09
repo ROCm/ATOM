@@ -182,6 +182,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         if callable(callback):
             callback(block_manager)
 
+    def prefetch_lookups(self, seqs) -> None:
+        callback = getattr(self._impl, "prefetch_lookups", None)
+        if callable(callback):
+            callback(seqs)
+
+    def lookup_pending(self, seq) -> bool:
+        callback = getattr(self._impl, "lookup_pending", None)
+        return bool(callback(seq)) if callable(callback) else False
+
     @property
     def has_state_tier(self) -> bool:
         """True when the selected impl actually hosts the KDA state tier.

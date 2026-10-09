@@ -459,6 +459,7 @@ def test_qsa_tokens_per_req_is_one_on_decode_three_on_verify():
 def test_graph_max_tokens_per_req_follows_cli(monkeypatch):
     from atom.plugin.sglang import qwen4_exp_bridge as bridge
 
+    monkeypatch.setattr(bridge, "_resolved_spec_draft_tokens", lambda: 0)
     monkeypatch.setattr(bridge, "_server_args", lambda: None)
     assert bridge._get_qsa_graph_max_tokens_per_req() == 1
     monkeypatch.setattr(
@@ -473,6 +474,25 @@ def test_graph_max_tokens_per_req_follows_cli(monkeypatch):
         lambda: SimpleNamespace(speculative_num_draft_tokens=0),
     )
     assert bridge._get_qsa_graph_max_tokens_per_req() == 1
+    # 0.5.20 leaves the raw field unset; eagle topk 1 resolves to steps+1.
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            speculative_num_draft_tokens=None,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=2,
+            speculative_eagle_topk=1,
+        ),
+    )
+    assert bridge._get_qsa_graph_max_tokens_per_req() == 3
+    monkeypatch.setattr(bridge, "_resolved_spec_draft_tokens", lambda: 3)
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(speculative_num_draft_tokens=None),
+    )
+    assert bridge._get_qsa_graph_max_tokens_per_req() == 3
 
 
 def test_verify_graph_fill_drops_stale_pad_page_table():

@@ -51,6 +51,7 @@ from atom.config import (
     q_proj_has_row_sliceable_scale,
     q_proj_is_qrep_widened,
     qrep_enabled_for_layer,
+    qrep_for_step,
     qrep_unsupported_reason,
 )
 from atom.distributed.dcp_utils import (
@@ -931,6 +932,23 @@ def test_gate_takes_no_interleave_input():
     )
 
 
+@pytest.mark.parametrize(
+    "qrep, seg, prefill, prefill_qrep, expected",
+    [
+        (True, False, False, False, True),  # decode: always, when the layer has QREP
+        (True, False, False, True, True),
+        (True, False, True, False, False),  # sparse prefill: gathers by default
+        (True, False, True, True, True),  # ... and replicates under the env
+        (True, True, False, False, False),  # seg: q_out is per-rank sized
+        (True, True, True, True, False),
+        (False, False, False, False, False),  # no QREP on the layer: never
+        (False, False, True, True, False),
+    ],
+)
+def test_qrep_for_step_truth_table(qrep, seg, prefill, prefill_qrep, expected):
+    assert qrep_for_step(qrep, seg, prefill, prefill_qrep) is expected
+
+
 def test_gate_reason_is_human_readable():
     """The reason string is logged verbatim; it should name the actual cause."""
     reason = qrep_unsupported_reason(1, False)
@@ -1447,6 +1465,7 @@ def tp_group():
     import torch.distributed as dist
 
     try:
+        from aiter import destroy_dist_env
         from aiter.dist.parallel_state import (
             init_distributed_environment,
             initialize_model_parallel,
@@ -1457,18 +1476,33 @@ def tp_group():
         # runner. Skipping here keeps that mistake from turning CI red.
         pytest.skip(f"requires aiter: {e}", allow_module_level=False)
 
-    if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29578")
-        torch.cuda.set_device(0)
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method="tcp://127.0.0.1:29578",
-        )
-        initialize_model_parallel(tensor_model_parallel_size=1)
-    yield
+    if dist.is_initialized():
+        yield
+        return
+    # The group and the environment it leaves must not outlive this module:
+    # aiter pins HIP_VISIBLE_DEVICES to the world it starts ("0" here), and a
+    # later test's spawned multi-GPU workers inherit it and see one device.
+    leaked = ("HIP_VISIBLE_DEVICES", "MASTER_ADDR", "MASTER_PORT")
+    saved = {name: os.environ.get(name) for name in leaked}
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29578")
+    torch.cuda.set_device(0)
+    init_distributed_environment(
+        world_size=1,
+        rank=0,
+        local_rank=0,
+        distributed_init_method="tcp://127.0.0.1:29578",
+    )
+    initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        yield
+    finally:
+        destroy_dist_env()
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _build_layer(quant_type=None, n_wide=N_WIDE):

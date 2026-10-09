@@ -194,13 +194,6 @@ class Drafter(abc.ABC):
                 max_bs * mtp_k, dtype=torch.int64, **kwargs
             ),
             "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
-            # Device-only scratch, shared by PP slots just like other device
-            # tensors in forward_vars. The rejection sampler consumes it on
-            # the forward stream before the next prepare can overwrite it;
-            # draft proposal uses separate token storage. No host publication.
-            "verification_draft_token_ids": torch.empty(
-                max_bs * mtp_k, dtype=torch.int32, device=device
-            ),
         }
 
     # ---- draft passes ----
@@ -638,40 +631,13 @@ class Drafter(abc.ABC):
             unified=running_tokens_are_unified,
         )
 
-    def prepare_inputs(
-        self,
-        scheduled_bs: int,
-        # [scheduled_bs] each request's anchor offset WITHIN its own segment;
-        # for a verified request that is its accepted-draft count. None ->
-        # every segment's last row, what a step that verified nothing wants.
-        anchor_in_seq: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Anchor row per request = its segment start + `anchor_in_seq`.
+    def prepare_inputs(self, scheduled_bs: int) -> torch.Tensor:
+        """Anchor row per request when nothing was verified: its segment's last.
 
-        Reading forward from the start is what keeps this length-free; counting
-        back from the segment end needs the segment length, which DSpark's
-        ragged verify makes a per-request number.
+        A verified step takes its anchors from the rejection verdict instead.
         """
         cu_seqlens_q = get_forward_context().attn_metadata.cu_seqlens_q
-        cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
-
-        if anchor_in_seq is None:
-            anchor_in_seq = cu_seqlens_q[1:] - cu_seqlens_q[:-1] - 1
-        token_indices = cu_seqlens_q[:-1] + anchor_in_seq
-
-        # Defensive clamp to the valid flat-token range [0, total_tokens-1].
-        # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
-        # mixed batches) can drive an anchor index just out of range; the anchor
-        # only seeds the DRAFT (a wrong anchor lowers acceptance but never
-        # corrupts the verified/target output — losslessness is preserved), so
-        # clamping is safe and avoids an index_select GPU fault. No-op on the
-        # normal path where indices are already in range.
-        if self.is_block_drafter:
-            upper = (cu_seqlens_q[-1] - 1).clamp_(min=0)
-            token_indices = token_indices.clamp_(min=0)
-            torch.minimum(token_indices, upper, out=token_indices)
-
-        return token_indices
+        return cu_seqlens_q[1 : scheduled_bs + 1] - 1
 
     @h2d_producer("spec_decode", runner="runner")
     def prepare_spec_decode_indices(
@@ -683,7 +649,8 @@ class Drafter(abc.ABC):
         """Fill host indices/counts before their group's first GPU consumer.
 
         This uses only the settled query lengths, so it can share token input
-        publication. The caller must publish the group before gathering IDs.
+        publication. The caller must publish the group before verification
+        reads them.
         """
         scheduled_bs = len(num_sampled_tokens)
 
@@ -745,13 +712,8 @@ class Drafter(abc.ABC):
         cu_num_draft_tokens = var["cu_num_draft_tokens"].gpu[:scheduled_bs]
         bonus_logits_indices = var["bonus_logits_indices"].gpu[:scheduled_bs]
 
-        # Compute the draft token ids.
-        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = var["verification_draft_token_ids"][:sum_drafted_tokens]
-        torch.index_select(input_ids[1:], 0, target_logits_indices, out=draft_token_ids)
-
         metadata = SpecDecodeMetadata(
-            draft_token_ids=draft_token_ids,
+            input_ids=input_ids,
             num_spec_steps=self.mtp_k,
             num_draft_tokens_np=num_draft_tokens,
             cu_num_draft_tokens=cu_num_draft_tokens,

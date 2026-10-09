@@ -408,27 +408,10 @@ class _FakeCacheSlice:
         return self.identity, shape
 
 
-class _FakeTransferTensor:
-    def __init__(self, address):
-        self._address = address
-
-    def stride(self, dim):
-        assert dim == 0
-        return 1
-
-    def element_size(self):
-        return 1
-
-    def numel(self):
-        return 8
-
-    def data_ptr(self):
-        return self._address
-
-
-def _FakeTransferStack(num_layers, address_base):
-    """One fake tensor per layer, at distinguishable addresses."""
-    return [_FakeTransferTensor(address_base + layer) for layer in range(num_layers)]
+def _transfer_stack(num_layers):
+    """One real 8-byte tensor per layer: `page_region` views and checks it, and
+    these tests read only which consumer row each region lands on."""
+    return [torch.zeros(8, dtype=torch.uint8) for _ in range(num_layers)]
 
 
 def _bind_builder(module, index_cache_layer_map, *, rows_before: int):
@@ -527,7 +510,7 @@ def test_transfer_regions_use_explicit_compact_consumer_map(monkeypatch):
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
     builder.kv_pool = _FakePool(
-        layers=4, regions=[*_FakeTransferStack(4, 100), *_FakeTransferStack(3, 200)]
+        layers=4, regions=[*_transfer_stack(4), *_transfer_stack(3)]
     )
     runner.index_cache_layer_ids = (3, 5, 6)
     builder.num_blocks = 8
@@ -561,7 +544,7 @@ def test_hybrid_transfer_regions_compact_both_kv_and_index_rows(monkeypatch):
     _mock_pp(monkeypatch, rank=1, world_size=2)
     builder.block_ratio = 1
     builder.kv_pool = _FakePool(
-        layers=2, regions=[*_FakeTransferStack(2, 100), *_FakeTransferStack(2, 200)]
+        layers=2, regions=[*_transfer_stack(2), *_transfer_stack(2)]
     )
     runner.index_cache_layer_ids = (3, 5)
     builder.num_blocks = 8

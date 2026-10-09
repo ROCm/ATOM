@@ -69,6 +69,7 @@ def metadata_buffers(batch_size, tokens, blocks, device="cpu", geometry=None):
             read_side=False,
         )
     )
+    buffers.update(DeepseekV41MetadataBuilder._engram_rows_buffer(tokens, device))
     if geometry is not None:
         buffers.update(
             DeepseekV41MetadataBuilder._compress_plan_buffers(

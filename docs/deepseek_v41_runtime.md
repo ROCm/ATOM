@@ -69,13 +69,17 @@ its own. Both arrangements are supported at TP4; whole-expert EP is the primary
 deployment configuration. Validate quality and throughput for the selected
 arrangement and workload.
 
-`index_cache_dtype="fp8"` is the only index plane, and the runtime refuses any
-other before loading weights. The main pool is independent of it and takes
+The index plane is `index_cache_dtype="fp8"` (default) or `"fp4"`, and the
+runtime refuses any other before loading weights. FP4 is the official
+arithmetic (E2M1, one E8M0 per 32 dims) in the row-group scorer's page-8
+layout, values and scales in two planes (`index_plane.py`); one aiter kernel
+norms, rotates, quantizes and stores a key, bit for bit the FP8 path's key
+chain before its quantization. The main pool is independent of it and takes
 `kv_cache_dtype="bf16"` or `"fp4"`; under FP4, main rows use their own format
 and SWA uses FP8. Both use the original V4 BF16 attention kernels and inverse
 RoPE; no V4 file is modified to serve V4.1.
 
-One plane means one scorer, for every shape. It reads the plane in place and
+Each plane format has one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a
 decode token and a drafted token are one shape to it and a ragged batch is not
 a case. The scorer consumes the existing paged index plane during prefill,
