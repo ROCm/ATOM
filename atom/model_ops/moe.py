@@ -5215,9 +5215,6 @@ class FusedMoE(torch.nn.Module):
 
             if _tbo:
                 tbo_switch_to_compute_sync()
-                compute = torch.cuda.current_stream()
-                hidden_states.record_stream(compute)
-                router_logits.record_stream(compute)
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
@@ -5257,10 +5254,6 @@ class FusedMoE(torch.nn.Module):
                 )
             if _tbo:
                 tbo_switch_to_compute_sync()
-                # The scatter allocates on comm, but callers consume on compute.
-                # This runs inside moe_forward's opaque runtime op, including
-                # compiled execution, and protects every model using this path.
-                final_hidden_states.record_stream(torch.cuda.current_stream())
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)
