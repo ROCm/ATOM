@@ -287,6 +287,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
+    # gfx1250: run the fused mHC post + pre (M < 1024) with AITER's Gluon kernels
+    # instead of HIP; shuffled residuals then use AITER's Gluon block width.
+    "ATOM_MHC_GLUON_POST_PRE": lambda: os.getenv("ATOM_MHC_GLUON_POST_PRE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.

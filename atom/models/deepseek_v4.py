@@ -4060,6 +4060,18 @@ class Block(nn.Module):
         self.enable_fused_hc = (
             self._mhc_fused_post_pre is not None and self.layer_id != 0
         )
+        # gfx1250 ATOM_MHC_GLUON_POST_PRE: AITER's Gluon fused post + pre reads and
+        # writes shuffled residuals in its own block (MHC_RES_KS_GLUON), so every
+        # shuffle and unshuffle of the residual uses it. None: AITER's default block.
+        self.mhc_res_ks = None
+        if (
+            envs.ATOM_MHC_GLUON_POST_PRE
+            and self._mhc_fused_post_pre is not None
+            and hasattr(aiter, "mhc_fused_post_pre_gluon")
+            and get_gfx_runtime() == "gfx1250"
+        ):
+            self._mhc_fused_post_pre = aiter.mhc_fused_post_pre_gluon
+            self.mhc_res_ks = aiter.MHC_RES_KS_GLUON
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -4110,6 +4122,8 @@ class Block(nn.Module):
             pack_kw = {"w_preshuffle_bf16": 1} if self.enable_hc_fn_pack_bf16 else {}
             if res_preshuffle:
                 pack_kw["res_preshuffle"] = True
+                if self.mhc_res_ks is not None:
+                    pack_kw["res_ks"] = self.mhc_res_ks
             post, comb, y = self._mhc_pre(
                 residual,
                 hc_fn,
@@ -4168,6 +4182,8 @@ class Block(nn.Module):
             # `out` inherits residual.dtype = x.dtype (residual stream is BF16
             # end-to-end in Block.forward), so no cast needed on the kernel path.
             post_kw = {"res_preshuffle": True} if res_preshuffle else {}
+            if res_preshuffle and self.mhc_res_ks is not None:
+                post_kw["res_ks"] = self.mhc_res_ks
             out = torch.empty_like(residual)
             self._mhc_post(
                 out,
@@ -4649,7 +4665,9 @@ class DeepseekV4Model(nn.Module):
         if hasattr(aiter, "mhc_res_repeat"):
             # Aiter writes either the ordinary repeated residual or the shuffled
             # gfx1250 layout directly, without materializing repeat + shuffle.
-            h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
+            res_ks = self.layers[0].mhc_res_ks
+            ks_kw = {} if res_ks is None else {"ks": res_ks}
+            h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle, **ks_kw)
         else:
             # Older AITER versions only support the ordinary residual layout.
             h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
