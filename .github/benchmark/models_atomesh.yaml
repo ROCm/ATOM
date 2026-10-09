@@ -487,19 +487,11 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32
           concurrency: [32]
           env:
-            <<: *glm52_agentic_lmcache_cpp4_dcp4_env
+            <<: *glm52_agentic_lmcache_cpp4_dcp4_env_common
             prefill:
-              <<: *glm52_agentic_lmcache_cpp4_dcp4_prefill_env
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-
-        - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c48
-          concurrency: [48]
-
-        - <<: *glm52_agentic_lmcache_chunked_cpp4_dcp4
-          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c56
-          concurrency: [56]
 
         # 4-5) 1P2D: CPP4 prefill (PP4×TP1, node 0) paired with 2× DPA4 decode
         # (dp4×tp1 each, node 1 GPU 0-3 and GPU 4-7). MTP4 with fixed
