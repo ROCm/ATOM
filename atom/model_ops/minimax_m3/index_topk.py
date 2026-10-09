@@ -353,9 +353,13 @@ def _emit_sparse_block_table_kernel(
         pid_h,
         block_size,
         pages_per_block,
-        block_page_stride,
-        NUM_KV_HEADS,
-        BLOCK_SIZE_T,
+        # By keyword: these three sit in a row, so dropping one from a
+        # positional call shifts the rest up and binds them silently -- which
+        # is exactly how two call sites on the indexer-CP path were left
+        # mis-bound when this parameter was added.
+        block_page_stride=block_page_stride,
+        NUM_KV_HEADS=NUM_KV_HEADS,
+        BLOCK_SIZE_T=BLOCK_SIZE_T,
     )
 
 
@@ -961,9 +965,10 @@ def _topk_index_packed_kernel(
             pid_h,
             block_size,
             pages_per_block,
-            block_page_stride,
-            NUM_KV_HEADS,
-            BLOCK_SIZE_T,
+            # By keyword, for the reason given at the other call site.
+            block_page_stride=block_page_stride,
+            NUM_KV_HEADS=NUM_KV_HEADS,
+            BLOCK_SIZE_T=BLOCK_SIZE_T,
         )
 
 
