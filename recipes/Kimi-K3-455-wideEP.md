@@ -2,10 +2,11 @@
 
 > **Current optimized source recipe:** use
 > [Kimi-K3-455-wideEP-optimized.md](Kimi-K3-455-wideEP-optimized.md) for the
-> exact 2026-10-08 ATOM/AITER bases, patch bundles, ptpc policy, launch, and
+> exact 2026-10-09 ATOM/AITER bases, patch bundles, ptpc policy, launch, and
 > accuracy gates. This page remains the historical bring-up/baseline record.
-> Its PR #2380 unfused-gather instructions apply to the older image path, not
-> the optimized #6120/#6121 source stack.
+> Its PR #2380 unfused-gather instructions apply only to the older
+> `20260918`/Triton 3.8 image path. The optimized source stack requires
+> Triton 3.9 plus AITER #6121 and does not include AITER #6120.
 
 Full-size **Kimi-K3** (2.78T, 93 layers: 24 full-attention MLA + 69 KDA linear,
 896 routed experts top-16, MXFP4 routed experts / BF16 everything else) served
@@ -340,9 +341,9 @@ sudo rm -f /dev/shm/psm_* /dev/shm/nccl-*
 
 ---
 
-## ⚠️ Required patch: ATOM PR #2380
+## ⚠️ Historical 20260918/Triton 3.8 patch: ATOM PR #2380
 
-**This configuration does not run on stock ATOM.** Apply
+**This older image configuration does not run on stock ATOM.** Apply
 [ROCm/ATOM#2380 — *feat(mla): unfused torch fallback for gather_kv_b_proj*](https://github.com/ROCm/ATOM/pull/2380)
 before serving, and set `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. Without the patch the
 env var does nothing and the server dies on the first long prompt at
@@ -801,7 +802,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `FAIL: HOTSWAP=1 but /app/rjprefix not found` | The prefix is not in the container. Re-install it; `docker rm` removes it. **Do not "fix" this with `HOTSWAP=0`** |
 | First decode request SIGABRTs, silently | `ATOM_USE_TRITON_MLA=1` not set |
 | `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
-| LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM |
+| LLVM PHI assertion on long input at concurrency | On the historical `20260918`/Triton 3.8 image, use [PR #2380](https://github.com/ROCm/ATOM/pull/2380) with `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. For the optimized source stack, upgrade to Triton 3.9 and use AITER #6121; do not apply the retired #6120 workaround |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
@@ -829,7 +830,8 @@ routed/grouped MoE stay excluded, while attention, dense, and shared-expert
 layers are enabled. `kv_b_proj` is allowed only with AITER #6121. The optional
 MegaMoE TDM/direct-route overlay is not part of the default or correctness
 stack, and stock `ATOM_MORI_V2_FUSED=1` is existing infrastructure rather than
-a claimed optimization.
+a claimed optimization. This path requires Triton 3.9; AITER #6120 is closed
+and absent because the exact upstream production case passed `3/3` strict.
 
 ## Throughput
 

@@ -2,11 +2,12 @@
 set -euo pipefail
 
 readonly ATOM_BASE="a526f0d557eeed08396670249af58bd85fa57338"
-readonly AITER_BASE="57b7cf03ad32f72247c151cff2933abd11ff77d1"
+readonly AITER_BASE="e6ded2168ef43111c57d591dd310eccdfc27aaf1"
 readonly ATOM_PATCH_SHA256="2cc961463aca0396b4decca2b1ffb03410d988bc1a21e7dfa2066eae3c03193c"
-readonly AITER_PATCH_SHA256="f05053b7d9453d5aa0c3030e12ae870a0ac127d1cb121985962baa278b7d0c88"
+readonly AITER_PATCH_SHA256="2a8d2860ef44b3ac02fe265f74683b7548cc1a086b8770f9fe73cc6ac04f875f"
 readonly EXPERIMENTAL_MORI_SHA256="31d6aa6e615007008692030ac3236055fec99427555a6ebf69e0f53571509d83"
 readonly BF16_SHA256="196fe1af733b2e62681c779b280829580de440c4917db3a86924bc7a8261ad9f"
+readonly MIN_TRITON_VERSION="3.9"
 
 EXPERIMENTAL_MORI=0
 if [[ ${1:-} == "--experimental-mori" ]]; then
@@ -26,6 +27,45 @@ AITER_PATCH="${HERE}/aiter.patch"
 EXPERIMENTAL_MORI_PATCH="${HERE}/experimental_mori_aiter.patch"
 BF16_SOURCE="${HERE}/k3_bf16_hot_gfx1250_production_safe.csv"
 BF16_DEST="${AITER_ROOT}/aiter/configs/k3_bf16_hot_gfx1250_production_safe.csv"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+verify_triton() {
+  "${PYTHON_BIN}" - "${MIN_TRITON_VERSION}" <<'PY'
+import sys
+
+minimum_text = sys.argv[1]
+try:
+    from packaging.version import InvalidVersion, Version
+except ImportError as exc:
+    raise SystemExit(
+        "packaging is required for the Triton version preflight; "
+        "install/upgrade packaging before applying this recipe"
+    ) from exc
+
+try:
+    import triton
+except ImportError as exc:
+    raise SystemExit(
+        "Triton is not importable; install Triton >= "
+        f"{minimum_text}. Do not apply the retired gather kernel workaround."
+    ) from exc
+
+version_text = str(getattr(triton, "__version__", "unknown"))
+path = str(getattr(triton, "__file__", "unknown"))
+print(f"Triton version: {version_text}")
+print(f"Triton path: {path}")
+try:
+    actual = Version(version_text)
+except InvalidVersion as exc:
+    raise SystemExit(f"cannot parse Triton version {version_text!r}") from exc
+minimum = Version(minimum_text)
+if actual < minimum:
+    raise SystemExit(
+        f"Triton >= {minimum} is required, found {actual}. "
+        "Upgrade Triton; do not apply the retired #6120 kernel workaround."
+    )
+PY
+}
 
 verify_repo() {
   local name=$1 root=$2 expected=$3 actual
@@ -59,6 +99,7 @@ patch_mode() {
 }
 
 # Complete every preflight before changing either checkout.
+verify_triton
 verify_repo ATOM "${ATOM_ROOT}" "${ATOM_BASE}"
 verify_repo AITER "${AITER_ROOT}" "${AITER_BASE}"
 verify_sha256 "${ATOM_PATCH_SHA256}" "${ATOM_PATCH}"

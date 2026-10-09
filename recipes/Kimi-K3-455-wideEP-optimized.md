@@ -21,6 +21,9 @@ export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=0
 export ATOM_UNFUSED_GATHER_KV_B_PROJ=0
 ```
 
+This uses the upstream Triton 3.9 gather path. AITER #6120 is not present:
+the exact production case passes `3/3` strict on current upstream Triton 3.9.
+
 The preceding clean stack passed non-fake text `10/10` and full five-shot
 GSM8K (`1319` samples): strict `0.9583 +/- 0.0055`. An earlier ptpc-only gate
 scored strict `0.9598 +/- 0.0054`, flexible `0.9606 +/- 0.0054`.
@@ -71,7 +74,7 @@ exists, even when VRAM is still empty.
 
 ## Prepare exact sources
 
-The manifest pins the fetched 2026-10-08 heads. Do not substitute a newer
+The manifest pins the fetched 2026-10-09 heads. Do not substitute a newer
 `main`.
 
 ```bash
@@ -79,7 +82,7 @@ git clone git@github.com:ROCm/ATOM.git ATOM-base
 git -C ATOM-base checkout --detach a526f0d557eeed08396670249af58bd85fa57338
 
 git clone git@github.com:ROCm/aiter.git AITER-base
-git -C AITER-base checkout --detach 57b7cf03ad32f72247c151cff2933abd11ff77d1
+git -C AITER-base checkout --detach e6ded2168ef43111c57d591dd310eccdfc27aaf1
 
 git clone --branch xiaobingsuper/kimi-k3-mi455-b0-recipe \
   git@github.com:ROCm/ATOM.git recipe
@@ -87,9 +90,11 @@ BUNDLE=$PWD/recipe/experiments/kimi_k3_b0/all_optimizations
 "$BUNDLE/apply.sh" "$PWD/ATOM-base" "$PWD/AITER-base"
 ```
 
-`apply.sh` verifies both base commits and artifact checksums, runs
-`git apply --check`, applies the patches, and installs the production-safe BF16
-CSV. Re-running it is safe.
+`apply.sh` first prints the imported Triton version and module path. It requires
+a PEP 440/`packaging.version`-comparable version of at least 3.9, then verifies
+both base commits and artifact checksums, runs `git apply --check`, applies the
+patches, and installs the production-safe BF16 CSV. Re-running it is safe. If
+the preflight reports Triton 3.8, upgrade Triton; do not restore #6120.
 
 ## Included formal PRs
 
@@ -103,8 +108,6 @@ CSV. Re-running it is safe.
   large LDS capacity for K3 `D=33792` SiTUv2 quantization.
 - [AITER #6115](https://github.com/ROCm/aiter/pull/6115): extend the fused G2L
   routing LUT to K3's 896 experts.
-- [AITER #6120](https://github.com/ROCm/aiter/pull/6120): fix gfx1250 Triton
-  `gather_kv_b_proj` code generation.
 - [AITER #6121](https://github.com/ROCm/aiter/pull/6121): optional Tier-B
   FlyDSL cached-prefix gather/projection.
 - [AITER #6130](https://github.com/ROCm/aiter/pull/6130): publish the gfx1250
@@ -113,6 +116,8 @@ CSV. Re-running it is safe.
   gfx1250 sigmoid top-k family.
 
 ATOM #2447 and the closed ATOM grouped-top-k candidate are deliberately absent.
+AITER #6120 is also absent: it was closed after Triton 3.9 passed the exact
+production case `3/3` strict.
 
 ## Retained local ATOM candidates
 

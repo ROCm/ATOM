@@ -972,10 +972,10 @@ index 9059edf88f5a327055647fd7405f81cfda3a65c5..2ba2d135e950d33b21de4a6e33cf852b
          )
  
 diff --git a/aiter/ops/topk.py b/aiter/ops/topk.py
-index 84cbd135e7dadaf0a76c16335f70ac8bc0820b18..00bef318e8f00dc31dd4ae7a32f57bf1c68df6e0 100644
+index 84cbd135e7dadaf0a76c16335f70ac8bc0820b18..60b5ac7e9ec2679f50966291810c993d7bae72d7 100644
 --- a/aiter/ops/topk.py
 +++ b/aiter/ops/topk.py
-@@ -29,6 +29,79 @@ def topk_gating_fwd(
+@@ -29,6 +29,77 @@ def topk_gating_fwd(
  
  
  _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
@@ -1040,9 +1040,7 @@ index 84cbd135e7dadaf0a76c16335f70ac8bc0820b18..00bef318e8f00dc31dd4ae7a32f57bf1
 +    need_renorm: bool,
 +    routed_scaling_factor: float,
 +) -> None:
-+    from .triton.moe.moe_routing.exact_sigmoid_topk import (
-+        exact_sigmoid_biased_topk,
-+    )
++    from .triton.moe.moe_routing.topk import exact_sigmoid_biased_topk
 +
 +    exact_sigmoid_biased_topk(
 +        gating_output,
@@ -1055,7 +1053,7 @@ index 84cbd135e7dadaf0a76c16335f70ac8bc0820b18..00bef318e8f00dc31dd4ae7a32f57bf1
  
  
  def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
-@@ -72,6 +145,20 @@ def topk_gating(
+@@ -72,6 +143,20 @@ def topk_gating(
              f"correction_bias dtype {correction_bias.dtype} is not supported for "
              f"{gating_output.dtype} gating_output, expected one of {valid}"
          )
@@ -1076,7 +1074,7 @@ index 84cbd135e7dadaf0a76c16335f70ac8bc0820b18..00bef318e8f00dc31dd4ae7a32f57bf1
      topk_gating_fwd(
          topk_weights,
          topk_indices,
-@@ -187,6 +274,24 @@ def biased_grouped_topk(
+@@ -187,6 +272,24 @@ def biased_grouped_topk(
  ):
      token_num = gating_output.shape[0]
      num_experts = gating_output.shape[1]
@@ -1122,19 +1120,14 @@ index 3c36124ef330a124a86a6a5693347e29f24091b2..d8fe3775f55d37272ab08ae233b90f72
      ),
      # HAS_V / COMPUTE_OUTPUT are in the key because the three passes below have
      # very different per-iteration cost and must not share a tuned config, and
-diff --git a/aiter/ops/triton/_triton_kernels/moe/moe_routing/exact_sigmoid_topk.py b/aiter/ops/triton/_triton_kernels/moe/moe_routing/exact_sigmoid_topk.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..a7951d521448e5d6fcd04b380856bcf05927d075
---- /dev/null
-+++ b/aiter/ops/triton/_triton_kernels/moe/moe_routing/exact_sigmoid_topk.py
-@@ -0,0 +1,70 @@
-+# SPDX-License-Identifier: MIT
-+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-+
-+import triton
-+import triton.language as tl
-+
-+
+diff --git a/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py b/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py
+index dce76977917be651463288d2822a9176a0caac79..a3e49912ea59fc2c5369efd4ae616047066ed0b4 100644
+--- a/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py
++++ b/aiter/ops/triton/_triton_kernels/moe/moe_routing/topk.py
+@@ -4,6 +4,75 @@ import triton.language as tl
+ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+ 
+ 
 +@triton.jit
 +def _exact_sigmoid_biased_topk(
 +    logits_ptr,
@@ -1151,6 +1144,11 @@ index 0000000000000000000000000000000000000000..a7951d521448e5d6fcd04b380856bcf0
 +    BLOCK_N: tl.constexpr,
 +    NEED_RENORM: tl.constexpr,
 +):
++    """gfx1250 caller-owned fp32/int32 specialization.
++
++    Kept separate from bitmatrix-producing ``_topk`` to preserve its ABI and
++    generic performance; also preserves HIP wave32 tie and NaN behavior.
++    """
 +    row = tl.program_id(0)
 +    cols = tl.arange(0, BLOCK_N)
 +    mask = (row < n_rows) & (cols < N_EXPERTS)
@@ -1160,7 +1158,6 @@ index 0000000000000000000000000000000000000000..a7951d521448e5d6fcd04b380856bcf0
 +    bias = tl.load(bias_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 +    scores = 1.0 / (1.0 + tl.exp(-logits))
 +    choice = tl.where(mask, scores + bias, float("-inf"))
-+    # The legacy gfx1250 HIP path ignores NaNs during its strict-greater scan.
 +    choice = tl.where(choice == choice, choice, float("-inf"))  # noqa: PLR0124
 +
 +    slots = tl.arange(0, TOPK)
@@ -1198,6 +1195,11 @@ index 0000000000000000000000000000000000000000..a7951d521448e5d6fcd04b380856bcf0
 +        selected_weights,
 +        mask=row_mask,
 +    )
++
++
+ @triton.jit
+ def get_topmask_and_fullmask(x):
+     tl.static_assert(
 diff --git a/aiter/ops/triton/configs/gfx1250/triton/attention/chunk_delta_attn/DEFAULT.json b/aiter/ops/triton/configs/gfx1250/triton/attention/chunk_delta_attn/DEFAULT.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..a78bbea849ac3e815031393bd23fa9adf2009f36
@@ -1215,47 +1217,22 @@ index 0000000000000000000000000000000000000000..a78bbea849ac3e815031393bd23fa9ad
 +        ]
 +    }
 +}
-diff --git a/aiter/ops/triton/gather_kv_b_proj.py b/aiter/ops/triton/gather_kv_b_proj.py
-index 61a92e534933438ed11a83bb915b3cb5da63d6fe..9ee532fa863a8237f20503af0ee9266163bb8194 100644
---- a/aiter/ops/triton/gather_kv_b_proj.py
-+++ b/aiter/ops/triton/gather_kv_b_proj.py
-@@ -122,10 +122,16 @@ def gather_kv_b_proj(
-     max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
-     flat_token_grid = block_size == 1 and not is_fp4_weight
-     if flat_token_grid:
--        chunk_workers = min(
--            max_kv_chunks,
--            max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
--        )
-+        if arch_info.get_arch() == "gfx1250":
-+            # The gfx1250 compiler rejects the runtime grid-stride loop in the
-+            # flat kernel with an LLVM PHI type assertion. One chunk per
-+            # workgroup removes that loop while retaining the fused operation.
-+            chunk_workers = max_kv_chunks
-+        else:
-+            chunk_workers = min(
-+                max_kv_chunks,
-+                max(1, (get_num_sms() * 6 + tp_k_head_num_k - 1) // tp_k_head_num_k),
-+            )
-         _triton_gather_kv_b_proj_flat[(tp_k_head_num_k * chunk_workers,)](
-             total_kv_k,
-             k_buffer,
-diff --git a/aiter/ops/triton/moe/moe_routing/exact_sigmoid_topk.py b/aiter/ops/triton/moe/moe_routing/exact_sigmoid_topk.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..931db5ed1c7fa9468f08363e05f19f3f4319bf82
---- /dev/null
-+++ b/aiter/ops/triton/moe/moe_routing/exact_sigmoid_topk.py
-@@ -0,0 +1,37 @@
-+# SPDX-License-Identifier: MIT
-+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-+
-+import torch
-+
-+from aiter.ops.triton._triton_kernels.moe.moe_routing.exact_sigmoid_topk import (
+diff --git a/aiter/ops/triton/moe/moe_routing/topk.py b/aiter/ops/triton/moe/moe_routing/topk.py
+index 94af50f12450b5864ba44a22effed6f96faf0178..c13c51866334e1bf224525a77212bd49d2269366 100644
+--- a/aiter/ops/triton/moe/moe_routing/topk.py
++++ b/aiter/ops/triton/moe/moe_routing/topk.py
+@@ -2,6 +2,7 @@ import torch
+ import triton
+ 
+ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
 +    _exact_sigmoid_biased_topk,
-+)
-+
-+
+     _grouped_topk,
+     _hash_routing,
+     _topk,
+@@ -9,6 +10,39 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
+ from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
+ 
+ 
 +def exact_sigmoid_biased_topk(
 +    gating_output: torch.Tensor,
 +    correction_bias: torch.Tensor,
@@ -1264,7 +1241,11 @@ index 0000000000000000000000000000000000000000..931db5ed1c7fa9468f08363e05f19f3f
 +    need_renorm: bool,
 +    routed_scaling_factor: float,
 +) -> None:
-+    """Run a measured gfx1250 sigmoid + bias top-k specialization."""
++    """Write exact gfx1250 sigmoid top-k results into caller-owned buffers.
++
++    Unlike :func:`topk`, this follows the HIP fp32/int32 ABI without a bitmatrix.
++    ``aiter.ops.topk`` guards the measured family and all fallback paths.
++    """
 +    num_experts = gating_output.shape[1]
 +    topk = topk_ids.shape[1]
 +    _exact_sigmoid_biased_topk[(gating_output.shape[0],)](
@@ -1279,272 +1260,15 @@ index 0000000000000000000000000000000000000000..931db5ed1c7fa9468f08363e05f19f3f
 +        routed_scaling_factor,
 +        N_EXPERTS=num_experts,
 +        TOPK=topk,
-+        BLOCK_N=1 << (num_experts - 1).bit_length(),
++        BLOCK_N=triton.next_power_of_2(num_experts),
 +        NEED_RENORM=need_renorm,
 +        num_warps=4,
 +    )
-diff --git a/csrc/include/aiter_hip_common.h b/csrc/include/aiter_hip_common.h
-index dacfb7429b6d9a09a6dbc1809620a3c342dbe412..4d764234a93e002f60e6c87f311432add6bfffc3 100644
---- a/csrc/include/aiter_hip_common.h
-+++ b/csrc/include/aiter_hip_common.h
-@@ -584,17 +584,7 @@ static uint32_t get_num_cu_func()
-     return num_cu;
- }
- 
--static uint32_t get_warp_size_func()
--{
--    static const uint32_t warp_size = []() {
--        hipDevice_t dev;
--        hipDeviceProp_t dev_prop;
--        HIP_CALL(hipGetDevice(&dev));
--        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
--        return static_cast<uint32_t>(dev_prop.warpSize);
--    }();
--    return warp_size;
--}
-+static uint32_t get_warp_size_func();
- 
- struct WarpSizeValue
- {
-@@ -679,3 +669,27 @@ struct SynchronizedCache
-     std::mutex map_mu;
-     std::unordered_map<Key, T, Hash, KeyEqual> map;
- };
 +
-+static uint32_t get_warp_size_func()
-+{
-+    static SynchronizedCache<int, uint32_t> cache;
-+    int device = -1;
-+    HIP_CALL(hipGetDevice(&device));
-+    return cache.get_or_create(device, [device]() {
-+        hipDeviceProp_t prop{};
-+        HIP_CALL(hipGetDeviceProperties(&prop, device));
-+        return static_cast<uint32_t>(prop.warpSize);
-+    });
-+}
 +
-+static size_t get_smem_size_func()
-+{
-+    static SynchronizedCache<int, size_t> cache;
-+    int device = -1;
-+    HIP_CALL(hipGetDevice(&device));
-+    return cache.get_or_create(device, [device]() {
-+        hipDeviceProp_t prop{};
-+        HIP_CALL(hipGetDeviceProperties(&prop, device));
-+        return prop.sharedMemPerBlock;
-+    });
-+}
-diff --git a/csrc/include/opus/opus.hpp b/csrc/include/opus/opus.hpp
-index 38bc9a53bc565123b30054db53e70ace1eaceeae..3aca72944e66a70fd9dbc8cad6f317c881afa15d 100644
---- a/csrc/include/opus/opus.hpp
-+++ b/csrc/include/opus/opus.hpp
-@@ -1597,6 +1597,8 @@ OPUS_H_D constexpr index_t get_smem_size()
- {
- #if defined(__gfx950__)
-     return 163840;  // 160KB (CDNA4)
-+#elif defined(__gfx1250__)
-+    return 327680;  // 320KB (CDNA5)
- #else
-     return 65536;   // 64KB
- #endif
-diff --git a/csrc/kernels/activation_kernels.cu b/csrc/kernels/activation_kernels.cu
-index 091a0276182f9d1f592df03e47f93855a251ddb3..fff6234d2fb2830478f9f7912a8ab8018e5b6adc 100644
---- a/csrc/kernels/activation_kernels.cu
-+++ b/csrc/kernels/activation_kernels.cu
-@@ -7,6 +7,7 @@
- // the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
- #define AITER_NO_TORCH_TYPES
- #include <cmath>
-+#include <limits>
- 
- #include "aiter_hip_common.h"
- #include "aiter_opus_plus.h"
-@@ -826,7 +827,11 @@ situv2_activate_scalar(const opus::vector_t<opus::bf16_t, VecSize>& gate,
- // FP32 LDS. WARP_SIZE is a device compile-time constant (32 on gfx12, 64 on
- // gfx9/gfx950), so the reduction follows the native wave topology on both, and
- // a single-wave block skips the cross-wave stage entirely.
--template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
-+template <int32_t BlockSize,
-+          int32_t VecSize,
-+          int32_t StaticD = 0,
-+          bool SinglePass = false,
-+          bool RecomputeMultiPass = false>
- __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
-     opus::fp8_t* __restrict__ out,
-     const opus::bf16_t* __restrict__ input,
-@@ -866,26 +871,34 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
-     static constexpr int32_t load_chunk_bytes =
-         load_bytes % 16 == 0 ? 16 : (load_bytes % 8 == 0 ? 8 : 4);
-     auto gate_buffer = opus::make_gmem<opus::bf16_t>(
--        gate_ptr, dim * sizeof(opus::bf16_t));
-+        gate_ptr,
-+        static_cast<unsigned int>(dim) *
-+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
-     auto up_buffer = opus::make_gmem<opus::bf16_t>(
--        up_ptr, dim * sizeof(opus::bf16_t));
-+        up_ptr,
-+        static_cast<unsigned int>(dim) *
-+            static_cast<unsigned int>(sizeof(opus::bf16_t)));
-     auto out_buffer = opus::make_gmem<opus::fp8_t>(
--        out_ptr, dim * sizeof(opus::fp8_t));
-+        out_ptr,
-+        static_cast<unsigned int>(dim) *
-+            static_cast<unsigned int>(sizeof(opus::fp8_t)));
- 
-     extern __shared__ float activated[];
--    auto* reduce_scratch = activated + (register_resident ? 0 : dim);
-+    auto* reduce_scratch =
-+        activated + ((register_resident || RecomputeMultiPass) ? 0 : dim);
-     float thread_max = 0.0f;
-     using vec_f       = opus::vector_t<float, VecSize>;
-     vec_f register_values{};
- 
--    auto activate_chunk = [&](int idx) {
-+    auto compute_chunk = [&](int idx) {
-         auto gate = load_vector_nbytes<
-             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(gate_buffer, idx);
-         auto up = load_vector_nbytes<
-             opus::bf16_t, VecSize, load_chunk_bytes, GROUP_NT>(up_buffer, idx);
- 
-         vec_f act_values{};
--        if constexpr(StaticD == 768 && (VecSize == 8 || VecSize == 4))
-+        if constexpr(
-+            (StaticD == 768 || StaticD == 33792) && (VecSize == 8 || VecSize == 4))
-         {
-             act_values = situv2_activate_packed<VecSize>(gate,
-                                                          up,
-@@ -900,10 +913,19 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
-             act_values = situv2_activate_scalar<VecSize>(
-                 gate, up, beta, gate_tanh_mul, linear_beta, up_tanh_mul, thread_max);
-         }
-+        return act_values;
-+    };
-+
-+    auto activate_chunk = [&](int idx) {
-+        vec_f act_values = compute_chunk(idx);
-         if constexpr(register_resident)
-         {
-             register_values = act_values;
-         }
-+        else if constexpr(RecomputeMultiPass)
-+        {
-+            return;
-+        }
-         else if constexpr(VecSize == 8 && StaticD != 0)
-         {
-             using vec_f4 = opus::vector_t<float, 4>;
-@@ -998,6 +1020,10 @@ __global__ __launch_bounds__(BlockSize) void situv2_and_mul_quant_kernel(
-         {
-             values = register_values;
-         }
-+        else if constexpr(RecomputeMultiPass)
-+        {
-+            values = compute_chunk(idx);
-+        }
-         else if constexpr(VecSize == 8 && StaticD != 0)
-         {
-             using vec_f4 = opus::vector_t<float, 4>;
-@@ -1732,7 +1758,11 @@ void silu_and_mul_quant(const aiter_tensor_t& out,
-     }
- }
- 
--template <int32_t BlockSize, int32_t VecSize, int32_t StaticD = 0, bool SinglePass = false>
-+template <int32_t BlockSize,
-+          int32_t VecSize,
-+          int32_t StaticD = 0,
-+          bool SinglePass = false,
-+          bool RecomputeMultiPass = false>
- static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
-                                         const aiter_tensor_t& input,
-                                         const aiter_tensor_t& scale,
-@@ -1759,15 +1789,17 @@ static void launch_situv2_and_mul_quant(const aiter_tensor_t& out,
-     const size_t num_waves  = (BlockSize + wave_size - 1) / wave_size;
-     // Activations need d floats unless they stay in registers; the cross-wave
-     // scratch needs num_waves floats unless the block is a single wave.
--    const size_t lds_bytes = (static_cast<size_t>(register_resident ? 0 : d) +
-+    const size_t lds_bytes =
-+        (static_cast<size_t>((register_resident || RecomputeMultiPass) ? 0 : d) +
-                               (single_wave ? 0 : num_waves)) *
--                             sizeof(float);
-+        sizeof(float);
-     // Both live in one dynamic allocation, so a wide row plus its scratch can
-     // outgrow the 64 KB budget even though d alone fits. Catch it here instead
-     // of at the launch, which would only report hipErrorInvalidValue.
--    AITER_CHECK(lds_bytes <= static_cast<size_t>(opus::get_smem_size()),
-+    AITER_CHECK(lds_bytes <= get_smem_size_func(),
-                 "situv2_and_mul_quant: d is too large for the LDS budget");
--    situv2_and_mul_quant_kernel<BlockSize, VecSize, StaticD, SinglePass>
-+    situv2_and_mul_quant_kernel<
-+        BlockSize, VecSize, StaticD, SinglePass, RecomputeMultiPass>
-         <<<dim3(num_tokens), dim3(BlockSize), lds_bytes, stream>>>(
-             reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-             reinterpret_cast<const opus::bf16_t*>(input.data_ptr()),
-@@ -1807,16 +1839,22 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
-                     linear_beta > 0.0f,
-                 "situv2_and_mul_quant: beta and linear_beta must be finite and positive");
- 
--    const int d              = input.size(-1) / 2;
-+    // Dynamic kernels advance a signed 32-bit index by at most 1024 * 8
-+    // elements. Leave room for the final loop increment, and reject before
-+    // narrowing the tensor dimension to int.
-+    constexpr int64_t max_kernel_stride = 1024 * 8;
-+    constexpr int64_t max_supported_d =
-+        static_cast<int64_t>(std::numeric_limits<int>::max()) - max_kernel_stride + 1;
-+    const int64_t d64 = input.size(-1) / 2;
-+    AITER_CHECK(d64 <= max_supported_d,
-+                "situv2_and_mul_quant: d exceeds the 32-bit kernel indexing limit (",
-+                max_supported_d,
-+                ")");
-+
-+    const int d              = static_cast<int>(d64);
-     const int64_t num_tokens = input.numel() / input.size(-1);
--    // Beyond 4096 the row no longer fits one chunk per thread, so it is staged
--    // in FP32 LDS instead. 16384 floats fill the 64 KB budget exactly, but the
--    // multi-pass path also needs one float per wave of cross-wave scratch out
--    // of the same allocation -- four of them for the widest such block (256
--    // threads on wave64) -- so the usable bound is the largest multiple of 8
--    // below 16384 - 4.
--    AITER_CHECK(d > 0 && d <= 16376 && d % 8 == 0,
--                "situv2_and_mul_quant: d must be divisible by 8 and in (0, 16376]");
-+    AITER_CHECK(d > 0 && d % 8 == 0,
-+                "situv2_and_mul_quant: d must be positive and divisible by 8");
-     AITER_CHECK(group_size == d,
-                 "situv2_and_mul_quant: only per-token quantization "
-                 "(group_size == d) is implemented");
-@@ -1843,6 +1881,25 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
- #define LAUNCH_SITUV2_SP(BLOCK_SIZE, VEC_SIZE, STATIC_D)                                   \
-     launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, STATIC_D, true>(                     \
-         out, input, scale, d, num_tokens, beta, linear_beta, stream)
-+#define LAUNCH_SITUV2_RECOMPUTE(BLOCK_SIZE, VEC_SIZE)                                      \
-+    launch_situv2_and_mul_quant<BLOCK_SIZE, VEC_SIZE, 0, false, true>(                      \
-+        out, input, scale, d, num_tokens, beta, linear_beta, stream)
-+
-+    const size_t smem_size = get_smem_size_func();
-+    const size_t static_scratch = (1024 / wave_size) * sizeof(float);
-+    if(d == 33792 &&
-+       static_cast<size_t>(d) * sizeof(float) + static_scratch <= smem_size)
-+    {
-+        LAUNCH_SITUV2(1024, 8, 33792);
-+        return;
-+    }
-+    const size_t generic_block = wave_size == 32 ? 96 : 256;
-+    const size_t generic_scratch = generic_block / wave_size * sizeof(float);
-+    if(static_cast<size_t>(d) * sizeof(float) + generic_scratch > smem_size)
-+    {
-+        LAUNCH_SITUV2_RECOMPUTE(1024, 8);
-+        return;
-+    }
- 
-     if(d == 768)
-     {
-@@ -1935,6 +1992,7 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
- 
- #undef LAUNCH_SITUV2
- #undef LAUNCH_SITUV2_SP
-+#undef LAUNCH_SITUV2_RECOMPUTE
- }
- 
- void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]
+ def grouped_topk(
+     x: torch.Tensor,
+     k: int,
 diff --git a/op_tests/test_flydsl_gather_kv_b_proj.py b/op_tests/test_flydsl_gather_kv_b_proj.py
 index b228fdaad88e0dfd24e7f9e760dea19603d99418..2c47f61f6108fb9f1ccfcd46d3af278092a58e34 100644
 --- a/op_tests/test_flydsl_gather_kv_b_proj.py
@@ -1994,195 +1718,3 @@ index 0000000000000000000000000000000000000000..5ba0fde40062e0de180975fbf49660ca
 +    assert not topk_ops._can_use_gfx1250_exact_sigmoid_topk(
 +        logits, bias, weights.to(torch.bfloat16), ids
 +    )
-diff --git a/op_tests/test_situv2_and_mul_quant.py b/op_tests/test_situv2_and_mul_quant.py
-index 46c714a1fc501500806ce9b95b7aaad7dffa354e..9f53347707a2e58c8a5429d531633e8f913835eb 100644
---- a/op_tests/test_situv2_and_mul_quant.py
-+++ b/op_tests/test_situv2_and_mul_quant.py
-@@ -104,6 +104,64 @@ def run_edge_shapes():
-         BETA,
-         LINEAR_BETA,
-     )
-+
-+    # Empty tensors exercise shape validation without allocating multi-GB
-+    # rows. The largest safe d leaves room for a final 1024 * 8 loop step.
-+    max_indexed_d = torch.iinfo(torch.int32).max - 1024 * 8 + 1
-+    situv2_and_mul_quant(
-+        torch.empty((0, max_indexed_d), dtype=dtypes.fp8),
-+        torch.empty((0, 2 * max_indexed_d), dtype=dtypes.bf16),
-+        torch.empty((0, 1), dtype=dtypes.fp32),
-+        max_indexed_d,
-+        BETA,
-+        LINEAR_BETA,
-+    )
-+
-+    too_large_d = max_indexed_d + 8
-+    # AITER_CHECK aborts rather than raising, so isolate the negative case.
-+    import subprocess
-+    import sys
-+
-+    cmd = [
-+        sys.executable,
-+        "-c",
-+        (
-+            "import torch\n"
-+            "from aiter import dtypes\n"
-+            "from aiter.ops.activation import situv2_and_mul_quant\n"
-+            f"d = {too_large_d}\n"
-+            "situv2_and_mul_quant(\n"
-+            "    torch.empty((0, d), dtype=dtypes.fp8, device='cuda'),\n"
-+            "    torch.empty((0, 2 * d), dtype=dtypes.bf16, device='cuda'),\n"
-+            "    torch.empty((0, 1), dtype=dtypes.fp32, device='cuda'),\n"
-+            f"    d, {BETA}, {LINEAR_BETA})\n"
-+        ),
-+    ]
-+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
-+    if proc.returncode == 0:
-+        raise AssertionError("oversized d must be rejected before int narrowing")
-+    assert "32-bit kernel indexing limit" in proc.stdout + proc.stderr
-+
-+    for d in (33792, 81912, 81920, 100000):
-+        x = torch.randn((2, 2 * d), dtype=dtypes.bf16)
-+        ref = run_torch(x)
-+        out = torch.empty((2, d), dtype=dtypes.fp8)
-+        scale = torch.empty((2, 1), dtype=dtypes.fp32)
-+        situv2_and_mul_quant(out, x, scale, d, BETA, LINEAR_BETA)
-+        checkAllclose(
-+            ref,
-+            out.to(dtypes.fp32) * scale,
-+            rtol=8e-2,
-+            atol=3e-1,
-+            msg=f"situv2_and_mul_quant d={d} out",
-+        )
-+        checkAllclose(
-+            ref.abs().amax(dim=-1, keepdim=True) / torch.finfo(dtypes.fp8).max,
-+            scale,
-+            rtol=2e-5,
-+            atol=3e-8,
-+            msg=f"situv2_and_mul_quant d={d} scale",
-+        )
-     aiter.logger.info("situv2_and_mul_quant edge shapes passed")
- 
- 
-diff --git a/op_tests/triton_tests/test_gather_kv_b_proj.py b/op_tests/triton_tests/test_gather_kv_b_proj.py
-index 3d2da2696efb96051c3ebc8f320cca8081c8e02d..a4d1b8c0fb5ff9bc6ba9b376ebf1337dbf899c8a 100644
---- a/op_tests/triton_tests/test_gather_kv_b_proj.py
-+++ b/op_tests/triton_tests/test_gather_kv_b_proj.py
-@@ -27,7 +27,7 @@ def ref_gather_kv_b_proj(
-     kv_indices: torch.Tensor,  # len(kv_indices) = kv_indptr[-1]
-     kv_prefix_sum_context_lens: torch.Tensor,  # [batch_size + 1]
-     kv_proj_weight: torch.Tensor,  # [tp_heads * (qk_nope_head_dim + v_head_dim), kv_c_dim]
--    kv_proj_scale: torch.Tensor,  # [weight_n] per-row or [N//128, K//128] block
-+    kv_proj_scale: torch.Tensor | None,  # None, [weight_n], or [N//128, K//128]
-     qk_nope_head_dim: int = 128,
-     v_head_dim: int | None = None,
- ):
-@@ -41,13 +41,17 @@ def ref_gather_kv_b_proj(
- 
-     _num_block, _block_size, hidden_dim = k_buffer.shape
-     weight_n, weight_k = kv_proj_weight.shape
--    per_row_scale = kv_proj_scale.dim() == 1 or (
--        kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
-+    no_scale = kv_proj_scale is None
-+    per_row_scale = not no_scale and (
-+        kv_proj_scale.dim() == 1
-+        or (kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1)
-     )
- 
-     assert hidden_dim == kv_c_dim + kv_pe_dim
-     assert weight_k == kv_c_dim
--    if per_row_scale:
-+    if no_scale:
-+        pass
-+    elif per_row_scale:
-         assert kv_proj_scale.numel() == weight_n
-     else:
-         scale_granularity_n = weight_n // kv_proj_scale.shape[0]
-@@ -74,7 +78,7 @@ def ref_gather_kv_b_proj(
-     k_prefix_tp = k_prefix.view(total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim)
-     v_prefix_tp = v_prefix.view(total_kv, tp_k_head_num, v_head_dim)
- 
--    if not per_row_scale:
-+    if not no_scale and not per_row_scale:
-         kv_proj_scale_repeat = kv_proj_scale.repeat_interleave(
-             scale_granularity_n, dim=0
-         )
-@@ -105,7 +109,9 @@ def ref_gather_kv_b_proj(
-             -1, kv_c_dim
-         )[: context_end - context_start, :]
- 
--        if per_row_scale:
-+        if no_scale:
-+            kv_proj = k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T
-+        elif per_row_scale:
-             kv_proj = (
-                 k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T
-             ) * (kv_proj_scale.to(torch.float32).reshape(1, -1))
-@@ -524,20 +530,29 @@ def test_gather_kv_b_proj_per_row_scale(
- 
- 
- @pytest.mark.parametrize(
--    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode",
-+    "batch_size, block_size, num_tp, total_heads, k_buffer_type, avg_kv_length, scale_mode",
-     [
--        (4, 1, 4, torch.bfloat16, 512, "block"),
--        (8, 16, 4, torch.bfloat16, 1024, "block"),
--        (4, 1, 4, dtypes.fp8, 512, "block"),
--        (8, 16, 4, dtypes.fp8, 1024, "block"),
--        (4, 1, 4, torch.bfloat16, 512, "per_row"),
--        (8, 16, 4, torch.bfloat16, 1024, "per_row"),
--        (4, 1, 4, dtypes.fp8, 512, "per_row"),
--        (8, 16, 4, dtypes.fp8, 1024, "per_row"),
-+        (4, 1, 4, 128, torch.bfloat16, 512, "block"),
-+        (8, 16, 4, 128, torch.bfloat16, 1024, "block"),
-+        (4, 1, 4, 128, dtypes.fp8, 512, "block"),
-+        (8, 16, 4, 128, dtypes.fp8, 1024, "block"),
-+        (4, 1, 4, 128, torch.bfloat16, 512, "per_row"),
-+        (8, 16, 4, 128, torch.bfloat16, 1024, "per_row"),
-+        (4, 1, 4, 128, dtypes.fp8, 512, "per_row"),
-+        (8, 16, 4, 128, dtypes.fp8, 1024, "per_row"),
-+        # gfx1250 flat-grid path: enough chunks to require GRID_STRIDE on main.
-+        (4, 1, 1, 96, dtypes.fp8, 2048, "none"),
-     ],
- )
- def test_gather_kv_b_proj_bf16_weight(
--    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, scale_mode, perf=False
-+    batch_size,
-+    block_size,
-+    num_tp,
-+    total_heads,
-+    k_buffer_type,
-+    avg_kv_length,
-+    scale_mode,
-+    perf=False,
- ):
-     """Test gather_kv_b_proj with bf16 weight (no quantization on weight).
- 
-@@ -550,9 +565,11 @@ def test_gather_kv_b_proj_bf16_weight(
-     kv_pe_dim = 64
-     qk_nope_head_dim = 128
-     v_head_dim = 128
--    tp_k_head_num = 128 // num_tp
-+    tp_k_head_num = total_heads // num_tp
-     num_block = 2 * avg_kv_length // block_size
--    weight_preshuffle = True
-+    # Kimi-K3's unquantized kv_b_proj stays row-major; the quantized cases use
-+    # the existing preshuffled path.
-+    weight_preshuffle = scale_mode != "none"
-     device = "cuda"
-     weight_dtype = torch.bfloat16
-     weight_n = tp_k_head_num * (qk_nope_head_dim + v_head_dim)
-@@ -603,10 +620,13 @@ def test_gather_kv_b_proj_bf16_weight(
-     # Use all-ones scale to simulate no weight quantization
-     if scale_mode == "per_row":
-         kv_proj_scale = torch.ones((weight_n, 1), device=device, dtype=torch.float32)
--    else:
-+    elif scale_mode == "block":
-         kv_proj_scale = torch.ones(
-             (weight_n // 128, kv_c_dim // 128), device=device, dtype=torch.float32
-         )
-+    else:
-+        assert scale_mode == "none"
-+        kv_proj_scale = None
- 
-     k_ref, v_ref = ref_gather_kv_b_proj(
-         k_buffer,
