@@ -203,6 +203,50 @@ jobs:
             lm_eval_num_concurrent: 8
             accuracy_test_threshold: 0.94
             runner: spur-runner-mi355x-8gpu
+          - model_name: "Kimi-K3 TP8"
+            model_path: "moonshotai/Kimi-K3"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 16384 --mem-fraction-static 0.93 --disable-radix-cache"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              SGLANG_PLUGINS=atom_sglang
+              SGLANG_USE_AITER=1
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+              ATOM_LOADER_NUM_THREADS=16
+              ATOM_SYNC_AFTER_LOAD=1
+              ATOM_DIST_TIMEOUT_SECONDS=3600
+              ATOM_USE_TRITON_GEMM=1
+              AITER_USE_GROUPED_GEMM=0
+              ATOM_USE_TRITON_MOE=0
+              AITER_FLYDSL_FORCE=1
+              AITER_FORCE_GFX1250=0
+              ATOM_MLA_PAGE_SIZE=1
+              ATOM_USE_UNIFIED_ATTN=1
+              ATOM_FORCE_ATTN_TRITON=1
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 64
+            accuracy_test_threshold: 0.94
+            runner: spur-runner-mi355x-8gpu
+          - model_name: "Qwen3.8-Flash-Next-FP8 TP2"
+            model_path: "Qwen/Qwen3.8-Flash-Next-FP8"
+            extra_args: "--trust-remote-code --tensor-parallel-size 2 --ep-size 2 --attention-backend aiter --kv-cache-dtype bf16 --page-size 64 --mem-fraction-static 0.95 --context-length 16384 --max-running-requests 32 --disable-radix-cache --reasoning-parser qwen3 --cuda-graph-backend-decode full --cuda-graph-max-bs-decode 32"
+            env_vars: |
+              SGLANG_DEFAULT_SERVER_ARGS=
+              SGLANG_PLUGINS=atom_sglang
+              SGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models
+              SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=atom.plugin.sglang.models
+              SGLANG_USE_AITER=1
+              SGLANG_AITER_KV_CACHE_LAYOUT=nhd
+              AITER_LOG_LEVEL=WARNING
+              AITER_MOE_PADDING_SIZE=128
+            lm_eval_num_fewshot: 5
+            lm_eval_num_concurrent: 32
+            lm_eval_use_chat_completions: "1"
+            lm_eval_extra_model_args: "max_retries=3,timeout=3600,tokenized_requests=False,trust_remote_code=True"
+            lm_eval_batch_size: 1
+            lm_eval_gen_kwargs: "max_gen_toks=4096,until=<|im_end|>"
+            accuracy_test_threshold: 0.96
+            runner: spur-runner-mi355x-8gpu
     env:
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
       CONTAINER_NAME: plugin_ci_sglang_${{ github.run_id }}_${{ strategy.job-index }}
@@ -241,6 +285,8 @@ jobs:
           MATRIX_LM_EVAL_NUM_CONCURRENT: ${{ matrix.lm_eval_num_concurrent }}
           MATRIX_LM_EVAL_USE_CHAT_COMPLETIONS: ${{ matrix.lm_eval_use_chat_completions }}
           MATRIX_LM_EVAL_EXTRA_MODEL_ARGS: ${{ matrix.lm_eval_extra_model_args }}
+          MATRIX_LM_EVAL_BATCH_SIZE: ${{ matrix.lm_eval_batch_size }}
+          MATRIX_LM_EVAL_GEN_KWARGS: ${{ matrix.lm_eval_gen_kwargs }}
           MATRIX_ACCURACY_TEST_THRESHOLD: ${{ matrix.accuracy_test_threshold }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

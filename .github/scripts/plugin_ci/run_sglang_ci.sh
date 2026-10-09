@@ -48,6 +48,8 @@ LM_EVAL_NUM_FEWSHOT="${MATRIX_LM_EVAL_NUM_FEWSHOT:-3}"
 LM_EVAL_NUM_CONCURRENT="${MATRIX_LM_EVAL_NUM_CONCURRENT:-65}"
 LM_EVAL_USE_CHAT_COMPLETIONS="${MATRIX_LM_EVAL_USE_CHAT_COMPLETIONS:-0}"
 LM_EVAL_EXTRA_MODEL_ARGS="${MATRIX_LM_EVAL_EXTRA_MODEL_ARGS:-}"
+LM_EVAL_BATCH_SIZE="${MATRIX_LM_EVAL_BATCH_SIZE:-}"
+LM_EVAL_GEN_KWARGS="${MATRIX_LM_EVAL_GEN_KWARGS:-}"
 ACCURACY_TEST_THRESHOLD="${MATRIX_ACCURACY_TEST_THRESHOLD:-0.0}"
 
 # shellcheck disable=SC1091
@@ -206,6 +208,14 @@ if [[ -n "${DRAFT_ID}" ]]; then
   fi
 fi
 
+eval_docker_env=()
+if [[ -n "${LM_EVAL_BATCH_SIZE}" ]]; then
+  eval_docker_env+=(-e "LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE}")
+fi
+if [[ -n "${LM_EVAL_GEN_KWARGS}" ]]; then
+  eval_docker_env+=(-e "LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS}")
+fi
+
 docker exec \
   -e SGLANG_MODEL_NAME="${MODEL_NAME}" \
   -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH}" \
@@ -218,6 +228,7 @@ docker exec \
   -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
   -e LM_EVAL_USE_CHAT_COMPLETIONS="${LM_EVAL_USE_CHAT_COMPLETIONS}" \
   -e LM_EVAL_EXTRA_MODEL_ARGS="${LM_EVAL_EXTRA_MODEL_ARGS}" \
+  "${eval_docker_env[@]}" \
   "${CONTAINER_NAME}" bash -lc "
     set -euo pipefail
     bash .github/scripts/atom_sglang_test.sh accuracy
