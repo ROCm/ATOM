@@ -400,6 +400,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # MiniMax-M3 prefill index scorer: aiter's FlyDSL MFMA kernel ("flydsl") or
+    # the Triton tile kernel ("triton"). "auto", the default, follows the INDEX
+    # CACHE DTYPE: flydsl on an fp8 cache, Triton on bf16. That is not a
+    # preference, it is where the kernel's `k_lds` path -- which stages K
+    # through LDS and so reads a quarter of the K bytes -- becomes legal, and
+    # without it the flydsl kernel takes a register path measured 3.6-4.8x
+    # SLOWER than Triton at 32k-116k context. With it, 36-46% faster over that
+    # same range. "auto" also falls back to Triton on an aiter that predates
+    # the kernel, since ATOM pins an older one and that aiter is a working M3.
+    # The two explicit values never fall back: a benchmark arm that asked for
+    # flydsl and silently got Triton is a wrong measurement, not a degraded
+    # one, so set one of them rather than "auto" when measuring. Decode has no
+    # such choice -- flydsl is its only scorer.
+    "ATOM_M3_PREFILL_INDEX_SCORE": lambda: os.getenv(
+        "ATOM_M3_PREFILL_INDEX_SCORE", "auto"
+    ),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

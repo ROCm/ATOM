@@ -550,6 +550,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         index_metadata,
     ):
         from atom.model_ops.minimax_m3.index_topk import (
+            index_score_work_map_for_forward,
             minimax_m3_index_topk_decode,
             n_valid_column_per_row_for_forward,
         )
@@ -595,6 +596,25 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 num_idx_heads=self.num_idx_heads,
                 decode_max_q=max_query_len,
             ),
+            # Same owner and the same hoist, for a steeper cost: the FlyDSL
+            # scorer builds its own dispatch map when none arrives, ~120us of
+            # launch floor against a score kernel of 17-250us, and it would be
+            # paid once per sparse layer instead of once per step.
+            #
+            # The bound is the block table's own width, not
+            # `ceil(max_seq_len/128)`: the map's row count IS the kernel's grid
+            # and must not move between capture and replay, and this step's
+            # longest request does move. vLLM sizes the decode block table from
+            # the model length, so its width is capture-stable.
+            index_score_work_map=index_score_work_map_for_forward(
+                main_metadata,
+                "decode",
+                index_decode_md.seq_lens,
+                max_block=index_decode_md.block_table.shape[1],
+                max_query_len=max_query_len,
+                num_idx_heads=self.num_idx_heads,
+            ),
+            index_score_max_block=index_decode_md.block_table.shape[1],
         )
         self._store_cached_topk(key, topk_idx)
         return topk_idx

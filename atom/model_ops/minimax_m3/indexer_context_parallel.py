@@ -2,71 +2,15 @@
 
 import torch
 import triton
-import triton.language as tl
 
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_BLOCK_SIZE_K,
     DECODE_TOPK_NUM_WARPS,
     _alloc_emit,
-    _decode_score_chunks,
     _launch_select,
     _require_packable,
+    decode_index_score,
 )
-
-
-@triton.jit(do_not_specialize=["LOCAL_BLOCKS", "GLOBAL_BLOCKS", "CHUNK"])
-def _context_score(
-    Q,
-    Cache,
-    Table,
-    Lengths,
-    Scores,
-    Q_TOKEN_STRIDE: tl.constexpr,
-    Q_HEAD_STRIDE: tl.constexpr,
-    TABLE_STRIDE: tl.constexpr,
-    HEADS: tl.constexpr,
-    QUERY_LEN: tl.constexpr,
-    LOCAL_BLOCKS,
-    GLOBAL_BLOCKS,
-    RANK: tl.constexpr,
-    WORLD: tl.constexpr,
-    CHUNK,
-    N: tl.constexpr,
-    SCALE: tl.constexpr,
-):
-    request = tl.program_id(0)
-    tokens = tl.num_programs(0) * QUERY_LEN
-    chunk = tl.program_id(1)
-    n = tl.arange(0, N)
-    token, head = n // HEADS, n % HEADS
-    row = request * QUERY_LEN + token
-    d = tl.arange(0, 128)
-    q = tl.load(
-        Q + row[None, :] * Q_TOKEN_STRIDE + head[None, :] * Q_HEAD_STRIDE + d[:, None],
-        mask=n[None, :] < HEADS * QUERY_LEN,
-        other=0,
-    )
-    length = tl.load(Lengths + request)
-    cutoff = length - QUERY_LEN + token + 1
-    pos = tl.arange(0, 128)
-    for local in range(chunk * CHUNK, tl.minimum((chunk + 1) * CHUNK, LOCAL_BLOCKS)):
-        block = local * WORLD + RANK
-        valid = (block < GLOBAL_BLOCKS) & (block * 128 < length)
-        # Every output slot is overwritten, including empty shards and replay padding.
-        score = tl.full((N,), float("-inf"), tl.float32)
-        if valid:
-            page = tl.load(Table + request * TABLE_STRIDE + block).to(tl.int64)
-            k = tl.load(Cache + page * 128 * 128 + pos[:, None] * 128 + d[None, :])
-            dot = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * SCALE
-            dot = tl.where(
-                block * 128 + pos[:, None] < cutoff[None, :], dot, float("-inf")
-            )
-            score = tl.max(dot, 0)
-        tl.store(
-            Scores + (head * tokens + row) * LOCAL_BLOCKS + local,
-            score,
-            mask=n < HEADS * QUERY_LEN,
-        )
 
 
 def indexer_context_scores(
@@ -79,11 +23,33 @@ def indexer_context_scores(
     world_size,
     max_query_len,
     sm_scale,
+    work_map=None,
+    max_block=0,
 ):
     """Return [heads,tokens,ceil(blocks/world)] with round-robin logical blocks.
 
     Index cache remains replicated. Caller supplies valid live lengths no greater
     than max_seq_len and in-bounds physical pages; no host reads of live metadata.
+
+    ``work_map`` is the scorer's packed dispatch order, built once per decode
+    step in the metadata against this rank's LOCAL block bound, and
+    ``max_block`` is that bound. Omitting them is correct and costs ~120us of
+    launch floor per call -- see :func:`decode_index_score`, which builds its
+    own when none arrives. Every production caller hoists.
+
+    ``max_block`` has to come from the caller rather than from ``max_seq_len``
+    here, and the two are NOT the same number under a cudagraph: the map's row
+    count is the grid, baked at capture, so its bound is the model length, while
+    ``max_seq_len`` is this step's longest request. The shard is therefore the
+    wider of the two and carries dead trailing blocks. Either width is a correct
+    input to `local_candidate_keys`, which reads the width off the tensor and
+    masks what is not this rank's to answer for.
+
+    Dead slots -- past a request's own blocks, or past this rank's share of the
+    global ones -- are left UNWRITTEN, so the result is not safe to read raw.
+    `local_candidate_keys` is what makes that sound: it masks both kinds, the
+    second from the (rank, world, global block count) it is given rather than
+    from the length. See the comment on the allocation below.
     """
     if (
         world_size < 1
@@ -136,32 +102,36 @@ def indexer_context_scores(
     ):
         raise ValueError("all score inputs must be on the same GPU")
     local = triton.cdiv(blocks, world_size)
-    scores = torch.empty(
-        (heads, tokens, local), dtype=torch.float32, device=idx_q.device
-    )
-    if tokens:
-        chunks = min(local, _decode_score_chunks(seq_lens.numel(), local))
-        _context_score[(seq_lens.numel(), chunks)](
-            idx_q,
-            index_cache,
-            block_table,
-            seq_lens,
-            scores,
-            Q_TOKEN_STRIDE=idx_q.stride(0),
-            Q_HEAD_STRIDE=idx_q.stride(1),
-            TABLE_STRIDE=block_table.stride(0),
-            HEADS=heads,
-            QUERY_LEN=max_query_len,
-            LOCAL_BLOCKS=local,
-            GLOBAL_BLOCKS=blocks,
-            RANK=rank,
-            WORLD=world_size,
-            CHUNK=triton.cdiv(local, chunks),
-            N=max(16, triton.next_power_of_2(heads * max_query_len)),
-            SCALE=sm_scale * 1.4426950409,
-            num_stages=3,
-        )
-    return scores
+    if not tokens:
+        return torch.empty((heads, 0, local), dtype=torch.float32, device=idx_q.device)
+    # A LOCAL bound, never the global `blocks`: under CP the kernel is given
+    # this rank's own block count and stores at the compacted local index. It
+    # must be the bound the map was built against -- a disagreement is caught
+    # there by a row-count assert rather than showing up as a silently
+    # misnumbered shard.
+    width = max_block or local
+    # Contiguous ON PURPOSE. The scorer's own allocator hands back a permuted,
+    # feature-contiguous view once `tokens * heads >= 16` -- which is every
+    # qlen>1 decode at world_size 4 -- and `local_candidate_keys` rejects a
+    # non-contiguous score outright. Both layouts carry bit-identical values,
+    # so asking for this one here costs the store's coalescing and nothing
+    # else, and it beats a copy after the fact.
+    #
+    # Uninitialised is correct here, though it is not obvious. Round-robin
+    # sharding does not divide evenly -- at 257 global blocks over 4 ranks,
+    # rank 0 owns 65 and ranks 1-3 own 64 while every shard is `ceil(257/4)`
+    # wide -- so three of the four carry a trailing slot the scorer never
+    # writes. `local_candidate_keys` masks those out from `(rank, world_size,
+    # global_blocks)` rather than from the length alone, so their content
+    # cannot reach the selection; `test_a_shard_that_runs_past_the_global_end
+    # _is_not_selectable` pins exactly that, and the Triton kernel this
+    # replaced paid for a full -inf store to get the same property.
+    out = torch.empty((heads, tokens, width), dtype=torch.float32, device=idx_q.device)
+    return decode_index_score(
+        idx_q, index_cache, block_table, seq_lens, width,
+        max_query_len, heads, sm_scale, work_map,
+        cp_world=world_size, cp_rank=rank, out=out,
+    )  # fmt: skip
 
 
 def select_global_blocks(

@@ -113,6 +113,13 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_V4_HCA_PERSIST** | bool | 1 (true) | DeepSeek-V4 HCA (`compress_ratio` 128) fp8 decode through aiter's persistent V4-NM kernel (`aiter.mla.mla_decode_fwd_v4_nm_ps`): one launch that splits the KV on the GPU and merges in-kernel, instead of the decode ASM plus a host-built split plan. Taken only with fp8 KV, 128 local heads, gfx950, row-dense KV pools and `ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768`; everything else stays on the ASM path. An aiter without the kernel keeps the ASM path (logged once). One workspace per device (about 64 MiB) is allocated at model load, before KV sizing and CUDA-graph capture. Set `0` to force the ASM path. |
 | **ATOM_V4_HCA_PERSIST_MIN_ROWS** | int | 15 | Smallest decode call (q rows) that uses `ATOM_V4_HCA_PERSIST`; smaller calls stay on the ASM path. |
 
+### MiniMax-M3
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_M3_PREFILL_INDEX_SCORE** | `auto` \| `flydsl` \| `triton` | `auto` | Which kernel scores the lightning-indexer blocks during prefill: aiter's FlyDSL MFMA kernel (`aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill`) or the Triton query-tile kernel it is being measured against. `auto` follows the **index cache dtype**: FlyDSL on an fp8 cache, Triton on bf16. That is where the kernel's `k_lds` path — which stages K through LDS and so reads a quarter of the K bytes — becomes legal; without it the FlyDSL kernel takes a register path measured 3.6–4.8× *slower* than Triton at 32k–116k context, and with it 36–46% faster over that same range. `auto` also falls back to Triton on an aiter that predates the kernel — it is newer than the aiter ATOM pins. The two explicit values never fall back: asking for `flydsl` on an aiter that lacks it raises, because an arm that silently ran the other kernel is a wrong measurement rather than a degraded one. Set one of them by name when benchmarking, never `auto`. Selection is unaffected either way — the two scorers agree on every block a row can select — so this is a pure performance A/B. Decode has no equivalent: FlyDSL is its only scorer. |
+
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
