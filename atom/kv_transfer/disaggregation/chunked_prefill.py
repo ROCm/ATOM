@@ -29,7 +29,7 @@ class PrefillHandoff:
     def from_wire(cls, req_id, data):
         """Validate the wire handoff and attach D's local request ID."""
         if not isinstance(data, dict):
-            raise ValueError("missing prefill handoff")
+            raise TypeError("prefill handoff must be a dictionary")
         first = data.get("first_token_id")
         drafts = data.get("draft_token_ids", [])
         cached = data.get("prefix_cache_hit_tokens", 0)
