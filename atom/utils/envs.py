@@ -162,11 +162,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS": lambda: _nonnegative_int_env(
         "ATOM_PD_MLA_LANDING_CREDIT_WAIT_MS", 10
     ),
-    # Decode: seconds a request that already failed on one prefill stage waits
-    # for the other stages before it is reported failed anyway.
-    "ATOM_PD_MLA_LANDING_FAIL_WAIT_S": lambda: _nonnegative_int_env(
-        "ATOM_PD_MLA_LANDING_FAIL_WAIT_S", 30
-    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
