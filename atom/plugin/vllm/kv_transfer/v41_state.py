@@ -114,6 +114,13 @@ class V41StateViews:
         # OOM during connector registration -- and the thing that has to shrink
         # is the KV pool or this depth, not the model. Say the figure at the
         # point of allocation so the traceback has it.
+        # The device the state lives on, named for the duck type the recurrent
+        # leg's own views satisfy (`KdaPageViews.device`): under the `mp`
+        # backend `_state_storage_for_mp` reads it to place this tier's
+        # staging, because there is no in-process engine to ask. Taken from
+        # the cache rather than from the staging ring below, so it is right
+        # even if the ring fails to allocate.
+        self.device = cache.state_bytes.device
         want = depth * self.entry_bytes
         try:
             self._staging = torch.empty(

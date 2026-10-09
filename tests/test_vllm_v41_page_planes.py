@@ -37,10 +37,15 @@ PAGED_BYTES = PAGE_BYTES + sum(OWNER_ROWS.values()) * INDEX_ROW_BYTES
 
 
 class FakeGeometry:
-    def __init__(self, page_bytes, paged_bytes, state_bytes):
+    def __init__(self, page_bytes, paged_bytes, state_bytes, index_planes=None):
         self.page_bytes = page_bytes
         self.paged_bytes = paged_bytes
         self.state_bytes = state_bytes
+        # `(name, row bytes)` per plane an owner's index rows take, which is
+        # what names the published plane. One entry is the fp8 layout; the fp4
+        # one has two (values and scales).
+        self.index_planes = index_planes or (("index", INDEX_ROW_BYTES),)
+        self.alignment = 1024
 
 
 class FakeCache:
@@ -105,7 +110,7 @@ def test_the_main_page_leads_and_index_planes_follow_owner_order():
     cache = FakeCache()
     roles = [role for role, _ in v41_page_planes(cache)]
     assert roles == ["dsv41.page"] + [
-        f"dsv41.index_plane.{owner}.0" for owner in OWNER_ROWS
+        f"dsv41.index_plane.{owner}" for owner in OWNER_ROWS
     ]
 
 
@@ -225,3 +230,31 @@ def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
         "the hardcoded speculative_tokens=0 is only safe while the platform "
         "refuses speculative decoding, and that refusal is gone"
     )
+
+
+def test_the_plugin_and_native_publishers_name_the_same_planes():
+    """Two publishers, one set of bytes, and nothing bound them together.
+
+    `v41_page_planes` (this connector) and
+    `DeepseekV41MetadataBuilder.get_kv_transfer_tensors` (the native
+    `lmcache_mp` path) each build their own list from the same cache. They
+    drifted once already -- a flat iteration here against a nested one there,
+    which published tuples where tensors belong -- and each publisher only
+    ever checks itself against its own `unit_regions`, so neither notices.
+
+    The names are the key space. Comparing the formats rather than running the
+    native publisher keeps this a unit test; what it pins is that a rename on
+    either side has to be a rename on both.
+    """
+    import inspect
+
+    from atom.model_ops.attentions.deepseek_v41 import backend as native
+    from atom.plugin.vllm import deepseek_v41_bridge as plugin
+
+    native_src = inspect.getsource(
+        native.DeepseekV41MetadataBuilder.get_kv_transfer_tensors
+    )
+    plugin_src = inspect.getsource(plugin.v41_page_planes)
+    for fmt in ('"dsv41.page"', 'f"dsv41.{name}_plane.{owner}"'):
+        assert fmt in native_src, f"native publisher no longer uses {fmt}"
+        assert fmt in plugin_src, f"plugin publisher no longer uses {fmt}"

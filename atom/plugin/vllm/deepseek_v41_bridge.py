@@ -609,10 +609,11 @@ def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
     a disjoint view of its tail. STATE is addressed by request slot, not by
     page, so a positional mover would hand one request another's rings.
     """
+    names = [name for name, _ in cache.geometry.index_planes]
     return [("dsv41.page", cache.page_bytes)] + [
-        (f"dsv41.index_plane.{owner}.{i}", plane)
-        for owner, planes in cache.index_planes.items()
-        for i, plane in enumerate(planes)
+        (f"dsv41.{name}_plane.{owner}", plane)
+        for owner, owned in cache.index_planes.items()
+        for name, plane in zip(names, owned)
     ]
 
 

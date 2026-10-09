@@ -532,6 +532,30 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         single sharded plane in the middle of the layout would be served to the
         wrong rank exactly as a sharded layout would.
         """
+        if self._is_deepseek_v41:
+            # The spec instrument is blind here by construction. V4.1 publishes
+            # through one proxy layer whose `FullAttentionSpec` is a byte
+            # container, not a description of attention, so reading it would
+            # answer "sharded" for a pool that is not -- costing a factor of
+            # TP in tier capacity for every V4.1 run.
+            #
+            # What stands in for it is the pool geometry: `build_v41_pool_geometry`
+            # takes the text config and the block size and NOTHING about tensor
+            # parallelism. A cache with any dimension split across ranks could
+            # not be sized without knowing how many ranks there are, so a
+            # geometry that never asks is a geometry that does not shard. The
+            # native backend reaches the same conclusion from the same model
+            # and says so in its own publisher
+            # (`DeepseekV41MetadataBuilder.get_kv_transfer_tensors`:
+            # "No cache dimension is split across TP"), and a test holds the
+            # two together so they cannot drift apart silently.
+            #
+            # The limit, stated rather than left to be discovered: this is not
+            # the independent instrument the rest of this method uses. It is
+            # two code paths in one tree agreeing about one model. If V4.1 ever
+            # shards a cache dimension, both have to change, and only the test
+            # would notice if one did not.
+            return max(1, int(getattr(self._config, "tensor_parallel_size", 1) or 1))
         groups = getattr(self._kv_cache_config, "kv_cache_groups", None) or ()
         if not groups:
             return 1
@@ -1052,12 +1076,24 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         extra = self._config.kv_transfer_config.get("kv_connector_extra_config") or {}
         depth = int(extra.get("atom.offload.v41.state_stage_depth", 8))
         views = V41StateViews(self._v41_cache, stage_depth=depth)
-        gpu_connector = self._worker._engine.gpu_connector
-        meta = self._worker._lmcache_metadata
+        # Same split the recurrent leg makes, and for the same reason: under
+        # `mp` the KV bytes live in the server process and there is no
+        # in-process `_engine` to borrow a GPU connector or a storage manager
+        # from. V4.1's STATE cannot follow the KV there -- the multiprocess
+        # protocol addresses groups by paged block and this state is addressed
+        # by request slot -- so it gets an engine of its own, in this process.
+        if self._offload_backend == "mp":
+            device, release_after, storage, meta = self._state_storage_for_mp(views)
+        else:
+            gpu_connector = self._worker._engine.gpu_connector
+            device = gpu_connector.device
+            release_after = gpu_connector.release_gpu_staging_after_transfer
+            storage = self._worker._engine.storage_manager
+            meta = self._worker._lmcache_metadata
         staged = StagedTransfer(
-            gpu_connector.device,
+            device,
             staging_buffer_bytes=views.entry_bytes,
-            release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
+            release_after_transfer=release_after,
         )
         codec = StateByteCodec(
             views,
@@ -1068,7 +1104,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             worker_id=int(meta.worker_id),
             layout_id=views.layout_id,
         )
-        codec.bind_storage_manager(self._worker._engine.storage_manager)
+        codec.bind_storage_manager(storage)
         self._v41_views = views
         self._kda_tier = KdaStateTier(codec, thread_name_prefix="atom-v41")
         self._v41_leg = V41StateWorkerLeg(views, self._kda_tier, self._v41_slots)
@@ -1565,7 +1601,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         sending, recving = self.get_finished(finished_req_ids)
-        failed = set(self._worker.take_load_error_reqs())
+        # The MP worker is a different class and does not carry the per-request
+        # failure set; only the in-process one records it. Absent, this reports
+        # no request-level failures, which is what the block channel did before
+        # -- a connector that raised here would turn every step into a dead
+        # engine on the backend that has the fewest ways to notice.
+        drain = getattr(self._worker, "take_load_error_reqs", None)
+        failed = set(drain()) if callable(drain) else set()
         if self._kda_error_reqs:
             failed |= self._kda_error_reqs
             self._kda_error_reqs = set()

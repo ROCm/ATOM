@@ -125,3 +125,21 @@ def test_a_connector_without_a_config_reads_as_single_group():
 
     c = object.__new__(AtomLMCacheOffloadConnector)
     assert c._multi_group_failures() is False
+
+
+def test_a_worker_without_the_request_set_is_not_an_error():
+    """The MP worker is a different class and does not record per-request
+    failures. Raising here would make the backend with the fewest ways to
+    notice a failure die on every step instead.
+    """
+    from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+
+    c = object.__new__(AtomLMCacheOffloadConnector)
+    c._worker = object()  # no take_load_error_reqs
+    c._kv_cache_config = _Cfg(2)
+    c._kda_error_reqs = set()
+    c._abandoned_loads = set()
+    c.get_finished = lambda ids: ({"s"}, {"r0"})
+    res = c.get_transfer_results(set())
+    assert res.failed_recving == set()
+    assert res.finished_recving == {"r0"}
