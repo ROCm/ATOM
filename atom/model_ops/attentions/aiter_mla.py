@@ -448,25 +448,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
 
-        self.dcp_sparse_prefill_nonps = (
-            self.is_sparse
-            and mla_dcp_sparse_prefill_uses_nonps(
-                self.dcp_world_size,
-                self.num_attention_heads * self.dcp_world_size,
-                self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
-                dcp_persistent,
-                config.max_num_batched_tokens,
+        nonps_args = (
+            self.dcp_world_size,
+            self.num_attention_heads * self.dcp_world_size,
+            self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
+            dcp_persistent,
+        )
+        self.dcp_sparse_prefill_nonps = self.is_sparse and (
+            mla_dcp_sparse_prefill_uses_nonps(
+                *nonps_args, config.max_num_batched_tokens
             )
         )
+        # Warn only when the step budget is what turned the flag off.
         if (
-            envs.ATOM_DCP_SPARSE_PREFILL_NONPS
-            and self.is_sparse
-            and config.max_num_batched_tokens > NONPS_MAX_Q_ROWS
+            self.is_sparse
+            and not self.dcp_sparse_prefill_nonps
+            and mla_dcp_sparse_prefill_uses_nonps(*nonps_args, NONPS_MAX_Q_ROWS)
         ):
             logger.warning(
                 "ATOM_DCP_SPARSE_PREFILL_NONPS ignored: max_num_batched_tokens=%d "
                 "exceeds the %d q rows the non-persistent gqa64 kernel takes; "
-                "DCP sparse prefill stays persistent.",
+                "DCP sparse prefill keeps its default kernel.",
                 config.max_num_batched_tokens,
                 NONPS_MAX_Q_ROWS,
             )
