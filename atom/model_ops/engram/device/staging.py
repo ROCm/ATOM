@@ -64,6 +64,7 @@ class EngramStaging:
             host.max_num_tokens, dtype=torch.int32, device=host.device
         )
         self.step = None
+        self.forked = True
         self.flat = {
             layer: torch.empty(
                 host.max_num_tokens,
@@ -189,6 +190,13 @@ class EngramStaging:
         # the compute stream instead: same work in the same order, with the
         # prefetch no longer overlapping the layers that consume it.
         forking = not capture_breaks_mid_forward()
+        # Remembered for `consume` and `join`, which otherwise order against a
+        # stream that was never forked. Under a breakable capture that is not
+        # merely redundant: this function runs in an eager break, so its
+        # events are recorded off-capture, and a captured layer waiting on one
+        # is refused -- `hipErrorStreamCaptureIsolation`, "dependency created
+        # on uncaptured work in another stream".
+        self.forked = forking
         issuing = self.stream if forking else compute
         if forking:
             # Get the parent BEFORE entering the guard: waiting on ourselves
@@ -230,11 +238,13 @@ class EngramStaging:
                 elif host._tp_group is None:
                     host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
                 # Ready means the complete embedding, including TP reassembly.
-                self.done[layer].record(issuing)
+                if forking:
+                    self.done[layer].record(issuing)
 
     def consume(self, layer, width):
         host = self.host
-        torch.cuda.current_stream(host.device).wait_event(self.done[layer])
+        if getattr(self, "forked", True):
+            torch.cuda.current_stream(host.device).wait_event(self.done[layer])
         if host._tp_group is not None and self.collective is None:
             out = self.flat[layer][:width]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
@@ -243,7 +253,10 @@ class EngramStaging:
 
     def join(self):
         # Close the fork even if a partial forward did not consume every layer.
-        torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
+        # Nothing to close when there was no fork, and saying so matters: the
+        # wait would otherwise cross the capture boundary this step runs on.
+        if getattr(self, "forked", True):
+            torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
 
 
 class EngramStagedRows(dict):

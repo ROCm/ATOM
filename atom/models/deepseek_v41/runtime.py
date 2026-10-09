@@ -10,6 +10,13 @@ from atom.utils.forward_context import get_forward_context
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
 
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+except ImportError:  # no vLLM, or too old for breakable capture: no break
+
+    def eager_break_during_capture(fn):
+        return fn
+
 
 def _fake_layer_output(hidden, layer_name):
     return torch.empty_like(hidden)
@@ -17,9 +24,24 @@ def _fake_layer_output(hidden, layer_name):
 
 # The boundary ops carry a dependency on hidden so the compiler retains and
 # orders the stream fork/join with the model's tensor work.
+@eager_break_during_capture
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_begin_forward(hidden: torch.Tensor) -> None:
-    """Read live request state on every execution, including graph capture."""
+    """Read live request state on every execution, including a replay.
+
+    A break, and it has to be: everything here is per step and host-decided --
+    the cursor advance, the Engram snapshot, the staging fork -- and under
+    vLLM's breakable capture a forward that is not a break runs once, at
+    capture, and never again. The kernels this issues were recorded with the
+    warmup batch's values, so every replay rewrote the cursor's position
+    column with the warmup's 1: a decode at position 29 then found its state
+    at 1, with the history column (28) correct beside it.
+
+    The shape the decorator wants, by construction rather than by care: one
+    tensor argument, mutated in place, everything else read from the forward
+    context -- which `v41_stage_step` republishes from inside its own break,
+    so the metadata this reads is this step's and not the recorded one.
+    """
     metadata = get_forward_context().attn_metadata
     metadata.step.begin_forward()
     if not metadata.step.requests:
@@ -31,8 +53,10 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
         stage()
 
 
+@eager_break_during_capture
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_end_forward(hidden: torch.Tensor) -> None:
+    """Closes what `v41_begin_forward` opened, so it breaks for the same reason."""
     metadata = get_forward_context().attn_metadata
     if not metadata.step.requests:
         hidden.zero_()

@@ -1109,6 +1109,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 input_ids=input_ids,
                 positions=positions,
                 slot_allocator=slot_allocator,
+                vllm_config=self.vllm_config,
                 force_dummy=not ready,
             ) as atom_positions:
                 hidden_states = self.model(

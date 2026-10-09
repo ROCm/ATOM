@@ -153,9 +153,34 @@ class TestProxyBlockSizing:
         config = _vllm_config(max_num_seqs=max_num_seqs)
         reserve = v41_proxy_state_reserve_blocks(config)
         page_size = v41_proxy_page_size_bytes(config)
-        needed = max_num_seqs * fake_geometry.state_bytes
+        # Two halves, not one: the scheduler's slots, and the same number
+        # again for the rows vLLM stages during warmup and capture. Those rows
+        # never finish, so lending them slots out of the scheduler's share
+        # lends them permanently, and the first full batch of real requests
+        # then evicted a live one. Asserted against
+        # `v41_num_state_slots` rather than `2 * max_num_seqs` so the two
+        # cannot drift, and the second half is asserted separately below --
+        # sizing the tail for one half is exactly the regression this guards.
+        slots = bridge.v41_num_state_slots(config)
+        assert slots == 2 * bridge.v41_scheduler_state_slots(config)
+        needed = slots * fake_geometry.state_bytes
         assert reserve * page_size >= needed
         assert (reserve - 1) * page_size < needed
+
+    @pytest.mark.parametrize("num_reqs", [1, 8, 64])
+    def test_capture_slots_cannot_collide_with_a_request(self, fake_geometry, num_reqs):
+        """The capture half is disjoint from everything the allocator owns.
+
+        Both halves of the refusal this replaces: a synthetic batch whose rows
+        shared one slot (`begin_step`: "Each request needs its own valid STATE
+        slot"), and one that took slots the allocator had already given out
+        (a decode at position 912 finding a cursor at 1).
+        """
+        config = _vllm_config(max_num_seqs=64)
+        slots = bridge.v41_capture_state_slots(num_reqs, config)
+        assert len(set(slots.tolist())) == num_reqs
+        assert min(slots.tolist()) >= bridge.v41_scheduler_state_slots(config)
+        assert max(slots.tolist()) < bridge.v41_num_state_slots(config)
 
     def test_state_reserve_is_zero_for_every_other_model(self, monkeypatch):
         # The reserve patch is installed process-wide, so this zero is what
