@@ -133,6 +133,14 @@ on:
         required: false
         default: rocm/atom-dev:latest
         type: string
+      atom_source:
+        description: 'ATOM python package the servers import: mounted = this checkout (mounted at /workspace/ATOM), image = the copy installed in the docker image (/app/ATOM). Scripts and the mesh router still come from this checkout.'
+        required: false
+        default: mounted
+        type: choice
+        options:
+          - mounted
+          - image
       atomesh_slurm_submit_runner:
         description: 'GitHub runner label used to submit Slurm jobs: atomesh-cicd = TW MI355X, atomesh-cicd-mi350 = Spur MI350X, atomesh-cicd-mi355-crusoe = Crusoe MI355X'
         required: false
@@ -1668,6 +1676,7 @@ jobs:
           # existing release profile for both benchmark and eval services.
           ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
+          ATOMESH_ATOM_SOURCE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_source || 'mounted' }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
           RESULT_DIR: atomesh-results
           SLURM_SUBMIT_RUNNER: ${{ matrix.runner.slurm_submit_runner }}
