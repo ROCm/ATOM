@@ -103,7 +103,9 @@ class ScoreWorkspace:
     `pages` bounds the PAGE pool the FP4 plane's packed rows can see.
     """
 
-    def __init__(self, geometry, max_tokens, columns, device, pages=None):
+    def __init__(
+        self, geometry, max_tokens, columns, device, pages=None, candidate_blocks=0
+    ):
         ratios = sorted({ratio for _, ratio in geometry.owners})
         self._tiles = {
             ratio: torch.empty(
@@ -113,7 +115,27 @@ class ScoreWorkspace:
             )
             for ratio in ([] if geometry.index_fp4 else ratios)
         }
+        # Two independent widths, and the plane has to hold the larger.
+        #
+        # A layer reading the whole context needs `columns * rows_per_page`.
+        # A layer reading an earlier layer's candidate list needs
+        # `candidate_blocks * index_block_rows` instead -- and that second
+        # number comes from the checkpoint (`candidate_topk_blocks`), not from
+        # `max_model_len`, so which of the two is larger flips with the
+        # context length. Sizing from the first alone fits every long-context
+        # configuration and none of the short ones: the candidate plane then
+        # overruns a workspace whose own arithmetic is correct, and the error
+        # names the scorer rather than the budget it was sized from.
         widths = [columns * geometry.rows_per_page(ratio) for ratio in ratios]
+        if candidate_blocks:
+            # Two independent widths, and the plane has to hold the larger. A
+            # layer reading the whole context needs `columns * rows_per_page`;
+            # one reading an earlier layer's candidate list needs
+            # `candidate_blocks * index_block_rows`, which the checkpoint fixes
+            # and `max_model_len` does not bound -- so which is larger flips
+            # with the context length, and sizing from the first alone fits
+            # every long-context configuration and none of the short ones.
+            widths.append(candidate_blocks * geometry.index_block_rows)
         plane = max((min(max_tokens, plane_rows(w)) * w for w in widths), default=0)
         self.packed = geometry.index_fp4
         if self.packed and pages is None:

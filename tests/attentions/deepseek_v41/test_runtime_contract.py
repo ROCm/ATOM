@@ -135,6 +135,101 @@ def test_lmcache_mp_is_the_only_kv_transfer_admitted():
         )
 
 
+def vllm_plugin_config(**overrides):
+    """A config the way the vLLM plugin builds one for V4.1.
+
+    `plugin_config.is_vllm` is what distinguishes it from the other plugin
+    backends, which still have no V4.1 bridge; `kv_cache_block_size` is 256
+    because that is the PAGE size `atom.config` forces for this model and the
+    proxy layer's block size on the vLLM side.
+    """
+    fields = {
+        "plugin_config": SimpleNamespace(is_vllm=True),
+        "enable_prefix_caching": False,
+        "kv_cache_block_size": 256,
+    }
+    fields.update(overrides)
+    return runtime_config(**fields)
+
+
+def test_vllm_plugin_text_path_is_admitted():
+    validate_runtime_config(vllm_plugin_config())
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        # DSpark is admitted (see the test below); every other method still
+        # has no driver on this path.
+        {
+            "speculative_config": SimpleNamespace(
+                method="eagle3", num_speculative_tokens=5
+            )
+        },
+        # CSA2 blocks are reusable only at whole-PAGE boundaries after the
+        # compressor has run, so vLLM's hash-based reuse would hand back
+        # blocks whose STATE side was never replayed.
+        {"enable_prefix_caching": True},
+    ],
+)
+def test_vllm_plugin_refuses_what_the_bridge_cannot_drive(override):
+    with pytest.raises(ValueError):
+        validate_runtime_config(vllm_plugin_config(**override))
+
+
+def test_vllm_plugin_admits_dspark_speculation():
+    """vLLM owns the DSpark draft; the bridge owes only the CSA2 state a
+    verification step leaves behind, which it now stages and commits."""
+    validate_runtime_config(
+        vllm_plugin_config(
+            speculative_config=SimpleNamespace(
+                method="dspark", num_speculative_tokens=5, model=None
+            ),
+            # What `--kv-cache-dtype auto` resolves to for this model; the
+            # draft's own `fp8_ds_mla` lives in vLLM's speculative config, not
+            # here, because the two pools no longer share a CacheConfig.
+            kv_cache_dtype="bf16",
+            # The native DSpark knobs this gate reads; their defaults are off,
+            # and the dynamic-schedule branch below them is a native concern.
+            dspark=SimpleNamespace(
+                confidence_schedule=None, ragged=False, calibration_profile=None
+            ),
+        )
+    )
+
+
+def test_other_plugin_backends_are_still_refused_outright():
+    with pytest.raises(ValueError, match="plugin mode outside vLLM"):
+        validate_runtime_config(
+            runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
+        )
+
+
+def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
+    """The plugin's transport is vLLM's `kv_connector`, not an ATOM name.
+
+    Resolving it through `KVConnectorFactory` is a category error, so the gate
+    forks on the mode. This also pins that the gate is *reachable* at all: it
+    reads `Config.kv_transfer_config`, which the plugin path populates in
+    `atom.plugin.config`. Before that plumbing existed the dict was always
+    empty here and every connector was admitted without the question being
+    asked -- a check that passes because it was never run.
+    """
+    validate_runtime_config(vllm_plugin_config(kv_transfer_config=None))
+    # The allow-list is empty on this path, so every connector is refused --
+    # including `lmcache_mp`, which is admitted natively and means nothing
+    # here. A PAGE prefix restored without its CSA2 STATE kills the engine, so
+    # there is no partial transport worth admitting.
+    for connector in (
+        "AtomLMCacheOffloadConnector",
+        "LMCacheConnectorV1",
+        "lmcache_mp",
+        "NixlConnector",
+    ):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                vllm_plugin_config(kv_transfer_config={"kv_connector": connector})
+            )
 def _attach_uncompiled_backbone(model):
     """The runtime model's one compiled graph, built bare and run uncompiled,
     for a model assembled without its constructor."""
@@ -365,3 +460,68 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+def test_the_scorer_plane_fits_the_candidate_list_at_short_contexts():
+    """The candidate plane is wider than the context one below ~16k tokens.
+
+    `candidate_topk_blocks` comes from the checkpoint and `max_model_len` does
+    not bound it, so which of the two planes is widest flips with the context
+    length. Sizing from the context alone fits every long-context
+    configuration and none of the short ones -- and the failure surfaces as
+    "a [8192, 16384] scorer temporary exceeds its workspace", naming the
+    scorer rather than the budget it was sized from. This is checkable from a
+    geometry alone: no model, no GPU, no vLLM.
+    """
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+
+    geo = V41PoolGeometry(
+        26, ((20, 1),), 256, 128, 512, 128, index_block_rows=8, index_topk=512
+    )
+    # 8192 tokens of context: 32 PAGEs of 256, so the context plane is
+    # 32 * 256 = 8192 wide. The candidate list is 2048 blocks of 8 = 16384.
+    columns, candidate_blocks = 32, 2048
+    context_width = columns * geo.rows_per_page(1)
+    candidate_width = candidate_blocks * geo.index_block_rows
+    assert candidate_width > context_width, "fixture no longer exercises the case"
+
+    ws = ScoreWorkspace(geo, 8192, columns, "cpu", candidate_blocks=candidate_blocks)
+    # The call the old sizing refused, at the exact shape it refused it in.
+    ws.logits(8192, candidate_width)
+
+    # And the context plane still fits, so this widened rather than traded.
+    ws.logits(8192, context_width)
+
+    # Negative control: without the candidate width the same call must fail,
+    # or this test would pass against the defect it exists to catch.
+    narrow = ScoreWorkspace(geo, 8192, columns, "cpu")
+    with pytest.raises(ValueError, match="exceeds its workspace"):
+        narrow.logits(8192, candidate_width)
+
+
+def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
+    """Sized from every leading dim of `hidden`, not from `shape[0]`.
+
+    ATOM hands this layer `[batch, tokens, dim]`; upstream's native V4.1 gets
+    `[tokens, dim]`, and its `_alloc_attn_out(hidden_states.shape[0], ...)`
+    is correct only for that shape. Copying the form without the premise
+    allocates one row per sequence, and the 518 tests here all passed on it --
+    only a kernel's own `out=` check caught it, at server startup.
+    """
+    import torch
+
+    pytest.importorskip("aiter", reason="the attention module reaches AITER")
+    from atom.models.deepseek_v41.attention import Attention
+
+    heads, head_dim = 16, 512
+    stub = SimpleNamespace(heads=heads, head_dim=head_dim)
+
+    for shape, tokens in (((8192, 7168), 8192), ((1, 8192, 7168), 8192)):
+        hidden = torch.empty(shape, dtype=torch.bfloat16, device="cpu")
+        out = Attention._alloc_attn_out(stub, hidden)
+        assert out.shape[-2:] == (heads, head_dim)
+        # The leading dims are whatever `hidden` had, so the flatten this
+        # path performs next yields one row per token under either layout.
+        assert (
+            out.shape[:-2].numel() == tokens
+        ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"

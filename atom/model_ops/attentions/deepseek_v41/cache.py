@@ -45,7 +45,60 @@ from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    def __init__(self, geometry, pages, slots, device, max_tokens=0, workspace=None):
+    @staticmethod
+    def _adopt_backing(backing, size, device):
+        """Take an externally owned uint8 arena as this cache's whole pool.
+
+        The vLLM plugin path pages out of the slab vLLM's KVCacheManager
+        allocated for ATOM's proxy attention layer, so that the pool is not
+        allocated a second time beside vLLM's own accounting. The hand-over is
+        all or nothing: PAGE and STATE share one address space because
+        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
+        the paged region, and the index builder emits page rows and window rows
+        into a single array that is dereferenced against a single base. A
+        caller that owns only the block pool must therefore hand over a slab
+        wide enough for STATE behind it as well.
+
+        The arena has to behave exactly like the ``torch.zeros`` it replaces:
+        flat uint8, contiguous, on this cache's device, and at least ``size``
+        bytes. It is trimmed to exactly ``size`` because the regions carved out
+        of it are reshaped to their own strides, which a longer tail would not
+        divide.
+        """
+        if not isinstance(backing, torch.Tensor):
+            raise TypeError("An external CSA2 backing must be a tensor")
+        if backing.dtype != torch.uint8 or backing.dim() != 1:
+            raise ValueError("An external CSA2 backing must be flat uint8")
+        if not backing.is_contiguous():
+            raise ValueError("An external CSA2 backing must be contiguous")
+        # Where ``torch.zeros(device=device)`` would have put it -- an
+        # index-less ``cuda`` means the current device, which is what vLLM
+        # hands down in ``device_config.device``, and comparing that to a
+        # tensor's always-indexed ``.device`` would never match.
+        resolved = torch.empty(0, device=device).device
+        if backing.device != resolved:
+            raise ValueError(
+                f"An external CSA2 backing on {backing.device} cannot back a "
+                f"cache on {resolved}"
+            )
+        if backing.numel() < size:
+            raise ValueError(
+                f"An external CSA2 backing of {backing.numel()} bytes is short "
+                f"of the {size} this geometry needs"
+            )
+        return backing[:size]
+
+    def __init__(
+        self,
+        geometry,
+        pages,
+        slots,
+        device,
+        max_tokens=0,
+        workspace=None,
+        *,
+        backing=None,
+    ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
@@ -56,7 +109,13 @@ class PagedAttentionCache:
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
         size = boundary + slots * geometry.state_bytes
-        self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
+        if backing is None:
+            self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
+        else:
+            self.backing = self._adopt_backing(backing, size, device)
+            # What the `torch.zeros` above already guarantees, and what the
+            # cursor reset below and every cold read assume.
+            self.backing.zero_()
         main_bytes = self.num_pages * geometry.page_bytes
         self.pages = EntryMajorArena(
             geometry.page_fields,
@@ -300,6 +359,13 @@ class PagedAttentionCache:
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
+
+        # Held so a reader that cannot be handed this object still finds it.
+        # Under vLLM's breakable capture an eager break is replayed with the
+        # arguments it was captured with, so attention cannot take `step` as a
+        # parameter and see this step -- it would see the one recorded with the
+        # graph. The cache outlives every step, so reading it from here is live.
+        self.current_step = step
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
@@ -369,6 +435,7 @@ class PagedAttentionCache:
         if not wrong.size:
             return
         first = int(wrong[0])
+
         raise ValueError(
             f"Request {requests[first]} needs state at {starts[first]}, "
             f"found {int(cursors[first, 0])}; replay from a recoverable boundary"
@@ -658,6 +725,7 @@ class PagedAttentionCache:
         still owes, `None` for each the caller has no use for.
         """
         dim, packed = self.geometry.head_dim, self.packed
+
         if not step.width:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (

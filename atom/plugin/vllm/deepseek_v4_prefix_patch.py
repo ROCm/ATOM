@@ -39,9 +39,16 @@ def _mark_v4_proxy_cache_mode(static_forward_context, is_profiling: bool) -> Non
             layer._atom_v4_profiling_kv_cache = is_profiling
 
 
+# Matched as substrings of a layer name, so "v4" must not be written in a way
+# that also has to match "v41": `".atom_deepseek_v4_proxy" in
+# "...atom_deepseek_v41_proxy"` is False, which is how V4.1 went without this
+# patch while having exactly the global-arena property it exists for -- its
+# PAGE and STATE share one address space, a slot's ring being addressed as an
+# offset past the absolute end of the paged region.
 _V4_PROXY_LAYER_MARKERS = (
     ".atom_deepseek_v4_proxy",
     ".atom_deepseek_v4_draft_proxy",
+    ".atom_deepseek_v41_proxy",
 )
 
 
@@ -134,27 +141,38 @@ def apply_vllm_v4_profile_cache_patch() -> None:
     must therefore stay on its existing dummy-attention path until vLLM
     installs the real cache.
     """
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from atom.plugin.vllm.gpu_model_runner_targets import gpu_model_runner_classes
 
-    original = GPUModelRunner.initialize_kv_cache
-    if getattr(original, "_atom_v4_profile_cache_patched", False):
-        return
+    # Both runner classes, because `GPUWorker` picks between two unrelated ones
+    # and this patch read only the older name. On 0.31 with the V2 runner
+    # selected that left the wrapper on a class nobody instantiates: the marker
+    # never ran, `_atom_v4_profiling_kv_cache` sat at its `__init__` default of
+    # False through the profiling capture, and the bind that reads it could not
+    # tell the throwaway pool from the serving one.
+    for runner_cls in gpu_model_runner_classes():
+        original = runner_cls.initialize_kv_cache
+        if getattr(original, "_atom_v4_profile_cache_patched", False):
+            continue
 
-    @functools.wraps(original)
-    def wrapped_initialize_kv_cache(self, kv_cache_config, *args, **kwargs):
-        # vLLM keeps adding keyword-only knobs to this method (0.29 added
-        # `kv_cache_allocation_context`), so forward everything untouched and
-        # only read back the flag this patch cares about.
-        result = original(self, kv_cache_config, *args, **kwargs)
-        is_profiling = kwargs.get("is_profiling", args[0] if args else False)
-        _mark_v4_proxy_cache_mode(
-            self.compilation_config.static_forward_context,
-            is_profiling,
-        )
-        return result
+        def make_wrapper(original):
+            @functools.wraps(original)
+            def wrapped_initialize_kv_cache(self, kv_cache_config, *args, **kwargs):
+                # Forwarded blind: vLLM keeps adding keyword-only knobs here
+                # (0.29 added `kv_cache_allocation_context`), and a wrapper
+                # that names the parameters it knows turns a newly added one
+                # into a TypeError at the only call site that passes it.
+                result = original(self, kv_cache_config, *args, **kwargs)
+                is_profiling = kwargs.get("is_profiling", args[0] if args else False)
+                _mark_v4_proxy_cache_mode(
+                    self.compilation_config.static_forward_context,
+                    is_profiling,
+                )
+                return result
 
-    wrapped_initialize_kv_cache._atom_v4_profile_cache_patched = True
-    GPUModelRunner.initialize_kv_cache = wrapped_initialize_kv_cache
+            wrapped_initialize_kv_cache._atom_v4_profile_cache_patched = True
+            return wrapped_initialize_kv_cache
+
+        runner_cls.initialize_kv_cache = make_wrapper(original)
 
 
 def _v4_sliding_window(vllm_config) -> int:
