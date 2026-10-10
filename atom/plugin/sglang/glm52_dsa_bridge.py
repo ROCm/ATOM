@@ -1172,8 +1172,9 @@ def resolve_draft_extend_lens(
         else:
             prefix_lens = prefix_lens.astype(np.int32)
 
+    # Trust the position-derived length. Widening with seq_lens pulls in the
+    # graph-capture fill and the draft indexer reads past the KV pool.
     context_lens = (prefix_lens + draft_token_num).astype(np.int32)
-    context_lens = np.maximum(context_lens, seq_lens).astype(np.int32)
     return prefix_lens.astype(np.int32), context_lens.astype(np.int32)
 
 
@@ -1758,12 +1759,17 @@ def build_atom_glm52_attention_metadata_from_sglang(
     atom_config,
 ):
     if getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)():
+        # Positions are the draft-token locations. seq_lens can still hold the
+        # CUDA-graph fill (GLM52_GRAPH_SEQ_LEN_CAPACITY) on an uncaptured batch,
+        # and max(seq_lens, positions) then walks req_to_token past the tokens
+        # that were written. That is an HSA aperture in the verify indexer.
         return build_mtp_verify_decode_metadata(
             forward_batch,
             positions,
             token_to_kv_pool=token_to_kv_pool,
             req_to_token_pool=req_to_token_pool,
             atom_config=atom_config,
+            use_positions=True,
         )
     if forward_batch.forward_mode.is_decode_or_idle():
         return build_decode_metadata(

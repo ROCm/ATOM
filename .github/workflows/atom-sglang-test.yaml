@@ -205,7 +205,7 @@ jobs:
             runner: spur-runner-mi355x-8gpu
           - model_name: "Kimi-K3 TP8"
             model_path: "moonshotai/Kimi-K3"
-            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 16384 --mem-fraction-static 0.93 --disable-radix-cache"
+            extra_args: "--trust-remote-code --tensor-parallel-size 8 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --page-size 128 --context-length 16384 --mem-fraction-static 0.80 --max-running-requests 8 --disable-radix-cache"
             env_vars: |
               SGLANG_DEFAULT_SERVER_ARGS=
               SGLANG_PLUGINS=atom_sglang
@@ -224,7 +224,7 @@ jobs:
               ATOM_USE_UNIFIED_ATTN=1
               ATOM_FORCE_ATTN_TRITON=1
             lm_eval_num_fewshot: 5
-            lm_eval_num_concurrent: 64
+            lm_eval_num_concurrent: 8
             accuracy_test_threshold: 0.94
             runner: spur-runner-mi355x-8gpu
           - model_name: "Qwen3.8-Flash-Next-FP8 TP2"

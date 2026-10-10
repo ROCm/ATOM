@@ -1956,6 +1956,9 @@ def sparse_attn_indexer(
         logits = torch.empty(
             [num_rows, max_model_len], dtype=torch.float32, device="cuda"
         )
+        # top_k_per_row_decode and the paged scorer index KV with context_lens.
+        # A CUDA-graph fill longer than this buffer is an HSA aperture.
+        context_lens = torch.clamp(decode_metadata.context_lens, max=max_model_len)
         if indexer_fp4:
             from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
@@ -1974,7 +1977,9 @@ def sparse_attn_indexer(
                     next_n,
                     attn_metadata.block_tables,
                 ).kernel_args(
-                    decode_metadata.index_row_ends[:num_rows],
+                    torch.clamp(
+                        decode_metadata.index_row_ends[:num_rows], max=max_model_len
+                    ),
                     heads=padded_q_decode_tokens.shape[-2],
                     page_size=runner_block_size,
                     max_seq_len=max_model_len,
@@ -1986,7 +1991,7 @@ def sparse_attn_indexer(
                 kv_cache,
                 weights[:num_padded_tokens],
                 logits,
-                decode_metadata.context_lens,
+                context_lens,
                 attn_metadata.block_tables,
                 max_model_len,
                 KVBlockSize=runner_block_size,
@@ -1996,7 +2001,7 @@ def sparse_attn_indexer(
         top_k_per_row_decode(
             logits,
             next_n,
-            decode_metadata.context_lens,
+            context_lens,
             topk_indices_decode,
             num_rows,
             logits.stride(0),
