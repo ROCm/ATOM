@@ -1047,6 +1047,14 @@ def triton_mega_moe(
                 f"MegaMoE has no {_name!r}: this path drives the transport "
                 "through its internals, which have moved. See triton_mega_moe."
             )
+    # Everything below reads the dispatch output token-major. The compact plan
+    # lands one row per route, grouped per expert, which would be misread.
+    if getattr(mega._config, "stage1_fused", False):
+        raise RuntimeError(
+            "triton_mega_moe needs a token-major dispatch, and flydsl on an "
+            "fp8/fp4 MEGA_DISPATCH_WIRE runs the compact plan; use MEGA_DISPATCH=mori "
+            "to run Triton experts on MegaMoE"
+        )
 
     recv_x, recv_w, recv_idx, total_recv, routing = mega._dispatch(
         hidden_states.contiguous(),
