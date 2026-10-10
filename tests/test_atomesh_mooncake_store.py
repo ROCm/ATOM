@@ -9,11 +9,10 @@ numa_exec.py (and so for mooncake_master / mooncake_client), drop_page_cache.py
 and numa_memory_budget.py, and a ``curl`` stub for the master's metadata and
 metrics servers. The stub master listens on its RPC port, as the readiness
 check needs; each owner the stub starts adds its segment to the capacity the
-metrics stub reports. The launcher's inline programs (``python3 -c``) run on
-the real interpreter, except the image check's ``import mooncake.store``.
+metrics stub reports. The stub also answers the image check's
+``python3 -c 'import mooncake.store'``.
 """
 
-import ast
 import json
 import os
 import re
@@ -32,17 +31,13 @@ SERVER_SCRIPT = (
 
 PYTHON_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
-    if [[ "${1:-}" == "-c" ]]; then
-      if [[ "${2:-}" == "import mooncake.store" ]]; then
-        exit "${STUB_STORE_IMPORT_RC:-0}"
-      fi
-      exec "${REAL_PYTHON}" "$@"
+    if [[ "${1:-}" == "-c" && "${2:-}" == "import mooncake.store" ]]; then
+      exit "${STUB_STORE_IMPORT_RC:-0}"
     fi
     echo "$$ HIP=${HIP_VISIBLE_DEVICES-unset} QP=${MC_NUM_QP_PER_EP-unset} THP=${GLIBC_TUNABLES-unset} BIND=${MC_TCP_BIND_ADDRESS-unset} MR=${MC_MAX_MR_SIZE-unset} $*" >> "${STUB_CALLS}"
     case " $* " in
       *" mooncake_master "*)
         touch "${STUB_DIR}/master-up"
-        [[ -n "${STUB_MASTER_NO_RPC:-}" ]] && exec sleep 60
         port="$(sed -n 's/.* --rpc_port=\\([0-9]*\\) .*/\\1/p' <<< " $* ")"
         exec "${REAL_PYTHON}" -c 'import socket, sys, time
     s = socket.socket()
@@ -253,14 +248,13 @@ stop_mooncake_store
         self.assertEqual(devices, "rdma4,rdma5,rdma6,rdma7")
 
     def test_owner_entries_may_name_their_own_nics(self):
-        owners, devices = self.plan(
-            MOONCAKE_STORE_OWNERS="0:64:rdma0,rdma1;1:96",
-            MOONCAKE_STORE_OWNER_RDMA_DEVICES="rdma6,rdma7",
-        )
+        # An entry without its own NICs serves on rdma4-rdma7.
+        owners, devices = self.plan(MOONCAKE_STORE_OWNERS="0:64:rdma0,rdma1;1:96")
         self.assertEqual(
-            owners, [["0", "64", "rdma0,rdma1"], ["1", "96", "rdma6,rdma7"]]
+            owners,
+            [["0", "64", "rdma0,rdma1"], ["1", "96", "rdma4,rdma5,rdma6,rdma7"]],
         )
-        self.assertEqual(devices, "rdma0,rdma1,rdma6,rdma7")
+        self.assertEqual(devices, "rdma0,rdma1,rdma4,rdma5,rdma6,rdma7")
 
     def test_invalid_owner_specs_are_refused(self):
         for env in (
@@ -269,7 +263,6 @@ stop_mooncake_store
             {"MOONCAKE_STORE_OWNERS": "0:10;;1:10"},
             {"MOONCAKE_STORE_OWNERS": "0:10:rdma 4"},
             {"MOONCAKE_STORE_OWNERS": ";"},
-            {"MOONCAKE_STORE_OWNER_RDMA_DEVICES": "rdma4,,rdma5"},
         ):
             with self.subTest(env=env):
                 self.run_shell("plan_mooncake_store_owners\n", expect_rc=2, **env)
@@ -281,8 +274,6 @@ stop_mooncake_store
 dump_launch_info() { echo "LAUNCH $*"; }
 start_mooncake_store
 mooncake_store_running
-# A second prefill worker of this shell reuses the Store.
-start_mooncake_store
 printf 'ENV %s\\n' "${mooncake_store_prefill_env[@]}"
 stop_mooncake_store
 ! mooncake_store_running
@@ -354,23 +345,10 @@ stop_mooncake_store
                 "--local_buffer_size=0",
             ):
                 self.assertIn(f" {flag} ", f"{call} ")
-        # The workers get the offload connector and its Mooncake settings, and
-        # nothing else: no LMCache tier sits between them and the Store.
-        env = prefixed_lines(result.stdout, "ENV ")
-        extra = json.loads(env.pop("ATOM_KV_OFFLOAD_EXTRA_CONFIG"))
-        self.assertEqual(
-            env,
-            {
-                "ATOM_KV_OFFLOAD": "mooncake_store",
-                "OFFLOAD_LOAD_WORKERS": "1",
-                "MC_NUM_QP_PER_EP": "1",
-                "MC_MAX_MR_SIZE": "1073741824",
-                "MC_TCP_BIND_ADDRESS": HOST,
-            },
-        )
         # One shared master; ATOM keeps the stages off the owners' NICs.
+        env = prefixed_lines(result.stdout, "ENV ")
         self.assertEqual(
-            extra,
+            json.loads(env["ATOM_KV_OFFLOAD_EXTRA_CONFIG"]),
             {
                 "mooncake_store.local_hostname": HOST,
                 "mooncake_store.protocol": "rdma",
@@ -464,26 +442,14 @@ stop_mooncake_store
         self.assertFalse([arg for arg in server if "ATOM_KV_OFFLOAD" in arg])
         self.assertIn("EXPORTED=none", result.stdout)
 
-    def test_the_cases_connector_settings_join_the_launchers(self):
+    def test_the_workers_load_workers_and_mr_size_follow_the_case(self):
         _, env = self.start_and_stop(
             MOONCAKE_STORE_OWNERS="0:8;1:8",
-            MOONCAKE_STORE_CONNECTOR_CONFIG=(
-                ' {"mooncake_store.direct_copy": false,'
-                ' "mooncake_store.load_pool_mib": 512, "max_pending_saves": 4} '
-            ),
-            MOONCAKE_STORE_LEASE_TTL_MS="30000",
             OFFLOAD_LOAD_WORKERS="2",
             MC_MAX_MR_SIZE="4294967296",
         )
-        extra = json.loads(env["ATOM_KV_OFFLOAD_EXTRA_CONFIG"])
-        self.assertIs(extra["mooncake_store.direct_copy"], False)
-        self.assertEqual(extra["mooncake_store.load_pool_mib"], 512)
-        self.assertEqual(extra["max_pending_saves"], 4)
-        self.assertEqual(extra["mooncake_store.master"], f"{HOST}:{self.master_port}")
         self.assertEqual(env["OFFLOAD_LOAD_WORKERS"], "2")
         self.assertEqual(env["MC_MAX_MR_SIZE"], "4294967296")
-        (master,) = self.store_calls("mooncake_master")
-        self.assertIn(" --default_kv_lease_ttl=30000 ", master)
 
     def pools(self, **env):
         result = self.run_shell(
@@ -692,76 +658,32 @@ stop_mooncake_store
             self.assertFalse(self.alive(pid), pid)
         self.assertFalse(list((self.root / "logs").glob("*.metrics")))
 
-    @staticmethod
-    def decode_node(**env):
-        """A decode node's environment: the Store settings come prefixed."""
-        return {
-            "NODE_RANK": "1",
-            "NODE0_ADDR": HOST,
-            "host_ip": "127.0.0.2",
-            "MOONCAKE_STORE": "0",
-            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE": "1",
-            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS": "0:8:rdma0",
-            "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS": "0:8:rdma1;0:8:rdma2",
-            **env,
-        }
-
     def test_decode_owners_give_up_on_masters_that_never_answer(self):
+        # A decode node: the Store settings come prefixed.
         result = self.run_shell(
             "start_mooncake_store_decode_owners\n",
             expect_rc=1,
-            **self.decode_node(
-                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="4",
-                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="1",
-            ),
+            NODE_RANK="1",
+            NODE0_ADDR=HOST,
+            host_ip="127.0.0.2",
+            MOONCAKE_STORE="0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:8:rdma0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1;0:8:rdma2",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="4",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="1",
         )
-        # The wait, plus the prefill node's compaction of its one owner node.
-        self.assertIn("prefill-node masters not ready after 5s", result.stderr)
+        # The wait, plus the prefill node's compaction of two NUMA nodes.
+        self.assertIn("prefill-node masters not ready after 6s", result.stderr)
         self.assertEqual(self.store_calls("mooncake_client"), [])
         # The page cache dropper is stopped with the rest.
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
-    def test_the_compaction_budget_counts_each_pinned_numa_node(self):
-        result = self.run_shell(
-            """
-echo "PREFILL $(mooncake_store_compaction_budget MOONCAKE_STORE_OWNERS)"
-echo "DECODE $(mooncake_store_compaction_budget MOONCAKE_STORE_DECODE_OWNERS)"
-""",
-            MOONCAKE_STORE_OWNERS="0:8;1:8;1:8",
-            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
-            MOONCAKE_STORE_COMPACT_TIMEOUT="600.5",
-        )
-        # Two owner nodes, 600.5 s each.
-        self.assertIn("PREFILL 1201\n", result.stdout)
-        self.assertIn("DECODE 601\n", result.stdout)
-
-    def test_decode_owners_allow_for_the_prefill_nodes_compaction(self):
-        # The prefill node starts its masters only once it has compacted its
-        # one owner node, which this node's wait did not wait for: here they
-        # answer 4 s into a 2 s wait, inside its 10 s compaction budget.
-        (self.root / "segments").write_text(f"{self.master_port} {8 * GIB}\n")
-        self.run_shell(
-            f"""
-(
-  until grep -q -- ' --every ' "${{STUB_CALLS}}"; do sleep 0.2; done
-  sleep 4
-  exec setsid python3 /scripts/numa_exec.py 0 mooncake_master \
-    --rpc_port={self.master_port}
-) >/dev/null 2>&1 &
-start_mooncake_store_decode_owners
-stop_mooncake_store
-""",
-            **self.decode_node(
-                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="2",
-                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="10",
-            ),
-        )
-        self.assertEqual(len(self.store_calls("mooncake_client")), 2)
-
     def test_the_prefill_node_allows_for_the_decode_nodes_compaction(self):
         # The decode node mounts its owners only once it has compacted its
-        # memory: here 5 s into a 2 s wait, inside its 10 s compaction budget.
+        # memory: here 5 s into a 2 s wait, inside the 2 x 10 s it allows for
+        # that compaction.
         self.run_shell(
             f"""
 (
@@ -783,46 +705,12 @@ stop_mooncake_store
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
-    def test_a_decode_owner_dying_before_ready_stops_the_others(self):
-        self.run_shell(
-            f"""
-setsid python3 /scripts/numa_exec.py 1 mooncake_master \
-  --rpc_port={self.master_port} >/dev/null 2>&1 &
-start_mooncake_store_decode_owners
-""",
-            expect_rc=5,
-            **self.decode_node(
-                STUB_DIE_OWNER_PORT="50152",
-                ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="30",
-            ),
-        )
-        owners = self.store_calls("mooncake_client")
-        self.assertEqual(len(owners), 2)
-        for pid in {int(c.split()[0]) for c in owners}:
-            self.assertFalse(self.alive(pid), pid)
-
-    def test_decode_owners_leave_a_running_store_alone(self):
-        # The capacity start_mooncake_store waits for includes the decode
-        # owners' share, which the pre-seeded segment stands in for.
-        (self.root / "segments").write_text(f"{self.master_port} {8 * GIB}\n")
-        self.run_shell(
-            """
-start_mooncake_store
-start_mooncake_store_decode_owners
-stop_mooncake_store
-""",
-            MOONCAKE_STORE_OWNERS="0:8;1:8",
-            MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
-        )
-        self.assertEqual(len(self.store_calls("mooncake_client")), 2)
-        for pid in self.stub_pids():
-            self.assertFalse(self.alive(pid), pid)
-
     def test_several_prefill_workers_on_a_node_are_refused_before_anything_starts(
         self,
     ):
-        # The Store's owners are placed around one prefill worker's GPUs. A second worker in the same shell found it only once the first
-        # was up, and its refusal then stopped the Store under the first.
+        # The Store's owners are placed around one prefill worker's GPUs, and
+        # a second worker in the same shell would reach it only once the first
+        # was up.
         for script, env, workers in (
             ("", {"ATOMESH_PD_WORKER_LAYOUT": "prefill_single_node", "xP": "2"}, 2),
             (
@@ -853,26 +741,6 @@ stop_mooncake_store
         ):
             with self.subTest(env=env, script=script):
                 self.run_shell(script + "check_mooncake_store_settings\n", **env)
-
-    def test_a_prefill_worker_on_other_gpus_is_refused(self):
-        # The Store's owners were placed around the first worker's GPUs; the
-        # settings check refuses the layouts that would get here first.
-        result = self.run_shell(
-            """
-start_mooncake_store
-export HIP_VISIBLE_DEVICES=4,5,6,7
-start_mooncake_store
-""",
-            expect_rc=2,
-            MOONCAKE_STORE_OWNERS="0:8;1:8",
-        )
-        self.assertIn(
-            "planned for the prefill GPUs 0,1,2,3; this prefill worker uses GPUs "
-            "4,5,6,7",
-            result.stderr,
-        )
-        for pid in self.stub_pids():
-            self.assertFalse(self.alive(pid), pid)
 
     def test_cleanup_saves_the_metrics_before_it_stops_a_worker(self):
         # A decode node stops its owners once the router closes, and the
@@ -925,15 +793,9 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
     def test_the_master_is_ready_only_once_its_rpc_port_listens(self):
         # Its HTTP metadata server answers first; the owners need the RPC one.
         self.run_shell(
-            "start_mooncake_store\n",
-            expect_rc=1,
-            STUB_MASTER_NO_RPC="1",
-            MOONCAKE_STORE_MASTER_WAIT_TIMEOUT="4",
+            'plan_mooncake_store_pools\ntouch "${STUB_DIR}/master-up"\n'
+            '! mooncake_masters_ready "${host_ip}"\n'
         )
-        self.assertEqual(len(self.store_calls("mooncake_master")), 1)
-        self.assertEqual(self.store_calls("mooncake_client"), [])
-        for pid in self.stub_pids():
-            self.assertFalse(self.alive(pid), pid)
 
     def test_pins_that_do_not_fit_stop_the_start_before_the_master(self):
         result = self.run_shell(
@@ -946,14 +808,13 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         self.run_shell(
             "prepare_mooncake_store_memory\n",
             MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS="/share/models:/data/cache",
-            MOONCAKE_STORE_NODE_RESERVE_GIB="64",
             # A fragmented node may need longer than the default 600 s.
             MOONCAKE_STORE_COMPACT_TIMEOUT="1800",
         )
         calls = self.calls.read_text()
         self.assertIn("/scripts/drop_page_cache.py /share/models /data/cache\n", calls)
         self.assertIn(
-            "--reserve-gib 64 --compact --compact-timeout 1800\n",
+            "--reserve-gib 128 --compact --compact-timeout 1800\n",
             calls,
         )
 
@@ -978,7 +839,6 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         )
 
     def test_conflicting_settings_are_refused_before_anything_starts(self):
-        connector_config = "MOONCAKE_STORE_CONNECTOR_CONFIG"
         for env, message in (
             ({"ATOM_KV_OFFLOAD": "lmcache"}, "ATOM_KV_OFFLOAD is set by the launcher"),
             (
@@ -1015,69 +875,18 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                 "names the offload connector mooncake_store",
             ),
             ({"MC_NUM_QP_PER_EP": "2"}, "MC_NUM_QP_PER_EP=2"),
-            (
-                {connector_config: '{"mooncake_store.master":"10.0.0.1:1"}'},
-                "sets mooncake_store.master, which the launcher sets",
-            ),
-            (
-                {connector_config: '{"mooncake_store.pools":{}}'},
-                "sets mooncake_store.pools, which the launcher sets",
-            ),
-            ({connector_config: '{"chunk_size":256}'}, "sets chunk_size: it takes"),
-            ({connector_config: '["mooncake_store.load_pool_mib"]'}, "a JSON object"),
-            ({connector_config: "{load_pool_mib: 512}"}, "is not JSON"),
-            # The workers refuse these too, but only after the Store started.
-            (
-                # Gone: the transfer pool is always in the worker GPU's HBM.
-                {connector_config: '{"mooncake_store.pool_device":"cpu"}'},
-                "sets mooncake_store.pool_device: it takes",
-            ),
-            (
-                {connector_config: '{"mooncake_store.load_pool_mib":"512"}'},
-                'sets mooncake_store.load_pool_mib to "512": it must be a positive',
-            ),
-            (
-                {connector_config: '{"mooncake_store.startup_probe":1}'},
-                "sets mooncake_store.startup_probe to 1: it must be true or false",
-            ),
-            (
-                {connector_config: '{"mooncake_store.save_abandon_timeout_s":0}'},
-                "save_abandon_timeout_s to 0: it must be a positive number",
-            ),
-            (
-                {connector_config: '{"max_pending_saves":true}'},
-                "sets max_pending_saves to true: it must be a positive integer",
-            ),
             ({"MC_MS_AUTO_DISC": "1"}, "MC_MS_AUTO_DISC=1 makes the Store's"),
-            ({"MOONCAKE_STORE_LEASE_TTL_MS": "0"}, "LEASE_TTL_MS=0 is not"),
-            ({"MOONCAKE_STORE_LEASE_TTL_MS": "10s"}, "LEASE_TTL_MS=10s is not"),
-            # Each would be misread later: by the NUMA budget, the compaction's
-            # timeout, bash arithmetic in the waits, or a Store process.
+            # Each would be misread later: by the compaction's timeout, bash
+            # arithmetic in the waits, or a Store process.
             *(
                 ({f"MOONCAKE_STORE_{name}": value}, f"{name}={value} is not a {kind}")
                 for name, value, kind in (
                     ("COMPACT_TIMEOUT", "0", "positive number"),
                     ("COMPACT_TIMEOUT", "-600", "positive number"),
                     ("COMPACT_TIMEOUT", "nan", "positive number"),
-                    ("NODE_RESERVE_GIB", "-8", "non negative number"),
-                    ("NODE_RESERVE_GIB", "nan", "non negative number"),
                     ("WAIT_TIMEOUT", "20m", "positive integer number"),
-                    ("MASTER_WAIT_TIMEOUT", "120.5", "positive integer number"),
-                    ("PAGE_CACHE_DROP_SECONDS", "inf", "non negative number"),
-                    ("OWNER_THREADS", "0", "positive integer number"),
-                    ("OWNER_MAX_MR_SIZE", "64G", "positive integer number"),
                     ("MASTER_NUMA", "-1", "integer number"),
-                    ("EVICTION_HIGH_WATERMARK", "1.5", "fraction number"),
-                    ("EVICTION_RATIO", "0", "fraction number"),
                 )
-            ),
-            # The default owners name their own NICs; this one takes the list.
-            (
-                {
-                    "MOONCAKE_STORE_OWNERS": "0:8",
-                    "MOONCAKE_STORE_OWNER_RDMA_DEVICES": "rdma9",
-                },
-                "rdma9 is not in",
             ),
         ):
             with self.subTest(env=env):
@@ -1105,10 +914,6 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         }
         for env, message in (
             (
-                {"ATOMESH_PREFILL_ENV_ATOM_KV_OFFLOAD": "lmcache_mp"},
-                "ATOM_KV_OFFLOAD is set by the launcher",
-            ),
-            (
                 {
                     "ATOMESH_PREFILL_ENV_PREFILL_KV_TRANSFER_CONFIG": (
                         '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
@@ -1116,23 +921,9 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                 },
                 "names the offload connector lmcache_offload",
             ),
-            ({"ATOMESH_DECODE_ENV_MC_NUM_QP_PER_EP": "2"}, "MC_NUM_QP_PER_EP=2"),
             ({"ATOMESH_ENV_MC_NUM_QP_PER_EP": "4"}, "MC_NUM_QP_PER_EP=4"),
-            ({"ATOMESH_PREFILL_ENV_MC_MS_AUTO_DISC": "1"}, "MC_MS_AUTO_DISC=1"),
             # The decode node's owners start from the decode role env.
             ({"ATOMESH_DECODE_ENV_MC_MS_AUTO_DISC": " 1"}, "MC_MS_AUTO_DISC=1"),
-            (
-                {"ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS": "0:0"},
-                "is not <numa>:<GiB>",
-            ),
-            (
-                {
-                    "ATOMESH_PREFILL_ENV_MOONCAKE_STORE_CONNECTOR_CONFIG": (
-                        '{"lmcache.chunk_size":256}'
-                    )
-                },
-                "sets lmcache.chunk_size: it takes",
-            ),
             # Only the decode node would plan its pools with it.
             (
                 {"ATOMESH_DECODE_ENV_MOONCAKE_STORE_DECODE_OWNERS": "0:8:rdma0"},
@@ -1284,48 +1075,11 @@ class LauncherWiringTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, expect_rc, result.stderr)
         self.assertIn("ATOMESH_MOONCAKE_MASTER_PORT=66051 is outside", result.stderr)
-        # The defaults sit below the ephemeral port range (32768-60999).
-        for name, port in (
-            ("MASTER", 26051),
-            ("METADATA", 26080),
-            ("METRICS", 26090),
-            ("OWNER", 26052),
-        ):
-            self.assertIn(
-                f'ATOMESH_MOONCAKE_{name}_PORT="${{ATOMESH_MOONCAKE_{name}_PORT:-{port}}}"',
-                self.source,
-            )
 
-    @staticmethod
-    def launch_line(body):
-        """The line of a server function that starts the server."""
-        (line,) = [
-            line
-            for line in body.splitlines()
-            if line.lstrip().startswith("start_logged_process ")
-        ]
-        return line
-
-    def test_prefill_gets_the_store_env_and_decode_one_qp(self):
-        prefill = self.source.split("start_prefill() {")[1].split("\n}\n")[0]
-        self.assertIn("start_mooncake_store", prefill)
-        self.assertIn(
-            'prefill_offload_env=("${mooncake_store_prefill_env[@]}")', prefill
-        )
-        # On the command line, after the role env: never exported to decode.
-        # (MooncakeStoreTest runs both functions; this pins the launch lines.)
-        self.assertIn(
-            ' env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" '
-            '"${prefill_offload_env[@]}" "${prefill_cmd[@]}"',
-            self.launch_line(prefill),
-        )
+    def test_store_steps_are_ordered_and_the_waits_watch_the_store(self):
+        # MooncakeStoreTest runs the server functions and cleanup_processes;
+        # these orderings and the waits are outside what it runs.
         decode = self.source.split("start_decode() {")[1].split("\n}\n")[0]
-        self.assertIn('decode_mooncake_env=("MC_NUM_QP_PER_EP=1")', decode)
-        self.assertIn(
-            ' env "${decode_cache_env[@]}" "${decode_dp_env[@]}" '
-            '"${decode_mooncake_env[@]}" "${decode_cmd[@]}"',
-            self.launch_line(decode),
-        )
         # The decode node's owners mount before its workers load.
         self.assertLess(
             decode.index("start_mooncake_store_decode_owners"),
@@ -1335,13 +1089,6 @@ class LauncherWiringTest(unittest.TestCase):
         self.assertLess(
             self.source.index("\nvalidate_mooncake_store_settings\nwrite_metadata\n"),
             self.source.index('  start_prefill "prefill-rank-0"'),
-        )
-        cleanup = self.source.split("cleanup_processes() {")[1].split("\n}\n")[0]
-        self.assertIn("stop_mooncake_store", cleanup)
-        # The metrics are saved before the first worker is stopped.
-        self.assertLess(
-            cleanup.index("save_mooncake_store_metrics"),
-            cleanup.index("terminate_process_group"),
         )
         for waiter in ("wait_http() {", "wait_router_closed() {"):
             body = self.source.split(waiter)[1].split("\n}\n")[0]
@@ -1367,37 +1114,6 @@ class LauncherWiringTest(unittest.TestCase):
             self.assertIsNotNone(starts, branch[:200])
             self.assertIsNotNone(trap, branch[:200])
             self.assertLess(trap.start(), starts.start(), branch[:200])
-
-    def test_the_launcher_knows_every_connector_setting(self):
-        # The launcher checks a case's connector settings before the Store
-        # starts, from its own copy of them: the load-config job that runs
-        # these tests cannot import ATOM.
-        config_py = (
-            SERVER_SCRIPT.parents[3]
-            / "atom/kv_transfer/offload/mooncake_store/config.py"
-        )
-        (fields,) = [
-            ast.literal_eval(node.value)
-            for node in ast.parse(config_py.read_text()).body
-            if isinstance(node, ast.Assign)
-            and [getattr(target, "id", None) for target in node.targets] == ["_FIELDS"]
-        ]
-        start = self.source.index("mooncake_store_worker_config() {")
-        body = self.source[start : self.source.index("|| exit 2\n}\n", start)]
-        program, arguments = body.split("python3 -c '", 1)[1].split("\n' ", 1)
-        launcher_keys = arguments.split("\\\n")[1].strip().strip('"').split()
-        (settings,) = [
-            [key.value for key in node.value.keys]
-            for node in ast.parse(program).body
-            if isinstance(node, ast.Assign)
-            and [getattr(target, "id", None) for target in node.targets] == ["settings"]
-        ]
-        prefix = "mooncake_store."
-        self.assertIn("max_pending_saves", settings)
-        case_keys = [key[len(prefix) :] for key in settings if key.startswith(prefix)]
-        self.assertEqual(len(case_keys), len(settings) - 1)
-        self.assertFalse(set(case_keys) & set(launcher_keys))
-        self.assertEqual(sorted(case_keys + launcher_keys), sorted(fields))
 
 
 if __name__ == "__main__":

@@ -736,73 +736,47 @@ purge_lmcache_disk() {
 # Mooncake Store as their KV offload tier: ATOM's mooncake_store offload
 # connector saves each PP stage's full chunks of a prompt to the Store, whose
 # memory belongs to owner processes started here, and loads a prefix hit back
-# over RDMA, with no CPU tier in the workers.
-#  - A master, on the CPUs of MOONCAKE_STORE_MASTER_NUMA (default 1), and one
-#    owner per MOONCAKE_STORE_OWNERS entry "<numa>:<GiB>[:<rdma,...>]"
-#    (default "0:768:rdma4,rdma5;1:768:rdma6,rdma7"), bound to that node by
-#    numa_exec.py. An owner without its own device list serves on
-#    MOONCAKE_STORE_OWNER_RDMA_DEVICES (default rdma4-rdma7). ATOM gives each
-#    prefill stage one NIC of its own, the GPU's, and under one shared master
-#    refuses one the owners use: owners and requesters sharing NICs there
-#    stall concurrent reads. The default owners mount on pit2-p03 (TW MI355X)
-#    nodes: about 1.5 TiB per NUMA node, rdma4-7 on NUMA1, and an ionic NIC
-#    that registers at most 832-896 GiB for one process -- a 960 GiB owner
-#    fails to mount on one NIC or four, and two owners of 768 and 960 GiB on
-#    the same four NICs failed as well, while 768 + 768 GiB on separate NIC
-#    pairs mount in 12 s.
-#  - MOONCAKE_STORE_POOLS=per_nic (default shared) is for nodes whose owners
-#    must share the stages' NICs, e.g. a job that may use only the memory and
-#    NICs of its own GPUs: one master per owner NIC, every owner on exactly one
-#    NIC, and ATOM points the stage on a NIC at that NIC's pool
-#    (mooncake_store.pools). A NIC then carries one stage's reads from its own
-#    pool's owners, not every owner's. Across two nodes, four stages read
-#    147 GB/s this way with no retransmission.
-#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format, are owners the decode
-#    node starts on its own memory (pd_worker_layout multi_node, one prefill
-#    node and one decode node), joining the prefill node's masters. The
+# over RDMA, with no CPU tier in the workers. Its settings, all in the prefill
+# role env, which a decode node reads as well:
+#  - MOONCAKE_STORE_OWNERS: one owner per "<numa>:<GiB>[:<rdma,...>]" entry,
+#    bound to that NUMA node by numa_exec.py; an entry without NICs serves on
+#    rdma4-rdma7. The default "0:768:rdma4,rdma5;1:768:rdma6,rdma7" fits
+#    pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node, rdma4-7 on
+#    NUMA1. An owner above 832 GiB may not register on an ionic NIC. ATOM gives
+#    each prefill stage its GPU's NIC and, under one shared master, refuses one
+#    an owner uses: owners and requesters sharing NICs stall concurrent reads.
+#  - MOONCAKE_STORE_MASTER_NUMA (default 1): the NUMA node the masters run on.
+#  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
+#    the stages' NICs: one master per owner NIC, every owner on exactly one
+#    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
+#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
+#    starts on its own memory, joining the prefill node's masters
+#    (pd_worker_layout multi_node, one prefill node and one decode node). The
 #    prefill workers start once every pool counts the owners of both nodes.
-#  - Every Mooncake process runs with MC_NUM_QP_PER_EP=1: the master, the
-#    owners, the prefill workers and the decode workers, whose P->D transfer
-#    engine reads the same variable (peers with different QP counts cannot
-#    connect). The decode gets it on every node of the job.
-#  - The launcher owns the workers' ATOM_KV_OFFLOAD and
-#    ATOM_KV_OFFLOAD_EXTRA_CONFIG here, so PREFILL_KV_TRANSFER_CONFIG names the
-#    P/D connector only. MOONCAKE_STORE_CONNECTOR_CONFIG, a JSON object of the
-#    connector's other keys (mooncake_store.*, max_pending_saves), joins the
-#    extra config, e.g. {"mooncake_store.load_pool_mib":2048}; an unknown key
-#    or a value of the wrong type is refused before anything starts.
-#  - A lookup or a read leases its objects for MOONCAKE_STORE_LEASE_TTL_MS
-#    (default 10000): eviction skips them until then, and a read that ends
-#    later fails.
-#  - The owners pin huge pages under MPOL_BIND. Before they start, the clean
-#    page cache of MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated,
-#    default the model) is dropped, the owners' pins must fit each node with
-#    MOONCAKE_STORE_NODE_RESERVE_GIB (default 128) to spare, and each
-#    node is compacted for its pins (numa_memory_budget.py --compact, stopped
-#    after MOONCAKE_STORE_COMPACT_TIMEOUT seconds, default 600) before the
-#    owners fault them. A node whose compaction runs out of time can leave an
-#    owner 4 KiB pages its NICs refuse to register (seen on pit2-p03-g27, whose
-#    NUMA1 did not compact 768 GiB in 600 s with 1342 GiB free; its NUMA0, like
-#    both nodes of pit2-p03-g19 and -g23, took 34 s).
+#  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
+#    the owners pin huge pages under MPOL_BIND, so the clean page cache of
+#    these goes first; each node must then fit its pins with 128 GiB to spare,
+#    and is compacted for them (numa_memory_budget.py --compact).
+#  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
+#    compaction; a node that does not compact in time can leave an owner 4 KiB
+#    pages its NICs refuse to register.
 #  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
 #    Store once this node has compacted: for every pool to count its owners,
 #    and on a decode node for the prefill node's masters. A wait on the other
 #    node's part also allows for that node's compaction, which its Store waits
-#    for and this node's did not: MOONCAKE_STORE_COMPACT_TIMEOUT per NUMA node
-#    it pins. MOONCAKE_STORE_MASTER_WAIT_TIMEOUT (default 120 s) bounds the
-#    wait for this node's own masters.
-#  - One Store per node, started for one prefill worker: the case places its
-#    owners on NICs that worker's GPUs leave free, or, with per-NIC pools, on
-#    those GPUs' own NICs. Another worker on the node's other GPUs would share
-#    a NIC with an owner or find no pool for its own, which the workers refuse
-#    only once they have loaded the model, so a layout that starts several
-#    prefill workers on one node (prefill_single_node with xP > 1,
-#    packed_nodes with two prefill workers on a node) is refused up front.
-# validate_mooncake_store_settings refuses a conflicting setting, or an image
-# without the Store, before the node starts anything. Master and owners start
-# before the workers, which connect (and round-trip a probe chunk) while they
-# build their engines and never retry, and stop after them. A Store lives as
-# long as this shell: its objects outlive a worker restart, not the job.
+#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+# Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
+# transfer engine included (peers with different QP counts cannot connect).
+# The launcher owns the workers' ATOM_KV_OFFLOAD and
+# ATOM_KV_OFFLOAD_EXTRA_CONFIG, so PREFILL_KV_TRANSFER_CONFIG names the P/D
+# connector only. A node runs one Store, for one prefill worker whose GPUs its
+# owners' NICs are placed around, so a layout that starts several prefill
+# workers on one node is refused. validate_mooncake_store_settings refuses a
+# conflicting setting, or an image without the Store, before the node starts
+# anything. Master and owners start before the workers, which connect (and
+# round-trip a probe chunk) while they build their engines and never retry,
+# and stop after them. A Store lives as long as this shell: its objects
+# outlive a worker restart, not the job.
 mooncake_store_pids=()
 mooncake_store_logs=()
 mooncake_store_names=()
@@ -827,8 +801,6 @@ mooncake_store_ready=0
 mooncake_store_metrics_saved=0
 # The prefill workers' env for the running Store, set by start_mooncake_store.
 mooncake_store_prefill_env=()
-# The prefill GPUs the running Store was started for.
-mooncake_store_started_for=""
 
 # The prefill role env asks for it; the decode role reads the same variable
 # from ATOMESH_PREFILL_ENV_ on any node.
@@ -881,8 +853,8 @@ refuse_mooncake_nic_auto_discovery() {
 
 # parse_mooncake_owner_spec <setting> <numa[]> <gib[]> <devices[]>: appends
 # the "<numa>:<GiB>[:<rdma,...>]" entries of MOONCAKE_STORE_OWNERS or
-# MOONCAKE_STORE_DECODE_OWNERS to the named arrays; exits 2 on an invalid
-# configuration.
+# MOONCAKE_STORE_DECODE_OWNERS to the named arrays, an entry without NICs on
+# rdma4-rdma7; exits 2 on an invalid configuration.
 parse_mooncake_owner_spec() {
   local setting="$1"
   local -n numa_out="$2"
@@ -892,14 +864,9 @@ parse_mooncake_owner_spec() {
   if [[ "${setting}" == "MOONCAKE_STORE_OWNERS" ]]; then
     default_spec="0:768:rdma4,rdma5;1:768:rdma6,rdma7"
   fi
-  local spec default_devices
+  local spec
   spec="$(mooncake_setting "${setting}" "${default_spec}")"
-  default_devices="$(mooncake_setting MOONCAKE_STORE_OWNER_RDMA_DEVICES rdma4,rdma5,rdma6,rdma7)"
   local device_list='[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'
-  if [[ ! "${default_devices}" =~ ^${device_list}$ ]]; then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_OWNER_RDMA_DEVICES=${default_devices} is not a comma-separated device list" >&2
-    exit 2
-  fi
   local -a entries=()
   IFS=';' read -r -a entries <<< "${spec}"
   if [[ "${#entries[@]}" -eq 0 ]]; then
@@ -915,7 +882,7 @@ parse_mooncake_owner_spec() {
     fi
     numa_out+=("$(( 10#${BASH_REMATCH[1]} ))")
     gib_out+=("$(( 10#${BASH_REMATCH[2]} ))")
-    devices_out+=("${BASH_REMATCH[4]:-${default_devices}}")
+    devices_out+=("${BASH_REMATCH[4]:-rdma4,rdma5,rdma6,rdma7}")
   done
 }
 
@@ -1004,7 +971,7 @@ kv_transfer_offload_connector() {
   local config="${1,,}" name
   config="${config//[[:space:]]/}"
   for name in lmcache_offload lmcacheoffloadconnector lmcacheconnectorv1 \
-    lmcache_mp lmcachempconnector mooncake_store mooncakestoreoffloadconnector; do
+    lmcache_mp lmcachempconnector mooncake_store; do
     if [[ "${config}" == *"\"kv_connector\":\"${name}\""* ]]; then
       printf '%s' "${name}"
       return 0
@@ -1013,99 +980,12 @@ kv_transfer_offload_connector() {
   return 1
 }
 
-# mooncake_store_worker_config [launcher JSON object]: that object with the
-# case's MOONCAKE_STORE_CONNECTOR_CONFIG merged in, the prefill workers'
-# ATOM_KV_OFFLOAD_EXTRA_CONFIG; exits 2 when the case's value is not a JSON
-# object of the connector's settings, each of the type the connector takes,
-# or sets one of the keys the launcher derives from the Store it starts. The
-# workers would refuse such a value too, but only after the Store started.
-mooncake_store_worker_config() {
-  python3 -c '
-import json
-import math
-import sys
-
-config = json.loads(sys.argv[1] or "{}")
-text = sys.argv[2].strip()
-launcher_keys = {"mooncake_store." + key for key in sys.argv[3].split()}
-name = "MOONCAKE_STORE_CONNECTOR_CONFIG"
-
-
-def positive_integer(value):
-    return type(value) is int and value > 0
-
-
-def positive_seconds(value):
-    return type(value) in (int, float) and math.isfinite(value) and value > 0
-
-
-# The settings a case may give the connector, as it parses them
-# (atom/kv_transfer/offload/mooncake_store/config.py, whose _FIELDS are these
-# and the launcher keys; tests/test_atomesh_mooncake_store.py keeps them equal).
-settings = {
-    "mooncake_store.rdma_devices": (
-        "a comma-separated string",
-        lambda value: isinstance(value, str),
-    ),
-    "mooncake_store.chunk_tokens": ("a positive integer", positive_integer),
-    "mooncake_store.load_pool_mib": ("a positive integer", positive_integer),
-    "mooncake_store.save_pool_mib": ("a positive integer", positive_integer),
-    "mooncake_store.lookup_batch_keys": ("a positive integer", positive_integer),
-    "mooncake_store.save_abandon_timeout_s": (
-        "a positive number of seconds",
-        positive_seconds,
-    ),
-    "mooncake_store.startup_probe": (
-        "true or false",
-        lambda value: isinstance(value, bool),
-    ),
-    "mooncake_store.chunk_groups": (
-        "true or false",
-        lambda value: isinstance(value, bool),
-    ),
-    "mooncake_store.direct_copy": (
-        "true or false",
-        lambda value: isinstance(value, bool),
-    ),
-    "max_pending_saves": ("a positive integer", positive_integer),
-}
-try:
-    extra = json.loads(text) if text else {}
-except ValueError as exc:
-    sys.exit(f"[mooncake-store][FAIL] {name} is not JSON: {exc}")
-if not isinstance(extra, dict):
-    sys.exit(f"[mooncake-store][FAIL] {name} must be a JSON object")
-for key, value in extra.items():
-    if key in launcher_keys:
-        sys.exit(
-            f"[mooncake-store][FAIL] {name} sets {key}, which the launcher "
-            "sets from the Store it starts"
-        )
-    if key not in settings:
-        known = ", ".join(settings)
-        sys.exit(
-            f"[mooncake-store][FAIL] {name} sets {key}: it takes the "
-            f"mooncake_store connector settings {known} only"
-        )
-    kind, valid = settings[key]
-    if not valid(value):
-        sys.exit(
-            f"[mooncake-store][FAIL] {name} sets {key} to {json.dumps(value)}: "
-            f"it must be {kind}"
-        )
-print(json.dumps({**config, **extra}, separators=(",", ":")))
-' "${1:-}" "${MOONCAKE_STORE_CONNECTOR_CONFIG:-}" \
-    "master metadata pools owner_rdma_devices local_hostname protocol" \
-    || exit 2
-}
-
 # require_mooncake_store_number <name> <default> <kind>: refuses a numeric
 # Store setting that is not one of its kind, before anything starts. The
-# helpers and bash arithmetic would misread it later: a NaN or negative reserve
-# passes any NUMA budget, a compaction timeout of 0 skips the compaction, and a
-# wait timeout bash cannot add aborts the wait without stopping what it waited
-# for. Kinds: positive_integer, integer (>= 0), positive and non_negative
-# (decimals), fraction (a decimal in (0, 1]).
+# helpers and bash arithmetic would misread it later: a compaction timeout of 0
+# skips the compaction, and a wait timeout bash cannot add aborts the wait
+# without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
+# and positive (a decimal).
 require_mooncake_store_number() {
   local name="$1" value valid=0
   value="$(mooncake_setting "$1" "$2")"
@@ -1113,8 +993,6 @@ require_mooncake_store_number() {
     positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
     integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
     positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
-    non_negative) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ ]] && valid=1 ;;
-    fraction) [[ "${value}" =~ ^(0[.][0-9]*[1-9][0-9]*|1([.]0+)?)$ ]] && valid=1 ;;
   esac
   if ((!valid)); then
     echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
@@ -1166,22 +1044,9 @@ check_mooncake_store_settings() {
     echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
     exit 2
   fi
-  if [[ ! "${MOONCAKE_STORE_LEASE_TTL_MS:-10000}" =~ ^[0-9]+$ ]] \
-    || (( 10#${MOONCAKE_STORE_LEASE_TTL_MS:-10000} == 0 )); then
-    echo "[mooncake-store][FAIL] MOONCAKE_STORE_LEASE_TTL_MS=${MOONCAKE_STORE_LEASE_TTL_MS:-} is not a positive number of milliseconds" >&2
-    exit 2
-  fi
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
-  require_mooncake_store_number MOONCAKE_STORE_NODE_RESERVE_GIB 128 non_negative
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
-  require_mooncake_store_number MOONCAKE_STORE_MASTER_WAIT_TIMEOUT 120 positive_integer
-  require_mooncake_store_number MOONCAKE_STORE_PAGE_CACHE_DROP_SECONDS 1800 non_negative
-  require_mooncake_store_number MOONCAKE_STORE_OWNER_THREADS 4 positive_integer
-  require_mooncake_store_number MOONCAKE_STORE_OWNER_MAX_MR_SIZE 68719476736 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
-  require_mooncake_store_number MOONCAKE_STORE_EVICTION_HIGH_WATERMARK 0.90 fraction
-  require_mooncake_store_number MOONCAKE_STORE_EVICTION_RATIO 0.05 fraction
-  mooncake_store_worker_config >/dev/null
   plan_mooncake_store_owners
   plan_mooncake_store_pools
 }
@@ -1276,7 +1141,7 @@ prepare_mooncake_store_memory() {
     pins+=("${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
   done
   if ! python3 "${ATOMESH_SCRIPT_DIR}/numa_memory_budget.py" \
-    --reserve-gib "$(mooncake_setting MOONCAKE_STORE_NODE_RESERVE_GIB 128)" \
+    --reserve-gib 128 \
     --compact \
     --compact-timeout "$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
     ${pins[@]+"${pins[@]}"}; then
@@ -1466,11 +1331,12 @@ mooncake_owner_pool() {
   exit 2
 }
 
-# Drops the model's page cache every 45 s while the workers load weights, which
-# would refill it; page cache is per file, so this serves every node.
+# Drops the model's page cache every 45 s for 30 min while the workers load
+# weights, which would refill it; page cache is per file, so this serves every
+# node.
 start_mooncake_page_cache_dropper() {
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
-    --every 45 --for "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_SECONDS 1800)" "${MODEL_PATH}" &
+    --every 45 --for 1800 "${MODEL_PATH}" &
   mooncake_page_cache_dropper_pid=$!
 }
 
@@ -1484,8 +1350,7 @@ start_mooncake_store_owners() {
   # transfer engine binds the role IP.
   local -a owner_env=(
     HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1
-    GLIBC_TUNABLES=glibc.malloc.hugetlb=1
-    "MC_MAX_MR_SIZE=$(mooncake_setting MOONCAKE_STORE_OWNER_MAX_MR_SIZE 68719476736)"
+    GLIBC_TUNABLES=glibc.malloc.hugetlb=1 MC_MAX_MR_SIZE=68719476736
     "MC_TCP_BIND_ADDRESS=${host_ip}"
   )
   local i pool log
@@ -1501,7 +1366,7 @@ start_mooncake_store_owners() {
       --metadata_server="http://${master_addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")/metadata"
       --protocol=rdma --device_names="${mooncake_owner_plan_devices[i]}"
       --global_segment_size="$(( mooncake_owner_plan_gib[i] * 1024 * 1024 * 1024 ))"
-      --local_buffer_size=0 --threads="$(mooncake_setting MOONCAKE_STORE_OWNER_THREADS 4)"
+      --local_buffer_size=0 --threads=4
     )
     dump_launch_info "MOONCAKE_OWNER" "${owner_env[@]}" "${cmd[@]}"
     env "${owner_env[@]}" setsid "${cmd[@]}" >"${log}" 2>&1 &
@@ -1521,18 +1386,14 @@ report_mooncake_store_owners() {
   done
 }
 
-# mooncake_store_compaction_budget <owner setting>: the longest the node whose
-# owners <owner setting> lists compacts its memory before its Store starts.
-# numa_memory_budget.py compacts each NUMA node with pins in turn and stops
-# each after MOONCAKE_STORE_COMPACT_TIMEOUT.
-mooncake_store_compaction_budget() {
-  local -a numa=() gib=() devices=()
-  parse_mooncake_owner_spec "$1" numa gib devices
-  local nodes
-  nodes="$(printf '%s\n' "${numa[@]}" | sort -u | wc -l)"
-  awk -v nodes="${nodes}" \
-    -v timeout="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
-    'BEGIN { s = nodes * timeout; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
+# mooncake_store_cross_node_timeout: the wait for the other node's part of the
+# Store, MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes
+# first there: numa_memory_budget.py compacts each NUMA node with pins in turn,
+# two at most, and stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
+mooncake_store_cross_node_timeout() {
+  awk -v wait="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)" \
+    -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    'BEGIN { s = wait + 2 * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
 }
 
 # The connector's mooncake_store.pools for per_nic pools: each pool's NIC and
@@ -1550,9 +1411,10 @@ mooncake_pools_json() {
   printf '}'
 }
 
-# The connector keys the launcher derives from the Store it starts: the stage
-# on a NIC reads that NIC's pool, whose owners share the NIC, under per_nic;
-# otherwise every stage reads the one master and stays off the owners' NICs.
+# The prefill workers' connector config, which the launcher derives from the
+# Store it starts: the stage on a NIC reads that NIC's pool, whose owners share
+# the NIC, under per_nic; otherwise every stage reads the one master and stays
+# off the owners' NICs.
 mooncake_store_launcher_config_json() {
   printf '{"mooncake_store.local_hostname":"%s","mooncake_store.protocol":"rdma",' "${host_ip}"
   if [[ -n "${mooncake_pool_devices[0]}" ]]; then
@@ -1566,23 +1428,9 @@ mooncake_store_launcher_config_json() {
 
 start_mooncake_store() {
   mooncake_store_requested || return 0
-  # check_mooncake_store_settings refuses a layout that starts several prefill
-  # workers from one shell; should one get here anyway, it would share the
-  # Store, whose owners were placed around the first worker's GPUs only.
-  if mooncake_store_running; then
-    if [[ "${mooncake_store_started_for}" != "${HIP_VISIBLE_DEVICES:-}" ]]; then
-      echo "[mooncake-store][FAIL] the Store was planned for the prefill GPUs ${mooncake_store_started_for}; this prefill worker uses GPUs ${HIP_VISIBLE_DEVICES:-}" >&2
-      stop_mooncake_store || true
-      exit 2
-    fi
-    return 0
-  fi
   check_mooncake_store_settings
   check_mooncake_owner_devices
-  local worker_config
-  worker_config="$(mooncake_store_worker_config "$(mooncake_store_launcher_config_json)")" || exit 2
   prepare_mooncake_store_memory
-  mooncake_store_started_for="${HIP_VISIBLE_DEVICES:-}"
   start_mooncake_page_cache_dropper
   mooncake_store_pids=()
   mooncake_store_logs=()
@@ -1602,9 +1450,8 @@ start_mooncake_store() {
       --http_metadata_server_host="${host_ip}"
       --http_metadata_server_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
       --metrics_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")"
-      --default_kv_lease_ttl="${MOONCAKE_STORE_LEASE_TTL_MS:-10000}"
-      --eviction_high_watermark_ratio="${MOONCAKE_STORE_EVICTION_HIGH_WATERMARK:-0.90}"
-      --eviction_ratio="${MOONCAKE_STORE_EVICTION_RATIO:-0.05}"
+      --default_kv_lease_ttl=10000
+      --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05
       --allocation_strategy=random --memory_allocator=offset --client_ttl=10
     )
     dump_launch_info "MOONCAKE_MASTER" "${store_env[@]}" "${cmd[@]}"
@@ -1614,19 +1461,17 @@ start_mooncake_store() {
     mooncake_store_names+=("master$(mooncake_pool_suffix "${pool}")")
   done
   mooncake_store_master_count="${#mooncake_pool_devices[@]}"
-  wait_for_mooncake_store masters "${MOONCAKE_STORE_MASTER_WAIT_TIMEOUT:-120}" \
-    mooncake_masters_ready "${host_ip}"
+  wait_for_mooncake_store masters 120 mooncake_masters_ready "${host_ip}"
   start_mooncake_store_owners "${host_ip}"
   local capacity=0
   for pool in "${!mooncake_pool_devices[@]}"; do
     capacity=$(( capacity + mooncake_pool_capacity[pool] ))
   done
   echo "[wait] mooncake-store pools=${#mooncake_pool_devices[@]} owners here=${#mooncake_owner_plan_numa[@]} capacity=${capacity} bytes"
-  local owners_timeout="${MOONCAKE_STORE_WAIT_TIMEOUT:-1200}" budget
+  local owners_timeout="${MOONCAKE_STORE_WAIT_TIMEOUT:-1200}"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
     # The decode node mounts its owners only once it has compacted its memory.
-    budget="$(mooncake_store_compaction_budget MOONCAKE_STORE_DECODE_OWNERS)"
-    owners_timeout=$(( owners_timeout + budget ))
+    owners_timeout="$(mooncake_store_cross_node_timeout)"
   fi
   wait_for_mooncake_store "owners" "${owners_timeout}" \
     mooncake_store_capacity_reaches "${host_ip}"
@@ -1634,7 +1479,7 @@ start_mooncake_store() {
   report_mooncake_store_owners
   mooncake_store_prefill_env=(
     "ATOM_KV_OFFLOAD=mooncake_store"
-    "ATOM_KV_OFFLOAD_EXTRA_CONFIG=${worker_config}"
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG=$(mooncake_store_launcher_config_json)"
     # One load worker by default, as PR #2459 settled on for this Store: four
     # hung its PP prefill pipeline at c96.
     "OFFLOAD_LOAD_WORKERS=${OFFLOAD_LOAD_WORKERS:-1}"
@@ -1652,8 +1497,6 @@ start_mooncake_store() {
 start_mooncake_store_decode_owners() {
   mooncake_store_requested || return 0
   [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
-  # The prefill node's own Store (a single-node job starts decode there too).
-  mooncake_store_running && return 0
   plan_mooncake_store_pools
   plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
   check_mooncake_owner_devices
@@ -1663,11 +1506,10 @@ start_mooncake_store_decode_owners() {
   mooncake_store_logs=()
   mooncake_store_names=()
   mooncake_store_master_count=0
-  local timeout budget
+  local timeout
   timeout="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)"
   # The prefill node starts its masters only once it has compacted its memory.
-  budget="$(mooncake_store_compaction_budget MOONCAKE_STORE_OWNERS)"
-  wait_for_mooncake_store "prefill-node masters" "$(( timeout + budget ))" \
+  wait_for_mooncake_store "prefill-node masters" "$(mooncake_store_cross_node_timeout)" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
