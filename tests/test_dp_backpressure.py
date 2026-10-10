@@ -5,6 +5,7 @@ stubs _send_request, and checks: (1) per-rank cap is honored, (2) the rest waits
 the pending pool, (3) completing a seq re-feeds the drained rank, (4) a fast rank
 ends up processing MORE total requests than a slow one (the whole point of Fix A).
 """
+
 import pickle
 from collections import deque
 from threading import Lock
@@ -94,9 +95,16 @@ def test_refill_feeds_fast_rank_more():
     assert all(r <= 3 for r in mgr._rank_reqs), mgr._rank_reqs
     # Pending shrank by the 10 refills.
     assert len(mgr._bp_pending) == 40 - 12 - 10, len(mgr._bp_pending)
-    print("OK refill: rank0 processed", len(mgr.sent[0]),
-          "vs peers", [len(mgr.sent[i]) for i in (1, 2, 3)],
-          "| in-flight", mgr._rank_reqs, "| pending", len(mgr._bp_pending))
+    print(
+        "OK refill: rank0 processed",
+        len(mgr.sent[0]),
+        "vs peers",
+        [len(mgr.sent[i]) for i in (1, 2, 3)],
+        "| in-flight",
+        mgr._rank_reqs,
+        "| pending",
+        len(mgr._bp_pending),
+    )
 
 
 def test_drains_everything():
@@ -113,8 +121,9 @@ def test_drains_everything():
         guard += 1
         assert guard < 1000
     assert len(mgr._bp_pending) == 0
-    assert sum(len(s) for s in mgr.sent) == 20  # every seq dispatched exactly once
-    assert len(set(sum(mgr.sent, []))) == 20    # no duplicates
+    dispatched = [sid for rank_ids in mgr.sent for sid in rank_ids]
+    assert len(dispatched) == 20  # every seq dispatched exactly once
+    assert len(set(dispatched)) == 20  # no duplicates
     print("OK drain: all 20 dispatched exactly once, nothing stuck")
 
 
