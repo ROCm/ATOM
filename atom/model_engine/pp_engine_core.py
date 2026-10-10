@@ -103,6 +103,7 @@ class PPEngineCoreProc(EngineCore):
     def _pp_head_step(self):
         launched = 0
         while len(self._in_flight) < self.pp_size:
+            self.utility_handler.apply_deferred_profiler_action()
             result = self.scheduler.schedule()
 
             rejected = self.scheduler.take_rejected()
