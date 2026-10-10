@@ -9,20 +9,20 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: "Preset — test: TP4 / c=2,4 / 900s; nightly: TP2+TP4 / 3600s"
+        description: "Preset — test: DeepSeek TP4 + Kimi-K3 TP8; nightly: DeepSeek TP2+TP4"
         type: choice
         options: [test, nightly]
         default: test
       models:
-        description: "Models (optional) — empty uses the preset; e.g. deepseek-v41-flash"
+        description: "Models (optional) — empty uses the preset; e.g. kimi-k3 or deepseek-v41-flash"
         type: string
         default: ""
       concurrency:
-        description: "Concurrency (optional) — empty uses the preset; test defaults to 2,4"
+        description: "Concurrency (optional) — empty uses each recipe; test: DeepSeek 2,4 / Kimi-K3 48"
         type: string
         default: ""
       duration_seconds:
-        description: "Seconds per point (optional) — empty uses test: 900 / nightly: 3600; allowed 900–3600"
+        description: "Seconds per point (optional) — empty uses each recipe: 900 or 3600; allowed 900–3600"
         type: string
         default: ""
       dry_run:

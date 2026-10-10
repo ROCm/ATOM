@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
 
@@ -89,6 +90,12 @@ class StateSlotPool:
         self._free: set[int] = set(range(num_slots))
         self._vacant: list[int] = list(range(num_slots))
         self._checkpointed: deque[int] = deque()
+        # Optional PAGE-coordinator images borrowing otherwise vacant slots.
+        # Only READY, unpinned images are here, and they remain allocatable.
+        # The callback removes the coordinator record BEFORE admission writes
+        # the slot. The coordinator alone owns hashes, generations and pins.
+        self._borrowed: OrderedDict[int, Callable[[], None]] = OrderedDict()
+        self.borrowing_enabled = False
         # Slots whose checkpoint is a guess rather than this prompt's own end;
         # `mark_speculative` explains what the distinction is worth. Cleared
         # when the guess pays off (`promote`) or the content goes (`release` of
@@ -170,9 +177,12 @@ class StateSlotPool:
         """
         slot = self._pop_vacant()
         if slot < 0:
-            slot = self._checkpointed.popleft()
-            self._free.discard(slot)
-            self.checkpoints_evicted += 1
+            if self._checkpointed:
+                slot = self._checkpointed.popleft()
+                self._free.discard(slot)
+                self.checkpoints_evicted += 1
+            else:
+                slot = self._take_borrowed()
         # Whatever guess this slot carried is spent with it. Not folded into
         # `invalidate`, which also runs on the re-file inside `_index` and would
         # clear a mark that was only just made.
@@ -206,10 +216,64 @@ class StateSlotPool:
         """
         while self._vacant:
             slot = heappop(self._vacant)
-            if slot in self._free and self.slot_hash[slot] == -1:
+            if (
+                slot in self._free
+                and self.slot_hash[slot] == -1
+                and slot not in self._borrowed
+            ):
                 self._free.discard(slot)
                 return slot
         return -1
+
+    def can_borrow(self, reserve: int, *, allocations: int = 0) -> bool:
+        """A snapshot fits without spending the vacant admission reserve.
+
+        Admission may spend the reserve; it is a limit on new snapshots, not
+        a hard partition that reduces the maximum request count.
+        `allocations` covers requests not allocated yet during a fit probe.
+        A cached image may be replaced, but pinned/writing slots are absent
+        from `_free` and can never be selected.
+        """
+        vacant = len(self._free) - len(self._checkpointed) - len(self._borrowed)
+        return vacant > reserve + allocations or (
+            bool(self._borrowed) and len(self._free) > reserve + allocations
+        )
+
+    def borrow(self, reserve: int, *, replace: bool = True) -> int:
+        """Reserve a destination, optionally replacing an old borrowed image."""
+        if not self.can_borrow(reserve):
+            return -1
+        vacant = len(self._free) - len(self._checkpointed) - len(self._borrowed)
+        if vacant > reserve:
+            return self._pop_vacant()
+        return self._take_borrowed() if replace and self._borrowed else -1
+
+    def _take_borrowed(self) -> int:
+        slot = next(iter(self._borrowed))
+        self._borrowed[slot]()
+        # The eviction callback must have returned the image as vacant.
+        assert slot not in self._borrowed and slot in self._free
+        self.claim(slot)
+        return slot
+
+    def cache_borrowed(self, slot: int, evict: Callable[[], None]) -> None:
+        """Publish an immutable image or return its last completed reader."""
+        assert slot not in self._free and self.slot_hash[slot] == -1
+        self._borrowed[slot] = evict
+        self._free.add(slot)
+
+    def pin_borrowed(self, slot: int) -> None:
+        """Remove a READY image from admission until all its readers finish."""
+        assert slot in self._borrowed and slot in self._free
+        del self._borrowed[slot]
+        self.claim(slot)
+
+    def release_borrowed(self, slot: int) -> None:
+        """Discard an image, whether reserved, READY, or finally unpinned."""
+        self._borrowed.pop(slot, None)
+        if slot in self._free:
+            self.claim(slot)
+        self.release(slot)
 
     def claim(self, slot: int) -> None:
         """Take one specific free slot off the list, content and all.
@@ -367,6 +431,8 @@ class StateSlotPool:
         Both clear on their own, so the caller retries rather than blocks.
         """
         top = self.num_slots - 1
+        if self.borrowing_enabled:
+            raise RuntimeError("cannot resize a pool with borrowed checkpoints")
         if top < 0 or self.is_pinned(top):
             return None
         held = self.holds_checkpoint(top)
@@ -642,7 +708,9 @@ class StateSlotPool:
         `checkpoint_fates`, which owns that question. `kept - num_slots ==
         evicted` is the thrash signal.
         """
-        held = sum(1 for g in self._free if self.slot_hash[g] != -1)
+        held = len(self._borrowed) + sum(
+            1 for g in self._free if self.slot_hash[g] != -1
+        )
         return {
             "slots_total": self.num_slots,
             "slots_used": self.num_slots - len(self._free),

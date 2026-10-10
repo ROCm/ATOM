@@ -352,7 +352,7 @@ def test_agentic_dispatch_overrides_keep_the_server_recipe():
 
     from build_agentic_benchmark_matrix import build_configs
 
-    defaults = build_configs()
+    defaults = build_configs(inputs={"models": "deepseek-v41-flash"})
     selected = build_configs(
         inputs={
             "models": "deepseek-v41-flash",
@@ -482,13 +482,13 @@ def test_agentic_nightly_subset_keeps_each_tp_grid():
         build_configs(inputs={"profile": "nightly", "concurrency": "256"})
 
 
-def test_agentic_manual_default_stays_a_two_point_test():
+def test_agentic_deepseek_test_selection_stays_a_two_point_test():
     import json
     import shlex
 
     from build_agentic_benchmark_matrix import build_configs
 
-    (config,) = build_configs()
+    (config,) = build_configs(inputs={"models": "deepseek-v41-flash"})
     assert json.loads(config["concurrency"]) == [2, 4]
     assert "-tp 4" in config["server_args"]
     assert "--cudagraph-mode FULL" in config["server_args"]
@@ -657,4 +657,59 @@ def test_agentic_custom_image_digest_resolution(monkeypatch):
     assert (
         resolve_run_image("example.org/atom:test")["pinned"]
         == f"example.org/atom:test@{digest}"
+    )
+
+
+def test_agentic_kimi_k3_c48_has_prefill_checkpoint_compatible_configuration():
+    import json
+    import shlex
+
+    from build_agentic_benchmark_matrix import build_configs
+
+    defaults = build_configs()
+    assert {c["prefix"] for c in defaults} == {"deepseek-v41-flash", "kimi-k3"}
+    (config,) = build_configs(inputs={"models": "kimi-k3"})
+    assert config["bench_kind"] == "aiperf_agentic"
+    assert json.loads(config["concurrency"]) == [48]
+    args = shlex.split(config["server_args"])
+    expected = {
+        "-tp": "8",
+        "--decode-context-parallel-size": "8",
+        "--data-parallel-size": "1",
+        "--max-num-seqs": "96",
+        "--max-num-batched-tokens": "8192",
+        "--method": "dspark",
+        "--num-speculative-tokens": "3",
+        "--spec-decode-acceptance-length": "3.00",
+        "--state-checkpoint-interval-tokens": "-1",
+        "--kv_cache_dtype": "fp8",
+    }
+    for flag, value in expected.items():
+        assert args.count(flag) == 1 and args[args.index(flag) + 1] == value
+    assert "--enable_prefix_caching" in args
+    assert (
+        "--enable-expert-parallel" not in args and "--enable-dp-attention" not in args
+    )
+    assert json.loads(args[args.index("--kv-transfer-config") + 1]) == {
+        "kv_connector": "lmcache_offload",
+        "kv_role": "offload",
+    }
+    assert json.loads(args[args.index("--cudagraph-capture-sizes") + 1]) == list(
+        range(1, 385)
+    )
+    env = dict(line.split("=", 1) for line in config["env_vars"].splitlines())
+    assert env["ATOM_KDA_SPARE_STATE_CHECKPOINTS"] == "1"
+    assert env["ATOM_KDA_SPARE_STATE_RESERVE"] == "8"
+    assert env["ATOM_ENABLE_REPLAYSSM"] == "0"
+    assert env["ATOM_STATE_CHECKPOINT_DEMAND"] == "0"
+    assert env["ATOM_GDN_SSM_DTYPE"] == "fp16"
+    assert env["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "128"
+    assert env["LMCACHE_LOCAL_CPU"] == "True"
+    assert env["LMCACHE_CHUNK_SIZE"] == "1024"
+    assert env["BENCHMARK_PRECISION"] == "fp4"
+    assert env["BENCHMARK_MODEL_KEY"] == "kimik3"
+    assert env["AIPERF_BENCHMARK_DURATION"] == "3600"
+    assert env["AIPERF_MAX_CONTEXT_LENGTH"] == "1048576"
+    assert not any(
+        k.startswith("DYN_") or k in ("ETCD_ENDPOINTS", "HEAD_NODE_IP") for k in env
     )

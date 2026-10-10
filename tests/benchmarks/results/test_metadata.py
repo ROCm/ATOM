@@ -139,3 +139,29 @@ def test_partial_cli_reports_missing_identity(tmp_path):
     assert json.loads(result.stdout)["status"] == "partial"
     assert "missing software.atom_sha" in json.loads(result.stdout)["missing"]
     assert "Bundle incomplete: missing software.atom_sha" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "key,baseline,changed",
+    [
+        ("ATOM_KDA_SPARE_STATE_CHECKPOINTS", "0", "1"),
+        ("ATOM_KDA_SPARE_STATE_RESERVE", "8", "16"),
+        ("ATOM_ENABLE_REPLAYSSM", "0", "1"),
+        ("LMCACHE_MAX_LOCAL_CPU_SIZE", "128", "192"),
+    ],
+)
+def test_k3_cache_settings_change_captured_recipe_identity(
+    monkeypatch, key, baseline, changed
+):
+    from atom.benchmarks.results.bundle import recipe_fingerprint
+    from atom.benchmarks.results.metadata import performance_env
+
+    config = read_json(FIXTURES / "agentic-config.json")
+    monkeypatch.setenv(key, baseline)
+    config["recipe"]["environment"] = performance_env()
+    assert config["recipe"]["environment"][key] == baseline
+    before = recipe_fingerprint(config)
+    monkeypatch.setenv(key, changed)
+    config["recipe"]["environment"] = performance_env()
+    assert config["recipe"]["environment"][key] == changed
+    assert recipe_fingerprint(config) != before

@@ -18,6 +18,8 @@ from typing import Any
 
 import torch
 
+from atom.kv_transfer.disaggregation.types import StateSlotSource
+
 logger = logging.getLogger("atom")
 
 
@@ -27,10 +29,9 @@ class StateByteCodec:
     An opaque flat uint8 blob: the x-packed / strided / multi-plane state
     layouts cannot be expressed in LMCache's token-major model at all.
 
-    The two directions read different things by design: a store gathers the
-    checkpoint's PAGE units (`page_unit_views`, where #2045 keeps the image), a
-    load scatters into the Active Slot the resuming forward reads
-    (`state_entry_views`). The blob is the same ordered byte stream either way.
+    A store gathers an immutable PAGE image or a leased StateSlotSource;
+    a load scatters into the Active Slot the resuming forward reads. Both
+    sources produce the same conv-all-layers / SSM-all-layers byte stream.
     """
 
     def __init__(
@@ -141,9 +142,9 @@ class StateByteCodec:
     def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.
 
-        Reads PAGE units where `get` writes an Active Slot; safe because the
-        copy plan intersects two *ordered byte streams*, so a blob gathered in
-        unit order is byte-identical to one gathered in slot order.
+        Reads PAGE units, or a typed immutable slot source, where `get` writes
+        an Active Slot. The PAGE copy plan and state_entry_views expose the
+        same ordered byte stream, so either image uses the same CPU key.
 
         A refusal is not an error -- `_allocate` returns None under CPU pressure,
         and a whole image is refused sooner than a KV chunk, so the state leg
@@ -183,7 +184,12 @@ class StateByteCodec:
         # and shrinking the CPU pool one entry per failure. `get` guards its own
         # reference with `finally` for the same reason.
         try:
-            self._staged.pack(self._backend.page_unit_views(unit_ids), obj)
+            views = (
+                self._backend.state_entry_views(unit_ids.slot_id)
+                if isinstance(unit_ids, StateSlotSource)
+                else self._backend.page_unit_views(unit_ids)
+            )
+            self._staged.pack(views, obj)
             # Source first: `pack` has synchronized the stream that reads the
             # units, so nothing on the device touches them from here.
             if on_source_released is not None:

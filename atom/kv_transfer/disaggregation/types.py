@@ -100,6 +100,23 @@ LoadCompletionId = ReqId | LoadOperationId
 
 
 @dataclass(frozen=True)
+class StateSlotSource:
+    """An immutable slot image leased until every rank stops its D2H read.
+
+    Kept distinct from PAGE ids so an empty tuple can never silently name a
+    slot. Operation identity/generation is carried by StateStoreOperationId.
+    """
+
+    slot_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.slot_id, int) or isinstance(self.slot_id, bool):
+            raise TypeError("state source slot must be an integer")
+        if self.slot_id < 0:
+            raise ValueError("state source slot must be nonnegative")
+
+
+@dataclass(frozen=True)
 class StateStoreOperationId:
     """Exact identity of one hand-out of a state checkpoint to the CPU tier.
 

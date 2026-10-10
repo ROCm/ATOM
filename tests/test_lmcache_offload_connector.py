@@ -7333,3 +7333,54 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+def test_cpu_state_codec_reads_borrowed_slot_before_releasing_source(lmcache_key):
+    from atom.kv_transfer.disaggregation.types import StateSlotSource
+
+    codec = _codec("L")
+    events = []
+    planes = [torch.arange(512, dtype=torch.int16).view(torch.uint8)]
+    obj = SimpleNamespace(
+        tensor=torch.empty(1024, dtype=torch.uint8),
+        ref_count_down=lambda: events.append("down"),
+    )
+    codec._allocate = lambda size: obj
+    codec._backend = SimpleNamespace(
+        state_entry_views=lambda slot: (
+            planes if slot == 3 else pytest.fail("wrong slot")
+        ),
+        page_unit_views=lambda units: pytest.fail("slot source treated as PAGE ids"),
+    )
+
+    def pack(views, target):
+        target.tensor.copy_(torch.cat([x.reshape(-1) for x in views]))
+        events.append("packed")
+
+    codec._staged = SimpleNamespace(pack=pack)
+    codec._storage.batched_put = lambda keys, objects: events.append("put")
+    assert codec.put(42, StateSlotSource(3), lambda: events.append("source-released"))
+    assert torch.equal(obj.tensor, planes[0])
+    assert events == ["packed", "source-released", "put"]
+
+
+def test_k3_worker_forwards_typed_slot_source_without_reinterpreting_it():
+    from atom.kv_transfer.disaggregation.types import StateSlotSource
+
+    worker = _k3_worker()
+    submitted = []
+    worker._state_tier = SimpleNamespace(
+        submit_store=lambda op, source: submitted.append((op, source))
+    )
+    operation = StateStoreOperationId(42, 3)
+    source = StateSlotSource(5)
+    meta = LMCacheOffloadMetadata()
+    meta.state_stores = [(operation, source)]
+    worker._start_state_stores(pickle_roundtrip(meta))
+    assert submitted == [(operation, source)]
+
+
+def pickle_roundtrip(value):
+    import pickle
+
+    return pickle.loads(pickle.dumps(value))

@@ -9,12 +9,14 @@ Agentic trace replay uses the separate
 two catalogs: [`models_agentic.json`](./models_agentic.json) for the default
 manual test, and [`models_agentic_nightly.json`](./models_agentic_nightly.json)
 for the daily 08:17 UTC run. Both use `rocm/atom-dev:latest` and checked-out branch
-code. The manual default remains DeepSeek V4.1 Flash + DSpark5, TP4 with FULL
-graphs, concurrency 2/4 and 900 seconds per point. Nightly is based on InferenceX
-PR #3387 with a custom grid: TP2 c=1/2/4/8/16/32/64/128 and TP4 c=1/4/8,
+code. The manual `test` catalog contains DeepSeek V4.1 Flash + DSpark5,
+TP4 with FULL graphs, concurrency 2/4 and 900 seconds per point, plus Kimi-K3
++ DSpark3, TP8/DCP8, concurrency 48 and 3600 seconds. An empty `models` input
+selects both models. Nightly remains DeepSeek only, based on InferenceX PR #3387
+with a custom grid: TP2 c=1/2/4/8/16/32/64/128 and TP4 c=1/4/8,
 3600 seconds per point, 5 warmup requests per lane and fixed AL 3.51.
-Both profiles set GPU memory utilization to 0.95, omit the max-num-seqs override,
-and use capture sizes 1–32 plus 48/64/96/128/160/192/224/256 for every point.
+The DeepSeek recipes set GPU memory utilization to 0.95, omit the max-num-seqs
+override, and use capture sizes 1–32 plus 48/64/96/128/160/192/224/256.
 Agentic variants declare `concurrency` directly; random `scenarios`, ISL/OSL,
 length ratios and concurrency bands are not part of these catalogs.
 Select **ATOM Agentic Benchmark**
@@ -32,6 +34,41 @@ concurrency points and directly reuse
 consumers, including AgenticViewer. See
 [`benchmark-artifacts.md`](../../docs/benchmark-artifacts.md#ci-and-configuration)
 for capture and verification details.
+
+
+## Kimi-K3 single-server Agentic case
+
+In **ATOM Agentic Benchmark**, select the branch containing the implementation,
+set `profile=test` and `models=kimi-k3`, and leave concurrency and duration empty
+for the recipe's C48 / 3600-second point. Set `dry_run=true` to preview the
+matrix without allocating a GPU runner. The catalog entry is in
+[`models_agentic.json`](./models_agentic.json); it starts a single ATOM server
+through `benchmark-tmpl.yml` and does not invoke ATOMesh or a Dynamo frontend.
+
+The case uses TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
+`max-num-seqs=96`, `max-num-batched-tokens=8192`, DSpark3 with draft model
+`Inferact/Kimi-K3-DSpark`, and fixed acceptance length 3.00. It loads the K3 FP4
+weights, uses FP8 KV and LMCache DRAM offload with 128 GiB per rank, block size
+128, and LMCache chunk size 1024. The Agentic trace context cap is 1,048,576
+tokens; request lengths come from the dataset rather than random ISL/OSL flags.
+
+Spare STATE checkpoints are explicitly enabled with:
+
+```text
+ATOM_ENABLE_REPLAYSSM=0
+ATOM_KDA_SPARE_STATE_CHECKPOINTS=1
+ATOM_KDA_SPARE_STATE_RESERVE=8
+ATOM_STATE_CHECKPOINT_DEMAND=0
+--state-checkpoint-interval-tokens -1
+```
+
+Only prefill checkpoint placement is enabled. Each DSpark3 request owns four
+runtime slots; each retained checkpoint uses one spare slot, falling back to
+PAGE when the spare STATE capacity is exhausted. Reserve 8 is measured in
+physical slots. ATOM/AITER/LMCache settings follow the supplied September 29
+configuration; deployment-specific Dynamo/ETCD addresses are not required by
+this direct single-server workflow. The checkpoint switch and reserve are
+captured in benchmark metadata and the recipe fingerprint for comparison runs.
 
 ## Flow
 

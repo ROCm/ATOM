@@ -331,6 +331,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
+    # Opt-in K3 cache: borrow idle STATE slots without changing max_num_seqs.
+    # Placement remains controlled by checkpoint interval / demand.
+    "ATOM_KDA_SPARE_STATE_CHECKPOINTS": lambda: (
+        os.getenv("ATOM_KDA_SPARE_STATE_CHECKPOINTS", "0") == "1"
+    ),
+    "ATOM_KDA_SPARE_STATE_RESERVE": lambda: int(
+        os.getenv("ATOM_KDA_SPARE_STATE_RESERVE", "8")
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by

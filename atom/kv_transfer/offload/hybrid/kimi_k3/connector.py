@@ -15,6 +15,7 @@ import time
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
+    StateSlotSource,
     StateStoreOperationId,
 )
 from atom.kv_transfer.offload import config as offcfg
@@ -425,7 +426,12 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             # releases the store's pinned PAGE units now rather than on the
             # reconciler's full timeout, without escaping past super().
             try:
-                self._state_tier.submit_store(op, tuple(int(u) for u in unit_ids))
+                source = (
+                    unit_ids
+                    if isinstance(unit_ids, StateSlotSource)
+                    else tuple(int(u) for u in unit_ids)
+                )
+                self._state_tier.submit_store(op, source)
             except Exception:
                 logger.exception(
                     "kimi_k3 offload: submit_store failed for %s; failing it.",
