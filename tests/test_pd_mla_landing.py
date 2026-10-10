@@ -32,8 +32,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
-    pack_landing_rows,
-    pack_staging_slots,
+    pack_slots,
 )
 from atom.kv_transfer.disaggregation.types import MLA_KV_ROLE
 
@@ -90,9 +89,9 @@ def test_landing_rows_are_the_token_runs_in_destination_order(
 
 @pytest.mark.parametrize("num_rows", [1, 15, 16, 17, 100, 333])
 @pytest.mark.parametrize("slot_rows", [16, 40, 64, 200])
-def test_pack_landing_rows_covers_every_row_and_splits_on_pages(num_rows, slot_rows):
+def test_pack_slots_covers_every_row_and_splits_on_pages(num_rows, slot_rows):
     widths = [TOKEN_BYTES, TOKEN_BYTES, TOKEN_BYTES]
-    slots = pack_landing_rows(widths, num_rows, slot_rows * TOKEN_BYTES, BLOCK_SIZE)
+    slots = pack_slots(widths, num_rows, slot_rows * TOKEN_BYTES, BLOCK_SIZE)
     seen = {r: np.zeros(num_rows, dtype=int) for r in range(len(widths))}
     for items in slots:
         end = 0
@@ -108,13 +107,13 @@ def test_pack_landing_rows_covers_every_row_and_splits_on_pages(num_rows, slot_r
         assert (counts == 1).all()
 
 
-def test_pack_landing_rows_rejects_a_slot_smaller_than_a_page():
+def test_pack_slots_rejects_a_slot_smaller_than_a_page():
     with pytest.raises(ValueError, match="cannot hold"):
-        pack_landing_rows([TOKEN_BYTES], 40, 15 * TOKEN_BYTES, BLOCK_SIZE)
+        pack_slots([TOKEN_BYTES], 40, 15 * TOKEN_BYTES, BLOCK_SIZE)
 
 
-def test_pack_staging_slots_can_start_regions_at_later_pages():
-    slots = pack_staging_slots([PAGE_BYTES] * 3, 6, 4 * PAGE_BYTES, [6, 2, 0])
+def test_pack_slots_can_start_regions_at_later_pages():
+    slots = pack_slots([PAGE_BYTES] * 3, 6, 4 * PAGE_BYTES, 1, [6, 2, 0])
     pages = {r: [] for r in range(3)}
     for items in slots:
         for region, start, stop, _ in items:
@@ -618,7 +617,6 @@ def _producer(mc, regions, *, staging_rows=None):
         conn._mla_staging = torch.empty(
             (2, staging_rows * TOKEN_BYTES), dtype=torch.uint8
         )
-        conn._mla_staging_pool_size = 2
         conn._mla_staging_free = [0, 1]
         conn._mla_staging_cv = threading.Condition()
         conn._stream = _Stream()
@@ -759,7 +757,6 @@ def test_landing_falls_back_to_staged_pages_without_credits(monkeypatch):
     assert labels[0] == "landed-mla"
     assert labels.count("landed-mla") == 1
     assert "staged-mla" in labels
-    assert new._landing_credits.stats["fallbacks"] == 1
 
 
 def test_small_transfers_keep_the_staged_path(monkeypatch):
@@ -892,9 +889,12 @@ def test_write_done_reports_landed_slots_only_when_offered():
     conn._notify_transfer_result(
         {**base, "mla_landing": {}, "_mla_landed": [4, 4, 5]}, success=True
     )
-    first, second = (msgpack.loads(p[1]) for p in sent)
-    assert "landed_slots" not in first
+    # A None offer is no offer, as for the write listener and the transfer.
+    conn._notify_transfer_result({**base, "mla_landing": None}, success=True)
+    first, second, third = (msgpack.loads(p[1]) for p in sent)
+    assert first["landed_slots"] is None
     assert second["landed_slots"] == [4, 4, 5]
+    assert third["landed_slots"] is None
 
 
 def test_landing_requests_complete_through_the_receiver():

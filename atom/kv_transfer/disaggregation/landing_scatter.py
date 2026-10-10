@@ -4,7 +4,7 @@
 """Decode-side scatter of landed MLA rows into the paged KV cache.
 
 A DCP producer packs the rows a decode rank owns into a landing slot in rank
-order (see ``MooncakeConnector._execute_landed_mla_regions``). Row ``j`` of
+order (see ``MooncakeConnector._execute_mla_regions``). Row ``j`` of
 consumer region ``c`` belongs at token ``j % block_size`` of destination block
 ``dst_block_ids[j // block_size]``, so consecutive rows fill whole destination
 pages. The scatter copies one segment -- a run of rows that is contiguous at
