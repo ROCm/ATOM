@@ -107,6 +107,7 @@ from atom.mono.device.ops import (
     kernel_symbol,
     lane_gather,
     lanes_below,
+    launcher,
     lds_bytes,
     popcount,
     row_sum,
@@ -1559,7 +1560,7 @@ def build_moe(key: MoeBuild):
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         x: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,

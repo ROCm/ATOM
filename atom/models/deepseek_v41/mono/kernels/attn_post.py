@@ -93,6 +93,7 @@ from atom.mono.device.ops import (
     fp8_pack4,
     kernel_symbol,
     lane_gather,
+    launcher,
     ld_i32,
     row_sum,
     traced,
@@ -680,7 +681,7 @@ def build_attn_post(key: AttnPostBuild):
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         iact: Int32, iq: Int64, iw: Int64, plane: Int64, iqs: Int64,
         pscale: Int64, iplan: Int64, itab: Int64,

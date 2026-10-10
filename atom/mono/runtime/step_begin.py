@@ -27,6 +27,7 @@ from atom.mono.device.ops import (
     CM_SYS,
     ballot,
     kernel_symbol,
+    launcher,
     load_ptr64,
     memrealtime,
     rsrc,
@@ -149,10 +150,9 @@ def _build(key: StepBeginBuild):
     assert 1 <= tp <= FENCE_SLOTS
     keyed = key_tuple(key, source_digest("mono"))
 
-    @flyc.kernel(
-        name=kernel_symbol("mono_step_begin", tp=tp, debug=int(debug)),
-        known_block_size=[THREADS, 1, 1],
-    )
+    name = kernel_symbol("mono_step_begin", tp=tp, debug=int(debug))
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def step_begin(
         s0: Int64, n0: Int64, s1: Int64, n1: Int64,
         peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
@@ -180,7 +180,7 @@ def _build(key: StepBeginBuild):
         _zero(s0, n0, lane0, stride)
         _zero(s1, n1, lane0, stride)
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         s0: Int64, n0: Int64, s1: Int64, n1: Int64,
         peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
