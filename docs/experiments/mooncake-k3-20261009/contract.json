@@ -13,7 +13,7 @@
     "Mooncake direct RDMA push instead of MoRI READ",
     "P-only Mooncake embedded Store instead of LMCache MP; same 1799 GiB aggregate CPU pool, 8 GiB private buffer",
     "Mooncake example proxy with health/models adapter instead of MoRI router",
-    "current idle g12/g13 in the same approved pool",
+    "current idle g10/g12 in the same approved pool",
     "safetensors loader instead of fastsafetensors"
   ],
   "cpu_store_gib_total": 1799,
@@ -35,8 +35,8 @@
     "display_topology": "1P1D-TP8-DCP8",
     "pd_worker_layout": "multi_node",
     "nodes": [
-      "pit2-p03-g12",
-      "pit2-p03-g13"
+      "pit2-p03-g10",
+      "pit2-p03-g12"
     ],
     "num_nodes": 2,
     "isl": [
@@ -312,9 +312,18 @@
       }
     }
   },
-  "resume_from_run": 37906592218,
+  "resume_from_run": 37953102503,
   "retry_changes": [
-    "Retry only ESTALE in peer-state reads: four attempts with 0.1/0.2/0.4s backoff, otherwise preserve exit codes.",
-    "Select idle g12/g13 from the same authorized pool (inspection 37952706738), replacing occupied g10/g12."
-  ]
+    "Install missing/outdated main Python dependencies from a pinned runtime list; keep native main unchanged.",
+    "Fix package provenance to report active venv distributions instead of shadowed image copies.",
+    "Validate main common requirements and actual Mooncake/Store imports before serving.",
+    "Use currently idle g10/g12 in the authorized pool; inspection38021019640."
+  ],
+  "runtime_dependencies": {
+    "huggingface_hub": "1.31.0",
+    "xgrammar": "0.2.8",
+    "apache-tvm-ffi": "0.1.11",
+    "oss-harmony": "0.0.11",
+    "setuptools": "79.0.1"
+  }
 }

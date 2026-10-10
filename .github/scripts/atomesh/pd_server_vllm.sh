@@ -48,7 +48,11 @@ install_native_vllm() {
       }
   export PATH="${venv}/bin:${PATH}"
   server_pythonpath=""
-  env PYTHONPATH= "${venv}/bin/python" - "${venv}" "${sha}" \
+  if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
+    uv pip install --python "${venv}/bin/python" --no-deps \
+      -r "${ATOMESH_SCRIPT_DIR}/pd_mooncake_requirements.txt"
+  fi
+  env PYTHONPATH= "${venv}/bin/python" - "${venv}" "${sha}" "${src}" \
     "${RUNTIME_LOG_DIR}/native-manifest-rank-${NODE_RANK}.json" <<'PY'
 import importlib.metadata
 import hashlib
@@ -59,19 +63,39 @@ from pathlib import Path
 
 import torch
 import vllm
+from packaging.requirements import Requirement
 
 assert Path(vllm.__file__).is_relative_to(sys.argv[1]), vllm.__file__
+package_names = {d.metadata['Name'] for d in importlib.metadata.distributions()}
 manifest = {
     "source_sha": sys.argv[2], "source_path": vllm.__file__,
     "torch": torch.__version__, "hip": torch.version.hip,
-    "packages": {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
+    # Resolve the active distribution when both venv and image contain a package.
+    "packages": {name: importlib.metadata.version(name) for name in sorted(package_names)},
     "model_files": {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for pattern in ("*config*.json", "tokenizer*.json", "tokenizer.model")
         for path in Path(os.environ["MODEL_PATH"]).glob(pattern)
     },
 }
-Path(sys.argv[3]).write_text(json.dumps(manifest, indent=2) + "\n")
+if os.environ.get("ATOMESH_VLLM_MOONCAKE_ENABLED") == "1":
+    mismatches = []
+    for line in (Path(sys.argv[3]) / "requirements/common.txt").read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        req = Requirement(line)
+        if req.marker and not req.marker.evaluate():
+            continue
+        try:
+            version = importlib.metadata.version(req.name)
+        except importlib.metadata.PackageNotFoundError:
+            version = None
+        if version is None or not req.specifier.contains(version, prereleases=True):
+            mismatches.append({"requirement": str(req), "installed": version})
+    manifest["common_requirement_mismatches"] = mismatches
+Path(sys.argv[4]).write_text(json.dumps(manifest, indent=2) + "\n")
+assert not manifest.get("common_requirement_mismatches"), manifest.get("common_requirement_mismatches")
 print(f"[vllm] native source installation OK: {sys.argv[2]} {vllm.__file__}")
 PY
 }

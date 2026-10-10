@@ -32,3 +32,11 @@ Run [37906592218](https://github.com/ROCm/ATOM/actions/runs/37906592218), Slurm6
 The retry adds four bounded read attempts only for `ESTALE` (0.1/0.2/0.4-second delays). Persistent read faults, invalid records, run ownership checks, and real peer failures retain their original exit semantics. CPU fault injection reproduced exit2 before this change and passed after it; cleanup-state, job-result, Store-probe, and matrix suites total 23 passing tests. This validates error handling, not the availability of the remote NFS service.
 
 The retry uses g12/g13 because g10 is now occupied. Local matrix comparison differs only in the node pair. vLLM source, Mooncake wheel, model parameters, account, QoS, GPU count, Store gate, C16 performance window, and natural GSM8K phase are unchanged. Evidence is under `/app/test_scripts/dspark_pd/mooncake-rocm-c16-20261009/retry-estale/`; the original failure is archived separately.
+
+## Dependency alignment after run37953102503
+
+The source built successfully on both ranks, the official ROCm wheel passed HIP/multi-protocol checks, and the Mooncake master started. Both P/D then failed importing the direct connector: the image has huggingface_hub1.30.0 but pinned main requires1.31.0 for its httpx re-export. Both rank cleanup queries succeeded with empty task-container lists. No model requests were run.
+
+A local isolated1.30.0 installation reproduces the exact import failure;1.31.0 passes. Source requirement audit also found xgrammar0.2.6 instead of0.2.8 and missing oss-harmony; xgrammar0.2.8 needs apache-tvm-ffi0.1.11. The pinned runtime requirements include these versions and restore image setuptools79.0.1 after native build tooling installs84. The active dependency imports and declared common/transitive requirements are checked locally. Remote startup now checks common requirements and imports both Mooncake connectors before model launch. Package manifests resolve the active distribution so image metadata cannot overwrite venv provenance.
+
+The next run uses idle g10/g12 per CPU inspection38021019640 at03:34:57 UTC, with identical model, transport, Store, performance and accuracy configuration. The vLLM source remains pure bacbbe187. Current contract and inputs are in this directory; detailed local evidence is in `/app/test_scripts/dspark_pd/mooncake-rocm-c16-20261009/retry-hub131/`.

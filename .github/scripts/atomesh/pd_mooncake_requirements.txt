@@ -1,0 +1,7 @@
+# Align the pinned ROCm image with vLLM bacbbe187 requirements/common.txt.
+huggingface_hub==1.31.0
+xgrammar==0.2.8
+apache-tvm-ffi==0.1.11
+oss-harmony==0.0.11
+# The build tooling otherwise selects setuptools 84, outside vLLM's runtime bound.
+setuptools==79.0.1

@@ -10,7 +10,12 @@ install_mooncake() {
     > "${RUNTIME_LOG_DIR}/mooncake-package-rank-${NODE_RANK}.log" 2>&1
   python3 - <<'PY'
 import mooncake.engine
+import openai_harmony
+import xgrammar
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import MooncakeStoreConnector
 assert mooncake.engine.SUPPORT_HIP, "Mooncake was not compiled for HIP"
+print(f"[mooncake] connector imports OK: {MooncakeConnector.__name__}, {MooncakeStoreConnector.__name__}")
 PY
   export VLLM_MOONCAKE_BOOTSTRAP_PORT=$((18998 + ATOMESH_SERVICE_PORT_OFFSET))
   export MOONCAKE_MASTER_PORT=$((19051 + ATOMESH_SERVICE_PORT_OFFSET))
