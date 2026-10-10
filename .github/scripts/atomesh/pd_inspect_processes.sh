@@ -20,7 +20,7 @@ while IFS= read -r container; do
   [[ "${container}" == atomesh-* && "${container}" =~ -${job_id}-[0-9]+(-benchmark|-eval)?$ ]] || continue
   printf 'Container: %s\n' "${container}"
   # shellcheck disable=SC2016
-  timeout --kill-after=5s 90s docker exec --privileged --user 0 "${container}" bash -c '
+  timeout --kill-after=5s 90s docker exec "${container}" bash -c '
     id
     ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
     ps -eo pid,ppid,etimes,pcpu,stat,args | grep -E "[n]inja|[h]ipcc|[c]lang-22" | cut -c 1-1200
