@@ -21,7 +21,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode,
     run_pa_fwd_asm,
 )
-from atom.utils import envs
+from atom.utils import blasst, envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
@@ -527,6 +527,10 @@ class PagedAttentionImpl(nn.Module):
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
+        # No block_skip_threshold here on purpose: BLASST is prefill-only. A
+        # decode step has one query row per sequence and no running max to
+        # threshold against, so there is nothing to skip; the kernel would
+        # force-disable it anyway. See prefill_attention_triton.
         unified_attention(
             q,
             k_cache,
@@ -931,6 +935,14 @@ class PagedAttentionImpl(nn.Module):
         # at 0 -- hence is_prefill False, which is the branch this method is
         # reached from. Every is_prefill batch sets the two counts equal.
         n_seqs = fwd_ctx.context.scheduled_bs
+
+        # BLASST block skipping, keyed off the KV length being attended over,
+        # which is what the calibrated fit is defined against. 0.0 unless
+        # configured, and the kernel treats 0.0 as "run dense", so this is exact
+        # dense attention by default. The kernel additionally force-disables
+        # skipping for all-decode and sliding-window batches.
+        block_skip_threshold = blasst.resolve_threshold(attn_metadata.max_seqlen_k)
+
         unified_attention(
             q,
             k_for_attn,
@@ -953,6 +965,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
+            block_skip_threshold=block_skip_threshold,
         )
 
         return o

@@ -164,6 +164,37 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 |----------|------|---------|-------------|
 | **ATOM_EPLB_MAX_REBALANCES** | int | 0 (no limit) | Stop periodic rebalancing once this many rebalances have run, and serve with that expert placement for the rest of the process: balance on early traffic, then pay no further migrations. Only rebalances that run count; an interval the balancedness gate skips does not. The limit is checked after a rebalance's last migration chunk commits, on every rank in lockstep; after it, the manager also stops reducing the per-step has-prefill flag. Load recording continues (its buffers are fixed for CUDA graphs) but is no longer read. `0` or a negative value keeps rebalancing for the life of the process. Read when the EPLB manager is built, so set it before the server starts. |
 
+## BLASST sparse attention
+
+BLASST skips a K/V tile when its per-tile max attention score falls more than
+`log(threshold)` below the running softmax max, eliding that tile's V load and `P@V`
+matmul. A tile is skipped only when every row in the block agrees, so `SPARSITY` is a
+target rather than a guarantee.
+
+**Scope:** prefill only, and only on the Triton `unified_attention` 2D kernel -- reached
+when `ATOM_USE_UNIFIED_ATTN=1` or the model uses flash layout. Decode, sliding-window
+layers and the 3D path always run dense. The default (`0`) is exact dense attention.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_BLASST_THRESHOLD** | float | 0 (off) | Fixed block-skip threshold. Takes precedence over the calibrated fit below when > 0. |
+| **ATOM_BLASST_ALPHA** | float | 0 (off) | Scale coefficient of the calibrated fit `threshold = alpha * exp(beta * sparsity) / seqlen`. Needs `ATOM_BLASST_SPARSITY` to take effect. The `1/seqlen` term is load-bearing: scores spread over more tiles as context grows, so a fixed threshold would skip an ever-larger fraction as the sequence lengthens. |
+| **ATOM_BLASST_BETA** | float | 0 | Exponent coefficient of the same fit. |
+| **ATOM_BLASST_SPARSITY** | float | 0 (off) | Target fraction of K/V tiles to skip, in `[0, 1)`. Needs `ATOM_BLASST_ALPHA` to take effect. |
+
+Reference fit: `ALPHA=7.4142 BETA=9.6915`, giving `0.0288` at `SPARSITY=0.5` and 32K
+context. **These were calibrated for Qwen3-8B and are only valid for that model.** Another
+model needs its own calibration to confirm accuracy does not degrade under BLASST.
+
+```bash
+ATOM_USE_UNIFIED_ATTN=1 ATOM_BLASST_ALPHA=7.4142 ATOM_BLASST_BETA=9.6915 \
+  ATOM_BLASST_SPARSITY=0.5 python -m atom.entrypoints.openai_server --model Qwen/Qwen3-8B
+
+# or pin the threshold directly
+ATOM_USE_UNIFIED_ATTN=1 ATOM_BLASST_THRESHOLD=0.0288 \
+  python -m atom.entrypoints.openai_server --model Qwen/Qwen3-8B
+```
+
 ## Fusion passes
 
 ### RMSNorm
