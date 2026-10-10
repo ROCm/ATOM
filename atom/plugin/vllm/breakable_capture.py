@@ -28,3 +28,18 @@ def capture_breaks_mid_forward() -> bool:
     except ImportError:
         return False
     return BreakableCUDAGraphCapture.is_active()
+
+
+def breakable_capture_enabled() -> bool:
+    """Whether this run may capture graphs around a model's step work at all.
+
+    Asked before a capture starts, where `capture_breaks_mid_forward` asks
+    whether one is recording right now. A builder reads it to decide whether
+    it has to keep one dummy cache alive across buckets, so it has to answer
+    for the whole run rather than for this instant.
+    """
+    try:
+        from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    except ImportError:
+        return False
+    return bool(is_breakable_cudagraph_enabled())

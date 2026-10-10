@@ -29,28 +29,21 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 
-try:
-    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-except ImportError:  # native ATOM runs without vLLM installed
-
-    def eager_break_during_capture(fn):
-        return fn
-
 
 def _breakable_cudagraph_enabled() -> bool:
-    """Whether graphs may be captured around this model's step work.
+    """Whether this run may capture graphs around this model's step work.
 
-    Read per call rather than once at import: the env var is set before the
-    worker imports vLLM, but a test may flip it, and the cost is a dict lookup
-    next to a cache allocation.
+    Routed through the plugin: the answer is one frontend's, and this file is
+    not that frontend's. Native ATOM owns its own capture loop and never asks
+    vLLM anything, so it takes the False below without importing it.
     """
-    try:
-        from vllm.compilation.breakable_cudagraph import (
-            is_breakable_cudagraph_enabled,
-        )
-    except ImportError:
+    from atom.plugin import is_vllm
+
+    if not is_vllm():
         return False
-    return bool(is_breakable_cudagraph_enabled())
+    from atom.plugin.vllm.breakable_capture import breakable_capture_enabled
+
+    return breakable_capture_enabled()
 
 
 from .checkpoints import StateCopies
@@ -705,12 +698,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             candidates=step.max_q_len if tentative else 0,
         )
 
-    @eager_break_during_capture
     def prepare_model_inputs(self, input_ids, metadata):
         """One CSA2 step's host-side work: Engram rows, state, cursor.
 
-        A break point for breakable cudagraph capture, which is what lets this
-        model be captured at all. None of this can be replayed from a graph --
+        Called by the metadata builder, before the forward and outside any
+        capture, which is what lets this model be captured at all. None of this can be replayed from a graph --
         the Engram row staging hashes token ids, `prepare_state` resets the
         slots this batch recycled, and `advance_cursor` writes the committed
         position -- and it has to happen once, in order, per step.

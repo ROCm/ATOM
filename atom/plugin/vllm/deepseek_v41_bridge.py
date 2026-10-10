@@ -253,6 +253,34 @@ def v41_capture_state_slots(num_reqs: int, vllm_config) -> np.ndarray:
     return np.arange(base, base + num_reqs, dtype=np.int32)
 
 
+def _v41_staged_running_tokens() -> int:
+    """The padded width this forward will run, as of staging time.
+
+    Not from the forward context: vLLM sets that around the model call, and
+    this runs before it, so `batch_descriptor` there is the previous step's or
+    absent. Staging a 12-row step for a graph captured at 256 produced
+
+        shape '[12, -1, 512]' is invalid for input of size 131072
+
+    on the first replay -- the live step narrower than the buffers the
+    captured kernels write.
+
+    `InputBatch.num_tokens_after_padding` is what vLLM itself sizes the
+    forward from, and the pass-through patch puts that batch within reach
+    here, which is the same source rather than a second guess at it.
+    """
+    try:
+        from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+        batch = get_current_input_batch()
+    except Exception:  # noqa: BLE001
+        return 0
+    padded = getattr(batch, "num_tokens_after_padding", None)
+    if padded is not None:
+        return int(padded)
+    return int(getattr(batch, "num_tokens", 0) or 0)
+
+
 def _v41_capture_batch(snapshot, vllm_config):
     """The synthetic batch vLLM is about to capture, declared for what it is.
 
@@ -303,16 +331,56 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     if snapshot is None or snapshot.num_reqs == 0:
         return None
     slot_allocator = getattr(model, "_atom_v41_slot_allocator", None)
-    if slot_allocator is None and not capturing:
+    from atom.plugin.vllm.dummy_run import in_dummy_run as _in_dummy_run
+
+    if slot_allocator is None and not (
+        capturing or _in_dummy_run() or _v41_request_ids_are_synthetic(snapshot)
+    ):
         return None
     num_reqs = int(snapshot.num_reqs)
-    if capturing:
+    # `capturing` is vLLM calling `build_for_cudagraph_capture`, which it only
+    # does for a FULL graph. A PIECEWISE capture comes through `build` like any
+    # other step, so the batch has to be recognised rather than announced --
+    # by the repeated placeholder request id, which real traffic cannot
+    # produce because vLLM never schedules one request twice in a step.
+    from atom.plugin.vllm.dummy_run import in_dummy_run
+
+    # Three signals, union, because no one of them covers every synthetic
+    # batch and each was measured to miss a different kind:
+    #
+    #   capturing          vLLM calling `build_for_cudagraph_capture`, exact,
+    #                      but only for a FULL graph.
+    #   in_dummy_run()     the window `_dummy_run` spans -- which the warmup
+    #                      forward before a capture does not go through, and
+    #                      that one arrived with `synthetic=False`, 64 rows
+    #                      and one slot between them.
+    #   repeated req_id    what that warmup forward does have. Real traffic
+    #                      cannot produce it: vLLM never schedules a request
+    #                      twice in one step.
+    synthetic = capturing or in_dummy_run() or _v41_request_ids_are_synthetic(snapshot)
+    if synthetic:
         batch = _v41_capture_batch(snapshot, vllm_config)
     else:
         batch = _v41_scheduled_batch(snapshot, slot_allocator, None)
     running_bs = num_reqs
-    running_tokens = max(_v41_live_running_tokens(None), int(batch.total_tokens_num))
-    metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
+    running_tokens = max(_v41_staged_running_tokens(), int(batch.total_tokens_num))
+    try:
+        metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
+    except ValueError as exc:
+        if "STATE slot" not in str(exc):
+            raise
+        # Not `... or ()`: these are numpy arrays on the scheduled path and an
+        # array's truth value raises -- which is how this diagnostic died on
+        # the one failure it exists to explain, for the second time today.
+        committed = getattr(batch, "state_slots_committed", None)
+        slots = [] if committed is None else [int(x) for x in committed]
+        tables = getattr(batch, "block_tables", None)
+        raise ValueError(
+            f"{exc} -- synthetic={synthetic} capturing={capturing} "
+            f"num_reqs={num_reqs} slots={slots[:8]} distinct={len(set(slots))} "
+            f"cache_slots={getattr(builder.cache, 'num_slots', None)} "
+            f"spans={0 if tables is None else len(tables)}"
+        ) from exc
     input_ids = _v41_step_input_ids(running_tokens)
     if input_ids is None:
         return None
@@ -323,13 +391,36 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
             raise
         _dump_v41_state_rows(snapshot, batch, builder, exc)
         raise
+    # The Engram staging too, not just `prepare_model_inputs`. The cursor
+    # advance rides on it (`EngramStaging.start` -> `_advance_cursor`), and the
+    # forward's own call is skipped for a step staged here -- so leaving it
+    # behind meant the cursor was never written, and the second decode of a
+    # request found position 0 where it had reached 2.
+    rows = getattr(metadata, "engram_embeddings", None)
+    stage = getattr(rows, "stage", None)
+    if stage is not None:
+        stage()
+        # Closed here, not left for the forward to close. The staging may fork
+        # a prefetch stream, and this runs before the forward -- so the event
+        # it records is outside whatever capture the forward is under, and a
+        # captured layer waiting on it is refused:
+        #
+        #     hipErrorStreamCaptureIsolation: dependency created on uncaptured
+        #     work in another stream
+        #
+        # Joining inside this window costs the overlap with the layers that
+        # consume the rows, which this step never had: the whole of it happens
+        # before the first layer runs.
+        join = getattr(rows, "join", None)
+        if join is not None:
+            join()
     metadata.staged_outside_forward = True
     return SimpleNamespace(
         metadata=metadata,
         positions=step_positions,
         running_bs=running_bs,
         running_tokens=running_tokens,
-        capturing=capturing,
+        capturing=synthetic,
     )
 
 
