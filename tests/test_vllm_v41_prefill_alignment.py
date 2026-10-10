@@ -75,15 +75,27 @@ def test_a_chunk_too_small_for_even_one_block_is_left_alone():
     assert wrapper()(FakeScheduler(), request(), 0, 200) == 200
 
 
-def test_the_last_chunk_stops_on_the_prompt_anchor():
-    """The one boundary below the prompt that nothing else will reach.
+def test_the_last_chunk_is_exempt_by_default():
+    """The anchor clip is off, and the reason is a measured failure.
 
-    Boundaries ABOVE the prompt are reached anyway -- decode walks the frontier
-    one token at a time -- so the last chunk used to be exempt entirely. The
-    anchor is different: it is the last block-aligned point at or before the
-    prompt end, and once the frontier passes it nothing returns to it. A prompt
-    of 5,000 tokens anchors at 4,864.
+    Splitting a prompt that would run in one chunk is the only way a short
+    prompt gets a mid-prefill boundary, and the state machinery does not
+    survive one: the chunk after the split arrives with `starts` at the anchor
+    while the slot's cursor reads something unrelated. Isolated on one binary,
+    same prompts: clip off 8/8 with zero refusals, clip on dead on the second
+    request.
     """
+    w = wrapper()
+    assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 904
+
+
+def test_the_anchor_clip_can_still_be_asked_for(monkeypatch):
+    """Kept behind a switch for whoever picks up the cursor bug.
+
+    5,000 tokens anchors at 4,864, so the last chunk stops 136 short of the
+    prompt end.
+    """
+    monkeypatch.setenv("ATOM_V41_PROMPT_ANCHOR_CLIP", "1")
     w = wrapper()
     assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 4864 - 4096
 

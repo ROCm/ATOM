@@ -30,6 +30,7 @@ the subclass matching the already-resolved ``async_scheduling`` value.
 import functools
 import inspect
 import logging
+import os
 
 logger = logging.getLogger("atom")
 
@@ -222,6 +223,7 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
         planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
         if planner is None or num_new_tokens <= 0:
             return num_new_tokens
+
         interval = int(planner.state_interval)
         block = int(planner.hash_block_size)
         start = int(num_computed_tokens)
@@ -237,9 +239,31 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
             # `total`, and once the frontier is past it nothing returns to it.
             # A prompt whose length is not a whole number of blocks reaches it
             # only if a chunk ends there, which is this clip.
-            anchor = (total // block) * block
-            if start < anchor < end:
-                return anchor - start
+            # The prompt-end anchor is NOT taken by default, and this is a
+            # correctness limit rather than a preference.
+            #
+            # Clipping here splits a prompt that would otherwise run in one
+            # chunk, which is the only way a short prompt ever acquires a
+            # mid-prefill boundary. The state machinery does not survive one:
+            # the chunk after the split arrives with `starts` at the anchor and
+            # the slot's cursor reading something else entirely -- measured as
+            # "needs state at 1280, found 3" on the second request of a run,
+            # with no reuse involved at all, and an isolation pair that settles
+            # it (clip off: 8/8 and zero refusals; clip on, same binary, same
+            # prompts: dead on request two).
+            #
+            # The cost is real and worth stating: without this, a prompt
+            # shorter than `state_interval` has no boundary, so the tier
+            # stores nothing for it -- which is exactly the gap the anchor was
+            # added to close. Prompts longer than one interval keep their rung
+            # boundaries and are unaffected.
+            #
+            # ATOM_V41_PROMPT_ANCHOR_CLIP=1 takes it anyway, for whoever picks
+            # up the mid-prefill cursor bug.
+            if os.environ.get("ATOM_V41_PROMPT_ANCHOR_CLIP") in ("1", "true", "True"):
+                anchor = (total // block) * block
+                if start < anchor < end:
+                    return anchor - start
             return num_new_tokens
         # Spacing, not a fixed ladder: the planner accepts any block-aligned
         # frontier at least `interval` past the last one it stored, so aiming
