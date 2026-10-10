@@ -259,6 +259,56 @@ class BlockManager:
             hash_block_size=self.hash_block_size,
             enabled=self.enable_prefix_caching,
         )
+        self._spare_state_prefill_only = False
+        if envs.ATOM_KDA_SPARE_STATE_CHECKPOINTS:
+            spec_config = getattr(config, "speculative_config", None)
+            dspark3_prefill = (
+                spec_config is not None
+                and getattr(spec_config, "use_dspark", lambda: False)()
+                and spec_config.num_speculative_tokens == 3
+                and self.state_checkpoint_interval_tokens == -1
+            )
+            transfer_config = getattr(config, "kv_transfer_config", None) or {}
+            if (
+                getattr(getattr(config, "hf_config", None), "model_type", None)
+                != "kimi_linear"
+                or self.paged_state_checkpoints is None
+                or not self.enable_prefix_caching
+                or self.num_state_slots <= 0
+                or self.state_slots_per_req != (4 if dspark3_prefill else 1)
+                or (spec_config is not None and not dspark3_prefill)
+                or envs.ATOM_ENABLE_REPLAYSSM is not False
+                or getattr(config, "pipeline_parallel_size", 1) != 1
+                or getattr(config, "enable_rapidserve", False)
+                or (
+                    transfer_config
+                    and (
+                        transfer_config.get("kv_connector") != "lmcache_offload"
+                        or transfer_config.get("kv_role", "offload")
+                        not in ("offload", "kv_both")
+                    )
+                )
+            ):
+                raise ValueError(
+                    "spare STATE checkpoints require K3, prefix caching, "
+                    "PP1, no RapidServe, explicit ATOM_ENABLE_REPLAYSSM=0, "
+                    "and colocated lmcache_offload or no connector; "
+                    "speculation is limited to DSpark3 with four slots per "
+                    "request and state_checkpoint_interval_tokens=-1 "
+                    "(prefill checkpoints only)"
+                )
+            self._spare_state_prefill_only = dspark3_prefill
+            reserve = envs.ATOM_KDA_SPARE_STATE_RESERVE
+            self.paged_state_checkpoints.store.attach_slots(self.state, reserve)
+            logger.info(
+                "[State Cache] spare STATE checkpoints enabled: slots=%d, "
+                "vacant reserve=%d; slots/request=%d; prefill_only=%s; "
+                "placement follows interval/demand",
+                self.num_state_slots,
+                reserve,
+                self.state_slots_per_req,
+                self._spare_state_prefill_only,
+            )
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
@@ -557,8 +607,17 @@ class BlockManager:
         """
         if self.paged_state_checkpoints is None:
             return True
+        store = self.paged_state_checkpoints.store
+        if store.slots is not None and store.slots.can_borrow(
+            store.slot_reserve, allocations=self.state_slots_per_req
+        ):
+            # The prospective request still needs its MLA pages. A slot image
+            # does not consume PAGE units, but cannot supply missing KV either.
+            return self.paged_state_checkpoints.has_available_units(
+                live_blocks, protected_hash=protected_hash
+            )
         return self.paged_state_checkpoints.has_available_units(
-            live_blocks + self.paged_state_checkpoints.store.units_per_checkpoint,
+            live_blocks + store.units_per_checkpoint,
             protected_hash=protected_hash,
         )
 
@@ -1096,6 +1155,8 @@ class BlockManager:
                 hit_hash = h
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
+        if seq.has_per_req_cache:
+            seq._state_adopted_checkpoint_hash = -1
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
             # The joint boundary, when there is one -- the same rule the fork
             # branch below already used, and the PAGE branch did not.
@@ -1185,6 +1246,9 @@ class BlockManager:
         returns True as well, which is correct with no boundary and wrong with
         one.
         """
+        adopted = getattr(seq, "_state_adopted_checkpoint_hash", -1)
+        if adopted != -1 and adopted == seq.offload_joint.boundary_hash:
+            return True  # already owns the exact immutable snapshot it claimed
         if seq.offload_joint.load_hash != -1:
             return True  # a CPU load is in flight for it
         if getattr(seq, "state_fork_src", -1) != -1:
@@ -1229,12 +1293,24 @@ class BlockManager:
         Adopting is then off the table — the pin means someone else's forward
         still has to read it, or copy out of it.
 
-        PAGE checkpoints gather into a fresh committed slot rather than being
-        adopted: the bytes live in the KV pool, not in a state slot, so there is
-        nothing here to hand over. Only fork checkpoints can be adopted.
+        PAGE images gather into a fresh slot. An optional borrowed STATE image
+        follows the same copy lifecycle, except an unpinned source can be
+        adopted when preserving it would leave too few slots for the request.
         """
         width = self.state_slots_per_req
         if self.paged_state_checkpoints is not None:
+            # Protect the source before allocating the whole rollback set.
+            # If free space only fits the request including its source, adopt
+            # that unpinned source; otherwise keep the image for other readers.
+            slot = self.paged_state_checkpoints.store.allocate_slot_restore(
+                hit_hash, request_slots=width
+            )
+            if slot >= 0:
+                seq.state_slots = [slot] + self.state.pop_many(width - 1)
+                seq.state_fork_src = -1
+                if not self.paged_state_checkpoints.restore_queued_for(slot):
+                    seq._state_adopted_checkpoint_hash = hit_hash
+                return True
             seq.state_slots = self.state.pop_many(width)
             seq.state_fork_src = -1
             if hit_hash == -1:
@@ -2303,6 +2379,12 @@ class BlockManager:
         reason: it is the prompt's end stepped back to the grid, and an unaimed
         position at or past the prompt end is past it too.
         """
+        if self._spare_state_prefill_only and (
+            not aimed or pos >= seq.num_prompt_tokens
+        ):
+            # Only complete prefill states are exported for DSpark3. Decode
+            # snapshots need accepted-state/conv canonicalization first.
+            return []
         interval = self.state_checkpoint_interval_tokens
         if interval == 0 or pos <= 0:
             return []

@@ -10,10 +10,14 @@ from collections import OrderedDict, deque
 from collections.abc import Hashable, Iterator, Mapping
 from dataclasses import dataclass
 from time import monotonic
+from typing import TYPE_CHECKING
 
-from atom.kv_transfer.disaggregation.types import StateStoreOperationId
+from atom.kv_transfer.disaggregation.types import StateSlotSource, StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+
+if TYPE_CHECKING:
+    from atom.model_engine.state_pool import StateSlotPool
 
 _CHANGE_LOG_LIMIT = 4096
 
@@ -92,22 +96,32 @@ class PagedStateCheckpointSpec:
 
 @dataclass(frozen=True)
 class CheckpointStoreOp:
-    """Scatter the checkpointed part of an Active Slot into PAGE units."""
+    """Snapshot an Active Slot into PAGE units or a borrowed full-state slot."""
 
     src_slot: int
     unit_ids: tuple[int, ...]
     total_bytes: int
     layout_id: str
+    dst_slot: int = -1  # >=0: full KDA slot copy, unit_ids must be empty
+
+    @property
+    def slot_pair(self) -> tuple[int, int] | None:
+        return (self.src_slot, self.dst_slot) if self.dst_slot >= 0 else None
 
 
 @dataclass(frozen=True)
 class CheckpointRestoreOp:
-    """Gather one ordered PAGE-unit image back into an Active Slot."""
+    """Restore a PAGE-unit image or an immutable borrowed slot."""
 
     dst_slot: int
     unit_ids: tuple[int, ...]
     total_bytes: int
     layout_id: str
+    src_slot: int = -1  # >=0: restore from an immutable borrowed slot
+
+    @property
+    def slot_pair(self) -> tuple[int, int] | None:
+        return (self.src_slot, self.dst_slot) if self.src_slot >= 0 else None
 
 
 @dataclass
@@ -116,6 +130,7 @@ class CheckpointRecord:
     unit_ids: tuple[int, ...]
     state: str = COPYING
     pin_count: int = 0
+    slot_id: int = -1
 
 
 @dataclass(frozen=True)
@@ -160,6 +175,12 @@ class PageUnitCheckpointStore:
     ):
         self.pool = pool
         self.spec = spec
+        self.slots: StateSlotPool | None = None
+        self.slot_reserve = 0
+        self.slot_stores = 0
+        self.slot_restores = 0
+        self.slot_adoptions = 0
+        self.slot_evictions = 0
         # Whether anything downstream can carry a store. False leaves the
         # offload queue permanently empty and takes no pins, which is what a
         # deployment with no CPU tier must cost: a pin nobody releases would
@@ -218,6 +239,56 @@ class PageUnitCheckpointStore:
         # `was_reclaimed`.
         self._offload_reclaimed: OrderedDict = OrderedDict()
 
+    def attach_slots(self, slots: StateSlotPool, reserve: int) -> None:
+        """Enable full-image KDA snapshots in a fixed pool."""
+        if reserve < 0:
+            raise ValueError("spare STATE reserve must be nonnegative")
+        if self.slots is not None or self.records:
+            raise ValueError("attach spare STATE slots before creating checkpoints")
+        if self.spec.image_bytes != self.spec.slot_bytes:
+            raise ValueError("borrowed checkpoints require a complete slot image")
+        if slots.transfer.kind != "none":
+            raise ValueError("borrowed checkpoints cannot share a fork index")
+        self.slots = slots
+        slots.borrowing_enabled = True
+        self.slot_reserve = reserve
+
+    def _cache_slot(self, checkpoint_id: int) -> None:
+        record = self.records[checkpoint_id]
+        self.slots.cache_borrowed(record.slot_id, lambda: self._evict(checkpoint_id))
+
+    def _pin_record(self, record: CheckpointRecord) -> None:
+        if record.slot_id >= 0 and record.pin_count == 0:
+            self.slots.pin_borrowed(record.slot_id)
+        record.pin_count += 1
+
+    def allocate_slot_restore(self, prefix_hash: int, *, request_slots: int = 1) -> int:
+        """Secure a source while leaving room for the request's rollback set.
+
+        Return its main slot; the caller allocates the other request_slots-1
+        slots while the source stays pinned. If free space fits exactly the
+        request including an unpinned source, consume the image as its main
+        slot. Otherwise retain it for fan-out readers.
+        """
+        if request_slots < 1:
+            raise ValueError("a request needs at least one STATE slot")
+        cid = self.lookup(prefix_hash)
+        if cid < 0 or self.records[cid].slot_id < 0:
+            return -1
+        record = self.records[cid]
+        if not self.slots.has_free(request_slots):
+            raise AssertionError("admission must reserve the full STATE slot set")
+        if record.pin_count == 0 and self.slots.num_free() == request_slots:
+            slot = record.slot_id
+            self.slots.pin_borrowed(slot)
+            self._release_record(cid, release_slot=False)
+            self.slot_adoptions += 1
+            return slot
+        self._pin_record(record)
+        dst = self.slots.pop()
+        self._queue_restore(cid, dst)
+        return dst
+
     @property
     def units_per_checkpoint(self) -> int:
         return self.spec.units_per_checkpoint
@@ -251,6 +322,7 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         return (
             checkpoint_id != protected
+            and record.slot_id < 0
             and record.state == READY
             and record.pin_count == 0
         )
@@ -325,6 +397,26 @@ class PageUnitCheckpointStore:
     def begin_store(self, prefix_hash: int, src_slot: int) -> CheckpointStoreOp | None:
         if self.lookup(prefix_hash) >= 0 or prefix_hash in self._pending_by_hash:
             return None
+        if self.slots is not None:
+            dst = self.slots.borrow(self.slot_reserve, replace=False)
+            if dst < 0 and self.pool.num_free < self.units_per_checkpoint:
+                # Keep distinct images in spare PAGE space once slots fill.
+                # Only replace a borrowed image when PAGE is under pressure;
+                # otherwise this tier would cap all GPU state at N-A-R images.
+                dst = self.slots.borrow(self.slot_reserve)
+            if dst >= 0:
+                cid = self._new_identity()
+                self.records[cid] = CheckpointRecord(prefix_hash, (), slot_id=dst)
+                self._pending_by_hash[prefix_hash] = cid
+                self._inflight_stores.append(cid)
+                self.slot_stores += 1
+                return CheckpointStoreOp(
+                    src_slot,
+                    (),
+                    self.spec.image_bytes,
+                    self.spec.layout_id,
+                    dst_slot=dst,
+                )
         needed = self.units_per_checkpoint
         # A store takes what its own image needs and nothing more. It used to
         # take a floor for live KV on top, which meant one accepted store
@@ -376,13 +468,20 @@ class PageUnitCheckpointStore:
         if checkpoint_id < 0:
             return None
         record = self.records[checkpoint_id]
-        record.pin_count += 1
+        self._pin_record(record)
+        return self._queue_restore(checkpoint_id, dst_slot)
+
+    def _queue_restore(self, checkpoint_id: int, dst_slot: int) -> CheckpointRestoreOp:
+        record = self.records[checkpoint_id]
         self._lru.move_to_end(checkpoint_id)
+        if record.slot_id >= 0:
+            self.slot_restores += 1
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
             unit_ids=record.unit_ids,
             total_bytes=self.spec.image_bytes,
             layout_id=self.spec.layout_id,
+            src_slot=record.slot_id,
         )
         self._queued_restores.append((checkpoint_id, op))
         return op
@@ -505,6 +604,8 @@ class PageUnitCheckpointStore:
             self.hash_to_checkpoint[record.prefix_hash] = checkpoint_id
             self._note_change(record.prefix_hash)
             self._lru[checkpoint_id] = None
+            if record.slot_id >= 0:
+                self._cache_slot(checkpoint_id)
             self._queue_offload_store(checkpoint_id, record)
 
         restores, self._inflight_restores = self._inflight_restores, []
@@ -552,7 +653,7 @@ class PageUnitCheckpointStore:
 
     def take_offload_stores(
         self, max_inflight: int
-    ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
+    ) -> list[tuple[StateStoreOperationId, tuple[int, ...] | StateSlotSource]]:
         """`(operation, unit_ids)` to hand the tier now, pinning each.
 
         The pin is taken HERE, not at READY, and that is what bounds it: a pin
@@ -571,7 +672,7 @@ class PageUnitCheckpointStore:
         `_hash_in_flight` refuses that -- but they may follow one another
         closely enough that the earlier one's report is still on the wire.
         """
-        out: list[tuple[StateStoreOperationId, tuple[int, ...]]] = []
+        out: list[tuple[StateStoreOperationId, tuple[int, ...] | StateSlotSource]] = []
         # Nominations whose hash is transiently in flight: held aside and
         # re-queued after the pass, NOT dropped (see below).
         deferred: list = []
@@ -581,6 +682,17 @@ class PageUnitCheckpointStore:
             # Spent while it waited -- which nomination deliberately allows.
             # Terminal: there is nothing left to store, so drop it.
             if record is None or record.state != READY:
+                continue
+            if record.slot_id >= 0 and (
+                self.slots.num_free() <= self.slot_reserve
+                or sum(
+                    not pin.source_released
+                    and self.records[pin.checkpoint_id].slot_id >= 0
+                    for pin in self._offload_pins.values()
+                )
+                >= max(1, self.slot_reserve)
+            ):
+                deferred.append(checkpoint_id)
                 continue
             if self._hash_in_flight(record.prefix_hash):
                 # NOT terminal. The record is still READY and is a live, valid
@@ -630,19 +742,28 @@ class PageUnitCheckpointStore:
         checkpoint_id = self.lookup(prefix_hash)
         if checkpoint_id < 0 or self._hash_in_flight(prefix_hash):
             return None
+        # External PAGE/SLOT transport leases require PAGE ids. The slot source
+        # is supported by the colocated K3 CPU tier, not by P/D transports.
+        if self.records[checkpoint_id].slot_id >= 0:
+            return None
         return self._pin_offload_source(checkpoint_id, timeout_reclaimable=False)
 
     def _pin_offload_source(
         self, checkpoint_id: int, *, timeout_reclaimable: bool
-    ) -> tuple[StateStoreOperationId, tuple[int, ...]]:
+    ) -> tuple[StateStoreOperationId, tuple[int, ...] | StateSlotSource]:
         record = self.records[checkpoint_id]
         self._offload_generation += 1
         op = StateStoreOperationId(int(record.prefix_hash), self._offload_generation)
-        record.pin_count += 1
+        self._pin_record(record)
         self._offload_pins[op] = _OffloadPin(
-            checkpoint_id, monotonic(), timeout_reclaimable=timeout_reclaimable
+            checkpoint_id,
+            monotonic(),
+            timeout_reclaimable=timeout_reclaimable and record.slot_id < 0,
         )
-        return op, record.unit_ids
+        source = (
+            StateSlotSource(record.slot_id) if record.slot_id >= 0 else record.unit_ids
+        )
+        return op, source
 
     def _hash_in_flight(self, prefix_hash: int) -> bool:
         """Whether some generation of `prefix_hash` is already pinned.
@@ -808,6 +929,8 @@ class PageUnitCheckpointStore:
             # is the entire point of the tier -- and only now do the units go
             # back.
             self._release_record(checkpoint_id)
+        elif record.pin_count == 0 and record.slot_id >= 0:
+            self._cache_slot(checkpoint_id)
 
     def _release_restore_pin(self, checkpoint_id: int) -> None:
         record = self.records.get(checkpoint_id)
@@ -818,6 +941,8 @@ class PageUnitCheckpointStore:
         record.pin_count -= 1
         if record.state == EVICTING and record.pin_count == 0:
             self._release_record(checkpoint_id)
+        elif record.pin_count == 0 and record.slot_id >= 0:
+            self._cache_slot(checkpoint_id)
 
     def unindex(self, prefix_hash: int) -> bool:
         self._note_change(prefix_hash)
@@ -857,10 +982,12 @@ class PageUnitCheckpointStore:
             del self.hash_to_checkpoint[record.prefix_hash]
         record.state = EVICTING
         self._lru.pop(checkpoint_id, None)
+        if record.slot_id >= 0:
+            self.slot_evictions += 1
         self._release_record(checkpoint_id)
         self.evictions += 1
 
-    def _release_record(self, checkpoint_id: int) -> None:
+    def _release_record(self, checkpoint_id: int, *, release_slot: bool = True) -> None:
         record = self.records.pop(checkpoint_id)
         self._note_change(record.prefix_hash)
         self._lru.pop(checkpoint_id, None)
@@ -868,7 +995,13 @@ class PageUnitCheckpointStore:
             del self.hash_to_checkpoint[record.prefix_hash]
         if self._pending_by_hash.get(record.prefix_hash) == checkpoint_id:
             del self._pending_by_hash[record.prefix_hash]
-        self.pool.release_units(record.unit_ids, ("state-checkpoint", checkpoint_id))
+        if record.slot_id >= 0:
+            if release_slot:
+                self.slots.release_borrowed(record.slot_id)
+        else:
+            self.pool.release_units(
+                record.unit_ids, ("state-checkpoint", checkpoint_id)
+            )
 
 
 class PagedStateCheckpointCoordinator:
@@ -1153,7 +1286,7 @@ class PagedStateCheckpointCoordinator:
 
     def take_offload_stores(
         self, max_inflight: int
-    ) -> list[tuple[StateStoreOperationId, tuple[int, ...]]]:
+    ) -> list[tuple[StateStoreOperationId, tuple[int, ...] | StateSlotSource]]:
         """`(operation, unit_ids)` to hand the tier now. See the store."""
         return self.store.take_offload_stores(max_inflight)
 
@@ -1232,6 +1365,23 @@ class PagedStateCheckpointCoordinator:
             "offload_pins_reclaimed": self.store.offload_pins_reclaimed,
             "checkpoints_orphaned": self.checkpoints_orphaned,
         }
+        if self.store.slots is not None:
+            records = self.store.records.values()
+            fates.update(
+                slot_checkpoint_stores=self.store.slot_stores,
+                slot_checkpoint_restores=self.store.slot_restores,
+                slot_checkpoint_adoptions=self.store.slot_adoptions,
+                slot_checkpoint_evictions=self.store.slot_evictions,
+                slot_checkpoint_ready=sum(
+                    r.slot_id >= 0 and r.state == READY for r in records
+                ),
+                slot_checkpoint_pinned=sum(
+                    r.slot_id >= 0 and r.pin_count > 0 for r in records
+                ),
+                slot_checkpoint_copying=sum(
+                    r.slot_id >= 0 and r.state == COPYING for r in records
+                ),
+            )
         # `getattr`, not a direct call: `attach_offload` accepts anything that
         # answers `hashes`, and the tests attach a double that does not carry
         # counters. A missing `stats` means "no numbers to fold", not an error.

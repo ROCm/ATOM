@@ -449,6 +449,13 @@ class LLMEngine:
                 # Says the *paged* pool is too small, where `evicted` says the
                 # state pool is -- opposite fixes, so it cannot be folded in.
                 "checkpoints_orphaned",
+                "slot_checkpoint_stores",
+                "slot_checkpoint_restores",
+                "slot_checkpoint_adoptions",
+                "slot_checkpoint_evictions",
+                "slot_checkpoint_ready",
+                "slot_checkpoint_pinned",
+                "slot_checkpoint_copying",
                 "demands_recorded",
                 "demands_declined_no_room",
                 "chunks_cut_for_demand",

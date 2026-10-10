@@ -33,6 +33,7 @@ from .pool_layout.paged_state_copy import (
     plan_segmented_copy,
 )
 from .pool_layout.pool_rows import PoolRowsMixin
+from .pool_layout.slot_checkpoint import copy_kda_checkpoint_slots
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
 if TYPE_CHECKING:
@@ -827,6 +828,16 @@ class GDNStateMixin(PoolRowsMixin):
                 f"a checkpoint image is {spec.image_bytes} B but the op names "
                 f"{op.total_bytes}"
             )
+        pair = getattr(op, "slot_pair", None)
+        if pair is not None:
+            if op.unit_ids or spec.image_bytes != spec.slot_bytes or self.replayssm:
+                raise RuntimeError("slot checkpoints require a complete KDA image")
+            slots = self.model_runner.mamba_k_cache.shape[1]
+            if pair[0] == pair[1] or any(slot < 0 or slot >= slots for slot in pair):
+                raise RuntimeError(
+                    "state checkpoint slot is invalid or aliases its source"
+                )
+            return
         if len(op.unit_ids) != spec.units_per_checkpoint:
             raise RuntimeError(
                 f"a checkpoint takes {spec.units_per_checkpoint} PAGE units but "
@@ -851,6 +862,30 @@ class GDNStateMixin(PoolRowsMixin):
             return
         for op in (*store_ops, *restore_ops):
             self._validate_paged_state_op(op)
+
+        # Full slot images use a dtype-preserving, layer-strided torch copy.
+        # Sources/destinations stay pinned until batch completion, as with
+        # PAGE copies; no midstep KDA state is inferred.
+        pairs = [
+            op.slot_pair
+            for op in (*store_ops, *restore_ops)
+            if getattr(op, "slot_pair", None) is not None
+        ]
+        if pairs:
+            runner = self.model_runner
+            copy_kda_checkpoint_slots(
+                runner.mamba_k_cache,
+                runner.mamba_v_cache,
+                runner.state_runtime.checkpoint_spec,
+                store_ops,
+                restore_ops,
+            )
+        store_ops = [op for op in store_ops if getattr(op, "slot_pair", None) is None]
+        restore_ops = [
+            op for op in restore_ops if getattr(op, "slot_pair", None) is None
+        ]
+        if not store_ops and not restore_ops:
+            return
 
         plan = self._checkpoint_copy_plan()
         slot_bases = self._checkpoint_slot_bases()
