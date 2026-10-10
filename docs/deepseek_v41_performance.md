@@ -72,6 +72,13 @@ passes ordinary int32 row indices to V4 attention. Prefill keeps the current
 chunk in BF16; decode preserves V4's batch size and split-K dispatch. Neither
 path materializes the entire historical main KV pool.
 
+On the BF16 pool, decode attention reads two sources
+(`sparse_attn_v4_paged_2src`): the selection from the pool, and the window
+through the layer's own ring (`ring_view`), whose rows are one list shared by
+every layer. An index group's layers share one selection plane. The OPUS kernel
+splits each token's keys across blocks when the step has too few tokens to
+fill the GPU.
+
 Packed PAGE writes reuse V4's sentinel-aware `swa_scatter_rows`. A zero-copy
 view preserves gaps between PAGE fields, and compression-plan offsets select
 the destination rows. Padding rows are skipped on the device, including during
@@ -97,10 +104,15 @@ level 0, and broader compiler support remains outside the supported scope.
 
 ## Memory and numerical limits
 
-The paged scorer bands queries at the int32 addressing limit. A large band can
-require nearly 8 GiB of FP32 logits; quantized queries, tile tables and selection
-workspace occupy additional memory. Reserve scratch headroom when sizing
-long-context workloads. Visibility-sized scratch remains optimization work.
+The FP4 index plane packs the scorer's FP32 logits: each row as long as its own
+visibility, aligned, in one buffer sized from the PAGE pool the memory budget
+can hold rather than from the model length. A step whose rows overflow that
+buffer -- requests sharing a prefix the pool stores once -- runs eagerly,
+scored in bands, instead of from a decode graph. The FP8 plane
+keeps a plane band at the int32 addressing limit, which can require nearly
+8 GiB, plus its tile tables; reserve scratch headroom for it when sizing
+long-context workloads. Quantized queries and selection workspace occupy memory
+beside either.
 
 A Reindex layer scores `candidate_topk_blocks` blocks rather than the whole
 context: the index plane is paged at `candidate_block_size`, so the candidate

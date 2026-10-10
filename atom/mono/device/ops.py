@@ -9,7 +9,8 @@ Ported from the FlyDSL GLM-5 layer kernel (ROCm/FlyDSL branch
 ``kernels/mla_moe_layer/shared_reuse_moe_kernel.py``). Only published flydsl APIs
 and aiter's vendored ``buffer_ops`` / ``dpp_utils`` are used.
 
-Every function but ``kernel_symbol`` is traced inside a ``@flyc.kernel`` body.
+Every function but ``kernel_symbol`` and ``launcher`` is traced inside a
+``@flyc.kernel`` body.
 
 Raw boundaries kept, for want of an equivalent on the pinned FlyDSL:
 ``buffer_ops`` loads / stores (the kernels take raw Int64 addresses, no tensors
@@ -21,6 +22,9 @@ transposes, fp8 packing, MXFP4 scales); the LLVM intrinsics here (``expect``,
 
 from __future__ import annotations
 
+import re
+
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
@@ -53,6 +57,21 @@ def kernel_symbol(stem, **params):
     aiter's ``_ZN5aiter...E`` kernels are."""
     name = f"{stem}_{kernel_signature(**params)}"
     return f"_ZN4atom{len(name)}{name}E"
+
+
+def launcher(symbol):
+    """``flyc.jit`` for the launcher of the kernel named ``symbol``
+    (``kernel_symbol``), named ``launch_<stem>_<params>`` after it: FlyDSL
+    names a launcher's cache directory after the function, on its first call.
+    Renamed once jitted: the rewriter finds the function by its name."""
+    name = re.fullmatch(r"_ZN4atom\d+(\w+)E", symbol)[1]
+
+    def jit(fn):
+        jitted = flyc.jit(fn)
+        jitted.func.__name__ = f"launch_{name}"
+        return jitted
+
+    return jit
 
 
 def rsrc(addr, nbytes=None):

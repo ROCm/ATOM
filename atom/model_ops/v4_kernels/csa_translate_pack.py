@@ -22,7 +22,7 @@ CG benefits (V4-Pro: 31 CSA layers per fwd):
   - 1 captured graph node per layer instead of 7-8
 
 Per-token write offset (`skip_prefix_len_per_token[t]`) accommodates the
-two-source paged_prefill layout:
+two-source paged_2src layout:
   - decode:           skip = window_size       (full SWA prefix)
   - pure prefill:     skip = 0                 (no SWA history in `unified_kv`)
   - chunked prefill:  skip = prior_swa_count   (variable per-token)
