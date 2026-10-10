@@ -425,6 +425,10 @@ class GatedDeltaNet(nn.Module):
             core_attn_out_spec, last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
+        # Whether the prefill chunk kernel writes straight into core_attn_out
+        # (pure prefill); the merge below then sees the same data_ptr and skips
+        # its copy.
+        wrote_core_attn_out = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
@@ -464,6 +468,11 @@ class GatedDeltaNet(nn.Module):
             else:
                 initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
                 initial_state[~has_initial_state, ...] = 0
+                # With no spec tokens the non-spec rows are rows [0, T) of the
+                # op's output, so let the kernel write there instead of into a
+                # fresh `o` that step 3 would copy over (a 64 MiB memcpy per
+                # GDN layer at T=16384).
+                wrote_core_attn_out = spec_sequence_masks is None
                 core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
@@ -475,6 +484,11 @@ class GatedDeltaNet(nn.Module):
                     cu_seqlens=non_spec_query_start_loc,
                     head_first=False,
                     use_qk_l2norm_in_kernel=True,
+                    o=(
+                        core_attn_out[:num_actual_tokens].unsqueeze(0)
+                        if wrote_core_attn_out
+                        else None
+                    ),
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
                     keep_intermediate_states=ckpt is not None,
