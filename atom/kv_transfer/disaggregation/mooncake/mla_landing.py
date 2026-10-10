@@ -199,7 +199,9 @@ class _StageTransfer:
 
     stage_addr: str
     slots: frozenset[int]
-    seen: set[int] = field(default_factory=set)
+    # READY seq -> the slot that READY named, or that the write-done listed
+    # when it counted the READY lost.
+    seen: dict[int, int] = field(default_factory=dict)
     done: bool = False
 
 
@@ -463,9 +465,29 @@ class LandingReceiver:
                 elif seq in stage.seen:
                     # A duplicate: the first copy, or the write-done that
                     # counted it lost, owns the credit.
-                    pass
+                    if stage.seen[seq] != slot:
+                        logger.error(
+                            "[PD-LANDING] req %s stage %d seq %d names slot %d, "
+                            "not %d; failing the request",
+                            req_id,
+                            pp_rank,
+                            seq,
+                            slot,
+                            stage.seen[seq],
+                        )
+                        self._fail_locked(request)
                 elif request.failed or stage.done:
-                    stage.seen.add(seq)
+                    if not request.failed:
+                        # Its stage's write-done ended the stage without it.
+                        logger.error(
+                            "[PD-LANDING] req %s stage %d seq %d is missing from "
+                            "its write-done; failing the request",
+                            req_id,
+                            pp_rank,
+                            seq,
+                        )
+                        self._fail_locked(request)
+                    stage.seen[seq] = slot
                     credit_addr = stage.stage_addr
                 elif items is None:
                     logger.error(
@@ -475,12 +497,12 @@ class LandingReceiver:
                         pp_rank,
                         slot,
                     )
-                    stage.seen.add(seq)
+                    stage.seen[seq] = slot
                     self._fail_locked(request)
                     # The slot's RDMA write finished before READY: return it now.
                     credit_addr = stage.stage_addr
                 else:
-                    stage.seen.add(seq)
+                    stage.seen[seq] = slot
                     request.pending += 1
                     self._queue.put(
                         _Task(
@@ -507,7 +529,9 @@ class LandingReceiver:
         ``landed_slots`` lists the slot of every READY the stage sent, by
         ``seq`` (None from a producer that does not land). A READY that never
         arrived fails the request, and its slot goes back to the stage: the
-        RDMA write finished before the write-done was sent.
+        RDMA write finished before the write-done was sent. A list that names
+        a slot outside the stage's partition, or that disagrees with the
+        READYs that arrived, fails the request and returns nothing.
         """
         outcome = None
         lost: list[int] = []
@@ -526,7 +550,12 @@ class LandingReceiver:
             stage.done = True
             if landed_slots is not None and not (
                 isinstance(landed_slots, list)
-                and all(isinstance(slot, int) for slot in landed_slots)
+                and all(
+                    isinstance(slot, int)
+                    and not isinstance(slot, bool)
+                    and slot in stage.slots
+                    for slot in landed_slots
+                )
             ):
                 # Which READY never arrived is unknown: count a failed write-done.
                 logger.error(
@@ -536,12 +565,24 @@ class LandingReceiver:
                     pp_rank,
                 )
                 landed_slots, success = None, False
-            if landed_slots:
+            elif any(
+                seq >= len(landed_slots or ()) or landed_slots[seq] != slot
+                for seq, slot in stage.seen.items()
+            ):
+                # A READY the list does not name: trust neither, return nothing.
+                logger.error(
+                    "[PD-LANDING] req %s stage %d: its write-done and its READYs "
+                    "disagree on the landed slots; failing the request",
+                    req_id,
+                    pp_rank,
+                )
+                success = False
+            elif landed_slots:
                 for seq, slot in enumerate(landed_slots):
-                    if seq not in stage.seen and slot in stage.slots:
+                    if seq not in stage.seen:
                         # Returned here: its READY, if a reconnect reordered
                         # it behind this write-done, is then a duplicate.
-                        stage.seen.add(seq)
+                        stage.seen[seq] = slot
                         lost.append(slot)
             if not success:
                 self._fail_locked(request)
