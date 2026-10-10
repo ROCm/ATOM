@@ -549,21 +549,6 @@ def should_use_persistent_mode(
     )
 
 
-def _clamp_cu_seqlens(cu_seqlens: torch.Tensor, n_tokens: int) -> torch.Tensor:
-    """Keep a varlen cumulative index inside the packed Q/K rows.
-
-    ``flash_attn_varlen_func`` walks ``[0, cu_seqlens[-1])``. A cumulative
-    length past the tensor is an HSA aperture on the hd256 bf16 kernel.
-    """
-
-    if cu_seqlens.numel() == 0 or n_tokens < 0:
-        return cu_seqlens
-    return torch.minimum(
-        cu_seqlens,
-        torch.tensor(int(n_tokens), dtype=cu_seqlens.dtype, device=cu_seqlens.device),
-    )
-
-
 class MLAAttention(nn.Module):
     def __init__(
         self,
@@ -2148,18 +2133,14 @@ class MLAAttention(nn.Module):
             k, quant_k_rope = self._prepare_prefill_k(k_nope, k_rope)
 
         q, k = self._drop_rope_pad(q, k)
-        # hd256 varlen reads every row up to cu_seqlens[-1]. MTP metadata can
-        # publish a context longer than the K/V this call just materialized.
-        cu_seqlens_q = _clamp_cu_seqlens(attn_metadata.cu_seqlens_q, q.shape[0])
-        cu_seqlens_k = _clamp_cu_seqlens(attn_metadata.cu_seqlens_k, k.shape[0])
         output = self._flash_attn_prefill(
             q,
             k,
             v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=min(int(attn_metadata.max_seqlen_q), int(q.shape[0])),
-            max_seqlen_k=min(int(attn_metadata.max_seqlen_k), int(k.shape[0])),
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
             min_seqlen_q=attn_metadata.min_seqlen_q,
             dropout_p=attn_metadata.dropout_p,
             causal=True,
