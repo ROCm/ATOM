@@ -99,9 +99,15 @@ class Block(nn.Module):
                 quant_config=native_quant_config(),
             )
 
-    def attention_forward(self, normed, cache, step, rope):
+    def attention_forward(self, normed, cache, step, rope, kv_written=False):
         """Run attention on its seam's normed BF16 input."""
+        if kv_written:
+            return self.attn(normed, None, cache, step, rope, kv_written=True)
         return self.attn(normed, None, cache, step, rope)
+
+    def write_kv(self, normed, cache, step, rope):
+        """The attention's cache writes alone (`Attention.write_kv`)."""
+        self.attn.write_kv(normed, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
         if embeddings is None:
@@ -158,11 +164,21 @@ class Block(nn.Module):
         # projection.
         return SinglePassHCState(residual, pre, output, post, comb)
 
-    def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
-        normed, residual, pre, post, comb = self.prepare_attention(
-            state, embeddings, image_mask
-        )
-        output = self.attention_forward(normed, cache, step, rope)
+    def forward(
+        self, state, cache, step, rope, embeddings=None, image_mask=None, seam=None
+    ):
+        """``seam``: ``prepare_attention``'s outputs, computed and with the KV
+        written (``write_kv``) by the caller; the layer runs from attention on.
+        Bounded replay splits the last KV source this way across its graphs,
+        and still calls the module so its forward hooks see the output."""
+        if seam is None:
+            normed, residual, pre, post, comb = self.prepare_attention(
+                state, embeddings, image_mask
+            )
+            output = self.attention_forward(normed, cache, step, rope)
+        else:
+            normed, residual, pre, post, comb = seam
+            output = self.attention_forward(normed, cache, step, rope, kv_written=True)
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )

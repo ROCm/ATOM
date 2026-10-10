@@ -13,7 +13,10 @@ from atom.model_ops.attentions.deepseek_v41.metadata import (
     RequestSpan,
 )
 from atom.models.deepseek_v41.bounded_replay import (
+    LateLayerTail,
     build_late_layer_tail,
+    cut_layer,
+    cut_layer_rows,
     decoder_replay_unsupported,
     late_layer_start,
     late_layer_tail_layout,
@@ -66,7 +69,15 @@ def _config(**overrides):
 def test_v41_flash_layout_replays_from_layer_21():
     config = _config()
     assert decoder_replay_unsupported(config) is None
+    assert cut_layer(config) == 20
     assert late_layer_start(config) == 21
+
+
+def test_the_cut_layer_runs_the_ring_and_its_first_rows_window():
+    """The ring's first row reaches back `window - 1` rows: with those below
+    it, every ring row sees its whole window (`pos - WINDOW + 1 .. pos`)."""
+    geometry = SimpleNamespace(ring_slots=133, window_size=128)
+    assert cut_layer_rows(geometry) == 260
 
 
 @pytest.mark.parametrize(
@@ -283,7 +294,7 @@ def test_the_late_layers_see_the_tails_image_mask():
     """The late layers' MoE router reads the forward's image mask; during the
     tail it must be the tail's rows, and the forward's afterwards."""
     pytest.importorskip("triton")
-    from atom.models.deepseek_v41.bounded_replay import LateLayerTail, late_layer_tail
+    from atom.models.deepseek_v41.bounded_replay import late_layer_tail
 
     step = _step([300, 20], [0, 0])
     rows = torch.tensor([167 + i for i in range(133)] + list(range(300, 320)))
@@ -310,62 +321,129 @@ def test_the_late_layers_see_the_tails_image_mask():
     assert metadata.image_mask is mask and metadata.step is step
 
 
-def test_late_rows_land_back_at_their_forward_rows(monkeypatch):
-    """A replay's late-layer outputs and DSpark aux captures come back at the
-    forward rows of each request's tail, whatever the mix of lengths."""
-    pytest.importorskip("aiter")
-    from atom.models.deepseek_v41 import runtime
-    from atom.models.deepseek_v41.bounded_replay import LateLayerTail
+def _fake_tail(step, tail_len, specs):
+    """`build_late_layer_tail` on the host: the layout, without the uploads."""
+    spans, indices, _ = late_layer_tail_layout(step, tail_len)
+    empty = torch.empty(0)
+    tail = BatchStep(spans, empty, empty, empty, empty, empty, scheduled=len(indices))
+    return LateLayerTail(torch.from_numpy(indices), tail)
 
-    lengths, tail_len, hidden = [3, 9, 5, 12], 4, 6
-    step = _step(lengths, [0, 50, 7, 100])
-    _, indices, _ = late_layer_tail_layout(step, tail_len)
-    rows = torch.from_numpy(indices)
-    total = sum(lengths)
+
+def _replaying_model(monkeypatch, step, ring, window, seen):
+    """A runtime model whose stages record the rows they are handed, each row
+    tagged with its forward row, over a forward that replays with `ring`."""
+    from atom.models.deepseek_v41 import runtime
+
     model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(model)
-    aux = [torch.full((64, hidden), -1.0), torch.full((64, hidden), -2.0)]
+    model.replay, model.replay_enabled = True, True
+    model.cut_specs = model.late_specs = ()
+    model.late_aux_layers, model.aux_buffers = (), None
 
-    def late(*state):
-        # the stage sees only the tail; tag each row with its forward row
-        kept = state[0].shape[0]
-        assert kept == rows.numel()
-        aux[1][:kept] = rows[:, None].float() + 0.5
-        return rows[:, None].float().expand(kept, hidden).clone()
+    def early(input_ids, embeds):
+        # the seam: normed [N, H], residual [N, hc, H], pre/post [N, hc],
+        # combination [N, hc, hc], rows first; normed carries the forward row
+        n = input_ids.numel()
+        rows = torch.arange(n, dtype=torch.float32)
+        return (
+            rows[:, None].expand(n, 2).clone(),
+            torch.zeros(n, 4, 2),
+            torch.zeros(n, 4),
+            torch.zeros(n, 4),
+            torch.zeros(n, 4, 4),
+        )
 
-    model.late = late
-    # capture 0 is an early layer's (full rows already), capture 1 a late one's
-    model.late_aux_layers, model.aux_buffers = (1,), aux
-    metadata = SimpleNamespace(step=step)
+    def cut(normed, residual, pre, post, comb):
+        seen.append(("cut", normed[:, 0].long()))
+        # the mHC state: residual, pre_mix, pending (the row, again), post, comb
+        return residual, pre, normed, post, comb
+
+    def late(residual, pre, pending, post, comb):
+        seen.append(("late", pending[:, 0].long()))
+        return pending[:, :1].expand(-1, 6).clone()
+
+    model.early, model.cut, model.late = early, cut, late
+    # the cut layer's cache writes run on every row the early graph returns
+    model._write_cut_kv = lambda forward, normed: seen.append(
+        ("write_kv", normed[:, 0].long())
+    )
+    metadata = SimpleNamespace(
+        step=step,
+        cache=SimpleNamespace(
+            geometry=SimpleNamespace(ring_slots=ring, window_size=window)
+        ),
+    )
     monkeypatch.setattr(
-        runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+        runtime,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
     )
+    monkeypatch.setattr(runtime, "replay_rows", lambda forward, n: ring)
+    monkeypatch.setattr(runtime, "build_late_layer_tail", _fake_tail)
     monkeypatch.setattr(runtime, "late_layer_tail", _swap_step_only)
-    # residual [N, hc, H], pre [N, hc], pending [N, H], post [N, hc],
-    # combination [N, hc, hc]: rows first, as the early graph returns them
-    state = (
-        torch.zeros(total, 4, 2),
-        torch.zeros(total, 4),
-        torch.zeros(total, 2),
-        torch.zeros(total, 4),
-        torch.zeros(total, 4, 4),
-    )
-    from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+    return model, metadata
 
-    tail_state = SinglePassHCState(*state).take_rows(rows)
-    out = model._late_on_tail(tail_state, LateLayerTail(rows, step), total)
-    assert out.shape == (total, hidden)
-    torch.testing.assert_close(out[rows], rows[:, None].float().expand(-1, hidden))
+
+def _last_rows(lengths, n):
+    rows, offset = [], 0
+    for length in lengths:
+        rows += range(offset + max(length - n, 0), offset + length)
+        offset += length
+    return torch.tensor(rows)
+
+
+def test_the_cut_and_late_layers_run_on_nested_tails(monkeypatch):
+    """The cut layer runs each request's last `ring + window - 1` rows, the
+    late layers the last `ring` of those, and the output and the late aux
+    captures land back at their forward rows, whatever the mix of lengths."""
+    pytest.importorskip("aiter")
+    lengths, ring, window = [3, 9, 5, 12], 3, 3
+    step = _step(lengths, [0, 50, 7, 100])
+    total, seen = sum(lengths), []
+    model, metadata = _replaying_model(monkeypatch, step, ring, window, seen)
+    tail = _last_rows(lengths, ring)
+    aux = [torch.full((64, 6), -1.0), torch.full((64, 6), -2.0)]
+    late = model.late
+
+    def late_capturing(*state):
+        # a late layer's capture writes the tail's rows at the buffer's head
+        aux[1][: state[2].shape[0]] = state[2][:, :1] + 0.5
+        return late(*state)
+
+    model.late = late_capturing
+    # capture 0 is an early layer's (every row already), capture 1 a late one's
+    model.late_aux_layers, model.aux_buffers = (1,), aux
+    out = model(torch.zeros(total, dtype=torch.int64), None)
+
+    assert [stage for stage, _ in seen] == ["write_kv", "cut", "late"]
+    torch.testing.assert_close(seen[0][1], torch.arange(total))
+    torch.testing.assert_close(seen[1][1], _last_rows(lengths, ring + window - 1))
+    torch.testing.assert_close(seen[2][1], tail)
+    assert out.shape == (total, 6)
+    torch.testing.assert_close(out[tail], tail[:, None].float().expand(-1, 6))
     # rows outside the tail are zero, not undefined
     outside = torch.ones(total, dtype=torch.bool)
-    outside[rows] = False
+    outside[tail] = False
     assert torch.all(out[outside] == 0)
-    torch.testing.assert_close(
-        aux[1][rows], rows[:, None].float().expand(-1, hidden) + 0.5
-    )
+    torch.testing.assert_close(aux[1][tail], tail[:, None].float().expand(-1, 6) + 0.5)
     # an early layer's capture is left alone
     assert torch.all(aux[0] == -1.0)
     assert metadata.step is step
+
+
+def test_aux_capture_at_the_cut_layer_is_refused():
+    pytest.importorskip("aiter")
+    from atom.models.deepseek_v41 import runtime
+
+    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
+    torch.nn.Module.__init__(model)
+    model.replay = True
+    model.__dict__["cut"] = SimpleNamespace(first=20)
+    model.__dict__["late"] = SimpleNamespace(first=21)
+    with pytest.raises(ValueError, match="layer 20"):
+        model.set_aux_hidden_state_rows((20, 37), (None, None))
+    model.set_aux_hidden_state_rows((19, 37, 38), ("a", "b", "c"))
+    assert model.late_aux_layers == (1, 2)
 
 
 def _swap_step_only(metadata, tail):
@@ -386,32 +464,21 @@ def _swap_step_only(metadata, tail):
 
 def test_hidden_state_export_turns_replay_off(monkeypatch):
     """With replay forbidden (TorchSpec export reads every row), a replayable
-    prefill runs the late layers on every row."""
+    prefill runs the cut and late layers on every row."""
     pytest.importorskip("aiter")
-    from atom.models.deepseek_v41 import runtime
-
-    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
-    torch.nn.Module.__init__(model)
-    model.replay, model.replay_enabled, model.late_specs = True, True, ()
-    rows_seen = []
-    model.early = lambda input_ids, embeds: (
-        torch.zeros(input_ids.numel(), 4, 2),
-        torch.zeros(input_ids.numel(), 4),
-        torch.zeros(input_ids.numel(), 2),
-        torch.zeros(input_ids.numel(), 4),
-        torch.zeros(input_ids.numel(), 4, 4),
-    )
-    model.late = lambda *state: rows_seen.append(state[0].shape[0]) or state[0]
-    forward = _forward([500])
-    monkeypatch.setattr(runtime, "get_forward_context", lambda: forward)
-    monkeypatch.setattr(
-        runtime,
-        "build_late_layer_tail",
-        lambda *a: SimpleNamespace(token_indices=torch.arange(367, 500)),
-    )
-    monkeypatch.setattr(model, "_late_on_tail", lambda *a: rows_seen.append("tail"))
+    seen = []
+    model, _ = _replaying_model(monkeypatch, _step([500], [0]), 133, 128, seen)
     model(torch.zeros(500, dtype=torch.int64), None)
-    assert rows_seen == ["tail"]
+    assert [(stage, rows.numel()) for stage, rows in seen] == [
+        ("write_kv", 500),
+        ("cut", 260),
+        ("late", 133),
+    ]
+    seen.clear()
     assert model.set_decoder_replay(False) is False
     model(torch.zeros(500, dtype=torch.int64), None)
-    assert rows_seen == ["tail", 500]
+    assert [(stage, rows.numel()) for stage, rows in seen] == [
+        ("write_kv", 500),
+        ("cut", 500),
+        ("late", 500),
+    ]
