@@ -40,6 +40,7 @@ from atom.kv_transfer.disaggregation.types import (
     SaveSourceGroupId,
 )
 from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
     DENSE_PAGE_SOURCE_SAFE_CHANNEL,
@@ -61,6 +62,7 @@ from atom.kv_transfer.offload.mooncake_store import pool as pool_mod
 from atom.kv_transfer.offload.mooncake_store import scheduler as scheduler_mod
 from atom.kv_transfer.offload.mooncake_store import worker as worker_mod
 from atom.kv_transfer.offload.mooncake_store.config import (
+    StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
 )
@@ -70,7 +72,6 @@ from atom.kv_transfer.offload.mooncake_store.pool import (
 )
 from atom.kv_transfer.offload.mooncake_store.scheduler import (
     MooncakeStoreOffloadScheduler,
-    _PromptView,
     prompt_chunk_hashes,
 )
 from atom.kv_transfer.offload.mooncake_store.worker import (
@@ -241,6 +242,10 @@ class FakeGPUConnector:
 
     gpu_staging_chunk_bytes = CHUNK_BYTES
     gpu_staging_buffer_bytes = 4 * CHUNK_BYTES
+    # The real token range -> KV block mapping, which in-place copies use.
+    block_size = BLOCK
+    _ranges_to_block_ids = BlockGPUConnector._ranges_to_block_ids
+    _range_block_ids = BlockGPUConnector._range_block_ids
 
     def __init__(self, source_safe=None) -> None:
         self.kv: dict[int, bytes] = {}
@@ -248,7 +253,6 @@ class FakeGPUConnector:
         self.source_safe = source_safe
         self.fail_from = False
         self.fail_to = False
-        self.stats: dict = {}
         self.events: list = []
         self.closed = False
         self._operation = None
@@ -278,7 +282,6 @@ class FakeGPUConnector:
             slot.tensor.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
             if self._operation is not None and self.source_safe is not None:
                 self.source_safe(SaveSourceGroupId(self._operation, ((start, end),)))
-        self.stats = {"producer_fenced": int(producer_event is not None)}
 
     def batched_to_gpu(self, slots, starts, ends, *, block_ids):
         self.calls.append(("to", list(starts)))
@@ -288,12 +291,6 @@ class FakeGPUConnector:
             data = slot.tensor.numpy().tobytes()
             for i, block in enumerate(block_ids[start // BLOCK : end // BLOCK]):
                 self.kv[block] = data[i * BYTES_PER_BLOCK : (i + 1) * BYTES_PER_BLOCK]
-
-    def last_transfer_stats(self):
-        return dict(self.stats)
-
-    def reset_transfer_stats(self):
-        self.stats = {}
 
     def close(self):
         self.closed = True
@@ -404,7 +401,8 @@ def _hashes(num_tokens, offset=0):
 
 
 def _key(hashes, index, *, rank=0, world=1, namespace=NAMESPACE):
-    return keys.chunk_key(namespace, rank, world, keys.chunk_digest(hashes, index))
+    [key] = keys.chunk_keys(namespace, rank, world, hashes, index, index + 1)
+    return key
 
 
 def _save_req(req_id, num_tokens, *, skip=0, generation=0, offset=0, block_ids=None):
@@ -532,13 +530,12 @@ def test_config_defaults_and_shared_master():
         }
     )
     assert (cfg.master, cfg.metadata, dict(cfg.pools)) == (MASTER, METADATA, {})
-    assert cfg.protocol == "rdma"
-    assert cfg.chunk_tokens == 256 and cfg.lookup_batch_keys == 8192
+    assert cfg.protocol == "rdma" and cfg.chunk_tokens == 256
     assert (cfg.load_pool_bytes, cfg.save_pool_bytes) == (1024 << 20, 256 << 20)
     assert cfg.save_abandon_timeout_s == 300.0
-    assert cfg.startup_probe and cfg.direct_copy and cfg.chunk_groups
     assert cfg.owner_rdma_devices == cfg.rdma_devices == ()
-    assert cfg.store_masters() == [nic.StorePool(MASTER, METADATA)]
+    assert cfg.store_masters() == [StorePool(MASTER, METADATA)]
+    assert cfg.pool_of("rdma3") == StorePool(MASTER, METADATA)
 
 
 def test_config_falls_back_to_the_top_level_dict_and_resolves_the_host(monkeypatch):
@@ -556,20 +553,24 @@ def test_config_falls_back_to_the_top_level_dict_and_resolves_the_host(monkeypat
     assert cfg.owner_rdma_devices == ("rdma4", "rdma5")
 
 
-def test_config_per_nic_pools_from_json_text():
+def test_config_per_nic_pools():
     pools = {
         "rdma0": {"master": "10.0.0.1:26051", "metadata": METADATA},
         "rdma1": {"master": "10.0.0.1:26151", "metadata": METADATA},
         "rdma2": {"master": "10.0.0.1:26051", "metadata": METADATA},
     }
     cfg = parse_mooncake_store_config(
-        _extra(master=None, metadata=None, pools=json.dumps(pools))
+        _extra(master=None, metadata=None, protocol="rdma", pools=pools)
     )
     assert cfg.master is None and cfg.pools["rdma1"].master == "10.0.0.1:26151"
+    # A worker uses its NIC's pool; a NIC without one is refused.
+    assert cfg.pool_of("rdma1") == StorePool("10.0.0.1:26151", METADATA)
+    with pytest.raises(ValueError, match="no pool for RDMA device 'rdma3'"):
+        cfg.pool_of("rdma3")
     # Two NICs naming one master make one lookup target.
     assert cfg.store_masters() == [
-        nic.StorePool("10.0.0.1:26051", METADATA),
-        nic.StorePool("10.0.0.1:26151", METADATA),
+        StorePool("10.0.0.1:26051", METADATA),
+        StorePool("10.0.0.1:26151", METADATA),
     ]
 
 
@@ -582,7 +583,7 @@ def test_config_per_nic_pools_from_json_text():
             '{"mooncake_store.local_hostname":"10.1.1.1","mooncake_store.protocol":'
             '"rdma","mooncake_store.master":"10.1.1.1:26051","mooncake_store.'
             'metadata":"http://10.1.1.1:26080/metadata","mooncake_store.'
-            'owner_rdma_devices":"rdma4,rdma5,rdma6,rdma7","max_pending_saves":8}'
+            'owner_rdma_devices":"rdma4,rdma5,rdma6,rdma7"}'
         ),
         # ... or one master per NIC.
         (
@@ -611,20 +612,12 @@ def test_config_takes_the_launcher_worker_config(launcher_json):
         ({"master": "10.0.0.1:0"}, "host:port"),
         ({"metadata": ""}, "non-empty string"),
         ({"protocol": "ib"}, "protocol must be one of"),
-        # Gone: the transfer pool is always in the worker GPU's HBM.
-        ({"pool_device": "cpu"}, "unknown Mooncake Store offload"),
         ({"chunk_tokens": 256.0}, "chunk_tokens must be an integer"),
         ({"chunk_tokens": 0}, "chunk_tokens must be positive"),
         ({"load_pool_mib": True}, "load_pool_mib must be an integer"),
-        ({"lookup_batch_keys": 0}, "lookup_batch_keys must be positive"),
         ({"save_abandon_timeout_s": 0}, "finite and > 0"),
         ({"save_abandon_timeout_s": float("inf")}, "finite and > 0"),
         ({"save_abandon_timeout_s": "300"}, "number of seconds"),
-        # Gone: switching it off left every block after a load unhashed.
-        ({"publish_loaded_prefix": False}, "unknown Mooncake Store offload"),
-        ({"startup_probe": 1}, "true or false"),
-        ({"direct_copy": "false"}, "true or false"),
-        ({"chunk_groups": "yes"}, "true or false"),
         ({"rdma_devices": ["rdma0"]}, "comma-separated string"),
     ],
 )
@@ -633,17 +626,30 @@ def test_config_refuses_bad_settings(overrides, match):
         parse_mooncake_store_config(_extra(**overrides))
 
 
-def test_config_refuses_a_bad_pool_table():
-    with pytest.raises(ValueError, match="not JSON"):
-        parse_mooncake_store_config(_extra(master=None, metadata=None, pools="{x"))
-    with pytest.raises(ValueError, match="host:port"):
+@pytest.mark.parametrize(
+    ("pools", "match"),
+    [
+        # The JSON object itself, not its text.
+        (json.dumps({"rdma0": {"master": MASTER, "metadata": METADATA}}), "object"),
+        ({}, "non-empty JSON object"),
+        (["rdma0"], "non-empty JSON object"),
+        ({"rdma0": MASTER}, "'rdma0'"),
+        ({"rdma0": {"metadata": METADATA}}, r"pools\['rdma0'\]\.master"),
+        ({"rdma0": {"master": "nohost", "metadata": METADATA}}, "host:port"),
+        ({"rdma0": {"master": MASTER, "metadata": ""}}, "metadata must be"),
+    ],
+)
+def test_config_refuses_a_bad_pool_table(pools, match):
+    with pytest.raises(ValueError, match=match):
         parse_mooncake_store_config(
-            _extra(
-                master=None,
-                metadata=None,
-                pools={"rdma0": {"master": "nohost", "metadata": METADATA}},
-            )
+            _extra(master=None, metadata=None, protocol="rdma", pools=pools)
         )
+
+
+def test_config_refuses_pools_without_rdma():
+    pools = {"rdma0": {"master": MASTER, "metadata": METADATA}}
+    with pytest.raises(ValueError, match="a tcp Store client has none"):
+        parse_mooncake_store_config(_extra(master=None, metadata=None, pools=pools))
 
 
 def test_engine_compatibility_refuses_what_phase_one_does_not_move():
@@ -685,8 +691,6 @@ def test_chain_digests_name_their_whole_prefix():
     # A prefix's chain is a prefix of the chain; a partial chunk is left out.
     assert keys.chunk_hash_chain(tokens[:20], CHUNK) == full[: 2 * keys.DIGEST_BYTES]
     assert keys.chunk_hash_chain(tokens, CHUNK, num_tokens=20) == full[:32]
-    # Extending from previous digests hashes only the new chunks.
-    assert keys.chunk_hash_chain(tokens, CHUNK, previous=full[:32]) == full
     # Changing one token changes its chunk's digest and every later one.
     edited = tokens.copy()
     edited[17] += 1
@@ -707,15 +711,6 @@ def test_chain_seed_separates_media_prompts():
     image_a = keys.chunk_hash_chain(tokens, CHUNK, seed=keys.chain_seed(12345))
     image_b = keys.chunk_hash_chain(tokens, CHUNK, seed=keys.chain_seed(54321))
     assert len({text[:16], image_a[:16], image_b[:16]}) == 3
-
-
-def test_chain_refuses_bad_input():
-    with pytest.raises(ValueError, match="fit in int32"):
-        keys.chunk_hash_chain([2**31] * CHUNK, CHUNK)
-    with pytest.raises(ValueError, match="whole 16-byte digests"):
-        keys.chunk_hash_chain(list(range(16)), CHUNK, previous=b"x")
-    with pytest.raises(ValueError, match="cover 3 chunks"):
-        keys.chunk_hash_chain(list(range(16)), CHUNK, previous=bytes(48))
 
 
 def test_chain_does_not_pin_the_sequence_array():
@@ -845,7 +840,7 @@ def test_namespace_fingerprints_the_kv_layout_the_environment_selects(monkeypatc
 
 def test_key_spellings():
     digest = bytes(range(16))
-    assert keys.chunk_key("ns", 2, 4, digest) == f"ns/w2of4/{digest.hex()}"
+    assert keys.chunk_keys("ns", 2, 4, digest, 0, 1) == [f"ns/w2of4/{digest.hex()}"]
     assert (
         keys.chunk_keys("ns", 1, 2, digest * 3, 1, 3)
         == [f"ns/w1of2/{digest.hex()}"] * 2
@@ -897,8 +892,9 @@ def test_client_setup_and_registration_failures_name_the_cause(cluster):
         client.register(0x1000, 4096)
 
 
-def test_client_lookups_are_batched_in_order(cluster):
-    client = _client(lookup_batch_keys=3)
+def test_client_lookups_are_batched_in_order(cluster, monkeypatch):
+    monkeypatch.setattr(store_client, "_LOOKUP_BATCH_KEYS", 3)
+    client = _client()
     store = cluster.stores[0]
     store.objects.update({"k1": b"x", "k4": b"x"})
     store.exist_codes["k5"] = store_client.RPC_FAIL
@@ -1043,7 +1039,6 @@ def test_quarantined_slots_never_come_back(cluster, caplog):
     # No time brings them back: nothing bounds how late an RDMA access lands.
     assert (pool.usable("save"), pool.quarantined("save")) == (0, 2)
     assert (pool.usable("load"), pool.quarantined("load")) == (2, 1)
-    assert not hasattr(held[0], "held_until")
 
 
 def test_closing_a_pool_with_a_quarantined_slot_keeps_its_memory(cluster, caplog):
@@ -1144,7 +1139,7 @@ def _nic_cfg(rdma_devices="", owners="", pools=None):
     return SimpleNamespace(
         rdma_devices=tuple(nic.parse_device_list(rdma_devices)),
         owner_rdma_devices=tuple(nic.parse_device_list(owners)),
-        pools=nic.parse_store_pools(pools),
+        pools=pools or {},
     )
 
 
@@ -1219,36 +1214,8 @@ def test_requester_device_never_shares_an_owner_nic(node):
 
 
 def test_requester_device_shares_the_owner_nic_of_its_own_pool(node):
-    cfg = _nic_cfg(owners="rdma0,rdma1,rdma2,rdma3", pools=json.dumps(POOLS))
+    cfg = _nic_cfg(owners="rdma0,rdma1,rdma2,rdma3", pools=POOLS)
     assert nic.requester_rdma_device(0, cfg) == "rdma3"
-
-
-def test_parse_store_pools():
-    assert nic.parse_store_pools(" ") == nic.parse_store_pools(None) == {}
-    assert nic.parse_store_pools(json.dumps(POOLS)) == {
-        "rdma2": nic.StorePool("10.0.0.1:26251", "http://10.0.0.1:26280/metadata"),
-        "rdma3": nic.StorePool("10.0.0.1:26351", "http://10.0.0.1:26380/metadata"),
-    }
-    assert nic.parse_store_pools(POOLS) == nic.parse_store_pools(json.dumps(POOLS))
-    for bad, match in (
-        ("rdma0=10.0.0.1:50051", "not JSON"),
-        ("{}", "non-empty JSON object"),
-        ('["rdma0"]', "non-empty JSON object"),
-        ('{"rdma0": {"metadata": "http://h/metadata"}}', "'rdma0'"),
-        ('{"rdma0": "10.0.0.1:50051"}', "'rdma0'"),
-    ):
-        with pytest.raises(ValueError, match=match):
-            nic.parse_store_pools(bad)
-
-
-def test_store_pool_of():
-    pools = nic.parse_store_pools(POOLS)
-    assert nic.store_pool_of(None, {}) is None
-    assert nic.store_pool_of("rdma3", pools).master == "10.0.0.1:26351"
-    with pytest.raises(ValueError, match="tcp"):
-        nic.store_pool_of(None, pools)
-    with pytest.raises(ValueError, match="no pool for RDMA device 'rdma0'"):
-        nic.store_pool_of("rdma0", pools)
 
 
 def test_parse_device_list():
@@ -1285,11 +1252,11 @@ def test_lookup_is_the_prefix_every_rank_holds(cluster):
     hashes = _hashes(48)
     _store_chunks(cluster, hashes, range(6), rank=0, world=2)
     _store_chunks(cluster, hashes, [0, 1, 3, 4, 5], rank=1, world=2)  # hole at 2
-    assert lookup.lookup(list(range(48))) == 2 * CHUNK
+    assert lookup.lookup(_seq(0, 48)) == 2 * CHUNK
     _store_chunks(cluster, hashes, [2], rank=1, world=2)
-    assert lookup.lookup(list(range(48))) == 6 * CHUNK
-    assert lookup.lookup(list(range(52))) == 6 * CHUNK  # partial tail not asked
-    assert lookup.lookup(list(range(7))) == 0  # shorter than a chunk
+    assert lookup.lookup(_seq(0, 48)) == 6 * CHUNK
+    assert lookup.lookup(_seq(0, 52)) == 6 * CHUNK  # partial tail not asked
+    assert lookup.lookup(_seq(0, 7)) == 0  # shorter than a chunk
     [store] = cluster.stores
     # One RPC per lookup, rank-major, the partial chunk never asked about.
     asked = [call[1] for call in store.calls if call[0] == "exists"]
@@ -1304,7 +1271,7 @@ def test_lookup_counts_rank_objects_past_the_shared_prefix(
     hashes = _hashes(48)
     _store_chunks(cluster, hashes, range(6), rank=0, world=2)
     _store_chunks(cluster, hashes, [0, 1, 3, 4, 5], rank=1, world=2)  # hole at 2
-    assert lookup.lookup(list(range(48))) == 2 * CHUNK
+    assert lookup.lookup(_seq(0, 48)) == 2 * CHUNK
     # Rank 0's chunks 2-5 are stranded: stored, unusable while rank 1 lacks 2.
     assert (lookup.lookups, lookup.uneven_lookups, lookup.stranded_objects) == (
         1,
@@ -1312,17 +1279,17 @@ def test_lookup_counts_rank_objects_past_the_shared_prefix(
         4,
     )
     _store_chunks(cluster, hashes, [2], rank=1, world=2)
-    assert lookup.lookup(list(range(48))) == 6 * CHUNK
+    assert lookup.lookup(_seq(0, 48)) == 6 * CHUNK
     assert (lookup.lookups, lookup.uneven_lookups, lookup.stranded_objects) == (
         2,
         1,
         4,
     )
     with caplog.at_level(logging.INFO, logger="atom"):
-        lookup.lookup(list(range(48)))
+        lookup.lookup(_seq(0, 48))
         assert not any("LOOKUP-STATS" in r.getMessage() for r in caplog.records)
         scheduler_clock.now += scheduler_mod._LOOKUP_STATS_INTERVAL_S
-        lookup.lookup(list(range(48)))
+        lookup.lookup(_seq(0, 48))
     assert [
         r.getMessage() for r in caplog.records if "LOOKUP-STATS" in r.getMessage()
     ] == ["[OFFLOAD-LOOKUP-STATS] lookups=4 uneven_lookups=1 stranded_objects=4"]
@@ -1333,29 +1300,28 @@ def test_lookup_answers_nothing_on_any_store_error(cluster):
     hashes = _hashes(24)
     _store_chunks(cluster, hashes, range(3))
     lookup = scheduler._lookup_client
-    assert lookup.lookup(list(range(24))) == 24
+    assert lookup.lookup(_seq(0, 24)) == 24
     [store] = cluster.stores
     store.exist_codes[next(iter(cluster.objects[MASTER]))] = store_client.RPC_FAIL
-    assert lookup.lookup(list(range(24))) is None
+    assert lookup.lookup(_seq(0, 24)) is None
     store.exist_codes.clear()
     store.raise_on = "exists"
-    lookup._retry_lookup_at = 0.0  # past the pause the failure started
-    assert lookup.lookup(list(range(24))) is None
+    lookup._paused_until = 0.0  # past the pause the failure started
+    assert lookup.lookup(_seq(0, 24)) is None
     assert store.calls[-1][0] == "exists"
     # None is a non-answer: the scheduler does not remember it as a miss.
-    lookup._retry_lookup_at = 0.0
+    lookup._paused_until = 0.0
     assert scheduler.get_num_new_matched_tokens(_seq(3, 25)) == (0, False)
     assert scheduler._lookup_results == {}
 
 
-def test_lookup_splits_large_prompts_into_batches(cluster):
-    scheduler = MooncakeStoreOffloadScheduler(
-        _config(pp=2, extra=_extra(lookup_batch_keys=4))
-    )
+def test_lookup_splits_large_prompts_into_batches(cluster, monkeypatch):
+    monkeypatch.setattr(store_client, "_LOOKUP_BATCH_KEYS", 4)
+    scheduler = MooncakeStoreOffloadScheduler(_config(pp=2))
     hashes = _hashes(40)
     for rank in range(2):
         _store_chunks(cluster, hashes, range(5), rank=rank, world=2)
-    assert scheduler._lookup_client.lookup(list(range(40))) == 40
+    assert scheduler._lookup_client.lookup(_seq(0, 40)) == 40
     [store] = cluster.stores
     assert [len(c[1]) for c in store.calls if c[0] == "exists"] == [4, 4, 2]
 
@@ -1365,13 +1331,13 @@ def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
         "rdma0": {"master": "10.0.0.1:26051", "metadata": METADATA},
         "rdma1": {"master": "10.0.0.1:26151", "metadata": METADATA},
     }
-    config = _config(pp=2, extra=_extra(master=None, metadata=None, pools=pools))
-    lookup = MooncakeStoreOffloadScheduler(config)._lookup_client
+    extra = _extra(master=None, metadata=None, protocol="rdma", pools=pools)
+    lookup = MooncakeStoreOffloadScheduler(_config(pp=2, extra=extra))._lookup_client
     hashes = _hashes(32)
     # Each stage's NIC routes its chunks to its own pool.
     _store_chunks(cluster, hashes, range(4), rank=0, world=2, master="10.0.0.1:26051")
     _store_chunks(cluster, hashes, range(4), rank=1, world=2, master="10.0.0.1:26151")
-    assert lookup.lookup(list(range(32))) == 32
+    assert lookup.lookup(_seq(0, 32)) == 32
     assert sorted(s.setup_args[6] for s in cluster.stores) == [
         "10.0.0.1:26051",
         "10.0.0.1:26151",
@@ -1380,17 +1346,16 @@ def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
     cluster.store_of("10.0.0.1:26051").exist_codes = {
         key: store_client.RPC_FAIL for key in cluster.objects["10.0.0.1:26151"]
     }
-    assert lookup.lookup(list(range(32))) == 32
+    assert lookup.lookup(_seq(0, 32)) == 32
     # ... and makes the answer a non-answer where no pool does.
     cluster.objects["10.0.0.1:26151"].clear()
-    assert lookup.lookup(list(range(32))) is None
-    lookup.close()
+    assert lookup.lookup(_seq(0, 32)) is None
 
 
 def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     lookup = scheduler._lookup_client
-    prompt = list(range(16))
+    prompt = _seq(0, 16)
     assert lookup.lookup(prompt) == 0
     [store] = cluster.stores
 
@@ -1398,7 +1363,7 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
         return sum(1 for call in store.calls if call[0] == "exists")
 
     for failure in ("raise", "code"):
-        lookup._retry_lookup_at = 0.0
+        lookup._paused_until = 0.0
         if failure == "raise":
             store.raise_on = "exists"
         else:
@@ -1422,7 +1387,7 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
 
 def test_a_lookup_that_blocked_pauses_ten_times_as_long(cluster, scheduler_clock):
     lookup = MooncakeStoreOffloadScheduler(_config())._lookup_client
-    assert lookup.lookup(list(range(16))) == 0
+    assert lookup.lookup(_seq(0, 16)) == 0
     [store] = cluster.stores
 
     def dead_master(keys):
@@ -1430,20 +1395,20 @@ def test_a_lookup_that_blocked_pauses_ten_times_as_long(cluster, scheduler_clock
         return [store_client.RPC_FAIL] * len(keys)
 
     store.batch_is_exist = dead_master
-    assert lookup.lookup(list(range(16))) is None
-    assert lookup._retry_lookup_at == pytest.approx(scheduler_clock.now + 43.0)
+    assert lookup.lookup(_seq(0, 16)) is None
+    assert lookup._paused_until == pytest.approx(scheduler_clock.now + 43.0)
 
 
 def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     lookup = scheduler._lookup_client
     cluster.setup_rc = store_client.RPC_FAIL
-    assert lookup.lookup(list(range(16))) is None
-    assert lookup.lookup(list(range(16))) is None
+    assert lookup.lookup(_seq(0, 16)) is None
+    assert lookup.lookup(_seq(0, 16)) is None
     assert len(cluster.stores) == 1  # no reconnect on every step
     cluster.setup_rc = 0
-    lookup._retry_connect_at = 0.0
-    assert lookup.lookup(list(range(16))) == 0
+    lookup._paused_until = 0.0
+    assert lookup.lookup(_seq(0, 16)) == 0
     assert len(cluster.stores) == 2
 
 
@@ -1462,17 +1427,15 @@ def test_a_connect_that_blocked_pauses_ten_times_as_long(
         return store_client.RPC_TIMEOUT
 
     monkeypatch.setattr(FakeStore, "setup", unanswered_setup)
-    assert lookup.lookup(list(range(16))) is None
+    assert lookup.lookup(_seq(0, 16)) is None
     # Paused from the failure, not from before the setup that blocked.
-    assert lookup._retry_connect_at == pytest.approx(
-        scheduler_clock.now + 10 * blocked_s
-    )
+    assert lookup._paused_until == pytest.approx(scheduler_clock.now + 10 * blocked_s)
     scheduler_clock.now += 0.01  # the next request's lookup
-    assert lookup.lookup(list(range(16))) is None
+    assert lookup.lookup(_seq(0, 16)) is None
     assert len(cluster.stores) == 1
     monkeypatch.setattr(FakeStore, "setup", setup)
     scheduler_clock.now += 10 * blocked_s
-    assert lookup.lookup(list(range(16))) == 0
+    assert lookup.lookup(_seq(0, 16)) == 0
     assert len(cluster.stores) == 2
 
 
@@ -1480,9 +1443,8 @@ def test_lookup_hashes_a_sequence_prompt_once(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
     seq = _seq(4, 20)
     seq.token_ids.extend([999] * 5)  # generated tokens are not prompt
-    view = scheduler._lookup_token_ids(seq)
-    assert isinstance(view, _PromptView) and len(view) == 20
-    assert scheduler._lookup_client.lookup(view) == 0
+    assert scheduler._lookup_token_ids(seq) is seq
+    assert scheduler._lookup_client.lookup(seq) == 0
     assert seq._mooncake_store_chunk_hashes == _hashes(16)
     seq._mooncake_store_chunk_hashes = b"\x01" * 32  # cached: not hashed again
     assert prompt_chunk_hashes(seq, CHUNK) == b"\x01" * 32
@@ -1660,7 +1622,7 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     elif meanwhile == "store_error":
         store.exist_codes[key] = store_client.RPC_FAIL
     elif meanwhile == "lookups_paused":  # another prompt's lookup just failed
-        offload._lookup_client._retry_lookup_at = scheduler_clock.now + 10.0
+        offload._lookup_client._paused_until = scheduler_clock.now + 10.0
     store_engine.withheld.on = False
     batch, _ = engine.schedule()
     # Admitted and parked, and its load dispatched in the same step.
@@ -1850,31 +1812,6 @@ def test_every_stage_puts_a_chunk_in_the_same_group(cluster, make_worker):
     assert len(groups) == 10 and len(set(groups.values())) == 5
 
 
-def test_chunk_groups_can_be_turned_off(cluster, make_worker):
-    worker, _ = make_worker(config=_config(extra=_extra(chunk_groups=False)))
-    worker._do_save_req(_save_req(52, 40))
-    [store] = cluster.stores
-    assert store.put_group_ids and all(ids is None for ids in store.put_group_ids)
-    assert cluster.groups[MASTER] == {}
-
-
-def test_put_refuses_group_ids_that_do_not_match_its_keys(cluster):
-    client = store_client.MooncakeStoreClient(
-        local_hostname="10.0.0.2",
-        metadata_server=METADATA,
-        master_server_addr=MASTER,
-        protocol="tcp",
-        rdma_devices="",
-    )
-    try:
-        with pytest.raises(ValueError, match="one per key"):
-            client.put(["a", "b"], [1, 2], [8, 8], group_ids=["g"])
-        [store] = cluster.stores
-        assert store.put_group_ids == []
-    finally:
-        client.close()
-
-
 def test_save_skips_what_is_already_stored(cluster, make_worker):
     worker, gpu = make_worker()
     request = _save_req(12, 40, skip=16)
@@ -1941,7 +1878,7 @@ def test_a_put_transfer_failure_before_the_batch_wait_frees_its_slots(
 
 
 def test_a_put_the_batch_wait_gave_up_on_quarantines_only_its_slot(
-    cluster, make_worker, slow_calls, monkeypatch
+    cluster, make_worker, slow_calls
 ):
     worker, _ = make_worker(save_slots=8)
     request = _save_req(17, 16)
@@ -1956,10 +1893,6 @@ def test_a_put_the_batch_wait_gave_up_on_quarantines_only_its_slot(
     assert _store(request.save_operation, False) in (
         worker.get_finished().connector_completions
     )
-    # However long ago: nothing bounds how late that RDMA work can land.
-    later = time.monotonic() + 3600
-    monkeypatch.setattr(time, "monotonic", lambda: later)
-    assert (pool.quarantined("save"), pool.usable("save")) == (1, 7)
 
 
 def test_a_put_that_raises_quarantines_its_window(cluster, make_worker):
@@ -2252,7 +2185,7 @@ def test_load_transfer_failure_before_the_batch_wait_frees_its_slots(
 
 
 def test_a_load_the_batch_wait_gave_up_on_quarantines_only_its_slot(
-    cluster, make_worker, slow_calls, monkeypatch
+    cluster, make_worker, slow_calls
 ):
     worker, _ = make_worker(load_slots=8)
     worker._do_save_req(_save_req(36, 16))
@@ -2266,9 +2199,6 @@ def test_a_load_the_batch_wait_gave_up_on_quarantines_only_its_slot(
     # is out of use for good.
     assert (pool.quarantined("load"), pool.usable("load")) == (1, 7)
     assert worker.get_finished().failed_loading == {request.load_operation}
-    later = time.monotonic() + 3600
-    monkeypatch.setattr(time, "monotonic", lambda: later)
-    assert (pool.quarantined("load"), pool.usable("load")) == (1, 7)
 
 
 def test_a_get_that_raises_quarantines_its_window(cluster, make_worker):
@@ -2407,32 +2337,10 @@ def test_a_stage_that_stops_early_still_completes_every_quorum(cluster, make_wor
 # --- registration and startup ------------------------------------------------
 
 
-def test_registered_under_its_name_and_alias():
+def test_registered_as_an_offload_backend():
     assert KVConnectorFactory.canonical_name("mooncake_store") == "mooncake_store"
-    assert (
-        KVConnectorFactory.canonical_name("MooncakeStoreOffloadConnector")
-        == "mooncake_store"
-    )
-
-
-def test_a_second_offload_connector_beside_it_is_refused_at_startup(cluster):
     assert KVConnectorFactory.is_offload_backend("mooncake_store")
     assert not KVConnectorFactory.is_offload_backend("mooncake")
-    store = {
-        "kv_connector": "mooncake_store",
-        "kv_role": "offload",
-        "kv_connector_extra_config": _extra(),
-    }
-    for other in (store, {"kv_connector": "lmcache_mp", "kv_role": "offload"}):
-        config = _config()
-        config.kv_transfer_config = {
-            "kv_connector": "multi",
-            "connectors": [store, other],
-        }
-        for role in ("scheduler", "worker"):
-            with pytest.raises(ValueError, match="at most one offload sub-connector"):
-                KVConnectorFactory.create_connector(config, role=role)
-    assert cluster.stores == []
 
 
 def test_factory_builds_both_halves(cluster):
@@ -2467,8 +2375,8 @@ def one_rank(monkeypatch):
     )
 
 
-def _registering_config(**overrides):
-    return _config(extra=_extra(save_pool_mib=1, load_pool_mib=1, **overrides))
+def _registering_config():
+    return _config(extra=_extra(save_pool_mib=1, load_pool_mib=1))
 
 
 def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
@@ -2487,6 +2395,7 @@ def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
         assert store.objects == {}  # the probe removed its key
         assert ("remove", puts[0][1][0], True) in store.calls
         assert worker._namespace == keys.store_namespace(worker._config, CHUNK)
+        assert not worker._in_place  # the fused staging kernel needs a GPU
     finally:
         worker.close()
     assert store.closed and store.registered == {}
@@ -2545,15 +2454,6 @@ def test_a_probe_transfer_left_unsettled_keeps_the_pool(
         worker.close()
 
 
-def test_registration_without_the_probe(cluster, one_rank):
-    worker = MooncakeStoreOffloadConnector(_registering_config(startup_probe=False))
-    try:
-        worker.register_kv_caches(_kv_caches(), num_blocks=8)
-        assert [c[0] for c in cluster.stores[0].calls] == ["register"]
-    finally:
-        worker.close()
-
-
 def test_rdma_workers_need_one_qp_and_use_their_pool(cluster, one_rank, monkeypatch):
     config = _config(
         extra=_extra(
@@ -2601,12 +2501,11 @@ def test_kv_offload_mode_selects_the_store_connector():
         "kv_connector": "multi",
         "connectors": [producer, offload],
     }
-    for name in ("mooncake_store", "MooncakeStoreOffloadConnector"):
-        existing = {"kv_connector": "multi", "connectors": [{"kv_connector": name}]}
-        with pytest.raises(ValueError, match="conflicts with an offload connector"):
-            compose_kv_offload_config(
-                json.dumps(existing), kv_offload_connector_config("lmcache", "")
-            )
+    existing = {"kv_connector": "multi", "connectors": [offload]}
+    with pytest.raises(ValueError, match="conflicts with an offload connector"):
+        compose_kv_offload_config(
+            json.dumps(existing), kv_offload_connector_config("lmcache", "")
+        )
 
 
 # --- in-place copies -----------------------------------------------------------
@@ -2696,7 +2595,7 @@ def make_in_place_worker(cluster, monkeypatch):
         worker._namespace = NAMESPACE
         worker._rank, worker._world = 0, 1
         worker._chunk_bytes = PAGE_CHUNK_BYTES
-        monkeypatch.setattr(worker, "_in_place_copy", lambda _pool: True)
+        worker._in_place = True
         monkeypatch.setattr(worker, "_in_place_stream", lambda: stream)
         built.append(worker)
         return worker, gpu, codec, stream
@@ -2806,6 +2705,27 @@ def test_in_place_load_unpacks_each_window_once(cluster, make_in_place_worker):
     assert output.failed_loading == set()
 
 
+class _UnreadBlock:
+    def __int__(self):
+        raise AssertionError("a block outside the copied windows was read")
+
+
+def test_in_place_copies_read_only_their_windows_blocks(cluster, make_in_place_worker):
+    # The request carries the whole block table, which grows with the prompt;
+    # a window converts its own blocks only. Chunk 0 is in HBM: its blocks
+    # are in no window.
+    worker, _gpu, codec, _stream = make_in_place_worker(save_slots=8, load_slots=8)
+    worker._do_save_req(_save_req(47, 40))
+    codec.calls.clear()
+    destination = [_UnreadBlock(), _UnreadBlock(), *range(102, 110)]
+    load = _load_req(47, hbm=8, lmc=40, block_ids=destination)
+    worker._do_load_req(load)
+
+    unpacks = [call[1] for call in codec.calls if call[0] == "unpack"]
+    assert unpacks == [[102, 103, 104, 105], [106, 107, 108, 109]]
+    assert worker.get_finished().finished_loading == {load.load_operation}
+
+
 def test_scattered_slots_fall_back_to_the_staging_copy(cluster, make_in_place_worker):
     worker, gpu, codec, _stream = make_in_place_worker(save_slots=16)
     gpu.pattern = staticmethod(_page_pattern)
@@ -2839,27 +2759,6 @@ def test_in_place_pack_failure_claims_nothing(cluster, make_in_place_worker):
         for completion in completions
     )
     assert worker._pool.quarantined("save") == 0  # the fence held: released
-
-
-@pytest.mark.parametrize(
-    ("direct_copy", "device", "fused", "expected"),
-    [
-        (True, "cuda", True, True),
-        (False, "cuda", True, False),
-        (True, "cpu", True, False),
-        (True, "cuda", False, False),
-    ],
-)
-def test_in_place_gate(cluster, direct_copy, device, fused, expected):
-    worker = MooncakeStoreOffloadConnector(
-        _config(extra=_extra(direct_copy=direct_copy))
-    )
-    worker._codec = SimpleNamespace(has_fused_chunk_major_staging=fused)
-    pool = SimpleNamespace(device=torch.device(device))
-    assert worker._in_place_copy(pool) is expected
-    worker._codec = None
-    assert worker._in_place_copy(pool) is False
-    worker.close()
 
 
 def test_in_place_save_failure_reports_each_chunk_once(cluster, make_in_place_worker):

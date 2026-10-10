@@ -13,37 +13,23 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from numbers import Real
-from typing import Any
+from typing import Any, NamedTuple
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload.mooncake_store.nic import (
-    StorePool,
-    parse_device_list,
-    parse_store_pools,
-)
+from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
 KEY_PREFIX = "mooncake_store."
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
-_FIELDS = (
-    "master",
-    "metadata",
-    "pools",
-    "owner_rdma_devices",
-    "rdma_devices",
-    "protocol",
-    "local_hostname",
-    "chunk_tokens",
-    "load_pool_mib",
-    "save_pool_mib",
-    "lookup_batch_keys",
-    "save_abandon_timeout_s",
-    "startup_probe",
-    "direct_copy",
-    "chunk_groups",
-)
+
+
+class StorePool(NamedTuple):
+    """The master of one Store pool."""
+
+    master: str
+    metadata: str
 
 
 @dataclass(frozen=True)
@@ -66,17 +52,7 @@ class MooncakeStoreOffloadConfig:
     chunk_tokens: int
     load_pool_mib: int
     save_pool_mib: int
-    # Most keys one `batch_is_exist` call carries.
-    lookup_batch_keys: int
     save_abandon_timeout_s: float
-    # One-chunk Store round trip at worker startup.
-    startup_probe: bool
-    # Pack and unpack a window in place in the GPU pool, without the staging
-    # copy, whenever its slots are one run.
-    direct_copy: bool
-    # Put every rank's object of a chunk in one Mooncake group, which the
-    # master evicts whole.
-    chunk_groups: bool
 
     @property
     def load_pool_bytes(self) -> int:
@@ -89,8 +65,28 @@ class MooncakeStoreOffloadConfig:
     def store_masters(self) -> list[StorePool]:
         """Every distinct ``(master, metadata)`` a lookup must ask."""
         if not self.pools:
-            return [StorePool(str(self.master), str(self.metadata))]
+            return [self.pool_of(None)]
         return sorted(set(self.pools.values()))
+
+    def pool_of(self, nic: str | None) -> StorePool:
+        """The pool of the worker whose Store client uses RDMA device ``nic``.
+
+        Raises:
+            ValueError: Per-NIC pools have none for ``nic``.
+        """
+        if not self.pools:
+            return StorePool(str(self.master), str(self.metadata))
+        pool = self.pools.get(nic)
+        if pool is None:
+            raise ValueError(
+                f"mooncake_store.pools has no pool for RDMA device {nic!r} "
+                f"(pools: {', '.join(sorted(self.pools))})"
+            )
+        return pool
+
+
+# The known setting names, after KEY_PREFIX.
+_FIELDS = tuple(field.name for field in fields(MooncakeStoreOffloadConfig))
 
 
 def parse_mooncake_store_config(
@@ -102,7 +98,8 @@ def parse_mooncake_store_config(
 
     Raises:
         ValueError: An unknown ``mooncake_store.*`` key, a value of the wrong
-            type or out of range, or neither a shared master nor pools.
+            type or out of range, neither a shared master nor pools, or pools
+            without rdma.
     """
     kvc = kv_transfer_config or {}
     extra = kvc.get("kv_connector_extra_config", kvc) or {}
@@ -122,7 +119,10 @@ def parse_mooncake_store_config(
             )
         values[name] = value
 
-    pools = parse_store_pools(values.get("pools"))
+    protocol = _choice(
+        "mooncake_store.protocol", values.get("protocol", "rdma"), _PROTOCOLS
+    )
+    pools = _pools(values.get("pools"))
     master = values.get("master")
     metadata = values.get("metadata")
     if pools:
@@ -132,8 +132,11 @@ def parse_mooncake_store_config(
                 "(one shared pool) or mooncake_store.pools (one pool per NIC), "
                 "not both"
             )
-        for device, pool in pools.items():
-            _address(f"mooncake_store.pools[{device!r}].master", pool.master)
+        if protocol != "rdma":
+            raise ValueError(
+                "mooncake_store.pools keys the Store pools by RDMA device; a tcp "
+                "Store client has none"
+            )
     else:
         if master is None or metadata is None:
             raise ValueError(
@@ -159,9 +162,7 @@ def parse_mooncake_store_config(
         rdma_devices=_devices(
             "mooncake_store.rdma_devices", values.get("rdma_devices", "")
         ),
-        protocol=_choice(
-            "mooncake_store.protocol", values.get("protocol", "rdma"), _PROTOCOLS
-        ),
+        protocol=protocol,
         local_hostname=_text("mooncake_store.local_hostname", local_hostname),
         chunk_tokens=offcfg._strict_integer(
             "mooncake_store.chunk_tokens", values.get("chunk_tokens", 256), minimum=1
@@ -172,23 +173,9 @@ def parse_mooncake_store_config(
         save_pool_mib=offcfg._strict_integer(
             "mooncake_store.save_pool_mib", values.get("save_pool_mib", 256), minimum=1
         ),
-        lookup_batch_keys=offcfg._strict_integer(
-            "mooncake_store.lookup_batch_keys",
-            values.get("lookup_batch_keys", 8192),
-            minimum=1,
-        ),
         save_abandon_timeout_s=_positive_seconds(
             "mooncake_store.save_abandon_timeout_s",
             values.get("save_abandon_timeout_s", 300.0),
-        ),
-        startup_probe=_flag(
-            "mooncake_store.startup_probe", values.get("startup_probe", True)
-        ),
-        chunk_groups=_flag(
-            "mooncake_store.chunk_groups", values.get("chunk_groups", True)
-        ),
-        direct_copy=_flag(
-            "mooncake_store.direct_copy", values.get("direct_copy", True)
         ),
     )
 
@@ -253,15 +240,32 @@ def _devices(name: str, value: Any) -> tuple[str, ...]:
     return tuple(parse_device_list(value))
 
 
+def _pools(value: Any) -> dict[str, StorePool]:
+    """``mooncake_store.pools``, RDMA device -> its pool; empty when unset."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(
+            "mooncake_store.pools must be a non-empty JSON object keyed by RDMA "
+            "device"
+        )
+    pools = {}
+    for device, pool in value.items():
+        name = f"mooncake_store.pools[{device!r}]"
+        if not isinstance(pool, Mapping):
+            raise ValueError(  # noqa: TRY004
+                f'{name} must be {{"master": "host:port", "metadata": "<url>"}}'
+            )
+        pools[_text(name, device)] = StorePool(
+            _address(f"{name}.master", pool.get("master")),
+            _text(f"{name}.metadata", pool.get("metadata")),
+        )
+    return pools
+
+
 def _choice(name: str, value: Any, choices: tuple[str, ...]) -> str:
     if value not in choices:
         raise ValueError(f"{name} must be one of {list(choices)}, got {value!r}")
-    return value
-
-
-def _flag(name: str, value: Any) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be true or false, got {value!r}")  # noqa: TRY004
     return value
 
 

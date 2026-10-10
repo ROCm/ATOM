@@ -29,7 +29,6 @@ digests travel to the workers in the request metadata.
 
 from __future__ import annotations
 
-import array
 import hashlib
 import json
 from types import SimpleNamespace
@@ -46,7 +45,6 @@ _MEDIA_SEED_PERSON = b"atom-kv-media-v1"
 _NAMESPACE_PREFIX = "atomkv1-"
 # Bumped when the dense codec's per-chunk byte layout changes.
 CODEC_ID = "dense-opaque-block-v1"
-_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 
 
 def pp_stage_layer_spans(config: Any) -> list[tuple[int, int]]:
@@ -185,75 +183,30 @@ def chunk_hash_chain(
     chunk_tokens: int,
     *,
     num_tokens: int | None = None,
-    previous: bytes = b"",
     seed: bytes | None = None,
 ) -> bytes:
     """Digests of every full chunk of ``token_ids[:num_tokens]``, concatenated.
 
     ``h_i = blake2b(h_{i-1} || int32-LE(tokens[i*C:(i+1)*C]))`` with a 16-byte
-    digest, starting from ``seed`` (``chain_seed()`` by default). ``previous``
-    holds the digests of a prefix already hashed; only the chunks after it are
-    hashed, so a caller may extend a chain incrementally. Any partial chunk at
-    the end is left out.
-
-    ``token_ids`` may be a list, an ``array("i")`` -- read in place, without a
-    copy -- or an integer ndarray.
-
-    Raises:
-        ValueError: ``previous`` is not whole digests or covers more chunks
-            than the tokens hold, or a token does not fit in int32.
+    digest, starting from ``seed`` (``chain_seed()`` by default). Any partial
+    chunk at the end is left out. An ``array("i")`` is read in place, without
+    a copy.
     """
     chunk_tokens = int(chunk_tokens)
-    if chunk_tokens <= 0:
-        raise ValueError("chunk_tokens must be positive")
-    if len(previous) % DIGEST_BYTES:
-        raise ValueError("previous chunk digests must be whole 16-byte digests")
-    tokens = _int32_tokens(token_ids)
-    if num_tokens is not None:
-        tokens = tokens[: int(num_tokens)]
+    # The view must not outlive the call: an array exporting its buffer
+    # cannot grow, and the scheduler appends to `Sequence.token_ids`.
+    tokens = np.asarray(token_ids, dtype="<i4")[:num_tokens]
     total = len(tokens) // chunk_tokens
-    done = len(previous) // DIGEST_BYTES
-    if done > total:
-        raise ValueError(
-            f"previous digests cover {done} chunks but the tokens hold {total}"
-        )
-    if done == total:
-        return bytes(previous)
-    link = previous[-DIGEST_BYTES:] if done else (seed or chain_seed())
-    if len(link) != DIGEST_BYTES:
-        raise ValueError("a chain seed is one 16-byte digest")
-    raw = memoryview(tokens[done * chunk_tokens : total * chunk_tokens].tobytes())
+    raw = memoryview(tokens[: total * chunk_tokens].tobytes())
     stride = chunk_tokens * 4
-    out = bytearray(previous)
+    link = seed or chain_seed()
+    out = bytearray()
     for offset in range(0, len(raw), stride):
         digest = hashlib.blake2b(link, digest_size=DIGEST_BYTES, person=_CHAIN_PERSON)
         digest.update(raw[offset : offset + stride])
         link = digest.digest()
         out += link
     return bytes(out)
-
-
-def _int32_tokens(token_ids: Any) -> np.ndarray:
-    """Token ids as little-endian int32, without copying an ``array("i")``."""
-    if (
-        isinstance(token_ids, array.array)
-        and token_ids.typecode == "i"
-        and token_ids.itemsize == 4
-    ):
-        # The view must not outlive the caller: an array exporting its
-        # buffer cannot grow, and the scheduler appends to `Sequence.token_ids`.
-        tokens = np.frombuffer(token_ids, dtype=np.int32)
-    else:
-        tokens = np.asarray(token_ids)
-        if tokens.size == 0:
-            tokens = tokens.astype(np.int32)
-        if tokens.ndim != 1 or tokens.dtype.kind not in "iu":
-            raise ValueError("token ids must be a flat sequence of integers")
-        if tokens.dtype != np.int32 and (
-            int(tokens.min()) < _INT32_MIN or int(tokens.max()) > _INT32_MAX
-        ):
-            raise ValueError("token ids must fit in int32")
-    return tokens.astype("<i4", copy=False)
 
 
 def chunk_digest(hashes: bytes, index: int) -> bytes:
@@ -264,11 +217,6 @@ def chunk_digest(hashes: bytes, index: int) -> bytes:
 def rank_key_prefix(namespace: str, rank: int, world: int) -> str:
     """The part of a chunk key every chunk of one rank shares."""
     return f"{namespace}/w{int(rank)}of{int(world)}/"
-
-
-def chunk_key(namespace: str, rank: int, world: int, digest: bytes) -> str:
-    """Store key of one rank's object for the chunk whose digest is ``digest``."""
-    return rank_key_prefix(namespace, rank, world) + bytes(digest).hex()
 
 
 def chunk_keys(

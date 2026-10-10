@@ -58,7 +58,6 @@ KVConnectorFactory.register(
     worker_class="MooncakeStoreOffloadConnector",
     scheduler_module="atom.kv_transfer.offload.mooncake_store.scheduler",
     scheduler_class="MooncakeStoreOffloadScheduler",
-    aliases=("MooncakeStoreOffloadConnector",),
     requires_pd_staging=False,
     offload=True,
     # The dense codec builds from `KVCacheTensor`s; the region map is unread.
