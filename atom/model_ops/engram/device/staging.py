@@ -22,7 +22,7 @@ from atom.model_ops.engram.device.hashing import (
     engram_snapshot_indices,
 )
 from atom.model_ops.engram.device.uva import uva_gather_into
-from atom.utils.forward_context import capture_breaks_mid_forward
+from atom.plugin import is_vllm
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,20 @@ class EngramStep:
     cursor: torch.Tensor
     history_index: torch.Tensor
     candidates: torch.Tensor | None
+
+
+def _capture_breaks_mid_forward() -> bool:
+    """Ask the active frontend whether it may break a capture mid-forward.
+
+    Routed through the plugin because the answer is one frontend's internals
+    and this file is not; native ATOM records one graph per forward and never
+    breaks, so the question only has a non-trivial answer under vLLM.
+    """
+    if not is_vllm():
+        return False
+    from atom.plugin.vllm.breakable_capture import capture_breaks_mid_forward
+
+    return capture_breaks_mid_forward()
 
 
 class EngramStaging:
@@ -189,7 +203,7 @@ class EngramStaging:
         # `capture_end()` refuses as `hipErrorStreamCaptureUnjoined`. Issue on
         # the compute stream instead: same work in the same order, with the
         # prefetch no longer overlapping the layers that consume it.
-        forking = not capture_breaks_mid_forward()
+        forking = not _capture_breaks_mid_forward()
         # Remembered for `consume` and `join`, which otherwise order against a
         # stream that was never forked. Under a breakable capture that is not
         # merely redundant: this function runs in an eager break, so its

@@ -22,6 +22,11 @@ import torch
 
 from atom.model_ops.engram.device import staging as staging_mod
 
+# Patched on `staging`, not on the plugin module it delegates to: the question
+# "may this capture break mid-forward" is one frontend's, so the predicate
+# lives in `atom.plugin.vllm`, and what this file is testing is the fork
+# decision that reads it.
+
 
 def _call_start(breaks: bool):
     """Run `start` with no layers, reporting which stream it issued on."""
@@ -42,7 +47,7 @@ def _call_start(breaks: bool):
         return nullcontext()
 
     with (
-        patch.object(staging_mod, "capture_breaks_mid_forward", lambda: breaks),
+        patch.object(staging_mod, "_capture_breaks_mid_forward", lambda: breaks),
         patch.object(torch.cuda, "current_stream", lambda device=None: compute),
         patch.object(torch.cuda, "stream", fake_stream),
     ):

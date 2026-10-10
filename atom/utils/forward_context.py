@@ -983,31 +983,6 @@ def _normalize_cudagraph_runtime_mode(mode: Any) -> CUDAGraphMode | None:
     return CUDAGraphMode[name]
 
 
-def capture_breaks_mid_forward() -> bool:
-    """Whether the active frontend may end a capture segment mid-forward.
-
-    vLLM's breakable CUDA graph splits one forward into several graphs, ending
-    a segment at each eager break.  A side stream forked earlier in that
-    forward and joined later is outstanding at those breaks, and
-    `capture_end()` refuses it:
-
-        HIP error: capturing stream has unjoined work (hipErrorStreamCaptureUnjoined)
-
-    So a fork whose join is not in the same segment must not be opened while
-    this is true.  ATOM's own capture loop records one graph per forward and
-    never breaks, hence False natively.
-    """
-    from atom.plugin import is_vllm
-
-    if not is_vllm():
-        return False
-    try:
-        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-    except ImportError:
-        return False
-    return BreakableCUDAGraphCapture.is_active()
-
-
 def get_current_cudagraph_runtime_mode() -> CUDAGraphMode:
     """Return the concrete graph mode for the active model forward.
 

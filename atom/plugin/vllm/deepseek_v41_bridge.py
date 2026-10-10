@@ -253,6 +253,37 @@ def v41_capture_state_slots(num_reqs: int, vllm_config) -> np.ndarray:
     return np.arange(base, base + num_reqs, dtype=np.int32)
 
 
+def _v41_capture_batch(snapshot, vllm_config):
+    """The synthetic batch vLLM is about to capture, declared for what it is.
+
+    Two things it is not, and both have to be said or the step is refused:
+
+    It has no history. vLLM's dummy metadata carries a nonzero computed-token
+    count, so the rows arrive looking like decodes mid-sequence, and
+    `prepare_state` then checks their cursors against a position no slot has
+    ever held -- "Request 1 needs state at 2, found 0", during capture, before
+    the server is up. Declared fresh, every row takes the reset path that the
+    judge exempts by position, which is also what is true of them.
+
+    Its rows are not requests. They take slots from the half the allocator
+    never hands out, so a capture cannot evict a request in flight nor collide
+    with one -- and they stay on the serving cache, because the scratch cache's
+    addresses would be recorded into the graph for the life of the entry.
+    """
+    query_lens = np.asarray(snapshot.query_lens, dtype=np.int32)
+    num_reqs = int(snapshot.num_reqs)
+    return SimpleNamespace(
+        is_dummy_run=False,
+        req_ids=snapshot.req_ids,
+        num_scheduled_tokens=query_lens,
+        context_lens=query_lens.astype(np.int64),
+        state_slots_committed=v41_capture_state_slots(num_reqs, vllm_config),
+        block_tables=snapshot.block_rows,
+        total_seqs_num=num_reqs,
+        total_tokens_num=int(query_lens.sum()),
+    )
+
+
 def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturing):
     """One CSA2 step, staged where no graph can capture it.
 
@@ -275,8 +306,10 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     if slot_allocator is None and not capturing:
         return None
     num_reqs = int(snapshot.num_reqs)
-    slots = np.arange(num_reqs, dtype=np.int32) if capturing else None
-    batch = _v41_scheduled_batch(snapshot, slot_allocator, slots)
+    if capturing:
+        batch = _v41_capture_batch(snapshot, vllm_config)
+    else:
+        batch = _v41_scheduled_batch(snapshot, slot_allocator, None)
     running_bs = num_reqs
     running_tokens = max(_v41_live_running_tokens(None), int(batch.total_tokens_num))
     metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
