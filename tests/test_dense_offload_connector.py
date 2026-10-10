@@ -879,6 +879,47 @@ def test_native_admission_spends_the_memo(monkeypatch, scheduler, seq_factory):
     assert connector._tier_hit_memo == {}
 
 
+def test_prefetch_skips_a_request_that_resumes_after_its_load(monkeypatch):
+    """A resumed request skips the match, so its lookup would never be consumed."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    resumed = _load_seq(70, num_prompt_tokens=16)
+    resumed.offload_loaded = True
+    preempted = _load_seq(71, num_prompt_tokens=16)
+    preempted.offload_loaded = True
+    preempted.block_table = []
+
+    sched.prefetch_lookups([resumed, preempted])
+
+    assert submitted == ["71"]
+
+
+def test_prefetch_skips_a_finished_load_before_admission(monkeypatch):
+    """Promoted to the head after its load, `offload_loaded` is still unset."""
+
+    sched = _scheduler(monkeypatch)
+    submitted = []
+    sched._lookup_client = SimpleNamespace(
+        submit=lambda _tokens, sid: submitted.append(sid) or True,
+        pump=lambda: None,
+        pending_ids=lambda: (),
+    )
+    loaded = _load_seq(72, num_prompt_tokens=16)
+    loaded.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    fresh = _load_seq(73, num_prompt_tokens=16)
+    fresh.status = SequenceStatus.WAITING
+
+    sched.prefetch_lookups([loaded, fresh])
+
+    assert submitted == ["73"]
+
+
 def test_a_declined_load_is_not_looked_up_again_every_step(monkeypatch):
     """The plugin's shape: the decline is what releases the lookup.
 

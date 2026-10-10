@@ -55,6 +55,9 @@ class _MPLookupClient:
         self._async: dict[str, list] = {}
         # Prompts of submitted lookups not yet consumed, to free their locks.
         self._async_tokens: dict[str, list[int]] = {}
+        # Answered async hits. Kept here, not only in the adapter's result
+        # cache, which `cleanup_lookup_result` clears by request ID.
+        self._async_hits: dict[str, int] = {}
         self._orphans: set[str] = set()
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter
@@ -83,6 +86,7 @@ class _MPLookupClient:
         if (
             not self._async_supported
             or lookup_id in self._async
+            or lookup_id in self._async_tokens
             or lookup_id in self._lookups
         ):
             return False
@@ -152,9 +156,9 @@ class _MPLookupClient:
         if result is None:
             entry[3] = adapter._client.query_prefetch_status(request_id)
             return False
-        adapter._lookup_results[request_id] = int(result) * int(
-            adapter.lmcache_tokens_per_chunk
-        )
+        hit = int(result) * int(adapter.lmcache_tokens_per_chunk)
+        adapter._lookup_results[request_id] = hit
+        self._async_hits[lookup_id] = hit
         del self._async[lookup_id]
         return True
 
@@ -178,7 +182,7 @@ class _MPLookupClient:
 
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)
-        hit = self._adapter._lookup_results.get(request_id)
+        hit = self._async_hits.pop(lookup_id, None)
         token_ids = self._async_tokens.pop(lookup_id, None)
         if hit and token_ids is not None:
             self._adapter.free_lookup_locks(
@@ -225,8 +229,12 @@ class _MPLookupClient:
                     return None
                 time.sleep(self._poll_interval)
         self._async_tokens.pop(lookup_id, None)
+        async_hit = self._async_hits.pop(lookup_id, None)
         state = _LookupState(token_ids=list(token_ids))
         self._lookups[lookup_id] = state
+        if async_hit is not None:
+            state.hit = async_hit
+            return async_hit
         request_id = _mp_session_id(self._config, lookup_id)
         self._adapter.maybe_submit_lookup_request(request_id, token_ids)
         deadline = time.monotonic() + self._timeout
