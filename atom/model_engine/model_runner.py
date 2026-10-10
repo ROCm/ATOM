@@ -41,7 +41,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import KVConnectorFactory, KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -1760,9 +1760,19 @@ class ModelRunner:
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
-        available_for_kv_budget -= self._kv_budget_extra_reserve(total)
-        # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv_budget, free)
+        extra_reserve = self._kv_budget_extra_reserve(total)
+        available_for_kv_budget -= extra_reserve
+        # GPU buffers the KV connector allocates after the KV cache is sized.
+        connector_bytes = KVConnectorFactory.kv_budget_reserve_bytes(config)
+        if connector_bytes:
+            logger.info(
+                "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
+            )
+            available_for_kv_budget -= connector_bytes
+        # This prevents OOM when other processes share the GPU. Free HBM must
+        # cover the connector buffers too.
+        free_for_kv = free - connector_bytes
+        available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)
 
@@ -1782,7 +1792,9 @@ class ModelRunner:
             # Minimum gpu_memory_utilization that makes the budget just cover the
             # per-request pools. Rounded UP to the next 0.01 so the printed value
             # is actually sufficient, not the exact threshold.
-            min_util = (non_kv_overhead + exc.reserved_bytes) / total
+            min_util = (
+                non_kv_overhead + extra_reserve + connector_bytes + exc.reserved_bytes
+            ) / total
             min_util_hint = math.ceil(min_util * 100) / 100
             base_msg = (
                 f"Per-request cache tensor "
@@ -1791,14 +1803,23 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
-            if available_for_kv_budget > free:
-                # The physical free-memory clamp is the binding limit, not the
-                # utilization budget — raising --gpu-memory-utilization won't help.
+            if (
+                available_for_kv_budget > free_for_kv
+                or free_for_kv <= exc.reserved_bytes
+            ):
+                # The physical free-memory clamp is the binding limit, now or
+                # once the budget grows — raising --gpu-memory-utilization won't help.
+                connector_note = (
+                    f"{connector_bytes / (1 << 30):.2f}GB of it reserved for KV "
+                    f"connector buffers; "
+                    if connector_bytes
+                    else ""
+                )
                 fix_msg = (
                     f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
-                    f"(other processes may be holding memory); raising "
-                    f"--gpu-memory-utilization will NOT help. Free GPU memory or "
-                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                    f"({connector_note}other processes may be holding memory); "
+                    f"raising --gpu-memory-utilization will NOT help. Free GPU memory "
+                    f"or reduce --max-num-seqs (currently {config.max_num_seqs})."
                 )
             elif min_util_hint <= 1.0:
                 fix_msg = (

@@ -528,3 +528,17 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
+
+## Mooncake PD MLA staging
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_STAGING** | bool | 1 | Prefill (`kv_producer`, plain `mooncake` connector) only. When the decode side runs DCP, gather the MLA tokens each decode rank owns into a GPU staging slot laid out as its destination pages, then RDMA one descriptor per run of adjacent destination pages instead of one per 576-byte token. Destination bytes are identical. The pool holds one 8 MiB slot per send worker (`num_worker_threads`, default 16), capped at 256 MiB per producer GPU, and is held back from the KV cache budget. A prefill learns the decode's DCP size only per request, so the pool is reserved whenever this is on; set 0 where no decode runs DCP. 0 restores the per-token path. |
+
+## Mooncake PD MLA landing
+
+Set on the decode side; the prefill side follows what each write request offers and needs MLA staging enabled.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_LANDING** | bool | 1 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1) only. Allocate a GPU landing pool per rank and give prefill stages partitions of it. A stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. The pool is 256 MiB of 8 MiB slots per decode rank, held back from the KV cache budget. Partitions go first come, first served: a prefill stage endpoint gets `32 // its PP size` slots on first contact and keeps them while the decode runs, so with several prefill instances per decode rank a later one may get fewer slots, or none and keep the staged path. A prefill sends a transfer needing fewer than 2 slots, or the rest of one after waiting 10 ms for a free slot, through the staged per-page path. 0 keeps the staged per-page writes. |
