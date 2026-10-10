@@ -415,7 +415,10 @@ EOF
 EOF
   {
     printf 'export %q=%q\n' GITHUB_WORKSPACE "${REPO_ROOT}"
-    printf 'exec %q\n' "${JOB_SCRIPT}"
+    # git tracks the job script as 0644 and only the workflow chmods it, so a
+    # submission from anywhere else would exec a non-executable file and die
+    # with 126 before writing a log. Every other call site already uses bash.
+    printf 'exec bash %q\n' "${JOB_SCRIPT}"
   } >> "${SUBMIT_SCRIPT}"
   chmod +x "${SUBMIT_SCRIPT}"
   SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" --export=ALL "${SUBMIT_SCRIPT}")

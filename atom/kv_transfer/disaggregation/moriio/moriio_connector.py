@@ -11,6 +11,7 @@ KV cache migration between producer (prefill) and consumer (decode) nodes.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -39,6 +40,7 @@ from atom.kv_transfer.disaggregation.moriio.moriio_engine import MoRIIOWrapper
 from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
+    KVConnectorOutput,
     ReqId,
     ReqMeta,
     TransferId,
@@ -77,8 +79,14 @@ class MoRIIOConnector(KVConnectorBase):
 
     1. Registering local KV cache tensors for RDMA access.
     2. Performing handshakes with remote engines to exchange memory metadata.
-    3. Issuing RDMA read operations to pull KV cache blocks from the producer.
-    4. Tracking transfer completion and notifying the producer when done.
+    3. Moving KV cache blocks from the producer to the consumer, in one of two
+       modes chosen by the consumer's ``moriio_mode``:
+
+       - ``write`` (default): the consumer sends the producer its block ids
+         and the producer pushes the KV with RDMA writes, then reports back.
+       - ``read``: the consumer pulls the KV with RDMA reads.
+
+    4. Tracking transfer completion and notifying the peer when done.
     5. Periodically pinging the proxy for service discovery.
     """
 
@@ -94,6 +102,7 @@ class MoRIIOConnector(KVConnectorBase):
         self.is_producer = (
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
+        self.transfer_mode = self._transfer_mode_from(kv_transfer_config)
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.base_handshake_port = kv_transfer_config.get(
@@ -102,8 +111,10 @@ class MoRIIOConnector(KVConnectorBase):
 
         # Compute unique side-channel port for this (dp, tp) rank
         handshake_port = self.base_handshake_port
+        # tp_size must be passed: it strides the DP ranks apart, and the
+        # default of 1 would put every DP rank on the same port set.
         self.side_channel_port = handshake_port + get_port_offset(
-            self.dp_rank, self.tp_rank
+            self.dp_rank, self.tp_rank, self.tp_size
         )
         self.engine_id = f"{self.local_ip}:{handshake_port}"
 
@@ -139,11 +150,12 @@ class MoRIIOConnector(KVConnectorBase):
         rdma_cfg.max_msg_sge = kv_transfer_config.get("max_msg_sge", 0)
         logger.info(
             "RdmaBackendConfig: qp_per_transfer=%d, workers=%d, "
-            "poll_mode=%s, notification=%s",
+            "poll_mode=%s, notification=%s, transfer_mode=%s",
             qp_per_transfer,
             num_worker_threads,
             poll_mode.name,
             enable_notification,
+            self.transfer_mode,
         )
         self.moriio_wrapper.set_backend_type(BackendType.RDMA, rdma_cfg)
 
@@ -162,9 +174,10 @@ class MoRIIOConnector(KVConnectorBase):
 
         # Handshake management
         self.zmq_context = zmq.Context()
-        self.load_ready_flag: dict[str, bool] = {}
-        self.write_ready_flags: dict[str, bool] = {}
         self._handshake_lock = threading.RLock()
+        self._handshake_timeout_s = float(
+            os.environ.get("ATOM_MORIIO_HANDSHAKE_TIMEOUT_S", "300")
+        )
         self._handshake_futures: dict[EngineId, Future[set[str]]] = {}
         self._remote_agents: dict[EngineId, set[str]] = {}
         self._ready_requests: queue.Queue[tuple[ReqId, ReqMeta]] = queue.Queue()
@@ -177,6 +190,37 @@ class MoRIIOConnector(KVConnectorBase):
         # In-flight receive transfers
         self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str]] = {}
+
+        # Opt-in correctness probe. A transfer that reports success only says
+        # the RDMA verbs retired, not that every layer's KV arrived, and decode
+        # cannot tell the difference -- it just attends over whatever is in the
+        # block and degenerates. Digesting each layer's destination before and
+        # after the transfer turns that silent case into a log line.
+        self._verify_kv = os.environ.get("ATOM_MORIIO_VERIFY", "") not in ("", "0")
+        self._verify_before: dict[ReqId, dict[str, int]] = {}
+        self._verify_rows: dict[ReqId, Any] = {}
+        self._logged_layout = False
+
+        # Requests rejected before a single transfer was issued. They have no
+        # status to poll, so get_finished has to report them from here.
+        self._failed_before_read: set[ReqId] = set()
+
+        # Serial WRITE mode, producer side. The listener thread only queues
+        # requests; the worker thread, which owns every RDMA call, drains them,
+        # waits out each consumer's handshake, and tracks the writes in flight.
+        self._write_requests: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._pending_writes: list[tuple[dict[str, Any], float]] = []
+        self._write_handshakes: dict[EngineId, Future[set[str]]] = {}
+        self._sending_writes: dict[int, tuple[list[Any], dict[str, Any]]] = {}
+
+        # Serial WRITE mode, consumer side: requests waiting on the producer's
+        # report, and the reports the listener thread has collected.
+        self._awaiting_write: dict[ReqId, float] = {}
+        self._write_reports: dict[ReqId, bool] = {}
+        self._write_reports_lock = threading.Lock()
+        self._write_timeout_s = float(
+            os.environ.get("ATOM_MORIIO_WRITE_TIMEOUT_S", "600")
+        )
 
         # Completed send-side transfers (populated by handshake listener)
         self.done_sending: set[int] = set()
@@ -288,6 +332,23 @@ class MoRIIOConnector(KVConnectorBase):
         self._handshake_listener_thread.start()
 
     @staticmethod
+    def _transfer_mode_from(kv_transfer_config: dict, environ=os.environ) -> str:
+        """``"write"`` or ``"read"``: which side posts the RDMA verbs.
+
+        Only the consumer's mode matters: it either pulls with reads or asks
+        for a push, and the producer serves both. Write is the default because
+        on ionic AINIC (fw 1.117.5-a-56) an RDMA READ into GPU memory reports
+        SUCCESS without placing any data, while writes land.
+        """
+        mode = environ.get("ATOM_MORIIO_MODE") or kv_transfer_config.get(
+            "moriio_mode", "write"
+        )
+        mode = str(mode).lower()
+        if mode not in ("read", "write"):
+            raise ValueError(f"moriio_mode must be 'read' or 'write', got {mode!r}")
+        return mode
+
+    @staticmethod
     def _engine_name_with_dp(engine_name: str, dp_rank: int) -> str:
         """Build a unique engine identifier that includes the DP rank."""
         return f"{engine_name}_dp{dp_rank}"
@@ -308,8 +369,12 @@ class MoRIIOConnector(KVConnectorBase):
 
         self.request_id_to_transfer_id = metadata.request_id_to_transfer_id
 
-        remote_engine_id: str | None = None
-        need_handshake = False
+        if self.transfer_mode == "write":
+            for req_id, meta in metadata.reqs_to_recv.items():
+                self._request_write(req_id, meta)
+            return
+
+        deferred = 0
 
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = f"{meta.remote_host}:{meta.remote_handshake_port}"
@@ -318,30 +383,36 @@ class MoRIIOConnector(KVConnectorBase):
 
             if dp0_id not in self._remote_agents:
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
+                    # _remote_agents is keyed by the dp-suffixed id that the
+                    # handshake callback registers, so re-check that one.
+                    if dp0_id not in self._remote_agents:
                         self._initiate_background_handshake(
                             req_id, remote_engine_id, meta
                         )
-                        need_handshake = True
+                        deferred += 1
                         continue
 
             self._issue_read_for_req(req_id, meta)
 
-        # If a handshake was needed, spin until it completes then read.
-        while need_handshake:
-            if (
-                self._ready_requests.empty()
-                and remote_engine_id not in self.load_ready_flag
-            ):
+        # Drain every deferred request, not just the first off the queue: the
+        # rest would sit waiting on KV that was never asked for. One entry is
+        # queued per deferral, so the count is exact.
+        deadline = time.monotonic() + self._handshake_timeout_s
+        while deferred:
+            try:
+                entry = self._ready_requests.get(timeout=0.01)
+            except queue.Empty:
+                if time.monotonic() >= deadline:
+                    logger.error(
+                        "Timed out after %.0fs with %d handshake(s) pending; "
+                        "those requests have no KV read in flight",
+                        self._handshake_timeout_s,
+                        deferred,
+                    )
+                    break
                 continue
-            elif (
-                not self._ready_requests.empty()
-                and remote_engine_id in self.load_ready_flag
-            ):
-                self._issue_read_for_req(*self._ready_requests.get_nowait())
-                break
-            else:
-                break
+            self._issue_read_for_req(*entry)
+            deferred -= 1
 
     def _issue_read_for_req(self, req_id: str, meta: ReqMeta) -> None:
         """Issue RDMA reads for a single request."""
@@ -352,15 +423,113 @@ class MoRIIOConnector(KVConnectorBase):
             self.tp_rank,
             meta.remote_dp_rank,
         )
-        self._read_blocks(
-            request_id=req_id,
-            dst_engine_id=meta.remote_engine_id,
-            local_block_ids=meta.local_block_ids,
-            remote_block_ids=meta.remote_block_ids,
-            remote_host=meta.remote_host,
-            remote_handshake_port=meta.remote_handshake_port,
-            remote_dp_rank=meta.remote_dp_rank,
+        if self._rejects_transfer_subset(req_id, meta):
+            self._failed_before_read.add(req_id)
+            return
+        try:
+            self._read_blocks(
+                request_id=req_id,
+                dst_engine_id=meta.remote_engine_id,
+                local_block_ids=meta.local_block_ids,
+                remote_block_ids=meta.remote_block_ids,
+                remote_host=meta.remote_host,
+                remote_handshake_port=meta.remote_handshake_port,
+                remote_dp_rank=meta.remote_dp_rank,
+                remote_tp_size=int(meta.tp_size or 0),
+            )
+        except ValueError:
+            # start_load_kv runs on the worker's busy_loop, so letting this
+            # escape takes down the rank and with it every other request on
+            # it. Failing just this one lets the scheduler retry or abort it.
+            logger.exception("req %s: refusing to read KV", req_id)
+            self._failed_before_read.add(req_id)
+
+    @staticmethod
+    def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
+        """Whether the request asks for a subset neither direction implements.
+
+        Both paths move every advertised block, paired one to one. A request to
+        skip already-computed blocks is safe to over-serve; a source stride is
+        not, because the pairing would put blocks in the wrong place.
+        """
+        if getattr(meta, "num_computed_blocks", 0):
+            logger.warning(
+                "req %s asks to skip %d already-computed blocks, which this "
+                "connector does not implement; transferring all blocks",
+                req_id,
+                meta.num_computed_blocks,
+            )
+        if getattr(meta, "src_block_skip_factor", 1) != 1:
+            logger.error(
+                "req %s: src_block_skip_factor=%s is not implemented by the "
+                "MoRIIO connector; blocks would be paired one to one",
+                req_id,
+                meta.src_block_skip_factor,
+            )
+            return True
+        return False
+
+    def _request_write(self, req_id: ReqId, meta: ReqMeta) -> None:
+        """Ask the producer to push this request's KV into our blocks.
+
+        The consumer half of serial WRITE mode. The producer has already run
+        the prefill and holds the source blocks until it reports back, so all
+        that is left is to tell it where to write.
+        """
+        if self._rejects_transfer_subset(req_id, meta):
+            self._failed_before_read.add(req_id)
+            return
+        dst = [int(b) for b in meta.local_block_ids]
+        src = [int(b) for b in (meta.remote_block_ids or [])]
+        # The producer's table also covers the token it generated, which we
+        # never allocate for, so a longer source is normal. A shorter one would
+        # leave the tail of the prompt with nothing to fill it.
+        if len(src) < len(dst):
+            logger.error(
+                "req %s: %d local blocks but only %d remote blocks; the tail of "
+                "the prompt's KV has no source",
+                req_id,
+                len(dst),
+                len(src),
+            )
+            self._failed_before_read.add(req_id)
+            return
+
+        if self._verify_kv:
+            first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
+            is_mla = self.kv_caches[first_layer].v_cache is None
+            rows = self._verify_rows_for(dst, is_mla)
+            self._verify_rows[req_id] = rows
+            self._verify_before[req_id] = self._verify_digest(rows)
+
+        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
+        port = int(meta.remote_handshake_port) + get_port_offset(
+            int(meta.remote_dp_rank or 0), self.tp_rank, remote_tp_size
         )
+        request = {
+            "transfer_id": self.request_id_to_transfer_id.get(req_id, meta.transfer_id),
+            "decode_req_id": req_id,
+            "decode_host": self.local_ip,
+            "decode_handshake_port": self.base_handshake_port,
+            "decode_dp_rank": self.dp_rank,
+            "decode_tp_size": self.tp_size,
+            "dst_block_ids": dst,
+            "src_block_ids": src[: len(dst)],
+        }
+        try:
+            self.moriio_wrapper.send_message(
+                [MoRIIOConstants.WRITE_REQ, msgpack.dumps(request)],
+                meta.remote_host,
+                port,
+            )
+        except Exception:
+            # Same reasoning as the read path: this runs on the busy_loop.
+            logger.exception("req %s: could not ask the producer to push KV", req_id)
+            self._verify_rows.pop(req_id, None)
+            self._verify_before.pop(req_id, None)
+            self._failed_before_read.add(req_id)
+            return
+        self._awaiting_write[req_id] = time.monotonic()
 
     def merge_contiguous_blocks(
         self,
@@ -492,6 +661,18 @@ class MoRIIOConnector(KVConnectorBase):
                     f"layer {ln}: local has {len(local_metas)} descs, "
                     f"remote has {len(remote_metas)} — chunk count mismatch"
                 )
+                # Packed descriptors carry the owning engine's key, so equal
+                # bytes mean the handshake handed back our own. Every transfer
+                # would then copy this rank onto itself and still report
+                # success.
+                if local_metas == remote_metas:
+                    logger.error(
+                        "layer %s: %s advertised descriptors byte-identical to "
+                        "ours; transfers will copy this rank's own blocks and "
+                        "the KV will never arrive",
+                        ln,
+                        remote_engine_id,
+                    )
 
                 def _unpack(packed):
                     return self.moriio_wrapper.get_unpack_memory_metadata(packed)
@@ -532,6 +713,90 @@ class MoRIIOConnector(KVConnectorBase):
             self.remote_moriio_metadata[remote_engine_id],
         )
 
+    def _verify_rows_for(self, local_block_ids: list[int], is_mla: bool) -> Any:
+        """Row indices into dim 0 covered by the given blocks.
+
+        MLA lays dim 0 out as tokens, so a block spans ``block_size`` rows;
+        every other layout indexes blocks directly.
+        """
+        import torch
+
+        first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
+        device = self.kv_caches[first_layer].k_cache.device
+        idx = torch.as_tensor(local_block_ids, dtype=torch.int64, device=device)
+        if not is_mla:
+            return idx
+        offsets = torch.arange(
+            self.kv_cache_block_size, dtype=torch.int64, device=device
+        )
+        return (idx[:, None] * self.kv_cache_block_size + offsets[None, :]).reshape(-1)
+
+    def _verify_digest(self, rows: Any) -> dict[str, int]:
+        """Position-weighted byte digest of each layer's destination rows.
+
+        Read as uint8 so the digest is dtype-agnostic, and stacked so all
+        layers cost one device sync rather than one each. Weighted because a
+        reused block still holds an earlier request's KV, and under a plain
+        byte sum new KV with the same total looks like KV that never landed.
+        """
+        import torch
+
+        names = list(self.layer_name_to_local_kv_cache_metadata)
+        sample = self.kv_caches[names[0]].k_cache
+        row_bytes = sample[0].numel() * sample.element_size()
+        # Weights stay below 2**16, so even a full 32k-token prompt sums far
+        # inside int64.
+        weights = (
+            torch.arange(
+                rows.numel() * row_bytes, dtype=torch.int64, device=sample.device
+            )
+            % 65521
+            + 1
+        )
+        sums = [
+            torch.sum(
+                self.kv_caches[name]
+                .k_cache.index_select(0, rows)
+                .view(torch.uint8)
+                .reshape(-1)
+                .to(torch.int64)
+                * weights
+            )
+            for name in names
+        ]
+        return dict(zip(names, torch.stack(sums).tolist()))
+
+    def _verify_landed(self, req_id: ReqId) -> None:
+        """Report layers whose destination never changed across the transfer."""
+        rows = self._verify_rows.pop(req_id, None)
+        before = self._verify_before.pop(req_id, None)
+        if rows is None or before is None:
+            return
+        after = self._verify_digest(rows)
+        unchanged = [name for name, value in before.items() if after[name] == value]
+        if unchanged:
+            # A digest of 0 on both sides means the destination is still the
+            # zeroed buffer; a non-zero one that did not move means an earlier
+            # request's bytes were there and the transfer left them alone.
+            logger.error(
+                "[moriio-verify] req %s: %d of %d layers unchanged after the "
+                "transfer reported done (first %s, digest %d -> %d, rows=%d) -- "
+                "decode will attend over KV that never arrived",
+                req_id,
+                len(unchanged),
+                len(before),
+                unchanged[0],
+                before[unchanged[0]],
+                after[unchanged[0]],
+                rows.numel(),
+            )
+        else:
+            logger.info(
+                "[moriio-verify] req %s: all %d layers changed",
+                req_id,
+                len(before),
+            )
+
     def _read_blocks(
         self,
         local_block_ids: list[int],
@@ -541,6 +806,7 @@ class MoRIIOConnector(KVConnectorBase):
         remote_host: str,
         remote_handshake_port: int,
         remote_dp_rank: int = 0,
+        remote_tp_size: int = 0,
     ) -> None:
         """Issue RDMA reads for all layers of a single request.
 
@@ -552,6 +818,29 @@ class MoRIIOConnector(KVConnectorBase):
         Transfer statuses are stored for later polling in
         :meth:`_pop_done_transfers`.
         """
+
+        # Checked before anything else, because _group_offsets pairs what it
+        # can and drops the rest silently. The two lists are legitimately
+        # different lengths: the producer's block table also covers the token
+        # it generated, which the consumer gets as first_token_id and does not
+        # allocate for. Extra producer blocks are therefore the normal case and
+        # the prefix pairing is what we want. Fewer is not: the consumer would
+        # be left attending over blocks nobody filled.
+        if len(remote_block_ids) < len(local_block_ids):
+            raise ValueError(
+                f"req {request_id}: {len(local_block_ids)} local blocks but "
+                f"only {len(remote_block_ids)} remote blocks; the tail of the "
+                "prompt's KV has no source"
+            )
+        if len(remote_block_ids) > len(local_block_ids):
+            logger.debug(
+                "req %s: producer offered %d blocks for %d local; pairing the "
+                "first %d",
+                request_id,
+                len(remote_block_ids),
+                len(local_block_ids),
+                len(local_block_ids),
+            )
 
         logger.debug(
             "Reading %d blocks for req %s from %s (tp_rank=%d, remote_dp_rank=%d)",
@@ -565,35 +854,22 @@ class MoRIIOConnector(KVConnectorBase):
         dp_engine_id = self._engine_name_with_dp(dst_engine_id, remote_dp_rank)
         sessions, _remote_meta = self._get_or_build_sessions(dp_engine_id)
 
-        bpc = self.blocks_per_chunk
-        first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
-        cache_tensor = self.kv_caches[first_layer].k_cache
-        is_mla = self.kv_caches[first_layer].v_cache is None
-        sz = cache_tensor.element_size()
+        is_mla, per_block_bytes = self._kv_layout()
+        groups = self._group_offsets(local_block_ids, remote_block_ids, per_block_bytes)
 
-        if is_mla:
-            per_block_bytes = self.kv_cache_block_size * cache_tensor.stride(0) * sz
-        else:
-            per_block_bytes = cache_tensor.stride(0) * sz
-
-        # Group block pairs by (local_chunk, remote_chunk)
-        groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
-        for lb, rb in zip(local_block_ids, remote_block_ids):
-            lci = lb // bpc
-            rci = rb // bpc
-            key = (lci, rci)
-            if key not in groups:
-                groups[key] = ([], [], [])
-            groups[key][0].append((lb % bpc) * per_block_bytes)
-            groups[key][1].append((rb % bpc) * per_block_bytes)
-            groups[key][2].append(per_block_bytes)
-
-        # Notify port = base handshake port + offset(remote_dp_rank, local_tp_rank)
+        # Notify port = base handshake port + offset(remote_dp_rank, local_tp_rank).
+        # Strided by the *remote* TP size, since the port belongs to the peer.
         notify_port = remote_handshake_port + get_port_offset(
-            remote_dp_rank, self.tp_rank
+            remote_dp_rank, self.tp_rank, remote_tp_size or self.tp_size
         )
 
         layer_names = list(self.layer_name_to_local_kv_cache_metadata.keys())
+
+        if self._verify_kv:
+            rows = self._verify_rows_for(local_block_ids, is_mla)
+            self._verify_rows[request_id] = rows
+            self._verify_before[request_id] = self._verify_digest(rows)
+
         for layer_idx, layer_name in enumerate(layer_names):
             k_sessions, v_sessions = sessions[layer_idx]
 
@@ -628,6 +904,295 @@ class MoRIIOConnector(KVConnectorBase):
             notify_port,
         )
 
+    def _kv_layout(self) -> tuple[bool, int]:
+        """``(is_mla, per_block_bytes)`` for the registered KV cache.
+
+        MLA lays dim 0 out as tokens, so a block spans ``block_size`` rows of
+        it; every other layout indexes blocks directly.
+        """
+        first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
+        cache_tensor = self.kv_caches[first_layer].k_cache
+        is_mla = self.kv_caches[first_layer].v_cache is None
+        rows_per_block = self.kv_cache_block_size if is_mla else 1
+        per_block_bytes = (
+            rows_per_block * cache_tensor.stride(0) * cache_tensor.element_size()
+        )
+
+        # Every layer moves with offsets derived from the first layer's stride,
+        # so a layer shaped differently would be transferred at the wrong
+        # addresses without ever failing a transfer.
+        for name in self.layer_name_to_local_kv_cache_metadata:
+            other = self.kv_caches[name].k_cache
+            if other.shape != cache_tensor.shape or other.stride() != (
+                cache_tensor.stride()
+            ):
+                raise ValueError(
+                    f"layer {name} is shaped {tuple(other.shape)}/"
+                    f"{other.stride()} but offsets come from {first_layer} "
+                    f"shaped {tuple(cache_tensor.shape)}/{cache_tensor.stride()}"
+                )
+
+        if not self._logged_layout:
+            self._logged_layout = True
+            logger.info(
+                "[moriio-layout] is_mla=%s layers=%d block_size=%d "
+                "per_block_bytes=%d blocks_per_chunk=%s k_chunks=%d shape=%s",
+                is_mla,
+                len(self.layer_name_to_local_kv_cache_metadata),
+                self.kv_cache_block_size,
+                per_block_bytes,
+                self.blocks_per_chunk,
+                self.num_k_chunks,
+                tuple(cache_tensor.shape),
+            )
+        return is_mla, per_block_bytes
+
+    def _group_offsets(
+        self,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        per_block_bytes: int,
+    ) -> dict[tuple[int, int], tuple[list[int], list[int], list[int]]]:
+        """Chunk-relative byte offsets of each block pair, grouped by chunk pair.
+
+        Pairs positionally and stops at the shorter list; callers check the
+        lengths first. Each ``(local_chunk, remote_chunk)`` group is one batch
+        on the matching session of the NxN grid. Shared by both directions, so
+        a read and a write of the same pair always touch the same bytes.
+        """
+        bpc = self.blocks_per_chunk
+        groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
+        for lb, rb in zip(local_block_ids, remote_block_ids):
+            key = (lb // bpc, rb // bpc)
+            if key not in groups:
+                groups[key] = ([], [], [])
+            groups[key][0].append((lb % bpc) * per_block_bytes)
+            groups[key][1].append((rb % bpc) * per_block_bytes)
+            groups[key][2].append(per_block_bytes)
+        return groups
+
+    def _write_blocks(self, request: dict[str, Any], engine_id: str) -> list[Any]:
+        """Push our source blocks into the consumer's; return the statuses.
+
+        The producer half of serial WRITE mode. Local here is our source and
+        remote the consumer's destination, the same positional pairing the
+        read path uses, issued from the other end.
+        """
+        dst = [int(b) for b in request["dst_block_ids"]]
+        src = [int(b) for b in request["src_block_ids"]]
+        if len(src) < len(dst):
+            raise ValueError(
+                f"transfer {request['transfer_id']}: {len(dst)} destination "
+                f"blocks but only {len(src)} source blocks"
+            )
+        sessions, _remote_meta = self._get_or_build_sessions(engine_id)
+        _is_mla, per_block_bytes = self._kv_layout()
+        groups = self._group_offsets(src[: len(dst)], dst, per_block_bytes)
+
+        statuses: list[Any] = []
+        for k_sessions, v_sessions in sessions:
+            for (lci, rci), (l_offs, r_offs, szs) in groups.items():
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        szs, l_offs, r_offs, k_sessions[(lci, rci)]
+                    )
+                )
+                if v_sessions:
+                    statuses.append(
+                        self.moriio_wrapper.write_remote_data_status(
+                            szs, l_offs, r_offs, v_sessions[(lci, rci)]
+                        )
+                    )
+        logger.debug(
+            "RDMA write issued for transfer %s: %d blocks, %d layers, %d chunk "
+            "groups to %s",
+            request["transfer_id"],
+            len(dst),
+            len(sessions),
+            len(groups),
+            engine_id,
+        )
+        return statuses
+
+    def _service_write_requests(self) -> None:
+        """Start queued pushes and report the ones that have finished.
+
+        Runs on the worker thread from ``get_finished``, which the engine keeps
+        calling while finished prefills hold deferred blocks, so a request is
+        served even when no batch is running.
+        """
+        while True:
+            try:
+                request = self._write_requests.get_nowait()
+            except queue.Empty:
+                break
+            if self._is_valid_write_request(request):
+                self._pending_writes.append((request, time.monotonic()))
+
+        waiting: list[tuple[dict[str, Any], float]] = []
+        for request, queued_at in self._pending_writes:
+            ready = self._write_target_ready(request)
+            if ready is None:
+                if time.monotonic() - queued_at > self._handshake_timeout_s:
+                    logger.error(
+                        "transfer %s: no handshake with the consumer after %.0fs",
+                        request["transfer_id"],
+                        self._handshake_timeout_s,
+                    )
+                    self._finish_write(request, ok=False)
+                else:
+                    waiting.append((request, queued_at))
+                continue
+            if not ready:
+                self._finish_write(request, ok=False)
+                continue
+            try:
+                statuses = self._write_blocks(request, self._write_engine_id(request))
+            except Exception:
+                logger.exception(
+                    "transfer %s: could not push KV to the consumer",
+                    request["transfer_id"],
+                )
+                self._finish_write(request, ok=False)
+                continue
+            self._sending_writes[int(request["transfer_id"])] = (statuses, request)
+        self._pending_writes = waiting
+
+        for transfer_id, (statuses, request) in list(self._sending_writes.items()):
+            failed = [status for status in statuses if status.Failed()]
+            if failed:
+                logger.error(
+                    "RDMA write failed for transfer %s: %d of %d transfers "
+                    "failed, first: %s (code %s)",
+                    transfer_id,
+                    len(failed),
+                    len(statuses),
+                    failed[0].Message(),
+                    failed[0].Code(),
+                )
+                self._finish_write(request, ok=False)
+            elif all(status.Succeeded() for status in statuses):
+                self._finish_write(request, ok=True)
+
+    @staticmethod
+    def _is_valid_write_request(request: Any) -> bool:
+        """Whether a WRITE_REQ has every field the push and its report need.
+
+        Checked on dequeue because the fields are indexed and cast on the
+        worker thread, where one bad request would take down the rank. A
+        malformed one names nothing that could be released or answered, so it
+        is dropped.
+        """
+        try:
+            int(request["transfer_id"])
+            int(request["decode_handshake_port"])
+            int(request.get("decode_dp_rank", 0))
+            int(request.get("decode_tp_size") or 0)
+            valid = (
+                "decode_req_id" in request
+                and isinstance(request["decode_host"], str)
+                and isinstance(request["dst_block_ids"], list)
+                and isinstance(request["src_block_ids"], list)
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            logger.error(
+                "Dropping malformed WRITE_REQ with fields %s",
+                sorted(request) if isinstance(request, dict) else type(request),
+            )
+        return valid
+
+    @classmethod
+    def _write_engine_id(cls, request: dict[str, Any]) -> str:
+        """The dp-suffixed id the consumer's sessions are cached under."""
+        return cls._engine_name_with_dp(
+            f"{request['decode_host']}:{request['decode_handshake_port']}",
+            int(request.get("decode_dp_rank", 0)),
+        )
+
+    def _write_target_ready(self, request: dict[str, Any]) -> bool | None:
+        """Whether we can write to this consumer yet: True, False, or None.
+
+        None means the handshake is still running. It runs on the handshake
+        executor rather than here, so an unreachable consumer cannot freeze
+        this rank's worker loop.
+        """
+        engine_id = self._write_engine_id(request)
+        with self._handshake_lock:
+            if engine_id in self._remote_agents:
+                return True
+            future = self._write_handshakes.get(engine_id)
+            if future is None:
+                future = self._handshake_executor.submit(
+                    self._execute_handshake,
+                    request["decode_host"],
+                    int(request["decode_handshake_port"]),
+                    int(request.get("decode_tp_size") or self.tp_size),
+                    engine_id,
+                    int(request.get("decode_dp_rank", 0)),
+                )
+                self._write_handshakes[engine_id] = future
+            if not future.done():
+                return None
+            # Dropped either way: success is recorded in _remote_agents, and a
+            # failure should be retried by the next request, not cached.
+            del self._write_handshakes[engine_id]
+            try:
+                self._remote_agents[engine_id] = future.result()
+            except Exception:
+                logger.exception("Handshake with consumer %s failed", engine_id)
+                return False
+            return True
+
+    def _finish_write(self, request: dict[str, Any], ok: bool) -> None:
+        """Release the source blocks and tell the consumer how the push went."""
+        transfer_id = int(request["transfer_id"])
+        self._sending_writes.pop(transfer_id, None)
+        # Released whatever happened: a consumer told the push failed has no
+        # reason to come back for these blocks.
+        self.done_sending.add(transfer_id)
+        port = int(request["decode_handshake_port"]) + get_port_offset(
+            int(request.get("decode_dp_rank", 0)),
+            self.tp_rank,
+            int(request.get("decode_tp_size") or self.tp_size),
+        )
+        report = {"decode_req_id": request["decode_req_id"], "ok": ok}
+        try:
+            self.moriio_wrapper.send_message(
+                [MoRIIOConstants.WRITE_DONE, msgpack.dumps(report)],
+                request["decode_host"],
+                port,
+            )
+        except Exception:
+            logger.exception(
+                "transfer %s: could not report the push to the consumer", transfer_id
+            )
+
+    def _collect_write_reports(
+        self, done_recving: set[ReqId], failed_recving: set[ReqId]
+    ) -> None:
+        """Move producer reports, and pushes that never got one, into the sets."""
+        with self._write_reports_lock:
+            reports, self._write_reports = self._write_reports, {}
+        for req_id, ok in reports.items():
+            if self._awaiting_write.pop(req_id, None) is None:
+                logger.warning("Write report for req %s, which is not waiting", req_id)
+                continue
+            (done_recving if ok else failed_recving).add(req_id)
+
+        now = time.monotonic()
+        for req_id, asked_at in list(self._awaiting_write.items()):
+            if now - asked_at > self._write_timeout_s:
+                logger.error(
+                    "req %s: no report from the producer %.0fs after asking it "
+                    "to push KV",
+                    req_id,
+                    self._write_timeout_s,
+                )
+                del self._awaiting_write[req_id]
+                failed_recving.add(req_id)
+
     def _handshake_listener(
         self,
         metadata: MoRIIOAgentMetadata,
@@ -639,9 +1204,11 @@ class MoRIIOConnector(KVConnectorBase):
     ) -> None:
         """Background thread that serves metadata to incoming handshake requests.
 
-        Handles two message types:
+        Handles four message types:
         - ``GET_META_MSG``: Responds with engine + per-layer KV cache metadata.
         - ``POP_DONE_RECV``: Records that the consumer finished reading the request.
+        - ``WRITE_REQ`` (producer): queues a consumer's request for a push.
+        - ``WRITE_DONE`` (consumer): records the producer's report on a push.
         """
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(metadata)
@@ -673,6 +1240,25 @@ class MoRIIOConnector(KVConnectorBase):
                         "Handshake listener: consumer finished reading req %d", req_id
                     )
 
+                # A bad write frame is logged and dropped rather than raised:
+                # this thread also serves every other peer's handshake.
+                elif msg == MoRIIOConstants.WRITE_REQ:
+                    # Only queued; the worker thread owns the RDMA engine.
+                    try:
+                        self._write_requests.put(msgpack.loads(parts[2]))
+                    except Exception:
+                        logger.exception("Dropping undecodable WRITE_REQ")
+
+                elif msg == MoRIIOConstants.WRITE_DONE:
+                    try:
+                        report = msgpack.loads(parts[2])
+                        req_id, ok = report["decode_req_id"], bool(report["ok"])
+                    except Exception:
+                        logger.exception("Dropping undecodable WRITE_DONE")
+                        continue
+                    with self._write_reports_lock:
+                        self._write_reports[req_id] = ok
+
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
                     raise ValueError(f"Unexpected handshake message: {msg!r}")
@@ -696,7 +1282,9 @@ class MoRIIOConnector(KVConnectorBase):
         start_time = time.perf_counter()
 
         # Each (dp, tp) rank uses a unique port offset
-        port_offset = get_port_offset(remote_dp_rank, self.tp_rank)
+        port_offset = get_port_offset(
+            remote_dp_rank, self.tp_rank, remote_tp_size or self.tp_size
+        )
         path = make_zmq_path("tcp", host, port + port_offset)
         logger.info("Initiating handshake on %s", path)
 
@@ -783,8 +1371,6 @@ class MoRIIOConnector(KVConnectorBase):
         def _on_all_done(_f: Future[Any], entry=(req_id, meta)):
             logger.debug("All handshakes completed for req %s", req_id)
             self._ready_requests.put(entry)
-            self.load_ready_flag[remote_engine_id] = True
-            self.write_ready_flags[remote_engine_id] = True
 
         futures: list[Future[set[str]]] = []
 
@@ -815,36 +1401,74 @@ class MoRIIOConnector(KVConnectorBase):
         all_done_future = self._handshake_executor.submit(_wait_all)
         all_done_future.add_done_callback(_on_all_done)
 
-    def _pop_done_transfers(self) -> set[str]:
+    def _pop_done_transfers(self) -> tuple[set[str], set[str]]:
+        """Return the (done, failed) receive request IDs.
+
+        ``_read_blocks`` issues one ``batch_read`` per (layer, chunk group) and
+        each carries its own transfer uid, so they complete in any order. A
+        request is done only once every one of them has succeeded; the last
+        one issued finishing says nothing about the others.
+        """
         done_req_ids: set[str] = set()
+        failed_req_ids: set[str] = set()
         with self.moriio_wrapper.lock:
             to_remove = []
             for req_id, status_list in self._recving_transfers.items():
-                if status_list[-1].Succeeded():
-                    done_req_ids.add(req_id)
-                    # the Decode req_id(request_id) ,Prefill req_id(transfer_id)
-                    # so we need to use transfer_id to send notify
-                    self.moriio_wrapper.send_notify(
-                        self.request_id_to_transfer_id[req_id],
-                        self._recving_transfers_callback_addr[req_id][0],
-                        self._recving_transfers_callback_addr[req_id][1],
+                failed = [status for status in status_list if status.Failed()]
+                if failed:
+                    logger.error(
+                        "RDMA read failed for req %s: %d of %d transfers "
+                        "failed, first: %s (code %s)",
+                        req_id,
+                        len(failed),
+                        len(status_list),
+                        failed[0].Message(),
+                        failed[0].Code(),
                     )
-                    to_remove.append(req_id)
+                    failed_req_ids.add(req_id)
+                elif not all(status.Succeeded() for status in status_list):
+                    continue
+                else:
+                    done_req_ids.add(req_id)
+                # Notify either way: the producer holds the source blocks until
+                # it hears back, so a dropped notify leaks them for the run.
+                # the Decode req_id(request_id) ,Prefill req_id(transfer_id)
+                # so we need to use transfer_id to send notify
+                self.moriio_wrapper.send_notify(
+                    self.request_id_to_transfer_id[req_id],
+                    self._recving_transfers_callback_addr[req_id][0],
+                    self._recving_transfers_callback_addr[req_id][1],
+                )
+                to_remove.append(req_id)
             for req_id in to_remove:
                 del self._recving_transfers[req_id]
                 del self._recving_transfers_callback_addr[req_id]
 
-            return done_req_ids
+            return done_req_ids, failed_req_ids
 
-    def get_finished(self) -> tuple[set[int], set[str]]:
-        """Return the sets of finished sending and receiving request IDs.
+    def get_finished(self) -> KVConnectorOutput:
+        """Return the finished sending, receiving, and failed request IDs.
 
         Called by the worker each step via ``async_proc_aggregation``.
-
-        Returns:
-            ``(done_sending, done_recving)`` tuple.
         """
-        done_recving = self._pop_done_transfers()
+        if self.is_producer:
+            # Before done_sending is read below, so a push that finishes this
+            # step releases its blocks this step.
+            self._service_write_requests()
+        done_recving, failed_recving = self._pop_done_transfers()
+        if self._awaiting_write or self._write_reports:
+            self._collect_write_reports(done_recving, failed_recving)
+        if self._failed_before_read:
+            failed_recving |= self._failed_before_read
+            self._failed_before_read = set()
+        if self._verify_kv:
+            # Outside _pop_done_transfers so the digests stay off the path
+            # that holds the wrapper lock.
+            for req_id in done_recving:
+                self._verify_landed(req_id)
+            for req_id in failed_recving:
+                self._verify_rows.pop(req_id, None)
+                self._verify_before.pop(req_id, None)
         if self.is_producer:
             done_sending = self.done_sending.copy()
             self.done_sending.clear()
@@ -858,7 +1482,11 @@ class MoRIIOConnector(KVConnectorBase):
                 )
                 self.done_sending.clear()
             done_sending = set()
-        return done_sending, done_recving
+        return KVConnectorOutput(
+            finished_sending=done_sending,
+            finished_recving=done_recving,
+            failed_recving=failed_recving,
+        )
 
 
 # ===================================================================

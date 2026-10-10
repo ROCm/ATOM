@@ -114,6 +114,29 @@ ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
+
+# Catalog paths name the Hugging Face org (<root>/<org>/<model>), but some
+# clusters keep the same weights flat under <root>/<model>.
+resolve_model_path() {
+  local path="$1"
+  local trimmed="${path%/}"
+  if [[ "${trimmed}" != /* || -e "${trimmed}" ]]; then
+    printf '%s' "${path}"
+    return 0
+  fi
+  local flat
+  flat="$(dirname -- "$(dirname -- "${trimmed}")")"
+  flat="${flat%/}/$(basename -- "${trimmed}")"
+  if [[ -e "${flat}" ]]; then
+    echo "[paths] ${path} not found; using ${flat}" >&2
+    printf '%s' "${flat}"
+  else
+    printf '%s' "${path}"
+  fi
+}
+MODEL_PATH="$(resolve_model_path "${MODEL_PATH}")"
+DRAFT_MODEL_PATH="$(resolve_model_path "${DRAFT_MODEL_PATH}")"
+
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-}"
 SPEC_DECODE_ACCEPTANCE_LENGTH="${SPEC_DECODE_ACCEPTANCE_LENGTH:-}"
 STATE_CHECKPOINT_INTERVAL_TOKENS="${STATE_CHECKPOINT_INTERVAL_TOKENS:-}"
@@ -287,6 +310,57 @@ apply_role_env() {
   apply_prefixed_env "${prefix}" "${role_ip}"
 }
 
+# KV_CONNECTOR (env.common) picks the connector of the built-in kv-transfer
+# configs. MoRI IO advertises get_ip(), which falls back to the default-route
+# address, so pin it to the address the router and the peer role dial.
+prepare_kv_connector() {
+  case "${KV_CONNECTOR:-mooncake}" in
+    mooncake) ;;
+    moriio)
+      export ATOM_HOST_IP="${ATOM_HOST_IP:-${host_ip}}"
+      python3 - <<'PY' || true
+import importlib.metadata as md
+
+for dist in ("amd-mori-nightly", "amd-mori", "mori"):
+    try:
+        print(f"[kv] moriio with {dist} {md.version(dist)}")
+        break
+    except md.PackageNotFoundError:
+        continue
+else:
+    print("[kv] moriio: no MoRI distribution metadata found")
+PY
+      ;;
+    *)
+      echo "ERROR: unsupported KV_CONNECTOR=${KV_CONNECTOR} (expected mooncake or moriio)" >&2
+      return 2
+      ;;
+  esac
+}
+
+# A role's catalog JSON wins over the built-in config, but must not name a
+# different connector than an explicit KV_CONNECTOR.
+kv_transfer_config() {
+  local role="$1"
+  local override="$2"
+  local ip="$3"
+  local port="$4"
+  if [[ -z "${override}" ]]; then
+    printf '{"kv_role":"%s","kv_connector":"%s","proxy_ip":"%s","handshake_port":%s}' \
+      "${role}" "${KV_CONNECTOR:-mooncake}" "${ip}" "${port}"
+    return 0
+  fi
+  if [[ -n "${KV_CONNECTOR:-}" ]]; then
+    local named
+    named="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("kv_connector", ""))' "${override}")" || return 2
+    if [[ "${named}" != "${KV_CONNECTOR}" ]]; then
+      echo "ERROR: KV_CONNECTOR=${KV_CONNECTOR} but the ${role} kv-transfer-config names '${named}'" >&2
+      return 2
+    fi
+  fi
+  printf '%s' "${override}"
+}
+
 host_ip="$(echo "${IPADDRS}" | tr ',' '\n' | sed -n "$((NODE_RANK + 1))p")"
 if [[ -z "${host_ip}" ]]; then
   host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -294,6 +368,7 @@ fi
 host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
+prepare_kv_connector || exit 2
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
 if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
@@ -753,11 +828,7 @@ start_prefill() {
     )
   fi
   local prefill_kv_transfer_config
-  if [[ -n "${PREFILL_KV_TRANSFER_CONFIG}" ]]; then
-    prefill_kv_transfer_config="${PREFILL_KV_TRANSFER_CONFIG}"
-  else
-    prefill_kv_transfer_config="{\"kv_role\":\"kv_producer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -809,11 +880,7 @@ start_decode() {
     )
   fi
   local decode_kv_transfer_config
-  if [[ -n "${DECODE_KV_TRANSFER_CONFIG}" ]]; then
-    decode_kv_transfer_config="${DECODE_KV_TRANSFER_CONFIG}"
-  else
-    decode_kv_transfer_config="{\"kv_role\":\"kv_consumer\",\"kv_connector\":\"mooncake\",\"proxy_ip\":\"${host_ip}\",\"handshake_port\":${handshake_port}}"
-  fi
+  decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -1242,13 +1309,14 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 result_dir = Path(sys.argv[1])
 eval_conc = sys.argv[2]
+threshold = sys.argv[3]
 json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
 if not json_files:
     print("[eval] ERROR: no result JSON found")
@@ -1265,6 +1333,16 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+if threshold:
+    if not isinstance(score, (int, float)) or score < float(threshold):
+        raise SystemExit(
+            f"[eval] FAIL: concurrent={eval_conc} gsm8k score {score} "
+            f"is below threshold {float(threshold):.4f}"
+        )
+    print(
+        f"[eval] PASS: concurrent={eval_conc} gsm8k score {score:.4f} "
+        f">= threshold {float(threshold):.4f}"
+    )
 PY
   done
 
