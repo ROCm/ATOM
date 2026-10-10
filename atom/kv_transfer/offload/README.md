@@ -515,9 +515,7 @@ python -m atom.entrypoints.openai_server --model <model> --kv-cache-dtype fp8 ..
 
 The atomesh launcher (`MOONCAKE_STORE=1`, `.github/scripts/atomesh/pd_server_atom.sh`)
 starts the masters and owners, sizes and binds them to NUMA nodes, and builds
-this worker config. It checks a case's own connector keys
-(`MOONCAKE_STORE_CONNECTOR_CONFIG`) against this table and their types before
-it starts anything.
+this worker config.
 
 ### Deployment notes
 
