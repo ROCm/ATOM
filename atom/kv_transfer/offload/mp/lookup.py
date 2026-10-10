@@ -76,9 +76,9 @@ class _MPLookupClient:
     # A lookup costs a blocking round trip on the scheduler thread (the server
     # hashes the whole prompt before it answers). `submit` sends it while the
     # request still waits; `pump` advances it without blocking. Either way the
-    # answer lands in the adapter's own result cache, so the synchronous
-    # `lookup` that later consumes it returns at once and every lock
-    # lifecycle after that is unchanged.
+    # answered hit is kept in `_async_hits`, so the synchronous `lookup` that
+    # later consumes it returns at once, and `discard` can still free its
+    # locks after the adapter's result cache was cleaned up.
 
     def submit(self, token_ids: list[int], lookup_id: str) -> bool:
         """Send this request's lookup without waiting. False if not sent."""
@@ -125,12 +125,7 @@ class _MPLookupClient:
             return self._advance(lookup_id)
         except Exception:
             # Let the synchronous path ask again and surface the error there.
-            logger.warning(
-                "LMCache MP async lookup failed for request %s; asking again",
-                lookup_id,
-                exc_info=True,
-            )
-            self._async.pop(lookup_id, None)
+            self._drop_failed(lookup_id)
             return True
 
     def pending_ids(self):
@@ -169,16 +164,26 @@ class _MPLookupClient:
             try:
                 answered = self._advance(lookup_id)
             except Exception:
-                logger.warning(
-                    "LMCache MP async lookup failed for request %s",
-                    lookup_id,
-                    exc_info=True,
-                )
-                self._async.pop(lookup_id, None)
+                self._drop_failed(lookup_id)
                 continue
             if answered and lookup_id in self._orphans:
                 self._orphans.discard(lookup_id)
                 self._release_unconsumed(lookup_id)
+
+    def _drop_failed(self, lookup_id: str) -> None:
+        """Forget an async lookup that raised; call from its except block.
+
+        Its hit is unknown, so read locks the server may already hold for it
+        cannot be freed here and expire only with the L1 read TTL.
+        """
+        entry = self._async.pop(lookup_id, None)
+        logger.warning(
+            "LMCache MP async lookup failed for request %s in phase %s; "
+            "read locks it may hold are left to the read TTL",
+            lookup_id,
+            entry[2] if entry is not None else None,
+            exc_info=True,
+        )
 
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)
@@ -216,7 +221,7 @@ class _MPLookupClient:
                     if self._advance(lookup_id):
                         break
                 except Exception:
-                    self._async.pop(lookup_id, None)
+                    self._drop_failed(lookup_id)
                     raise
                 if time.monotonic() >= deadline:
                     logger.warning(

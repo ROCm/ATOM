@@ -251,3 +251,22 @@ def test_answered_lookup_survives_status_cleanup(monkeypatch):
     assert client.lookup(list(range(8)), "req") == 2 * CHUNK
     assert len(fake.lookups) == 1
     assert adapter.freed == []
+
+
+class _RaisingFuture(_Future):
+    def result(self, timeout=None):
+        raise RuntimeError("status query failed")
+
+
+def test_failed_lookup_warns_its_locks_are_left_to_the_ttl(caplog):
+    fake = _Client(chunks=2)
+    fake.query_prefetch_status = lambda _rid: _RaisingFuture()
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+    client.submit(list(range(8)), "req")
+
+    with caplog.at_level("WARNING", logger=mp_lookup.logger.name):
+        client.pump()
+
+    assert not client.is_pending("req")
+    assert "read TTL" in caplog.text and "phase status" in caplog.text

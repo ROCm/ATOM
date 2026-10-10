@@ -27,7 +27,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
-from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -274,7 +274,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # to the head before admission sets `offload_loaded`.
             if getattr(seq, "status", None) == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 continue
-            if self._resumes_without_match(seq):
+            if resumes_offload_prefill(seq):
                 continue
             if self._lookup_len(seq) <= 0:
                 continue
@@ -282,18 +282,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if submit(self._lookup_token_ids(seq), sid):
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
-
-    @staticmethod
-    def _resumes_without_match(seq) -> bool:
-        """Mirror of `Scheduler._is_offload_prefill_resume`.
-
-        Such a request skips `get_num_new_matched_tokens`, so a lookup sent
-        for it is never consumed and only holds read locks.
-        """
-        return bool(
-            getattr(seq, "offload_loaded", False)
-            or getattr(seq, "offload_load_failed", False)
-        ) and len(seq.block_table) > 0
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.

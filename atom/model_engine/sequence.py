@@ -160,6 +160,20 @@ def get_exit_sequence():
     return exit_seq
 
 
+def resumes_offload_prefill(seq) -> bool:
+    """True when an offload load already settled and `seq` keeps its blocks.
+
+    Such a request resumes its suffix prefill without matching the prefix
+    again. Shared by the scheduler's admission and the offload connector's
+    lookup prefetch, which must agree: a lookup sent for a request that skips
+    the match is never consumed and only holds read locks.
+    """
+    return (
+        getattr(seq, "offload_loaded", False)
+        or getattr(seq, "offload_load_failed", False)
+    ) and len(seq.block_table) > 0
+
+
 @dataclass
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
