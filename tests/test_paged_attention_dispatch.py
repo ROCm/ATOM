@@ -691,10 +691,9 @@ class TestWorkPlanWiring:
     def test_plans_are_only_minted_during_capture(self, monkeypatch):
         """The metadata builder never allocates a plan for an uncaptured batch.
 
-        aiter's planner takes batch as a tl.constexpr, so a new value costs a
-        kernel specialization -- 65-72 ms cold -- and a plan that can never be
-        freed, since some captured graph may have baked its pointers in.
-        Minting one mid-serving would be a stall for a batch no graph replays.
+        Its plans are captured into graphs and never freed, so the builder only
+        mints them at capture; an uncaptured batch gets a runtime plan in
+        run_pa_decode instead.
         """
         from atom.model_ops.attentions import aiter_attention as aa
 
@@ -861,8 +860,7 @@ class TestWorkPlanWiring:
 
         src = inspect.getsource(ba.run_pa_decode)
         assert (
-            "flydsl_enabled = envs.ATOM_PA_FLYDSL\n" in src
-            and "flydsl_enabled and _flydsl_pa_decode_num_seqs" in src
+            "flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src
         ), "the env gate is gone, or no longer short-circuits the capability check"
 
     def test_lengths_aiter_would_reject_build_no_plan(self, monkeypatch):

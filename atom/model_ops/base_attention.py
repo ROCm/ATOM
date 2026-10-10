@@ -499,8 +499,7 @@ def run_pa_decode(
     validation so an unsupported shape falls back here instead of raising
     inside aiter.
     """
-    flydsl_enabled = envs.ATOM_PA_FLYDSL
-    flydsl_seqs = flydsl_enabled and _flydsl_pa_decode_num_seqs(
+    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
         output=output,
         q=q,
         k_cache=k_cache,
