@@ -761,6 +761,7 @@ class GemmaRMSNorm(nn.Module):
         eps: float = 1e-6,
         quant_config: LayerQuantConfig | None = None,
         write_bf16: bool = False,
+        fused_allreduce: bool = False,
     ) -> None:
         super().__init__()
         self.weight = atom_parameter(torch.zeros(hidden_size))
@@ -772,6 +773,23 @@ class GemmaRMSNorm(nn.Module):
 
             if quant_config.quant_type == QuantType.per_1x128:
                 self.use_fused_quant = True
+        # Fold the TP all-reduce of the input (the un-reduced output of the
+        # previous row-parallel layer) into this norm.
+        self.fused_allreduce = (
+            fused_allreduce and get_tensor_model_parallel_world_size() > 1
+        )
+        if self.fused_allreduce:
+            # aiter's fused AR + RMSNorm + per-group quant kernels only do
+            # x * w, so feed them the precomputed Gemma weight (1 + w) and run
+            # the plain-RMSNorm epilogue. Filled in process_weights_after_loading;
+            # a fixed buffer keeps the storage stable for CUDA graphs.
+            self.register_buffer(
+                "gemma_weight", torch.ones_like(self.weight.data), persistent=False
+            )
+
+    def process_weights_after_loading(self):
+        if self.fused_allreduce:
+            self.gemma_weight.copy_(self.weight.data.float() + 1.0)
 
     @staticmethod
     def forward_static(
@@ -889,11 +907,37 @@ class GemmaRMSNorm(nn.Module):
             return out_fp8, out_scale, out_bf16, res_out
         return out_fp8, out_scale, out_bf16
 
+    def _forward_fused_allreduce(self, x, residual):
+        # Same return contracts as _forward_fused_fp8 / forward_cuda.
+        if self.use_fused_quant:
+            outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                x.contiguous(),
+                residual,
+                self.gemma_weight,
+                self.variance_epsilon,
+                quant_type="per_group",
+                group_size=128,
+                emit_bf16=self.write_bf16,
+                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+            )
+            out_fp8, res_out, out_scale = outs[:3]
+            out_bf16 = outs[3] if self.write_bf16 else None
+            return out_fp8, out_scale, out_bf16, res_out
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x.contiguous(),
+            residual,
+            self.gemma_weight,
+            self.variance_epsilon,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.fused_allreduce:
+            assert residual is not None, "fused all-reduce norm needs a residual"
+            return self._forward_fused_allreduce(x, residual)
         if self.use_fused_quant:
             return self._forward_fused_fp8(x, residual)
         return self.forward_cuda(x, residual)

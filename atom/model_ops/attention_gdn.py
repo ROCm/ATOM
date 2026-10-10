@@ -384,6 +384,12 @@ class GatedDeltaNet(nn.Module):
                 # rejected drafts of the previous step are undone simply by
                 # `write_pos` never having advanced past them.
                 nsd = gdn_metadata.num_spec_decodes
+                # Pure spec-decode batch: the spec tokens are exactly the
+                # first num_actual_tokens rows, so write straight into the
+                # result and skip the merge copy below.
+                spec_only = (
+                    gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0
+                )
                 core_attn_out_spec = replayssm_gated_delta_rule(
                     q=query_spec,
                     k=key_spec,
@@ -401,6 +407,7 @@ class GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
+                    o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
                 )
                 last_recurrent_state = None
             else:
@@ -623,7 +630,8 @@ class GatedDeltaNet(nn.Module):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
