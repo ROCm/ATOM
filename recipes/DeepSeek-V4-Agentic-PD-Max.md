@@ -339,16 +339,25 @@ atomesh launch --host 0.0.0.0 --port 8000 --pd-disaggregation \
 
 The commands below use concurrency 256 on both server nodes and the client.
 Replace `10.0.0.1` and `10.0.0.2` with the prefill and decode IPs
-in both the server and router commands. Prefill uses TBO and the tuned CPU
-offload tier; decode uses plain Mooncake without TBO or CPU offload.
+in both the server and router commands. Prefill uses EP8, Mega, EPLB and
+LMCache MP; decode uses plain Mooncake without EP or CPU offload. TBO is off
+on both nodes.
 Decode captures every per-rank batch size from 1 through `CONC / 4`
 (1–64 at concurrency 256); prefill uses default graph sizes.
 
-`lmcache.max_local_cpu_size` is **per worker**: 8 workers × 128 GiB = 1,024 GiB
-for the CPU cache. Ensure at least **1,280 GiB of available host memory** before
-startup, including 256 GiB of headroom. Check `psutil.virtual_memory().available`
-against `(8 * size + 256) * 1024**3` bytes, where `size` is the per-worker cache
-size in GiB.
+Start one LMCache MP server in a separate shell in the same container or
+network namespace as prefill. Its lazy L1 cache is shared by all eight P ranks;
+`--l1-size-gb 1000` is a node-wide limit. Provision that much available host
+RAM plus engine and transfer-buffer headroom, or reduce the limit.
+
+```bash
+lmcache server --host 127.0.0.1 --port 5555 \
+  --chunk-size 256 --null-block-id -1 \
+  --separate-object-groups --supported-transfer-mode lmcache_driven \
+  --l1-size-gb 1000 --l1-use-lazy --l1-read-ttl-seconds 900 \
+  --eviction-policy LRU --eviction-trigger-watermark 0.98 \
+  --http-host 127.0.0.1 --http-port 19555
+```
 
 ### Prefill node
 
@@ -386,13 +395,25 @@ export GPU_MAX_HW_QUEUES=5
 export PYTHONHASHSEED=0                  # Consistent LMCache hashes across processes
 export OFFLOAD_COPY_WORKERS=1
 export OFFLOAD_MIN_LOAD_TOKENS=8192
-export OFFLOAD_SLOT_STAGING_SLOTS=4
+export OFFLOAD_MIN_SAVE_TOKENS=8192
+export OFFLOAD_MAX_PENDING_SAVES=8
+export ATOM_KV_OFFLOAD=lmcache_mp
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5555,"lmcache.mp.tp_rank_collapse":true}'
+export LMCACHE_CHUNK_SIZE=256
+
+export MORI_SHMEM_HEAP_SIZE=16G
+export ATOM_MEGA_MASK_PAD_ROWS=1
+export ATOM_MEGA_DECODE_MTPR=512
+export AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023
+export ATOM_EPLB_MAX_REBALANCES=4
 
 python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --served-model-name deepseek-ai/DeepSeek-V4-Pro \
   --host 0.0.0.0 --server-port 8010 \
   --tensor-parallel-size 8 \
-  --enable-dp-attention --enable-tbo \
+  --enable-dp-attention --enable-expert-parallel \
+  --all2all-backend high-throughput --moe-backend mega \
+  --enable-eplb --eplb-config '{"load_window_size":100,"rebalance_interval":200}' \
   --kv-cache-dtype fp8 --index-cache-dtype fp4 \
   --enable-prefix-caching \
   --max-num-seqs $(( CONC * 2 )) \
@@ -402,35 +423,11 @@ python3 -u -m atom.entrypoints.openai_server \
   --method dspark --num-speculative-tokens 3 \
   --spec-decode-acceptance-length 3.01 \
   --kv-transfer-config '{
-    "kv_connector": "multi",
-    "connectors": [
-      {
-        "kv_role": "kv_producer",
-        "kv_connector": "mooncake",
-        "proxy_ip": "10.0.0.1",
-        "handshake_port": 6301,
-        "protocol": "rdma"
-      },
-      {
-        "kv_connector": "lmcache_offload",
-        "kv_role": "offload",
-        "offload_layout": "hybrid",
-        "max_pending_saves": 8,
-        "slot_sidecar_staging_slots": 4,
-        "lmcache.local_cpu": true,
-        "lmcache.max_local_cpu_size": 128,
-        "lmcache.local_disk": null,
-        "lmcache.max_local_disk_size": 0,
-        "lmcache.remote_url": null,
-        "lmcache.chunk_size": 256,
-        "lmcache.cache_policy": "LRU",
-        "lmcache.lookup_server_worker_ids": [],
-        "lmcache.store_location": "LocalCPUBackend",
-        "lmcache.retrieve_locations": [
-          "LocalCPUBackend"
-        ]
-      }
-    ]
+    "kv_role": "kv_producer",
+    "kv_connector": "mooncake",
+    "proxy_ip": "10.0.0.1",
+    "handshake_port": 6301,
+    "protocol": "rdma"
   }'
 ```
 
@@ -526,9 +523,9 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --public-dataset semianalysis_cc_traces_weka_062126
 ```
 
-Host memory: the eight workers use 1,024 GiB for the CPU cache. The prefill
-node needs at least **1,280 GiB of available host memory** before startup,
-including 256 GiB of headroom.
+MP uses the shared CPU limit configured above. The legacy
+`lmcache_offload` SLOT-sidecar tuning and measurements below do not apply
+to this native-state MP configuration.
 
 ## The offload settings that matter
 

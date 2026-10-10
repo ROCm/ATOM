@@ -35,6 +35,7 @@ from atom.models.deepseek_v41.mono.check import (
     check_moe,
     check_post,
     check_selection,
+    decode_keys,
 )
 from atom.models.deepseek_v41.mono.config import MAX_ROWS
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
@@ -435,7 +436,7 @@ class V41MonoDecodeRunner:
                 if block.attn.indexer is not None:
                     check_selection(self, spec, step)
                 # the original index build, for the reference attention alone
-                keys = cache.attention_indices(spec, step)[:2]
+                keys = decode_keys(cache, spec, step)
                 check_post(self, block, keys, residual, gates, rope, cache, step)
                 self._moe(spec.layer_id, weights)
                 check_moe(self, block)

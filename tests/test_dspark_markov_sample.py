@@ -128,3 +128,64 @@ def test_fused_reads_and_writes_the_strided_columns_it_is_given(dtype):
         embed = dspark_markov_argmax(base, prev, w1, w2, out_ids[:, k + 1])
         assert torch.equal(embed, ref_embed), k
         assert torch.equal(out_ids[:, k + 1], ref_ids), k
+
+
+class _TpGroup:
+    """`dspark_markov_argmax_tp`'s group, over shards run one after another:
+    `all_gather` returns every shard's `(max, id)` pack, rank order."""
+
+    def __init__(self, packs):
+        self.world_size = len(packs)
+        self._packs = packs
+
+    def all_gather(self, packed, dim, use_custom):
+        assert dim == 0
+        return torch.cat(self._packs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 32, 160])
+def test_sharded_sampling_matches_the_whole_vocab(tp, rows):
+    """Each rank's `(max, id)` over its vocab shard, reduced across ranks, is
+    the whole-vocab op's id and gathered row, bit for bit -- including a
+    maximum tied across two shards, where the lower id must win."""
+    from atom.model_ops.dspark_markov_sample import _launch, dspark_markov_argmax_tp
+
+    vocab, rank = 129280, 256
+    base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
+    w1, w2 = w1 * 0.05, w2 * 0.05
+    # an exact tie between ids in the first and last shard: same base logit,
+    # same Markov column, so the same biased logit -- the lower id must win
+    base[0, 1000] = base[0, vocab - 7] = 80.0
+    w2[vocab - 7] = w2[1000]
+    ref = _ids(rows, "cuda", torch.int32)
+    ref_embed = dspark_markov_argmax(base, prev, w1, w2, ref)
+    assert ref[0].item() == 1000
+    shard = vocab // tp
+    packs = []
+    for r in range(tp):
+        packed = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
+        _launch(
+            base[:, r * shard : (r + 1) * shard],
+            prev,
+            w1,
+            w2,
+            ref,
+            r * shard,
+            packed,
+        )
+        packs.append(packed)
+    for r in range(tp):
+        out = _ids(rows, "cuda", torch.int32)
+        embed = dspark_markov_argmax_tp(
+            base[:, r * shard : (r + 1) * shard],
+            prev,
+            w1,
+            w2,
+            out,
+            r * shard,
+            _TpGroup(packs),
+        )
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        torch.testing.assert_close(embed, ref_embed, rtol=0, atol=0)

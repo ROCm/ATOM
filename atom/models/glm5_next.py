@@ -645,7 +645,7 @@ class Glm5NextIndexer(Indexer):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor:
+    ) -> None:
         from atom.utils.forward_context import get_forward_context
 
         forward_context = get_forward_context()
@@ -720,7 +720,7 @@ class Glm5NextIndexer(Indexer):
                 )
             if state_slot_idx_in is None:
                 state_slot_idx_in = state_slot_idx
-            out = torch.ops.aiter.sparse_attn_indexer_kpool(
+            torch.ops.aiter.sparse_attn_indexer_kpool(
                 hidden_states,
                 self.k_cache.kv_cache[0],
                 q_fp8,
@@ -743,9 +743,9 @@ class Glm5NextIndexer(Indexer):
                 self.scale_fmt,
                 self.stable_topk,
             )
-            return out
+            return
 
-        out = self.sparse_attn_indexer_impl(
+        self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -774,7 +774,6 @@ class Glm5NextIndexer(Indexer):
             False,
             self.stable_topk,
         )
-        return out
 
 
 class _ZeroRopePad:
