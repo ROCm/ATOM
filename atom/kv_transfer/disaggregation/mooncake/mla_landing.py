@@ -13,8 +13,12 @@ into its paged KV cache.
 
 Protocol, per decode rank (every rank has its own pool and connector):
 
-1. The rank splits its pool into one partition per prefill stage endpoint and
-   advertises the stage's partition in every ``write_request``
+1. On first contact the rank gives a prefill stage endpoint a partition of
+   ``pool_slots // pp_size`` slots (``pp_size`` is the prefill's), first
+   come, first served, and never takes it back while the decode runs. With
+   several prefill instances per decode rank, a later one may get fewer
+   slots, or none and keep the staged path. The rank advertises the stage's
+   partition in every ``write_request``
    (``mla_landing = {epoch, base, slot_bytes, slots}``).
 2. The stage keeps the partition as credits (``LandingCredits``), shared by
    all its requests to that rank. A send worker takes a credit, gathers rows
@@ -81,8 +85,8 @@ MLA_LANDING_MIN_SLOTS = 2
 # Prefill: how long a send worker waits for a free landing slot before it
 # sends the rest of the transfer through the staged per-page path.
 MLA_LANDING_CREDIT_WAIT_S = 0.010
-# Decode: one rank's landing pool, held back from the KV budget and split
-# evenly across the prefill stages that send to the rank.
+# Decode: one rank's landing pool, held back from the KV budget and handed
+# out to prefill stages first come, first served (``advertise``).
 MLA_LANDING_SLOT_BYTES = 8 << 20
 MLA_LANDING_POOL_BYTES = 256 << 20
 

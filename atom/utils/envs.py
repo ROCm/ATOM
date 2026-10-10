@@ -137,10 +137,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.
     "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
-    # Decode (`kv_consumer`, DCP > 1) only: give each prefill stage a partition
-    # of a GPU landing pool. The stage writes a rank's MLA rows packed into one
-    # slot with one RDMA descriptor, the decode side scatters them into the
-    # paged KV and returns the slot. 0 = staged per-page writes only.
+    # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
+    # GPU landing pool, first come, first served (see mla_landing.py). A stage
+    # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
+    # the decode side scatters them into the paged KV and returns the slot.
+    # 0 = staged per-page writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
