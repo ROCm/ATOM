@@ -92,6 +92,31 @@ def _blocking_state_probe() -> bool:
     return bool(is_plugin_mode())
 
 
+_ADVANCE_COUNTS = {}
+
+
+def _note_advance(which: str) -> None:
+    """Which branch advanced this step, keyed by the graph mode it ran under.
+
+    PIECEWISE passes the full dataset and FULL_AND_PIECEWISE loses an advance
+    late in it, so the two modes' counts against the same code are the
+    comparison: the branch a FULL step takes and a PIECEWISE step does not is
+    where the advance goes missing.
+    """
+    try:
+        from atom.plugin.vllm.req_id_passthrough_patch import (
+            get_current_cudagraph_mode,
+        )
+
+        mode = getattr(get_current_cudagraph_mode(), "name", None)
+    except Exception:  # noqa: BLE001
+        mode = None
+    key = f"{mode}:{which}"
+    _ADVANCE_COUNTS[key] = _ADVANCE_COUNTS.get(key, 0) + 1
+    if _ADVANCE_COUNTS[key] in (1, 100, 1000):
+        logger.info("V41ADV %s x%d", key, _ADVANCE_COUNTS[key])
+
+
 def _staging_advances(embeddings, step) -> bool:
     """Whether this step's Engram rows carry a staging that advances the cursor.
 
@@ -865,6 +890,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
+            _note_advance("write_engram_cursor")
         elif (
             not metadata.dummy
             and not step.tentative
@@ -879,6 +905,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # step deferred to staging and the ones without it leaked an
             # advance each ("needs state at 828, found 818").
             cache.advance_cursor(step, histories)
+            _note_advance("advance_cursor")
+        else:
+            _note_advance(
+                f"none(stage={getattr(embeddings, 'stage', None) is not None},"
+                f"cand={getattr(step, 'candidates', None) is not None},"
+                f"dummy={metadata.dummy},tent={step.tentative})"
+            )
         if on_device and step.tentative:
             cache.pending.staged_on_device = True
 
