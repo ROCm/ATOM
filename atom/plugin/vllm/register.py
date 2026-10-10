@@ -314,6 +314,18 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    # vLLM auto-enables the breakable cudagraph for V4 while building
+    # VllmConfig, which happens after this hook in every process.
+    from atom.plugin.vllm.deepseek_v4_cudagraph_patch import (
+        apply_vllm_v4_breakable_cudagraph_opt_out,
+        apply_vllm_v4_prefill_not_uniform_patch,
+    )
+
+    apply_vllm_v4_breakable_cudagraph_opt_out()
+    # V1 dispatches the FULL decode graph on shape alone; for ATOM's V4 a step
+    # with a still-prefilling row is not a uniform decode.
+    apply_vllm_v4_prefill_not_uniform_patch()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()
