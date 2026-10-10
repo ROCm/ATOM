@@ -463,15 +463,21 @@ class TestOffloadInflightCap:
 
 
 class TestOffloadPinRelease:
-    def test_success_and_failure_release_identically(self):
-        """The pin keeps the bytes still during the copy, and the copy is over
-        either way. Whether the hash becomes reachable is the index's business."""
-        for _ in range(2):
-            _pool, store = offload_store()
-            cid, _op = ready(store, 11)
-            [(sent, _units)] = store.take_offload_stores(max_inflight=4)
-            store.settle_offload_store(sent)
-            assert store.records[cid].pin_count == 0
+    def test_settling_releases_the_pin_whatever_the_outcome_was(self):
+        """This level takes no outcome: `settle_offload_store` has no `ok`.
+
+        The pin existed to keep the bytes still during the copy and the copy is
+        over either way, so releasing it is unconditional here. Whether the hash
+        becomes reachable is decided one level up, by
+        `BlockManager.settle_state_store(op, ok=...)` -- see
+        `test_a_failed_store_releases_but_is_not_indexed` in
+        `tests/test_block_manager.py`, which is where the two legs differ.
+        """
+        _pool, store = offload_store()
+        cid, _op = ready(store, 11)
+        [(sent, _units)] = store.take_offload_stores(max_inflight=4)
+        store.settle_offload_store(sent)
+        assert store.records[cid].pin_count == 0
 
     def test_a_report_for_a_hash_never_sent_is_a_no_op(self):
         from atom.kv_transfer.disaggregation.types import StateStoreOperationId

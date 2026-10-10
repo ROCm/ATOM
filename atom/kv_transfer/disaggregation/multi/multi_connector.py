@@ -37,11 +37,11 @@ Merge strategy mirrors vLLM's ``MultiConnector``, adapted to ATOM's
   sub-metadata per connector, in connector order. The worker de-multiplexes by
   index in ``start_load_kv``.
 * ``get_finished`` — union each sub-connector's completion sets independently.
-* ``_state_tier`` — the state offload tier, if a sub built one, re-exposed on
-  the composite by ``_adopt_state_tier`` at ``register_kv_caches`` time (which
-  also refuses a config that lists two offload subs). Mirroring the sub's tier
-  on the composite keeps the attribute defined, so a probe for it resolves to
-  the real tier instead of raising ``AttributeError``.
+* ``_refuse_two_state_tiers`` — run at ``register_kv_caches`` time. It owns no
+  tier of its own; each sub keeps and uses its own, because ``start_load_kv``
+  fans each sub its own metadata. All this does is refuse a config that lists
+  two offload subs, which would leave a hash reported indexed by one tier and
+  fetched from another.
 
 Completion reporting and source-block retention
 ----------------------------------------------
@@ -178,7 +178,7 @@ class MultiConnectorMetadata(ConnectorMetadata):
         so answering from them alone drops every step whose only work belongs
         to a sub. Delegating rather than mirroring the subs' fields is the
         point: the aggregating properties below exist for the idle-dispatch
-        path and have to name each field, and `state_loads` was missed there,
+        path and have to name each field, and `state_stores` was missed there,
         which silently parked every state-only load run under `multi`.
         """
         return super().has_work() or any(
@@ -232,12 +232,6 @@ class MultiConnector(KVConnectorBase):
             getattr(c, "is_producer", False) for c in self._connectors
         )
 
-        # The state tier of whichever sub owns one. Adopted in
-        # `register_kv_caches` via `_adopt_state_tier`; set to None here so the
-        # attribute exists before the subs register -- a probe for it must
-        # resolve, not raise `AttributeError`.
-        self._state_tier = None
-
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -246,10 +240,10 @@ class MultiConnector(KVConnectorBase):
     ) -> None:
         for c in self._connectors:
             c.register_kv_caches(kv_caches, transfer_tensors, num_blocks)
-        self._adopt_state_tier()
+        self._refuse_two_state_tiers()
 
-    def _adopt_state_tier(self) -> None:
-        """Take over the one sub-connector's state tier, or refuse two.
+    def _refuse_two_state_tiers(self) -> None:
+        """Refuse a config whose sub-connectors built more than one state tier.
 
         Nothing in ``_build_subconnectors`` stops a config from listing
         ``lmcache_offload`` twice, which would leave two live tiers and no
@@ -268,7 +262,6 @@ class MultiConnector(KVConnectorBase):
                 f"offload tier ({names}); exactly one may. List the offload "
                 "backend once in kv_transfer_config.connectors."
             )
-        self._state_tier = tiers[0]._state_tier if tiers else None
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         metas = getattr(metadata, "metas", None)
@@ -329,8 +322,8 @@ class MultiConnector(KVConnectorBase):
 
         `ModelRunner.exit()` resolves `getattr(connector, "close", None)` on the
         composite under `multi`; without this forwarder it returns None and no
-        sub is joined -- the offload sub's non-daemon `lmc-state-store` /
-        `lmc-state-load` / `offload-save` threads keep copying out of the KV pool
+        sub is joined -- the offload sub's non-daemon `lmc-state-store` and
+        `offload-save` threads keep copying out of the KV pool
         that `destroy_dist_env()` is about to release. Guard per sub (`getattr`):
         a producer sub such as moriio need not implement `close`.
         """
@@ -404,6 +397,19 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         """
         return self._load_winner.get(getattr(seq, "id", None))
 
+    def _state_only_carrier(self, seq: Any):
+        """The tier sub, when `seq` has a state load and no KV load owner.
+
+        `offload_joint.load_hash` is set by the engine only when it secured a
+        state load from the tier (`BlockManager._start_state_load`), so it is the
+        engine's own statement that a state leg is in flight; the tier sub is
+        the only sub that can carry one.
+        """
+        joint = getattr(seq, "offload_joint", None)
+        if joint is None or int(getattr(joint, "load_hash", -1)) == -1:
+            return None
+        return self._state_tier_sub()
+
     def _state_tier_sub(self):
         """The one sub-connector that actually hosts the state offload tier.
 
@@ -452,6 +458,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         the tier sub (finding 1). Cleared by `request_finished` /
         `cancel_pending_load`.
         """
+        # A new arbitration starts clean. The cancel flag a losing sub reads is
+        # per arbitration, not per request: a request preempted after one sub
+        # lost can be re-admitted, and if that sub wins this time a stale flag
+        # would still suppress its state leg (`KimiK3OffloadScheduler.update_
+        # state_after_alloc`) while its KV load goes out -- the forward would
+        # then resume over a state slot nothing filled.
+        if getattr(seq, "offload_load_cancelled", False):
+            seq.offload_load_cancelled = False
         result = (0, False)
         winner = None
         for c in self._connectors:
@@ -550,8 +564,17 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # `_decide_load_after_alloc` (kimi_k3's joint-boundary clamp); an owner
         # that armed a load but does not refine (a P/D producer) parks -- the
         # scheduler's own absent-hook default -- so the forward waits rather than
-        # running over the load's blocks. No owner means no load: don't park.
+        # running over the load's blocks.
+        #
+        # No KV owner is not always "no load". A STATE-ONLY load -- the KV is
+        # resident in HBM, the recurrent state is in the tier -- wins no KV
+        # arbitration, because every sub's KV answer is 0. The tier sub armed
+        # it anyway (`update_state_after_alloc` is fanned to every sub) and it
+        # alone carries it, so it answers. Without this the composite declined
+        # every state-only resume and the request recomputed from 0.
         c = self._load_owner(seq)
+        if c is None:
+            c = self._state_only_carrier(seq)
         if c is not None and hasattr(c, "should_park_for_load_after_alloc"):
             return c.should_park_for_load_after_alloc(seq)
         return c is not None
@@ -565,33 +588,18 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return c.adjust_prefill_chunk_after_alloc(seq, chunk)
         return chunk
 
-    def enqueue_state_loads(self, loads) -> bool:
-        """First sub that can carry them owns them; False if none can.
-
-        Only one sub may host the tier (the worker raises at model load when
-        two do), so "first" is also "only".
-
-        The False is not a formality: every load here belongs to a parked
-        request only a report can wake, and the caller's `hasattr` guard cannot
-        catch a swallowed one because this method always exists.
-
-        Select by `has_state_tier`, not method presence -- see
-        `_state_tier_sub`.
-        """
-        c = self._state_tier_sub()
-        if c is None:
-            return False
-        return bool(c.enqueue_state_loads(loads))
-
     def enqueue_state_stores(self, stores) -> bool:
-        """Symmetric to `enqueue_state_loads`: the one sub that hosts the tier
-        owns the stores; False if none can.
+        """The one sub that hosts the tier owns the stores; False if none can.
+
+        Only one sub may host it (the worker raises at model load when two do),
+        so "first" is also "only". The False is not a formality: the engine has
+        already pinned each store's PAGE units against a report.
 
         Without this forwarder the engine's `getattr(connector,
         "enqueue_state_stores")` misses on the shell, so it takes the "did not
         carry" branch and releases each store's PAGE units *before* the D2H --
         the CPU tier can never fill under `kv_connector: multi`, even with an
-        offload sub-connector configured. `_adopt_state_tier` already guarantees
+        offload sub-connector configured. `_refuse_two_state_tiers` guarantees
         at most one tier, so "first" is "only" here too.
 
         Select by `has_state_tier`, not method presence -- see
@@ -618,15 +626,14 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return set(), set()
         return c.take_state_reports()
 
-    def take_state_load_survived(self) -> set:
-        """Requests whose state bytes outlived a failed joint load, from the
-        tier sub; empty set if none.
+    def take_missed_state_hashes(self) -> set:
+        """Hashes whose state `get` missed, from the tier sub; empty if none.
 
         `Scheduler._update_from_kv_xfer_finished` reads this off the composite,
         and its `getattr(..., None)` default is indistinguishable from "nothing
-        survived" -- so without the forwarder every survivor under
-        `kv_connector: multi` settled as a failure, forgetting a hash whose
-        bytes are present.
+        missed" -- so without the forwarder a hash LMCache dropped stays
+        advertised under `kv_connector: multi`, parking every later request over
+        that prefix against a `get` that must miss.
 
         Select by `has_state_tier`, not method presence -- see
         `_state_tier_sub`.
@@ -634,7 +641,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         c = self._state_tier_sub()
         if c is None:
             return set()
-        return c.take_state_load_survived()
+        return c.take_missed_state_hashes()
 
     def take_state_source_releases(self) -> set:
         """Stores whose PAGE units the GPU has finished reading, from the tier
@@ -805,7 +812,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         -- the composite under `multi` -- and `getattr`-defaults to 0.0 when it
         is absent. 0.0 silently switches off all three leak reclaimers
         (`_reconcile_stalled_deferred_saves`, `reclaim_stale_state_store_pins`,
-        `reconcile_orphan_load_slots`), so a missing forwarder here is not a
+        `StateOffloadIndex.reclaim`), so a missing forwarder here is not a
         no-op: one lost save report then keeps `has_pending_kv_work()` True
         forever, one dropped store completion pins a checkpoint image out of the
         pool, one orphaned load slot wedges `can_allocate`'s state gate -- with
