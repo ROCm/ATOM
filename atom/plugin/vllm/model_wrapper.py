@@ -956,6 +956,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.get_eagle3_default_aux_hidden_state_layers = (
             self._resolve_eagle3_aux_hidden_state_layers
         )
+        if self.is_dspark:
+            # A DSpark draft has no output projection of its own and expects
+            # the target's under the name vLLM uses. Nothing fails without it:
+            # the draft keeps an unfilled head and drafts noise.
+            from atom.plugin.vllm.v41_draft_lm_head import attach_v41_target_lm_head
+
+            attach_v41_target_lm_head(self, model)
 
     def _resolve_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         # Following ATOM server mode, perfer the draft's configured IDs that

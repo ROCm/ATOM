@@ -422,12 +422,16 @@ def validate_runtime_config(config):
         ),
         ("RapidServe", config.enable_rapidserve),
         ("plugin mode outside vLLM", plugin is not None and not on_vllm_plugin),
-        # TODO: DSpark under the vLLM plugin needs vLLM's proposer to drive
-        # ATOM's tentative staging; the proxy bridge drives a single
-        # target-only step today.
+        # DSpark is admitted on the plugin: vLLM owns the draft (it ships
+        # `DSparkV41DraftModel`), proposes from it and decides acceptance with
+        # its own rejection sampler, and what the bridge owes is the CSA2
+        # state a verify step leaves behind. Every other method still has no
+        # driver here, and the platform gate names which one was asked for.
         (
-            "speculative decoding on the vLLM plugin",
-            on_vllm_plugin and config.speculative_config is not None,
+            "speculative decoding other than DSpark on the vLLM plugin",
+            on_vllm_plugin
+            and config.speculative_config is not None
+            and getattr(config.speculative_config, "method", None) != "dspark",
         ),
         # TODO: CSA2 blocks are only reusable at whole-PAGE boundaries after
         # the compressor has run; vLLM's hash-based reuse would hand back

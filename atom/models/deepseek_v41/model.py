@@ -214,6 +214,12 @@ class DeepseekV41ForCausalLM(nn.Module):
         self.config, self.max_length = config, max_length
         self.topology = build_attention_topology(config)[: config.num_hidden_layers]
         self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        # vLLM's speculator hands the draft the *target's* input embedding, and
+        # it looks for it under `embed_tokens`/`embedding` on `target.model`
+        # (which, for V4.1, is this module via the `model` property). Register
+        # the alias after `embed` so `embed` stays the primary name in
+        # `named_parameters()` and weight loading is untouched.
+        self.embed_tokens = self.embed
         # One shared configuration owns all expert source/online quantization
         # rules. Native attention and Engram projections own their A8 layouts.
         self.moe_quant_config = make_v4_quant_config(
@@ -252,6 +258,10 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.head = ParallelHead(config.vocab_size, config.hidden_size)
+        # Layers whose output a DSpark draft reads. Empty until a speculator
+        # asks for them, so a non-speculative forward collapses nothing extra.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self._aux_hidden_states: list = []
         self.window_rope = RotaryEmbedding(
             config.qk_rope_head_dim, max_length, base=config.rope_theta
         )
@@ -282,6 +292,34 @@ class DeepseekV41ForCausalLM(nn.Module):
     # fact, so V4 reads it off a built layer rather than off a global flag.
     # That reaches the layers through `self.model`, so it applies here as is.
     disable_fused_shared_loading = DeepseekV4ForCausalLM.disable_fused_shared_loading
+
+    def set_aux_hidden_state_layers(self, layers) -> None:
+        """Layers whose collapsed output the draft reads, set by the speculator."""
+        self.aux_hidden_state_layers = tuple(int(i) for i in layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """The layers this checkpoint names, not the generic early/middle/late.
+
+        Every other ATOM target returns `(2, n // 2, n - 3)`, which is vLLM's
+        Eagle3 default and is a guess made in the absence of anything better.
+        V4.1 has something better: the checkpoint carries
+        `dspark_target_layer_ids`, and its draft stages were trained against
+        those layers. Returning the generic triple here would hand the draft
+        three layers it has never seen and nothing would say so -- the shapes
+        agree, so it would simply propose badly.
+        """
+        ids = getattr(self.config, "dspark_target_layer_ids", None)
+        if not ids:
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark needs `dspark_target_layer_ids` from the "
+                "checkpoint; this config carries none, and the generic Eagle3 "
+                "triple would feed the draft layers it was not trained on"
+            )
+        return tuple(int(i) for i in ids)
+
+    def get_aux_hidden_states(self) -> list:
+        """What the last forward collected, in the order the layers were asked for."""
+        return self._aux_hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """(param_name, weight_name, expert_id, shard_id) for FusedMoE.
@@ -336,6 +374,7 @@ class DeepseekV41ForCausalLM(nn.Module):
         # This also makes offline forwards obey the lazy staging contract.
         self.begin_forward(hidden, engram_embeddings)
         state = SinglePassHCState.from_embeddings(hidden, self.config.hc_mult)
+        aux_hidden_states = []
         for spec, layer in zip(self.topology, self.layers):
             rope = self.global_rope if spec.ratio else self.window_rope
             state = layer(
@@ -346,7 +385,25 @@ class DeepseekV41ForCausalLM(nn.Module):
                 engram_embeddings.get(spec.layer_id),
                 image_mask=image_mask,
             )
+            if spec.layer_id + 1 in self.aux_hidden_state_layers:
+                # `+ 1`, and the mean rather than `collapse()`, because both
+                # are what a DSpark draft was trained against. vLLM's own V4
+                # target states the convention: it collects after layer `idx`
+                # under `if (idx + 1) in self.aux_hidden_state_layers`, so the
+                # id names a layer's *input*, and the value it appends is
+                # `aux_recon.mean(dim=1)` -- the reconstructed post-mhc stream
+                # averaged over hc_mult.
+                #
+                # `collapse()` is a different quantity: the streams weighted by
+                # the learned pre-mix and summed, which is the next sublayer's
+                # input projection. Feeding that instead cost nothing visible
+                # -- the answers stayed correct, because rejection sampling
+                # keeps the target's distribution -- and showed up only as a
+                # mean acceptance length of 1.04 with 100 draft tokens/s.
+                aux_hidden_states.append(state.settle().residual.mean(dim=-2))
         hidden = state.collapse()
+        if aux_hidden_states:
+            self._aux_hidden_states = aux_hidden_states
         self.end_forward(hidden, engram_embeddings)
         return hidden
 

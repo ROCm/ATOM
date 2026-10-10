@@ -107,6 +107,37 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
 
+def _refuse_unsupported_v41_speculation(vllm_config) -> None:
+    """Admit DSpark, refuse every other speculative method.
+
+    vLLM drives DSpark itself -- it ships the V4.1 draft model
+    (`DSparkV41DraftModel`), proposes from it and decides acceptance with its
+    own rejection sampler -- so what the bridge owes is the CSA2 state a
+    verify step leaves behind: the window ring, the compressor's incomplete
+    group and the Engram cursor, staged tentatively and committed at the
+    accepted prefix.
+
+    The other methods have no such owner here. MTP would need a draft the
+    proxy does not register, and admitting one silently would not fail at
+    configuration time -- it would serve, and be wrong about state, which is
+    the failure this path is least able to show.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return
+    method = (getattr(spec, "method", None) or "").lower()
+    if method == "dspark":
+        return
+    msg = (
+        f"DeepSeek-V4.1 on the vLLM plugin supports DSpark speculation only; "
+        f"method={method or 'unset'!r} has no draft this bridge drives. Pass "
+        "--speculative-config with method=dspark, drop it, or run the native "
+        "ATOM engine."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
 def _select_hybrid_aware_scheduler(vllm_config) -> None:
     """Point vLLM at a scheduler whose KV-load-failure recovery knows about
     multiple KV cache groups.
@@ -226,15 +257,7 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         logger.error(msg)
         raise ValueError(msg)
 
-    if getattr(vllm_config, "speculative_config", None) is not None:
-        msg = (
-            "DeepSeek-V4.1 on the vLLM plugin does not support speculative "
-            "decoding yet; DSpark drafting needs ATOM's tentative staging, which "
-            "the proxy bridge does not drive. Run the native ATOM engine for "
-            "DSpark, or drop --speculative-config."
-        )
-        logger.error(msg)
-        raise ValueError(msg)
+    _refuse_unsupported_v41_speculation(vllm_config)
 
     from vllm.config import CUDAGraphMode
 

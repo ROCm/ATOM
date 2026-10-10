@@ -133,6 +133,20 @@ def v41_kv_cache_dtype(vllm_config) -> str:
     )
 
 
+def v41_speculative_tokens(vllm_config) -> int:
+    """Draft tokens a DSpark verify step carries, or 0 when not speculating.
+
+    Read off vLLM's own speculative config, the way the V4 bridge reads it:
+    the draft is proposed and its acceptance decided by vLLM, and what ATOM
+    owns is the CSA2 state a verify step leaves behind.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return 0
+    n = getattr(spec, "num_speculative_tokens", None)
+    return int(n) if n else 0
+
+
 def v41_proxy_geometry(vllm_config):
     """The ``V41PoolGeometry`` the proxy pool is sized and carved by.
 
@@ -156,9 +170,12 @@ def v41_proxy_geometry(vllm_config):
         v41_text_config(vllm_config),
         ATOM_DEEPSEEK_V41_BLOCK_SIZE,
         packed=v41_kv_cache_dtype(vllm_config) == "fp4",
-        # Speculative decoding (MTP / DSpark) is refused on the plugin path;
-        # see `enforce_deepseek_v41_constraints` in the platform.
-        speculative_tokens=0,
+        # The draft width a verify step retains. It moves the geometry -- an
+        # extra nextn layer, a window widened by it, and ring slack for the
+        # writes a rejected prefix leaves behind -- so the pool the scheduler
+        # sizes and the cache the runtime builds have to derive it from the
+        # same place, which is this function.
+        speculative_tokens=v41_speculative_tokens(vllm_config),
     )
     try:
         vllm_config._atom_v41_geometry = geometry
@@ -374,7 +391,12 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     if input_ids is None:
         return None
     try:
-        metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
+        metadata, step_positions = builder._prepare(
+            batch,
+            running_bs,
+            running_tokens,
+            **_v41_prepare_kwargs(builder, batch, synthetic),
+        )
     except ValueError as exc:
         if "STATE slot" not in str(exc):
             raise
@@ -421,6 +443,13 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
         if join is not None:
             join()
     metadata.staged_outside_forward = True
+    if getattr(metadata.step, "tentative", False):
+        # Held until the sampler says how much of the draft block survived.
+        # Set after staging, not at `_prepare`: a step that raised on the way
+        # here never reached the cache, and leaving a stale handle behind
+        # would commit the wrong step's prefix.
+        global _V41_PENDING_SPECULATIVE_STEP
+        _V41_PENDING_SPECULATIVE_STEP = (builder, metadata)
     return SimpleNamespace(
         metadata=metadata,
         positions=step_positions,
@@ -1305,6 +1334,83 @@ def v41_stage_step(
         raise
     _v41_publish_metadata(metadata)
     return metadata, step_positions, running_bs, running_tokens, synthetic
+
+
+# The step whose Engram cursor is still waiting on the sampler, as
+# `(builder, metadata)`. A tentative step does not advance its own cursor --
+# only the accepted prefix does, and which prefix that is nobody knows until
+# vLLM has rejected what it rejects. `v41_commit_speculative_state` closes it.
+_V41_PENDING_SPECULATIVE_STEP: tuple | None = None
+
+
+def _v41_prepare_kwargs(builder, batch, synthetic):
+    """Tentative-step arguments for `_prepare`, empty without speculation.
+
+    A speculative step runs the draft's whole block and keeps the Engram
+    cursor off to one side; the sampler picks the accepted prefix afterwards.
+    Synthetic batches (capture, dummy run) are excluded: nothing samples for
+    them, so a tentative step there would be left uncommitted forever.
+    """
+    speculative_tokens = builder.geometry.speculative_tokens
+    if synthetic or not speculative_tokens:
+        return {}
+    lengths = [int(n) for n in batch.num_scheduled_tokens]
+    ends = [int(n) for n in batch.context_lens]
+    rows = [(end - length, length) for end, length in zip(ends, lengths) if length]
+    if not rows:
+        return {}
+    # A tentative step is a verification step: every row is a draft block on
+    # top of an existing prefix. A prefill row is neither -- it starts at
+    # position 0 and is longer than a block -- and the cache refuses the mix.
+    # Such a step verifies nothing, so there is nothing to hold back from its
+    # cursor and the ordinary advance is right.
+    # A row carries a draft block only if it continues an existing prefix and
+    # is wider than the single token a plain decode runs. A one-token decode
+    # row verifies nothing, so its cursor can advance the ordinary way.
+    def _is_draft(row):
+        position, length = row
+        return position > 0 and 1 < length <= speculative_tokens + 1
+
+    def _fits_tentative(row):
+        position, length = row
+        return position > 0 and length <= speculative_tokens + 1
+
+    if not any(_is_draft(row) for row in rows):
+        return {}
+    if not all(_fits_tentative(row) for row in rows):
+        # Draft rows beside prefill rows: the draft rows would advance their
+        # cursor over tokens verification may yet reject. Loud, because the
+        # damage is a silent per-request drift.
+        raise NotImplementedError(
+            "DeepSeek-V4.1 on the vLLM plugin cannot verify a draft block in "
+            "the same step as a prefill "
+            f"(rows position/length: {rows[:16]}, spec={speculative_tokens})"
+        )
+    return {
+        "tentative": True,
+        "max_q_len": max(length for _position, length in rows),
+    }
+
+
+def v41_commit_speculative_state(anchors) -> bool:
+    """Write the accepted prefix's cursor for the step the sampler just ended.
+
+    `anchors`: each request's flat row of its last accepted token, in the
+    scheduled order `_prepare` built. Returns whether a step was waiting.
+    """
+    global _V41_PENDING_SPECULATIVE_STEP
+
+    pending = _V41_PENDING_SPECULATIVE_STEP
+    if pending is None:
+        return False
+    _V41_PENDING_SPECULATIVE_STEP = None
+    builder, metadata = pending
+    builder.commit_speculative_state(metadata, anchors)
+    return True
+
+
+def v41_speculative_step_is_pending() -> bool:
+    return _V41_PENDING_SPECULATIVE_STEP is not None
 
 
 def _v41_prepared_for_this_step(proxy_layer_name):

@@ -503,3 +503,14 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
+    # The other half of V4.1's tentative speculative step: the builder stages
+    # it, this commits the accepted prefix once the sampler has judged it.
+    from atom.plugin.vllm.v41_speculative_commit import patch_v41_speculative_commit
+
+    patch_v41_speculative_commit()
+    # Runs in the EngineCore process, which is where the scheduler lives.
+    from atom.plugin.vllm.v41_speculative_scheduling_patch import (
+        patch_v41_speculative_scheduling,
+    )
+
+    patch_v41_speculative_scheduling()

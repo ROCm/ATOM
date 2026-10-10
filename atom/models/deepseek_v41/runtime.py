@@ -137,7 +137,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         """Tensor-only serving entry; guarded ops read the live forward context."""
-        return self.forward_hidden(
+        hidden = self.forward_hidden(
             input_ids.unsqueeze(0),
             None,
             None,
@@ -146,6 +146,13 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 None if inputs_embeds is None else inputs_embeds.unsqueeze(0)
             ),
         ).squeeze(0)
+        if not self.aux_hidden_state_layers:
+            return hidden
+        # A speculator asked for intermediate layers, so the runner expects the
+        # pair, not the tensor: `hidden_states, aux_hidden_states =
+        # model_output` in vLLM's model runner. Drop the offline batch axis the
+        # same way the backbone output does.
+        return hidden, [aux.squeeze(0) for aux in self.get_aux_hidden_states()]
 
     def compute_logits(self, hidden):
         return self.head.get_logits(self.norm(hidden))
