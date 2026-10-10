@@ -875,3 +875,33 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch):
     assert mla_landing_reserve_bytes(_config(producer)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
+
+
+def test_mooncake_answers_the_runner_kv_budget_reserve(monkeypatch):
+    """The runner asks the factory; Mooncake answers with its two MLA pools."""
+    _mooncake()  # the factory imports the worker class
+    from atom.kv_transfer.disaggregation import KVConnectorFactory
+
+    def reserve(transfer, **overrides):
+        return KVConnectorFactory.kv_budget_reserve_bytes(
+            _config(transfer, **overrides)
+        )
+
+    producer = {
+        "kv_connector": "mooncake",
+        "kv_role": "kv_producer",
+        "num_worker_threads": 16,
+    }
+    consumer = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    offload = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    # A prefill without DCP stages: one 8 MiB slot per send worker.
+    assert reserve(producer, dcp=1) == 128 << 20
+    # A DCP decode rank lands into its whole pool; the offload sub adds nothing.
+    assert reserve(consumer) == 256 << 20
+    assert reserve({"kv_connector": "multi", "connectors": [consumer, offload]}) == (
+        256 << 20
+    )
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
+    assert reserve(consumer) == 0
