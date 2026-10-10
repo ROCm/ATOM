@@ -108,9 +108,29 @@ def test_an_interval_without_a_block_hash_is_refused():
 # ---- cap_hit ------------------------------------------------------------
 
 
-def test_an_unarmed_cap_passes_the_hit_through():
-    # The hook is armed per lookup; outside one there is no request to judge.
-    assert make_planner().cap_hit(SimpleNamespace(id="r0"), 4096) == 4096
+def test_an_unarmed_cap_declines_the_hit():
+    """Fail closed, which is the opposite of what this used to assert.
+
+    The hook's whole job is that no external hit reaches the model without
+    passing a boundary test. Returning the hit untouched when no lookup is
+    armed does not skip the test, it waives it: PAGE gets restored to a
+    position whose STATE was never written, and the forward's cursor check
+    turns that into a dead engine, not a worse answer. Measured as
+    "needs state at 6912, found 3" on a repeated-prefix workload.
+
+    Declining costs a recompute of a prefix the tier may really have held.
+    That is the trade, and it is the right way round.
+    """
+    planner = make_planner()
+    assert planner.cap_hit(SimpleNamespace(id="r0"), 4096) == 0
+    assert planner._counters["cap_unarmed"] == 1
+
+
+def test_an_unarmed_cap_leaves_a_zero_hit_alone():
+    """Nothing to decline, and no cause to count one."""
+    planner = make_planner()
+    assert planner.cap_hit(SimpleNamespace(id="r0"), 0) == 0
+    assert planner._counters["cap_unarmed"] == 0
 
 
 def test_a_hit_with_no_stored_boundary_is_declined_outright():

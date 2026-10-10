@@ -398,6 +398,7 @@ class V41BoundaryPlanner:
             "cursor_mismatch": 0,
             "cap_kept": 0,
             "cap_declined": 0,
+            "cap_unarmed": 0,
             # The same two, for hits vLLM served from its own pool without
             # asking the connector. Kept apart because they answer different
             # questions: the connector pair measures the tier, this pair
@@ -405,6 +406,9 @@ class V41BoundaryPlanner:
             # block pool does not carry.
             "local_cap_declined": 0,
         }
+        # One warning per planner, not per hit: an unarmed cap fires once
+        # per request on whatever path is missing its arming.
+        self._warned_unarmed = False
         self._last_stats_log = 0.0
         if self.state_interval % self.chunk_size:
             raise ValueError(
@@ -452,8 +456,30 @@ class V41BoundaryPlanner:
         claimed the answer is 0, never *hit*.
         """
         hit = int(hit)
-        if hit <= 0 or self._lookup_ctx is None:
+        if hit <= 0:
             return hit
+        if self._lookup_ctx is None:
+            # Fail closed, which is what the paragraph above promises and what
+            # the code did not do. An unarmed hook used to return the hit
+            # untouched, so an external hit that never reached a boundary test
+            # was served whole: PAGE restored to a position whose STATE was
+            # never written, and `_report_stale_state` then killing the engine
+            # ("needs state at 6912, found 3"). Declining costs a recompute of
+            # a prefix the tier may well have held; serving it costs the
+            # server.
+            self._counters["cap_unarmed"] += 1
+            if not self._warned_unarmed:
+                self._warned_unarmed = True
+                logger.warning(
+                    "V4.1 state offload: the hit cap fired outside a lookup "
+                    "(seq=%s, hit=%d) and declined it. Every external hit has "
+                    "to pass a boundary test, so a path that caps without "
+                    "arming is a path that would restore PAGE bytes with no "
+                    "STATE behind them.",
+                    getattr(seq, "id", None),
+                    hit,
+                )
+            return 0
         req_id, request = self._lookup_ctx
         if str(seq.id) != req_id:
             logger.warning(
