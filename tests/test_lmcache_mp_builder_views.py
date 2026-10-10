@@ -125,11 +125,13 @@ def mla_builder_cls():
         "triton": _module("triton", next_power_of_2=lambda value: value),
         "atom.distributed.dcp_utils": _module(
             "atom.distributed.dcp_utils",
+            NONPS_MAX_Q_ROWS=32768,
             dcp_persistent_supported=noop,
             get_dcp_rank=lambda: 0,
             get_dcp_world_size=lambda: 1,
             mla_dcp_decode_is_persistent=lambda *args, **kwargs: False,
             mla_dcp_sparse_prefill_is_persistent=lambda *args, **kwargs: False,
+            mla_dcp_sparse_prefill_uses_nonps=lambda *args, **kwargs: False,
         ),
         "atom.distributed.pcp_utils": _module(
             "atom.distributed.pcp_utils",
