@@ -45,6 +45,7 @@ from atom.mono.plan.execution import THREADS, WAVES
 def select_defs(k4ctx):
     """The functions of the indexer's top-k selection (every block ranked, or a long
     context's shares)."""
+    vllm_cache = k4ctx["vllm_cache"]
     SY = k4ctx["SY"]
     blk = k4ctx["blk"]
     block_table = k4ctx["block_table"]
@@ -188,11 +189,16 @@ def select_defs(k4ctx):
         """A selected block's pages into blk (when its slot is split task
         ``part``'s) and, part 0, into the token's sparse table; thread 0 the
         sparse context length."""
-        if sel & (slot // 2 == part):
-            for j in range_constexpr(PAGES_PER_BLOCK):
-                fx.ptr_store(
-                    page * PAGES_PER_BLOCK + j, blk + ((slot % 2) * PAGES_PER_BLOCK + j)
-                )
+        if const_expr(vllm_cache):
+            if sel:
+                fx.ptr_store(page, blk + slot)
+        else:
+            if sel & (slot // 2 == part):
+                for j in range_constexpr(PAGES_PER_BLOCK):
+                    fx.ptr_store(
+                        page * PAGES_PER_BLOCK + j,
+                        blk + ((slot % 2) * PAGES_PER_BLOCK + j),
+                    )
         if sel & (part == 0):
             for j in range_constexpr(PAGES_PER_BLOCK):
                 bo.buffer_store(

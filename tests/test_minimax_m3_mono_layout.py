@@ -2,6 +2,9 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The MiniMax-M3 mono layer kernel's build-time layout (no GPU, no AITER)."""
 
+import subprocess
+import sys
+
 import pytest
 
 from atom.models.minimax_m3.mono import layout
@@ -16,6 +19,24 @@ from atom.models.minimax_m3.mono.config import (
 from atom.mono.plan.execution import BLOCKS
 
 TOKEN_COUNTS = range(1, MAX_TOKENS + 1)
+
+
+def test_kernel_layout_import_keeps_plugin_preparation_lazy():
+    """Kernel-only clients must not load engine or plugin modules."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import atom.models.minimax_m3.mono.layout; "
+                "assert not any(m.startswith(('atom.plugin', 'atom.model_engine')) "
+                "for m in sys.modules); "
+                "from atom import prepare_model_for_sglang; "
+                "assert callable(prepare_model_for_sglang)"
+            ),
+        ],
+        check=True,
+    )
 
 
 def _regions(table):

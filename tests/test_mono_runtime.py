@@ -320,3 +320,22 @@ def test_lazy_runner_refusal_is_for_good(monkeypatch, refusal):
 
     mono = route.LazyRunner(create, "test")
     assert not mono.ready(6) and not mono.enabled and not mono.ready(6)
+
+
+def test_optional_descriptor_preserves_positional_stream():
+    def kernel(a, descriptor):
+        pass
+
+    def launcher(a, stream=None, descriptor=0):
+        pass
+
+    abi = KernelAbi(("a",), keyword_names=("descriptor",))
+    abi.check(_Kernel(kernel), _Launcher(launcher))
+    assert abi.pack({"a": 7}) == [7]
+    assert abi.zeros() == [0]
+
+    def misplaced(a, descriptor=0, stream=None):
+        pass
+
+    with pytest.raises(TypeError, match="launcher parameters"):
+        abi.check(_Kernel(kernel), _Launcher(misplaced))

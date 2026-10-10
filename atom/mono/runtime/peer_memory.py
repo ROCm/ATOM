@@ -5,21 +5,8 @@
 import torch
 from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
 
-from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+from atom.mono.runtime.consensus import bind_agreed
 from atom.mono.runtime.step_begin import FENCE_BYTES
-
-
-class _DeviceBytes:
-    """``__cuda_array_interface__`` of ``nbytes`` bytes at a raw device address, for a
-    non-owning torch view."""
-
-    def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (ptr, False),
-            "version": 3,
-        }
 
 
 class PeerBuffer:
@@ -44,34 +31,48 @@ class PeerBuffer:
         npes: int,
         device: torch.device,
     ):
-        self.local = UncachedIpcHeap.alloc_uncached(nbytes + FENCE_BYTES)
-        # a view, not an owner: close() frees the memory under it
-        self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
+        self.local = 0
         self.rank = rank
         self._opened: list[int] = []
-        addresses = [self.local]
-        if npes > 1:
-            handles = UncachedIpcHeap.gather_object_list_via_broadcast(
-                group, UncachedIpcHeap.get_mem_handle_bytes(self.local)
+        self.bytes = self.addresses = None
+        handle = None
+
+        def allocate():
+            self.local = UncachedIpcHeap.alloc_uncached(nbytes + FENCE_BYTES)
+            # Non-owning view: HIP memory is released only by close().
+            storage = torch._C._construct_storage_from_data_pointer(
+                self.local, device, nbytes
             )
-            addresses, failure = [], None
-            try:
-                for peer, handle in enumerate(handles):
-                    if peer == rank:
-                        addresses.append(self.local)
-                    else:
-                        base = UncachedIpcHeap.open_mem_handle(handle)
-                        self._opened.append(base)
-                        addresses.append(base)
-            except RuntimeError as err:  # every rank must still reach the agreement
-                failure = err
-            if not tp_agree(failure is None, group):
-                self.close()
-                raise MonoUnsupported(
-                    f"peer memory handshake failed on {'this' if failure else 'another'}"
-                    " TP rank"
-                ) from failure
-        self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
+            self.bytes = torch.empty(0, dtype=torch.uint8, device=device).set_(
+                storage, 0, (nbytes,), (1,)
+            )
+
+        def export():
+            nonlocal handle
+            handle = UncachedIpcHeap.get_mem_handle_bytes(self.local)
+
+        def map_peers():
+            addresses = []
+            for peer, peer_handle in enumerate(handles):
+                base = self.local
+                if peer != rank:
+                    base = UncachedIpcHeap.open_mem_handle(peer_handle)
+                    self._opened.append(base)
+                addresses.append(base)
+            self.addresses = torch.tensor(addresses, dtype=torch.int64, device=device)
+
+        try:
+            bind_agreed(allocate, group)
+            bind_agreed(export, group)
+            handles = (
+                UncachedIpcHeap.gather_object_list_via_broadcast(group, handle)
+                if npes > 1
+                else [handle]
+            )
+            bind_agreed(map_peers, group)
+        except Exception:
+            self.close()
+            raise
 
     def kernel_args(self) -> dict:
         """A kernel's view of the group, by ABI name: this rank's buffer
@@ -85,6 +86,7 @@ class PeerBuffer:
     def close(self) -> None:
         """Close the peer mappings and free the local buffer; idempotent. Only once no
         kernel of any rank can still touch it (the runner is being dropped)."""
+        self.addresses = None
         opened, self._opened = self._opened, []
         for base in opened:
             UncachedIpcHeap.close_mem_handle(base)

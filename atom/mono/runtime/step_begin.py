@@ -212,5 +212,5 @@ def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
         peers.bytes.nbytes,
         peers.rank,
         state.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        stream=torch.cuda.current_stream(state.device),
     )

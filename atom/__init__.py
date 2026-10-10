@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from atom.plugin.sglang import prepare_model_for_sglang
 from atom.sampling_params import SamplingParams
 
 __all__ = [
@@ -17,8 +16,7 @@ __all__ = [
 # engine to read a dataclass, which is why the test suite hand-stubbed
 # `atom.config` instead of importing it.
 #
-# The two names above stay eager: both cost only dataclasses, logging and
-# typing.
+# Plugin preparation is also lazy so importing a kernel does not load plugins.
 
 
 def __getattr__(name: str):
@@ -26,6 +24,10 @@ def __getattr__(name: str):
         from atom.model_engine.llm_engine import LLMEngine
 
         return LLMEngine
+    if name == "prepare_model_for_sglang":
+        from atom.plugin.sglang import prepare_model_for_sglang
+
+        return prepare_model_for_sglang
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

@@ -73,6 +73,7 @@ def router_defs(k4ctx):
     tokens = k4ctx["tokens"]
     v4f = k4ctx["v4f"]
     w_gate = k4ctx["w_gate"]
+    router_logits_fp32 = k4ctx["router_logits_fp32"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
 
@@ -294,7 +295,9 @@ def router_defs(k4ctx):
             stamp(23)
             # the routing key and sigmoid go out, not the logit: the consumers'
             # routing starts at the max rounds
-            sc = hw_rcp(1.0 + hw_exp2(-bf16_round(logit) * LOG2E))
+            if const_expr(not router_logits_fp32):
+                logit = bf16_round(logit)
+            sc = hw_rcp(1.0 + hw_exp2(-logit * LOG2E))
             rk = route_key(sc + bias_r, e_r)
             if lane < SCORE_COPIES:
                 mb_put_words(scores_copy(lane, k), e_r * 2, [rk, sc.bitcast(fx.Int32)])

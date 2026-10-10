@@ -24,14 +24,15 @@ def _python_params(fn) -> tuple[str, ...]:
 @dataclass(frozen=True)
 class KernelAbi:
     names: tuple[str, ...]
+    keyword_names: tuple[str, ...] = ()
 
     def check(self, kernel, launcher) -> None:
         """The kernel takes exactly ``names``; the launcher too, then ``stream``."""
         got = _python_params(kernel)
-        if got != self.names:
+        if got != (*self.names, *self.keyword_names):
             raise TypeError(f"kernel parameters {got} != ABI {self.names}")
         got = _python_params(launcher)
-        if got != (*self.names, "stream"):
+        if got != (*self.names, "stream", *self.keyword_names):
             raise TypeError(f"launcher parameters {got} != ABI {self.names} + stream")
 
     def pack(self, values: dict) -> list:

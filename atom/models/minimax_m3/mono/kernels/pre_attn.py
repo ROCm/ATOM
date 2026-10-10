@@ -42,6 +42,11 @@ from atom.models.minimax_m3.mono.config import (
     IndexHeads,
     qkv_rows,
 )
+from atom.models.minimax_m3.mono.kernels.cache import (
+    index_arguments,
+    index_query_fp8,
+    is_vllm_cache,
+)
 from atom.models.minimax_m3.mono.kernels.common import (
     ar_block_sums,
     ar_pack_sumsq,
@@ -174,7 +179,7 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
-    index_topk=True, dense=False, plain_norm=False,
+    index_topk=True, dense=False, plain_norm=False, vllm_cache=False, index_slots=None,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -187,6 +192,8 @@ def emit_pre_attn(
     ``plain_norm`` (layer 0: no all-reduce in front): the norm's output rounded
     to bf16, then the linear's own per-token quant, as the original layer does."""
     rows = heads.rows
+    if const_expr(not vllm_cache):
+        index_slots = ptrs[12]
     (
         ar,
         res,
@@ -480,6 +487,9 @@ def emit_pre_attn(
             slot = fx.Int32(
                 bo.buffer_load(rsrc(slot_mapping), 2 * tk, vec_width=1, dtype=T.i32)
             )
+            index_slot = fx.Int32(
+                bo.buffer_load(rsrc(index_slots), 2 * tk, vec_width=1, dtype=T.i32)
+            )
             # gamma and this position's cos / sin go out before the wait
             if const_expr(index_topk):
                 gw = is_q.select(g_q, is_k.select(g_k, is_iq.select(g_iq, g_ik)))
@@ -501,13 +511,18 @@ def emit_pre_attn(
                     am = fx.max(am, fmath.absf(e[j]))
                 am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
                 vs = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
+                if const_expr(vllm_cache):
+                    vs = fx.Float32(
+                        bo.buffer_load(rsrc(v_scale), 0, vec_width=1, dtype=T.f32)
+                    )
                 if slot >= 0:
                     b = slot // PAGE16
                     t = slot % PAGE16
-                    if l32 == 0:
-                        bo.buffer_store(
-                            vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
-                        )
+                    if const_expr(not vllm_cache):  # noqa: SIM102
+                        if l32 == 0:
+                            bo.buffer_store(
+                                vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
+                            )
                     r_v = rsrc(v_cache)
                     for j in range_constexpr(ELEMS):
                         q8 = fp8_pack4(e[j] / vs, 0.0, 0.0, 0.0) & 0xFF
@@ -527,6 +542,8 @@ def emit_pre_attn(
                         cache_modifier=cm_out,
                     )
                 if is_iq:
+                    if const_expr(vllm_cache):
+                        out = index_query_fp8(out)
                     bo.buffer_store(
                         fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
                         rsrc(iq_out),
@@ -538,16 +555,21 @@ def emit_pre_attn(
                         am = fx.max(am, fmath.absf(out[j]))
                     am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
                     ksc = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
+                    if const_expr(vllm_cache):
+                        ksc = fx.Float32(
+                            bo.buffer_load(rsrc(k_scale), 0, vec_width=1, dtype=T.f32)
+                        )
                     if slot >= 0:
                         b = slot // PAGE16
                         t = slot % PAGE16
-                        if l32 == 0:
-                            bo.buffer_store(
-                                ksc,
-                                rsrc(k_scale),
-                                b * PAGE16 + t,
-                                cache_modifier=cm_out,
-                            )
+                        if const_expr(not vllm_cache):  # noqa: SIM102
+                            if l32 == 0:
+                                bo.buffer_store(
+                                    ksc,
+                                    rsrc(k_scale),
+                                    b * PAGE16 + t,
+                                    cache_modifier=cm_out,
+                                )
                         if const_expr(dense):
                             # the dense path's Triton rope-cache: K quantized
                             # from f32, page-128 SHUFFLE [b128][d / 16][t][16]
@@ -572,12 +594,12 @@ def emit_pre_attn(
                             k_off // 4,
                             cache_modifier=cm_out,
                         )
-                if (ht == IK_TASK) & (slot >= 0):
+                if (ht == IK_TASK) & (index_slot >= 0):
                     qi = [bf16_round(out[j]) for j in range(ELEMS)]
                     bo.buffer_store(
                         fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
                         rsrc(index_cache),
-                        (slot * HEAD_DIM + d0) // 4,
+                        (index_slot * HEAD_DIM + d0) // 4,
                         cache_modifier=cm_out,
                     )
 
@@ -599,6 +621,7 @@ def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False,
+    vllm_cache=False, cache_args=None,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -613,6 +636,9 @@ def emit_k1(
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
+    index_slots, index_table, index_width = slot_mapping, block_table, bt_width
+    if const_expr(vllm_cache):
+        index_slots, index_table, index_width = index_arguments(cache_args)
     mbox = Mailbox(layer, diag, region_ids)
     qkv_mb = sreg(scratch, SCRATCH_QKV, "k1.qkv")
     x8_mb = scratch + fx.Int64(SCRATCH_X8)  # plain words, behind x8s's tags
@@ -635,6 +661,8 @@ def emit_k1(
         got = mb_poll([(qkv_mb, base + d0, 2), (qkv_mb, base + d0 + 2, 2)])
         e = [got[h][j].bitcast(fx.Float32) for h in range(2) for j in range(2)]
         out = head_norm_rope(e, lane, gw4, cs, sn, eps)
+        if const_expr(vllm_cache):
+            out = index_query_fp8(out)
         row = qs + (tk * heads.count + head) * (HEAD_DIM // 2)
         fx.ptr_store(bf16_pair(out[0], out[1]), row + lane * 2)
         fx.ptr_store(bf16_pair(out[2], out[3]), row + (lane * 2 + 1))
@@ -690,6 +718,8 @@ def emit_k1(
         index_topk,
         dense,
         plain_norm,
+        vllm_cache,
+        index_slots,
     )  # fmt: skip
     stamp(5)
 
@@ -709,7 +739,7 @@ def emit_k1(
             (bid + (BLOCKS - score_base)) % BLOCKS, lane, uniform(wave), red, mb_put,
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
-            block_table, seq_lens, bt_width, wait_new_keys if signal else None,
+            index_table, seq_lens, index_width, wait_new_keys if signal else None,
             make_index_q, heads, q_frag_head, make_index_q_heads,
         )  # fmt: skip
     stamp(6)
@@ -724,7 +754,8 @@ K1_ABI = KernelAbi(
         "cos_sin", "positions", "slot_mapping", "k_cache", "v_cache", "k_scale",
         "v_scale", "index_cache", "q_out", "iq_out", "block_table", "seq_lens",
         "bt_width", "q_len", "iscore", "scratch", "layer", "tl",
-    )
+    ),
+    keyword_names=("cache_args",),
 )  # fmt: skip
 
 
@@ -742,6 +773,7 @@ class K1Build:
     plain_norm: bool = field(metadata={"sym": "pn"})
     eps: float
     sm_scale: float
+    cache_mode: str = field(metadata={"sym": "cm"})
 
 
 def build_pre_attn_kernel(
@@ -754,6 +786,7 @@ def build_pre_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     dense: bool = False,
     plain_norm: bool = False,
+    cache_mode: str = "atom",
 ):
     """``@flyc.jit`` launcher of K1 for this model's RMSNorm epsilon, attention
     scale and sparse pinned blocks, a decode batch of ``tokens`` (<= MAX_TOKENS)
@@ -761,9 +794,12 @@ def build_pre_attn_kernel(
     (``dense_pre``): q | k | v rows only, no indexer, K inserted as the dense
     path's rope-cache does; ``plain_norm``: layer 0's input norm
     (``emit_pre_attn``)."""
+    vllm_cache = is_vllm_cache(cache_mode)
+    if vllm_cache and dense:
+        raise ValueError("scalar cache mode requires indexed sparse attention")
     assert 1 <= tokens <= MAX_TOKENS
     key = K1Build(
-        tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
+        cache_mode=cache_mode, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         dense=dense, plain_norm=plain_norm, eps=eps, sm_scale=sm_scale,
     )  # fmt: skip
@@ -815,6 +851,7 @@ def build_pre_attn_kernel(
         scratch: Int64,
         layer: Int32,
         tl: Int64,
+        cache_args: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -843,6 +880,7 @@ def build_pre_attn_kernel(
             index_topk=not dense,
             dense=dense,
             plain_norm=plain_norm,
+            vllm_cache=vllm_cache, cache_args=cache_args,
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
@@ -877,6 +915,7 @@ def build_pre_attn_kernel(
         layer: Int32,
         tl: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
+        cache_args: Int64 = 0,
     ):
         _ = build_key  # every build parameter in the JIT cache key
         pre_attn_kernel(
@@ -908,6 +947,7 @@ def build_pre_attn_kernel(
             scratch,
             layer,
             tl,
+            cache_args,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     K1_ABI.check(pre_attn_kernel, launch_pre_attn)

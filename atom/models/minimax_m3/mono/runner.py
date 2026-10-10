@@ -39,7 +39,6 @@ from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
     LOCAL_Q_HEADS,
-    MAX_TOKENS,
     N_ROUTED,
     ONE_INDEX_HEAD,
     TOP_K,
@@ -47,6 +46,7 @@ from atom.models.minimax_m3.mono.config import (
     TP,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.execution import SparseExecution
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -58,14 +58,9 @@ from atom.models.minimax_m3.mono.kernels.post_attn import (
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     K1_ABI,
-    K1_ARGS,
     build_pre_attn_kernel,
 )
-from atom.models.minimax_m3.mono.kernels.pre_attn import (
-    SCRATCH_BYTES as K1_SCRATCH_BYTES,
-)
-from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
-from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
+from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -75,8 +70,6 @@ from atom.mono.runtime.debug import (
     raise_if_given_up,
     region_namer,
 )
-from atom.mono.runtime.lifecycle import owned_peer_buffer
-from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
@@ -264,50 +257,30 @@ class MonoDecodeRunner:
 
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
-        dev = self.dev
-        self.scratch1 = torch.zeros(K1_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
-        self.scratch4 = torch.zeros(K4_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
-        self.peers, self._finalizer = owned_peer_buffer(
-            self,
-            sym_layout(self.npes)["_bytes"],
+        self.execution = SparseExecution(
+            self.sparse,
+            [lw.attn_impl.index_cache for lw in self.sparse],
             group,
             self.rank,
             self.npes,
-            dev,
+            self.dev,
+            self.debug,
         )
-        # every mailbox pair, zeroed at each step's start (forward)
-        self.mailboxes = StepMailboxes(
-            self.peers, self.scratch1, self.scratch4, debug=self.debug
-        )
-        bf16 = torch.bfloat16
-        # row k = token k of the step; sparse layer i reads ars[i % 2] (the
-        # previous layer's output) and writes ars[(i + 1) % 2], likewise h_mids
-        self.ars = [
-            torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
-        ]
-        self.h_mids = [
-            torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
-        ]
-        self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
-        self.q = torch.empty(
-            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
-        )
-        self.iq = torch.empty(MAX_TOKENS, 1, HEAD_DIM, dtype=bf16, device=dev)
-        # layer 0's residual input: its K1 takes (embedding, 0), acc = embedding
-        self.zero_res = torch.zeros(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
-        # each layer's K1 pointers that do not change per step (K1_ARGS order)
-        self.k1_args = []
-        for i, lw in enumerate(self.sparse):
-            ptrs = {
-                "ar": _ptr(self.ars[i % 2]), "g_in": _ptr(lw.g_in), "w_qkv": _ptr(lw.w_qkv),
-                "s_qkv": _ptr(lw.s_qkv), "g_q": _ptr(lw.g_q), "g_k": _ptr(lw.g_k),
-                "g_iq": _ptr(lw.g_iq), "g_ik": _ptr(lw.g_ik), "cos_sin": _ptr(lw.cos_sin),
-                "index_cache": _ptr(lw.attn_impl.index_cache), "iq_out": _ptr(self.iq),
-                "scratch": _ptr(self.scratch1),
-            }  # fmt: skip
-            self.k1_args.append(
-                torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
-            )
+        # Dense and sparse kernels share these activation and mailbox buffers.
+        for name in (
+            "scratch1",
+            "scratch4",
+            "ars",
+            "h_mids",
+            "h",
+            "q",
+            "iq",
+            "zero_res",
+            "k1_args",
+            "peers",
+            "mailboxes",
+        ):
+            setattr(self, name, getattr(self.execution, name))
 
     def prepare(self, n: int) -> bool:
         """Whether every rank holds the n-token kernel (``WidthBuilds``)."""
@@ -315,7 +288,7 @@ class MonoDecodeRunner:
 
     def close(self) -> None:
         """Free the peer memory now (once no rank can launch another step)."""
-        self._finalizer()
+        self.execution.close()
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -449,30 +422,25 @@ class MonoDecodeRunner:
         n = res.shape[0]
         sparse_md = _sparse_metadata(fwd)
         block_table, seq_lens = rows
-        stream = torch.cuda.current_stream()
         impl = lw.attn_impl
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
         k16, v16, ks16, vs16 = impl._to_page16_shuffle(
             kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
         )
-        args = {
-            "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
-            "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
-            "k_scale": _ptr(ks16), "v_scale": _ptr(vs16), "w_o": _ptr(lw.w_o),
-            "s_o": _ptr(lw.s_o), "g_post": _ptr(lw.g_post), "w_gate": _ptr(lw.gate),
-            "bias": _ptr(lw.bias), "w13": _ptr(lw.w13), "s13": _ptr(lw.s13),
-            "w2": _ptr(lw.w2), "s2": _ptr(lw.s2), "h_mid": _ptr(self.h_mids[(i + 1) % 2]),
-            "ar_out": _ptr(self.ars[(i + 1) % 2]), "scratch": _ptr(self.scratch4),
-            **self.peers.kernel_args(), "layer": lw.layer_id,
-            "bt_width": block_table.shape[1],
-            "q_len": sparse_md.decode.max_query_len,
-            "tl": self.timeline.ptr(i) if self.timeline else 0,
-            "k1_args": _ptr(self.k1_args[i]), "positions": _ptr(positions),
-            "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
-            "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
-        }  # fmt: skip
-        self.k4[n][lw.index_topk](*K4_ABI.pack(args), stream=stream)
-        return self.h_mids[(i + 1) % 2][:n]
+        _, residual = self.execution.forward_layer(
+            i,
+            self.ars[i % 2][:n],
+            res,
+            positions,
+            (k16, v16, ks16, vs16),
+            (block_table, seq_lens),
+            sparse_md.slot_mapping,
+            fwd.attn_metadata.batch_id_per_q_token,
+            sparse_md.decode.max_query_len,
+            self.k4[n][lw.index_topk],
+            self.timeline.ptr(i) if self.timeline else 0,
+        )
+        return residual
 
     def finish_step(self, res: torch.Tensor) -> torch.Tensor:
         """The final norm (the mailboxes are cleared at the next step's start:

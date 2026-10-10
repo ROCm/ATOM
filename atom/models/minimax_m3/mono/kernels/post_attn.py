@@ -65,6 +65,7 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     IndexHeads,
 )
+from atom.models.minimax_m3.mono.kernels.cache import is_vllm_cache
 from atom.models.minimax_m3.mono.kernels.index_score import (
     index_scale_log2e,
     step_rows,
@@ -137,7 +138,8 @@ K4_ABI = KernelAbi(
         "v_scale", "w_o", "s_o", "g_post", "w_gate", "bias", "w13", "s13", "w2", "s2",
         "h_mid", "ar_out", "scratch", "sym", "peers", "rank", "layer", "bt_width",
         "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids",
-    )
+    ),
+    keyword_names=("cache_args",),
 )  # fmt: skip
 
 
@@ -156,11 +158,13 @@ class K4Build:
     index_topk: bool = field(metadata={"sym": "it"})
     fuse_k1: bool
     sm_scale: float
+    cache_mode: str = field(metadata={"sym": "cm"})
     eps: float
     route_scale: float
     shared_weight: float
     swiglu_limit: float
     debug: bool
+    router_logits_fp32: bool = field(default=False, metadata={"sym": "rf32"})
 
 
 def build_post_attn_kernel(
@@ -178,6 +182,8 @@ def build_post_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
+    cache_mode: str = "atom",
+    router_logits_fp32: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -189,13 +195,16 @@ def build_post_attn_kernel(
     ``index_topk``: the layer scores and selects its blocks; else (the original
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
     selecting layer of the step left in scratch."""
+    vllm_cache = is_vllm_cache(cache_mode)
+    if vllm_cache and (not index_topk or heads != ONE_INDEX_HEAD):
+        raise ValueError("scalar cache mode requires indexed sparse attention")
     assert 1 <= tokens <= MAX_TOKENS
     key = K4Build(
-        npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
+        cache_mode=cache_mode, npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
         route_scale=route_scale, shared_weight=shared_weight,
-        swiglu_limit=swiglu_limit, debug=debug,
+        swiglu_limit=swiglu_limit, debug=debug, router_logits_fp32=router_logits_fp32,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
@@ -290,6 +299,7 @@ def build_post_attn_kernel(
         slot_mapping: Int64,
         res: Int64,
         batch_ids: Int64,
+        cache_args: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -423,6 +433,7 @@ def build_post_attn_kernel(
                 diag,
                 REGION_IDS,
                 index_topk,
+                vllm_cache=vllm_cache, cache_args=cache_args,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)
@@ -590,6 +601,7 @@ def build_post_attn_kernel(
         res: Int64,
         batch_ids: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
+        cache_args: Int64 = 0,
     ):
         _ = build_key  # every build parameter in the JIT cache key
         post_attn_kernel(
@@ -625,6 +637,7 @@ def build_post_attn_kernel(
             slot_mapping,
             res,
             batch_ids,
+            cache_args,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     K4_ABI.check(post_attn_kernel, launch_post_attn)

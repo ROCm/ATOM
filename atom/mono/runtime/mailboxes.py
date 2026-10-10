@@ -31,6 +31,11 @@ class StepMailboxes:
             STATE_WORDS, dtype=torch.int64, device=peers.bytes.device
         )
 
+    @property
+    def resources(self) -> tuple[torch.Tensor, ...]:
+        """Storage mutated by a step, retained by graph owners through teardown."""
+        return (*self._scratch, self.peers.bytes, self.peers.addresses, self._state)
+
     def begin_step(self) -> None:
         """Before the step's first kernel, on its stream (a graph records it)."""
         step_begin(self._scratch, self.peers, self._state, self._debug)
