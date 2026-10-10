@@ -3842,7 +3842,8 @@ class MoE(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         shared_partial: torch.Tensor | None = None,
-        before_stage2=None,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Gate + FusedMoE routed-expert pass.
@@ -3857,7 +3858,8 @@ class MoE(nn.Module):
             x,
             router_logits,
             shared_partial,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
+            before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
         )
 
@@ -3937,16 +3939,23 @@ class MoE(nn.Module):
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
 
-        def produce_shared():
+        def produce_shared(output_rows):
             with torch.cuda.stream(self.alt_stream):
                 shared = self.shared_experts.forward(x)
-            routed_stream.wait_stream(self.alt_stream)
+                if shared.shape[0] != output_rows:
+                    padded = shared.new_zeros((output_rows, *shared.shape[1:]))
+                    padded[: shared.shape[0]].copy_(shared)
+                    shared = padded
             shared.record_stream(routed_stream)
             return shared
 
+        def wait_for_shared():
+            routed_stream.wait_stream(self.alt_stream)
+
         routed, is_complete = self.routed_expert_forward(
             x,
-            before_stage2=produce_shared,
+            before_stage2_for_rows=produce_shared,
+            before_shared_add=wait_for_shared,
             stage2_stream=routed_stream,
         )
         if is_complete:
