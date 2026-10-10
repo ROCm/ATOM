@@ -38,6 +38,7 @@ if [[ "${1:-}" == --worker ]]; then
   trap cleanup EXIT
   docker pull "${image}"
   docker run --name "${container}" --user "$(id -u):$(id -g)" \
+    -e STORE_SMOKE_HOST_IP="$(hostname -I | awk '{print $1}')" \
     --group-add video --group-add "$(stat -c %g /dev/dri/renderD128)" \
     --network host --ipc host \
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \

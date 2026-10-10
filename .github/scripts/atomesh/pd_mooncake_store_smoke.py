@@ -23,7 +23,7 @@ def worker(args):
     try:
         torch.cuda.set_device(args.rank)
         torch.cuda.init()
-        host = socket.gethostbyname(socket.gethostname())
+        host = os.environ["STORE_SMOKE_HOST_IP"]
         direct = TransferEngine()
         result["direct_init"] = direct.initialize(host, "P2PHANDSHAKE", "rdma", "")
         store = MooncakeDistributedStore()
