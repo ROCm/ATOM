@@ -216,6 +216,7 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+_QH128_ASM_HEADS = 128  # the gfx1250 QH128 ASM MLA decode is built for 128 Q heads
 
 
 def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
@@ -662,7 +663,19 @@ class MLAAttention(nn.Module):
                 raise ValueError("QH128 ASM MLA requires gfx1250")
             shuffled = self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
             if self.use_seg_mla or shuffled != (self.asm_mla_page_size == 64):
-                raise ValueError("QH128 ASM MLA page size must match the KV writer layout")
+                raise ValueError(
+                    "QH128 ASM MLA page size must match the KV writer layout"
+                )
+            try:
+                from aiter.mla import mla_decode_fwd_qh128_asm
+            except ImportError as e:
+                raise ImportError(
+                    "ATOM_MLA_QH128_ASM_PAGE_SIZE needs an aiter with "
+                    "aiter.mla.mla_decode_fwd_qh128_asm (ROCm/aiter#6133)"
+                ) from e
+            self._qh128_asm_decode = mla_decode_fwd_qh128_asm
+            # The kernel reads both scales from device memory, so they are
+            # created once here rather than on the per-step (captured) path.
             self._q_scale_device = self._q_scale.to(
                 torch.cuda.current_device(), non_blocking=True
             )
@@ -2528,11 +2541,12 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
+        kv_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         if (
             self.asm_mla_page_size
             and self.dcp_world_size == 1
             and not self.is_sparse_mla
-            and q.shape[1:] == (128, 576)
+            and q.shape[1:] == (_QH128_ASM_HEADS, kv_head_dim)
             and attn_metadata.max_seqlen_q == 1
             and kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn
             and o.dtype == torch.bfloat16
@@ -2545,49 +2559,50 @@ class MLAAttention(nn.Module):
             else:
                 q_asm, q_descale = quant_fp8_per_tensor(q)
                 q_quant = "dynamic_per_tensor"
+            # The page1 kernel always writes LSE; page64 only when asked.
             if self.asm_mla_page_size == 1 or return_lse:
                 final_lse = torch.empty(
-                    (B, 128), dtype=torch.float32, device=q.device
+                    (B, _QH128_ASM_HEADS), dtype=torch.float32, device=q.device
                 )
             if self.asm_mla_page_size == 64:
-                from aiter.mla import mla_decode_fwd_ps64_qh128_asm
-
                 # One query per sequence: trim DP padding on forced-eager
                 # steps, while graph capture/replay retain their padded B.
-                mla_decode_fwd_ps64_qh128_asm(
-                    q_asm,
-                    self._shuffled_kv_view(kv_c_and_k_pe_cache),
-                    attn_metadata.context_lens[:B],
-                    attn_metadata.block_tables[:B],
-                    o,
-                    q_descale,
-                    self._k_scale_device,
-                    self.scale,
-                    lse=final_lse,
-                )
+                kv = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+                kv_args = {
+                    "kv_layout": "gluon_shuffled",
+                    "seq_lens": attn_metadata.context_lens[:B],
+                    "page_table": attn_metadata.block_tables[:B],
+                }
             else:
-                from aiter.mla import mla_decode_fwd_ps1_qh128_asm
-
-                mla_decode_fwd_ps1_qh128_asm(
-                    q_asm,
-                    kv_c_and_k_pe_cache.view(-1, 1, 1, 576),
-                    attn_metadata.kv_indptr[: B + 1],
-                    attn_metadata.kv_indices,
-                    o,
-                    q_descale,
-                    self._k_scale_device,
-                    self.scale,
-                    lse=final_lse,
-                )
-            logged = getattr(MLAAttention, "_qh128_asm_logged_pages", set())
+                kv = kv_c_and_k_pe_cache.view(-1, 1, 1, kv_head_dim)
+                kv_args = {
+                    "kv_layout": "token_major",
+                    "kv_indptr": attn_metadata.kv_indptr[: B + 1],
+                    "kv_indices": attn_metadata.kv_indices,
+                }
+            self._qh128_asm_decode(
+                q_asm,
+                kv,
+                o,
+                page_size=self.asm_mla_page_size,
+                q_scale=q_descale,
+                kv_scale=self._k_scale_device,
+                softmax_scale=self.scale,
+                lse=final_lse,
+                **kv_args,
+            )
+            logged = getattr(MLAAttention, "_qh128_asm_logged_pages", frozenset())
             if self.asm_mla_page_size not in logged:
+                MLAAttention._qh128_asm_logged_pages = logged | {self.asm_mla_page_size}
                 logger.info(
                     "ASM QH128 MLA decode activated: page_size=%d "
-                    "input_q_dtype=%s q_quant=%s kv_dtype=%s q_heads=128",
-                    self.asm_mla_page_size, q.dtype, q_quant,
+                    "input_q_dtype=%s q_quant=%s kv_dtype=%s q_heads=%d",
+                    self.asm_mla_page_size,
+                    q.dtype,
+                    q_quant,
                     kv_c_and_k_pe_cache.dtype,
+                    _QH128_ASM_HEADS,
                 )
-                MLAAttention._qh128_asm_logged_pages = logged | {self.asm_mla_page_size}
         elif envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
             # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
             kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
