@@ -335,12 +335,6 @@ def validate_speculative_config(config):
         )
 
 
-def apply_runtime_defaults(config):
-    """Model defaults leave explicit execution options unchanged."""
-    if config.tbo_comm_stream_priority is None:
-        config.tbo_comm_stream_priority = -1
-
-
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode

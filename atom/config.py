@@ -2045,8 +2045,6 @@ class Config:
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
-    # None uses the model's default, or normal priority for other models.
-    tbo_comm_stream_priority: int | None = None
     enable_low_latency: bool = False
     # Routed MoE transport selection. ``auto`` preserves the historical
     # behavior (MoRI when importable, otherwise gather/scatter). ``rccl`` uses
@@ -2625,16 +2623,9 @@ class Config:
             # reuse shorter than a PAGE, which stops matching at all.
             self.kv_cache_block_size = 256
 
-            from atom.models.deepseek_v41.config import (
-                apply_runtime_defaults,
-                validate_runtime_config,
-            )
+            from atom.models.deepseek_v41.config import validate_runtime_config
 
-            apply_runtime_defaults(self)
             validate_runtime_config(self)
-
-        if self.tbo_comm_stream_priority is None:
-            self.tbo_comm_stream_priority = 0
 
     def compute_hash(self) -> str:
         """

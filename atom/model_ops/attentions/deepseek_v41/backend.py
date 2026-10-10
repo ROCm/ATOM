@@ -60,6 +60,7 @@ class DeepseekV41Backend(AttentionBackend):
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     capture_owns_cu_seqlens_q = True
+    tbo_comm_stream_priority = -1
 
     # Reuse V4's publisher and staging contract, including fixed addresses and
     # running_bs padding. Only pool-slot -> physical-row geometry differs.

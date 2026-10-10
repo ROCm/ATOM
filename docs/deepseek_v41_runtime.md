@@ -202,8 +202,8 @@ both microbatches. Each consumes its token slice and waits at its Engram layer;
 the parent joins the lookup after both workers finish, including failure.
 Already-staged rows are sliced identically when Engram overlap is disabled.
 
-V4.1 declares communication priority -1 in its model configuration; the generic
-default is 0 and `--tbo-comm-stream-priority` can explicitly override either.
+V4.1 uses communication stream priority -1 as a fixed backend policy;
+other backends keep the default priority 0.
 MoE keeps the existing compute-to-communication yield and event order.
 The V4.1-local `v41_record_tbo_expert_output` runtime marker protects the routed
 output after dispatch and before downstream shared-expert combine or mHC.

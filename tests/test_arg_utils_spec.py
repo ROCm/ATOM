@@ -120,16 +120,6 @@ class TestKVCacheDtypeCliAlias:
         assert self._parse(["--tensor_parallel_size", "4"]).tensor_parallel_size == 4
 
 
-class TestTBOStreamPriorityCli:
-    @pytest.mark.parametrize("priority", [None, 0, -1, -2])
-    def test_priority_reaches_engine_config(self, priority):
-        parser = FlexibleArgumentParser()
-        EngineArgs.add_cli_args(parser)
-        argv = [] if priority is None else ["--tbo-comm-stream-priority", str(priority)]
-        args = EngineArgs.from_cli_args(parser.parse_args(argv))
-        assert args._get_engine_kwargs()["tbo_comm_stream_priority"] == priority
-
-
 class TestMoEBackendCli:
     def _parse(self, argv):
         parser = argparse.ArgumentParser()

@@ -172,15 +172,3 @@ def test_native_draft_config_preserves_v41_architecture():
     assert config.head_dim == 512 and config.qk_rope_head_dim == 64
     assert config.dspark_n_routed_experts == 128
     assert config.n_routed_experts == 384
-
-
-# The runtime default is a model policy; explicit execution options win.
-@pytest.mark.parametrize("priority,expected", [(None, -1), (0, 0), (-2, -2)])
-def test_tbo_priority_default_preserves_explicit_override(priority, expected):
-    from types import SimpleNamespace
-
-    from atom.models.deepseek_v41.config import apply_runtime_defaults
-
-    config = SimpleNamespace(tbo_comm_stream_priority=priority)
-    apply_runtime_defaults(config)
-    assert config.tbo_comm_stream_priority == expected

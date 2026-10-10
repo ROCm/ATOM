@@ -748,7 +748,7 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
         ubatch_slices=parts,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
-    actual = UBatchWrapper(Model(), builder, comm_stream_priority=-1)(
+    actual = UBatchWrapper(Model(), builder)(
         torch.arange(14, device="cuda", dtype=torch.int32), parent.step.positions
     )
     assert order == [
@@ -931,7 +931,7 @@ def test_dp_moe_original_schedule_preserves_outputs(
         model(ids, parent.step.positions)
     if level == 3:
         assert len(model.compiled_codes) == 1
-    wrapper = UBatchWrapper(model, builder, comm_stream_priority=-1)
+    wrapper = UBatchWrapper(model, builder)
     for _ in range(3):
         calls.clear()
         actual = wrapper(ids, parent.step.positions)
@@ -1038,6 +1038,32 @@ def test_tbo_rejects_compacted_scheduler_rows_before_slicing():
         builder.build_ubatch_prefill_metadata(
             parent, UBatchSlice(slice(0, 1), slice(0, 4)), 1
         )
+
+
+@pytest.mark.parametrize("backend,expected", [("none", 0), ("v4", 0), ("v41", -1)])
+def test_tbo_communication_priority_is_backend_owned(monkeypatch, backend, expected):
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+
+    cls = {
+        "v4": DeepseekV4AttentionMetadataBuilder,
+        "v41": DeepseekV41MetadataBuilder,
+    }.get(backend)
+    builder = None if cls is None else cls.__new__(cls)
+    priorities = []
+    stream = object()
+
+    def create_stream(*, priority):
+        priorities.append(priority)
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "Stream", create_stream)
+    wrapper = UBatchWrapper(torch.nn.Identity(), builder)
+    wrapper._ensure_comm_stream()
+    wrapper._ensure_comm_stream()
+    assert priorities == [expected]
+    assert wrapper.comm_stream is stream
 
 
 def test_tbo_preserves_v4_forward_signature(monkeypatch):

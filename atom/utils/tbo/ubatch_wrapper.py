@@ -42,14 +42,11 @@ class UBatchWrapper(nn.Module):
         model: nn.Module,
         attn_metadata_builder=None,
         dp_gather_scatter: bool = False,
-        *,
-        comm_stream_priority: int = 0,
     ):
         super().__init__()
         self.model = model
         self.attn_metadata_builder = attn_metadata_builder
         self.dp_gather_scatter = dp_gather_scatter
-        self.comm_stream_priority = comm_stream_priority
         self.comm_stream: torch.cuda.Stream | None = None
         # Barrier: ubatch threads + main thread
         self.ready_barrier = threading.Barrier(3)  # 2 ubatch threads + 1 main
@@ -99,7 +96,10 @@ class UBatchWrapper(nn.Module):
 
     def _ensure_comm_stream(self):
         if self.comm_stream is None:
-            self.comm_stream = torch.cuda.Stream(priority=self.comm_stream_priority)
+            priority = getattr(
+                self.attn_metadata_builder, "tbo_comm_stream_priority", 0
+            )
+            self.comm_stream = torch.cuda.Stream(priority=priority)
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor

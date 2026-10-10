@@ -848,7 +848,6 @@ class ModelRunner:
                 self.model,
                 attn_metadata_builder=self.attn_metadata_builder,
                 dp_gather_scatter=dp_gather_scatter,
-                comm_stream_priority=config.tbo_comm_stream_priority,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
