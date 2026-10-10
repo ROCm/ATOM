@@ -772,32 +772,26 @@ def test_score_workspace_packs_only_the_fp4_plane_and_holds_its_maxima():
 
 
 @pytest.mark.parametrize("ratio,longest", [(1, 640), (2, 1409)])
-def test_a_step_past_one_packed_band_runs_eagerly(ratio, longest):
-    """A step runs from a graph exactly while its rows -- each seeing its
-    request's context in rows of the widest ratio, aligned -- fit one band
-    beside the padding rows a graph adds (at ratio 1 each sees a row). Ten
-    PAGEs, 40 token rows: ratio 1 leaves 3840 elements, six rows of 640;
-    ratio 2 leaves 4480, six of 704 (contexts to 1409 tokens). A plane
-    never runs eagerly."""
+def test_a_step_fits_one_packed_band_exactly_while_its_rows_do(ratio, longest):
+    """A step fits (and so runs from a graph, `step_needs_eager`) exactly
+    while its rows -- each seeing its request's context in rows of the widest
+    ratio, aligned -- fit one band beside the padding rows a graph adds (at
+    ratio 1 each sees a row). Ten PAGEs, 40 token rows: ratio 1 leaves 3840
+    elements, six rows of 640; ratio 2 leaves 4480, six of 704 (contexts to
+    1409 tokens). A plane always fits."""
     from types import SimpleNamespace
 
-    from atom.model_ops.attentions.deepseek_v41.backend import (
-        DeepseekV41MetadataBuilder,
-    )
     from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 
-    def eager(geometry, context):
-        builder = SimpleNamespace(
-            score_workspace=ScoreWorkspace(geometry, 40, 9, "cpu", pages=10)
-        )
-        batch = SimpleNamespace(num_scheduled_tokens=(6,), context_lens=(context,))
-        return DeepseekV41MetadataBuilder.step_needs_eager(builder, batch)
+    def fits(geometry, context):
+        workspace = ScoreWorkspace(geometry, 40, 9, "cpu", pages=10)
+        return workspace.fits((6,), (context,))
 
     fp4 = SimpleNamespace(**{**vars(_pool_geometry(True)), "owners": ((0, ratio),)})
-    assert not eager(fp4, longest)
-    assert eager(fp4, longest + 1)
+    assert fits(fp4, longest)
+    assert not fits(fp4, longest + 1)
     fp8 = SimpleNamespace(**{**vars(fp4), "index_fp4": False})
-    assert not eager(fp8, 1 << 20)
+    assert fits(fp8, 1 << 20)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
