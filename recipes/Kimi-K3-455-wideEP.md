@@ -34,6 +34,7 @@ translations, and GSM8K still scored **0.9621** over the full 1319.
 | agentic numbers and how they were taken | [Agentic (AgentX)](#agentic-agentx) → [AgentX result](#agentx-result) |
 | why it is slow and what to try | [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
 | take a profile | [Profiling](#profiling) |
+| run a newer stack (ROCm 10.2, ATOM/aiter `main`) — dp8ep8 on two nodes, **validated** | [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
 | try the optimization PR stack — **pending verification** | [Optimized source stack](#optimized-source-stack--pending-verification) |
 | you are on A0 silicon | [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon) |
 | find a tray's IP or BMC | [The rack: hosts and addresses](#the-rack-hosts-and-addresses) |
@@ -53,6 +54,10 @@ translations, and GSM8K still scored **0.9621** over the full 1319.
 | Fixed-length 14k/16, con32 | 26,207 tok/s total, TTFT median 13.2 s, TPOT median 73.9 ms |
 | Cold start | **under 6 min** |
 | Bottleneck | **decode** — see [Where the time goes](#where-the-time-goes-and-what-to-try-next) |
+
+A newer stack — ROCm 10.2, torch 2.14, Triton 3.9 and ATOM/aiter `main` of 2026-10-08 — also runs
+full K3, validated at dp8ep8 on two nodes (GSM8K strict-match 0.9575). See
+[Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes).
 
 ### The rest of the configuration
 
@@ -915,7 +920,7 @@ see [max_tokens](#k3-is-a-reasoning-model).
 ### Environment
 
 ```bash
-# --- translation: without these, every token is `!` ---
+# --- translation: A0 silicon only (without it every token is `!`); inert on B0, see Appendix B ---
 export LD_LIBRARY_PATH=/app/rjprefix/lib:$LD_LIBRARY_PATH
 export HSA_TOOLS_LIB=/app/rjprefix/lib/libhsa_hotswap_rocjitsu.so
 export HSA_HOTSWAP_VERBOSE=1
@@ -1223,12 +1228,13 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 
 | Symptom | Cause / fix |
 |---|---|
-| Every token is `!`, service otherwise perfect | Translation not in effect — B0 silicon running A0 kernels. See the top of this page. Most common failure by a wide margin |
+| Every token is `!`, service otherwise perfect | Translation not in effect — A0 silicon running the image's B0 code objects untranslated. See the top of this page and [Appendix B](#appendix-b-running-the-same-image-on-a0-silicon). Most common failure on A0 by a wide margin |
 | `FAIL: HOTSWAP=1 but /app/rjprefix not found` | The prefix is not in the container. Re-install it; `docker rm` removes it. **Do not "fix" this with `HOTSWAP=0`** |
 | First decode request SIGABRTs, silently | `ATOM_USE_TRITON_MLA=1` not set |
 | `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
 | LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM. The [optimized source stack](#optimized-source-stack--pending-verification) fixes it in aiter instead (#6120) |
-| `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together |
+| `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together. On newer aiter (`main` of 2026-10-08) the symm-mem knob exists only with [aiter #5431](https://github.com/ROCm/aiter/pull/5431); without it custom all-reduce is disabled on any group spanning nodes. Every rank should log `Custom allreduce: using torch.symm_mem transport (mori backend)` — see [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
+| `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe N) returned hipError 17` at model load, on more than one node | Newer aiter's MegaMoE turns on mori's TokOffExt by default, and TokOffExt IPC-maps every peer; IPC handles do not cross nodes. Set `MORI_EP_TOKOFF_EXT=0` — see [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
 | `/dev/kfd` missing after a reboot | `amdgpu` is blacklisted on the kernel command line. Load it with `perf_setup`; a bare `modprobe` skips the tuning. See [After a reboot](#after-a-reboot-load-the-driver-then-confirm-the-links-trained) |
@@ -1706,6 +1712,181 @@ another rank; its isolated contribution is unmeasured.
 
 ---
 
+## Newer stack: atom-dev image, dp8ep8 on two nodes
+
+Validated 2026-10-10 on CT2 + CT3 (B0, 432 GiB/GPU, perf_setup D): full K3 at `-tp 1`, DP 8, EP 8
+(112 experts per GPU), launched as [Config A](#config-a--accuracy-gsm8k-stock-launch) apart from the
+deltas below. Same model, a much newer base and `main`-branch code: ROCm 10.2, torch 2.14, upstream
+Triton 3.9, and ATOM/aiter/mori `main` of 2026-10-08.
+
+| | |
+|---|---|
+| **GSM8K**, 5-shot, full 1319 | **strict-match 0.9575 ±0.0056**, flexible-extract 0.9568 ±0.0056 — 5 min 23 s at `num_concurrent=32` |
+| Accuracy gate | pass: ` Paris. The Eiffel Tower is located in Paris. …`; decode and prefill agree; chat `17 * 23` → `content='391'` |
+| Memory at `--gpu-memory-utilization 0.90` | `peak_torch=276.12GB`, `non_torch` 17–21 GB, `cudagraph_est=0.64GB` → `available_for_kv` **82.3–86.3 GB** per rank |
+| Cold start | **7 min 44 s** on the first run, including about 4 min of aiter JIT builds (cached on the host afterwards); the weights were in page cache |
+
+### The image
+
+`rocm/atom-dev:ub24-dcgpu-rk-10.2.0a20260922.bkc.20261002-pyt2.14.0-tri-main-atomsrc-gfx1250-1009`
+(public), digest `sha256:961ec7e904aa4fcd7e1aad3067c4c0506be09ea91b6e573440878d5a12b41e29`. The
+versions below were read from the image's layers, not from its labels:
+
+| | 0918-ep8 (this page) | atom-dev 1009 |
+|---|---|---|
+| ROCm | 10.1.0a20260811 (BKC 20260820) | 10.2.0a20260922 (BKC 20261002), TheRock |
+| torch | 2.11.0 | 2.14.0 |
+| Triton | 3.8.0 (internal) | 3.9.0, upstream `main` @332c72a7, built from source |
+| FlyDSL | 0.2.4 | 0.3.4.1 |
+| ATOM / aiter / mori | bring-up build | `main` @16cc652b / @e965ebfe / @066fd10e (2026-10-08) |
+
+It is laid out differently from the fw-bringup images:
+
+- The gfx1250 venv is `/root/venv/atom-venv-gfx1250`; it sees torch and Triton through a `.pth` into
+  `/root/venv/rocm-venv`. The entrypoint activates it by `amdgpu-arch`, but `docker exec` does not go
+  through the entrypoint, so activate it yourself.
+- `/root/ATOM` and `/root/aiter` are deleted at the end of the build: ATOM and aiter are wheels.
+- The image ENV sets `NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo`. Override both, and mori's, on any
+  multi-node run.
+- `PREBUILD_KERNELS=0`: aiter JIT-builds most modules at first use
+  (`module_fused_qk_norm_rope_cache_quant_shuffle` alone took 150 s). Bind-mount `/root/.aiter` and
+  `/root/.triton` from the host so only the first cold start pays. Clear `/root/.cache/atom/*` after
+  changing code.
+- No rocjitsu: B0 only.
+
+The newest dated tags are not a newer base. `rocm/fw-bringup` stops at `gfx1250-atom-20261002`, a
+flattened container export with torch 2.11 / ROCm 10.1. The daily `gfx1250-atom-YYYYMMDD` tags in
+`rocm/fw-bringup-mlperf` are daily snapshots of a working container on the same 2026-09-23 base.
+
+### Patches
+
+Two open PRs are still needed. The image ships wheels, so apply the diffs to the venv: the `atom/` and
+`aiter/` paths in `site-packages`, the `csrc/` paths in `site-packages/aiter_meta`, which is where
+aiter's JIT reads its sources (`module_custom_all_reduce_gfx1250` is JIT-built, so it picks up the
+patch). Both apply cleanly to the image's commits, including the `envs.py` hunk that fails on 0918-ep8.
+
+| PR | why |
+|---|---|
+| [ATOM #2380](https://github.com/ROCm/ATOM/pull/2380) | the unfused `gather_kv_b_proj` (`ATOM_UNFUSED_GATHER_KV_B_PROJ=1`), kept as in Config A. Triton ≥ 3.9 is the upstream fix for the PHI assert ([aiter #6120](https://github.com/ROCm/aiter/pull/6120) was closed in its favour), so it may be unnecessary here; not tested |
+| [aiter #5431](https://github.com/ROCm/aiter/pull/5431) | `AITER_CUSTOM_AR_USE_SYMM_MEM`: gfx1250 custom all-reduce over torch.symm_mem (mori). Without it this aiter disables custom all-reduce on any group that spans nodes, and the DP LM head's custom all-gather asserts `not ca_comm.disabled` at the first decode. Every rank must log `Custom allreduce: using torch.symm_mem transport (mori backend)`: a failed probe falls back to IPC silently, and the assert comes back |
+
+```bash
+# on the host
+curl -sSL https://github.com/ROCm/ATOM/pull/2380.diff  -o /tmp/2380.diff
+curl -sSL https://github.com/ROCm/aiter/pull/5431.diff -o /tmp/5431.diff
+sudo docker cp /tmp/2380.diff k3dp8:/tmp/ && sudo docker cp /tmp/5431.diff k3dp8:/tmp/
+
+# in the container: runtime files only (--include drops the tests); git apply works outside a repository
+SP=/root/venv/atom-venv-gfx1250/lib/python3.12/site-packages
+cd $SP            && git apply --include='atom/*' /tmp/2380.diff && git apply --include='aiter/*' /tmp/5431.diff
+cd $SP/aiter_meta && git apply --include='csrc/*' /tmp/5431.diff
+# verify: each must reverse-apply cleanly (this also catches a truncated docker cp)
+cd $SP            && git apply --check -R --include='atom/*' /tmp/2380.diff && git apply --check -R --include='aiter/*' /tmp/5431.diff
+cd $SP/aiter_meta && git apply --check -R --include='csrc/*' /tmp/5431.diff && echo patched
+```
+
+`docker rm` discards the patches, as on 0918-ep8.
+
+### Environment and CLI — delta from Config A
+
+| | Config A | here | why |
+|---|---|---|---|
+| translation lines | set, inert on B0 | dropped | B0 |
+| `MORI_EP_TOKOFF_EXT` | unset | **`0`** — required on more than one node | aiter's MegaMoE turns mori's TokOffExt on by default (`mega_moe.py`: `os.environ.get("MORI_EP_TOKOFF_EXT", "1")`) without the single-host check mori's own op layer does. TokOffExt IPC-maps every peer and IPC handles do not cross nodes, so model load dies on every rank with `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe 4) returned hipError 17`. `0` puts dispatch back on the cco-window atomic |
+| `MORI_/NCCL_/GLOO_SOCKET_IFNAME` | as in Config B | `enp1s0f1`, required | the image's ENV says `lo` |
+| `HSA_XNACK` | `1` | `0` | follows the driver: perf_setup D/H loads amdgpu with `noretry=1` (XNACK off). Not A/B-tested |
+| `AITER_RUNTIME_GPU_ARCH`, `ATOM_USE_AITER_TRITON_ATTN`, `AITER_USE_OPUS_MOE_SORTING`, `ATOM_WO_A_USE_FLYDSL`, `ATOM_LOADER_USE_THREADPOOL` | set | dropped | not read anywhere in this ATOM, aiter or mori |
+
+Everything else is as in Config A: `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` (#2380), `ATOM_DP_LM_HEAD_MODE=allgather`
+with `ATOM_USE_CUSTOM_ALL_GATHER=1` and `AITER_CUSTOM_AR_USE_SYMM_MEM=1` (#5431), `ATOM_USE_TRITON_MLA=1`,
+and every CLI flag. This ATOM also has a gfx1250 asm MLA decode, used when `ATOM_USE_TRITON_MLA` is
+unset; it was not tried. The container is as in [Container](#container), plus
+`-v <host>/aiter:/root/.aiter -v <host>/triton:/root/.triton -v <host>/cache:/root/.cache` and
+`--entrypoint sleep <image> infinity`.
+
+Run on both nodes, `DPRANK` = 0 / 4:
+
+```bash
+#!/bin/bash
+source /root/venv/atom-venv-gfx1250/bin/activate
+# --- architecture ---
+export PYTORCH_ROCM_ARCH=gfx1250 GPU_ARCHS=gfx1250 GPU_ARCH_LIST=gfx1250 MORI_GPU_ARCHS=gfx1250 GPU_TARGETS=gfx1250
+export HSA_OVERRIDE_GFX_VERSION=12.5.0
+export ENABLE_CK=0
+# --- attention ---
+export ATOM_USE_TRITON_MLA=1
+export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0
+export ATOM_UNFUSED_GATHER_KV_B_PROJ=1          # ATOM #2380
+export ATOM_USE_UNIFIED_ATTN=1
+# --- MoE ---
+export ATOM_MOE_GU_ITLV=1
+export ATOM_USE_TRITON_MOE_DECODE=0
+export MEGA_DISPATCH=mori MEGA_DISPATCH_WIRE=fp4
+export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1
+export AITER_USE_GROUPED_GEMM=1
+export MORI_EP_TOKOFF_EXT=0                      # NEW: required on more than one node
+# --- GEMM / quantization ---
+export ATOM_USE_TRITON_GEMM=1
+export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1
+export AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1
+# --- communication ---
+export NCCL_MNNVL_ENABLE=1
+export NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS NCCL_CUMEM_ENABLE=1
+export MORI_SOCKET_IFNAME=enp1s0f1 NCCL_SOCKET_IFNAME=enp1s0f1 GLOO_SOCKET_IFNAME=enp1s0f1   # image ENV says lo
+export ATOM_DP_LM_HEAD_MODE=allgather
+export ATOM_USE_CUSTOM_ALL_GATHER=1 AITER_CUSTOM_AR_USE_SYMM_MEM=1   # aiter #5431
+# --- loading ---
+export HSA_XNACK=0 HSA_USE_SVM=1 HSA_ENABLE_SDMA=1
+export ATOM_LOADER_NUM_THREADS=4
+export TRITON_CACHE_DIR=/root/.triton/cache
+
+cd /tmp
+exec python3 -m atom.entrypoints.openai_server \
+  --model /models/Kimi-K3 \
+  --served-model-name moonshotai/Kimi-K3 \
+  --trust-remote-code \
+  -tp 1 \
+  --data-parallel-size 8 \
+  --data-parallel-size-local 4 \
+  --data-parallel-rank ${DPRANK} \
+  --data-parallel-master-ip <node0-data-plane-ip> \
+  --data-parallel-master-port 29500 --data-parallel-base-port 29700 \
+  --enable-expert-parallel --enable-dp-attention \
+  --kv_cache_dtype fp8 --index-cache-dtype fp8 \
+  --cudagraph-mode FULL \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 2048 \
+  --gpu-memory-utilization 0.90 \
+  --no-enable_prefix_caching \
+  --disable_uvicorn_access_log
+```
+
+### Other things this run showed
+
+- **No tuned MoE GEMM for the shape.** Every rank logs
+  `no grouped CSV config matched (token=16384 model_dim=3584 inter_dim=3072 experts=112 topk=16 …)`:
+  this aiter has no tuned entry for K3 at EP8, so defaults are used.
+- **Greedy sampling needs a gfx1250 `topk_select`.** Temperature 0 (the gate and GSM8K) goes through
+  `aiter.topk_select`. This aiter supports gfx1250. Some older aiter builds list only gfx942/gfx950
+  and need a `torch.argmax` fallback in ATOM's sampler.
+- **Copying the checkpoint between trays is fast.** It must be on every node. CT3 pulled the 1454 GiB
+  from CT2 over the data-plane NIC at about 9 GB/s, in 150 s, with 8 rsync streams and the jump host's
+  key forwarded (`ssh -A`), so no key is left on either tray:
+
+  ```bash
+  # on the destination tray
+  SSH="ssh -T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Compression=no"
+  $SSH -n root@<src-ip> "ls -1A /mnt/k3/Kimi-K3" \
+    | xargs -P 8 -I{} rsync -a --inplace -e "$SSH" "root@<src-ip>:/mnt/k3/Kimi-K3/{}" /data/k3/Kimi-K3/
+  sync   # most of it sits in page cache; trays here get AC-cycled
+  ```
+
+  `ls -1A` so the dotfiles (`.gitattributes`, `.eval_results/`) come too, and `-n` on the listing
+  `ssh` if the script itself arrives on stdin. Then compare `find . -type f -printf '%P %s\n' | sort`
+  on both sides.
+
+---
+
 ## Optimized source stack — pending verification
 
 > ⚠️ **Pending verification. Nothing in this section has been run on this
@@ -1903,6 +2084,12 @@ installs the BF16 GEMM table as
   ```bash
   python3 -c "from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt; print('ok')"
   ```
+
+  **Observed 2026-10-10** on the [atom-dev image](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes),
+  whose mori has `TokOffExt`: on more than one node the server still dies at model load, with
+  `hipIpcOpenMemHandle(pe N) returned hipError 17`. aiter's MegaMoE turns TokOffExt on without the
+  single-host check that mori's own op layer does, and TokOffExt IPC-maps every peer. A four-node run
+  of this stack needs `MORI_EP_TOKOFF_EXT=0`, whatever the mori version.
 
 ### Environment and CLI — delta from Config B
 
@@ -2390,3 +2577,6 @@ A correct run logs lines of this shape:
   [Throughput](#throughput) for why it is the first thing to try.
 - The [optimized source stack](#optimized-source-stack--pending-verification)
   as a whole: boot, accuracy and AgentX are all pending.
+- The [newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) beyond accuracy: throughput,
+  AgentX, dp16ep16 on four nodes, and A/Bs of `ATOM_UNFUSED_GATHER_KV_B_PROJ=0` (Triton 3.9's fused
+  gather) and of the new gfx1250 asm MLA decode (`ATOM_USE_TRITON_MLA` unset).
