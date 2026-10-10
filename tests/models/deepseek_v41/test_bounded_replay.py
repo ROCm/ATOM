@@ -108,7 +108,8 @@ def test_both_index_builders_floor_the_window_at_the_replay_start():
     eptr = torch.empty(tokens + 1, dtype=torch.int32, device="cuda")
     _indptr_scan[(1,)](
         batches, positions, cu, pptr, eptr, tokens, replay_start,
-        DECODE=False, WINDOW=window, RATIO=1, TOPK=0, EXTEND=True, BLOCK=64,
+        DECODE=False, WINDOW=window, RATIO=1, TOPK=0, EXTEND=True, SPLIT=False,
+        BLOCK=64,
     )  # fmt: skip
     counts = (pptr[1:] - pptr[:-1]).tolist()
     expected = []
