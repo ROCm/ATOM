@@ -98,6 +98,18 @@ class TestFlexibleArgumentParser:
         assert p.parse_args(["--enable-prefix-caching"]).enable_prefix_caching is True
 
 
+class TestArgparseHelpText:
+    def test_percentages_in_engine_argument_help_are_literal(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+
+        help_text = " ".join(parser.format_help().split())
+        assert "--state-checkpoint-demand" in help_text
+        assert "47% of all checkpoint writes" in help_text
+        assert "2.8% of the time" in help_text
+        assert "85.2% for an anchor" in help_text
+
+
 class TestKVCacheDtypeCliAlias:
     """--kv-cache-dtype and --kv_cache_dtype must both set kv_cache_dtype end-to-end."""
 
