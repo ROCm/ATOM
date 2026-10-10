@@ -161,10 +161,14 @@ class Qwen3NextMLP(nn.Module):
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, config, quant_config, prefix: str = ""):
+    def __init__(
+        self, config, quant_config, prefix: str = "", reduce_results: bool = True
+    ):
         super().__init__()
         # parallel_config = atom_config.parallel_config
         self.prefix = prefix
+        # False when the next norm folds the TP all-reduce in.
+        self.reduce_results = reduce_results
 
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -274,7 +278,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             final_hidden_states = routed_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
@@ -286,6 +290,7 @@ class Qwen3NextAttention(nn.Module):
         atom_config,
         quant_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         if hasattr(atom_config.hf_config, "text_config"):
@@ -335,6 +340,7 @@ class Qwen3NextAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
         if is_vllm():
@@ -478,6 +484,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         quant_config=None,
         speculative_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -579,6 +586,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             bias=False,
             input_is_parallel=True,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.out_proj",
         )
 

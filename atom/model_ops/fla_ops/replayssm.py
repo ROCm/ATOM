@@ -1127,6 +1127,29 @@ def _replayssm_ut_fwd_kernel(
         tl.store(p_bg, b_gt.to(p_bg.dtype.element_ty), mask=m_t)
 
 
+def _serial_launch_config(
+    N: int, HV: int, V: int, max_query_len: int, is_kda: bool
+) -> tuple[int, int, int]:
+    """(BV, num_warps, num_stages) for `_replayssm_fwd_kernel`.
+
+    Large batches (swept on gfx950 over bs 32..256, T 2..16, both the Qwen3.5
+    and Kimi-K3 head shapes): BV=64 with a single warp wins across the board.
+    BV=32 doubles the number of programs and replicates the per-token
+    l2norm/loads; BV=128 overflows the register budget.
+
+    Small multi-token verify batches are latency bound instead: at BV=64 the
+    grid is only 2 * N * HV single-warp programs. Splitting V into 16-wide
+    slices (8x the programs, 1/4 the state tile each) wins up to N * HV = 768
+    (tests/bench_replayssm_decode.py, gfx950, H=4 HV=16 K=V=128 T=4, cold
+    cache, us at BV=64 -> 16): bs1 19.9->9.3, bs6 20.2->12.2, bs16 23.3->19.2,
+    bs32 33.3->28.7, bs48 38.5->36.4, bs64 even. T=1 takes the T1_* paths,
+    where BV=64 stays best; num_stages is flat either way.
+    """
+    if not is_kda and max_query_len > 1 and N * HV <= 768:
+        return min(triton.next_power_of_2(V), 16), 1, 3
+    return min(triton.next_power_of_2(V), 64), 1, 3
+
+
 def replayssm_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1145,6 +1168,7 @@ def replayssm_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
     route: str = "auto",
+    o: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1163,6 +1187,9 @@ def replayssm_gated_delta_rule(
         route: ``"serial"`` walks tokens one at a time; ``"ut"`` uses the
             chunked delta-rule UT transform (scalar gate, non-headwise beta,
             multi-token steps only); ``"auto"`` picks ``"ut"`` when eligible.
+        o: optional contiguous ``[T_tot, HV, V]`` destination (e.g. a slice of
+            the layer's output buffer); the kernel writes into it directly
+            instead of a fresh tensor, saving the caller a device copy.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1185,7 +1212,11 @@ def replayssm_gated_delta_rule(
     assert triton.cdiv(K, BK) == 1, "K must fit one block"
 
     q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
-    o = q.new_empty(1, T_tot, HV, V)
+    if o is None:
+        o = q.new_empty(1, T_tot, HV, V)
+    else:
+        assert o.shape == (T_tot, HV, V) and o.is_contiguous() and o.dtype == q.dtype
+        o = o.unsqueeze(0)
 
     if route not in ("auto", "serial", "ut"):
         raise ValueError(f"unknown replayssm route {route!r}; expected auto|serial|ut")
@@ -1258,11 +1289,7 @@ def replayssm_gated_delta_rule(
         )
         return o
 
-    # Serial route tuning (swept on gfx950 over bs 32..256, T 2..16, both the
-    # Qwen3.5 and Kimi-K3 head shapes): BV=64 with a single warp wins across
-    # the board.  BV=32 doubles the number of programs and replicates the
-    # per-token l2norm/loads; BV=128 overflows the register budget.
-    BV = min(triton.next_power_of_2(V), 64)
+    BV, num_warps, num_stages = _serial_launch_config(N, HV, V, max_query_len, is_kda)
     NV = triton.cdiv(V, BV)
     # Replay tile height: the cursor can reach cap - max_query_len before a
     # flush resets it, and `tl.dot` wants at least 16 rows on CDNA, so a
@@ -1311,8 +1338,8 @@ def replayssm_gated_delta_rule(
         DOT_MODE=_replay_dot_mode(buf_u.dtype),
         T1_FAST=max_query_len == 1,
         T1_TILED=(max_query_len == 1) and not is_kda,
-        num_warps=1,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o
 
