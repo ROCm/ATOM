@@ -254,6 +254,25 @@ class KVConnectorFactory:
         return False
 
     @classmethod
+    def kv_budget_reserve_bytes(cls, config: Any) -> int:
+        """GPU bytes the configured connectors allocate after the KV cache.
+
+        The model runner sizes the KV cache before any connector exists, so
+        each transport's worker class answers from its own config
+        (`KVConnectorBase.kv_budget_reserve_bytes`); a `multi` sums its subs.
+        """
+
+        total = 0
+        # An unparsable `multi` (None) reserves nothing: building it raises
+        # before any buffer is allocated.
+        for name, leaf_config in cls.leaf_connectors(config) or ():
+            entry = cls._registry[name]
+            mod = importlib.import_module(entry["worker_module"])
+            klass = getattr(mod, entry["worker_class"])
+            total += klass.kv_budget_reserve_bytes(leaf_config)
+        return total
+
+    @classmethod
     def create_connector(
         cls, config: Any, role: str = "worker"
     ) -> KVConnectorBase | KVConnectorSchedulerBase:

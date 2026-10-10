@@ -42,9 +42,13 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     LandingReceiver,
 )
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
-from atom.kv_transfer.disaggregation.pd_landing import mla_landing_pool_shape
+from atom.kv_transfer.disaggregation.pd_landing import (
+    mla_landing_pool_shape,
+    mla_landing_reserve_bytes,
+)
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
+    mla_staging_reserve_bytes,
     mla_staging_slot_count,
     send_worker_count,
 )
@@ -913,6 +917,14 @@ class MooncakeConnector(KVConnectorBase):
             sizes.append(chunk)
             offset += chunk
         return sizes
+
+    @classmethod
+    def kv_budget_reserve_bytes(cls, config) -> int:
+        """The MLA staging pool (producer) and landing pool (DCP consumer).
+
+        ``register_kv_caches`` allocates both after the KV cache is sized.
+        """
+        return mla_staging_reserve_bytes(config) + mla_landing_reserve_bytes(config)
 
     def register_kv_caches(
         self,

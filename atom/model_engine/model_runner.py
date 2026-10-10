@@ -41,9 +41,7 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
-from atom.kv_transfer.disaggregation import KVConnectorOutput
-from atom.kv_transfer.disaggregation.pd_landing import mla_landing_reserve_bytes
-from atom.kv_transfer.disaggregation.pd_producer import mla_staging_reserve_bytes
+from atom.kv_transfer.disaggregation import KVConnectorFactory, KVConnectorOutput
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -1764,27 +1762,16 @@ class ModelRunner:
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
         available_for_kv_budget -= self._kv_budget_extra_reserve(total)
-        # The Mooncake producer allocates its MLA staging pool after the KV
-        # cache, so hold its bytes back here.
-        mla_staging_bytes = mla_staging_reserve_bytes(config)
-        if mla_staging_bytes:
+        # GPU buffers the KV connector allocates after the KV cache is sized.
+        connector_bytes = KVConnectorFactory.kv_budget_reserve_bytes(config)
+        if connector_bytes:
             logger.info(
-                "Reserving %.2fGB for P/D MLA staging", mla_staging_bytes / (1 << 30)
+                "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
             )
-            available_for_kv_budget -= mla_staging_bytes
-        # Likewise the Mooncake consumer's MLA landing pool (DCP decode).
-        mla_landing_bytes = mla_landing_reserve_bytes(config)
-        if mla_landing_bytes:
-            logger.info(
-                "Reserving %.2fGB for P/D MLA landing", mla_landing_bytes / (1 << 30)
-            )
-            available_for_kv_budget -= mla_landing_bytes
-        # This prevents OOM when other processes share the GPU. The pools
-        # above are allocated after the KV cache, so free HBM must cover them
-        # too.
-        available_for_kv = min(
-            available_for_kv_budget, free - mla_staging_bytes - mla_landing_bytes
-        )
+            available_for_kv_budget -= connector_bytes
+        # This prevents OOM when other processes share the GPU. Free HBM must
+        # cover the connector buffers too.
+        available_for_kv = min(available_for_kv_budget, free - connector_bytes)
 
         torch.set_default_device(None)
 
