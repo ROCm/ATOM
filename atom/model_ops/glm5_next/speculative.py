@@ -284,9 +284,8 @@ def run_speculative_kpool_indexer(
     # plain decode. Never branch on max_seqlen_k here either: CUDAGraph capture
     # leaves it 0 and would record the skip for every replay. For the same
     # reason the scratch is sized from the model limit, not this batch.
-    selected = torch.full(
+    selected = torch.empty(
         (num_query_tokens, output_width),
-        -1,
         device=keys.device,
         dtype=torch.int32,
     )
