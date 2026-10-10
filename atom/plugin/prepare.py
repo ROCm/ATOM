@@ -110,11 +110,40 @@ def _prepare_model_atom_rtpllm(
             conv1d_exclude,
         )
 
-    atom_config.quant_config.remap_layer_name(
-        atom_config.hf_config,
-        packed_modules_mapping=getattr(model_cls, "packed_modules_mapping", {}),
-        quant_exclude_name_mapping=getattr(model_cls, "quant_exclude_name_mapping", {}),
-    )
+    if model_arch == "Qwen4ExpForConditionalGeneration":
+        from atom.model_loader.loader import WeightsMapper
+
+        # The RTP bridge below currently feeds token IDs only. Do not build a
+        # vision tower that RTP never supplies pixel tensors or mRoPE grids to.
+        atom_config.multimodal_config = None
+        hf = (
+            getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
+        )
+        packed = {
+            **getattr(model_cls, "packed_modules_mapping", {}),
+            **{
+                f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+                for shard in range(int(hf.split_ngram_parts))
+            },
+        }
+        atom_config.quant_config.remap_layer_name(
+            atom_config.hf_config,
+            packed_modules_mapping=packed,
+            weights_mapper=WeightsMapper(
+                orig_to_new_prefix={"model.language_model.": "model."}
+            ),
+            quant_exclude_name_mapping=getattr(
+                model_cls, "quant_exclude_name_mapping", {}
+            ),
+        )
+    else:
+        atom_config.quant_config.remap_layer_name(
+            atom_config.hf_config,
+            packed_modules_mapping=getattr(model_cls, "packed_modules_mapping", {}),
+            quant_exclude_name_mapping=getattr(
+                model_cls, "quant_exclude_name_mapping", {}
+            ),
+        )
 
     set_attn_cls()
     if model_arch == "GlmMoeDsaForCausalLM":

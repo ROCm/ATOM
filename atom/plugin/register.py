@@ -2,38 +2,48 @@
 
 import logging
 import os
+from importlib import import_module
 
 from atom.config import Config
-from atom.models.deepseek_v2 import DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM
-from atom.models.glm4_moe import Glm4MoeForCausalLM
-from atom.models.minimax_m2 import MiniMaxM2ForCausalLM
-from atom.models.minimax_m3 import (
-    MiniMaxM3SparseForCausalLM,
-    MiniMaxM3SparseForConditionalGeneration,
-)
-from atom.models.qwen3 import Qwen3ForCausalLM
-from atom.models.qwen3_5 import (
-    Qwen3_5ForConditionalGenerationTextOnly,
-    Qwen3_5MoeForConditionalGenerationTextOnly,
-)
-from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
 
 logger = logging.getLogger("atom")
 
-_ATOM_SUPPORTED_MODELS = {
-    "Qwen3ForCausalLM": Qwen3ForCausalLM,
-    "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
-    "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
-    "DeepseekV32ForCausalLM": DeepseekV3ForCausalLM,
-    "GlmMoeDsaForCausalLM": GlmMoeDsaForCausalLM,
-    "MiniMaxM2ForCausalLM": MiniMaxM2ForCausalLM,
-    "MiniMaxM3SparseForCausalLM": MiniMaxM3SparseForCausalLM,
-    "MiniMaxM3SparseForConditionalGeneration": MiniMaxM3SparseForConditionalGeneration,
-    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
-    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
-}
+
+class _LazyModelRegistry(dict):
+    """Import only the requested architecture and its kernel dependencies."""
+
+    def __getitem__(self, name):
+        model = super().__getitem__(name)
+        if isinstance(model, str):
+            module_name, symbol = model.rsplit(":", 1)
+            model = getattr(import_module(module_name), symbol)
+            self[name] = model
+        return model
+
+
+_ATOM_SUPPORTED_MODELS = _LazyModelRegistry(
+    {
+        "Qwen3ForCausalLM": "atom.models.qwen3:Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM": "atom.models.qwen3_moe:Qwen3MoeForCausalLM",
+        "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
+        "DeepseekV3ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
+        "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
+        "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
+        "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGenerationTextOnly",
+        "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGenerationTextOnly",
+    }
+)
+
+if is_rtpllm():
+    from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+
+    _ATOM_SUPPORTED_MODELS["Qwen4ExpForConditionalGeneration"] = (
+        Qwen4ExpForConditionalGeneration
+    )
 
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM

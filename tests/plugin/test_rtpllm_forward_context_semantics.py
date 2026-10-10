@@ -1,10 +1,14 @@
 """Semantic checks for rtpllm forward-context bridge."""
 
+import importlib.util
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+
+import atom.config
 
 
 class _KwargsObject:
@@ -30,9 +34,9 @@ def _install_forward_context_stubs():
         sys.modules[name] = module
         return module
 
-    config = sys.modules["atom.config"]
+    config = atom.config
     config_attr = getattr(config, "get_current_atom_config", None)
-    config.get_current_atom_config = lambda: config.Config()
+    config.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=16)
 
     attention_gdn = stub(
         "atom.model_ops.attention_gdn",
@@ -76,8 +80,8 @@ def _install_forward_context_stubs():
     utils_forward_context._forward_kv_cache_context = SimpleNamespace(kv_cache_data={})
     utils_forward_context.reset_forward_context = lambda *args, **kwargs: None
     utils_forward_context.set_forward_context = lambda *args, **kwargs: None
-    utils_forward_context.get_forward_context = (
-        lambda *args, **kwargs: SimpleNamespace()
+    utils_forward_context.get_forward_context = lambda *args, **kwargs: (
+        SimpleNamespace()
     )
 
     def _set_kv_cache_data(value):
@@ -99,19 +103,26 @@ def _install_forward_context_stubs():
     return restore
 
 
-# The module under test binds these names at import time, so the stubs only
-# have to be in place across the import below -- and are put back immediately
-# after, because `sys.modules` is process-wide and the rest of the suite wants
-# the real ones.
-_restore_forward_context_stubs = _install_forward_context_stubs()
-
-from atom.plugin.rtpllm.utils.forward_context import (
-    RTPForwardContext,
-    RTPForwardMLAContext,
-    RTPForwardQwen35HybridContext,
+# Import a private copy so this test also works when another test has already
+# imported the production module. Its dependencies are stubbed only while the
+# private copy is loaded; the public module remains untouched.
+_MODULE_NAME = "atom.plugin.rtpllm.utils._forward_context_semantics_test"
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[2] / "atom/plugin/rtpllm/utils/forward_context.py"
 )
+_restore_forward_context_stubs = _install_forward_context_stubs()
+try:
+    _spec = importlib.util.spec_from_file_location(_MODULE_NAME, _MODULE_PATH)
+    assert _spec is not None and _spec.loader is not None
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules[_MODULE_NAME] = _module
+    _spec.loader.exec_module(_module)
+finally:
+    _restore_forward_context_stubs()
 
-_restore_forward_context_stubs()
+RTPForwardContext = _module.RTPForwardContext
+RTPForwardMLAContext = _module.RTPForwardMLAContext
+RTPForwardQwen35HybridContext = _module.RTPForwardQwen35HybridContext
 
 
 def _make_attn_inputs(
@@ -120,6 +131,7 @@ def _make_attn_inputs(
     prefix_lengths=None,
     sequence_lengths=None,
     sequence_lengths_plus_1_d=None,
+    sequence_lengths_plus_1_device=None,
     cu_seqlens=None,
     kv_cache_block_id_device=None,
     kv_cache_kernel_block_id_device=None,
@@ -131,6 +143,7 @@ def _make_attn_inputs(
         prefix_lengths=prefix_lengths,
         sequence_lengths=sequence_lengths,
         sequence_lengths_plus_1_d=sequence_lengths_plus_1_d,
+        sequence_lengths_plus_1_device=sequence_lengths_plus_1_device,
         cu_seqlens=cu_seqlens,
         kv_cache_block_id_device=kv_cache_block_id_device,
         kv_cache_kernel_block_id_device=kv_cache_kernel_block_id_device,
@@ -407,7 +420,7 @@ def test_rtpllm_decode_seq_lens_uses_rtp_plus_one_in_graph_and_eager_modes():
     eager_inputs = _make_attn_inputs(
         input_lengths=input_lengths,
         sequence_lengths=sequence_lengths,
-        sequence_lengths_plus_1_d=sequence_lengths_plus_1,
+        sequence_lengths_plus_1_device=sequence_lengths_plus_1,
         is_prefill=False,
     )
     eager_seq_lens = RTPForwardContext._build_seq_lens(
@@ -418,7 +431,7 @@ def test_rtpllm_decode_seq_lens_uses_rtp_plus_one_in_graph_and_eager_modes():
     graph_inputs = _make_attn_inputs(
         input_lengths=input_lengths,
         sequence_lengths=sequence_lengths,
-        sequence_lengths_plus_1_d=sequence_lengths_plus_1,
+        sequence_lengths_plus_1_device=sequence_lengths_plus_1,
         is_prefill=False,
         is_cuda_graph=True,
     )
@@ -632,7 +645,8 @@ def test_bind_temporarily_attaches_sparse_mla_indexer_cache(monkeypatch):
     ):
         assert mla_layer.kv_cache is layer_cache
         assert indexer.k_cache.kv_cache[0] is not old_index_cache
-        assert indexer.k_cache.kv_cache[0].shape == (32, 1, 144)
+        # The mocked KV base has 2 x 3 physical token slots.
+        assert indexer.k_cache.kv_cache[0].shape == (6, 1, 144)
 
     assert mla_layer.kv_cache is old_cache
     assert indexer.k_cache.kv_cache[0] is old_index_cache
