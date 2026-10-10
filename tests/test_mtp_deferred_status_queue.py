@@ -12,8 +12,13 @@ pytest.importorskip(
     exc_type=ImportError,
 )
 
-from atom.model_engine.model_runner import tokenIDProcessor
+from atom.model_engine.model_runner import (
+    ModelRunner,
+    _kv_config_has_producer,
+    tokenIDProcessor,
+)
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.utils.selector import Family
 
 
 def _prefill_batch(is_final_chunk: list[bool]) -> ScheduledBatch:
@@ -113,6 +118,180 @@ def _processor() -> tokenIDProcessor:
     return processor
 
 
+@pytest.mark.parametrize(
+    ("kv_config", "expected"),
+    [
+        ({}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_consumer"}, False),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, True),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                ],
+            },
+            True,
+        ),
+    ],
+)
+def test_detects_remote_prefill_producer(kv_config, expected):
+    assert _kv_config_has_producer(kv_config) is expected
+
+
+def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
+    runner = SimpleNamespace(
+        config=SimpleNamespace(pipeline_parallel_size=1, kv_transfer_config=kv_config),
+        attn_family=family,
+        device="cuda",
+    )
+    with (
+        mock.patch("atom.model_engine.model_runner.CpuGpuBuffer"),
+        mock.patch("atom.model_engine.model_runner.torch.cuda.Stream"),
+        mock.patch("atom.model_engine.model_runner.torch.zeros"),
+    ):
+        return tokenIDProcessor(runner, max_num_batched_tokens=8)
+
+
+def test_a_consumer_keeps_deferred_output():
+    """The other polarity of the sweep below, which fixes the role to producer.
+
+    Which config shapes read as a producer is `_kv_config_has_producer`'s
+    answer, pinned above; what is left for this layer is that the processor
+    asks it about `runner.config.kv_transfer_config` at all.
+    """
+    processor = _processor_for(
+        kv_config={"kv_role": "kv_consumer"}, family=Family.KIMI_MLA
+    )
+    assert processor.is_deferred_out is True
+
+
+@pytest.mark.parametrize(
+    ("family", "expected"),
+    [
+        (Family.KIMI_MLA, False),
+        (Family.QSA_GDN, False),
+        (Family.GDN, False),
+        (Family.V4, True),
+        (Family.MLA, True),
+        (Family.MHA, True),
+        (Family.CSA2, True),
+    ],
+)
+def test_only_recurrent_state_producers_give_up_deferred_output(family, expected):
+    """A paged write lands at T0's own position, so the consumer repeating it
+    changes nothing -- V4 and the other paged models stay on the path they
+    used before P/D handoff existed."""
+    processor = _processor_for(kv_config={"kv_role": "kv_producer"}, family=family)
+    assert processor.is_deferred_out is expected
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "expected"), [("kv_producer", True), ("kv_consumer", False)]
+)
+def test_the_processor_records_the_producer_role_whatever_the_state(kv_role, expected):
+    """The runner reads it to size its DP dummy and to scope its graph lookup,
+    and a paged producer -- which keeps deferred output -- is still one."""
+    processor = _processor_for(kv_config={"kv_role": kv_role}, family=Family.V4)
+    assert processor.is_pd_producer is expected
+
+
+def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
+    batch = object.__new__(ScheduledBatch)
+    batch.scheduled_tokens = np.array([11, 12, 13], dtype=np.int32)
+    batch.total_tokens_num = 3
+    batch.total_tokens_num_prefill = 0
+    batch.total_tokens_num_decode = 3
+    batch.total_seqs_num_prefill = 0
+    batch.total_seqs_num_decode = 3
+    batch.num_spec_step = num_spec_step
+    return batch
+
+
+def _recurrent_producer_processor() -> tokenIDProcessor:
+    """Non-deferred, and `use_spec` still on: the runner keeps the drafter."""
+    processor = _processor()
+    processor.is_deferred_out = False
+    processor.is_pipeline_parallel = False
+    processor.use_spec = True
+    return processor
+
+
+def test_a_non_deferred_decode_stages_the_scheduled_ids_as_they_are():
+    processor = _recurrent_producer_processor()
+
+    tokenIDProcessor.prepare_input_ids(processor, _decode_batch(num_spec_step=0), 1)
+
+    np.testing.assert_array_equal(processor.input_ids.np[:3], [11, 12, 13])
+    processor.input_ids.copy_to_gpu.assert_called_once_with(3)
+
+
+def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
+    """Nothing reaches it with drafts: PP verifies none locally and a producer
+    never speculates. Staging them here would size rows by `max_seqlen_q`,
+    which under DP is the group's maximum for a block drafter, not this
+    batch's row width."""
+    processor = _recurrent_producer_processor()
+
+    with pytest.raises(AssertionError, match="num_spec_step=3"):
+        tokenIDProcessor.prepare_input_ids(processor, _decode_batch(num_spec_step=3), 4)
+
+
+@pytest.mark.parametrize(("is_pd_producer", "expected_q"), [(False, 4), (True, 1)])
+def test_a_dp_dummy_runs_at_the_schedulers_query_width(is_pd_producer, expected_q):
+    """An idle rank's dummy is unified with its peers' decodes, so it must
+    match their height. A producer's peers decode at q=1 whatever its drafter's
+    `mtp_k`; a q=mtp_k+1 dummy beside them hands the uniform decode collectives
+    two different `running_tokens`."""
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.drafter = SimpleNamespace(mtp_k=3)
+    runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
+    runner.block_size = 16
+    runner.label = "runner"
+    seen = []
+    runner.forward = seen.append
+
+    ModelRunner.dummy_execution(runner)
+
+    (batch,) = seen
+    assert batch.is_dummy_run
+    assert batch.total_tokens_num == expected_q
+    assert batch.num_spec_step == expected_q - 1
+
+
+def _graph_runner(*, is_pd_producer: bool, drafter: bool = True) -> ModelRunner:
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
+    if drafter:
+        runner.drafter = SimpleNamespace(mtp_k=3)
+    runner.enforce_eager = False
+    runner._piecewise_cg_active = lambda: False
+    runner.graphs = {(8, 4): object()}
+    return runner
+
+
+def test_only_a_producer_with_a_drafter_may_miss_a_recording():
+    """Everywhere else a missing `(bs, q)` is a capture gap, and handing
+    `decide` no shapes keeps it a `KeyError` at replay instead of a silent
+    eager step."""
+    producer = _graph_runner(is_pd_producer=True)
+    assert set(ModelRunner._producer_graph_shapes(producer)) == {(8, 4)}
+
+    assert (
+        ModelRunner._producer_graph_shapes(_graph_runner(is_pd_producer=False)) is None
+    )
+    assert (
+        ModelRunner._producer_graph_shapes(
+            _graph_runner(is_pd_producer=True, drafter=False)
+        )
+        is None
+    )
+
+    producer.enforce_eager = True
+    assert ModelRunner._producer_graph_shapes(producer) is None
+
+
 def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
 
@@ -133,3 +312,81 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor.recv_mtp_status_async.assert_called_once_with()
     np.testing.assert_array_equal(processor.prev_rejected_num, [2])
     np.testing.assert_array_equal(processor.prev_bonus_num, [1])
+
+
+def test_deferred_decode_returns_the_flat_width_it_staged():
+    processor = object.__new__(tokenIDProcessor)
+    processor.input_ids = SimpleNamespace(
+        np=np.zeros(16, dtype=np.int32),
+        gpu=np.zeros(16, dtype=np.int32),
+        copy_to_gpu=mock.Mock(),
+    )
+    processor.decode_src = SimpleNamespace(
+        np=np.zeros(2, dtype=np.int32),
+        gpu=np.zeros(2, dtype=np.int32),
+        copy_to_gpu=mock.Mock(return_value=np.zeros(2, dtype=np.int32)),
+    )
+    input_ids_group = SimpleNamespace(
+        counts=[None, None],
+        indices={"input_ids": 0, "decode_src": 1},
+        publish=mock.Mock(),
+        check_writable=mock.Mock(),
+    )
+    processor.is_deferred_out = True
+    processor.prev_batch = object()
+    processor.use_spec = True
+    processor.prev_rejected_num = None
+    processor.prev_bonus_num = None
+    processor.pre_num_decode_token_per_seq = 1
+    processor.prev_token_ids = np.zeros(2, dtype=np.int32)
+    processor.draft_token_ids = None
+    cu_seqlens_q = np.array([0, 4, 8], dtype=np.int32)
+    forward_vars = {"cu_seqlens_q": SimpleNamespace(np=cu_seqlens_q, gpu=cu_seqlens_q)}
+    processor.runner = SimpleNamespace(
+        enforce_eager=True,
+        capture_sizes=[],
+        forward_vars=forward_vars,
+        h2d_groups={"input_ids": input_ids_group},
+        # Mirrors AttentionMetadataBuilder.decode_spans: the lengths and the
+        # cumsum come off the batch and the published buffer, not off a second
+        # copy this path keeps.
+        attn_metadata_builder=SimpleNamespace(
+            decode_spans=lambda b: (
+                b.total_seqs_num_decode,
+                b.num_scheduled_tokens[: b.total_seqs_num_decode],
+                forward_vars["cu_seqlens_q"].np[: b.total_seqs_num_decode + 1],
+            )
+        ),
+    )
+    processor.get_token_locations = mock.Mock(
+        return_value=SimpleNamespace(
+            deferred_curr=np.array([], dtype=np.int32),
+            deferred_prev=np.array([], dtype=np.int32),
+            new_curr=np.array([0, 1], dtype=np.int32),
+        )
+    )
+
+    batch = SimpleNamespace(
+        scheduled_tokens=np.arange(8, dtype=np.int32),
+        # Two q=4 rows, so the flat width is 8 and the request count is 2.
+        total_tokens_num=8,
+        total_tokens_num_prefill=0,
+        total_tokens_num_decode=8,
+        total_seqs_num_prefill=0,
+        total_seqs_num_decode=2,
+        num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
+        req_ids=[10, 11],
+        scheduled_spec_decode_tokens=np.arange(6, dtype=np.int32).reshape(2, 3),
+        num_rejected=np.zeros(2, dtype=np.int32),
+        num_bonus=np.zeros(2, dtype=np.int32),
+        produces_output=lambda: False,
+    )
+
+    with mock.patch(
+        "atom.model_engine.model_runner.fill_deferred_decode_ids"
+    ) as fill_ids:
+        result = tokenIDProcessor.prepare_input_ids(processor, batch, 4)
+
+    assert result.shape == (8,)
+    assert input_ids_group.counts == [8, 2]
+    fill_ids.assert_called_once()

@@ -98,6 +98,13 @@ class TestSplitZmqPath:
         assert scheme == "inproc"
         assert port == ""
 
+    def test_port_zero_is_a_port(self):
+        # "let the kernel pick" — the caller binds it and reads the port back.
+        scheme, host, port = split_zmq_path("tcp://*:0")
+        assert scheme == "tcp"
+        assert host == "*"
+        assert port == "0"
+
     def test_no_scheme_raises(self):
         with pytest.raises(ValueError, match="Invalid zmq path"):
             split_zmq_path("no-scheme-here")

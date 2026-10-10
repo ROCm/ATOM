@@ -189,6 +189,7 @@ def test_prefill_and_first_decode_ids_rotate_with_the_runner(monkeypatch, pp_siz
             total_tokens_num_prefill=2 if prefill else 0,
             total_tokens_num_decode=0 if prefill else 2,
             total_seqs_num_prefill=1 if prefill else 0,
+            num_spec_step=0,
             produces_output=lambda: False,
         )
         torch.cuda._sleep(2_000_000)
