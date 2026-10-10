@@ -179,6 +179,13 @@ class DeepseekV41ForCausalLM(nn.Module):
 
     block_cls = Block
 
+    # Layers whose input a DSpark draft reads, and the values collected there.
+    # Class attributes, not only instance ones: a model assembled without this
+    # constructor -- as the runtime-contract tests do, with `__new__` -- is
+    # still asked for them by `DeepseekV41RuntimeModel.forward`.
+    aux_hidden_state_layers: tuple[int, ...] = ()
+    _aux_hidden_states: list = []
+
     # Disk-name -> param-name rules for `atom.model_loader.loader.load_model`.
     # V4's two tables carry over as they are; V4.1 needs one rename V4's
     # substring dict cannot express safely, and one tensor class that is not a
@@ -258,10 +265,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.head = ParallelHead(config.vocab_size, config.hidden_size)
-        # Layers whose output a DSpark draft reads. Empty until a speculator
-        # asks for them, so a non-speculative forward collapses nothing extra.
-        self.aux_hidden_state_layers: tuple[int, ...] = ()
-        self._aux_hidden_states: list = []
+        # Instance copies of the class defaults below; the class ones exist so
+        # a model assembled without this constructor (tests build one with
+        # `__new__`) still answers the attribute rather than raising.
+        self.aux_hidden_state_layers = ()
+        self._aux_hidden_states = []
         self.window_rope = RotaryEmbedding(
             config.qk_rope_head_dim, max_length, base=config.rope_theta
         )

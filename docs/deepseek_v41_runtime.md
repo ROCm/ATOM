@@ -20,6 +20,10 @@ through end-to-end `lm_eval` evaluation.
 - `model_ops/engram/` prepares Engram rows after final GPU token IDs and restored
   state are available. There is no separate committed history map. Its host half
   (`mapping`, `tables`, `host`) imports without Triton; `device/` does not.
+- `runtime.py` compiles the forward as one graph (`_Backbone`), or as two split
+  after the last KV-source layer (`_EarlyLayers`, `_LateLayers`) under decoder
+  SWA bounded replay; `bounded_replay.py` builds the late layers' tail step
+  (below).
 - Scheduler consumes the existing generic `StateTransfer.copy` capability.
   The only scheduling change fixes cancellation of requests with no sampled
   output, including a middle prefill chunk and the first deferred step.
@@ -136,3 +140,37 @@ The [chat and tool protocol](deepseek_v41_protocol.md) and
 [vision and multimodal chunking](deepseek_v41_vision.md) are enabled
 independently of speculation. Host Engram lookup still reads final GPU IDs on
 the CPU; moving the lookup to HBM and fusing it further is future work.
+
+## Decoder SWA bounded replay
+
+Decoder SWA bounded replay is on by default; `--no-decoder-swa-bounded-replay`
+turns it off. It is SGLang's `--enable-decoder-swa-bounded-replay` and vLLM's
+`--swa-bounded-replay` (also on by default there). Layers 21..39 own no global KV,
+only their sliding-window rings, so after a prefill only each request's last
+ring of rows in them is ever read.
+
+With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
+as one graph (`runtime._Backbone`), as before. Otherwise the forward is two graphs split
+after the last KV-source layer (`_EarlyLayers`, `_LateLayers`, each with its
+own compile-cache key). A prefill runs the early graph on every row and the
+late graph on each request's last `ring_slots` rows (window + speculative
+tokens, 133 with five DSpark tokens), with a tail `BatchStep` whose
+`swa_replay_start` keeps the index build from reading window rows the late
+layers never wrote. Decode, warmup, draft, TBO, image and padded steps run
+both graphs on every row. After a replay only each request's last row of the
+model output is defined; the LM head reads only those.
+
+Accuracy: this is not a full prefill. In layer 21 the tail's rows see a
+window truncated at the tail start. The tail is only a few rows longer than
+the window, so from layer 22 on even the last token's window is made of rows
+computed from truncated windows, and the last token's logits and every ring
+row decode reads differ from a full prefill's in all 19 late layers. The
+global path (the KV-source layers' compressed KV and the top-k selections the
+late layers reuse) is exact. Measured on V4.1-Flash (TP2): GSM8K 3-shot
+92.2 with the flag vs 92.1 without (mean of three runs each on the two-graph
+build: 91.2 / 92.8 / 92.7 vs 92.5 / 91.4 / 92.3; run-to-run noise about 1 point); 40/40 on a 4K-60K-token long-context retrieval set either way.
+SGLang and vLLM make the same approximation.
+
+Cost: the early graph's every-row output is a graph input of the late one,
+so it lives until the late graph returns. On V4.1-Flash TP2 the profiled peak
+rises by about 0.8 GB (160.06 vs 159.28 GB), about 1% fewer KV entries.

@@ -132,6 +132,7 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
+    enable_decoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
@@ -502,6 +503,21 @@ class EngineArgs:
                 "rung costs the prompt that keeps it an extra prefill chunk, "
                 "and on measured traces the interval ladder is ~30x the writes "
                 "for reuse the other two placements already reach."
+            ),
+        )
+        parser.add_argument(
+            "--decoder-swa-bounded-replay",
+            "--enable-decoder-swa-bounded-replay",
+            dest="enable_decoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: in prefill, run the layers after the last "
+                "KV-source layer on each request's last window-ring rows only "
+                "(window + speculative tokens). Faster prefill; not numerically "
+                "equivalent to a full prefill. On by default, as vLLM's "
+                "--swa-bounded-replay; --no-decoder-swa-bounded-replay turns it "
+                "off. No effect on other models."
             ),
         )
         parser.add_argument(

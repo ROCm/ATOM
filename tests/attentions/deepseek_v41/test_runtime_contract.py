@@ -159,11 +159,11 @@ def test_vllm_plugin_text_path_is_admitted():
 @pytest.mark.parametrize(
     "override",
     [
-        # vLLM's proposer would have to drive ATOM's tentative staging; the
-        # proxy bridge drives a single target-only step.
+        # DSpark is admitted (see the test below); every other method still
+        # has no driver on this path.
         {
             "speculative_config": SimpleNamespace(
-                method="dspark", num_speculative_tokens=5
+                method="eagle3", num_speculative_tokens=5
             )
         },
         # CSA2 blocks are reusable only at whole-PAGE boundaries after the
@@ -175,6 +175,27 @@ def test_vllm_plugin_text_path_is_admitted():
 def test_vllm_plugin_refuses_what_the_bridge_cannot_drive(override):
     with pytest.raises(ValueError):
         validate_runtime_config(vllm_plugin_config(**override))
+
+
+def test_vllm_plugin_admits_dspark_speculation():
+    """vLLM owns the DSpark draft; the bridge owes only the CSA2 state a
+    verification step leaves behind, which it now stages and commits."""
+    validate_runtime_config(
+        vllm_plugin_config(
+            speculative_config=SimpleNamespace(
+                method="dspark", num_speculative_tokens=5, model=None
+            ),
+            # What `--kv-cache-dtype auto` resolves to for this model; the
+            # draft's own `fp8_ds_mla` lives in vLLM's speculative config, not
+            # here, because the two pools no longer share a CacheConfig.
+            kv_cache_dtype="bf16",
+            # The native DSpark knobs this gate reads; their defaults are off,
+            # and the dynamic-schedule branch below them is a native concern.
+            dspark=SimpleNamespace(
+                confidence_schedule=None, ragged=False, calibration_profile=None
+            ),
+        )
+    )
 
 
 def test_other_plugin_backends_are_still_refused_outright():
@@ -209,6 +230,17 @@ def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
             validate_runtime_config(
                 vllm_plugin_config(kv_transfer_config={"kv_connector": connector})
             )
+def _attach_uncompiled_backbone(model):
+    """The runtime model's one compiled graph, built bare and run uncompiled,
+    for a model assembled without its constructor."""
+    from atom.models.deepseek_v41 import runtime
+
+    model.replay = False
+    backbone = runtime._Backbone.__new__(runtime._Backbone)
+    torch.nn.Module.__init__(backbone)
+    backbone.do_not_compile = True
+    backbone.__dict__["owner"] = model
+    model.backbone = backbone
 
 
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
@@ -236,6 +268,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_backbone(model)
     # No layers are constructed: a step with no requests must not reach one.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert output.shape == (8, 64) and output.count_nonzero() == 0
@@ -285,6 +318,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_backbone(model)
     model(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
     assert seen == {name: {} for name in memos}
 

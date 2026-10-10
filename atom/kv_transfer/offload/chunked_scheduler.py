@@ -27,6 +27,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -268,6 +269,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if entry is not None and entry[0]() is seq:
                 continue
             if self._load_failed_seqs.get(sid) is seq:
+                continue
+            # Its lookup was consumed when it parked; a finished load moves it
+            # to the head before admission sets `offload_loaded`.
+            if getattr(seq, "status", None) == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if resumes_offload_prefill(seq):
                 continue
             if self._lookup_len(seq) <= 0:
                 continue

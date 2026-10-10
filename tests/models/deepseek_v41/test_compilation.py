@@ -195,7 +195,8 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
             assert not step.selected
             assert embeddings.events == ([] if empty else ["stage", "join"])
     if level == 3:
-        assert len(calls) == len(model.compiled_codes) == 1
+        # one graph, as before bounded replay: the flag is off
+        assert len(calls) == len(model.backbone.compiled_codes) == 1
     else:
         assert not calls
     assert tuple(model.state_dict()) == names == ("embed.weight",)

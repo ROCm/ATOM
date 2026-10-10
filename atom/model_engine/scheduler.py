@@ -42,6 +42,7 @@ from atom.model_engine.sequence import (
     SequenceStatus,
     SequenceType,
     new_token_ids,
+    resumes_offload_prefill,
 )
 from atom.model_engine.state_runtime import (
     DEFAULT_STATE_RUNTIME,
@@ -2415,14 +2416,7 @@ class Scheduler:
         ``BlockManager.allocate`` again for a sequence whose block table was
         allocated before it parked for the LMCache load.
         """
-        return (
-            self._connector_flag("is_offload")
-            and (
-                getattr(seq, "offload_loaded", False)
-                or getattr(seq, "offload_load_failed", False)
-            )
-            and len(seq.block_table) > 0
-        )
+        return self._connector_flag("is_offload") and resumes_offload_prefill(seq)
 
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""
