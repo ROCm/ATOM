@@ -364,6 +364,15 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
         batch = _v41_scheduled_batch(snapshot, slot_allocator, None)
     running_bs = num_reqs
     running_tokens = max(_v41_staged_running_tokens(), int(batch.total_tokens_num))
+    # Fetched before `_prepare`, not after. `_prepare` begins the step: it
+    # resets the slots this batch recycles and leaves the step on the cache.
+    # Bailing out after that and letting the forward stage the step again cost
+    # one cursor advance every time it happened, which is why a decode batch
+    # drifted further behind its own position the longer a run went -- four
+    # steps behind at request 146, ten by request 135 of the next run.
+    input_ids = _v41_step_input_ids(running_tokens)
+    if input_ids is None:
+        return None
     try:
         metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
     except ValueError as exc:
@@ -381,9 +390,6 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
             f"cache_slots={getattr(builder.cache, 'num_slots', None)} "
             f"spans={0 if tables is None else len(tables)}"
         ) from exc
-    input_ids = _v41_step_input_ids(running_tokens)
-    if input_ids is None:
-        return None
     try:
         builder.prepare_model_inputs(input_ids, metadata)
     except ValueError as exc:
@@ -703,6 +709,7 @@ def snapshot_v41_batch(common_attn_metadata):
         needed = -(-int(ends[i]) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
         row = block_table_np[i, :needed]
         block_rows.append(tuple(int(block) for block in row))
+    ids_from_patch = req_ids is not None
     if req_ids is None:
         # No pass-through patch: key on the request's first block, which vLLM
         # keeps for the request's lifetime.
@@ -710,6 +717,7 @@ def snapshot_v41_batch(common_attn_metadata):
     return SimpleNamespace(
         num_reqs=num_reqs,
         req_ids=req_ids,
+        ids_from_patch=ids_from_patch,
         query_lens=query_lens,
         num_computed=num_computed,
         ends=ends,
@@ -1130,6 +1138,13 @@ def _v41_request_ids_are_synthetic(snapshot) -> bool:
     fallback is only reached when the req_id pass-through patch is absent, and
     the row-divergence check next to it already governs that case.
     """
+    # Both keying modes make a repeat impossible for real traffic, which is
+    # why this does not ask which one produced the ids. With the pass-through
+    # patch they are vLLM's own request ids, unique in a step by construction.
+    # Without it `snapshot_v41_batch` keys on the request's first block, and
+    # two live requests cannot share one with prefix caching off. What does
+    # repeat is a block-less row -- and a scheduled request always owns at
+    # least one block, so those rows are not requests.
     ids = list(getattr(snapshot, "req_ids", None) or ())
     return bool(ids) and len(set(ids)) != len(ids)
 

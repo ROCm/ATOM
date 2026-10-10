@@ -49,6 +49,11 @@ logger = logging.getLogger("atom")
 _req_id_local = threading.local()
 
 
+def get_current_cudagraph_mode():
+    """The mode `prepare_attn` was called for, or None outside it."""
+    return getattr(_req_id_local, "cudagraph_mode", None)
+
+
 def get_current_input_batch():
     """Return the current step's vLLM ``InputBatch``, or None.
 
@@ -104,6 +109,14 @@ def _wrap_with_req_id_snapshot(cls, method_name: str, batch_from_arg=False) -> b
             args[0] if (batch_from_arg and args) else getattr(self, "input_batch", None)
         )
         _req_id_local.input_batch = batch
+        prev_mode = getattr(_req_id_local, "cudagraph_mode", None)
+        # `prepare_attn` is handed the mode it is preparing for. A model whose
+        # step work runs out here needs to know which one, because a FULL
+        # decode graph and a PIECEWISE one do not reach the forward the same
+        # way.
+        _req_id_local.cudagraph_mode = (
+            args[1] if (batch_from_arg and len(args) > 1) else None
+        )
         try:
             # Snapshot now: req_ids is already batch-reordered (swap_states ran
             # in _prepare_inputs) so it aligns with the per-request rows the
@@ -118,6 +131,7 @@ def _wrap_with_req_id_snapshot(cls, method_name: str, batch_from_arg=False) -> b
         finally:
             _req_id_local.req_ids = prev
             _req_id_local.input_batch = prev_batch
+            _req_id_local.cudagraph_mode = prev_mode
 
     wrapped._atom_req_id_passthrough_patched = True  # type: ignore[attr-defined]
     setattr(cls, method_name, wrapped)

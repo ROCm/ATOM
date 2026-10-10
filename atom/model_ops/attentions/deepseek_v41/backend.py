@@ -2,6 +2,7 @@
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
 import logging
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -55,6 +56,57 @@ logger = logging.getLogger("atom")
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
+
+
+def _blocking_state_probe() -> bool:
+    """Whether to render the stale-slot verdict in the step that asks for it.
+
+    `prepare_state` can ship the cursor rows asynchronously and judge them a
+    step later, which takes one blocking D2H (~58 us) off each decode step.
+    The deferred path is wrong under concurrency, and wrong in the direction
+    that costs most: it refuses correct state and takes the engine down.
+
+    Measured on the plugin path, FULL_AND_PIECEWISE, 64 concurrent GSM8K
+    requests, no KV connector of any kind:
+
+        needs state at 952, found 951
+
+    while the state-row dump for that same request, printed beside it, reads
+    `computed 953, cursor 953` -- self-consistent. The verdict is rendered
+    against a claim from one step and a `_probe` buffer that later steps have
+    already reused, so the two describe different moments.
+
+    Default on for the plugin path and off for the native one: that is where
+    the fault is observed, and the native engine drives its own scheduler.
+    `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
+
+    This is a guard, not a fix. The register slip in the deferred probe is
+    still not understood, and a check that fails closed on correct state is
+    worse than the microsecond it saves.
+    """
+    override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+    if override is not None and override != "":
+        return override not in ("0", "false", "False")
+    from atom.plugin import is_plugin_mode
+
+    return bool(is_plugin_mode())
+
+
+def _staging_advances(embeddings, step) -> bool:
+    """Whether this step's Engram rows carry a staging that advances the cursor.
+
+    `EngramStaging.start` does it on the way past; a plain mapping of rows has
+    no `stage` and does nothing. The caller needs the difference because the
+    advance has to happen exactly once, down one path or the other.
+    """
+    if getattr(embeddings, "stage", None) is None:
+        return False
+    # `EngramStaging._advance_cursor` stands down on a step that carries
+    # candidates -- a verify step's cursor belongs to the sampler. Asking only
+    # whether a `stage` exists left the same hole twice over: staging skipped
+    # the advance, the caller saw a `stage` and skipped it too, and neither
+    # thought it owed one.
+    return getattr(step, "candidates", None) is None
 
 
 def build_v41_pool_geometry(
@@ -774,7 +826,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=not on_device)
+            else cache.prepare_state(
+                step, histories=not on_device or _blocking_state_probe()
+            )
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
@@ -811,7 +865,19 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif staged is None and not metadata.dummy and not step.tentative:
+        elif (
+            not metadata.dummy
+            and not step.tentative
+            and not _staging_advances(embeddings, step)
+        ):
+            # Owed to `EngramStaging.start` only when there is a staging to do
+            # it. The condition used to be `staged is None`, which assumed the
+            # two always travel together -- and where they did not, the step
+            # advanced nothing at all: no error, no trace, the request simply
+            # one behind its own position for the rest of its life. Measured
+            # under FULL_AND_PIECEWISE at 64 concurrent requests, where every
+            # step deferred to staging and the ones without it leaked an
+            # advance each ("needs state at 828, found 818").
             cache.advance_cursor(step, histories)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True
