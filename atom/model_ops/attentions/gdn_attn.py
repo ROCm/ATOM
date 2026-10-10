@@ -88,6 +88,12 @@ class GDNAttentionMetadata:
     # from `non_spec_state_indices_tensor`. Same tensor otherwise; None on the
     # spec path, which never carries a fork.
     non_spec_state_indices_in_tensor: torch.Tensor | None = None
+    # Prefill-path state bookkeeping built once per step instead of once per
+    # GDN layer: `~has_initial_state`, and the write / read slots as int64 so
+    # index_copy_ / index_select take them without a per-layer cast.
+    no_initial_state: torch.Tensor | None = None
+    non_spec_state_indices_i64: torch.Tensor | None = None
+    non_spec_state_indices_in_i64: torch.Tensor | None = None
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -1207,6 +1213,13 @@ class GDNStateMixin(PoolRowsMixin):
         else:
             has_initial_state = None
 
+        no_initial_state = None
+        non_spec_state_indices_i64 = non_spec_state_indices_in_i64 = None
+        if has_initial_state is not None and non_spec_state_indices_tensor is not None:
+            no_initial_state = ~has_initial_state
+            non_spec_state_indices_i64 = non_spec_state_indices_tensor.long()
+            non_spec_state_indices_in_i64 = non_spec_state_indices_in_tensor.long()
+
         gdn_attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -1221,6 +1234,9 @@ class GDNStateMixin(PoolRowsMixin):
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_in_tensor=non_spec_state_indices_in_tensor,
+            no_initial_state=no_initial_state,
+            non_spec_state_indices_i64=non_spec_state_indices_i64,
+            non_spec_state_indices_in_i64=non_spec_state_indices_in_i64,
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
