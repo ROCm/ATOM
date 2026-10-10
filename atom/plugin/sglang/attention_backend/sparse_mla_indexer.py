@@ -1431,6 +1431,11 @@ def sparse_attn_indexer_sglang_plugin_mode(
         k_fp8 = indexer_graph_buffers.k_fp8
         k_scale = indexer_graph_buffers.k_scale
         gather_indptr = indexer_graph_buffers.gather_indptr
+        # Replay positions can still produce an end past the gathered window.
+        # top_k_per_row_prefill indexes KV with these ends. In-place so capture
+        # keeps the static buffer addresses.
+        cu_ends.clamp_(max=int(k_fp8.shape[0]))
+        torch.minimum(cu_starts, cu_ends, out=cu_starts)
     cp_gather_indexer_k_quant_cache(
         kv_cache,
         k_fp8,
