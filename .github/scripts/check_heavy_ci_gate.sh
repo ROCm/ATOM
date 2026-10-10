@@ -14,6 +14,7 @@ EVENT_NAME="${GITHUB_EVENT_NAME:-}"
 EVENT_PATH="${GITHUB_EVENT_PATH:-}"
 REPO="${GITHUB_REPOSITORY:-}"
 CI_GATE_LABELS="${CI_GATE_LABELS:-ci:full}"
+CURRENT_PR=""
 
 trim() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
@@ -37,7 +38,11 @@ label_is_allowed() {
 
 find_allowed_pr_label() {
   local labels label
-  labels="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+  if [ -n "${CURRENT_PR:-}" ]; then
+    labels="$(jq -r '.labels[]?.name // empty' <<< "${CURRENT_PR}")"
+  else
+    labels="$(jq -r '.pull_request.labels[]?.name // empty' "${EVENT_PATH}")"
+  fi
 
   if [ -z "${labels}" ] && [ -n "${REPO:-}" ] && [ -n "${PR_NUMBER:-}" ]; then
     labels="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name' 2>/dev/null || true)"
@@ -152,6 +157,67 @@ emit_decision() {
   fi
 }
 
+allow_heavy_ci() {
+  # Reviews release a gate; they are not requests to retry existing work.
+  # Workflow concurrency serializes these events with the original PR run.
+  # Explicit Actions reruns, labels and revision events retain their behavior.
+  if [ "${EVENT_NAME}" != "pull_request_review" ] \
+    || [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+    emit_decision "true" "$@"
+    return
+  fi
+
+  local head_sha head_ref head_repo runs run_ids run_id jobs started
+  head_sha="$(jq -r '.pull_request.head.sha // empty' "${EVENT_PATH}")"
+  head_ref="$(jq -r '.pull_request.head.ref // empty' "${EVENT_PATH}")"
+  head_repo="$(jq -r '.pull_request.head.repo.full_name // empty' "${EVENT_PATH}")"
+  if [ -z "${CI_GATE_WORKFLOW:-}" ] || [ -z "${GITHUB_RUN_ID:-}" ] || [ -z "${head_sha}" ]; then
+    emit_decision "false" "missing-run-context"
+    return
+  fi
+
+  if ! runs="$(gh api --paginate --slurp \
+    "repos/${REPO}/actions/workflows/${CI_GATE_WORKFLOW}/runs?head_sha=${head_sha}&per_page=100")"; then
+    emit_decision "false" "runs-query-failed"
+    return
+  fi
+  run_ids="$(jq -r --arg sha "${head_sha}" --arg branch "${head_ref}" --arg repo "${head_repo}" \
+    --argjson pr "${PR_NUMBER}" --argjson current "${GITHUB_RUN_ID}" '
+    .[].workflow_runs[]
+    | select(.id < $current and .head_sha == $sha and .head_branch == $branch)
+    | select(.event == "pull_request" or .event == "pull_request_review")
+    | select(any(.pull_requests[]?; .number == $pr) or
+        ((.pull_requests | length) == 0 and $repo != "" and .head_repository.full_name == $repo))
+    | .id' <<< "${runs}")"
+
+  while IFS= read -r run_id; do
+    [ -n "${run_id}" ] || continue
+    if ! jobs="$(gh api --paginate --slurp \
+      "repos/${REPO}/actions/runs/${run_id}/jobs?filter=all&per_page=100")"; then
+      emit_decision "false" "jobs-query-failed"
+      return
+    fi
+    # A successful workflow can contain only skipped GPU jobs. Check entry to
+    # the gated chain instead, across all attempts, including failures. Leaving
+    # the chain untouched also preserves successful cells of a partial failure.
+    if ! started="$(jq -r 'any(.[].jobs[]; .name == "Check Pre Checkin Signal" and .conclusion != "skipped")' <<< "${jobs}")"; then
+      emit_decision "false" "jobs-query-failed"
+      return
+    fi
+    if [ "${started}" = "true" ]; then
+      emit_decision "false" "heavy-ci-already-started"
+      echo "existing_run_id=${run_id}" >> "${OUTPUT_FILE}"
+      echo "Heavy CI already belongs to run ${run_id}; use an explicit rerun to retry it."
+      if [ -n "${SUMMARY_FILE}" ]; then
+        echo "- Existing heavy CI: https://github.com/${REPO}/actions/runs/${run_id}" >> "${SUMMARY_FILE}"
+      fi
+      return
+    fi
+  done <<< "${run_ids}"
+
+  emit_decision "true" "$@"
+}
+
 case "${EVENT_NAME}" in
   pull_request|pull_request_target|pull_request_review) ;;
   *)
@@ -170,17 +236,38 @@ PR_NUMBER="$(jq -r '.pull_request.number // empty' "${EVENT_PATH}")"
 IS_DRAFT="$(jq -r '.pull_request.draft // false' "${EVENT_PATH}")"
 BASE_REF="$(jq -r '.pull_request.base.ref // ""' "${EVENT_PATH}")"
 
-if [ "${BASE_REF}" != "main" ]; then
-  emit_decision "false" "non-main-base-branch"
-  exit 0
-fi
-
 if [ "${EVENT_NAME}" = "pull_request_review" ]; then
   REVIEW_STATE="$(jq -r '.review.state // ""' "${EVENT_PATH}")"
   if [ "${ACTION}" != "submitted" ] || [ "${REVIEW_STATE}" != "approved" ]; then
     emit_decision "false" "review-not-approved-event"
     exit 0
   fi
+fi
+
+# An approval can wait in the concurrency queue while the PR changes.
+# Never authorize obsolete code or labels from the original review payload.
+if [ "${EVENT_NAME}" = "pull_request_review" ] \
+  && [ -n "${PR_NUMBER}" ] && [ -n "${REPO}" ]; then
+  if ! CURRENT_PR="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"; then
+    emit_decision "false" "pr-query-failed"
+    exit 0
+  fi
+  if [ "$(jq -r '.state' <<< "${CURRENT_PR}")" != "open" ]; then
+    emit_decision "false" "pull-request-closed"
+    exit 0
+  fi
+  EXPECTED_HEAD_SHA="$(jq -r '.pull_request.head.sha // empty' "${EVENT_PATH}")"
+  if [ -z "${EXPECTED_HEAD_SHA}" ] || [ "$(jq -r '.head.sha // empty' <<< "${CURRENT_PR}")" != "${EXPECTED_HEAD_SHA}" ]; then
+    emit_decision "false" "stale-head-sha"
+    exit 0
+  fi
+  BASE_REF="$(jq -r '.base.ref' <<< "${CURRENT_PR}")"
+  IS_DRAFT="$(jq -r '.draft // false' <<< "${CURRENT_PR}")"
+fi
+
+if [ "${BASE_REF}" != "main" ]; then
+  emit_decision "false" "non-main-base-branch"
+  exit 0
 fi
 
 if [ "${ACTION}" = "closed" ]; then
@@ -198,7 +285,7 @@ NAME="${REPO#*/}"
 
 MATCHED_LABEL="$(find_allowed_pr_label || true)"
 if [ -n "${MATCHED_LABEL}" ]; then
-  emit_decision "true" "label-present" "${MATCHED_LABEL}"
+  allow_heavy_ci "label-present" "${MATCHED_LABEL}"
   exit 0
 fi
 
@@ -230,7 +317,7 @@ fi
 
 case "${REVIEW_DECISION}" in
   APPROVED)
-    emit_decision "true" "current-approval" "" "${REVIEW_DECISION}" "1" "0"
+    allow_heavy_ci "current-approval" "" "${REVIEW_DECISION}" "1" "0"
     ;;
   CHANGES_REQUESTED)
     emit_decision "false" "changes-requested" "" "${REVIEW_DECISION}" "0" "1"
