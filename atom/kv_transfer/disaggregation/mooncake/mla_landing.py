@@ -31,8 +31,15 @@ Protocol, per decode rank (every rank has its own pool and connector):
    request is reported only after all its stages ended, never on a timer: a
    stage still running may yet write the final KV pages directly (staged
    path, index regions), and reporting the failure lets the scheduler reuse
-   them. READY slots that arrive after a stage ended are dropped and their
-   credits returned, so they never reach the KV cache.
+   them. READY slots that arrive after the request failed or their stage
+   ended are dropped, so they never reach the KV cache. Each slot goes back
+   once: after its scatter, with its READY if that is dropped, or with the
+   write-done if its READY had not arrived by then. ZMQ keeps order only
+   within one connection, so a READY can still trail its write-done after a
+   reconnect; it then returns nothing. This holds while the write-done lists
+   every READY's slot at its seq, as the producer sends it. A malformed list
+   counts no READY lost, so a READY that arrives after its request retired
+   leaves its slot in flight on the stage.
 
 Credits never move between stages or ranks, so no slot is reused while a
 stage may still write it, and no side waits on another stream's progress.
@@ -76,8 +83,8 @@ MLA_LANDING_CREDIT_WAIT_S = 0.010
 _STATS_INTERVAL_S = 30.0
 # A failed request still waiting on a stage this long is logged once.
 _STALL_LOG_S = 30.0
-# A finished request's stage addresses are kept this long so READY slots that
-# arrive after it finished can still be dropped with their credit returned.
+# A finished request is remembered this long so READY slots that arrive after
+# it finished are dropped quietly; on_ready says why they return no credit.
 _TOMBSTONE_TTL_S = 600.0
 
 
@@ -271,11 +278,10 @@ class LandingReceiver:
 
         self._lock = threading.Lock()
         self._partitions: dict[str, list[int]] = {}
-        self._slot_owner: dict[int, str] = {}
         self._unassigned = list(range(pool_slots))
         self._warned_spent = False
         self._requests: dict[str, _Request] = {}
-        self._tombstones: dict[tuple[str, int], tuple[float, dict[int, str]]] = {}
+        self._tombstones: dict[tuple[str, int], float] = {}
         self._queue: queue.SimpleQueue[_Task] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._disabled = False
@@ -348,8 +354,6 @@ class LandingReceiver:
                     return None
                 del self._unassigned[:share]
                 self._partitions[stage_addr] = slots
-                for slot in slots:
-                    self._slot_owner[slot] = stage_addr
                 logger.info(
                     "[PD-LANDING] stage %s gets %d landing slots (%d unassigned)",
                     stage_addr,
@@ -413,9 +417,14 @@ class LandingReceiver:
         with self._lock:
             request = self._requests.get(req_id)
             if request is None or request.nonce != nonce:
-                # Retired or unknown: never scatter, but the slot's owner
-                # still gets it back.
-                credit_addr = self._slot_owner.get(slot)
+                # Retired or unknown: never scatter, and no credit goes back.
+                # A READY can trail its write-done across a reconnect, but
+                # each READY of a retired request was seen before its stage's
+                # write-done or counted lost by it, so its slot went back
+                # already, unless that write-done did not list it (a malformed
+                # list counts none lost): the slot then stays in flight on the
+                # stage. A READY of a request this rank never knew belongs to
+                # no transfer it tracks.
                 if (req_id, nonce) not in self._tombstones:
                     logger.warning(
                         "[PD-LANDING] READY for unknown req %s stage %d slot %d; "
@@ -436,7 +445,9 @@ class LandingReceiver:
                     )
                     self._fail_locked(request)
                 elif seq in stream.seen:
-                    pass  # duplicate; the first copy owns the credit
+                    # A duplicate: the first copy, or the write-done that
+                    # counted it lost, owns the credit.
+                    pass
                 elif request.failed or stream.done:
                     stream.seen.add(seq)
                     credit_addr = stream.stage_addr
@@ -511,11 +522,12 @@ class LandingReceiver:
                 )
                 landed_slots, success = None, False
             if landed_slots:
-                lost = [
-                    slot
-                    for seq, slot in enumerate(landed_slots)
-                    if seq not in stream.seen and slot in stream.slots
-                ]
+                for seq, slot in enumerate(landed_slots):
+                    if seq not in stream.seen and slot in stream.slots:
+                        # Returned here: its READY, if a reconnect reordered
+                        # it behind this write-done, is then a duplicate.
+                        stream.seen.add(seq)
+                        lost.append(slot)
                 credit_addr = stream.stage_addr
             if not success:
                 self._fail_locked(request)
@@ -556,7 +568,7 @@ class LandingReceiver:
                     request.stall_logged = True
                     running = [pp for pp, s in request.streams.items() if not s.done]
                     stalled.append((req_id, now - request.failed_at, running))
-            for key, (at, _) in list(self._tombstones.items()):
+            for key, at in list(self._tombstones.items()):
                 if now - at > _TOMBSTONE_TTL_S:
                     del self._tombstones[key]
             stats = None
@@ -771,10 +783,7 @@ class LandingReceiver:
 
     def _retire_locked(self, req_id: str, request: _Request) -> None:
         del self._requests[req_id]
-        self._tombstones[(req_id, request.nonce)] = (
-            time.monotonic(),
-            {pp: s.stage_addr for pp, s in request.streams.items()},
-        )
+        self._tombstones[(req_id, request.nonce)] = time.monotonic()
 
     def _send_credits(self, addr: str, slots: list[int]) -> None:
         payload = msgpack.dumps(

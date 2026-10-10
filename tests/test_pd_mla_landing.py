@@ -319,6 +319,42 @@ def test_duplicates_are_ignored_and_lost_ready_fails_the_request():
     assert dest.credits() == [("stage0", [slots[0]]), ("stage0", [slots[1]])]
 
 
+def test_a_ready_behind_its_write_done_returns_its_slot_once():
+    # ZMQ keeps order only within one connection: after a reconnect, a
+    # stage's write-done can overtake a READY still queued on the old one.
+    # The write-done returns the slot as lost; the READY must not return it
+    # again, or the stage could hand the slot to two transfers at once.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 2)["slots"]
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
+    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
+    assert dest.recv._queue.empty()
+    assert dest.credits() == []
+    assert dest.finished == []  # stage 1 may still be writing
+    dest.recv.stream_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == []
+
+
+def test_a_ready_after_its_request_retired_returns_nothing():
+    # The same reordered READY, arriving once every stage ended: the
+    # write-done that counted it lost already returned its slot.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 2)["slots"]
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
+    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    dest.recv.stream_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
+    assert dest.recv._queue.empty()
+    assert dest.credits() == []
+
+
 @pytest.mark.parametrize(
     "landed", [5, [[1]], "ab", [None]], ids=["int", "nested", "string", "none-slot"]
 )
@@ -338,7 +374,8 @@ def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     s1 = dest.recv.advertise("stage1", 2)["slots"]
     dest.recv.begin("r", 5, [1, 2, 3], {0: "stage0", 1: "stage1"}, 2)
-    dest.recv.stream_done("r", 1, 5, False, [])
+    dest.recv.stream_done("r", 1, 5, False, [s1[0]])
+    assert dest.credits() == [("stage1", [s1[0]])]
     assert dest.finished == []  # stage 0 may still be writing
     before = dest.regions[0].clone()
     rows = torch.ones((8, TOKEN_BYTES), dtype=torch.uint8)
@@ -348,9 +385,10 @@ def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     assert dest.credits() == [("stage0", [s0[0]])]
     dest.recv.stream_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == [("r", True)]
-    # A READY arriving after the request retired still returns its credit.
+    # A READY arriving after the request retired returns no credit: its
+    # stage's write-done already returned every slot it listed.
     dest.recv.on_ready(_ready("r", s1[0], 0, [[0, 0, 1, 0]], pp=1))
-    assert dest.credits() == [("stage1", [s1[0]])]
+    assert dest.credits() == []
     assert "r" not in dest.recv._requests
 
 
@@ -497,11 +535,16 @@ def test_scatter_errors_fail_the_slots_and_disable_landing():
     assert dest.recv.advertise("stage9", 1) is None
 
 
-def test_ready_for_an_unknown_request_returns_the_slot_to_its_owner():
+def test_ready_for_an_unknown_request_returns_nothing():
+    # It belongs to no transfer this rank tracks; returning its slot could
+    # free one the stage holds for another transfer.
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
     dest.recv.on_ready(_ready("ghost", s0[1], 0, [[0, 0, 1, 0]]))
-    assert dest.credits() == [("stage0", [s0[1]])]
+    dest.recv.on_ready(_ready("r", s0[1], 0, [[0, 0, 1, 0]], nonce=6))
+    assert dest.recv._queue.empty()
+    assert dest.credits() == []
 
 
 def test_a_failed_credit_send_still_reports_the_request():
