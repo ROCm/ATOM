@@ -37,6 +37,11 @@ on:
         required: false
         default: false
         type: boolean
+      inspect_gpu_nodes:
+        description: 'Read physical VRAM usage on up to two approved nodes using a CPU-only diagnostic job'
+        required: false
+        default: ''
+        type: string
       suite:
         description: 'Benchmark suite'
         required: false
@@ -238,12 +243,17 @@ jobs:
         env:
           SOURCE_RUN_ID: ${{ inputs.inspect_run_id }}
           INSPECT_PROCESSES: ${{ inputs.inspect_processes }}
+          INSPECT_GPU_NODES: ${{ inputs.inspect_gpu_nodes }}
         run: |
           set -euo pipefail
           [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]
           mkdir -p inspection
           date -u > inspection/collected-at.txt
           hostname > inspection/collector-host.txt
+          if [[ -n "${INSPECT_GPU_NODES}" ]]; then
+            bash .github/scripts/atomesh/pd_inspect_gpu_capacity.sh \
+              "${INSPECT_GPU_NODES}" > inspection/gpu-capacity.log 2>&1
+          fi
           timeout 15s srun --help > inspection/srun-help.txt 2>&1 || true
           timeout 10s scontrol --help > inspection/scontrol-help.txt 2>&1 || true
           IFS=',' read -r -a controllers <<< "${SPUR_CONTROLLER_ADDR:-}"
