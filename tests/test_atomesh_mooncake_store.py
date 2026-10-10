@@ -30,8 +30,7 @@ SERVER_SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_server_atom.sh"
 )
 
-PYTHON_STUB = textwrap.dedent(
-    """\
+PYTHON_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
     if [[ "${1:-}" == "-c" ]]; then
       if [[ "${2:-}" == "import mooncake.store" ]]; then
@@ -66,11 +65,9 @@ PYTHON_STUB = textwrap.dedent(
       *"/numa_memory_budget.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
     esac
     exit 0
-    """
-)
+    """)
 
-CURL_STUB = textwrap.dedent(
-    """\
+CURL_STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
     url="${*: -1}"
     case "${url}" in
@@ -90,8 +87,7 @@ CURL_STUB = textwrap.dedent(
         ;;
       *) exit 7 ;;
     esac
-    """
-)
+    """)
 
 # The image check only looks the Store binaries up on PATH; the launcher runs
 # them through numa_exec.py, which the python3 stub stands in for.
@@ -395,8 +391,7 @@ stop_mooncake_store
             source.index("start_prefill() {") : source.index("start_router() {")
         ]
         result = self.run_shell(
-            servers
-            + """
+            servers + """
 # Records each server's command line, one argument per line.
 start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
