@@ -1906,6 +1906,36 @@ reserved by the memory budget. At 0.90 it fits. This applies to the
 [AgentX launch](#server-launch-for-agentx) and to Config B too: their 0.94 is from the 0918-ep8 image,
 and this stack needs 0.90.
 
+### AgentX on this stack, dp8ep8
+
+[Config B](#config-b--agentic-throughput-agentx) on the launch of this section, with three changes:
+`--gpu-memory-utilization 0.90` (see above), `ATOM_MEGA_COMBINE_WIRE=fp4`, and DP 8 / EP 8 on two
+nodes. The rest is as written there: mori dispatch, `--max-num-batched-tokens 16384`,
+`--enable_prefix_caching`, `--fake-eplb`, `ATOM_DP_SESSION_AFFINITY=1`, `--max-num-seqs 8`. The client is
+Config B's aiperf command (concurrency 32, 1800 s, 3 warm-up requests per lane), plus
+`AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID=true` (and `AIPERF_HTTP_X_SESSION_ID_FROM_CORRELATION_ID=true`), and `--agentic-warmup-grace-period` in place of
+`--warmup-grace-period`, which agentic runs ignore. Measured 2026-10-10, default amdgpu parameters as above.
+
+Boot: `peak_torch=298.48GB cudagraph_est=5.05GB available_for_kv=54.36GB`. The 130 warm-up requests took
+17.6 min. Profiling: 1808.8 s, 66 requests completed, 41 cancelled at the window's end, 0 errors,
+`coverage passed: TTFT=75.6%, inter-token latency=100.0%`, `submission_valid=True`.
+
+| | dp8ep8, 8 GPUs, this stack | dp16ep16, 16 GPUs, 0918-ep8 ([AgentX result](#agentx-result)) |
+|---|---|---|
+| **Interactivity** p90 / avg / p50 (tok/s/user) | **2.31** / 0.85 / 0.48 | 2.53 / 1.07 / 0.53 |
+| **Total throughput** | **3301 tok/s, 413 per GPU** | 2913 tok/s, 182 per GPU |
+| **Prefix cache read** | 90.58% (95.4% theoretical) | 92.36% (94.68% theoretical) |
+| TTFT avg / p50 / p90 (s) | 55.5 / 44.9 / 101.8 | 198.6 / 125.0 / 445.0 |
+| Inter-token latency avg / p50 / p90 (s) | 1.82 / 2.07 / 2.37 | 1.42 / 1.90 / 1.99 |
+| Request latency avg / p50 (s) | 438 / 385 | 525 / 419 |
+| ISL / OSL avg (tok) | 91,813 / 210 | 100,926 / 212 |
+| Request throughput | 0.036 req/s | 0.029 req/s |
+
+Half the GPUs carry 13% more tokens, and TTFT is 3.6x lower on average, but every token after the first comes
+slower: inter-token latency is 28% higher, so interactivity p90 drops 9%. The two columns differ in
+stack, scale, driver parameters and utilization (0.90 against 0.94) at once, so none of these deltas can be
+pinned on one cause.
+
 ### Other things this run showed
 
 - **No tuned MoE GEMM for the shape.** Every rank logs
