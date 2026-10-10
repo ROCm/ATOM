@@ -11,7 +11,6 @@ import triton
 import triton.language as tl
 from aiter import QuantType
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.quant import per_group_quant_hip
 from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
@@ -119,6 +118,68 @@ def _fused_sigmoid_mul_fp8_group_quant_kernel(
 
 
 @triton.jit
+def _fused_sigmoid_mul_fp8_group_quant_tiled_kernel(
+    attn_ptr,
+    gate_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    M,
+    stride_attn_m,
+    stride_gate_m,
+    stride_fp8_m,
+    stride_scale_m,
+    stride_scale_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+):
+    """Prefill-shaped twin of _fused_sigmoid_mul_fp8_group_quant_kernel.
+
+    One program per BLOCK_M x BLOCK_N tile instead of per (row, 128-column
+    group), so a 16k-row prefill launches thousands of programs rather than
+    hundreds of thousands. Same arithmetic in the same order, so the FP8 values
+    and scales match the per-group kernel bit for bit. Rows are contiguous
+    (column stride 1); BLOCK_N divides N.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_mask = (rows < M)[:, None]
+    rows = rows.to(tl.int64)[:, None]
+
+    attn = tl.load(
+        attn_ptr + rows * stride_attn_m + cols[None, :], mask=row_mask, other=0.0
+    ).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + rows * stride_gate_m + cols[None, :], mask=row_mask, other=0.0
+    ).to(tl.float32)
+    x = tl.sigmoid(gate) * attn
+
+    x = x.reshape(BLOCK_M, NUM_QUANT_BLOCKS, QUANT_BLOCK_SIZE)
+    m = tl.maximum(tl.max(tl.abs(x), axis=-1), 1e-10)
+    scale_out = m.to(tl.float32) / FP8_MAX
+    scale_recip = 1.0 / scale_out.reshape(BLOCK_M, NUM_QUANT_BLOCKS, 1)
+    x = tl.clamp(x * scale_recip, FP8_MIN, FP8_MAX).reshape(BLOCK_M, BLOCK_N)
+
+    tl.store(
+        out_fp8_ptr + rows * stride_fp8_m + cols[None, :],
+        x.to(out_fp8_ptr.dtype.element_ty),
+        mask=row_mask,
+    )
+    scale_cols = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+    tl.store(
+        out_scale_ptr + rows * stride_scale_m + scale_cols[None, :] * stride_scale_n,
+        scale_out.to(out_scale_ptr.dtype.element_ty),
+        mask=row_mask,
+    )
+
+
+@triton.jit
 def _fused_sigmoid_mul_fp8_per_token_quant_kernel(
     # Input pointers
     attn_ptr,
@@ -201,6 +262,68 @@ def _fused_sigmoid_mul_fp8_per_token_quant(
         FP8_MAX=DTYPE_MAX,
         FP8_MIN=DTYPE_MIN,
     )
+    return out_fp8, out_scale
+
+
+def _group_quant_outputs(attn_output: Tensor, group_size: int, transpose_scale: bool):
+    """FP8 output and per-group scale buffers in the layout o_proj expects:
+    with transpose_scale the scale memory is column-major, viewed back as
+    (M, N // group_size) after the kernel."""
+    M, N = attn_output.shape
+    out_fp8 = torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device)
+    num_scale_cols = N // group_size
+    if transpose_scale:
+        out_scale = torch.empty(
+            (num_scale_cols, M), dtype=torch.float32, device=attn_output.device
+        )
+        return out_fp8, out_scale, out_scale.stride(1), out_scale.stride(0)
+    out_scale = torch.empty(
+        (M, num_scale_cols), dtype=torch.float32, device=attn_output.device
+    )
+    return out_fp8, out_scale, out_scale.stride(0), out_scale.stride(1)
+
+
+def fused_sigmoid_mul_fp8_quant_tiled(
+    attn_output: Tensor,
+    gate: Tensor,
+    group_size: int = 128,
+    transpose_scale: bool | None = None,
+    block_m: int = 16,
+    block_n: int = 512,
+    num_warps: int = 4,
+) -> tuple[Tensor, Tensor]:
+    """fused_sigmoid_mul_fp8_quant for many rows: same outputs, tiled grid."""
+    if transpose_scale is None:
+        from atom.utils import envs
+
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+    M, N = attn_output.shape
+    assert N % block_n == 0 and block_n % group_size == 0, (N, block_n, group_size)
+    assert attn_output.stride(1) == 1 and gate.stride(1) == 1
+    out_fp8, out_scale, stride_scale_m, stride_scale_n = _group_quant_outputs(
+        attn_output, group_size, transpose_scale
+    )
+    grid = (triton.cdiv(M, block_m), N // block_n)
+    _fused_sigmoid_mul_fp8_group_quant_tiled_kernel[grid](
+        attn_output,
+        gate,
+        out_fp8,
+        out_scale,
+        M,
+        attn_output.stride(0),
+        gate.stride(0),
+        out_fp8.stride(0),
+        stride_scale_m,
+        stride_scale_n,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        QUANT_BLOCK_SIZE=group_size,
+        FP8_MAX=DTYPE_MAX,
+        FP8_MIN=DTYPE_MIN,
+        num_warps=num_warps,
+    )
+    if transpose_scale:
+        out_scale = out_scale.view(M, N // group_size)
     return out_fp8, out_scale
 
 
@@ -309,22 +432,21 @@ def sigmoid_mul_fp8_group_quant(
     """sigmoid(gate) * attn_output as FP8 with per-1x128 scales, laid out as
     o_proj's own per_group_quant_hip would produce them.
 
-    Up to ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS rows this is the one-kernel
-    fused_sigmoid_mul_fp8_quant; above it, the elementwise gate and aiter's
-    per-group quant run separately, because the fused kernel's one program per
-    (row, 128-column group) grid is slower at prefill sizes (147 vs 87 us at
-    16384 rows, Qwen3.5 TP4 on MI355X).
+    Runs the tiled kernel with a tile picked from the row count -- 8 x 256 on
+    4 warps below 4096 rows, 8 x 1024 on 8 warps from there -- and is bit-identical to
+    fused_sigmoid_mul_fp8_quant, whose one program per (row, 128-column group)
+    grid falls behind as rows grow. GPU time, Qwen3.5 TP4 on MI355X, per-group
+    vs tiled: 24 rows 3.06 / 3.17 us, 384 rows 6.34 / 3.66 us, 16384 rows
+    147 / 30.6 us.
     """
-    from atom.utils import envs
-
-    if attn_output.shape[0] <= envs.ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS:
+    M, N = attn_output.shape
+    if attn_output.stride(1) != 1 or gate.stride(1) != 1 or N % 128:
         return fused_sigmoid_mul_fp8_quant(attn_output, gate)
-    gated = attn_output * torch.sigmoid(gate)
-    return per_group_quant_hip(
-        gated,
-        quant_dtype=fp8_dtype,
-        group_size=128,
-        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+    block_n, num_warps = (256, 4) if M < 4096 else (1024, 8)
+    while N % block_n:
+        block_n //= 2
+    return fused_sigmoid_mul_fp8_quant_tiled(
+        attn_output, gate, block_m=8, block_n=block_n, num_warps=num_warps
     )
 
 
