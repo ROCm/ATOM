@@ -584,6 +584,31 @@ resolve_flydsl_cache_dir() {
   echo "${private_dir}"
 }
 
+# Once AITER_JIT_DIR is set, aiter imports modules only from that dir, so a
+# fresh per-worker dir would JIT-rebuild every module the image already ships
+# (stalling the engine whenever a new one is first needed). Link the image's
+# prebuilt .so files in; modules it lacks still build into the writable dir.
+seed_aiter_jit_dir() {
+  local role="$1"
+  local dir="$2"
+  local src so linked=0
+
+  src="$(python3 -c 'import importlib.util as u, os; s = u.find_spec("aiter"); print(os.path.join(os.path.dirname(s.origin), "jit") if s else "")' 2>/dev/null || true)"
+  if [[ -n "${src}" && -d "${src}" && "${src}" != "${dir}" ]]; then
+    for so in "${src}"/*.so; do
+      [[ -r "${so}" ]] || continue
+      if [[ -e "${dir}/${so##*/}" ]] || ln -s "${so}" "${dir}/"; then
+        linked=$((linked + 1))
+      fi
+    done
+  fi
+  if (( linked > 0 )); then
+    echo "[runtime] ${role} aiter jit=${dir} (linked ${linked} prebuilt modules from ${src})" >&2
+  else
+    echo "[runtime] WARN: ${role} aiter jit=${dir} has no prebuilt modules linked; aiter JIT-builds modules on first use" >&2
+  fi
+}
+
 build_server_cache_env() {
   local role="$1"
   local server_port="$2"
@@ -594,6 +619,7 @@ build_server_cache_env() {
   cache_root="${cache_base}/${role}-${server_port}"
   mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
 
+  seed_aiter_jit_dir "${role}" "${cache_root}/aiter/jit"
   local flydsl_dir
   flydsl_dir="$(resolve_flydsl_cache_dir "${role}" "${cache_root}/flydsl")"
 
@@ -608,6 +634,10 @@ build_server_cache_env() {
   )
   echo "[runtime] ${role} cache root=${cache_root} (port=${server_port})"
 }
+
+if [[ -n "${AITER_JIT_DIR:-}" ]] && mkdir -p "${AITER_JIT_DIR}" 2>/dev/null; then
+  seed_aiter_jit_dir "container" "${AITER_JIT_DIR}"
+fi
 
 server_common=(
   --model "${MODEL_PATH}"
