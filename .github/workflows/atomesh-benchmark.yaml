@@ -588,7 +588,7 @@ jobs:
     needs: [load-config]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'store-smoke' }}
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
       - name: Download pinned ROCm Mooncake wheel

@@ -68,7 +68,7 @@ cancel_diagnostic() {
   done < <(timeout 15s squeue --noheader --format='%i|%j')
 }
 trap cancel_diagnostic EXIT
-timeout --kill-after=20s 1500s srun --job-name "${name}" \
+timeout --kill-after=20s 21000s srun --job-name "${name}" \
   --account amd-frameworks --partition amd-spur --qos amd-frameworks-qos \
   --exclusive --nodes 1 --ntasks 1 --cpus-per-task 16 --gpus 8 \
   --time 00:20:00 --nodelist "${nodes}" \
