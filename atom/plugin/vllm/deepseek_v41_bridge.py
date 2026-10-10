@@ -637,6 +637,38 @@ def register_deepseek_v41_proxy_layer(
     return proxy
 
 
+def _v41_scheduled_request_count(common_attn_metadata) -> int:
+    """How many rows of this batch are requests, padding excluded.
+
+    vLLM sizes the metadata it hands a builder differently per graph mode:
+    `DefaultModelState.prepare_attn` uses `num_reqs_after_padding` for a FULL
+    graph and `num_reqs` for everything else. Taking the number off the
+    metadata therefore means requests under PIECEWISE and requests-plus-
+    padding under FULL.
+
+    The padding rows carry no scheduled tokens, so `_prepare` drops them when
+    it builds the step's spans -- and `advance_cursor` then writes
+    `scheduled_bs` cursors into the *first* `scheduled_bs` slots, which are no
+    longer the slots those spans belong to once a padding row sits among them.
+    A live request's cursor was left at the step before its own, and the
+    refusal arrived hundreds of tokens later: 1159 wanted, 1158 found, under
+    FULL only, while PIECEWISE ran the whole dataset clean.
+
+    The input batch knows the unpadded count. Without the pass-through patch
+    there is no padding to subtract either, because that mode is the one vLLM
+    pads for, so the metadata's own number stands.
+    """
+    padded = int(common_attn_metadata.num_reqs)
+    try:
+        from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+        batch = get_current_input_batch()
+    except Exception:  # noqa: BLE001
+        return padded
+    scheduled = getattr(batch, "num_reqs", None)
+    return padded if scheduled is None else min(padded, int(scheduled))
+
+
 def snapshot_v41_batch(common_attn_metadata):
     """Host-side description of the step, with no device sync.
 
@@ -651,7 +683,7 @@ def snapshot_v41_batch(common_attn_metadata):
     stable for a request's lifetime, which is all the allocator needs, at the
     cost of the copy the patch exists to avoid.
     """
-    num_reqs = int(common_attn_metadata.num_reqs)
+    num_reqs = _v41_scheduled_request_count(common_attn_metadata)
     qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].numpy()
     query_lens = (qsl[1:] - qsl[:-1]).astype(np.int32)
 
