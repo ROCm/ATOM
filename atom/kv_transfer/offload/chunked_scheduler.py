@@ -80,7 +80,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # not order after. Named here rather than asserted because PP
             # offload has no supported configuration yet.
             logger.warning(
-                "LMCache offload scheduler: pipeline parallelism advances the "
+                "Offload scheduler: pipeline parallelism advances the "
                 "prefill frontier before the forward runs; dense saves may "
                 "include a chunk the producer fence does not cover"
             )
@@ -520,6 +520,26 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation=operation,
         )
 
+    def _build_load_request(
+        self,
+        seq,
+        load_spec: LoadSpec,
+        load_operation: LoadOperationId,
+        transfer_end: int,
+    ) -> LMCacheReqMeta:
+        """Describe one dispatched load of ``[hbm, transfer_end)`` to the worker.
+
+        Ships the prompt prefix the transfer covers, from which the worker
+        derives the chunk keys. A transport keyed differently overrides this.
+        """
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=list(seq.token_ids[:transfer_end]),
+            block_ids=list(seq.block_table),
+            load_spec=load_spec,
+            load_operation=load_operation,
+        )
+
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""
         del seq, saved
@@ -643,13 +663,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
             )
             meta.add_request(
-                LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[:transfer_end]),
-                    block_ids=list(seq.block_table),
-                    load_spec=ls,
-                    load_operation=load_operation,
-                )
+                self._build_load_request(seq, ls, load_operation, transfer_end)
             )
         meta.lookup_requests_in_step = [
             sid

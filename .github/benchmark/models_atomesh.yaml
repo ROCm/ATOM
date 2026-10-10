@@ -374,7 +374,7 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode:
+            decode: &glm52_cpp4_dcp4_decode_env
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               # Ranks share identical communicator groups instead of creating
               # duplicates, freeing decode memory for KV.
@@ -615,6 +615,98 @@ models:
             <<: *glm52_agentic_tp4_mtp5_decode
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+
+      # The nightly lmcache-1m cells with their prefix tier in a Mooncake Store
+      # and no LMCache anywhere: ATOM's mooncake_store offload connector moves
+      # each PP stage's 256-token KV chunks between its GPU and the Store, and
+      # the launcher starts the Store's master and owners on the prefill node
+      # (pd_server_atom.sh: MOONCAKE_STORE) and hands the prefill workers
+      # ATOM_KV_OFFLOAD=mooncake_store. Dispatch-only, never scheduled
+      # (suite=mooncake_store). The owner sizes and NICs fit pit2-p03 (TW
+      # MI355X) nodes only: about 1.5 TiB per NUMA node, NUMA1's NICs named
+      # rdma4-7 (Spur MI350X hosts name theirs ionic_N). Their own
+      # display_topology keeps them off the nightly cells' dashboard series.
+      mooncake_store:
+        - &glm52_agentic_mcstore_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c48
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE
+          concurrency: [48]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            # Restated: a merge cannot drop the nightly cells' LMCACHE_* keys.
+            prefill: &glm52_agentic_mcstore_cpp4_dcp4_env_prefill
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              VLLM_PP_LAYER_PARTITION: "20,20,20,18"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              MOONCAKE_STORE: "1"
+              # <numa>:<GiB>[:<rdma,...>] per owner, on NIC pairs of rdma4-7,
+              # disjoint from the stages' own NICs (their GPUs' rdma0-3) and
+              # from each other. Resize by overriding
+              # ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS, at most 832 GiB per
+              # owner (an ionic NIC's registration limit).
+              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              # The clean page cache of every model on the node goes before the
+              # owners pin huge pages, not just this one's: compaction would
+              # reclaim it otherwise.
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+            # The launcher adds MC_NUM_QP_PER_EP=1 for the P->D transfer engine.
+            decode: *glm52_cpp4_dcp4_decode_env
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c56
+          concurrency: [56]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c72
+          concurrency: [72]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c128
+          concurrency: [128]
+
+        # The same cells on two nodes that each give the job only GPUs 0-3
+        # with their NUMA node's memory and NICs (rdma0-3): the other half of
+        # each node belongs to another job. Prefill on the first node, decode
+        # on the second, both on GPUs 0-3. The Store pools both nodes' NUMA0
+        # memory, 4 x 240 GiB on each. Those owners must share the stages'
+        # NICs, so each NIC is a pool of its own (MOONCAKE_STORE_POOLS=per_nic):
+        # one master for all eight owners stalled reads for good. The page
+        # cache drop covers both nodes, the co-tenant's models included (page
+        # cache is per file, node-wide).
+        - &glm52_agentic_mcstore_2n_cpp4_dcp4
+          <<: *glm52_agentic_mcstore_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-2n-1m-c96
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-2N
+          pd_worker_layout: multi_node
+          concurrency: [96]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_mcstore_cpp4_dcp4_env_prefill
+              MOONCAKE_STORE_POOLS: "per_nic"
+              MOONCAKE_STORE_MASTER_NUMA: "0"
+              MOONCAKE_STORE_OWNERS: "0:240:rdma0;0:240:rdma1;0:240:rdma2;0:240:rdma3"
+              MOONCAKE_STORE_DECODE_OWNERS: "0:240:rdma0;0:240:rdma1;0:240:rdma2;0:240:rdma3"
+            decode:
+              <<: *glm52_cpp4_dcp4_decode_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+
+        - <<: *glm52_agentic_mcstore_2n_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-2n-1m-c112
+          concurrency: [112]
     accuracy:
       task: gsm8k
       fewshot: 20

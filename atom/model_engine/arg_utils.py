@@ -41,20 +41,26 @@ _OFFLOAD_CONNECTORS = frozenset(
         "lmcacheconnectorv1",
         "lmcache_mp",
         "lmcachempconnector",
+        "mooncake_store",
     }
 )
 
 
 # ATOM_KV_OFFLOAD value -> the offload connector it selects.
-_KV_OFFLOAD_MODES = {"lmcache": "lmcache_offload", "lmcache_mp": "lmcache_mp"}
+_KV_OFFLOAD_MODES = {
+    "lmcache": "lmcache_offload",
+    "lmcache_mp": "lmcache_mp",
+    "mooncake_store": "mooncake_store",
+}
 
 
 def kv_offload_connector_config(mode: str, extra_config: str) -> dict | None:
     """The offload connector ATOM_KV_OFFLOAD selects, or None when it is off.
 
-    ``lmcache`` is the in-process backend and ``lmcache_mp`` the standalone
-    ``lmcache server`` one. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes
-    the connector's ``kv_connector_extra_config``, which both backends read.
+    ``lmcache`` is the in-process LMCache backend, ``lmcache_mp`` the standalone
+    ``lmcache server`` one, and ``mooncake_store`` a Mooncake Store reached
+    without LMCache. ATOM_KV_OFFLOAD_EXTRA_CONFIG, a JSON object, becomes the
+    connector's ``kv_connector_extra_config``, which every backend reads.
     """
     mode = mode.strip().lower()
     if mode in ("", "0", "off", "none"):

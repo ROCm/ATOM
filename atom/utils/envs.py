@@ -148,11 +148,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
-    # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
-    # "lmcache_mp" (standalone `lmcache server`). Unset = off.
+    # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
+    # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
+    # Store, no LMCache). Unset = off.
     "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),
     # JSON object for that connector's kv_connector_extra_config, e.g.
-    # {"lmcache.chunk_size": 256} or {"lmcache.mp.port": 5556}.
+    # {"lmcache.chunk_size": 256}, {"lmcache.mp.port": 5556} or
+    # {"mooncake_store.master": "10.0.0.1:26051", ...}.
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),

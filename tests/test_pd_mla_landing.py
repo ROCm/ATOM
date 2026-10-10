@@ -988,7 +988,13 @@ def _listen(monkeypatch, mc, listener, messages):
                 raise _Stop
             return [b"peer", *messages.pop(0)]
 
-    monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(_Socket()))
+    def fake_socket(*_args, **_kwargs):
+        return nullcontext(_Socket())
+
+    # The producer's listener binds its own socket; the consumer's adopts the
+    # one bound when its port was chosen.
+    monkeypatch.setattr(mc, "zmq_socket_ctx", fake_socket)
+    monkeypatch.setattr(mc, "_owned_zmq_socket", fake_socket)
     with pytest.raises(_Stop):
         listener()
 
@@ -996,6 +1002,7 @@ def _listen(monkeypatch, mc, listener, messages):
 def _consumer(mc, dest):
     conn = object.__new__(mc.MooncakeConnector)
     conn._notification_port = 1
+    conn._notification_ctx = conn._notification_sock = None
     conn._mla_landing = dest.recv
     return conn
 

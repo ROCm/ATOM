@@ -52,6 +52,14 @@ PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
 PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
+# Mooncake Store (MOONCAKE_STORE=1): master RPC, its HTTP metadata and metrics
+# servers, and the owners' service ports (owner i uses the base + i). Below
+# the ephemeral port range (32768+), where an outgoing connection of this job
+# or another could hold one when a master or owner binds it.
+ATOMESH_MOONCAKE_MASTER_PORT="${ATOMESH_MOONCAKE_MASTER_PORT:-26051}"
+ATOMESH_MOONCAKE_METADATA_PORT="${ATOMESH_MOONCAKE_METADATA_PORT:-26080}"
+ATOMESH_MOONCAKE_METRICS_PORT="${ATOMESH_MOONCAKE_METRICS_PORT:-26090}"
+ATOMESH_MOONCAKE_OWNER_PORT="${ATOMESH_MOONCAKE_OWNER_PORT:-26052}"
 ATOMESH_EXECUTION_PHASE="${ATOMESH_EXECUTION_PHASE:-combined}"
 ATOMESH_SERVICE_PORT_OFFSET="${ATOMESH_SERVICE_PORT_OFFSET:-0}"
 case "${ATOMESH_EXECUTION_PHASE}" in
@@ -74,6 +82,10 @@ PREFILL_DP_MASTER_PORT=$((PREFILL_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 PREFILL_DP_BASE_PORT=$((PREFILL_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_DP_MASTER_PORT=$((DECODE_DP_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 DECODE_DP_BASE_PORT=$((DECODE_DP_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_MASTER_PORT=$((ATOMESH_MOONCAKE_MASTER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_METADATA_PORT=$((ATOMESH_MOONCAKE_METADATA_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_METRICS_PORT=$((ATOMESH_MOONCAKE_METRICS_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+ATOMESH_MOONCAKE_OWNER_PORT=$((ATOMESH_MOONCAKE_OWNER_PORT + ATOMESH_SERVICE_PORT_OFFSET))
 validate_shifted_port() {
   local name="$1"
   local value="${!name}"
@@ -94,6 +106,16 @@ for shifted_port_name in \
   DECODE_DP_BASE_PORT; do
   validate_shifted_port "${shifted_port_name}"
 done
+# The Store's ports only bound the offset when it runs (mooncake_store_requested).
+if [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE:-${MOONCAKE_STORE:-0}}" == "1" ]]; then
+  for shifted_port_name in \
+    ATOMESH_MOONCAKE_MASTER_PORT \
+    ATOMESH_MOONCAKE_METADATA_PORT \
+    ATOMESH_MOONCAKE_METRICS_PORT \
+    ATOMESH_MOONCAKE_OWNER_PORT; do
+    validate_shifted_port "${shifted_port_name}"
+  done
+fi
 unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
@@ -568,6 +590,7 @@ wait_http() {
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+    exit_if_mooncake_store_died
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
       wait "${pid}"
@@ -593,6 +616,7 @@ wait_router_closed() {
   while true; do
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
+      exit_if_mooncake_store_died
       if [[ -n "${server_pid:-}" ]] && ! kill -0 "${server_pid}" 2>/dev/null; then
         set +e
         wait "${server_pid}"
@@ -641,7 +665,9 @@ process_is_running() {
   if [[ -r "/proc/${pid}/stat" ]]; then
     state="$(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || true)"
     [[ -n "${state}" && "${state}" != "Z" ]]
-    return
+    # Not a bare return: in a function the EXIT trap runs, that returns the
+    # trap's $? (the exit status), and cleanup would then wait on live servers.
+    return $?
   fi
 
   kill -0 "${pid}" 2>/dev/null
@@ -661,6 +687,16 @@ terminate_process_group() {
   done
   if process_is_running "${pid}"; then
     kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    # A process in uninterruptible sleep (a GPU or RDMA teardown) outlives
+    # SIGKILL, and `wait` would block on it until the job's time limit.
+    deadline=$(( $(date +%s) + 30 ))
+    while process_is_running "${pid}" && [[ "$(date +%s)" -lt "${deadline}" ]]; do
+      sleep 1
+    done
+    if process_is_running "${pid}"; then
+      echo "[cleanup] WARNING: pid ${pid} is still running 30s after SIGKILL (state $(awk '{ print $3 }' "/proc/${pid}/stat" 2>/dev/null || echo '?')); not waiting for it" >&2
+      return 0
+    fi
   fi
   wait "${pid}" 2>/dev/null || true
 }
@@ -696,13 +732,806 @@ purge_lmcache_disk() {
   lmcache_disk_dir=""
 }
 
+# MOONCAKE_STORE=1 (prefill role env) gives this shell's prefill workers a
+# Mooncake Store as their KV offload tier: ATOM's mooncake_store offload
+# connector saves each PP stage's full chunks of a prompt to the Store, whose
+# memory belongs to owner processes started here, and loads a prefix hit back
+# over RDMA, with no CPU tier in the workers. Its settings, all in the prefill
+# role env, which a decode node reads as well:
+#  - MOONCAKE_STORE_OWNERS: one owner per "<numa>:<GiB>[:<rdma,...>]" entry,
+#    bound to that NUMA node by numa_exec.py; an entry without NICs serves on
+#    rdma4-rdma7. The default "0:768:rdma4,rdma5;1:768:rdma6,rdma7" fits
+#    pit2-p03 (TW MI355X) nodes: about 1.5 TiB per NUMA node, rdma4-7 on
+#    NUMA1. An owner above 832 GiB may not register on an ionic NIC. ATOM gives
+#    each prefill stage its GPU's NIC and, under one shared master, refuses one
+#    an owner uses: owners and requesters sharing NICs stall concurrent reads.
+#  - MOONCAKE_STORE_MASTER_NUMA (default 1): the NUMA node the masters run on.
+#  - MOONCAKE_STORE_POOLS=per_nic (default shared), for owners that must share
+#    the stages' NICs: one master per owner NIC, every owner on exactly one
+#    NIC, and each stage reads its own NIC's pool (mooncake_store.pools).
+#  - MOONCAKE_STORE_DECODE_OWNERS, in the same format: owners the decode node
+#    starts on its own memory, joining the prefill node's masters
+#    (pd_worker_layout multi_node, one prefill node and one decode node). The
+#    prefill workers start once every pool counts the owners of both nodes.
+#  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
+#    the owners pin huge pages under MPOL_BIND, so the clean page cache of
+#    these goes first; each node must then fit its pins with 128 GiB to spare,
+#    and is compacted for them (numa_memory_budget.py --compact).
+#  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
+#    compaction; a node that does not compact in time can leave an owner 4 KiB
+#    pages its NICs refuse to register.
+#  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
+#    Store once this node has compacted: for every pool to count its owners,
+#    and on a decode node for the prefill node's masters. A wait on the other
+#    node's part also allows for that node's compaction, which its Store waits
+#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+# Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
+# transfer engine included (peers with different QP counts cannot connect).
+# The launcher owns the workers' ATOM_KV_OFFLOAD and
+# ATOM_KV_OFFLOAD_EXTRA_CONFIG, so PREFILL_KV_TRANSFER_CONFIG names the P/D
+# connector only. A node runs one Store, for one prefill worker whose GPUs its
+# owners' NICs are placed around, so a layout that starts several prefill
+# workers on one node is refused. validate_mooncake_store_settings refuses a
+# conflicting setting, or an image without the Store, before the node starts
+# anything. Master and owners start before the workers, which connect (and
+# round-trip a probe chunk) while they build their engines and never retry,
+# and stop after them. A Store lives as long as this shell: its objects
+# outlive a worker restart, not the job.
+mooncake_store_pids=()
+mooncake_store_logs=()
+mooncake_store_names=()
+# Exit status of the first Store failure: a process that died before it was
+# stopped, or owner capacity the master lost during the run.
+mooncake_store_failed_rc=""
+mooncake_page_cache_dropper_pid=""
+mooncake_owner_plan_numa=()
+mooncake_owner_plan_gib=()
+mooncake_owner_plan_devices=()
+# One entry per pool, numbered alike on every node: its NIC under per_nic (""
+# for the one shared pool), and the segment bytes its master counts once the
+# owners of every node have mounted.
+mooncake_pool_devices=()
+mooncake_pool_capacity=()
+# The first entries of mooncake_store_pids are this node's masters: one per
+# pool on the prefill node, none on a decode node.
+mooncake_store_master_count=0
+# Set once every pool counts its planned capacity, and once the masters'
+# metrics of the run are saved.
+mooncake_store_ready=0
+mooncake_store_metrics_saved=0
+# The prefill workers' env for the running Store, set by start_mooncake_store.
+mooncake_store_prefill_env=()
+
+# The prefill role env asks for it; the decode role reads the same variable
+# from ATOMESH_PREFILL_ENV_ on any node.
+mooncake_store_requested() {
+  [[ "${ATOMESH_PREFILL_ENV_MOONCAKE_STORE:-${MOONCAKE_STORE:-0}}" == "1" ]]
+}
+
+# mooncake_setting <name> [default]: a Store setting of the prefill role env,
+# read the same way on a decode node, where only ATOMESH_PREFILL_ENV_<name>
+# carries it.
+mooncake_setting() {
+  local prefixed="ATOMESH_PREFILL_ENV_$1"
+  local plain="$1"
+  printf '%s' "${!prefixed:-${!plain:-${2:-}}}"
+}
+
+# mooncake_pool_port <base port> <pool>: the pool's master, metadata or
+# metrics port, 100 apart so the owners' service ports stay clear.
+mooncake_pool_port() {
+  echo $(( $1 + 100 * $2 ))
+}
+
+# mooncake_pool_suffix <pool>: the pool's log and metrics file suffix; none
+# for the one shared pool.
+mooncake_pool_suffix() {
+  if [[ "${#mooncake_pool_devices[@]}" -gt 1 || -n "${mooncake_pool_devices[0]:-}" ]]; then
+    printf -- '-pool%s' "$1"
+  fi
+}
+
+# Every Mooncake process needs one QP per endpoint; refuses any other value.
+require_mooncake_qp_per_endpoint() {
+  if [[ -n "${MC_NUM_QP_PER_EP:-}" && "${MC_NUM_QP_PER_EP}" != "1" ]]; then
+    echo "[mooncake-store][FAIL] MC_NUM_QP_PER_EP=${MC_NUM_QP_PER_EP}: the Mooncake Store needs 1 in every Mooncake process, P->D included" >&2
+    exit 2
+  fi
+}
+
+# Each Store client and owner is given its NICs: a prefill worker the GPU's
+# own, an owner its --device_names. MC_MS_AUTO_DISC=1 makes Mooncake take every
+# NIC of the node instead, which stalls concurrent reads; the workers refuse it
+# only once their model has loaded.
+refuse_mooncake_nic_auto_discovery() {
+  local auto_discovery="${MC_MS_AUTO_DISC:-}"
+  if [[ "${auto_discovery//[[:space:]]/}" == "1" ]]; then
+    echo "[mooncake-store][FAIL] MC_MS_AUTO_DISC=1 makes the Store's clients and owners use every NIC instead of the ones they are given; unset it" >&2
+    exit 2
+  fi
+}
+
+# parse_mooncake_owner_spec <setting> <numa[]> <gib[]> <devices[]>: appends
+# the "<numa>:<GiB>[:<rdma,...>]" entries of MOONCAKE_STORE_OWNERS or
+# MOONCAKE_STORE_DECODE_OWNERS to the named arrays, an entry without NICs on
+# rdma4-rdma7; exits 2 on an invalid configuration.
+parse_mooncake_owner_spec() {
+  local setting="$1"
+  local -n numa_out="$2"
+  local -n gib_out="$3"
+  local -n devices_out="$4"
+  local default_spec=""
+  if [[ "${setting}" == "MOONCAKE_STORE_OWNERS" ]]; then
+    default_spec="0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+  fi
+  local spec
+  spec="$(mooncake_setting "${setting}" "${default_spec}")"
+  local device_list='[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'
+  local -a entries=()
+  IFS=';' read -r -a entries <<< "${spec}"
+  if [[ "${#entries[@]}" -eq 0 ]]; then
+    echo "[mooncake-store][FAIL] ${setting} is empty" >&2
+    exit 2
+  fi
+  local entry
+  for entry in "${entries[@]}"; do
+    if [[ ! "${entry}" =~ ^([0-9]+):([0-9]+)(:(${device_list}))?$ ]] \
+      || (( 10#${BASH_REMATCH[2]} == 0 )); then
+      echo "[mooncake-store][FAIL] ${setting} entry '${entry}' is not <numa>:<GiB>[:<rdma,...>] with GiB > 0" >&2
+      exit 2
+    fi
+    numa_out+=("$(( 10#${BASH_REMATCH[1]} ))")
+    gib_out+=("$(( 10#${BASH_REMATCH[2]} ))")
+    devices_out+=("${BASH_REMATCH[4]:-rdma4,rdma5,rdma6,rdma7}")
+  done
+}
+
+# plan_mooncake_store_owners [setting]: fills the mooncake_owner_plan_* arrays
+# with this node's owners, MOONCAKE_STORE_OWNERS on the prefill node (the
+# default) or MOONCAKE_STORE_DECODE_OWNERS on a decode node.
+plan_mooncake_store_owners() {
+  mooncake_owner_plan_numa=()
+  mooncake_owner_plan_gib=()
+  mooncake_owner_plan_devices=()
+  parse_mooncake_owner_spec "${1:-MOONCAKE_STORE_OWNERS}" \
+    mooncake_owner_plan_numa mooncake_owner_plan_gib mooncake_owner_plan_devices
+}
+
+# Fills mooncake_pool_devices and mooncake_pool_capacity from the owners of
+# every node, numbering the pools alike on each; exits 2 on an invalid setting.
+plan_mooncake_store_pools() {
+  local mode
+  mode="$(mooncake_setting MOONCAKE_STORE_POOLS shared)"
+  local -a numa=() gib=() devices=()
+  parse_mooncake_owner_spec MOONCAKE_STORE_OWNERS numa gib devices
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS numa gib devices
+  fi
+  mooncake_pool_devices=()
+  mooncake_pool_capacity=()
+  local i device bytes
+  case "${mode}" in
+    shared)
+      bytes=0
+      for i in "${!gib[@]}"; do
+        bytes=$(( bytes + gib[i] * 1024 * 1024 * 1024 ))
+      done
+      mooncake_pool_devices=("")
+      mooncake_pool_capacity=("${bytes}")
+      ;;
+    per_nic)
+      for i in "${!devices[@]}"; do
+        if [[ "${devices[i]}" == *,* ]]; then
+          echo "[mooncake-store][FAIL] MOONCAKE_STORE_POOLS=per_nic gives each NIC a pool of its own, so every owner needs exactly one NIC; ${numa[i]}:${gib[i]}:${devices[i]} names several" >&2
+          exit 2
+        fi
+      done
+      while read -r device; do
+        bytes=0
+        for i in "${!devices[@]}"; do
+          if [[ "${devices[i]}" == "${device}" ]]; then
+            bytes=$(( bytes + gib[i] * 1024 * 1024 * 1024 ))
+          fi
+        done
+        mooncake_pool_devices+=("${device}")
+        mooncake_pool_capacity+=("${bytes}")
+      done < <(printf '%s\n' "${devices[@]}" | sort -u -V)
+      ;;
+    *)
+      echo "[mooncake-store][FAIL] MOONCAKE_STORE_POOLS=${mode} is neither shared nor per_nic" >&2
+      exit 2
+      ;;
+  esac
+  local base port last=$(( ${#mooncake_pool_devices[@]} - 1 ))
+  for base in ATOMESH_MOONCAKE_MASTER_PORT ATOMESH_MOONCAKE_METADATA_PORT ATOMESH_MOONCAKE_METRICS_PORT; do
+    port="$(mooncake_pool_port "${!base}" "${last}")"
+    if (( port > 65535 )); then
+      echo "[mooncake-store][FAIL] pool ${last}'s port ${base} + 100 x ${last} = ${port} is outside the valid TCP port range" >&2
+      exit 2
+    fi
+  done
+}
+
+# The owners' devices, each once, in plan order.
+mooncake_owner_devices_csv() {
+  local devices csv="" device
+  for devices in "${mooncake_owner_plan_devices[@]}"; do
+    for device in ${devices//,/ }; do
+      [[ ",${csv}," == *",${device},"* ]] || csv+="${csv:+,}${device}"
+    done
+  done
+  printf '%s' "${csv}"
+}
+
+# kv_transfer_offload_connector <kv-transfer-config JSON>: prints the first
+# offload connector the config names, matched by name or alias as ATOM matches
+# them (atom/model_engine/arg_utils.py, _OFFLOAD_CONNECTORS: any case, outer
+# whitespace ignored); fails when it names none.
+kv_transfer_offload_connector() {
+  local config="${1,,}" name
+  config="${config//[[:space:]]/}"
+  for name in lmcache_offload lmcacheoffloadconnector lmcacheconnectorv1 \
+    lmcache_mp lmcachempconnector mooncake_store; do
+    if [[ "${config}" == *"\"kv_connector\":\"${name}\""* ]]; then
+      printf '%s' "${name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# require_mooncake_store_number <name> <default> <kind>: refuses a numeric
+# Store setting that is not one of its kind, before anything starts. The
+# helpers and bash arithmetic would misread it later: a compaction timeout of 0
+# skips the compaction, and a wait timeout bash cannot add aborts the wait
+# without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
+# and positive (a decimal).
+require_mooncake_store_number() {
+  local name="$1" value valid=0
+  value="$(mooncake_setting "$1" "$2")"
+  case "$3" in
+    positive_integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && ((10#${value} > 0)) && valid=1 ;;
+    integer) [[ "${value}" =~ ^[0-9]{1,15}$ ]] && valid=1 ;;
+    positive) [[ "${value}" =~ ^[0-9]{1,15}([.][0-9]+)?$ && "${value}" =~ [1-9] ]] && valid=1 ;;
+  esac
+  if ((!valid)); then
+    echo "[mooncake-store][FAIL] ${name}=${value} is not a ${3//_/ } number" >&2
+    exit 2
+  fi
+}
+
+# Refuses a prefill setting the Store cannot run with, and fills the owner
+# plan. Independent of the node: the owners' devices and memory are checked
+# where the Store starts.
+check_mooncake_store_settings() {
+  local name
+  for name in ATOM_KV_OFFLOAD ATOM_KV_OFFLOAD_EXTRA_CONFIG; do
+    if [[ -n "${!name:-}" ]]; then
+      echo "[mooncake-store][FAIL] ${name} is set by the launcher under MOONCAKE_STORE=1; remove it from the case" >&2
+      exit 2
+    fi
+  done
+  local connector
+  if connector="$(kv_transfer_offload_connector "${PREFILL_KV_TRANSFER_CONFIG:-}")"; then
+    echo "[mooncake-store][FAIL] PREFILL_KV_TRANSFER_CONFIG names the offload connector ${connector}; under MOONCAKE_STORE=1 the launcher adds mooncake_store through ATOM_KV_OFFLOAD, and a worker runs one offload connector, so keep only the P/D connector there" >&2
+    exit 2
+  fi
+  require_mooncake_qp_per_endpoint
+  refuse_mooncake_nic_auto_discovery
+  local layout="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}" num_prefill="${xP:-1}" num_decode="${yD:-1}"
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] \
+    && [[ "${layout}" != "multi_node" || "${num_prefill}" != "1" || "${num_decode}" != "1" ]]; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_DECODE_OWNERS needs the decode on nodes of its own (pd_worker_layout multi_node, here ${layout}), one prefill node (here ${num_prefill}), whose masters they join, and one decode node (here ${num_decode}): the pools count the decode owners once" >&2
+    exit 2
+  fi
+  # This shell starts one Store, planned for its first prefill worker's GPUs;
+  # a second worker would find it only once the first is up. The packed
+  # layout's node of each prefill worker is in prefill_nodes.
+  local workers_on_a_node=1 node
+  local -A prefill_workers_on=()
+  case "${layout}" in
+    prefill_single_node) workers_on_a_node="${num_prefill}" ;;
+    packed_nodes)
+      for node in ${prefill_nodes[@]+"${prefill_nodes[@]}"}; do
+        prefill_workers_on[${node}]=$(( ${prefill_workers_on[${node}]:-0} + 1 ))
+        if (( ${prefill_workers_on[${node}]} > workers_on_a_node )); then
+          workers_on_a_node="${prefill_workers_on[${node}]}"
+        fi
+      done
+      ;;
+  esac
+  if (( workers_on_a_node > 1 )); then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
+    exit 2
+  fi
+  require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
+  require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
+  require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
+  plan_mooncake_store_owners
+  plan_mooncake_store_pools
+}
+
+# The image must carry the Store: the master and owner binaries, which only a
+# Mooncake built WITH_STORE=ON installs, and the mooncake.store module the
+# prefill workers' connector imports. Without them a Store process would only
+# "exit unexpectedly", or the workers fail late in their startup.
+check_mooncake_store_image() {
+  local binary
+  for binary in mooncake_master mooncake_client; do
+    if ! command -v "${binary}" >/dev/null 2>&1; then
+      echo "[mooncake-store][FAIL] ${binary} is not on PATH: MOONCAKE_STORE=1 needs an image whose Mooncake is built WITH_STORE=ON" >&2
+      exit 2
+    fi
+  done
+  local import_error
+  if ! import_error="$(python3 -c 'import mooncake.store' 2>&1)"; then
+    printf '%s\n' "${import_error}" >&2
+    echo "[mooncake-store][FAIL] python3 cannot import mooncake.store, which the prefill workers' mooncake_store connector needs" >&2
+    exit 2
+  fi
+}
+
+# Runs before this node starts anything: the prefill settings as start_prefill
+# will see them, the decode's QP count as start_decode will, and the image.
+# Each role env is applied in a subshell, so none of it stays in this shell.
+validate_mooncake_store_settings() {
+  # Before the switch check, so a decode-only MOONCAKE_STORE is caught too.
+  local name
+  while IFS='=' read -r name _; do
+    if [[ "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE \
+      || "${name}" == ATOMESH_DECODE_ENV_MOONCAKE_STORE_* ]]; then
+      echo "[mooncake-store][FAIL] ${name}: the Mooncake Store settings belong to the prefill role env (ATOMESH_PREFILL_ENV_), which every node reads; in the decode role env only the decode node would see them" >&2
+      exit 2
+    fi
+  done < <(env)
+  mooncake_store_requested || return 0
+  (
+    apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+    check_mooncake_store_settings
+  )
+  (
+    # The decode node's owners start from the decode role env.
+    apply_role_env "ATOMESH_DECODE_ENV_" "${host_ip}"
+    require_mooncake_qp_per_endpoint
+    refuse_mooncake_nic_auto_discovery
+  )
+  check_mooncake_store_image
+}
+
+# Every owner device needs an ACTIVE port, and one owner's devices must sit on
+# one NUMA node: Mooncake spreads a segment over the nodes of its NICs,
+# overriding numa_exec.py's binding.
+check_mooncake_owner_devices() {
+  local ib_root="${ATOMESH_IB_SYSFS_ROOT:-/sys/class/infiniband}"
+  local i device node nodes
+  for i in "${!mooncake_owner_plan_devices[@]}"; do
+    nodes=""
+    for device in ${mooncake_owner_plan_devices[i]//,/ }; do
+      if [[ ! -e "${ib_root}/${device}" ]]; then
+        echo "[mooncake-store][FAIL] owner${i} RDMA device ${device} is not in ${ib_root}" >&2
+        exit 2
+      fi
+      if ! grep -qs '^4:' "${ib_root}/${device}"/ports/*/state; then
+        echo "[mooncake-store][FAIL] owner${i} RDMA device ${device} has no ACTIVE port" >&2
+        exit 2
+      fi
+      node="$(cat "${ib_root}/${device}/device/numa_node" 2>/dev/null || echo '?')"
+      [[ " ${nodes} " == *" ${node} "* ]] || nodes+="${nodes:+ }${node}"
+    done
+    if [[ "${nodes}" == *" "* ]]; then
+      echo "[mooncake-store][FAIL] owner${i}'s RDMA devices ${mooncake_owner_plan_devices[i]} sit on NUMA nodes ${nodes}: Mooncake would spread its segment over them instead of keeping it on node ${mooncake_owner_plan_numa[i]}; give each owner the devices of one node" >&2
+      exit 2
+    fi
+  done
+}
+
+# prepare_mooncake_store_memory: drops the clean page cache that the owners'
+# huge-page faults would otherwise reclaim through compaction, then refuses pins
+# that do not fit a NUMA node (numa_memory_budget.py warns when they exceed its
+# free memory), and compacts each node for its pins: owners that fault a
+# fragmented node from many threads get 4 KiB pages, which the NICs refuse.
+prepare_mooncake_store_memory() {
+  local -a drop_dirs=()
+  IFS=':' read -r -a drop_dirs <<< "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS "${MODEL_PATH}")"
+  echo "[mooncake-store] dropping the page cache of ${drop_dirs[*]}"
+  python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${drop_dirs[@]}"
+  local -a pins=()
+  local i
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    pins+=("${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
+  done
+  if ! python3 "${ATOMESH_SCRIPT_DIR}/numa_memory_budget.py" \
+    --reserve-gib 128 \
+    --compact \
+    --compact-timeout "$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    ${pins[@]+"${pins[@]}"}; then
+    echo "[mooncake-store][FAIL] this node's Store owners must fit their NUMA nodes, see numa-budget above" >&2
+    exit 2
+  fi
+}
+
+mooncake_store_running() {
+  local pid
+  for pid in ${mooncake_store_pids[@]+"${mooncake_store_pids[@]}"}; do
+    [[ -n "${pid}" ]] && return 0
+  done
+  return 1
+}
+
+# Returns 1 and records the first exit status when a Store process exited.
+reap_dead_mooncake_store() {
+  local i rc any_died=0
+  for i in "${!mooncake_store_pids[@]}"; do
+    [[ -n "${mooncake_store_pids[i]}" ]] || continue
+    process_is_running "${mooncake_store_pids[i]}" && continue
+    set +e
+    wait "${mooncake_store_pids[i]}"
+    rc=$?
+    set -e
+    [[ "${rc}" -eq 0 ]] && rc=1
+    mooncake_store_pids[i]=""
+    mooncake_store_failed_rc="${mooncake_store_failed_rc:-${rc}}"
+    tail -n 50 "${mooncake_store_logs[i]}" >&2 || true
+    echo "[mooncake-store][FAIL] ${mooncake_store_names[i]} exited unexpectedly rc=${rc}, see ${mooncake_store_logs[i]}" >&2
+    any_died=1
+  done
+  [[ "${any_died}" -eq 0 ]]
+}
+
+# Without the Store the prefill workers' lookups answer nothing and their saves
+# fail, which they only log.
+exit_if_mooncake_store_died() {
+  reap_dead_mooncake_store || exit "${mooncake_store_failed_rc}"
+}
+
+# mooncake_metrics_file <pool>: where the pool master's final metrics go.
+mooncake_metrics_file() {
+  printf '%s' "${RUNTIME_LOG_DIR}/mooncake-master-rank-${NODE_RANK}$(mooncake_pool_suffix "$1").metrics"
+}
+
+# Saves each running master's metrics: the puts, gets, evictions and capacity
+# of the whole run. cleanup_processes calls it before stopping anything: a
+# decode node stops its owners once the router closes, and a master drops an
+# owner client_ttl (10 s) after its last heartbeat.
+save_mooncake_store_metrics() {
+  [[ "${mooncake_store_metrics_saved}" == "0" ]] || return 0
+  local pool
+  for (( pool = 0; pool < mooncake_store_master_count; pool++ )); do
+    [[ -n "${mooncake_store_pids[pool]:-}" ]] || continue
+    curl -s --max-time 10 \
+      "http://${host_ip}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")/metrics" \
+      > "$(mooncake_metrics_file "${pool}")" 2>/dev/null || true
+  done
+  mooncake_store_metrics_saved=1
+}
+
+# check_mooncake_store_capacity <pool>: records a failure when the pool
+# master's final metrics count less than its owners' segments: an owner whose
+# heartbeats lapse past client_ttl loses its segment while it keeps running,
+# which nothing else reports.
+check_mooncake_store_capacity() {
+  local pool="$1" metrics counted want
+  [[ "${mooncake_store_ready}" == "1" ]] || return 0
+  metrics="$(mooncake_metrics_file "${pool}")"
+  want="${mooncake_pool_capacity[pool]}"
+  counted="$(awk '$1 == "master_total_capacity_bytes" { print $2 }' "${metrics}" 2>/dev/null || true)"
+  if [[ -z "${counted}" ]]; then
+    echo "[mooncake-store] WARNING: ${metrics} has no master_total_capacity_bytes; the owners' capacity at shutdown is unknown" >&2
+    return 0
+  fi
+  if awk -v counted="${counted}" -v want="${want}" \
+    'BEGIN { exit !(counted + 0 < want + 0) }'; then
+    echo "[mooncake-store][FAIL] the master of pool ${pool} counts ${counted} of its owners' ${want} bytes at shutdown: an owner lost its segment during the run, see the owner logs" >&2
+    mooncake_store_failed_rc="${mooncake_store_failed_rc:-1}"
+  fi
+}
+
+# Returns non-zero when a Store process died before it was stopped, or a
+# master lost owner capacity during the run.
+stop_mooncake_store() {
+  terminate_process_group "${mooncake_page_cache_dropper_pid}"
+  mooncake_page_cache_dropper_pid=""
+  mooncake_store_running || return 0
+  save_mooncake_store_metrics
+  reap_dead_mooncake_store || true
+  local pool
+  for (( pool = 0; pool < mooncake_store_master_count; pool++ )); do
+    # A dead master answers for nobody.
+    if [[ -n "${mooncake_store_pids[pool]:-}" ]]; then
+      check_mooncake_store_capacity "${pool}"
+    fi
+  done
+  local i
+  # Owners before the master they report to.
+  for (( i = ${#mooncake_store_pids[@]} - 1; i >= 0; i-- )); do
+    [[ -n "${mooncake_store_pids[i]}" ]] || continue
+    terminate_process_group "${mooncake_store_pids[i]}"
+    mooncake_store_pids[i]=""
+    echo "[mooncake-store] ${mooncake_store_names[i]} stopped, log ${mooncake_store_logs[i]}"
+  done
+  [[ -z "${mooncake_store_failed_rc}" ]]
+}
+
+# Fails startup (stopping what it started) unless <condition> holds within
+# <timeout> seconds; a dying Store process fails it at once.
+wait_for_mooncake_store() {
+  local what="$1" timeout="$2"
+  shift 2
+  local deadline=$(( $(date +%s) + timeout ))
+  local log
+  until "$@"; do
+    if ! reap_dead_mooncake_store; then
+      echo "[wait][FAIL] mooncake-store ${what}: a Store process exited" >&2
+      stop_mooncake_store || true
+      exit "${mooncake_store_failed_rc}"
+    fi
+    for log in "${mooncake_store_logs[@]}"; do
+      if grep -q -E "Failed to setup client|Failed to mount|Check failed|FATAL" "${log}" 2>/dev/null; then
+        tail -n 50 "${log}" >&2 || true
+        echo "[wait][FAIL] mooncake-store ${what}: see ${log}" >&2
+        stop_mooncake_store || true
+        exit 1
+      fi
+    done
+    if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+      for log in "${mooncake_store_logs[@]}"; do
+        tail -n 20 "${log}" >&2 || true
+      done
+      echo "[wait][FAIL] mooncake-store ${what} not ready after ${timeout}s" >&2
+      stop_mooncake_store || true
+      exit 1
+    fi
+    sleep 2
+  done
+}
+
+# mooncake_master_ready <addr> <pool>: the HTTP metadata server answers about
+# a second before the master's RPC server listens, so the pool's master is
+# ready once both do.
+mooncake_master_ready() {
+  local addr="$1" pool="$2"
+  # Any HTTP answer, a 404 for the probe key included, means it is serving.
+  curl -s -o /dev/null --max-time 5 \
+    "http://${addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")/metadata?key=atomesh_probe" \
+    && timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ \
+      "${addr}" "$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")" 2>/dev/null
+}
+
+# mooncake_masters_ready <addr>: every pool's master on <addr> is ready.
+mooncake_masters_ready() {
+  local pool
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    mooncake_master_ready "$1" "${pool}" || return 1
+  done
+}
+
+# mooncake_store_capacity_reaches <addr>: every pool's master on <addr> counts
+# the segments of its owners on all nodes.
+mooncake_store_capacity_reaches() {
+  local pool
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    curl -s --max-time 5 \
+      "http://$1:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")/metrics" 2>/dev/null \
+      | awk -v want="${mooncake_pool_capacity[pool]}" \
+        '$1 == "master_total_capacity_bytes" { found = ($2 + 0 >= want) } END { exit !found }' \
+      || return 1
+  done
+}
+
+# mooncake_owner_pool <devices>: the pool of an owner on those devices.
+mooncake_owner_pool() {
+  local pool
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    if [[ -z "${mooncake_pool_devices[pool]}" || "${mooncake_pool_devices[pool]}" == "$1" ]]; then
+      echo "${pool}"
+      return 0
+    fi
+  done
+  echo "[mooncake-store][FAIL] no pool serves owner devices $1" >&2
+  exit 2
+}
+
+# Drops the model's page cache every 45 s for 30 min while the workers load
+# weights, which would refill it; page cache is per file, so this serves every
+# node.
+start_mooncake_page_cache_dropper() {
+  setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
+    --every 45 --for 1800 "${MODEL_PATH}" &
+  mooncake_page_cache_dropper_pid=$!
+}
+
+# start_mooncake_store_owners <master addr>: starts this node's owners
+# (mooncake_owner_plan_*), each joining its pool's master on <master addr>.
+start_mooncake_store_owners() {
+  local master_addr="$1"
+  # No GPU: a process that sees one makes Mooncake probe every buffer through HIP.
+  # glibc's THP malloc makes the whole segment huge pages, which the NICs
+  # register in under a second per 64 GiB MR; eno1 is firewalled, so the
+  # transfer engine binds the role IP.
+  local -a owner_env=(
+    HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1
+    GLIBC_TUNABLES=glibc.malloc.hugetlb=1 MC_MAX_MR_SIZE=68719476736
+    "MC_TCP_BIND_ADDRESS=${host_ip}"
+  )
+  local i pool log
+  local -a cmd=()
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    pool="$(mooncake_owner_pool "${mooncake_owner_plan_devices[i]}")"
+    log="${RUNTIME_LOG_DIR}/mooncake-owner-rank-${NODE_RANK}-${i}.log"
+    cmd=(
+      python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${mooncake_owner_plan_numa[i]}"
+      mooncake_client
+      --host="${host_ip}" --port="$(( ATOMESH_MOONCAKE_OWNER_PORT + i ))"
+      --master_server_address="${master_addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")"
+      --metadata_server="http://${master_addr}:$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")/metadata"
+      --protocol=rdma --device_names="${mooncake_owner_plan_devices[i]}"
+      --global_segment_size="$(( mooncake_owner_plan_gib[i] * 1024 * 1024 * 1024 ))"
+      --local_buffer_size=0 --threads=4
+    )
+    dump_launch_info "MOONCAKE_OWNER" "${owner_env[@]}" "${cmd[@]}"
+    env "${owner_env[@]}" setsid "${cmd[@]}" >"${log}" 2>&1 &
+    mooncake_store_pids+=("$!")
+    mooncake_store_logs+=("${log}")
+    mooncake_store_names+=("owner${i}")
+  done
+}
+
+# Reports each owner of this node once it mounted: pid, node, NICs and how much
+# of its memory is huge pages.
+report_mooncake_store_owners() {
+  local i pid
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    pid="${mooncake_store_pids[mooncake_store_master_count + i]}"
+    echo "[mooncake-store] owner${i} pid=${pid} numa=${mooncake_owner_plan_numa[i]} devices=${mooncake_owner_plan_devices[i]} $(grep -h AnonHugePages "/proc/${pid}/smaps_rollup" 2>/dev/null || echo 'AnonHugePages: ?')"
+  done
+}
+
+# mooncake_store_cross_node_timeout: the wait for the other node's part of the
+# Store, MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes
+# first there: numa_memory_budget.py compacts each NUMA node with pins in turn,
+# two at most, and stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
+mooncake_store_cross_node_timeout() {
+  awk -v wait="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)" \
+    -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    'BEGIN { s = wait + 2 * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
+}
+
+# The connector's mooncake_store.pools for per_nic pools: each pool's NIC and
+# its master.
+mooncake_pools_json() {
+  local pool sep=""
+  printf '{'
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    printf '%s"%s":{"master":"%s:%s","metadata":"http://%s:%s/metadata"}' "${sep}" \
+      "${mooncake_pool_devices[pool]}" \
+      "${host_ip}" "$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")" \
+      "${host_ip}" "$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
+    sep=","
+  done
+  printf '}'
+}
+
+# The prefill workers' connector config, which the launcher derives from the
+# Store it starts: the stage on a NIC reads that NIC's pool, whose owners share
+# the NIC, under per_nic; otherwise every stage reads the one master and stays
+# off the owners' NICs.
+mooncake_store_launcher_config_json() {
+  printf '{"mooncake_store.local_hostname":"%s","mooncake_store.protocol":"rdma",' "${host_ip}"
+  if [[ -n "${mooncake_pool_devices[0]}" ]]; then
+    printf '"mooncake_store.pools":%s}' "$(mooncake_pools_json)"
+  else
+    printf '"mooncake_store.master":"%s:%s",' "${host_ip}" "${ATOMESH_MOONCAKE_MASTER_PORT}"
+    printf '"mooncake_store.metadata":"http://%s:%s/metadata",' "${host_ip}" "${ATOMESH_MOONCAKE_METADATA_PORT}"
+    printf '"mooncake_store.owner_rdma_devices":"%s"}' "$(mooncake_owner_devices_csv)"
+  fi
+}
+
+start_mooncake_store() {
+  mooncake_store_requested || return 0
+  check_mooncake_store_settings
+  check_mooncake_owner_devices
+  prepare_mooncake_store_memory
+  start_mooncake_page_cache_dropper
+  mooncake_store_pids=()
+  mooncake_store_logs=()
+  mooncake_store_names=()
+  mooncake_store_ready=0
+  mooncake_store_metrics_saved=0
+  local -a store_env=(HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1)
+  local pool log
+  local -a cmd=()
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    log="${RUNTIME_LOG_DIR}/mooncake-master-rank-${NODE_RANK}$(mooncake_pool_suffix "${pool}").log"
+    cmd=(
+      python3 "${ATOMESH_SCRIPT_DIR}/numa_exec.py" "${MOONCAKE_STORE_MASTER_NUMA:-1}"
+      mooncake_master
+      --rpc_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_MASTER_PORT}" "${pool}")" --rpc_thread_num=32
+      --enable_http_metadata_server=true
+      --http_metadata_server_host="${host_ip}"
+      --http_metadata_server_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METADATA_PORT}" "${pool}")"
+      --metrics_port="$(mooncake_pool_port "${ATOMESH_MOONCAKE_METRICS_PORT}" "${pool}")"
+      --default_kv_lease_ttl=10000
+      --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05
+      --allocation_strategy=random --memory_allocator=offset --client_ttl=10
+    )
+    dump_launch_info "MOONCAKE_MASTER" "${store_env[@]}" "${cmd[@]}"
+    env "${store_env[@]}" setsid "${cmd[@]}" >"${log}" 2>&1 &
+    mooncake_store_pids+=("$!")
+    mooncake_store_logs+=("${log}")
+    mooncake_store_names+=("master$(mooncake_pool_suffix "${pool}")")
+  done
+  mooncake_store_master_count="${#mooncake_pool_devices[@]}"
+  wait_for_mooncake_store masters 120 mooncake_masters_ready "${host_ip}"
+  start_mooncake_store_owners "${host_ip}"
+  local capacity=0
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    capacity=$(( capacity + mooncake_pool_capacity[pool] ))
+  done
+  echo "[wait] mooncake-store pools=${#mooncake_pool_devices[@]} owners here=${#mooncake_owner_plan_numa[@]} capacity=${capacity} bytes"
+  local owners_timeout="${MOONCAKE_STORE_WAIT_TIMEOUT:-1200}"
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    # The decode node mounts its owners only once it has compacted its memory.
+    owners_timeout="$(mooncake_store_cross_node_timeout)"
+  fi
+  wait_for_mooncake_store "owners" "${owners_timeout}" \
+    mooncake_store_capacity_reaches "${host_ip}"
+  mooncake_store_ready=1
+  report_mooncake_store_owners
+  mooncake_store_prefill_env=(
+    "ATOM_KV_OFFLOAD=mooncake_store"
+    "ATOM_KV_OFFLOAD_EXTRA_CONFIG=$(mooncake_store_launcher_config_json)"
+    # One load worker by default, as PR #2459 settled on for this Store: four
+    # hung its PP prefill pipeline at c96.
+    "OFFLOAD_LOAD_WORKERS=${OFFLOAD_LOAD_WORKERS:-1}"
+    "MC_NUM_QP_PER_EP=1"
+    "MC_MAX_MR_SIZE=${MC_MAX_MR_SIZE:-1073741824}"
+    "MC_TCP_BIND_ADDRESS=${host_ip}"
+  )
+  echo "[wait][OK] mooncake-store masters=${host_ip}:${ATOMESH_MOONCAKE_MASTER_PORT}+100/pool pools=${mooncake_pool_devices[*]:-shared} metrics=http://${host_ip}:${ATOMESH_MOONCAKE_METRICS_PORT}/metrics"
+}
+
+# On a decode node: starts MOONCAKE_STORE_DECODE_OWNERS on this node's memory,
+# joining the prefill node's masters, before the decode workers load. Waits
+# until every pool counts the owners of all nodes, as the prefill node does
+# before its workers start.
+start_mooncake_store_decode_owners() {
+  mooncake_store_requested || return 0
+  [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]] || return 0
+  plan_mooncake_store_pools
+  plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
+  check_mooncake_owner_devices
+  prepare_mooncake_store_memory
+  start_mooncake_page_cache_dropper
+  mooncake_store_pids=()
+  mooncake_store_logs=()
+  mooncake_store_names=()
+  mooncake_store_master_count=0
+  local timeout
+  timeout="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)"
+  # The prefill node starts its masters only once it has compacted its memory.
+  wait_for_mooncake_store "prefill-node masters" "$(mooncake_store_cross_node_timeout)" \
+    mooncake_masters_ready "${NODE0_ADDR}"
+  start_mooncake_store_owners "${NODE0_ADDR}"
+  echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"
+  wait_for_mooncake_store "owners" "${timeout}" \
+    mooncake_store_capacity_reaches "${NODE0_ADDR}"
+  report_mooncake_store_owners
+  echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
+  # Before the router's end reaches a decode node, which then stops its owners.
+  save_mooncake_store_metrics
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
   purge_lmcache_disk
+  # Last: the workers read and write the Store until they exit.
+  if ! stop_mooncake_store && [[ "${rc}" -eq 0 ]]; then
+    rc="${mooncake_store_failed_rc}"
+  fi
   return "${rc}"
 }
 
@@ -743,6 +1572,12 @@ start_prefill() {
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
   reset_lmcache_disk
+  start_mooncake_store
+  # On the env command line, not exported: decode starts from this same shell.
+  local -a prefill_offload_env=()
+  if mooncake_store_running; then
+    prefill_offload_env=("${mooncake_store_prefill_env[@]}")
+  fi
   local -a prefill_cache_env=()
   build_server_cache_env "prefill" "${server_port}" prefill_cache_env
   local -a prefill_dp_env=()
@@ -769,8 +1604,8 @@ start_prefill() {
     "${prefill_cudagraph_args[@]}"
     ${PREFILL_SERVER_ARGS}
   )
-  dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  dump_launch_info "PREFILL" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_offload_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -784,6 +1619,7 @@ start_decode() {
   if [[ -n "${visible_devices}" ]]; then
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
+  start_mooncake_store_decode_owners
   local max_conc
   max_conc="$(echo "${BENCH_MAX_CONCURRENCY}" | tr 'x,' '\n' | sort -n | tail -1)"
   local decode_max_num_seqs="${MAX_NUM_SEQS}"
@@ -801,6 +1637,13 @@ start_decode() {
   fi
   local -a decode_cache_env=()
   build_server_cache_env "decode" "${server_port}" decode_cache_env
+  # The P->D transfer engine on both sides reads MC_NUM_QP_PER_EP, which the
+  # prefill's Mooncake Store sets to 1 (validate_mooncake_store_settings
+  # refused any other value); endpoints with other QP counts cannot connect.
+  local -a decode_mooncake_env=()
+  if mooncake_store_requested; then
+    decode_mooncake_env=("MC_NUM_QP_PER_EP=1")
+  fi
   local -a decode_dp_env=()
   if [[ "${USE_EXPLICIT_DP_PORTS}" == "1" ]]; then
     decode_dp_env=(
@@ -826,8 +1669,8 @@ start_decode() {
     "${decode_cudagraph_args[@]}"
     ${DECODE_SERVER_ARGS}
   )
-  dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
+  dump_launch_info "DECODE" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_mooncake_env[@]}" "${decode_cmd[@]}"
 }
 
 start_router() {
@@ -1293,15 +2136,20 @@ run_benchmark_and_eval() {
   fi
 }
 
+validate_mooncake_store_settings
 write_metadata
 
+# Every branch installs its EXIT trap before its first start (the pids expand
+# at exit): start_prefill and start_decode start the Store's masters and owners
+# before their server, so a start that fails stops what it and the starts
+# before it left running.
 if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"
   decode_handshake_port=$((HANDSHAKE_PORT + PREFILL_TP_SIZE))
   start_decode "decode-rank-0" "${DECODE_PORT}" "${decode_handshake_port}"
   decode_pid="${server_pid}"
-  trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
   for ip in "${prefill_ips[@]}"; do
     wait_http "http://${ip}:${PREFILL_PORT}/health" "prefill-${ip}" "${WAIT_SERVER_TIMEOUT}" "${prefill_pid}"
   done
@@ -1315,6 +2163,7 @@ if [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
 elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
   worker_pids=()
   declare -A local_worker_pid=()
+  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
   # Save the base handshake port; each worker overrides it so
   # apply_role_env expands ${HANDSHAKE_PORT} to the per-worker value.
   PACKED_BASE_HANDSHAKE_PORT="${HANDSHAKE_PORT}"
@@ -1340,7 +2189,6 @@ elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
     worker_pids+=("${server_pid}")
     local_worker_pid["decode-${idx}"]="${server_pid}"
   done
-  trap 'cleanup_processes ${router_pid:-} ${worker_pids[*]:-}' EXIT
   if [[ "${NODE_RANK}" -eq 0 ]]; then
     for idx in "${!prefill_ips[@]}"; do
       wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
@@ -1371,6 +2219,7 @@ elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
   cleanup_processes "${router_pid:-}" "${worker_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   prefill_pids=()
+  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in $(seq 0 $((xP - 1))); do
     gpu_start=$((idx * PREFILL_TP_SIZE))
     gpu_end=$((gpu_start + PREFILL_TP_SIZE - 1))
@@ -1382,7 +2231,6 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
     start_prefill "prefill-rank-0-worker-${idx}" "${prefill_port}" "${handshake_port}" "${prefill_dp_master_port}" "${prefill_dp_base_port}"
     prefill_pids+=("${server_pid}")
   done
-  trap 'cleanup_processes ${router_pid:-} ${prefill_pids[*]:-}' EXIT
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -1398,8 +2246,8 @@ elif [[ "${NODE_RANK}" -eq 0 && "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   run_benchmark_and_eval
   cleanup_processes "${router_pid}" "${prefill_pids[@]}"
 elif [[ "${NODE_RANK}" -eq 0 ]]; then
-  start_prefill "prefill-rank-0"
   trap 'cleanup_processes ${router_pid:-} ${server_pid:-}' EXIT
+  start_prefill "prefill-rank-0"
   for idx in "${!prefill_ips[@]}"; do
     wait_http "http://${prefill_ips[$idx]}:${prefill_ports[$idx]}/health" \
       "prefill-${prefill_ips[$idx]}:${prefill_ports[$idx]}" \
@@ -1416,6 +2264,7 @@ elif [[ "${NODE_RANK}" -eq 0 ]]; then
   kill "${router_pid}" "${server_pid}" 2>/dev/null || true
 elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
   decode_pids=()
+  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   for idx in $(seq 0 $((yD - 1))); do
     gpu_start=$((idx * DECODE_TP_SIZE))
     gpu_end=$((gpu_start + DECODE_TP_SIZE - 1))
@@ -1427,25 +2276,24 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -eq "${xP}" ]]; then
     start_decode "decode-rank-${NODE_RANK}-worker-${idx}" "${decode_port}" "${decode_handshake_port}" "${decode_dp_master_port}" "${decode_dp_base_port}"
     decode_pids+=("${server_pid}")
   done
-  trap 'cleanup_processes ${decode_pids[*]:-}' EXIT
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}"
   wait_router_closed
   cleanup_processes "${decode_pids[@]}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
-  start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
-  start_prefill "prefill-rank-${NODE_RANK}"
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_prefill "prefill-rank-${NODE_RANK}"
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
-  start_decode
   trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"

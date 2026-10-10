@@ -161,6 +161,13 @@ class LMCacheReqMeta:
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
     native_state: NativeStateTransfer | None = None
+    # 16-byte prefix-chained digests of chunks [0, n), concatenated, for
+    # transports that key objects by hash; they ship these instead of
+    # `token_ids`.
+    chunk_hashes: bytes | None = None
+    # The scheduler's `time.time()` when it dispatched this save, for workers
+    # that must stop reading its source before the scheduler may reclaim it.
+    dispatched_at: float | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

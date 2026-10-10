@@ -1,0 +1,245 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""The launcher's per-NUMA-node check of the memory the Mooncake L2 pins.
+
+sysfs is a temporary tree shaped like pit2-p03-g40: two CPU nodes first in the
+KFD topology, then eight GPUs in KFD order, the first four on NUMA node 0.
+"""
+
+import contextlib
+import importlib.util
+import io
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPT = (
+    Path(__file__).resolve().parents[1]
+    / ".github/scripts/atomesh/numa_memory_budget.py"
+)
+SPEC = importlib.util.spec_from_file_location("numa_memory_budget", SCRIPT)
+BUDGET = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(BUDGET)
+
+GIB_KB = 1024 * 1024
+# KFD order of the GPUs' PCI buses, and their NUMA nodes.
+GPU_BUSES = ["75", "05", "65", "15", "f5", "85", "e5", "95"]
+
+
+class NumaMemoryBudgetTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.sysfs = Path(temporary.name)
+        topology = self.sysfs / "class/kfd/kfd/topology/nodes"
+        for index in range(2):
+            node = topology / str(index)
+            node.mkdir(parents=True)
+            (node / "properties").write_text(
+                "cpu_cores_count 128\nsimd_count 0\nlocation_id 0\ndomain 0\n"
+            )
+        for index, bus in enumerate(GPU_BUSES):
+            node = topology / str(index + 2)
+            node.mkdir(parents=True)
+            (node / "properties").write_text(
+                f"simd_count 1024\nlocation_id {int(bus, 16) << 8}\ndomain 0\n"
+            )
+            device = self.sysfs / f"bus/pci/devices/0000:{bus}:00.0"
+            device.mkdir(parents=True)
+            (device / "numa_node").write_text(f"{index // 4}\n")
+        self.meminfo(0, total_gib=1511, free_gib=800, cache_gib=675)
+        self.meminfo(1, total_gib=1511, free_gib=786, cache_gib=711)
+
+    def meminfo(self, node, *, total_gib, free_gib, cache_gib):
+        directory = self.sysfs / f"devices/system/node/node{node}"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "meminfo").write_text(
+            f"Node {node} MemTotal:       {total_gib * GIB_KB} kB\n"
+            f"Node {node} MemFree:        {free_gib * GIB_KB} kB\n"
+            f"Node {node} FilePages:      {cache_gib * GIB_KB} kB\n"
+            f"Node {node} HugePages_Total:     0\n"
+        )
+
+    def run_script(self, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--sysfs", str(self.sysfs), *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_gpus_are_numbered_in_kfd_order(self):
+        self.assertEqual(
+            BUDGET.kfd_gpu_pci_addresses(self.sysfs)[:2],
+            ["0000:75:00.0", "0000:05:00.0"],
+        )
+        self.assertEqual(BUDGET.gpu_numa_nodes(self.sysfs, [0, 3, 4, 7]), [0, 0, 1, 1])
+        with self.assertRaises(SystemExit):
+            BUDGET.gpu_numa_nodes(self.sysfs, [8])
+        (self.sysfs / "bus/pci/devices/0000:65:00.0/numa_node").unlink()
+        with self.assertRaisesRegex(SystemExit, "GPU 2's NUMA node"):
+            BUDGET.gpu_numa_nodes(self.sysfs, [2])
+
+    def test_owners_and_the_l1s_add_up_per_node(self):
+        planned = BUDGET.plan_pins(["0:768", "1:960"], "0,1,2,3", 48, self.sysfs)
+        self.assertEqual(planned, {0: 768 + 4 * 48, 1: 960})
+        self.assertEqual(BUDGET.plan_pins(["0:8"], "", 48, self.sysfs), {0: 8})
+        with self.assertRaises(SystemExit):
+            BUDGET.plan_pins(["x:8"], "", 0, self.sysfs)
+
+    def test_pins_beyond_free_memory_warn_and_beyond_the_node_fail(self):
+        # pit2-p03-g40 with Kimi's weights cached: NUMA1 has 786 GiB free.
+        l1 = ("--reserve-gib", "128", "--gpus", "0,1,2,3", "--per-gpu-gib")
+        result = self.run_script(*l1, "48", "0:768", "1:960")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NUMA node 0: pins 960 GiB", result.stderr)
+        self.assertIn("[numa-budget][WARN] NUMA node 1: pins 960 GiB", result.stderr)
+        self.assertIn("786 GiB free, 711 GiB page cache", result.stderr)
+        # An L1 base still at 256 GiB cannot fit next to owner0.
+        result = self.run_script(*l1, "256", "0:768", "1:960")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("[numa-budget][FAIL] NUMA node 0: pins 1792 GiB", result.stderr)
+
+    def test_a_plan_that_fits_free_memory_passes_quietly(self):
+        result = self.run_script("--reserve-gib", "128", "0:64", "1:64")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("[numa-budget] NUMA node 1: pins 64 GiB", result.stdout)
+
+    def test_a_missing_node_fails(self):
+        result = self.run_script("2:8")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot read NUMA node 2", result.stderr)
+
+    def test_non_finite_or_negative_amounts_are_refused(self):
+        # 1600 GiB on a 1511 GiB node fails; a NaN or negative reserve or pin
+        # would compare its way past that check, so none is taken.
+        self.assertEqual(self.run_script("0:1600").returncode, 2)
+        for args in (
+            ("--reserve-gib", "nan", "0:1600"),
+            ("--reserve-gib", "-200", "0:1600"),
+            ("--reserve-gib", "inf", "0:8"),
+            ("--per-gpu-gib", "-1", "--gpus", "0", "0:8"),
+            ("--compact", "--compact-timeout", "0", "0:8"),
+            ("--compact", "--compact-timeout", "nan", "0:8"),
+            ("--compact", "--compact-timeout", "-5", "0:8"),
+        ):
+            with self.subTest(args=args):
+                result = self.run_script(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertRegex(result.stderr, "is not a finite (GiB|seconds)")
+                self.assertNotIn("compacting", result.stdout)
+        for pin in ("0:nan", "0:-800", "0:inf", "0:x"):
+            with self.subTest(pin=pin):
+                result = self.run_script("0:1600", pin)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"'{pin}' is not <node>:<GiB>", result.stderr)
+
+    def compact(self, *args, stalled_node=None):
+        calls, timeouts = [], []
+
+        def run(cmd, check, timeout=None):
+            calls.append(cmd)
+            timeouts.append(timeout)
+            if cmd[2] == str(stalled_node):
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        real_run = BUDGET.subprocess.run
+        BUDGET.subprocess.run = run
+        try:
+            status = BUDGET.main(["--sysfs", str(self.sysfs), "--compact", *args])
+        finally:
+            BUDGET.subprocess.run = real_run
+        self.timeouts = timeouts
+        return status, calls
+
+    def test_compact_faults_each_nodes_pins_bound_to_that_node(self):
+        status, calls = self.compact(
+            "--gpus", "0,1,2,3", "--per-gpu-gib", "48", "0:768", "1:960"
+        )
+        self.assertEqual(status, 0)
+        here = SCRIPT.parent
+        self.assertEqual(
+            calls,
+            [
+                [
+                    sys.executable,
+                    str(here / "numa_exec.py"),
+                    str(node),
+                    sys.executable,
+                    str(here / "compact_huge_pages.py"),
+                    gib,
+                ]
+                for node, gib in ((0, "960"), (1, "960"))
+            ],
+        )
+        self.assertEqual(self.timeouts, [600.0, 600.0])
+
+    def test_a_compaction_that_overruns_is_stopped_and_only_warns(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status, calls = self.compact(
+                "--compact-timeout", "5", "0:768", "1:960", stalled_node=0
+            )
+        self.assertEqual(status, 0)
+        # Node 1 is compacted all the same.
+        self.assertEqual([cmd[2] for cmd in calls], ["0", "1"])
+        self.assertEqual(self.timeouts, [5.0, 5.0])
+        self.assertIn(
+            "[numa-budget][WARN] compacting NUMA node 0 did not finish in 5 s",
+            stderr.getvalue(),
+        )
+
+    def test_compact_waits_for_a_plan_that_fits(self):
+        status, calls = self.compact("--reserve-gib", "128", "0:1500")
+        self.assertEqual(status, 2)
+        self.assertEqual(calls, [])
+
+
+class CompactHugePagesTest(unittest.TestCase):
+    def setUp(self):
+        path = SCRIPT.parent / "compact_huge_pages.py"
+        spec = importlib.util.spec_from_file_location("compact_huge_pages", path)
+        self.compact = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.compact)
+        self.script = path
+
+    def test_anon_huge_page_bytes_counts_the_overlapping_mappings(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".smaps") as smaps:
+            smaps.write(
+                "7f0000000000-7f0000400000 rw-p 00000000 00:00 0\n"
+                "AnonHugePages:      4096 kB\n"
+                "7f0000400000-7f0000800000 rw-p 00000000 00:00 0\n"
+                "AnonHugePages:      2048 kB\n"
+                "7f0000800000-7f0000a00000 rw-p 00000000 00:00 0 [heap]\n"
+                "AnonHugePages:      2048 kB\n"
+            )
+            smaps.flush()
+            start, end = 0x7F0000200000, 0x7F0000600000
+            self.assertEqual(
+                self.compact.anon_huge_page_bytes(start, end, smaps.name),
+                6144 * 1024,
+            )
+
+    def test_faults_and_frees_on_this_kernel(self):
+        result = subprocess.run(
+            [sys.executable, str(self.script), "0.0625"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(
+            result.stdout,
+            r"^\[thp-compact\](\[WARN\])? \d+ of 0 GiB came as huge pages "
+            r"\(\d+\.\d%\) in \d+ s\n$",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
