@@ -602,7 +602,9 @@ class GDNStateMixin(PoolRowsMixin):
     # whichever builder owns the paged pool (`_page_unit_regions`).
     #
     # Dormant under `StateTransfer.fork`: nothing produces a store op unless a
-    # subclass declares `copy()`. Only `_KimiMLAGDNCommon` does today.
+    # subclass declares `copy()`. `_KimiMLAGDNCommon` does, over its MLA pool.
+    # `GDNAttentionMetadataBuilder` does for the Qwen GDN/MHA family, over the
+    # MHA pool.
 
     def _checkpoint_layer_ranges(self) -> list[list[tuple[int, int]]]:
         """Per plane, one `(offset, nbytes)` per layer for slot 0.
@@ -1402,6 +1404,21 @@ class GDNStateMixin(PoolRowsMixin):
         return gdn_metadata
 
 
+# ``GDNAttentionMetadataBuilder`` is shared, so the model name is the gate.
+# Turning PAGE copies on for every subclass would aim the image at MHA
+# regions. Qwen4Exp inherits the builder and keeps its state on a QSA pool,
+# which this geometry does not address. The set is only the hybrids whose
+# full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
+#
+# These are text-config ``model_type`` values. A Qwen3.5 wrapper may report
+# ``qwen3_5_moe``; ``get_hf_text_config`` peels that to ``qwen3_5_moe_text``
+# before the membership test. Kimi needs no such set: its builder is only
+# constructed for ``kimi_linear``.
+GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
+    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
+)
+
+
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
@@ -1410,6 +1427,191 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+
+    def _uses_paged_checkpoints(self) -> bool:
+        """PAGE image for the Qwen GDN/MHA family; fork otherwise.
+
+        Off under pipeline parallelism and RapidServe. ``get_num_blocks``
+        raises when a copying transfer meets either, and answering yes there
+        would turn "this model keeps fork-slot checkpoints" into "this model
+        does not start". Kimi's ``_uses_paged_checkpoints`` is the same two
+        switches and no model-type set, because that builder is Kimi-only.
+        """
+
+        config = self.model_runner.config
+        if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1 or getattr(
+            config, "enable_rapidserve", False
+        ):
+            return False
+        from atom.utils import get_hf_text_config
+
+        text = get_hf_text_config(config.hf_config)
+        return getattr(text, "model_type", None) in GDN_PAGE_CHECKPOINT_MODEL_TYPES
+
+    def state_transfer(self) -> StateTransfer:
+        """PAGE image for Qwen GDN hybrids; fork for everyone else.
+
+        Qwen4Exp inherits this builder and stays on fork: its model type is
+        not in the set, and its QSA pool is not the MHA destination below.
+        Pipeline parallelism and RapidServe stay on fork so sizing does not
+        refuse to start.
+        """
+
+        if not self._uses_paged_checkpoints():
+            return super().state_transfer()
+
+        shape_k, shape_v = self._state_shape_for_runner()
+        dtype_k, dtype_v = self._state_dtypes()
+        # Same fields Kimi spells inline in ``state_transfer``. ``order`` is
+        # the one fact the shapes cannot say. ``spec`` changes the conv
+        # window. ``tp`` is in the id because the heads are sharded.
+        layout_id = (
+            "gdn-paged-state-v1"
+            f":layers={self.num_state_layers()}"
+            f":conv={tuple(shape_k)},{dtype_k}"
+            f":ssm={tuple(shape_v)},{dtype_v}"
+            ":order=conv-all-layers,ssm-all-layers"
+            f":tp={get_tp_group().world_size}"
+            f":spec={self.num_spec}"
+            ":carry=all"
+        )
+        return StateTransfer.copy(layout_id)
+
+    def checkpoint_page_unit_bytes(self) -> int | None:
+        """Bytes of one MHA page that a transfer actually publishes.
+
+        ``ModelRunner`` sizes the checkpoint unit from the paged pool's
+        ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
+        that charged size. Kimi's MLA pool needs no override: its charged
+        entry is exactly the rows the page geometry walks.
+
+        Qwen's ``MhaKvPool`` does not work that way. The pool is one
+        allocation ATOM lays out itself. Each field (K, V, scale) is rounded
+        up to 256 bytes so a kernel sees aligned rows, and ``entry_bytes``
+        bills those gaps. ``region_tensors()`` publishes only the real fields,
+        so the gaps are not a region. ``lmcache_mp`` requires the checkpoint
+        unit to equal the sum of the published regions; leaving the spec at
+        ``entry_bytes`` makes ``_page_unit_regions`` reject the mismatch.
+        BF16 fields are often already aligned, so the two sizes coincide.
+        Narrow dtypes (FP8, INT8) are where the padding dominates and the
+        sizes diverge. A draft pool merged into the same class is ordinary KV
+        appended after these regions and is not part of the state image, so
+        it is left out of this sum as well.
+
+        The vLLM plugin never consults this. It is handed the tensors to move
+        and sums ``numel * element_size``, which is already the published
+        bytes. There is no second, padded charge to reconcile.
+        """
+
+        if not self._uses_paged_checkpoints():
+            return None
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_published_page_bytes,
+        )
+
+        published = mha_published_page_bytes(self._declare_kv_pools().values())
+        if published <= 0:
+            raise RuntimeError("GDN PAGE checkpoint has no published MHA bytes")
+        return published
+
+    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Where a scheduler block sits in the MHA pool.
+
+        The mixin raises: it knows the state planes, not this pool. The
+        addresses have to match ``get_kv_transfer_tensors`` or the copy and
+        ``lmcache_mp`` would name different bytes.
+        """
+
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_regions,
+        )
+
+        pools = list(self.kv_pools.values())
+        key = tuple(
+            (
+                tensor.data_ptr(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.element_size(),
+            )
+            for pool in pools
+            for _, tensor in pool.region_tensors()
+        )
+        cached = getattr(self, "_page_unit_region_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        regions = mha_page_unit_regions(pools)
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        owned = int(regions[1].sum())
+        if spec is not None and owned != spec.page_unit_bytes:
+            raise RuntimeError(
+                f"a PAGE unit is {spec.page_unit_bytes} B but the MHA regions "
+                f"cover {owned} B"
+            )
+        self._page_unit_region_cache = (key, regions)
+        return regions
+
+    def _page_unit_bases(self, unit_ids):
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_bases,
+        )
+
+        return mha_page_unit_bases(self._page_unit_regions(), unit_ids)
+
+    def _page_unit_stream_sizes(self, units: int):
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_stream_sizes,
+        )
+
+        return mha_page_unit_stream_sizes(self._page_unit_regions(), units)
+
+    def page_unit_views(self, unit_ids):
+        """MHA views of one checkpoint image, for the in-process state tier.
+
+        The tier packs these bytes and unpacks them into ``state_entry_views``.
+        The copy plan already wrote the slot stream across these regions, so
+        the two orders are the same byte sequence once the tail is trimmed to
+        ``image_bytes``.
+        """
+
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_views,
+        )
+
+        self._page_unit_regions()
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
+        return mha_page_unit_views(
+            self.kv_pools.values(), unit_ids, image_bytes=image_bytes
+        )
+
+    def get_kv_transfer_tensors(self):
+        """MHA PAGE regions, plus the native checkpoint contract for lmcache_mp."""
+
+        transfer = super().get_kv_transfer_tensors()
+        if transfer is None or not self._uses_paged_checkpoints():
+            return transfer
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return transfer
+        bases, sizes = self._page_unit_regions()
+        count = len(bases)
+        published = [
+            (page.region.base_addr, page.region.unit_bytes)
+            for page in transfer.pages[:count]
+        ]
+        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+            raise RuntimeError(
+                "GDN transfer regions do not match its checkpoint PAGE unit: "
+                f"{len(transfer.pages)} published, {count} in a unit"
+            )
+        transfer.paged_state_checkpoint_spec = spec
+        transfer.execute_paged_state_copies = self.execute_paged_state_copies
+        transfer.paged_state_region_count = count
+        transfer.native_state_tp_replication_factor = 1
+        return transfer
 
     def _module_kinds(self, module) -> tuple:
         """The MHA row spaces, plus a slot for every linear-attention layer."""

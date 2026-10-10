@@ -1860,8 +1860,26 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+            # The charged entry can be larger than the bytes a transfer
+            # publishes: MHA alignment padding is not a region, and a draft
+            # pool merged into the same class is ordinary KV after the
+            # checkpoint regions. The backend names the published unit.
+            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+            published_unit = getattr(
+                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+            )
+            if callable(published_unit):
+                published = published_unit()
+                if published is not None:
+                    published = int(published)
+                    if published <= 0 or published > page_unit_bytes:
+                        raise RuntimeError(
+                            f"checkpoint PAGE unit is {published} B but the "
+                            f"paged pool entry is {page_unit_bytes} B"
+                        )
+                    page_unit_bytes = published
             checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                page_unit_bytes=page_unit_bytes,
                 slot_bytes=slot_bytes,
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,

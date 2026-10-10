@@ -79,6 +79,7 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     save_stall_seconds,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
+from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
@@ -6631,6 +6632,7 @@ def test_every_unconditional_shell_forward_exists_on_every_impl():
     impls = {
         "dense": DenseOffloadScheduler,
         "kimi_k3": KimiK3OffloadScheduler,
+        "qwen": QwenOffloadScheduler,
         "dsv4": DSV4OffloadScheduler,
     }
     broken = {
