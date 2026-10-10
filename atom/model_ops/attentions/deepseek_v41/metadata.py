@@ -82,6 +82,8 @@ class BatchStep:
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
+    # A one-token prefill, parent or microbatch, must not select decode kernels.
+    is_prefill: bool = False
     # Where each request starts, on the host. Built for `prefill_positions`
     # anyway, and published so the state lifecycle compares against the same
     # array rather than walking the spans again per forward.
@@ -91,8 +93,6 @@ class BatchStep:
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
-    # A one-token prefill, parent or microbatch, must not select decode kernels.
-    is_prefill: bool = False
     # TBO keeps memoized tile tables in a disjoint part of the parent budget.
     tile_workspace: TileWorkspace | None = None
 
