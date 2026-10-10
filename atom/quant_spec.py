@@ -65,6 +65,11 @@ d_dtypes = _LazyAiterAttr("aiter.utility.dtypes", "d_dtypes")
 # with MXFP4.
 NVFP4_DTYPE = "nvfp4"
 NVFP4_GROUP_SIZE = 16
+# NVFP4 source specs carrying this quant_method store the per-tensor global
+# scale as compressed-tensors does: the divisor ``448 * 6 / amax``. Quark and
+# ModelOpt store its reciprocal, the multiplier ``amax / (448 * 6)``, which is
+# what ``*_weight_scale_2`` holds once loaded.
+NVFP4_DIVISOR_GLOBAL_SCALE_METHOD = "compressed-tensors"
 
 # ──────────────────────────────────────────────────────────────────────
 # Typed layer-level spec
@@ -136,17 +141,26 @@ def will_online_requant(
     )
 
 
-def validate_nvfp4_online_target(quant_config, prefix: str) -> None:
+def validate_nvfp4_online_target(
+    quant_config, prefix: str, *, allow_mxfp8: bool = False
+) -> None:
     """Reject an NVFP4 source layer that online quantization will not convert.
 
-    NVFP4 is load-only and MXFP4 is its only runtime format, so every NVFP4
-    layer needs a per_1x32/fp4x2 online target. Layers call this when they are
-    built, so a recipe that leaves one out fails before any weight is loaded.
+    NVFP4 is load-only, so every NVFP4 layer needs an MX online target: MXFP4
+    (per_1x32/fp4x2) everywhere, and also MXFP8 (per_1x32/fp8) where the caller
+    passes ``allow_mxfp8`` -- FusedMoE does, linear layers do not yet. Layers
+    call this when they are built, so a recipe that leaves one out fails before
+    any weight is loaded.
     """
+    targets = "MXFP4 or MXFP8" if allow_mxfp8 else "MXFP4"
     if getattr(quant_config, "online_quant", False):
         target = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
-        if target.quant_type.value == QuantType.per_1x32.value and (
-            target.quant_dtype == d_dtypes.get("fp4x2")
+        allowed_dtypes = [d_dtypes.get("fp4x2")]
+        if allow_mxfp8:
+            allowed_dtypes.append(d_dtypes.get("fp8"))
+        if (
+            target.quant_type.value == QuantType.per_1x32.value
+            and target.quant_dtype in allowed_dtypes
         ):
             return
         if target.quant_type.value == QuantType.No.value:
@@ -160,8 +174,8 @@ def validate_nvfp4_online_target(quant_config, prefix: str) -> None:
         reason = "no online quantization config was given"
     raise ValueError(
         f"{prefix}: NVFP4 checkpoint weights cannot run directly and must be "
-        f"converted to MXFP4 online, but {reason}. Give this layer an mxfp4 "
-        "target in --online_quant_config."
+        f"converted to {targets} online, but {reason}. Give this layer an "
+        f"{targets.lower()} target in --online_quant_config."
     )
 
 
@@ -817,3 +831,62 @@ class GenericParser(QuantConfigParser):
                 QuantType.per_Token if act_scheme == "dynamic" else QuantType.per_Tensor
             )
         return QuantType.No
+
+
+# -- MXFP8 (optionally with NVFP4 routed experts) ---------------------------
+
+
+@register_quant_parser("mxfp8")
+class Mxfp8Parser(QuantConfigParser):
+    """Parser for ``quant_method: "mxfp8"`` checkpoints.
+
+    Plain MXFP8 parses exactly as the generic fallback did. MiniMax-M3.1 keeps
+    ``quant_method: "mxfp8"`` for every linear but stores the routed experts as
+    compressed-tensors ``nvfp4-pack-quantized`` (``weight_packed``,
+    ``weight_scale``, ``weight_global_scale``), announced only by the
+    ``moe_quant_algo`` / ``moe_quant_format`` fields. The generic heuristics
+    read neither, so they would build those experts as MXFP8.
+    """
+
+    # FusedMoE asks for its config at the experts container, e.g.
+    # ``model.layers.3.block_sparse_moe.experts``; ``shared_experts`` does not
+    # match because it ends in ``_experts``.
+    MOE_EXPERTS_PATTERN = "*.experts"
+    _NVFP4_MOE_FORMAT = "nvfp4-pack-quantized"
+
+    def parse(self, hf_quant_config: dict) -> ParsedQuantConfig:
+        parsed = GenericParser().parse(hf_quant_config)
+        moe_quant_algo = str(hf_quant_config.get("moe_quant_algo") or "").upper()
+        if not moe_quant_algo:
+            return parsed
+        if moe_quant_algo != "NVFP4":
+            raise ValueError(
+                f"Unsupported mxfp8 moe_quant_algo {moe_quant_algo!r}; ATOM "
+                "reads only NVFP4 routed experts in an MXFP8 checkpoint."
+            )
+        moe_quant_format = hf_quant_config.get("moe_quant_format")
+        if moe_quant_format != self._NVFP4_MOE_FORMAT:
+            raise ValueError(
+                f"Unsupported NVFP4 moe_quant_format {moe_quant_format!r}; "
+                f"ATOM reads only {self._NVFP4_MOE_FORMAT!r}."
+            )
+        group_size = hf_quant_config.get("group_size", NVFP4_GROUP_SIZE)
+        if group_size != NVFP4_GROUP_SIZE:
+            raise ValueError(
+                "ATOM supports NVFP4 routed experts only with "
+                f"group_size={NVFP4_GROUP_SIZE}, got {group_size}."
+            )
+        expert_spec = LayerQuantConfig(
+            quant_type=QuantType.per_1x32,
+            quant_dtype=NVFP4_DTYPE,
+            is_dynamic=True,
+            quant_method=NVFP4_DIVISOR_GLOBAL_SCALE_METHOD,
+        )
+        return ParsedQuantConfig(
+            global_spec=parsed.global_spec,
+            layer_pattern_specs=[
+                *parsed.layer_pattern_specs,
+                (self.MOE_EXPERTS_PATTERN, expert_spec),
+            ],
+            exclude_layers=parsed.exclude_layers,
+        )
