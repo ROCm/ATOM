@@ -838,8 +838,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # planner takes batch as a tl.constexpr, so a new value is a kernel
             # specialization -- 65-72 ms cold -- and a plan that is never freed
             # because some captured graph may have baked its pointers in. A
-            # runtime batch with no capture-owned plan is handled by the
-            # bounded runtime-plan cache in run_pa_decode.
+            # runtime batch with no capture-owned plan gets a runtime plan in
+            # run_pa_decode.
             # Only once a capture has happened: before the first one every
             # call lands here (profile run, eager warmup), and logging then
             # burns the one shot on a step that says nothing.

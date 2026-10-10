@@ -1339,13 +1339,9 @@ def minimax_m3_sparse_attn_decode_asm(
             topk_idx, block_table, seq_lens, block_page_stride=block_page_stride
         )
 
-    # Every sparse layer of one decode step selects the same per-row lengths:
-    # the local tail block is always selected, so a row's length depends only
-    # on its seq_len (checked: 0 differences over 9,000 C15 steps x 56 layer
-    # pairs). This holds while all sparse layers share topk / init / local
-    # blocks, as MiniMax-M3 does; a per-layer selection config would break it.
-    # With the step's metadata as ``plan_step_owner`` the FlyDSL plan is
-    # refreshed by the first sparse layer only.
+    # All sparse layers of a step share per-row lengths (the tail block is
+    # always selected, so a length depends only on seq_len, given one
+    # topk/init/local config), so the FlyDSL plan is refreshed once per step.
     _sparse_pa_per_row(
         q,
         k_cache,
@@ -1465,8 +1461,7 @@ def _sparse_pa_per_row(
         sliding_window=-1,
         ps=True,
         plan_step_owner=plan_step_owner,
-        # Sparse keeps its small static cap: each row's selected context is a
-        # bounded topk window, unlike the dense planner's long-tail lengths.
+        # Bounded topk window per row: keep the static split cap.
         plan_partition_cap=max_context_partition_num,
     )
 

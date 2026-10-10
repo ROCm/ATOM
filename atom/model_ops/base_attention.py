@@ -22,8 +22,7 @@ logger = logging.getLogger("atom")
 
 
 def _warn_removed_flydsl_plan_env() -> None:
-    """ATOM_PA_FLYDSL_PLAN is gone: with aiter #5809 every FlyDSL decode needs
-    a plan, so PLAN=0 could only mean gluon, which ATOM_PA_FLYDSL=0 already is."""
+    """Warn if the removed ATOM_PA_FLYDSL_PLAN is still set."""
     if "ATOM_PA_FLYDSL_PLAN" in os.environ:
         logger.warning(
             "ATOM_PA_FLYDSL_PLAN is no longer used and is ignored; FlyDSL "
@@ -381,18 +380,11 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
 ):
-    """Return the explicit plan aiter #5809 requires for this call.
+    """Return the explicit plan aiter #5809 requires, at aiter's default budget.
 
-    Plans use aiter's default workgroup budget (2*CU); #5809 ships no tuned
-    budgets. ``plan_partition_cap`` None takes aiter's default partition
-    ceiling, as the capture-owned plans do.
-
-    ``plan_step_owner``: an object the caller creates fresh every step (its
-    per-step metadata) and whose calls all share identical lengths (MiniMax-M3
-    sparse decode: every sparse layer of a step selects the same per-row
-    lengths). The plan is then refreshed by the first such call only -- one
-    planner launch per step instead of one per layer, in eager and in the
-    captured graph alike. None refreshes on every call.
+    ``plan_partition_cap``: None takes aiter's default partition ceiling.
+    ``plan_step_owner``: a per-step object whose calls all share the same
+    lengths; the plan is then refreshed once per step instead of every call.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
@@ -414,15 +406,9 @@ def _flydsl_prepare_explicit_plan(
     ):
         return existing_plan
 
-    # Plans own GPU metadata and their scratch cache keeps them alive. Keying
-    # this cache by the input tensor address therefore leaked one plan and one
-    # scratch allocation for every transient input buffer. A stream is the
-    # actual serialization boundary: calls on one stream may safely refresh and
-    # reuse the same plan, while TBO's concurrent streams must not share it.
-    # The remaining dimensions are bounded execution shapes, independent of
-    # allocator addresses. A step-scoped plan is kept apart from per-call ones:
-    # a per-call caller of the same shape in between would otherwise leave the
-    # remaining step-scoped calls on its lengths.
+    # Keyed by stream (TBO ubatches must not share a plan), never by tensor
+    # address. Step-scoped and per-call plans are kept apart so a per-call
+    # caller cannot leave the step's remaining calls on its lengths.
     stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
     plan_key = (
         stream_id,
@@ -437,9 +423,8 @@ def _flydsl_prepare_explicit_plan(
     plan = _FLYDSL_RUNTIME_PLANS.get(plan_key)
     lengths = context_lens[:num_seqs]
     if plan_step_owner is not None:
-        # Capture runs an eager warmup and the capture forward with the same
-        # metadata and stream; keying on the capture state makes the capture
-        # pass record its own refresh, so every replay re-plans.
+        # Warmup and capture share the metadata; keying on capture state makes
+        # the graph record its own refresh.
         refreshed = _flydsl_step_refreshed(plan_step_owner)
         mark = (plan_key, torch.cuda.is_current_stream_capturing())
         if plan is not None and mark in refreshed:
@@ -532,14 +517,10 @@ def run_pa_decode(
         sliding_window=sliding_window,
         ps=ps,
     )
-    # Every FlyDSL call now needs a plan, and aiter's planner rejects more than
-    # _FLYDSL_PLAN_MAX_BATCH rows (e.g. a long sparse prefill chunk folded into
-    # rows). Gluon has no such bound.
+    # aiter's planner rejects more than _FLYDSL_PLAN_MAX_BATCH rows.
     if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
         flydsl_seqs = None
-    # Resolved only on the FlyDSL path, so a deployment with FlyDSL off pays
-    # nothing. A bound below the query window (e.g. an all-padding step) is
-    # outside FlyDSL's contract; gluon takes it.
+    # Only on the FlyDSL path; a bound below the query window goes to gluon.
     if flydsl_seqs:
         context_bound = _flydsl_context_bound(max_context_length, block_tables, k_cache)
         if context_bound < max_seqlen_q:
@@ -588,8 +569,7 @@ def run_pa_decode(
         if work_plan is not None and not flydsl_plan_matches(
             work_plan, flydsl_seqs, k_cache.shape[1]
         ):
-            # Not fatal: #5809 requires a plan, so discard this incompatible
-            # capture-owned plan and rebuild a compatible explicit one below.
+            # Not fatal: rebuild a compatible explicit plan below.
             # Keyed on the plan's batch alone, which is a capture-ladder
             # rung and therefore bounded. The op's own count is not: the
             # case this warning exists for is a non-unified DP step, where
@@ -605,9 +585,7 @@ def run_pa_decode(
                 )
             work_plan = None
 
-        # aiter #5809 removed the static FlyDSL path: every decode now needs an
-        # explicit plan. Create a cached one for call sites that historically
-        # did not opt into the dense variable-work planner.
+        # aiter #5809 needs an explicit plan on every call.
         work_plan = _flydsl_prepare_explicit_plan(
             q=q,
             k_cache=k_cache,
