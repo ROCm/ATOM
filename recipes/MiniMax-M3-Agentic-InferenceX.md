@@ -1,6 +1,6 @@
 # MiniMax-M3 — Agentic serving recipe (InferenceX)
 
-TP4 + EAGLE3, MXFP4 weights, concurrency 1–48. This is the configuration the SemiAnalysis InferenceX reference benchmarks for this model (`configs/amd-master.yaml`: `{tp: 4, spec-decoding: mtp}`); CONC 40/48 add the LMCache CPU tier.
+TP4 + EAGLE3, MXFP4 weights, concurrency 1–48. This is the configuration the SemiAnalysis InferenceX reference benchmarks for this model (`configs/amd-master.yaml`: `{tp: 4, spec-decoding: mtp}`); CONC 40/48 add an LMCache CPU tier held by a standalone LMCache server (`lmcache_mp`).
 
 MiniMax-M3's KV is **uncompressed** — 22.9 KB per token per rank — so the GPU pool stops holding reusable prefixes well before it runs out of room. Throughput flattens at CONC=32 while interactivity keeps falling; 40c is the best point on the ladder, and 48c buys 3.9% more throughput for 38.5% less interactivity. See [Measured](#measured).
 
@@ -84,53 +84,65 @@ Monotone and never negative: throughput is neutral everywhere while interactivit
 
 ## Concurrency 40/48 — CPU offload
 
-Run the 40c and 48c points with LMCache CPU offload and the SLRU cache policy. Keep the server command above and add these to its `env \` block:
+Run the 40c and 48c points with a CPU tier held by a standalone LMCache server (LMCache multiprocess mode, `lmcache_mp`). The server owns the CPU pool and its eviction; ATOM's TP ranks register their KV pages with it over GPU IPC. M3 is PAGE-only here and each TP rank stores its own shard. Requires ATOM with #2518 (the lookup read-lock fix): without it, leaked read locks pin 30–50% of the server's cached objects until the read TTL, and eviction falls on newer prefixes instead.
+
+Start the server first, on the same host:
+
+```bash
+lmcache server --host 127.0.0.1 --port 5555 \
+  --chunk-size 256 --null-block-id -1 --separate-object-groups \
+  --supported-transfer-mode lmcache_driven \
+  --l1-size-gb 1024 --l1-use-lazy --l1-read-ttl-seconds 900 \
+  --eviction-policy LRU --eviction-trigger-watermark 0.995 --eviction-ratio 0.01 \
+  --max-workers 4 \
+  > lmcache_server_c${CONC}.log 2>&1 &
+```
+
+Then keep the ATOM server command above and add these to its `env \` block:
 
 ```bash
   ROCR_VISIBLE_DEVICES=0,1,4,5 \
   PYTHONHASHSEED=0 \
-  LMCACHE_LOCAL_CPU=True \
-  LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
+  ATOM_KV_OFFLOAD=lmcache_mp \
+  ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5555}' \
   LMCACHE_CHUNK_SIZE=256 \
   ATOM_PREFIX_CACHE_POLICY=slru \
   ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5 \
-  LMCACHE_CACHE_POLICY=ATOM_SLRU \
-  LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3 \
 ```
 
-### `ROCR_VISIBLE_DEVICES=0,1,4,5` is a prerequisite, not a tuning knob
+`PYTHONHASHSEED=0` is not optional: without it each TP rank hashes the same prompt to a different cache key and the offload hit rate goes to zero. Do not also pass `--kv-transfer-config` with `lmcache_offload`; ATOM rejects the combination.
 
-GPUs 0–3 sit on NUMA node 0 and 4–7 on node 1, and ranks pinning host memory on one node starve each other. On the 8×MI355X nodes measured here this is not a slowdown but a failure: with all four TP4 ranks on node 0 **the server did not come up** — the fourth rank never finished pinning its 256 GB and the ranks that did timed out on the `allocate_kv_cache` barrier after 600 s. Split two per socket, the same 1 TB pins in **24 s**. (TP2 on one node is merely slow rather than fatal: 45 min against 21 s split.)
+- `ROCR_VISIBLE_DEVICES=0,1,4,5` puts two ranks on each NUMA node (GPUs 0–3 are node 0, 4–7 node 1). With the in-process tier, four ranks pinning 256 GB each on one node never came up; MP has only been measured split. The split itself is free: no-offload CONC=32 on `0,1,4,5` vs `0,1,2,3` is +0.43% throughput, within the 0.6% noise floor.
+- `--l1-size-gb 1024` is 256 GB per TP4 rank in one pinned pool. `--l1-use-lazy` is required at this size: without it a 1.2 TB pool fails with `hipErrorInvalidDevicePointer`.
+- `--chunk-size` must equal ATOM's `LMCACHE_CHUNK_SIZE` and be a multiple of `--block-size` (128).
+- `--l1-read-ttl-seconds 900`: a lookup read-locks every chunk it hits until the retrieve releases it; a lock nobody releases expires after this TTL, and locked chunks are skipped by eviction.
+- `--max-workers 4` sets both server pools — the GPU pool (STORE/RETRIEVE, `--max-gpu-workers`) and the CPU pool (LOOKUP, `--max-cpu-workers`) — to 4, one slot per TP rank (default 1 each). It cuts lookup p90 from 121 to 92 ms at 40c; throughput and recompute are unchanged, so it is optional.
+- Tested with LMCache 0.5.6.dev139 (`rocm/atom-dev:nightly_202610031557`). The server needs `--null-block-id` and `--separate-object-groups`.
+- `/metrics` `prefix_cache_cached_tokens_total` does not count tokens restored from the MP tier, and ATOM prints no `OFFLOAD-LOAD-PROF` / `OFFLOAD-SAVE-PROF` lines in this mode. Read the tier from the server log (`Stored` / `Retrieved`) and ATOM's `[OFFLOAD-PROMOTE]` lines.
 
-Splitting puts the TP all-reduce across sockets, which costs nothing measurable: a no-offload CONC=32 arm on `0,1,4,5` against the same arm on `0,1,2,3` is +0.43% throughput, −1.08% p90 interactivity, +0.50% p50 — all at the 0.6% noise floor.
+### Eviction watermark and ratio
 
-`PYTHONHASHSEED=0` is not optional either: without it each TP rank hashes the same prompt to a different cache key and the offload hit rate goes to zero.
+The server checks usage once a second and, at or above `--eviction-trigger-watermark`, evicts `--eviction-ratio` of the pool in one batch, so the pool oscillates between `watermark − ratio` and `watermark`. The in-process tier evicts one block on demand and stays full. With the defaults (0.98 / 0.2) the pool is on average only ~90% as full as the in-process tier — and at 40c the reusable working set reaches the pool's capacity in the last ten minutes of the hour, so that shortfall shows up directly as recompute. Measured at 40c, 3600 s, same node and tree, against three in-process runs (mean 235,887 tok/s):
 
-and this to its args:
+| watermark / ratio | pool range | resident vs in-process | recompute, last 10 min | throughput vs in-process |
+|---|---|---:|---:|---:|
+| 0.98 / 0.2 (default ratio) | 0.786–0.978 | ~90% | 7.3–8.2 M | −2.2% to −5.3% (3 runs) |
+| 0.98 / 0.05 | 0.931–0.98 | ~96% | 6.8 M | −1.8% |
+| **0.995 / 0.01** | 0.985–0.996 | ~99% | 4.7 M | **−0.6%** |
+| in-process | full | 100% | 3.8–4.8 M | — |
 
-```bash
-    --kv-transfer-config '{"kv_connector":"lmcache_offload","kv_role":"offload"}' \
-```
+The cost of 0.995 / 0.01 is that a few stores land while the pool is full: 38 `Failed to batched allocate` lines, 6,967 chunks not stored, over the 3600 s run.
 
-### Cache policies
+### Measured: MP against the in-process tier
 
-`LMCACHE_LOCAL_CPU` / `LMCACHE_MAX_LOCAL_CPU_SIZE` / `LMCACHE_CHUNK_SIZE` turn the CPU tier on and size it. The remaining four variables are what make it worth having — two policies plus a fix that has no knob. Leave them out and HBM and CPU both fall back to plain LRU, and lookup defaults to rank 0.
+8×MI355X, TP4 + EAGLE3 + indexer CP, recipe command above plus the optional `--cudagraph-capture-sizes` list from the Notes, 3600 s, one node and one ATOM tree for both arms. The in-process arm is `lmcache_offload` with 256 GB per rank and LRU (`ATOM_SLRU` measured the same: +0.16%).
 
-- **`LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3` — all-rank lookup.** One id per TP4 rank. Each rank updates its own cache recency and pins its own KV shard, and the **minimum** hit length across ranks is the common restorable prefix — so a shard another rank has already evicted is never trusted.
-- **`LMCACHE_CACHE_POLICY=ATOM_SLRU` + `ATOM_PREFIX_CACHE_POLICY=slru` — segmented LRU.** New data enters probation, reused data is promoted to protection; probationary data is evicted first, demoting older protected entries once the limit is exceeded. `ATOM_PREFIX_CACHE_PROTECTED_RATIO=0.5` caps HBM protection at that fraction of total pool blocks; CPU protection targets half the resident chunks. Protected data stays evictable — referenced/pinned data does not. Separate CPU queues keep probationary eviction from scanning the protected segment, though pinned entries may still require a scan.
-- **Pin lifecycle** (no knob, always on): lookup pins are released on misses, errors, skipped loads and cancellation, including aborts before HBM allocation, while pins for pending loads are retained. This is independent of SLRU.
+| conc | CPU tier | runs | tok/s/chip | intvty_p90 | TTFT p90 (ms) | recompute | realised hit |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 | in-process | 3 | 58,943–59,026 | 89.2–91.0 | 1,041–1,089 | 24.5–25.5 M | 97.1–97.2% |
+| 40 | **MP** | 1 | **58,602** | 92.2 | 1,318 | 25.5 M | 97.1% |
 
-Only **synchronous** lookup is supported; enabling `LMCACHE_ENABLE_ASYNC_LOADING` is rejected at startup.
-
-Lookup scope is the biggest of the three by a wide margin. Measured at 48c, 1800 s, 256 GiB CPU cache per rank, no NVMe, FP8 KV, synthetic acceptance 0.5933 — **both arms had SLRU and the pin fix on, only the lookup scope changed**:
-
-| | rank 0 only | all-rank |
-|---|---:|---:|
-| Total prompt cache hit rate | 82.86% | **95.48%** |
-| Throughput (tok/s/chip) | 21,692.64 | **42,843.46** |
-| P90 ITL (ms) | 66.94 | **24.35** |
-
-> This pair isolates lookup scope, **not SLRU's independent contribution** — nobody has run SLRU on/off with everything else held. It also predates the `--gpu-memory-utilization 0.95`, cudagraph-size and indexer-CP changes, so its absolute numbers are **not** comparable with the [Measured](#measured) table above; the 48c row there reads 55,516 tok/s/chip at a P90 ITL of ~22 ms on the newer basis.
+MP and the in-process tier recompute the same prefill, and throughput is within noise. MP's TTFT p90 is higher; ITL p50 / p90 are 7.01 / 10.85 ms against 7.10–7.11 / 10.99–11.21 ms. 48c has not been measured with MP yet.
 
 ## aiperf
 
@@ -186,6 +198,8 @@ MI355X, TP4 + EAGLE3, MXFP4, `--gpu-memory-utilization 0.95`, explicit cudagraph
 | 32 | ✅ | — | 45,072 | 74.4 | 92.2% | 36.6 M | 94.4% |
 | 40 | ✅ | ✅ | 53,437 | 73.0 | 83.1% | 22.5 M | 97.1% |
 | 48 | ✅ | ✅ | 55,516 | 44.9 | 70.2% | 41.0 M | 94.9% |
+
+> The 40c and 48c rows were measured on 2026-09-17 with the in-process LMCache tier, on an older tree and a different node; the MP comparison in [Concurrency 40/48 — CPU offload](#concurrency-4048--cpu-offload) is on a newer basis, so compare within each table, not across.
 
 > The 1c and 2c rows complete only 270 and 431 requests in the hour, so their input-length mix is drawn from a much smaller sample than the rest of the ladder and skews long (ISL 272K and 182K against ~150K above 8c). Read them as operating points, not as points on the same corpus.
 
