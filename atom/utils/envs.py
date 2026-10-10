@@ -380,10 +380,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
-    # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
-    # path supports is ever routed to it; every other batch keeps the original
-    # model. 0 disables it.
+    # Fused decode for measured model/deployment/step geometries. Unsupported
+    # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.

@@ -1831,6 +1831,11 @@ class KimiLinearForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self._staged_c1 = None
+        if envs.ATOM_MONO_ENABLE:
+            from atom.models.kimi_k3_mono import KimiStagedC1Decode
+
+            self._staged_c1 = KimiStagedC1Decode(self, atom_config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -1842,6 +1847,14 @@ class KimiLinearForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if self._staged_c1 is not None and self._staged_c1.supports(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+        ):
+            self._staged_c1.prepare()
+            return self._staged_c1.forward(input_ids, positions, inputs_embeds)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

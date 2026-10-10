@@ -77,6 +77,10 @@ C8–C48 use 128 GiB LMCache; C56–C80 use **192 GiB**. LMCache CPU size is
 `AITER_REUSE_IDENTICAL_COMM_GROUPS=1` on **C56/C64/C72/C80**, and `0` on every
 other band (C1…C48).
 
+`ATOM_MONO_ENABLE=1` is enabled only at C1. It keeps the
+production attention, KDA, and AttnRes path and replaces the MoE tail. C2 and
+above remain `off`; their batch-efficient production path is faster.
+
 `ATOM_PREFILL_DECODE_INTERVAL=4` and `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` on
 **C16 and up**; unset on C1…C14.
 
@@ -154,6 +158,7 @@ GPU_MEMORY_UTILIZATION=0.90
 ENABLE_LMCACHE=1
 LMCACHE_MAX_LOCAL_CPU_SIZE=128
 ATOM_ENABLE_REPLAYSSM=0
+ATOM_MONO_ENABLE=0
 NUM_SPECULATIVE_TOKENS=0
 SPEC_DECODE_ACCEPTANCE_LENGTH=""
 
@@ -164,6 +169,9 @@ case "${CONC}" in
     ENABLE_LMCACHE=0
     NUM_SPECULATIVE_TOKENS=7
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.84
+    if [[ "${CONC}" == "1" ]]; then
+      ATOM_MONO_ENABLE=1
+    fi
     ;;
   8|12|14|16)
     # Mid: DCP=8 + LMCache 128 GiB + the narrow DSpark draft.
@@ -189,6 +197,8 @@ case "${CONC}" in
     exit 2
     ;;
 esac
+
+export ATOM_MONO_ENABLE
 
 # Stated as a rule rather than repeated in nine branches so the two cannot
 # drift apart.

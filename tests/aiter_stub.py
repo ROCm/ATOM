@@ -20,6 +20,7 @@ def stubbed_aiter():
     for name in (
         "aiter",
         "aiter.dist",
+        "aiter.dist.communication_op",
         "aiter.dist.shm_broadcast",
         # Bound at import by the P/D connectors; the real module probes the
         # GPU arch through `rocminfo` on the way in.
