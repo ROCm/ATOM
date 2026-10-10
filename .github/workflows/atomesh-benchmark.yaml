@@ -49,6 +49,7 @@ on:
         type: choice
         options:
           - smoke
+          - store-smoke
           - nightly
           - vllm
       rdma_smoke_nodes:
@@ -465,7 +466,7 @@ jobs:
             if [[ -n "${CASE_NAMES}" ]]; then
               CASE_NAME="${CASE_NAMES}"
             elif [[ "${RUN_ALL_MODELS}" != "true" ]]; then
-              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" ]]; then
+              if [[ -z "${MODEL_NAMES}" && "${SUITE}" != "smoke" && "${SUITE}" != "store-smoke" ]]; then
                 echo "::error::Set run_all_models=true, provide model_names, or provide case_names."
                 exit 1
               fi
@@ -473,7 +474,7 @@ jobs:
             fi
           fi
 
-          if [[ "${SUITE}" == "smoke" && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
+          if [[ ( "${SUITE}" == "smoke" || "${SUITE}" == "store-smoke" ) && -z "${CASE_NAME}" && -z "${MODEL_NAME}" && "${RUN_ALL_MODELS}" != "true" ]]; then
             python3 - <<'PY'
           import json
           import os
@@ -581,6 +582,49 @@ jobs:
         with:
           name: atomesh-benchmark-matrix
           path: atomesh-matrix.json
+
+  store-smoke-test:
+    name: Mooncake CPU Store registration smoke test
+    needs: [load-config]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.suite == 'store-smoke' }}
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download pinned ROCm Mooncake wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          target=.github/scripts/atomesh/mooncake-dist
+          mkdir -p "${target}"
+          curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/kvcache-ai/Mooncake/actions/artifacts/11593557642/zip \
+            -o "${target}/wheel.zip"
+          python3 - "${target}" <<'PYWHEEL'
+          import hashlib, sys, zipfile
+          from pathlib import Path
+          target = Path(sys.argv[1])
+          name = "mooncake_transfer_engine_rocm-0.3.13-cp312-cp312-manylinux_2_35_x86_64.whl"
+          with zipfile.ZipFile(target / "wheel.zip") as archive:
+              wheel = archive.read(name)
+          assert hashlib.sha256(wheel).hexdigest() == "7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6"
+          (target / name).write_bytes(wheel)
+          PYWHEEL
+      - name: Reproduce CPU Store registration
+        env:
+          STORE_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
+          STORE_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
+        run: |
+          bash .github/scripts/atomesh/pd_mooncake_store_smoke.sh \
+            "${STORE_SMOKE_NODES}" "${STORE_SMOKE_IMAGE}" \
+            "${GITHUB_WORKSPACE}/store-smoke-results"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mooncake-store-smoke-${{ github.run_id }}
+          path: store-smoke-results
 
   rdma-smoke-test:
     name: Mooncake RDMA smoke test
