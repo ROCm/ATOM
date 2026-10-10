@@ -105,6 +105,6 @@ def test_speculative_verify_dispatch(
     )
 
 
-def test_speculative_scratch_uses_live_batch_length():
+def test_speculative_scratch_covers_the_model_limit():
     assert speculative_pool_scratch_width(2051, 4) == 513
     assert speculative_pool_scratch_width(128 * 1024, 4) == 32 * 1024
