@@ -142,8 +142,8 @@ support_model_arch_dict = {
 }
 # Mono decode by wrapping the loaded model: the installer runs after the drafter
 # armed its hooks on the unwrapped layers, and may add per-step buffers to the
-# metadata builder before they are bound.
-# Architectures with an uncompiled outer class route inside it instead.
+# metadata builder before they are bound. Architectures not listed here route
+# mono decode inside their own model class instead.
 mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
@@ -851,15 +851,6 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
-        if (
-            config.enable_decoder_swa_bounded_replay
-            and hf_config.architectures[0] != "DeepseekV41ForCausalLM"
-        ):
-            logger.warning(
-                "--enable-decoder-swa-bounded-replay is ignored: only "
-                "DeepSeek-V4.1 supports it, not %s.",
-                hf_config.architectures[0],
-            )
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(

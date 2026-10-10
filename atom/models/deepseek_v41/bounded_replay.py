@@ -8,10 +8,11 @@ a prefill leaves behind in those layers is each request's last ring of rows,
 plus the logits and DSpark aux rows of its last token. So a prefill runs the
 early layers on every row and the late layers on each request's tail only.
 
-This is SGLang's ``--enable-decoder-swa-bounded-replay`` (``LateLayerTail``,
+On by default (``--no-decoder-swa-bounded-replay`` turns it off). This is
+SGLang's ``--enable-decoder-swa-bounded-replay`` (``LateLayerTail``,
 ``late_layer_tail_layout``, ``enter_late_layer_tail``) and vLLM's
-``--swa-bounded-replay`` (``DecoderReplayLayers``); the names follow SGLang.
-Under the flag the runtime model compiles the early and late layers as two
+``--swa-bounded-replay`` (``DecoderReplayLayers``, on by default there too);
+the names follow SGLang. With it the runtime model compiles the early and late layers as two
 graphs (``runtime._EarlyLayers`` / ``_LateLayers``) and, on a replay, hands
 the late graph the tail's rows with the tail's step in the forward context.
 
@@ -132,8 +133,9 @@ class LateLayerTail:
 
 def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs) -> LateLayerTail:
     """``step`` cut down to each request's tail, with what the late layers read
-    off the early ones carried over by row. Host-side and kernel-free; the
-    tail's indptrs are filled by ``late_layer_tail``."""
+    off the early ones carried over by row: one upload of the tail layout,
+    then device-side gathers. No Triton kernel; the tail's indptrs are filled
+    by ``late_layer_tail``."""
     spans, indices, replay_start = late_layer_tail_layout(step, tail_len)
     lengths = np.asarray([span.length for span in spans], dtype=np.int64)
     cu_seqlens_q = np.concatenate(([0], np.cumsum(lengths)))
@@ -191,10 +193,10 @@ def late_layer_tail(metadata, tail: LateLayerTail):
     """The late layers' step is the tail's while they run.
 
     Filling the tail's indptrs rewrites the cache's shared indptr buffers, and
-    the late REINDEX layers rewrite its tile workspace. The forward's step is
-    restored afterwards but those buffers keep the tail's contents: nothing
-    reads them after the model, and the next forward's ``begin_step`` refills
-    both.
+    the late REINDEX layers rewrite its tile workspace. When the forward's step
+    is restored its indptrs and memoized tiles are cleared, since those buffers
+    now hold the tail's contents: a reader after the model fails loudly
+    instead of reading them. The next forward's ``begin_step`` rebuilds both.
     """
     # Triton-backed; imported here so this module imports without it.
     from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
@@ -209,3 +211,5 @@ def late_layer_tail(metadata, tail: LateLayerTail):
         yield
     finally:
         metadata.step = full
+        full.indptrs = {}
+        full.tiles.clear()

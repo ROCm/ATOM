@@ -187,10 +187,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # `model_loader.deepseek_v41.engram_tables`, which the Engram runtime
     # imports directly and does not route through here.
     #
-    # The forward is one compiled graph (`_Backbone`). Under
-    # `--enable-decoder-swa-bounded-replay` it is two, split after the last
-    # KV-source layer, so a prefill can run the late one on each request's
-    # tail (`bounded_replay.py`); decode then runs both on every row.
+    # With decoder SWA bounded replay (on by default) the forward is two
+    # compiled graphs split after the last KV-source layer, so a prefill can
+    # run the late one on each request's tail (`bounded_replay.py`); decode
+    # runs both on every row. With --no-decoder-swa-bounded-replay it is one
+    # graph (`_Backbone`).
 
     block_cls = RuntimeBlock
 
@@ -243,10 +244,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         v41_end_forward(hidden)
 
     def set_aux_hidden_state_rows(self, layer_ids, buffers):
-        """DSpark's aux captures: ``buffers()`` returns the drafter's current
-        capture buffers, one per id in ``layer_ids``. A replay's late layers
-        capture the tail's rows only, which ``_late_on_tail`` moves to their
-        forward rows."""
+        """DSpark's aux capture buffers, one per id in ``layer_ids`` -- the
+        tensors its hooks write. A replay's late layers capture the tail's rows
+        only, which ``_late_on_tail`` moves to their forward rows."""
         if self.replay:
             start = self.late.first
             self.late_aux_layers = tuple(
@@ -264,26 +264,30 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         if ring is None:
             return self.late(*state)
         tail = build_late_layer_tail(forward.attn_metadata.step, ring, self.late_specs)
-        return self._late_on_tail(state, tail, input_ids.numel())
+        tail_state = SinglePassHCState(*state).take_rows(tail.token_indices)
+        # Release the early graph's every-row state before the late layers run;
+        # only the tail's rows are needed from here on.
+        del state
+        return self._late_on_tail(tail_state, tail, input_ids.numel())
 
-    def _late_on_tail(self, state, tail, num_tokens):
+    def _late_on_tail(self, tail_state, tail, num_tokens):
         rows = tail.token_indices
         with late_layer_tail(get_forward_context().attn_metadata, tail):
-            hidden = self.late(*SinglePassHCState(*state).take_rows(rows).fields())
+            hidden = self.late(*tail_state.fields())
         # Late-layer aux captures wrote the tail's rows at the buffer's head;
         # move each to its forward row. The other rows hold values nothing
         # reads: the draft's context write takes each request's last ring rows,
         # all of them in the tail.
         if self.late_aux_layers:
-            buffers = self.aux_buffers()
+            buffers = self.aux_buffers
             n = rows.numel()
             for k in self.late_aux_layers:
                 buffers[k].index_copy_(0, rows, buffers[k][:n].clone())
-        # Rows outside the tail are left unwritten: only each request's last
-        # row is read (the LM head's), and it is in the tail. `compute_logits`
-        # still norms every row; restricting it needs a per-forward signal
-        # that survives CUDA-graph replay, which skips this Python.
-        out = hidden.new_empty(num_tokens, hidden.shape[-1])
+        # Rows outside the tail are zero: only each request's last row is read
+        # (the LM head's), and it is in the tail. `compute_logits` still norms
+        # every row; restricting it needs a per-forward signal that survives
+        # CUDA-graph replay, which skips this Python.
+        out = hidden.new_zeros(num_tokens, hidden.shape[-1])
         out.index_copy_(0, rows, hidden)
         return out
 

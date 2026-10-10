@@ -408,12 +408,13 @@ class Drafter(abc.ABC):
         self._captures_aux = True
         # A target that runs some layers on a subset of rows (V4.1 bounded
         # replay) moves those layers' captures to their forward rows itself.
-        # It gets a getter, so a rebuilt buffer list is the one it moves.
+        # The hooks above bind these buffers now, so the target gets the same
+        # tensors.
         rows_hook = _descend_wrappers(
             target_model, lambda m: getattr(m, "set_aux_hidden_state_rows", None)
         )
         if rows_hook is not None:
-            rows_hook(tuple(spec.layer_ids), lambda: self._aux_buffers)
+            rows_hook(tuple(spec.layer_ids), tuple(self._aux_buffers))
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )

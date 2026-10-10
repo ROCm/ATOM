@@ -478,6 +478,23 @@ VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/atom")
 _DERIVED_CACHE_DIRS: set[str] = set()
 
 
+def _hash_traced_files(files) -> str:
+    """md5 over the paths and contents of the files Dynamo traced; the code
+    factor of a graph's compile-cache key."""
+    import hashlib
+
+    content = []
+    for filepath in files:
+        content.append(filepath)
+        if filepath == "<string>" or filepath == "<frozen os>":
+            # This means the function was dynamically generated, with
+            # e.g. exec() or frozen os module. We can't actually check these.
+            continue
+        with open(filepath) as f:
+            content.append(f.read())
+    return hashlib.md5("\n".join(content).encode(), usedforsecurity=False).hexdigest()
+
+
 class VllmBackend:
     """The compilation backend for `torch.compile` with vLLM.
     It is used for compilation level of `CompilationLevel.PIECEWISE`,
@@ -570,17 +587,7 @@ class VllmBackend:
         self.compilation_config.traced_files.clear()
         if not files:
             return self.prefix
-        import hashlib
-
-        content = []
-        for filepath in files:
-            content.append(filepath)
-            if filepath not in ("<string>", "<frozen os>") and os.path.exists(filepath):
-                with open(filepath) as f:
-                    content.append(f.read())
-        code = hashlib.md5(
-            "\n".join(content).encode(), usedforsecurity=False
-        ).hexdigest()[:10]
+        code = _hash_traced_files(files)[:10]
         return f"{self.prefix}-{code}"
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
@@ -611,27 +618,15 @@ class VllmBackend:
                 "Traced files (to be considered for compilation cache):\n%s",
                 "\n".join(forward_code_files),
             )
-            hash_content = []
-            for filepath in forward_code_files:
-                hash_content.append(filepath)
-                if filepath == "<string>" or filepath == "<frozen os>":
-                    # This means the function was dynamically generated, with
-                    # e.g. exec() or frozen os module. We can't actually check these.
-                    continue
-                with open(filepath) as f:
-                    hash_content.append(f.read())
-            import hashlib
-
-            code_hash = hashlib.md5(
-                "\n".join(hash_content).encode(), usedforsecurity=False
-            ).hexdigest()
-            factors.append(code_hash)
+            factors.append(_hash_traced_files(forward_code_files))
 
             # 3. compiler hash
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
 
             # combine all factors to generate the cache dir
+            import hashlib
+
             hash_key = hashlib.md5(
                 str(factors).encode(), usedforsecurity=False
             ).hexdigest()[:10]

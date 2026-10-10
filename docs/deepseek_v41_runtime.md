@@ -143,13 +143,14 @@ the CPU; moving the lookup to HBM and fusing it further is future work.
 
 ## Decoder SWA bounded replay
 
-`--enable-decoder-swa-bounded-replay` (off by default) is SGLang's flag of the
-same name and vLLM's `--swa-bounded-replay`. Layers 21..39 own no global KV,
+Decoder SWA bounded replay is on by default; `--no-decoder-swa-bounded-replay`
+turns it off. It is SGLang's `--enable-decoder-swa-bounded-replay` and vLLM's
+`--swa-bounded-replay` (also on by default there). Layers 21..39 own no global KV,
 only their sliding-window rings, so after a prefill only each request's last
 ring of rows in them is ever read.
 
-Without the flag the runtime model compiles its forward as one graph
-(`runtime._Backbone`), as before. With it, the forward is two graphs split
+With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
+as one graph (`runtime._Backbone`), as before. Otherwise the forward is two graphs split
 after the last KV-source layer (`_EarlyLayers`, `_LateLayers`, each with its
 own compile-cache key). A prefill runs the early graph on every row and the
 late graph on each request's last `ring_slots` rows (window + speculative
@@ -166,6 +167,10 @@ computed from truncated windows, and the last token's logits and every ring
 row decode reads differ from a full prefill's in all 19 late layers. The
 global path (the KV-source layers' compressed KV and the top-k selections the
 late layers reuse) is exact. Measured on V4.1-Flash (TP2): GSM8K 3-shot
-92.2 with the flag vs 92.1 without (mean of three runs each, run-to-run noise
-about 1 point); 40/40 on a 4K-60K-token long-context retrieval set either way.
+92.2 with the flag vs 92.1 without (mean of three runs each on the two-graph
+build: 91.2 / 92.8 / 92.7 vs 92.5 / 91.4 / 92.3; run-to-run noise about 1 point); 40/40 on a 4K-60K-token long-context retrieval set either way.
 SGLang and vLLM make the same approximation.
+
+Cost: the early graph's every-row output is a graph input of the late one,
+so it lives until the late graph returns. On V4.1-Flash TP2 the profiled peak
+rises by about 0.8 GB (160.06 vs 159.28 GB), about 1% fewer KV entries.

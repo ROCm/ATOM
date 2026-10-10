@@ -307,7 +307,7 @@ def test_late_rows_land_back_at_their_forward_rows(monkeypatch):
 
     model.late = late
     # capture 0 is an early layer's (full rows already), capture 1 a late one's
-    model.late_aux_layers, model.aux_buffers = (1,), lambda: aux
+    model.late_aux_layers, model.aux_buffers = (1,), aux
     metadata = SimpleNamespace(step=step)
     monkeypatch.setattr(
         runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
@@ -322,9 +322,16 @@ def test_late_rows_land_back_at_their_forward_rows(monkeypatch):
         torch.zeros(total, 4),
         torch.zeros(total, 4, 4),
     )
-    out = model._late_on_tail(state, LateLayerTail(rows, step), total)
+    from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+
+    tail_state = SinglePassHCState(*state).take_rows(rows)
+    out = model._late_on_tail(tail_state, LateLayerTail(rows, step), total)
     assert out.shape == (total, hidden)
     torch.testing.assert_close(out[rows], rows[:, None].float().expand(-1, hidden))
+    # rows outside the tail are zero, not undefined
+    outside = torch.ones(total, dtype=torch.bool)
+    outside[rows] = False
+    assert torch.all(out[outside] == 0)
     torch.testing.assert_close(
         aux[1][rows], rows[:, None].float().expand(-1, hidden) + 0.5
     )
