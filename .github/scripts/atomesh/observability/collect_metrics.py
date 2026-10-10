@@ -21,6 +21,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
 
 import export_report
+import hardware_report
 
 PROMETHEUS_VERSION = "3.5.0"
 REPORT_STEP = 5
@@ -54,6 +55,8 @@ def scrape_config(
     decode: list[str],
     mesh: str,
     interval: float = DEFAULT_SCRAPE_INTERVAL_SECONDS,
+    hardware: list[str] | None = None,
+    hardware_interval: float = 1.0,
 ) -> dict:
     """Accept the server script's resolved addresses, including per-worker ports."""
 
@@ -70,7 +73,7 @@ def scrape_config(
     duration = (
         f"{milliseconds // 1000}s" if milliseconds % 1000 == 0 else f"{milliseconds}ms"
     )
-    return {
+    config = {
         "global": {
             "scrape_interval": duration,
             "scrape_timeout": duration if interval < 1 else "1s",
@@ -97,6 +100,17 @@ def scrape_config(
             },
         ],
     }
+
+    if hardware:
+        config["scrape_configs"].append(
+            {
+                "job_name": "atom-hardware",
+                "scrape_interval": f"{round(scrape_interval_seconds(hardware_interval) * 1000)}ms",
+                "scrape_timeout": f"{round(min(hardware_interval, 1) * 1000)}ms",
+                "static_configs": [{"targets": sorted({target(t) for t in hardware})}],
+            }
+        )
+    return config
 
 
 def ensure_prometheus(directory: Path) -> str:
@@ -167,7 +181,11 @@ def wait_for_prometheus(
         if match:
             url = f"http://127.0.0.1:{match[1]}"
             try:
-                targets = get_json(url + "/api/v1/targets")["data"]["activeTargets"]
+                targets = [
+                    t
+                    for t in get_json(url + "/api/v1/targets")["data"]["activeTargets"]
+                    if t.get("labels", {}).get("job") != "atom-hardware"
+                ]
                 if len(targets) == target_count and all(
                     t["health"] == "up" for t in targets
                 ):
@@ -211,7 +229,11 @@ def wait_for_final_scrape(
             raise RuntimeError("Prometheus exited before the final scrape")
         if query_end is None:
             try:
-                targets = get_json(url + "/api/v1/targets")["data"]["activeTargets"]
+                targets = [
+                    t
+                    for t in get_json(url + "/api/v1/targets")["data"]["activeTargets"]
+                    if t.get("labels", {}).get("job") != "atom-hardware"
+                ]
                 if len(targets) == target_count and all(
                     t["health"] == "up"
                     and export_report.timestamp(t["lastScrape"]) > benchmark_end
@@ -297,7 +319,11 @@ def run(args) -> int:
     window = max(60, math.ceil(4 * interval))
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    config = scrape_config(args.prefill, args.decode, args.mesh, interval)
+    hardware = getattr(args, "hardware", [])
+    hardware_interval = getattr(args, "hardware_scrape_interval_seconds", 1.0)
+    config = scrape_config(
+        args.prefill, args.decode, args.mesh, interval, hardware, hardware_interval
+    )
     # JSON is valid YAML and avoids a YAML dependency inside the model image.
     save_json(output / "prometheus.yml", config)
     status = {
@@ -457,6 +483,29 @@ def run(args) -> int:
             ) as exc:
                 status["errors"].append(f"Report export failed: {exc}")
             finally:
+                if hardware and prometheus_url:
+                    try:
+                        panels, raw = hardware_report.collect_hardware(
+                            prometheus_url,
+                            start,
+                            end,
+                            step=REPORT_STEP,
+                            interval=hardware_interval,
+                            diagnostics=status["errors"],
+                        )
+                        data["panels"].extend(panels)
+                        save_json(output / "hardware-samples.json", raw)
+                        data["meta"]["hardware"] = {
+                            "start": start,
+                            "end": end,
+                            "scrape_interval_seconds": hardware_interval,
+                            "targets": sorted(set(hardware)),
+                        }
+                        notes.append(
+                            "Hardware summaries cover the complete benchmark invocation, including warmup and drain, excluding post-benchmark collection. Coverage is relative to the configured scrape interval; energy estimates omit gaps."
+                        )
+                    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                        status["errors"].append(f"Hardware export failed: {exc}")
                 stop_process(collector)
 
             status["collection_end"] = collection_end
@@ -502,6 +551,15 @@ def main():
     parser.add_argument("--prefill", action="append", required=True)
     parser.add_argument("--decode", action="append", required=True)
     parser.add_argument("--mesh", required=True)
+    parser.add_argument(
+        "--hardware-scrape-interval-seconds", type=scrape_interval_seconds, default=1.0
+    )
+    parser.add_argument(
+        "--hardware",
+        action="append",
+        default=[],
+        help="Node hardware exporter host:port; repeat per node",
+    )
     parser.add_argument(
         "--scrape-interval-seconds",
         type=scrape_interval_seconds,

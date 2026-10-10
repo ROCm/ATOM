@@ -23,6 +23,8 @@ from types import SimpleNamespace
 
 STATISTICS = {"mean": None, "p50": 0.50, "p90": 0.90, "p95": 0.95, "p99": 0.99}
 GAUGE_SERIES = {
+    "min",
+    "max",
     "running",
     "waiting",
     "waiting_kv",
@@ -355,7 +357,7 @@ def cache_count_query_for(panel, state, window, *, by_instance=False):
         return f"({gpu} + {offload})"
 
     def increase(metric):
-        return f'increase({metric}{{{panel["selector"]}}}[{window}s])'
+        return f"increase({metric}{{{panel['selector']}}}[{window}s])"
 
     values = increase(metrics[state])
     result = f"{aggregate}({values})"
@@ -436,13 +438,17 @@ def fetch_instance_series(url, query, start, end, step):
 
 def panel_queries(panel, window, *, by_instance=False):
     for statistic in statistics_for(panel):
-        yield "series", statistic, query_for(
-            panel, statistic, window, by_instance=by_instance
+        yield (
+            "series",
+            statistic,
+            query_for(panel, statistic, window, by_instance=by_instance),
         )
     if panel.get("kind") == "blocks":
         for state in ("used", "total"):
-            yield "block_counts", state, block_count_query_for(
-                panel, state, by_instance=by_instance
+            yield (
+                "block_counts",
+                state,
+                block_count_query_for(panel, state, by_instance=by_instance),
             )
     if panel.get("kind") == "cache":
         states = (
@@ -451,8 +457,10 @@ def panel_queries(panel, window, *, by_instance=False):
             else ("cached", "prompt")
         )
         for state in states:
-            yield "cache_counts", state, cache_count_query_for(
-                panel, state, window, by_instance=by_instance
+            yield (
+                "cache_counts",
+                state,
+                cache_count_query_for(panel, state, window, by_instance=by_instance),
             )
 
 
@@ -475,7 +483,7 @@ def request_context_query(panel, start, end):
     window_ms = max(1, math.ceil((end - start) * 1000))
     return (
         "max by (instance, request_id, sequence_id, started_at) ("
-        f'max_over_time({panel["metric"]}{{{panel["selector"]}}}[{window_ms}ms]))'
+        f"max_over_time({panel['metric']}{{{panel['selector']}}}[{window_ms}ms]))"
     )
 
 
@@ -800,8 +808,17 @@ def validate_data(data: dict) -> None:
         if panel["id"] in identifiers:
             raise ValueError("Panel identifiers must be unique")
         identifiers.add(panel["id"])
-        if panel.get("unit", "ms") not in {"ms", "requests", "%", "tokens"}:
-            raise ValueError("Panel unit must be ms, requests, tokens or %")
+        if panel.get("unit", "ms") not in {
+            "ms",
+            "requests",
+            "%",
+            "tokens",
+            "MHz",
+            "°C",
+            "W",
+            "GiB",
+        }:
+            raise ValueError("Unsupported panel unit")
         instances = panel.get("instances", {})
         if not isinstance(instances, dict) or any(
             not isinstance(k, str) or not k for k in instances
