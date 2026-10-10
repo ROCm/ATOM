@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791658107384,
+  "lastUpdate": 1791662114328,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "60f1e1b41f976696921d64b1273915e7fa8c90aa",
-          "message": "ci: retry docker push, gate manual dashboard uploads, set ATOM_MOE_GU_ITLV on gpt-oss (#2143)\n\n* ci: retry docker push with a fresh login\n\nThe nightly release build intermittently fails at push time. Each push step\nalready re-authenticates immediately before it, because the ~1h build leaves\nthe initial token stale and the manifest PUT comes back \"unauthorized:\nauthentication required\". That covers the first image only: a step pushing two\nmulti-GB tags can outlive the fresh token between them, and a transient\nregistry 5xx or dropped connection is not covered at all.\n\nAdd .github/scripts/docker_push_retry.sh and route all 13 push call sites\nthrough it. It re-authenticates before each retry rather than only sleeping,\nsince an expired token is the dominant failure and a bare retry reproduces it.\nThree attempts, backoff 15s doubling. Credentials arrive via stdin, never argv,\nmatching .github/actions/docker-auth.\n\nTwo properties worth stating, both exercised against a fake engine:\n- the happy path costs nothing extra (one push, zero logins);\n- with no credentials reachable it fails immediately with the reason named,\n  rather than burning the remaining attempts on the same auth error.\n\nThe per-step re-login is kept, so the first attempt still starts with a fresh\ntoken and the script only adds work when something actually fails.\n\nIn the native release step, `latest` and the nightly tag are now tagged\ntogether and pushed in one call. Previously the second push sat after the\nfirst multi-GB upload -- exactly where the token is most likely to have\nexpired -- with no retry behind it.\n\n* ci: default manual runs to not publishing dashboard data\n\nA hand-triggered run is usually a one-off experiment, and its numbers landing\nin the scheduled series read as a regression later. Manual runs should opt in.\n\nSix of the nine dashboard workflows already implement this and are untouched:\natom-test and atomesh-accuracy-validation gate on `push || schedule`, and\natomesh-benchmark, atomesh-mocker-benchmark, atom-vllm-accuracy-validation and\natom-sglang-accuracy-validation each already carry a dispatch input defaulting\nto false. Only three needed a change:\n\n- atom-vllm-benchmark, atom-sglang-benchmark: publish_to_dashboard and\n  upload_to_custom_dashboard flipped from default true to false. The\n  `schedule` branch sets both unconditionally, so only manual runs move.\n- atom-benchmark: had no gate at all. Adds the same input plus a\n  PUBLISH_DASHBOARD job env consumed by the five dashboard steps. Per-step\n  rather than a job-level `if` because the summary steps share that job and\n  must keep running.\n\nVerified with a script that parses every workflow and reports the gating input\nand its default: all nine now answer \"no upload\" for a bare manual run, and no\nnon-dispatch trigger changes behaviour.\n\nThe gate is spelled three ways across the repo already -- publish_to_dashboard,\npublish_dashboard, upload_accuracy_to_dashboard. This follows the majority for\nthe one new input; unifying the other five is a separate change.\n\n* ci: set ATOM_MOE_GU_ITLV=1 on the gpt-oss accuracy entries\n\nBoth gpt-oss-120b entries were the only MoE accuracy entries without it; the\nDeepSeek-V4-Pro family has carried it since it was introduced.\n\nMeasured on 8xMI355X, tp1, the same client_command this entry uses\n(chat-completions, 3-shot, conc 65, max_gen_toks 2048), GSM8K flexible-extract:\n\n  with    ATOM_MOE_GU_ITLV=1   0.9022 +/- 0.0082\n  without                      0.8825 +/- 0.0089\n\nso the pr-level entry moves from 0.0125 above its 0.87 threshold to 0.0322.\nn=1 per arm, and this repo has seen 1.6pp of run-to-run spread on an unchanged\ntree, so treat +1.97pp as \"no regression, likely a gain\" rather than a\nmeasurement. strict-match moves the other way (0.3450 -> 0.2153), which is the\nknown gpt-oss chat-format artifact -- flexible is the number this entry gates on.\n\nThe 2-GPU entry is unverified locally: that config faults on this box with or\nwithout the variable (Memory access fault, both arms), which is an environment\nproblem unrelated to this change. It is test_level main, so CI will be the\nfirst real signal.\n\n* ci: reserve publish_to_dashboard in the benchmark matrix builder\n\nThe new atom-benchmark dispatch input is not a model checkbox, but\n`build_benchmark_matrix.py` derives the model set as \"every input not in\nRESERVED_INPUTS\". Left out, `validate_dispatch_inputs` reports it as an extra\ncheckbox and every manual atom-benchmark run fails while building the matrix --\nso this is a runtime break, not only a red test.\n\nCaught by test_workflow_dispatch_inputs_match_catalog, which asserts the\ndispatch toggles equal the catalog prefixes. Single consumer: atom-benchmark is\nthe only workflow that runs the matrix builder, and nothing else enumerates\ndispatch inputs.",
-          "timestamp": "2026-09-04T23:47:40Z",
-          "url": "https://github.com/ROCm/ATOM/commit/60f1e1b41f976696921d64b1273915e7fa8c90aa"
-        },
-        "date": 1788639431412,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33893286822 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260904 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8939 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8362,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33893286822 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260904 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8249 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8522,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33893286822 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260904 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8393 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8764,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33893286822 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260904 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8597 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8704,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33893286822 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260904 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8529 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -278168,6 +278116,34 @@ window.BENCHMARK_DATA = {
             "value": 289.984,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38051087699 | docker_image=rocm/atom-dev:nightly_202610100257-rocm10.0 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.92%2C%22cache_hit_tokens%22%3A961768496%2C%22cache_total_tokens%22%3A1045445872%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A9282%2C%22concurrency%22%3A96%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3629.1249%2C%22e2el_ms%22%3A33161.2453%2C%22e2el_p90%22%3A69444.8303%2C%22e2el_p99%22%3A188862.6023%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610100257-rocm10.0%22%2C%22input_tput%22%3A266016.5352%2C%22input_tput_per_gpu%22%3A33252.0669%2C%22interactivity%22%3A6.8805%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A9278%2C%22interactivity_p90_itl%22%3A40.9562%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A20.126%2C%22itl_p90%22%3A24.4163%2C%22median_e2el_ms%22%3A22210.1628%2C%22median_itl_ms%22%3A20.5771%2C%22median_tpot_ms%22%3A20.5771%2C%22median_ttft_ms%22%3A5719.3741%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2319.8723%2C%22output_tput_per_gpu%22%3A289.984%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.3618%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc96-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38051087699%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A268336.4075%2C%22tpot_ms%22%3A20.126%2C%22tpot_p90%22%3A24.4163%2C%22tpot_p99%22%3A27.3654%2C%22tput_per_gpu%22%3A33542.0509%2C%22ttft_ms%22%3A13678.0456%2C%22ttft_p90%22%3A38291.2537%2C%22ttft_p99%22%3A78179.3355%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "id": "b4e2d9c7eecdee8768269a3029dc0f783caae46b",
+          "message": "docs(pd): landing partitions are first come, first served\n\nThe MLA landing docs said a decode rank splits its pool evenly across the\nprefill stages that send to it. It does not: advertise gives a prefill\nstage endpoint pool_slots // (its PP size) slots on first contact, first\ncome, first served, and never reclaims a partition while the decode runs.\nWith several prefill instances per decode rank, a later instance may get\nfewer slots, or none and keep the staged path.\n\nThe mla_landing.py module docstring, the comment on the pool constants,\nthe ATOM_PD_MLA_LANDING row of docs/environment_variables.md and its\ncomment in envs.py now say so. The row keeps its HBM cost (256 MiB of\n8 MiB slots per decode rank, held back from the KV cache budget) and its\nswitch.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-10T10:26:35Z",
+          "url": "https://github.com/ROCm/ATOM/commit/b4e2d9c7eecdee8768269a3029dc0f783caae46b"
+        },
+        "date": 1791662113375,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4 1048576/1024 c=128 perf point",
+            "value": 92.8033,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38051099775 | docker_image=rocm/atom-dev:nightly_202610100257-rocm10.0 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.494%2C%22cache_hit_tokens%22%3A134585152%2C%22cache_total_tokens%22%3A272429092%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A2879%2C%22concurrency%22%3A128%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3629.4924%2C%22e2el_ms%22%3A249163.7496%2C%22e2el_p90%22%3A544409.8446%2C%22e2el_p99%22%3A588158.2545%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610100257-rocm10.0%22%2C%22input_tput%22%3A69320.3351%2C%22input_tput_per_gpu%22%3A8665.0419%2C%22interactivity%22%3A0.4122%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A2879%2C%22interactivity_p90_itl%22%3A60.3312%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A12.8144%2C%22itl_p90%22%3A16.5752%2C%22median_e2el_ms%22%3A220970.3851%2C%22median_itl_ms%22%3A13.2126%2C%22median_tpot_ms%22%3A13.2126%2C%22median_ttft_ms%22%3A212013.604%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A742.4267%2C%22output_tput_per_gpu%22%3A92.8033%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.7326%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc128-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38051099775%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A70062.7618%2C%22tpot_ms%22%3A12.8144%2C%22tpot_p90%22%3A16.5752%2C%22tpot_p99%22%3A18.3362%2C%22tput_per_gpu%22%3A8757.8452%2C%22ttft_ms%22%3A236835.0938%2C%22ttft_p90%22%3A537155.6733%2C%22ttft_p99%22%3A575383.3155%7D"
           }
         ]
       }
