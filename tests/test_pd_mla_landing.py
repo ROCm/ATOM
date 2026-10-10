@@ -235,6 +235,8 @@ class _Dest:
         pool = self.recv.pool
 
         def copy(src, dst, nbytes, _events):
+            # The GPU kernel reads any offset: one outside the pool is a fault.
+            assert ((src >= 0) & (src <= pool.numel() - nbytes)).all()
             for s, d, n in zip(src, dst, nbytes):
                 ctypes.memmove(
                     self.recv._dst_origin + int(d), pool.data_ptr() + int(s), int(n)
@@ -317,6 +319,20 @@ def test_duplicates_are_ignored_and_lost_ready_fails_the_request():
     assert dest.credits() == [("stage0", [slots[0]]), ("stage0", [slots[1]])]
 
 
+@pytest.mark.parametrize(
+    "landed", [5, [[1]], "ab", [None]], ids=["int", "nested", "string", "none-slot"]
+)
+def test_malformed_landed_slots_fail_the_request(landed):
+    # They hide which READY never arrived, so the request cannot succeed;
+    # it still settles, since the stage ended.
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.stream_done("r", 0, 5, True, landed)
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == []
+
+
 def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
@@ -365,8 +381,22 @@ def test_items_out_of_range_fail_the_request_without_scattering():
 
 @pytest.mark.parametrize(
     "item",
-    [[0, 0, 1, -4], [0, 0, 0, 0], [0, 0, -1, 0], [0, 0, 1, 2]],
-    ids=["negative-offset", "no-rows", "negative-rows", "unaligned-offset"],
+    [
+        [0, 0, 1, -4],
+        [0, 0, 0, 0],
+        [0, 0, -1, 0],
+        [0, 0, 1, 2],
+        [0, 2**62, 2**62, 0],
+        [0, 0, 1, 2**63 - 4],
+    ],
+    ids=[
+        "negative-offset",
+        "no-rows",
+        "negative-rows",
+        "unaligned-offset",
+        "rows-wrap-int64",
+        "offset-wraps-int64",
+    ],
 )
 def test_malformed_items_fail_only_their_request(item):
     dest = _Dest()
@@ -379,6 +409,57 @@ def test_malformed_items_fail_only_their_request(item):
     assert dest.finished == [("r", True)]
     assert dest.recv.enabled
     assert all(torch.equal(a, b) for a, b in zip(dest.regions, before))
+
+
+_NO_ITEMS = object()  # the READY has no items field
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [1],
+        [[0, 0, 16]],
+        [[0, 0, 16, 0], [1]],
+        [],
+        "abcd",
+        None,
+        [[None, 0, 16, 0]],
+        [[2**63, 0, 16, 0]],
+        _NO_ITEMS,
+    ],
+    ids=[
+        "flat",
+        "three-columns",
+        "ragged",
+        "empty",
+        "string",
+        "none",
+        "none-value",
+        "past-int64",
+        "missing",
+    ],
+)
+def test_unparsable_items_fail_their_request_and_return_the_slot(items):
+    # on_ready runs on the listener thread: such items must not raise there,
+    # nor reach the scatter, where they would fail the batch and disable landing.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 2)["slots"]
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
+    ready = _ready("r", s0[0], 0, items)
+    if items is _NO_ITEMS:
+        del ready["items"]
+    dest.recv.on_ready(ready)
+    assert dest.recv._queue.empty()
+    # The slot's RDMA write finished before READY, so it goes back at once.
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    assert dest.finished == []  # stage 1 may still be writing
+    dest.recv.stream_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", True)]
+    # Stage 0's write-done listed the slot, but it went back only once.
+    assert dest.credits() == []
+    assert dest.recv.enabled
 
 
 def test_sweep_never_reports_a_failure_while_a_stage_still_runs():
@@ -421,6 +502,25 @@ def test_ready_for_an_unknown_request_returns_the_slot_to_its_owner():
     s0 = dest.recv.advertise("stage0", 1)["slots"]
     dest.recv.on_ready(_ready("ghost", s0[1], 0, [[0, 0, 1, 0]]))
     assert dest.credits() == [("stage0", [s0[1]])]
+
+
+def test_a_failed_credit_send_still_reports_the_request():
+    # Credits go out after the bookkeeping. A raise there would end the
+    # caller half done: a READY misreported as unread, a request never reported.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+
+    def unreachable(_addr, _parts):
+        raise RuntimeError("notify socket gone")
+
+    dest.recv._send = unreachable
+    rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
+    dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
+    dest.recv.on_ready(_ready("r", s0[1], 1, [1]))  # malformed: returned at once
+    dest.pump()  # slot 0 is returned once its task completes
+    dest.recv.stream_done("r", 0, 5, True, s0[:3])  # seq 2 lost: returned now
+    assert dest.finished == [("r", True)]
 
 
 # ---------------------------------------------------------------------------
@@ -783,6 +883,126 @@ def test_landing_requests_complete_through_the_receiver():
     assert conn.done_recving == {"r"}
     assert conn._pending_recv_expected == {}
     assert conn._pending_recv == set()
+
+
+def _listen(monkeypatch, mc, listener, messages):
+    """Run a connector's listener loop over ``(type, payload)`` messages."""
+
+    class _Stop(Exception):
+        pass
+
+    class _Socket:
+        def recv_multipart(self):
+            if not messages:
+                raise _Stop
+            return [b"peer", *messages.pop(0)]
+
+    monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(_Socket()))
+    with pytest.raises(_Stop):
+        listener()
+
+
+def _consumer(mc, dest):
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._notification_port = 1
+    conn._mla_landing = dest.recv
+    return conn
+
+
+def test_an_unreadable_ready_does_not_stop_the_listener(monkeypatch):
+    # The READY behind unreadable ones is still received. One with no good
+    # copy counts as lost: write-done fails the request and returns its slot.
+    mc = _mooncake()
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
+    ready = _ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows))
+    no_request_id = dict(ready)
+    del no_request_id["request_id"]
+    lost = _ready("r", s0[1], 1, [[0, 0, 4, 0]])
+    payloads = [
+        b"\xc1",  # not msgpack
+        msgpack.dumps([ready]),  # not a dict
+        msgpack.dumps(no_request_id),
+        msgpack.dumps({**ready, "slot": "x"}),
+        msgpack.dumps(ready),
+        msgpack.dumps({**lost, "seq": "x"}),  # its only copy
+    ]
+    _listen(
+        monkeypatch,
+        mc,
+        _consumer(mc, dest)._notification_listener,
+        [(MSG_LANDING_READY, payload) for payload in payloads],
+    )
+    assert dest.recv._requests["r"].pending == 1  # the good READY was queued
+    dest.pump()
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.stream_done("r", 0, 5, True, [s0[0], s0[1]])
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == [("stage0", [s0[1]])]
+
+
+def test_an_unreadable_write_done_does_not_stop_the_listener(monkeypatch):
+    # Every later receive on the rank needs the listener.
+    mc = _mooncake()
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    done = {"request_id": "r", "pp_rank": 0, "write_nonce": 5, "landed_slots": []}
+    no_request_id = dict(done)
+    del no_request_id["request_id"]
+    payloads = [
+        b"\xc1",  # not msgpack
+        msgpack.dumps([done]),  # not a dict
+        msgpack.dumps(no_request_id),
+        msgpack.dumps(done),
+    ]
+    _listen(
+        monkeypatch,
+        mc,
+        _consumer(mc, dest)._notification_listener,
+        [(mc.MSG_WRITE_DONE, payload) for payload in payloads],
+    )
+    assert dest.finished == [("r", False)]
+
+
+def test_unreadable_landing_fields_do_not_stop_the_write_listener(monkeypatch):
+    # Write requests arrive on the same thread as the credits.
+    mc = _mooncake()
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._side_channel_port = 1
+    conn._landing_credits = LandingCredits()
+    conn._landing_credits.sync("d0", {"epoch": 1, "slots": [0]})
+    assert conn._landing_credits.acquire("d0", 1, 0) == 0
+    submitted = []
+
+    class _Executor:
+        def submit(self, _fn, request_data):
+            submitted.append(request_data)
+
+    conn._send_executor = _Executor()
+    request = {
+        "request_id": "r",
+        "consumer_host": "d",
+        "consumer_rpc_port": 1,
+        "mla_landing": [1],  # not a partition
+    }
+    credit = {"consumer": "d0", "epoch": 1, "slots": [0]}
+    _listen(
+        monkeypatch,
+        mc,
+        conn._write_listener,
+        [
+            (mc.MSG_WRITE_REQUEST, msgpack.dumps(request)),
+            (MSG_LANDING_CREDIT, b"\xc1"),  # not msgpack
+            (MSG_LANDING_CREDIT, msgpack.dumps({**credit, "slots": [[0]]})),
+            (MSG_LANDING_CREDIT, msgpack.dumps(credit)),
+        ],
+    )
+    # The transfer still reaches a send worker, which reports its outcome.
+    assert submitted == [request]
+    assert conn._landing_credits.acquire("d0", 1, 0) == 0
 
 
 # ---------------------------------------------------------------------------

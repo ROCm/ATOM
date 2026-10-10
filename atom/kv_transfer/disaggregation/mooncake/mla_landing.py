@@ -192,7 +192,19 @@ class _Task:
     nonce: int
     pp_rank: int
     slot: int
-    items: list[tuple[int, int, int, int]]
+    items: np.ndarray
+
+
+def _ready_items(data: dict) -> np.ndarray | None:
+    """A READY's items as an int64 ``(n, 4)`` array, n >= 1; None if malformed."""
+    try:
+        items = np.asarray(data["items"], dtype=np.int64)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    # msgpack never yields a (0, 4) array ([] is 1-D); rejected all the same.
+    if items.ndim != 2 or items.shape[1] != 4 or not items.shape[0]:
+        return None
+    return items
 
 
 class LandingReceiver:
@@ -394,6 +406,9 @@ class LandingReceiver:
         pp_rank = data.get("pp_rank", 0)
         slot = int(data["slot"])
         seq = int(data["seq"])
+        # Malformed items fail only their request (below), never the listener
+        # thread or the scatter batch.
+        items = _ready_items(data)
         credit_addr = None
         with self._lock:
             request = self._requests.get(req_id)
@@ -425,6 +440,18 @@ class LandingReceiver:
                 elif request.failed or stream.done:
                     stream.seen.add(seq)
                     credit_addr = stream.stage_addr
+                elif items is None:
+                    logger.error(
+                        "[PD-LANDING] req %s stage %d slot %d: malformed items; "
+                        "failing the request",
+                        req_id,
+                        pp_rank,
+                        slot,
+                    )
+                    stream.seen.add(seq)
+                    self._fail_locked(request)
+                    # The slot's RDMA write finished before READY: return it now.
+                    credit_addr = stream.stage_addr
                 else:
                     stream.seen.add(seq)
                     request.pending += 1
@@ -434,7 +461,7 @@ class LandingReceiver:
                             nonce,
                             pp_rank,
                             slot,
-                            [tuple(item) for item in data["items"]],
+                            items,
                         )
                     )
         if credit_addr is not None:
@@ -471,6 +498,18 @@ class LandingReceiver:
             if stream is None or stream.done:
                 return True
             stream.done = True
+            if landed_slots is not None and not (
+                isinstance(landed_slots, list)
+                and all(isinstance(slot, int) for slot in landed_slots)
+            ):
+                # Which READY never arrived is unknown: count a failed write-done.
+                logger.error(
+                    "[PD-LANDING] req %s stage %d sent malformed landed slots; "
+                    "failing the request",
+                    req_id,
+                    pp_rank,
+                )
+                landed_slots, success = None, False
             if landed_slots:
                 lost = [
                     slot
@@ -609,20 +648,21 @@ class LandingReceiver:
             items = np.asarray(task.items, dtype=np.int64).reshape(-1, 4)
             region, row_start, row_count, offset = items.T
             rows = request.dst_block_ids.size * self.block_size
+            # Upper bounds subtract from local sizes rather than add READY
+            # values: such a sum can wrap past int64 and pass.
             if (
                 (region < 0).any()
                 or (region >= self._is_mla.size).any()
                 or not self._is_mla[region].all()
                 or (row_start < 0).any()
                 or (row_count <= 0).any()
-                or (row_start + row_count > rows).any()
+                or (row_count > rows - row_start).any()
                 # The scatter copies 4-byte words of the slot.
                 or (offset < 0).any()
                 or (offset % 4).any()
                 or (
-                    offset
-                    + row_count * self._region_block_bytes[region] // self.block_size
-                    > self.slot_bytes
+                    row_count * self._region_block_bytes[region] // self.block_size
+                    > self.slot_bytes - offset
                 ).any()
             ):
                 logger.error(
@@ -703,10 +743,7 @@ class LandingReceiver:
                 if outcome is not None:
                     outcomes.append((req_id, outcome))
         for addr, slots in credits.items():
-            try:
-                self._send_credits(addr, slots)
-            except Exception:
-                logger.exception("[PD-LANDING] returning slots to %s failed", addr)
+            self._send_credits(addr, slots)
         for req_id, failed in outcomes:
             try:
                 self._finish(req_id, failed)
@@ -743,4 +780,9 @@ class LandingReceiver:
         payload = msgpack.dumps(
             {"consumer": self.consumer_key, "epoch": self.epoch, "slots": slots}
         )
-        self._send(addr, [MSG_LANDING_CREDIT, payload])
+        try:
+            self._send(addr, [MSG_LANDING_CREDIT, payload])
+        except Exception:
+            # Not raised: callers send after their bookkeeping is done. The
+            # stage holds these slots in flight until this rank restarts.
+            logger.exception("[PD-LANDING] returning slots to %s failed", addr)

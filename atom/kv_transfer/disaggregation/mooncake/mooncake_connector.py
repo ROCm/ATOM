@@ -1638,18 +1638,29 @@ class MooncakeConnector(KVConnectorBase):
                     landing = request_data.get("mla_landing")
                     if landing is not None:
                         # Adopt the partition before any worker needs it.
-                        self._landing_credits.sync(
-                            f"{request_data['consumer_host']}:"
-                            f"{request_data['consumer_rpc_port']}",
-                            landing,
-                        )
+                        try:
+                            self._landing_credits.sync(
+                                f"{request_data['consumer_host']}:"
+                                f"{request_data['consumer_rpc_port']}",
+                                landing,
+                            )
+                        except Exception:
+                            # Not adopted: the transfer finds no credit and
+                            # stages its MLA rows, or fails on the same field.
+                            logger.exception(
+                                "[PRODUCER] adopting a landing partition failed"
+                            )
                     self._send_executor.submit(self._execute_transfer, request_data)
 
                 elif msg_type == MSG_LANDING_CREDIT:
-                    data = msgpack.loads(parts[2])
-                    self._landing_credits.release(
-                        data["consumer"], data["epoch"], data["slots"]
-                    )
+                    try:
+                        data = msgpack.loads(parts[2])
+                        self._landing_credits.release(
+                            data["consumer"], data["epoch"], data["slots"]
+                        )
+                    except Exception:
+                        # Write requests arrive on this thread too.
+                        logger.exception("[PRODUCER] handling a landing credit failed")
 
                 elif msg_type == MSG_RELEASE:
                     data = msgpack.loads(parts[2])
@@ -2912,17 +2923,25 @@ class MooncakeConnector(KVConnectorBase):
                 msg_type = parts[1]
 
                 if msg_type == MSG_WRITE_DONE:
-                    data = msgpack.loads(parts[2])
-                    self._record_write_done(
-                        data["request_id"],
-                        data.get("pp_rank", 0),
-                        data.get("tp_rank", 0),
-                        data.get("write_nonce", 0),
-                        success=data.get("success", True),
-                        landed_slots=data.get("landed_slots"),
-                    )
+                    try:
+                        data = msgpack.loads(parts[2])
+                        self._record_write_done(
+                            data["request_id"],
+                            data.get("pp_rank", 0),
+                            data.get("tp_rank", 0),
+                            data.get("write_nonce", 0),
+                            success=data.get("success", True),
+                            landed_slots=data.get("landed_slots"),
+                        )
+                    except Exception:
+                        # Every later receive on this rank needs this thread.
+                        logger.exception("[CONSUMER] handling a write-done failed")
                 elif msg_type == MSG_LANDING_READY and self._mla_landing is not None:
-                    self._mla_landing.on_ready(msgpack.loads(parts[2]))
+                    try:
+                        self._mla_landing.on_ready(msgpack.loads(parts[2]))
+                    except Exception:
+                        # A lost READY: write-done fails the request, returns the slot.
+                        logger.exception("[CONSUMER] unreadable landing READY dropped")
                 else:
                     logger.error("Unknown notification type: %s", msg_type)
 
