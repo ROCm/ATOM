@@ -143,6 +143,15 @@ def _register_custom_attention_to_sglang() -> None:
         )
         return ATOMDeepseekV4BackendForSgl(runner)
 
+    @register_attention_backend("dsa")
+    def create_atom_dsa_backend(runner):
+        hf_config = runner.model_config.hf_config
+        if is_glm52_dsa_config(hf_config):
+            return create_glm52_backend(runner)
+        import sglang.srt.layers.attention.dsa_backend as sglang_dsa_backend
+
+        return sglang_dsa_backend.DeepseekSparseAttnBackend(runner)
+
     @register_attention_backend("nsa")
     def create_atom_nsa_backend(runner):
         hf_config = runner.model_config.hf_config

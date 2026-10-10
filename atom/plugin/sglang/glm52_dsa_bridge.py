@@ -812,7 +812,23 @@ def resolve_target_verify_lens(
         )
     prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
     if use_positions:
-        context_lens = prefix_lens + draft_token_num
+        context_lens = prefix_lens + np.int32(draft_token_num)
+        # Capture rewrites every row to GLM52_GRAPH_SEQ_LEN_CAPACITY so the
+        # graph buffers are wide enough. Replay copies the real seq_lens over
+        # that sentinel; positions can still be the capture fill. Prefer the
+        # shorter real mirror, and collapse leftover sentinel padding so
+        # max_seqlen_k is not stuck at 10240.
+        seq_lens = get_seq_lens_cpu(forward_batch, bs)
+        sentinel = np.int32(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+        if seq_lens.shape[0] == bs and np.any(seq_lens < sentinel):
+            real = seq_lens.astype(np.int32)
+            context_lens = np.where(
+                real >= sentinel, context_lens, np.minimum(context_lens, real)
+            ).astype(np.int32)
+            context_lens = np.where(
+                context_lens >= sentinel, np.int32(draft_token_num), context_lens
+            ).astype(np.int32)
+            prefix_lens = np.maximum(context_lens - np.int32(draft_token_num), 0)
     else:
         position_context_lens = prefix_lens + draft_token_num
         context_lens = np.maximum(
@@ -1172,8 +1188,9 @@ def resolve_draft_extend_lens(
         else:
             prefix_lens = prefix_lens.astype(np.int32)
 
+    # Trust the position-derived length. Widening with seq_lens pulls in the
+    # graph-capture fill and the draft indexer reads past the KV pool.
     context_lens = (prefix_lens + draft_token_num).astype(np.int32)
-    context_lens = np.maximum(context_lens, seq_lens).astype(np.int32)
     return prefix_lens.astype(np.int32), context_lens.astype(np.int32)
 
 
@@ -1758,12 +1775,17 @@ def build_atom_glm52_attention_metadata_from_sglang(
     atom_config,
 ):
     if getattr(forward_batch.forward_mode, "is_target_verify", lambda: False)():
+        # Positions are the draft-token locations. seq_lens can still hold the
+        # CUDA-graph fill (GLM52_GRAPH_SEQ_LEN_CAPACITY) on an uncaptured batch,
+        # and max(seq_lens, positions) then walks req_to_token past the tokens
+        # that were written. That is an HSA aperture in the verify indexer.
         return build_mtp_verify_decode_metadata(
             forward_batch,
             positions,
             token_to_kv_pool=token_to_kv_pool,
             req_to_token_pool=req_to_token_pool,
             atom_config=atom_config,
+            use_positions=True,
         )
     if forward_batch.forward_mode.is_decode_or_idle():
         return build_decode_metadata(

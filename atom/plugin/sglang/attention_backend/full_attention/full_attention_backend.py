@@ -2119,6 +2119,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if k is None or v is None:
             raise RuntimeError("MHA speculative extend requires explicit k/v tensors")
 
+        # gfx95 extend attention consumes these tensors from a bf16 FMHA kernel.
+        # FP8 storage with a bf16 stride is an HSA aperture violation.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
+
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -2151,8 +2158,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         cu_seqlens_q = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
-        if q.dtype != k.dtype and k.dtype == dtypes.fp8:
-            q = q.to(dtypes.fp8)
+        # hd256 varlen on gfx95 is the bf16 FMHA kernel. Casting Q down to FP8
+        # still launches that kernel and then strides off the FP8 allocation.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
         o = flash_attn_varlen_func(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),

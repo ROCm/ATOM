@@ -25,6 +25,30 @@ logger = logging.getLogger("atom.plugin.sglang.prefill_compile_only")
 _COMPILE_ONLY_PREFILL_ACTIVE = False
 
 
+def resolve_prefill_cuda_graph_config(server_args):
+    """Prefill CUDA graph config for this process.
+
+    SGLang 0.5.20 publishes the resolved config on ``get_exec().graph`` and
+    leaves ``server_args.cuda_graph_config`` as None. Older call sites still
+    pass the config on ``server_args``.
+    """
+
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    prefill = getattr(cfg, "prefill", None) if cfg is not None else None
+    if prefill is not None:
+        return prefill
+    try:
+        from sglang.srt.runtime_context import get_exec
+
+        graph = getattr(get_exec(), "graph", None)
+        cfg = getattr(graph, "cuda_graph_config", None)
+    except Exception:  # noqa: BLE001 - published config is optional
+        return None
+    if cfg is None:
+        return None
+    return getattr(cfg, "prefill", None)
+
+
 def is_compile_only_prefill_active() -> bool:
     """Return whether the current tc_piecewise execution skips CUDA Graphs.
 
@@ -96,10 +120,8 @@ def apply_prefill_compile_only_patch() -> bool:
         return runner.prefill_backend_name == Backend.TC_PIECEWISE
 
     def init_compile_only_runner(self, model_runner):
-        if (
-            model_runner.server_args.cuda_graph_config.prefill.backend
-            != Backend.TC_PIECEWISE
-        ):
+        prefill = resolve_prefill_cuda_graph_config(model_runner.server_args)
+        if prefill is None or prefill.backend != Backend.TC_PIECEWISE:
             return original_runner_init(self, model_runner)
 
         # TcPiecewise compiles during runner construction. Set the branch before
@@ -109,7 +131,9 @@ def apply_prefill_compile_only_patch() -> bool:
             original_runner_init(self, model_runner)
 
     def build_compile_only_config(server_args):
-        prefill_config = server_args.cuda_graph_config.prefill
+        prefill_config = resolve_prefill_cuda_graph_config(server_args)
+        if prefill_config is None:
+            return original_build_config(server_args)
         original_compiler = prefill_config.tc_compiler
         try:
             prefill_config.tc_compiler = "inductor"
