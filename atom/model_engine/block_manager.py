@@ -1906,6 +1906,8 @@ class BlockManager:
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:
             return
+        if not envs.ATOM_STATE_CHECKPOINT_END_ANCHOR:
+            return
         # 0 is the off switch for checkpointing as a whole, not just the grid,
         # and `checkpointers_at` enforces it by refusing every position. An
         # anchor recorded here anyway would still be cut for — a shortened

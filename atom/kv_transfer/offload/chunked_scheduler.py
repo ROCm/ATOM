@@ -276,6 +276,42 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
 
+    def skip_tier_lookup(self, seq, hbm_tokens: int) -> bool:
+        """Admit `seq` without a tier lookup because HBM already covers it.
+
+        The scheduler calls this only when the HBM prefix leaves fewer than
+        `OFFLOAD_MIN_LOAD_TOKENS` uncached, where `_decide_load_after_alloc`
+        refuses every load: the lookup could not add reuse. Any async lookup
+        already sent is discarded so its read locks are released.
+
+        The lookup's one side effect that still matters is the save floor:
+        without it the save tracker starts at 0 and stores the whole resident
+        prefix again. The HBM prefix was computed, and saved, by an earlier
+        request, so its chunk floor stands in for the hit. If the tier evicted
+        it meanwhile, later lookups just stop at the hole; nothing is wrong.
+
+        False leaves the ordinary lookup path in charge: a load or lookup this
+        lifecycle already armed must be finished by that path.
+        """
+        if not self._do_load or self._lookup_client is None:
+            return False
+        sid = str(seq.id)
+        if sid in self._load_specs or sid in self._lookup_results:
+            return False
+        if sid in self._active_load_operations:
+            return False
+        self._begin_load_lifecycle(seq)
+        discard = getattr(self._lookup_client, "discard", None)
+        if callable(discard):
+            discard(sid)
+        self._lookup_defer_since.pop(sid, None)
+        self._forget_tier_hit(sid)
+        floor = self._chunk_floor(max(0, int(hbm_tokens)))
+        if floor > 0:
+            self._hit_save_floors[sid] = floor
+        self._perf_bump("lookup_skipped_hbm")
+        return True
+
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
 

@@ -1548,7 +1548,11 @@ class Scheduler:
             prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
             if prefetch is not None:
                 prefetch(
-                    itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
+                    self._prefetch_candidates(
+                        itertools.islice(
+                            self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
+                        )
+                    )
                 )
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
@@ -1690,9 +1694,15 @@ class Scheduler:
                 continue
 
             offload_resume = self._is_offload_prefill_resume(seq)
+            tier_lookup_skipped = (
+                not remote_ready_for_decode
+                and not offload_resume
+                and self._skip_tier_lookup_on_hbm_hit(seq)
+            )
             if (
                 not remote_ready_for_decode
                 and not offload_resume
+                and not tier_lookup_skipped
                 and self.kv_connector is not None
                 and self._offload_lookup_pending(seq)
             ):
@@ -1700,7 +1710,7 @@ class Scheduler:
                 continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
-                skip=remote_ready_for_decode or offload_resume,
+                skip=remote_ready_for_decode or offload_resume or tier_lookup_skipped,
             )
 
             if remote_ready_for_decode:
@@ -2423,6 +2433,67 @@ class Scheduler:
             )
             and len(seq.block_table) > 0
         )
+
+    def _hbm_covers_tier_lookup(self, seq: Sequence) -> int:
+        """HBM-resident prefix tokens if they leave a tier lookup nothing to load.
+
+        Returns 0 when the lookup may still pay off: the feature is off, the
+        connector has no offload tier, the pool refused the probe, or more than
+        `OFFLOAD_MIN_LOAD_TOKENS` stay uncached. Below that size no load is ever
+        armed, so the lookup's only effect would be delaying admission.
+
+        A `record=False` probe: no allocation, no joint-boundary commit. The
+        admission path probes again for real right after.
+        """
+        if (
+            not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT
+            or self.kv_connector is None
+            or not self._connector_flag("is_offload")
+            or getattr(self.kv_connector, "skip_tier_lookup", None) is None
+            or seq.kv_transfer_params
+            and seq.kv_transfer_params.get("do_remote_prefill")
+        ):
+            return 0
+        hit_blocks = self.block_manager.can_allocate(
+            seq,
+            record=False,
+            block_hashes=[],
+            reuse_hashes=self._local_prefill_coalescing,
+        )
+        if hit_blocks <= 0:
+            return 0
+        hbm_tokens = hit_blocks * self.block_manager.hash_block_size
+        if seq.num_tokens - hbm_tokens >= envs.OFFLOAD_MIN_LOAD_TOKENS:
+            return 0
+        return hbm_tokens
+
+    def _skip_tier_lookup_on_hbm_hit(self, seq: Sequence) -> bool:
+        """Admit without waiting on the tier when HBM leaves nothing to load."""
+        hbm_tokens = self._hbm_covers_tier_lookup(seq)
+        if not hbm_tokens:
+            return False
+        return bool(self.kv_connector.skip_tier_lookup(seq, hbm_tokens))
+
+    def _prefetch_candidates(self, seqs):
+        """Waiting seqs worth an async tier lookup; HBM-covered ones are not."""
+        if not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT:
+            yield from seqs
+            return
+        tick = self._schedule_tick
+        for seq in seqs:
+            if seq.status == SequenceStatus.ABORTED:
+                continue
+            # The head of `waiting` is re-offered every pass; one probe per seq
+            # per few passes keeps this off the lockstep critical path.
+            # Admission re-probes for real, so a stale answer costs only a
+            # lookup sent or not sent early.
+            memo = getattr(seq, "_tier_probe_memo", None)
+            if memo is None or tick - memo[0] >= 8:
+                memo = (tick, self._hbm_covers_tier_lookup(seq))
+                seq._tier_probe_memo = memo
+            if memo[1]:
+                continue
+            yield seq
 
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""

@@ -2006,3 +2006,45 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+def test_skipped_tier_lookup_keeps_the_hbm_prefix_as_save_floor(monkeypatch):
+    """HBM covers the prompt: no lookup is sent, and the prefix is not re-saved.
+
+    The skip stands in for a lookup that could not have armed a load, so the
+    one thing it must keep is the save floor; without it the tracker starts at
+    0 and stores the whole resident prefix again.
+    """
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
+    adapter = lookup._adapter
+    seq = _hit_seq(num_prompt=16)
+
+    assert scheduler.skip_tier_lookup(seq, 13) is True
+    assert adapter.submissions == []
+    assert "7" not in scheduler._load_specs
+    assert scheduler._hit_save_floors["7"] == 12
+
+    scheduler._do_save = True
+    seq.num_cached_tokens = 13
+    scheduler.update_state_after_alloc(seq)
+    assert scheduler._save_tracker["7"][1] == 12
+
+
+def test_skip_tier_lookup_releases_an_answered_prefetch(monkeypatch):
+    scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
+    seq = _hit_seq(num_prompt=16)
+    released = []
+    monkeypatch.setattr(lookup, "discard", released.append)
+
+    assert scheduler.skip_tier_lookup(seq, 12) is True
+    assert released == ["7"]
+
+
+def test_skip_tier_lookup_defers_to_an_armed_load(monkeypatch):
+    """A load already armed this lifecycle is finished by the ordinary path."""
+    scheduler, _ = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4, hit=12)
+    seq = _hit_seq(num_prompt=16)
+
+    assert scheduler.get_num_new_matched_tokens(seq) == (12, True)
+    assert scheduler.skip_tier_lookup(seq, 12) is False
+    assert "7" in scheduler._load_specs

@@ -363,6 +363,21 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return True
         return False
 
+    def skip_tier_lookup(self, seq: Any, hbm_tokens: int) -> bool:
+        """Skip every sub's external-tier lookup; True only if all that have one agree.
+
+        A sub that refuses (a load it already armed) keeps its lookup, and the
+        scheduler then runs the ordinary path for the whole composite.
+        """
+        subs = [
+            getattr(c, "skip_tier_lookup", None)
+            for c in self._connectors
+            if callable(getattr(c, "skip_tier_lookup", None))
+        ]
+        if not subs:
+            return False
+        return all([bool(fn(seq, hbm_tokens)) for fn in subs])
+
     def prefetch_lookups(self, seqs: Any) -> None:
         """Let each sub send its external-tier lookups ahead of admission."""
         seqs = list(seqs)

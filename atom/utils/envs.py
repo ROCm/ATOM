@@ -1009,6 +1009,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
+    # Skip the external-tier lookup when the HBM prefix leaves fewer than
+    # OFFLOAD_MIN_LOAD_TOKENS uncached: no load below that size is ever armed
+    # (`_decide_load_after_alloc` refuses it), so the lookup cannot add reuse
+    # and only delays admission while its answer is in flight.
+    "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT": lambda: _flag_env(
+        "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT"
+    ),
+    # Experimental: 0 stops cutting a prefill chunk at the prompt-end
+    # checkpoint anchor. Saves the extra lockstep step that tail chunk costs,
+    # at the price of resuming the next turn from the checkpoint ladder only.
+    "ATOM_STATE_CHECKPOINT_END_ANCHOR": lambda: _flag_env(
+        "ATOM_STATE_CHECKPOINT_END_ANCHOR", "1"
+    ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.

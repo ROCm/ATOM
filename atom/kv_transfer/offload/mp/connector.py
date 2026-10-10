@@ -197,6 +197,10 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
 
+    def skip_tier_lookup(self, seq: Any, hbm_tokens: int) -> bool:
+        skip = getattr(self._require_impl(), "skip_tier_lookup", None)
+        return bool(skip(seq, hbm_tokens)) if callable(skip) else False
+
     def should_defer_free(self, seq: Any) -> bool:
         return self._require_impl().should_defer_free(seq)
 

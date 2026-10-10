@@ -2705,6 +2705,17 @@ class TestLadderOffButCheckpointingOn:
         assert seq.checkpoint_end_pos == 0
         assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == []
 
+    def test_end_anchor_switch_off_anchors_nothing(self, monkeypatch):
+        """`ATOM_STATE_CHECKPOINT_END_ANCHOR=0` drops only the prompt-end anchor.
+
+        No anchor means no tail chunk cut for it; the grid still checkpoints.
+        """
+        monkeypatch.setenv("ATOM_STATE_CHECKPOINT_END_ANCHOR", "0")
+        bm = make_block_manager(ckpt_config(), state_runtime=PAGED_COPY_RUNTIME)
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0
+
     def test_both_classes_are_anchored_for(self):
         """The anchor costs a prefill chunk, so it has to buy something.
 
