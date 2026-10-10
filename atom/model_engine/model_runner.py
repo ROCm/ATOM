@@ -1101,6 +1101,15 @@ class ModelRunner:
 
         return cu_num_tokens, arange
 
+    def warmup_kv_offload(self):
+        """Startup-only RPC: warm the registered connector before traffic."""
+        connector = get_kvconnector()
+        warmup = getattr(connector, "warmup", None)
+        if not callable(warmup):
+            raise TypeError("OFFLOAD_WARMUP requires a supported offload connector")
+        warmup()
+        return True
+
     def release_multimodal_requests(self, request_ids):
         self.vision_embeddings.release(request_ids)
 

@@ -253,6 +253,7 @@ class AsyncIOProc:
     _BARRIER_FUNCS: ClassVar[set[str]] = {
         "update_weights_from_ipc",
         "update_weights_from_shm",
+        "warmup_kv_offload",
     }
 
     def busy_loop(self):

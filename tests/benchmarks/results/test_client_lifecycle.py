@@ -237,3 +237,51 @@ exit "$client_rc"
         check=False,
     )
     assert result.returncode == code, result.stderr
+
+
+@pytest.mark.parametrize(
+    "template,expected", [("0", False), ("1", True), ("true", True)]
+)
+def test_agentic_command_applies_chat_template_when_enabled(
+    tmp_path, template, expected
+):
+    executable = tmp_path / "bin/aiperf"
+    executable.parent.mkdir()
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        'out = pathlib.Path(os.environ["TEST_OUT"])\n'
+        '(out / "argv.json").write_text(json.dumps(sys.argv[1:]))\n'
+        '(out / "profile_export_aiperf.json").write_text("{}")\n'
+    )
+    executable.chmod(0o755)
+    env = os.environ.copy()
+    env.pop("ATOM_BUNDLE_WORK", None)
+    output = tmp_path / "output with spaces"
+    env.update(
+        AIPERF_VENV=str(tmp_path),
+        AIPERF_BENCHMARK_DURATION="900",
+        AIPERF_APPLY_CHAT_TEMPLATE=template,
+        ENABLE_TORCH_PROFILER="0",
+        MODEL_PATH="fixture with spaces",
+        TEST_OUT=str(output),
+    )
+    subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            'source .github/scripts/aiperf_agentic.sh; run_aiperf_agentic http://localhost 48 "$TEST_OUT"',
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    args = read_json(output / "argv.json")
+    assert ("--apply-chat-template" in args) is expected
+    assert args[args.index("--model") + 1] == "fixture with spaces"
+    assert args[args.index("--warmup-requests-per-lane") + 1] == "10"

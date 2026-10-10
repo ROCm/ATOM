@@ -133,3 +133,31 @@ def test_scheduler_shell_forwards_statistics():
     shell._impl = SimpleNamespace(get_statistics=lambda: expected)
 
     assert shell.get_statistics() is expected
+
+
+def test_warmup_rpc_waits_for_other_ranks_before_publishing_result():
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.async_proc import AsyncIOProc
+
+    calls = []
+    worker = AsyncIOProc.__new__(AsyncIOProc)
+    worker.label = "test"
+    worker.runners = [
+        SimpleNamespace(
+            warmup_kv_offload=lambda: calls.append("warmup") or True,
+            exit=lambda: None,
+        )
+    ]
+    worker.io_addrs = [None, "primary"]
+    worker.io_queues = [
+        None,
+        SimpleNamespace(put_nowait=lambda value: calls.append(("reply", value))),
+    ]
+    worker.kv_queue = None
+    worker.all_ranks_barrier = SimpleNamespace(wait=lambda: calls.append("barrier"))
+    commands = iter([("warmup_kv_offload", []), ("exit", [])])
+    worker.get_func = lambda: next(commands)
+    worker.busy_loop()
+    assert calls == ["warmup", "barrier", ("reply", True)]

@@ -1015,6 +1015,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-transfer offload profiling logs.
     "OFFLOAD_PROFILE": lambda: _flag_env("OFFLOAD_PROFILE"),
+    # Exercise the local CPU store/restore path before the server is ready.
+    "OFFLOAD_WARMUP": lambda: _flag_env("OFFLOAD_WARMUP"),
     # lmcache_mp sends tier lookups for the head of the waiting queue ahead of
     # admission; this is how many waiting requests per scheduling pass.
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
