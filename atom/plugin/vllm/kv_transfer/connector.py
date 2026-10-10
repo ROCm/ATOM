@@ -532,7 +532,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         single sharded plane in the middle of the layout would be served to the
         wrong rank exactly as a sharded layout would.
         """
-        if self._is_deepseek_v41:
+        # `getattr`, not an attribute read: this method is exercised against
+        # stubs that carry only what the spec branch needs, and a V4.1 flag
+        # that has to exist on every caller would make the narrow fix below
+        # a wide requirement.
+        if getattr(self, "_is_deepseek_v41", False):
             # The spec instrument is blind here by construction. V4.1 publishes
             # through one proxy layer whose `FullAttentionSpec` is a byte
             # container, not a description of attention, so reading it would

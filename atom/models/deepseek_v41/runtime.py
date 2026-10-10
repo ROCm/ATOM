@@ -19,10 +19,31 @@ def _fake_layer_output(hidden, layer_name):
 # orders the stream fork/join with the model's tensor work.
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_begin_forward(hidden: torch.Tensor) -> None:
-    """Read live request state on every execution, including graph capture."""
+    """Read live request state on every execution.
+
+    Everything here is per step and host-decided -- the cursor advance, the
+    Engram snapshot, the staging fork -- so it cannot be left to a forward
+    that a graph might record once and replay. Under the vLLM plugin it does
+    not run here at all: the metadata builder stages the step before the
+    forward, outside any capture, and the guard below returns on a step that
+    was. What is left is native ATOM, and the plugin's own window before its
+    proxy pool is bound.
+
+    This carried `@eager_break_during_capture` while the work still ran in the
+    forward. That only ever covered one frontend's PIECEWISE mode -- a FULL
+    graph skips the break outright, which is why the cursor's position column
+    kept replaying the warmup's value -- and it is redundant now that the work
+    has moved out. The decorator, and the vLLM import behind it, are gone from
+    this file with it.
+    """
     metadata = get_forward_context().attn_metadata
     metadata.step.begin_forward()
     if not metadata.step.requests:
+        return
+    if getattr(metadata, "staged_outside_forward", False):
+        # The plugin staged this step in the metadata builder, where no graph
+        # can capture it. Re-staging here would advance the cursor and reset
+        # the slots a second time.
         return
     if hidden.shape[-2] != metadata.step.width:
         raise ValueError("Token rows disagree with the width this step declared")
@@ -33,6 +54,7 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_end_forward(hidden: torch.Tensor) -> None:
+    """Closes what `v41_begin_forward` opened, so it breaks for the same reason."""
     metadata = get_forward_context().attn_metadata
     if not metadata.step.requests:
         hidden.zero_()

@@ -229,9 +229,18 @@ def register_platform() -> str | None:
     # any KVCacheManager is constructed.
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
         apply_vllm_v4_block_reuse_patch,
+        apply_vllm_v4_profile_cache_patch,
     )
 
     apply_vllm_v4_block_reuse_patch()
+    # Unconditionally, not from whoever registers a proxy layer. It was
+    # installed from V4's registration, so V4.1 -- which registers its own
+    # layer -- never got it, and the flag its bind reads never left a default
+    # that did not exist until this week. That is the third V4 guard V4.1
+    # missed for being opt-in (markers, attributes, now an installer), so this
+    # one stops being opt-in: `_mark_v4_proxy_cache_mode` only touches layers
+    # carrying `_atom_v4_proxy_layer`, which makes it a no-op everywhere else.
+    apply_vllm_v4_profile_cache_patch()
 
     _register_kv_connectors()
 
@@ -367,6 +376,31 @@ def register_model() -> None:
     )
 
     apply_vllm_v4_block_reuse_patch()
+    # Also here, and this is the site that matters: `register_platform` can be
+    # swallowed (see the note below on why this hook is the reliable one), and
+    # a profile-cache patch that did not install leaves V4.1's bind unable to
+    # tell the profile's placeholder pool from the serving one. Idempotent, so
+    # installing in both places costs nothing.
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_profile_cache_patch,
+    )
+
+    apply_vllm_v4_profile_cache_patch()
+
+    # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
+    # before EngineCore sizes the KV cache. This hook is the only one that is
+    # reliably reached: vLLM resolves the platform class from inside its own
+    # ``import vllm``, so ``register_platform`` -- and with it
+    # ``ATOMPlatform.check_and_update_config`` -- can fail on a partially
+    # initialized ``vllm`` package and be swallowed, leaving the stock ROCm
+    # platform in place. Installing is a no-op for every other model:
+    # ``deepseek_v41_state_reserve_blocks`` returns 0 unless the config it is
+    # handed is V4.1's.
+    from atom.plugin.vllm.deepseek_v41_state_reserve_patch import (
+        apply_vllm_v41_state_reserve_patch,
+    )
+
+    apply_vllm_v41_state_reserve_patch()
 
     # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
     # before EngineCore sizes the KV cache. This hook is the only one that is

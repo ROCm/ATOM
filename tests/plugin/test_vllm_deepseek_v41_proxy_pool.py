@@ -153,9 +153,34 @@ class TestProxyBlockSizing:
         config = _vllm_config(max_num_seqs=max_num_seqs)
         reserve = v41_proxy_state_reserve_blocks(config)
         page_size = v41_proxy_page_size_bytes(config)
-        needed = max_num_seqs * fake_geometry.state_bytes
+        # Two halves, not one: the scheduler's slots, and the same number
+        # again for the rows vLLM stages during warmup and capture. Those rows
+        # never finish, so lending them slots out of the scheduler's share
+        # lends them permanently, and the first full batch of real requests
+        # then evicted a live one. Asserted against
+        # `v41_num_state_slots` rather than `2 * max_num_seqs` so the two
+        # cannot drift, and the second half is asserted separately below --
+        # sizing the tail for one half is exactly the regression this guards.
+        slots = bridge.v41_num_state_slots(config)
+        assert slots == 2 * bridge.v41_scheduler_state_slots(config)
+        needed = slots * fake_geometry.state_bytes
         assert reserve * page_size >= needed
         assert (reserve - 1) * page_size < needed
+
+    @pytest.mark.parametrize("num_reqs", [1, 8, 64])
+    def test_capture_slots_cannot_collide_with_a_request(self, fake_geometry, num_reqs):
+        """The capture half is disjoint from everything the allocator owns.
+
+        Both halves of the refusal this replaces: a synthetic batch whose rows
+        shared one slot (`begin_step`: "Each request needs its own valid STATE
+        slot"), and one that took slots the allocator had already given out
+        (a decode at position 912 finding a cursor at 1).
+        """
+        config = _vllm_config(max_num_seqs=64)
+        slots = bridge.v41_capture_state_slots(num_reqs, config)
+        assert len(set(slots.tolist())) == num_reqs
+        assert min(slots.tolist()) >= bridge.v41_scheduler_state_slots(config)
+        assert max(slots.tolist()) < bridge.v41_num_state_slots(config)
 
     def test_state_reserve_is_zero_for_every_other_model(self, monkeypatch):
         # The reserve patch is installed process-wide, so this zero is what
@@ -382,4 +407,110 @@ def test_the_proxy_backend_answers_block_sizes_with_or_without_a_spec():
     assert (
         AtomDeepseekV41ProxyBackend.get_supported_kernel_block_sizes(object())
         == expected
+    )
+
+
+def test_the_proxy_layer_is_markable_for_the_memory_profile():
+    """The bind must be able to tell a profiling pool from the serving one.
+
+    `_mark_v4_proxy_cache_mode` only marks layers carrying
+    `_atom_v4_proxy_layer`, and the bind reads
+    `_atom_v4_profiling_kv_cache`. V4.1's proxy had neither, so the flag never
+    left its default and the bind ran against the profile's placeholder pool
+    -- 64 blocks under cudagraph capture, where `num_gpu_blocks` is already
+    non-zero and so clears the `pages <= 0` check. The result was a bind-time
+    "pool is too small", true of the placeholder and silent about the real one.
+    """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _mark_v4_proxy_cache_mode
+    from atom.plugin.vllm.deepseek_v41_bridge import AtomDeepseekV41ProxyAttention
+
+    proxy = AtomDeepseekV41ProxyAttention()
+    assert proxy._atom_v4_proxy_layer is True
+    assert proxy._atom_v4_profiling_kv_cache is False
+
+    # The marker reaches it, both ways, through the shared V4 helper.
+    _mark_v4_proxy_cache_mode({"layer": proxy}, True)
+    assert proxy._atom_v4_profiling_kv_cache is True
+    _mark_v4_proxy_cache_mode({"layer": proxy}, False)
+    assert proxy._atom_v4_profiling_kv_cache is False
+
+
+def test_the_profile_cache_patch_installs_without_a_v4_model():
+    """Installed by `register_model`, not by V4's proxy-layer registration.
+
+    The patch wraps `initialize_kv_cache` so `_mark_v4_proxy_cache_mode` can
+    flip the profiling flag V4.1's bind reads. It used to be installed from
+    `register_deepseek_v4_proxy_layer`, so a V4.1 run -- which registers its
+    own layer and never that one -- left the flag at its default and bound
+    against the profile's placeholder pool. Checked on the wiring: calling
+    `register_model` here would reach far more than this question.
+    """
+    import importlib
+    import inspect
+
+    register = importlib.import_module("atom.plugin.vllm.register")
+    source = inspect.getsource(register.register_model)
+    assert "apply_vllm_v4_profile_cache_patch()" in source, (
+        "register_model must install the profile-cache patch; installing it "
+        "from a model's own registration is what skipped V4.1"
+    )
+    # `register_platform` installs it too, but it is not checked here: that
+    # hook can be swallowed whole (see `deepseek_v41_state_reserve_patch`), so
+    # it is the belt and this is the braces.
+
+
+def test_the_profile_cache_patch_reaches_the_runner_the_worker_builds():
+    """vLLM has two unrelated `GPUModelRunner` classes; patch both.
+
+    `GPUWorker` picks between `vllm.v1.worker.gpu_model_runner` and the V2
+    rewrite in `vllm.v1.worker.gpu.model_runner` on `use_v2_model_runner`.
+    They share no base class and no method objects, so the patch -- written
+    against the first name alone -- was inert on every V2 deployment: the
+    marker never ran, `_atom_v4_profiling_kv_cache` stayed False through the
+    profiling capture, and the bind could not tell the 64-block throwaway pool
+    from the serving one. Inert and applied look identical in the logs, which
+    is why this is asserted on the classes rather than on a log line.
+    """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_profile_cache_patch,
+    )
+    from atom.plugin.vllm.gpu_model_runner_targets import gpu_model_runner_classes
+
+    classes = gpu_model_runner_classes()
+    assert classes, "no vLLM GPUModelRunner class resolved"
+    apply_vllm_v4_profile_cache_patch()
+    for runner_cls in classes:
+        assert getattr(
+            runner_cls.initialize_kv_cache, "_atom_v4_profile_cache_patched", False
+        ), f"{runner_cls.__module__}.{runner_cls.__qualname__} left unpatched"
+    # Idempotent: a second install must not stack a wrapper on a wrapper.
+    wrapped = [c.initialize_kv_cache for c in classes]
+    apply_vllm_v4_profile_cache_patch()
+    assert [c.initialize_kv_cache for c in classes] == wrapped
+
+
+def test_the_bind_does_not_read_whether_capturing_is_merely_permitted():
+    """`cudagraph_capturing_enabled` is a permission, not a phase.
+
+    It is declared `True` in `vllm/compilation/monitor.py` and set False only
+    when a capture phase ends, so in an eager run -- where no capture ever
+    happens -- it stays True for the life of the process. A bind guard keyed on
+    it therefore stood down on every forward, and the model served from the
+    private scratch cache: a healthy server emitting noise. Keyed the other
+    way it is just as wrong, since capture against the *serving* pool is
+    exactly when the bind must happen, or the captured graphs replay a scratch
+    cache.
+
+    Asserted on the source because the symptom is an absence: there is no
+    value this predicate could return that would make reading it correct.
+    """
+    import inspect
+
+    import atom.plugin.vllm.deepseek_v41_bridge as bridge_mod
+
+    source = inspect.getsource(bridge_mod)
+    assert "cudagraph_capturing_enabled" not in source, (
+        "the V4.1 bind must not gate on vLLM's capture permission flag; "
+        "the phase it needs to exclude is the profiling pool, which "
+        "_atom_v4_profiling_kv_cache names"
     )
