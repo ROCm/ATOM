@@ -15,6 +15,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 #[derive(Clone, Copy, Debug)]
 enum DispatchKind {
     Atom,
+    AtomChunked,
     Vllm,
     Sglang,
 }
@@ -143,12 +144,17 @@ fn dispatch(
             )
             .unwrap();
         match kind {
-            DispatchKind::Atom => {
+            DispatchKind::Atom | DispatchKind::AtomChunked => {
+                let decode_body = if matches!(kind, DispatchKind::AtomChunked) {
+                    json!({"kv_transfer_params": {"chunked_transfer": true}})
+                } else {
+                    json!({})
+                };
                 router
                     .dispatch_atom_relay_internal(
                         None,
                         json!({}),
-                        json!({}),
+                        decode_body,
                         context,
                         placement,
                         ctx,
@@ -344,7 +350,11 @@ async fn decode_http_error_does_not_reacquire_prefill_load() {
 
 #[tokio::test]
 async fn cancelling_dispatch_releases_pending_load() {
-    for kind in [DispatchKind::Atom, DispatchKind::Sglang] {
+    for kind in [
+        DispatchKind::Atom,
+        DispatchKind::AtomChunked,
+        DispatchKind::Sglang,
+    ] {
         let (p, d) = servers().await;
         let task = dispatch(kind, &p, &d, true);
         p.wait_entered().await;
@@ -452,4 +462,61 @@ async fn stalled_prefill_error_body_cancels_pending_decode() {
 #[tokio::test]
 async fn stalled_decode_error_body_cancels_pending_prefill() {
     check_stalled_dual_dispatch_error(false).await;
+}
+
+#[tokio::test]
+async fn atom_chunked_dispatch_starts_decode_before_prefill_completes() {
+    let (mut p, mut d) = servers().await;
+    let task = dispatch(DispatchKind::AtomChunked, &p, &d, false);
+    // P has not produced any response. D must nevertheless be able to
+    // preallocate and send its write request to every PP stage.
+    p.wait_entered().await;
+    d.wait_entered().await;
+    assert!(!task.is_finished());
+    p.respond(axum::Json(json!({"choices": []})).into_response());
+    wait_load(&p.worker, 0).await;
+    assert_eq!(d.worker.load(), 1);
+    d.respond(axum::Json(json!({"choices": ["decoded"]})).into_response());
+    let response = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bytes).unwrap(),
+        json!({"choices": ["decoded"]})
+    );
+}
+
+#[tokio::test]
+async fn atom_chunked_streaming_lifecycle() {
+    for end in [
+        StreamEnd::Eof,
+        StreamEnd::Done,
+        StreamEnd::Disconnect,
+        StreamEnd::Error,
+    ] {
+        check_streaming_lifecycle(DispatchKind::AtomChunked, end).await;
+    }
+}
+
+#[tokio::test]
+async fn atom_chunked_http_error_cancels_the_pending_peer() {
+    for fail_prefill in [true, false] {
+        let (mut p, mut d) = servers().await;
+        let task = dispatch(DispatchKind::AtomChunked, &p, &d, false);
+        p.wait_entered().await;
+        d.wait_entered().await;
+        let response = (StatusCode::SERVICE_UNAVAILABLE, "failed").into_response();
+        if fail_prefill {
+            p.respond(response);
+        } else {
+            d.respond(response);
+        }
+        let response = result(task).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(p.worker.load(), 0);
+        assert_eq!(d.worker.load(), 0);
+    }
 }
