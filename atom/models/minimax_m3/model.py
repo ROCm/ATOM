@@ -797,7 +797,23 @@ class MiniMaxM3Model(nn.Module):
         )
 
 
+# compressed-tensors ``nvfp4-pack-quantized`` routed experts (MiniMax-M3.1)
+# name their tensors differently from the ModelOpt/Quark NVFP4 layout that
+# Nvfp4MoEMethod registers. The global scale is a divisor there; FusedMoE
+# inverts it on load because the parser tags those experts' spec with
+# NVFP4_DIVISOR_GLOBAL_SCALE_METHOD. ``input_global_scale`` maps to no
+# parameter and is dropped: the online MX target quantizes activations
+# dynamically.
+_COMPRESSED_TENSORS_NVFP4_WEIGHTS_MAPPING: dict[str, str] = {
+    ".weight_packed": ".weight",
+    ".weight_global_scale": ".weight_scale_2",
+}
+
+
 class MiniMaxM3SparseForCausalLM(nn.Module):
+    weights_mapping: ClassVar[dict[str, str]] = (
+        _COMPRESSED_TENSORS_NVFP4_WEIGHTS_MAPPING
+    )
     packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
         ".index_q_proj": (".qkv_proj", "index_q"),
         ".index_k_proj": (".qkv_proj", "index_k"),
@@ -905,6 +921,7 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     }
     weights_mapping: ClassVar[dict[str, str]] = {
         "model.language_model.": "language_model.",
+        **_COMPRESSED_TENSORS_NVFP4_WEIGHTS_MAPPING,
     }
     skip_weight_prefixes: ClassVar[list[str]] = [
         "vision_tower.",

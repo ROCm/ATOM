@@ -373,7 +373,8 @@ class QuantizationConfig:
     def _validate_nvfp4_online_quant(self):
         """Reject NVFP4 checkpoint specs when no online config was given.
 
-        NVFP4 runs only after online conversion to MXFP4. This fails while the
+        NVFP4 runs only after online conversion to MXFP4 (or MXFP8 for MoE
+        experts). This fails while the
         config is parsed, before any layer is built;
         `validate_nvfp4_online_target` checks each NVFP4 layer's target as it
         is built.
@@ -385,8 +386,8 @@ class QuantizationConfig:
             raise ValueError(
                 "The checkpoint has NVFP4 layers, but no online quantization "
                 "config was given. NVFP4 weights cannot run directly: pass "
-                "--online_quant_config with an mxfp4 target, for example "
-                '\'{"global_quant_config": "mxfp4"}\'.'
+                "--online_quant_config with an mxfp4 target (MoE experts also "
+                'accept mxfp8), for example \'{"global_quant_config": "mxfp4"}\'.'
             )
 
     @property

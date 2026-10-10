@@ -75,6 +75,7 @@ from atom.model_ops.utils import (
 )
 from atom.plugin.vllm.moe import FusedMoEDecoratorForPluginMode
 from atom.quant_spec import (
+    NVFP4_DIVISOR_GLOBAL_SCALE_METHOD,
     NVFP4_DTYPE,
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
@@ -1035,7 +1036,7 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 
     This deliberately stops before any kernel-specific shuffle. The raw
     group-16 E4M3 scales and their per-tensor global scales remain in checkpoint
-    layout until the online pass converts them to MXFP4.
+    layout until the online pass converts them to MXFP4 or MXFP8.
     Direct NVFP4 inference is intentionally unsupported.
     """
 
@@ -1080,39 +1081,39 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
                 f"({intermediate_size_per_partition}) must be divisible by "
                 f"group_size={self.group_size}."
             )
-        # The only way out of NVFP4 is MXFP4, whose 32-wide blocks run along
-        # hidden for w13 and along the TP-local intermediate for w2. A size
+        # The only ways out of NVFP4 are MXFP4 and MXFP8, whose 32-wide blocks
+        # run along hidden for w13 and along the TP-local intermediate for w2. A size
         # that is only 16-aligned otherwise loads the whole checkpoint and
         # then trips a message-less `cols % group_size` assert in aiter.
         if hidden_size % 32 != 0:
             raise ValueError(
                 f"NVFP4 hidden size ({hidden_size}) is valid for the source "
-                "group size 16 but cannot be converted to MXFP4, which "
-                "requires a multiple of 32."
+                "group size 16 but cannot be converted to MXFP4/MXFP8, which "
+                "require a multiple of 32."
             )
         if intermediate_size_per_partition % 32 != 0:
             raise ValueError(
                 "NVFP4 intermediate size per TP partition "
                 f"({intermediate_size_per_partition}) is valid for the source "
-                "group size 16 but cannot be converted to MXFP4, which "
-                "requires a multiple of 32. Choose a TP size that keeps it "
+                "group size 16 but cannot be converted to MXFP4/MXFP8, which "
+                "require a multiple of 32. Choose a TP size that keeps it "
                 "aligned."
             )
         # An unregistered bias is skipped by the loader without a warning, and
-        # the MXFP4 target would then allocate zeros for it.
+        # the MX target would then allocate zeros for it.
         if layer.has_bias:
             raise ValueError(
                 f"{getattr(layer, 'prefix', '<fused_moe>')}: NVFP4 MoE expert "
                 "biases are not supported. Supporting them requires registering "
                 "w13_bias/w2_bias in Nvfp4MoEMethod.create_weights and copying "
-                "them into the MXFP4 buffers in FusedMoE._online_quant."
+                "them into the MX target buffers in FusedMoE._online_quant."
             )
 
         self.num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_pad = 0
-        # None until a model pins the MXFP4 target's padding here.
+        # None until a model pins the MX target's padding here.
         self.intermediate_pad = None
         scale_dtype = torch.float8_e4m3fn
         weight_device = (
@@ -1170,7 +1171,7 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 
         # w13 combines w1 and w3, so retain both source projections' global
         # weight scales independently. Input scales are not consumed by the
-        # dynamic MXFP4 target and are intentionally not registered.
+        # dynamic MX target and are intentionally not registered.
         for name, shape in (
             ("w13_weight_scale_2", (num_experts, 2)),
             ("w2_weight_scale_2", (num_experts,)),
@@ -1194,7 +1195,7 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         raise RuntimeError(
             f"{getattr(layer, 'prefix', '<fused_moe>')}: NVFP4 expert weights "
-            "were not converted to MXFP4 by FusedMoE online quantization."
+            "were not converted to MXFP4/MXFP8 by FusedMoE online quantization."
         )
 
     def init_prepare_finalize(self, layer: torch.nn.Module) -> None:
@@ -1211,8 +1212,8 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
         raise RuntimeError(
             f"{getattr(layer, 'prefix', '<fused_moe>')}: NVFP4 checkpoint "
             "weights are loaded, but direct NVFP4 inference is intentionally "
-            "blocked. Convert this layer to MXFP4 during online quantization "
-            "before forward."
+            "blocked. Convert this layer to MXFP4 or MXFP8 during online "
+            "quantization before forward."
         )
 
 
@@ -3308,7 +3309,7 @@ class FusedMoE(torch.nn.Module):
             and layer_quant_config.quant_dtype == NVFP4_DTYPE
         )
         if self.source_is_nvfp4:
-            validate_nvfp4_online_target(quant_config, prefix)
+            validate_nvfp4_online_target(quant_config, prefix, allow_mxfp8=True)
         self.has_bias = has_bias
 
         # Note: here we guard against accessing the TP and DP groups when
@@ -3515,7 +3516,7 @@ class FusedMoE(torch.nn.Module):
         self.use_chunked = get_dp_group().world_size > 1
 
         if self.source_is_nvfp4:
-            # NVFP4 is currently always converted to MXFP4 by online
+            # NVFP4 is currently always converted to MXFP4/MXFP8 by online
             # quantization; its input stages (FP4 values, FP8 scales) do not
             # describe the converted layer's activations.
             a_quant_dtype = None
@@ -4099,7 +4100,7 @@ class FusedMoE(torch.nn.Module):
                 assert self.tp_size == 1, "EP MoE should not TP-shard expert weights"
                 return False
             if source_is_nvfp4:
-                # There is no offline MXFP4 layout to reproduce: the blocks are
+                # There is no offline MX layout to reproduce: the blocks are
                 # made here, per rank, so the local shard is the only one that
                 # matters. `Nvfp4MoEMethod.create_weights` rejects shards that
                 # are not 32-aligned, which is what the `% 32` rule below would
@@ -4149,7 +4150,7 @@ class FusedMoE(torch.nn.Module):
                 )
         device = old_w13_data.device
         # Nvfp4MoEMethod pads nothing itself, so an intermediate_pad on it was
-        # pinned by the model for the MXFP4 target, whose create_weights resets it.
+        # pinned by the model for the MX target, whose create_weights resets it.
         pinned_intermediate_pad = (
             getattr(self.quant_method, "intermediate_pad", None)
             if source_is_nvfp4
@@ -4973,7 +4974,9 @@ class FusedMoE(torch.nn.Module):
 
         Returns whether ``param`` is one of the two NVFP4 scalar-metadata
         parameters. These values are replicated across TP ranks and selected
-        only by the local expert id (plus w1/w3 half for w13).
+        only by the local expert id (plus w1/w3 half for w13). A divisor-style
+        (compressed-tensors) global scale is stored as its reciprocal, so
+        ``*_weight_scale_2`` always holds the dequant multiplier.
         """
         w13_param = getattr(self, "w13_weight_scale_2", None)
         w2_param = getattr(self, "w2_weight_scale_2", None)
@@ -4986,6 +4989,10 @@ class FusedMoE(torch.nn.Module):
                 "Each NVFP4 expert projection must provide exactly one "
                 f"global scale, got shape {tuple(loaded_weight.shape)}."
             )
+        if self.layer_quant_config.quant_method == NVFP4_DIVISOR_GLOBAL_SCALE_METHOD:
+            # A zero divisor becomes inf, which validate_nvfp4_global_scales
+            # rejects like any other unloaded scale.
+            value = value.float().reciprocal()
         if param is w13_param:
             if shard_id not in ("w1", "w3"):
                 raise ValueError(
