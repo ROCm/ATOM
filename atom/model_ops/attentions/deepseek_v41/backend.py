@@ -740,9 +740,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(
-                step, histories=not on_device or self._blocking_state_probe
-            )
+            else cache.prepare_state(step, histories=not on_device)
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
