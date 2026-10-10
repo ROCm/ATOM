@@ -46,6 +46,11 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
+    if getattr(metadata, "staged_outside_forward", False):
+        # The plugin staged this step in the metadata builder, where no graph
+        # can capture it. Re-staging here would advance the cursor and reset
+        # the slots a second time.
+        return
     if hidden.shape[-2] != metadata.step.width:
         raise ValueError("Token rows disagree with the width this step declared")
     stage = getattr(metadata.engram_embeddings, "stage", None)

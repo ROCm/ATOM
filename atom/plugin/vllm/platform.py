@@ -262,31 +262,31 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         and getattr(compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
         and _breakable_cudagraph_available()
     ):
-        # PIECEWISE, and not any mode carrying FULL, for two independent
-        # reasons -- either alone would be enough:
+        # The requested mode is left alone, including one carrying FULL.
         #
-        # 1. `eager_break_during_capture` *skips the break* when the forward
-        #    context reports a FULL runtime mode (it assumes the backend
-        #    declared itself capturable). Under FULL our step work would be
-        #    recorded into the graph and never run again, which is silent: the
-        #    cursor would freeze and every replayed step would re-answer the
-        #    first one.
-        # 2. The proxy builder declares `AttentionCGSupport.NEVER`, which is
-        #    honest -- it cannot be captured. vLLM's three NEVER gates in
-        #    `resolve_cudagraph_mode_and_sizes` all test FULL (mixed_mode,
-        #    decode_mode, has_full_cudagraphs), so PIECEWISE passes them
-        #    untouched and NEVER stays true. Nothing here is a claim that the
-        #    attention is graph-safe; the breaks are.
-        if compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE:
-            logger.info(
-                "DeepSeek-V4.1 plugin mode: VLLM_USE_BREAKABLE_CUDAGRAPH=1, so "
-                "setting cudagraph_mode=%s -> PIECEWISE. Breakable capture ends "
-                "the segment at runtime around V4.1's per-step host work "
-                "instead of splitting an fx graph, which is what makes this "
-                "model capturable at all.",
-                compilation_config.cudagraph_mode,
-            )
-            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        # It was forced to PIECEWISE for two reasons, and the work that made
+        # FULL correct removed both. `eager_break_during_capture` skips the
+        # break when the runtime mode is FULL, which used to freeze V4.1's
+        # per-step host work into the graph -- but that work no longer runs in
+        # the forward at all: the metadata builder stages it, once per step,
+        # before the forward and outside anything a graph captures. And the
+        # proxy builder's `AttentionCGSupport.NEVER`, which vLLM's three gates
+        # in `resolve_cudagraph_mode_and_sizes` test for, is now
+        # `UNIFORM_SINGLE_TOKEN_DECODE` -- a claim about where the state is
+        # staged, which is the thing that changed.
+        #
+        # Measured before: asking for FULL_AND_PIECEWISE got
+        # "setting cudagraph_mode=NONE because attention is not compiled
+        # piecewise", and the server then answered every prompt correctly on
+        # no graphs at all. A downgrade to NONE is silent in everything except
+        # the capture count.
+        logger.info(
+            "DeepSeek-V4.1 plugin mode: VLLM_USE_BREAKABLE_CUDAGRAPH=1, leaving "
+            "cudagraph_mode=%s for vLLM to resolve. The step's host-side work "
+            "is staged by the metadata builder, before the forward, so a FULL "
+            "decode graph replays it rather than re-running it.",
+            compilation_config.cudagraph_mode,
+        )
 
 
 if not disable_vllm_plugin:

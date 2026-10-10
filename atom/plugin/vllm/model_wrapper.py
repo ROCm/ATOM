@@ -661,6 +661,21 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 vllm_config,
                 self.device_config.device,
             )
+            # The proxy layer is how the vLLM-facing metadata builder reaches
+            # back: it runs inside `ModelState.prepare_attn`, with no handle on
+            # the wrapper, and it has to bind the pool and stage the step from
+            # there -- outside anything a graph captures. Same shape as V4's
+            # `_atom_v4_model`.
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+            )
+
+            proxy = vllm_config.compilation_config.static_forward_context.get(
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+            )
+            if proxy is not None:
+                proxy._atom_v41_model = self.model
+                proxy._atom_v41_builder = self._deepseek_v41_builder
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.

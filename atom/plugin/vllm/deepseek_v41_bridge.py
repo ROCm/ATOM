@@ -253,6 +253,71 @@ def v41_capture_state_slots(num_reqs: int, vllm_config) -> np.ndarray:
     return np.arange(base, base + num_reqs, dtype=np.int32)
 
 
+def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturing):
+    """One CSA2 step, staged where no graph can capture it.
+
+    `capturing` is vLLM telling us the batch is synthetic -- it called
+    `build_for_cudagraph_capture` rather than `build`. That is a better signal
+    than anything derivable from the batch: four earlier attempts to infer it
+    (duplicate request ids, a startup-only window, a capture-active flag, a
+    reserved slot range) were each wrong in a way that only showed up under
+    load. A synthetic batch takes `arange` slots so it cannot collide with a
+    request in flight, and it is still staged against the serving cache --
+    routing it to the private scratch cache would bake that cache's addresses
+    into the graph for the life of the entry.
+
+    Returns what the forward needs and nothing it can recompute, or None when
+    there is no batch to stage.
+    """
+    if snapshot is None or snapshot.num_reqs == 0:
+        return None
+    slot_allocator = getattr(model, "_atom_v41_slot_allocator", None)
+    if slot_allocator is None and not capturing:
+        return None
+    num_reqs = int(snapshot.num_reqs)
+    slots = np.arange(num_reqs, dtype=np.int32) if capturing else None
+    batch = _v41_scheduled_batch(snapshot, slot_allocator, slots)
+    running_bs = num_reqs
+    running_tokens = max(_v41_live_running_tokens(None), int(batch.total_tokens_num))
+    metadata, step_positions = builder._prepare(batch, running_bs, running_tokens)
+    input_ids = _v41_step_input_ids(running_tokens)
+    if input_ids is None:
+        return None
+    try:
+        builder.prepare_model_inputs(input_ids, metadata)
+    except ValueError as exc:
+        if "needs state at" not in str(exc):
+            raise
+        _dump_v41_state_rows(snapshot, batch, builder, exc)
+        raise
+    metadata.staged_outside_forward = True
+    return SimpleNamespace(
+        metadata=metadata,
+        positions=step_positions,
+        running_bs=running_bs,
+        running_tokens=running_tokens,
+        capturing=capturing,
+    )
+
+
+def _v41_step_input_ids(running_tokens):
+    """This step's token ids, from the batch vLLM is about to run.
+
+    Engram hashes them, so they have to be the step's own. The builder runs
+    inside `ModelState.prepare_attn`, which holds the `InputBatch` -- the
+    pass-through patch exposes it, and without that patch there is nothing
+    here to hash and the caller falls back.
+    """
+    try:
+        from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+        batch = get_current_input_batch()
+    except Exception:  # noqa: BLE001
+        return None
+    ids = getattr(batch, "input_ids", None)
+    return None if ids is None else ids[:running_tokens]
+
+
 class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
     """Snapshot the step's host-side batch description; build nothing on device.
 
@@ -265,13 +330,19 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
     -- and attaches them for :func:`atom_deepseek_v41_forward_context` to
     consume.
 
-    ``_cudagraph_support`` is ``NEVER``: V4.1's step carries host-side Python
-    state (Engram hashing, tentative staging, per-slot resets) that cannot be
-    replayed from a captured graph, and the platform forces
-    ``cudagraph_mode=NONE`` to match.
+    ``_cudagraph_support`` is ``UNIFORM_SINGLE_TOKEN_DECODE``, and that is a
+    claim about where the host-side state is staged, not about the kernels.
+    Engram hashing, the cursor advance and the per-slot resets do not survive
+    a replay, so they run here -- once per step, before the forward, outside
+    anything a graph captures. What the graph then records reads the
+    persistent `forward_vars` buffers this refreshes in place.
+
+    Single-token decode and not wider: a mixed batch still goes through
+    PIECEWISE, and speculation would need the verify step's ragged widths
+    checked before claiming `UNIFORM_BATCH`.
     """
 
-    _cudagraph_support = AttentionCGSupport.NEVER
+    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -285,18 +356,55 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
             raise ValueError(
                 "ATOM DeepSeek-V4.1 proxy does not support cascade attention"
             )
+        return self._build_and_attach(common_attn_metadata, capturing=False)
+
+    def build_for_cudagraph_capture(self, common_attn_metadata):
+        # vLLM calls this instead of `build` for the synthetic batch it is
+        # about to capture a FULL graph from -- which is how the capture says
+        # so, rather than this guessing from the batch's shape. Same staging,
+        # into the same persistent buffers; only the STATE slots differ.
+        return self._build_and_attach(common_attn_metadata, capturing=True)
+
+    def _build_and_attach(self, common_attn_metadata, *, capturing):
+        """Stage this step outside the captured region, and hand it over.
+
+        vLLM calls a builder once per step, before `set_forward_context` and
+        before the (possibly graph-wrapped) model forward. Staging here is what
+        makes a captured graph correct: the cursor advance, the per-slot reset
+        and the Engram rows all happen on host-decided values, and a captured
+        forward replays without re-running any of it. The kernels that do get
+        captured read the persistent `forward_vars` buffers this refreshes in
+        place, so their addresses are stable and their contents are this step's.
+
+        Returns the same `CommonAttentionMetadata`, now carrying
+        `atom_v41_prepared`, which the forward consumes instead of staging
+        again. Left bare when the proxy pool is not bound yet (profiling, the
+        first warmup forward): the forward sees nothing prepared and falls back
+        to its private scratch cache, exactly as before.
+        """
         if common_attn_metadata is None:
             return common_attn_metadata
         common_attn_metadata.atom_v41_snapshot = snapshot_v41_batch(
             common_attn_metadata
         )
-        return common_attn_metadata
-
-    def build_for_cudagraph_capture(self, common_attn_metadata):
-        raise NotImplementedError(
-            "ATOM DeepSeek-V4.1 runs eager on the vLLM plugin path; "
-            "cudagraph_mode must be NONE"
+        sfc = self.vllm_config.compilation_config.static_forward_context
+        proxy = sfc.get(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME)
+        model = getattr(proxy, "_atom_v41_model", None)
+        builder = getattr(proxy, "_atom_v41_builder", None)
+        if model is None or builder is None:
+            return common_attn_metadata
+        if not bind_deepseek_v41_proxy_cache(model, builder, self.vllm_config):
+            return common_attn_metadata
+        prepared = _v41_stage_outside_forward(
+            builder,
+            model,
+            self.vllm_config,
+            common_attn_metadata.atom_v41_snapshot,
+            capturing=capturing,
         )
+        if prepared is not None:
+            common_attn_metadata.atom_v41_prepared = prepared
+        return common_attn_metadata
 
 
 class AtomDeepseekV41ProxyBackend(AttentionBackend):
@@ -1028,6 +1136,12 @@ def v41_stage_step(
     return metadata, step_positions, running_bs, running_tokens, synthetic
 
 
+def _v41_prepared_for_this_step(proxy_layer_name):
+    """What the builder staged for this step, or None if it did not run."""
+    common = get_deepseek_v41_proxy_metadata_from_vllm_context(proxy_layer_name)
+    return getattr(common, "atom_v41_prepared", None)
+
+
 @contextmanager
 def atom_deepseek_v41_forward_context(
     *,
@@ -1064,9 +1178,27 @@ def atom_deepseek_v41_forward_context(
     # never again: `_replay` walks the recorded segments and does not call the
     # model. Deciding here and passing the result in would pin every later
     # replay to the batch that was scheduled when the graph was recorded.
-    metadata, step_positions, running_bs, running_tokens, dummy = v41_stage_step(
-        builder, slot_allocator, input_ids, proxy_layer_name, force_dummy, vllm_config
-    )
+    # Staged by the metadata builder, outside anything a graph can capture.
+    # The forward consumes it; it does not re-stage, because the cursor
+    # advance and the per-slot reset are once-per-step and would be applied
+    # twice. `prepared` is absent only before the proxy pool is bound, where
+    # the fallback below runs the step on a private scratch cache.
+    prepared = _v41_prepared_for_this_step(proxy_layer_name)
+    if prepared is not None:
+        metadata = prepared.metadata
+        step_positions = prepared.positions
+        running_bs = prepared.running_bs
+        running_tokens = prepared.running_tokens
+        dummy = False
+    else:
+        metadata, step_positions, running_bs, running_tokens, dummy = v41_stage_step(
+            builder,
+            slot_allocator,
+            input_ids,
+            proxy_layer_name,
+            force_dummy,
+            vllm_config,
+        )
 
     is_prefill = metadata.state.value.startswith("prefill")
     context = Context(

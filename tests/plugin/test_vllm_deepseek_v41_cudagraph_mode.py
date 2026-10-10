@@ -53,13 +53,22 @@ def breakable(monkeypatch):
         CUDAGraphMode.PIECEWISE,
     ],
 )
-def test_breakable_capture_lands_on_piecewise_from_every_requested_mode(
-    breakable, requested
-):
+def test_breakable_capture_leaves_every_requested_mode_to_vllm(breakable, requested):
+    """A mode carrying FULL is no longer demoted on the way in.
+
+    It used to be, for two reasons that the staging move removed: the eager
+    break is skipped under FULL, and the proxy declared
+    `AttentionCGSupport.NEVER`. V4.1's per-step host work does not run in the
+    forward any more -- the metadata builder stages it before the forward,
+    outside any capture -- so FULL has nothing left to freeze, and the support
+    level says so. Which modes are actually viable is vLLM's call, made in
+    `resolve_cudagraph_mode_and_sizes` against that level; demoting here would
+    answer it twice and hide the answer.
+    """
     breakable(True)
     cfg = _Config(requested)
     atom_platform.enforce_deepseek_v41_constraints(cfg)
-    assert cfg.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert cfg.compilation_config.cudagraph_mode == requested
 
 
 def test_without_breakable_capture_the_mode_is_none(breakable):
@@ -84,7 +93,7 @@ def test_the_constraint_is_idempotent(breakable):
     cfg = _Config(CUDAGraphMode.FULL_AND_PIECEWISE)
     atom_platform.enforce_deepseek_v41_constraints(cfg)
     atom_platform.enforce_deepseek_v41_constraints(cfg)
-    assert cfg.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert cfg.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
 def test_a_non_v41_model_is_untouched(breakable):
@@ -151,3 +160,25 @@ def test_the_forward_context_does_not_open_atoms_side_stream_fork():
         "gates ATOM's side-stream fork, which vLLM's capture cannot end"
     )
     assert "in_hipgraph=_v41_capture_active()" not in source
+
+
+def test_the_proxy_claims_only_what_the_staging_supports():
+    """The support level is the thing vLLM gates FULL on, so state it here.
+
+    `NEVER` was honest while the step ran inside the forward; it is what made
+    an explicit FULL_AND_PIECEWISE resolve to NONE, with every prompt still
+    answered correctly on no graphs at all -- a downgrade that shows up in
+    nothing but the capture count. `UNIFORM_SINGLE_TOKEN_DECODE` and no wider:
+    a mixed batch still belongs to PIECEWISE, and a verify step's ragged
+    widths would have to be checked before claiming `UNIFORM_BATCH`.
+    """
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        AtomDeepseekV41ProxyMetadataBuilder,
+    )
+
+    assert (
+        AtomDeepseekV41ProxyMetadataBuilder._cudagraph_support
+        is AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
