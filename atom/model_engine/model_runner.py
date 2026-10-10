@@ -2678,6 +2678,7 @@ class ModelRunner:
             dp_size=dp_size,
             dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
             enforce_eager=self.enforce_eager,
+            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch),
             capture_sizes=self.capture_sizes_np,
             captured_tokens=(
                 self._piecewise_sorted_tokens if self._piecewise_cg_active() else None

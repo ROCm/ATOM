@@ -47,7 +47,7 @@ from atom.models.deepseek_v41.mono.kernels.moe_shape import (
     route_shape,
 )
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, traced
+from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, traced
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.device.sync import publish
@@ -226,7 +226,7 @@ def build_layer_post(key: LayerPostBuild):
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         iact: Int32, iq: Int64, iw: Int64, plane: Int64, iqs: Int64,
         pscale: Int64, iplan: Int64, itab: Int64,

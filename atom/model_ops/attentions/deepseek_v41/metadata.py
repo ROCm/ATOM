@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Request spans shared by CSA2 paging, compression and Engram staging."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -68,6 +71,8 @@ class BatchStep:
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
     group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    # A split decode's window rows (`indices.build_window_rows`), every layer's.
+    window_rows: torch.Tensor | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
@@ -86,6 +91,8 @@ class BatchStep:
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
+    # name -> what a step planner worked out on the host (`StepPlan.host`)
+    planned_host: dict[str, object] = field(default_factory=dict)
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -99,6 +106,7 @@ class BatchStep:
         self.tiles.clear()
         self.candidate_blocks.clear()
         self.group_indices.clear()
+        self.window_rows = None
 
     @property
     def width(self):
@@ -113,6 +121,15 @@ class BatchStep:
         # Verification has ring slack for the entire tentative block. All rows
         # can use the same causal paged-decode kernel as autoregressive decode.
         return self.tentative or all(request.length == 1 for request in self.requests)
+
+
+class StepPlan(NamedTuple):
+    """What a step planner (`add_step_planner`) laid out for a step: the rows
+    each of its buffers publishes, by name, and what it worked out on the
+    host, by name (`BatchStep.planned_host`)."""
+
+    rows: dict[str, int]
+    host: Mapping[str, object] = MappingProxyType({})
 
 
 def visible_buffer_name(ratio):
@@ -146,8 +163,7 @@ def prepare_batch_step(
     that is the width its kernels run; the backing token map uses V4's -1
     padding sentinel and block-table stride stays fixed across steps.
     `planners` are called as `planner(buffers, running_tokens)` once the rows
-    are staged, return their buffers' published rows by name, and need the
-    serving buffers.
+    are staged, return a `StepPlan`, and need the serving buffers.
     """
     scheduled_bs = len(requests)
     lengths = np.asarray([span.length for span in requests], dtype=np.int32)
@@ -223,9 +239,11 @@ def prepare_batch_step(
     batches = buffers["batch_id_per_q_token"]
     build_batch_ids(lengths, pad_to=running_tokens, out=batches.np)
     # Planners read the rows staged above and publish with them.
-    planned = {}
+    planned, planned_host = {}, {}
     for planner in planners:
-        planned.update(planner(buffers, running_tokens))
+        plan = planner(buffers, running_tokens)
+        planned.update(plan.rows)
+        planned_host.update(plan.host)
     required.update(planned)
     if state_slot_out is None:
         # Isolated eager cache callers have no metadata builder. Serving passes
@@ -284,4 +302,5 @@ def prepare_batch_step(
         visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
         request_positions=starts,
         planned={name: published[name] for name in planned},
+        planned_host=planned_host,
     )

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+import logging
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,35 +31,82 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 
-try:
-    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-except ImportError:  # native ATOM runs without vLLM installed
-
-    def eager_break_during_capture(fn):
-        return fn
-
 
 def _breakable_cudagraph_enabled() -> bool:
-    """Whether graphs may be captured around this model's step work.
+    """Whether this run may capture graphs around this model's step work.
 
-    Read per call rather than once at import: the env var is set before the
-    worker imports vLLM, but a test may flip it, and the cost is a dict lookup
-    next to a cache allocation.
+    Routed through the plugin: the answer is one frontend's, and this file is
+    not that frontend's. Native ATOM owns its own capture loop and never asks
+    vLLM anything, so it takes the False below without importing it.
     """
-    try:
-        from vllm.compilation.breakable_cudagraph import (
-            is_breakable_cudagraph_enabled,
-        )
-    except ImportError:
+    from atom.plugin import is_vllm
+
+    if not is_vllm():
         return False
-    return bool(is_breakable_cudagraph_enabled())
+    from atom.plugin.vllm.breakable_capture import breakable_capture_enabled
+
+    return breakable_capture_enabled()
 
 
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
+from .score_planner import ScorePlanner
+
+logger = logging.getLogger("atom")
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
+
+
+def _blocking_state_probe() -> bool:
+    """Whether to render the stale-slot verdict in the step that asks for it.
+
+    `prepare_state` can ship the cursor rows asynchronously and judge them a
+    step later, which takes one blocking D2H (~58 us) off each decode step.
+    The deferred path is wrong under concurrency, and wrong in the direction
+    that costs most: it refuses correct state and takes the engine down.
+
+    Measured on the plugin path, FULL_AND_PIECEWISE, 64 concurrent GSM8K
+    requests, no KV connector of any kind:
+
+        needs state at 952, found 951
+
+    while the state-row dump for that same request, printed beside it, reads
+    `computed 953, cursor 953` -- self-consistent. The verdict is rendered
+    against a claim from one step and a `_probe` buffer that later steps have
+    already reused, so the two describe different moments.
+
+    Default on for the plugin path and off for the native one: that is where
+    the fault is observed, and the native engine drives its own scheduler.
+    `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
+
+    This is a guard, not a fix. The register slip in the deferred probe is
+    still not understood, and a check that fails closed on correct state is
+    worse than the microsecond it saves.
+    """
+    override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+    if override is not None and override != "":
+        return override not in ("0", "false", "False")
+    from atom.plugin import is_plugin_mode
+
+    return bool(is_plugin_mode())
+
+
+def _staging_advances(embeddings, step) -> bool:
+    """Whether this step's Engram rows carry a staging that advances the cursor.
+
+    `EngramStaging.start` does it on the way past; a plain mapping of rows has
+    no `stage` and does nothing. The caller needs the difference because the
+    advance has to happen exactly once, down one path or the other.
+    """
+    if getattr(embeddings, "stage", None) is None:
+        return False
+    # `EngramStaging._advance_cursor` stands down on a step that carries
+    # candidates -- a verify step's cursor belongs to the sampler. Asking only
+    # whether a `stage` exists left the same hole twice over: staging skipped
+    # the advance, the caller saw a `stage` and skipped it too, and neither
+    # thought it owed one.
+    return getattr(step, "candidates", None) is None
 
 
 def build_v41_pool_geometry(
@@ -191,17 +240,33 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             )
             | self._engram_rows_buffer(self.max_num_batched_tokens, self.device)
         )
-        # Before the memory profile, so the budget counts it.
+        # Before the memory profile, so the budget counts it; and so before
+        # the pool is sized, which its packed logits follow: the weights are
+        # in, so what is left of the budget bounds the PAGEs from above.
         self.score_workspace = ScoreWorkspace(
             self.geometry,
             self.max_num_batched_tokens,
             self.block_table_cols,
             self.device,
+            pages=self._page_bound(model_runner.config.gpu_memory_utilization),
             # A candidate-consuming layer's plane is as wide as the candidate
             # list, which the checkpoint fixes and `max_model_len` does not
             # bound. Short contexts make it the widest plane in the model.
             candidate_blocks=int(getattr(self.config, "candidate_topk_blocks", 0) or 0),
         )
+        logger.info(
+            "V4.1 score workspace: %s logits, %.2f GiB",
+            "packed" if self.score_workspace.packed else "plane",
+            self.score_workspace.capacity * 4 / (1 << 30),
+        )
+        if self.score_workspace.packed:
+            self.add_step_planner(
+                ScorePlanner(
+                    self.score_workspace,
+                    (ratio for ratio, _ in self.geometry.compress_ratios),
+                    self.max_num_batched_tokens,
+                )
+            )
         self.cache = self.copies = self.engram = None
         self.dummy_weights = bool(model_runner.config.load_dummy)
         if not self.dummy_weights and self.config.engram_layer_ids:
@@ -216,8 +281,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def add_step_planner(self, planner):
         """Have `planner` lay its per-step tables out of each step's staged rows
-        (`prepare_batch_step`), in buffers of its own published with the step.
-        Before the forward buffers are bound to their publication."""
+        (`prepare_batch_step`), in buffers of its own published with the step,
+        and hand the step what it works out on the host (`StepPlan`). Before
+        the forward buffers are bound to their publication."""
         self.model_runner.forward_vars.update(planner.buffers(self.device, "v41_step"))
         self.step_planners = (*self.step_planners, planner)
 
@@ -327,6 +393,27 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             page_pool(self.geometry.paged_bytes),
             state_pool(STATE_SLOT_CLASS, self.geometry.state_bytes, entries_per_req=1),
         ]
+
+    def _page_bound(self, utilization):
+        """PAGEs the pool can reach at most: the budget the weights leave.
+
+        The pool is sized later from what the memory profile leaves, which
+        starts from at least what is allocated now.
+        """
+        total = torch.cuda.mem_get_info(self.device)[1]
+        left = int(total * utilization) - torch.cuda.memory_allocated(self.device)
+        return max(1, left // self.geometry.paged_bytes)
+
+    def step_needs_eager(self, batch):
+        """True when the step's rows cannot all be packed at once: a captured
+        graph scores one band, so such a step runs eagerly, in bands.
+
+        A row sees at most its request's context; shared prefixes, counted
+        once in the pool, are why the pool-sized buffer can fall short.
+        """
+        return not self.score_workspace.fits(
+            batch.num_scheduled_tokens, batch.context_lens
+        )
 
     def state_transfer(self):
         return StateTransfer.copy(self.geometry.layout_id)
@@ -705,12 +792,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             candidates=step.max_q_len if tentative else 0,
         )
 
-    @eager_break_during_capture
     def prepare_model_inputs(self, input_ids, metadata):
         """One CSA2 step's host-side work: Engram rows, state, cursor.
 
-        A break point for breakable cudagraph capture, which is what lets this
-        model be captured at all. None of this can be replayed from a graph --
+        Called by the metadata builder, before the forward and outside any
+        capture, which is what lets this model be captured at all. None of this can be replayed from a graph --
         the Engram row staging hashes token ids, `prepare_state` resets the
         slots this batch recycled, and `advance_cursor` writes the committed
         position -- and it has to happen once, in order, per step.
@@ -740,7 +826,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=not on_device)
+            else cache.prepare_state(
+                step, histories=not on_device or _blocking_state_probe()
+            )
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
@@ -777,7 +865,19 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif staged is None and not metadata.dummy and not step.tentative:
+        elif (
+            not metadata.dummy
+            and not step.tentative
+            and not _staging_advances(embeddings, step)
+        ):
+            # Owed to `EngramStaging.start` only when there is a staging to do
+            # it. The condition used to be `staged is None`, which assumed the
+            # two always travel together -- and where they did not, the step
+            # advanced nothing at all: no error, no trace, the request simply
+            # one behind its own position for the rest of its life. Measured
+            # under FULL_AND_PIECEWISE at 64 concurrent requests, where every
+            # step deferred to staging and the ones without it leaked an
+            # advance each ("needs state at 828, found 818").
             cache.advance_cursor(step, histories)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True

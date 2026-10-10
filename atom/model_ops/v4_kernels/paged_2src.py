@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse prefill attention with two KV sources: paged `unified_kv` (history)
-and per-fwd flat `kv` (current chunk's input).
+"""Sparse attention with two KV sources: paged `unified_kv` and a flat `kv`
+of rows, each token's keys drawn from both.
 
-Designed for V4 prefill: indexes the two KV sources directly without
-materialising a per-fwd `kv_flat_sa` packed tensor. See
+Designed for V4 prefill, where `kv` is the current chunk's input: indexes the
+two KV sources directly without materialising a per-fwd `kv_flat_sa` packed
+tensor. V4.1's BF16 decode runs it too, `kv` there the pool from a layer's
+window ring (its window rows, this step's already written). See
 `atom/model_ops/v4_kernels/doc/ATOM_V4_PAGED_PREFILL_DESIGN.zh.md` §1, §3
 for design rationale.
 
@@ -22,9 +24,9 @@ Caller contract:
     `-1` entries are skipped (sentinel).
   kv_indptr_prefix:  [N+1] int32 — true prefix sum (variable per-token len).
 
-  kv:                [total_tokens, D] BF16 — extend source = current
-    fwd's just-computed K (NOT yet written to the window). Layout matches
-    `swa_write` input.
+  kv:                [rows, D] BF16 — extend source. Prefill: the current
+    fwd's just-computed K (NOT yet written to the window), laid out as the
+    `swa_write` input. V4.1 decode: the window ring (`ring_view`).
   kv_indices_extend: [total_extend_indices] int32 — flat per-token row idx
     lists into `kv`. Per-token entries live in
     `kv_indices_extend[kv_indptr_extend[t] : kv_indptr_extend[t+1]]`.
@@ -86,7 +88,7 @@ _WAVES_PER_EU = 2
 
 
 @triton.jit
-def _sparse_attn_v4_paged_prefill_kernel(
+def _sparse_attn_v4_paged_2src_kernel(
     q_ptr,  # [N, H, D]
     unified_kv_ptr,  # [total_pages, D]   — prefix source
     kv_indices_prefix_ptr,  # [total_prefix_indices] int32
@@ -269,7 +271,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
 
 
 @triton.jit
-def _sparse_attn_v4_paged_prefill_csa_kernel(
+def _sparse_attn_v4_paged_2src_csa_kernel(
     q_ptr,  # [N, H, D]
     unified_kv_ptr,
     kv_indices_prefix_ptr,
@@ -393,7 +395,7 @@ def _sparse_attn_v4_paged_prefill_csa_kernel(
     tl.store(out_ptrs, out, mask=h_mask[:, None])
 
 
-def _sparse_attn_v4_paged_prefill_triton(
+def _sparse_attn_v4_paged_2src_triton(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
@@ -406,12 +408,10 @@ def _sparse_attn_v4_paged_prefill_triton(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not q.is_cuda:
-        raise RuntimeError(
-            "Triton sparse_attn_v4_paged_prefill requires CUDA/HIP tensors"
-        )
+        raise RuntimeError("Triton sparse_attn_v4_paged_2src requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(
-            f"sparse_attn_v4_paged_prefill expects fp16/bf16 q, got {q.dtype}"
+            f"sparse_attn_v4_paged_2src expects fp16/bf16 q, got {q.dtype}"
         )
     if unified_kv.dtype != q.dtype:
         raise RuntimeError(
@@ -458,7 +458,7 @@ def _sparse_attn_v4_paged_prefill_triton(
     # shapes, including HCA and non-512 V4 variants, use the generic kernel.
     use_csa_fast_kernel = has_prefix and avg_prefix_len > 16 and D == 512 and full_d
     if use_csa_fast_kernel:
-        _sparse_attn_v4_paged_prefill_csa_kernel[(T, triton.cdiv(H, block_h))](
+        _sparse_attn_v4_paged_2src_csa_kernel[(T, triton.cdiv(H, block_h))](
             q,
             unified_kv,
             kv_indices_prefix,
@@ -490,7 +490,7 @@ def _sparse_attn_v4_paged_prefill_triton(
         )
         return out
 
-    _sparse_attn_v4_paged_prefill_kernel[(T, triton.cdiv(H, block_h))](
+    _sparse_attn_v4_paged_2src_kernel[(T, triton.cdiv(H, block_h))](
         q,
         unified_kv,
         kv_indices_prefix,
@@ -527,7 +527,7 @@ def _sparse_attn_v4_paged_prefill_triton(
     return out
 
 
-def sparse_attn_v4_paged_prefill_reference(
+def sparse_attn_v4_paged_2src_reference(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
@@ -588,7 +588,7 @@ def sparse_attn_v4_paged_prefill_reference(
 
 
 @mark_trace
-def sparse_attn_v4_paged_prefill(
+def sparse_attn_v4_paged_2src(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices_prefix: torch.Tensor,
@@ -607,8 +607,8 @@ def sparse_attn_v4_paged_prefill(
     k_rope: torch.Tensor | None = None,
     prefix: str = "",
 ) -> torch.Tensor:
-    """V4 prefill sparse attention over two KV sources (paged unified_kv +
-    flat per-fwd kv), dispatching on the kv-cache layout.
+    """Sparse attention over two KV sources (paged unified_kv + flat kv),
+    dispatching on the kv-cache layout.
 
     Native 2buff fp8 (``unified_kv_rope`` provided): routes to aiter's
     ``pa_sparse_prefill_fp8_opus`` (op4). ``unified_kv`` is the packed fp8 NoPE
@@ -627,8 +627,9 @@ def sparse_attn_v4_paged_prefill(
       kv_indices_prefix: [total_prefix] int32 — flat per-token slot lists into
         unified_kv. -1 sentinels skipped.
       kv_indptr_prefix:  [T+1] int32 — true prefix sum.
-      kv:                [total_tokens, D] BF16/FP16 — extend source (bf16 path;
-        this fwd's input K, NOT yet in the window).
+      kv:                [rows, D] BF16/FP16 — extend source (bf16 path): this
+        fwd's input K, NOT yet in the window (prefill), or the window ring
+        (V4.1 decode).
       kv_indices_extend: [total_extend] int32 — flat per-token row idx lists
         into kv. -1 sentinels skipped.
       kv_indptr_extend:  [T+1] int32 — true prefix sum.
@@ -715,7 +716,7 @@ def sparse_attn_v4_paged_prefill(
             attn_sink,
             softmax_scale,
         )
-    return _sparse_attn_v4_paged_prefill_triton(
+    return _sparse_attn_v4_paged_2src_triton(
         q,
         unified_kv,
         kv_indices_prefix,

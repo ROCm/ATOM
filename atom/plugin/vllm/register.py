@@ -242,6 +242,12 @@ def register_platform() -> str | None:
     # carrying `_atom_v4_proxy_layer`, which makes it a no-op everywhere else.
     apply_vllm_v4_profile_cache_patch()
 
+    # Which forwards are vLLM's own, for a model that keeps per-request state.
+    from atom.plugin.vllm.dummy_run import apply_vllm_dummy_run_patch
+
+    covered = apply_vllm_dummy_run_patch()
+    logger.info("ATOM plugin: dummy-run marking covers %d runner class(es)", covered)
+
     _register_kv_connectors()
 
     # return the ATOM platform to vllm
@@ -386,6 +392,15 @@ def register_model() -> None:
     )
 
     apply_vllm_v4_profile_cache_patch()
+
+    # Also from here, and this is the site that matters: `register_platform`
+    # can be swallowed whole, and the first run proved it -- the coverage line
+    # this logs never appeared, so the marking covered nothing and the
+    # synthetic batches went on taking real STATE slots.
+    from atom.plugin.vllm.dummy_run import apply_vllm_dummy_run_patch
+
+    covered = apply_vllm_dummy_run_patch()
+    logger.info("ATOM plugin: dummy-run marking covers %d runner class(es)", covered)
 
     # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
     # before EngineCore sizes the KV cache. This hook is the only one that is

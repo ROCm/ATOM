@@ -125,8 +125,8 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
         check(fused_writer=False)
-    # PCP's candidate exchange is the only reader of the indexer op's return, so
-    # the FP4 path may leave that tensor unwritten only while this refusal holds.
+    # PCP's candidate exchange needs fp32 weights that the FP4 writer does not
+    # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):
         check(prefill_context_parallel=True)
     # Decode micro-batching is supported; only the prefill split is not, because
@@ -238,7 +238,7 @@ def _paged_layout(batch: int, ctx_len: int):
     return table, num_blocks, token, seq, slots
 
 
-def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
+def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0, weights_fill=0.0):
     """The production writer, in FP4 mode. Returns everything it emits.
 
     Through ATOM's own shim rather than `aiter.` directly: the shim is what
@@ -255,7 +255,7 @@ def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
     weights = (torch.randn(rows, HEADS, device="cuda") * weight_gain).bfloat16()
     q_fp4 = torch.zeros(rows, HEADS, HEAD_DIM // 2, **u8)
     q_scale = torch.zeros(fp4_q_scale_shape(rows, HEADS, HEAD_DIM), **u8)
-    weights_out = torch.zeros_like(weights)
+    weights_out = torch.full_like(weights, weights_fill)
     kv_cache = torch.zeros(num_blocks, 1, 4, _BLOCK, 16, **u8)
     kv_scale = torch.zeros(num_blocks, 1, 4, _BLOCK, **u8)
     attention_mla.indexer_qk_rope_quant_and_cache(
@@ -280,6 +280,42 @@ def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
         kv_cache_scale=kv_scale,
     )
     return q_fp4, q_scale, weights_out, kv_cache, kv_scale
+
+
+@pytest.mark.parametrize("next_n", [5, 6])
+def test_fp4_writer_covers_valid_rows_and_skips_padding(on_gfx950, monkeypatch, next_n):
+    from atom.model_ops import attention_mla
+
+    batch, short = 2, 2
+    rows = batch * next_n
+    ends = torch.tensor(
+        list(range(1, next_n + 1))
+        + [max(0, short - next_n + row + 1) for row in range(next_n)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    valid = ends > 0
+    slots = torch.full((rows,), -1, dtype=torch.int64, device="cuda")
+    slots[:next_n] = torch.arange(next_n, device="cuda")
+    slots[next_n:][valid[next_n:]] = 8 * _BLOCK + torch.arange(short, device="cuda")
+    positions = (ends - 1).clamp_min(0).long()
+
+    def write(fill):
+        torch.manual_seed(7)
+        return _fused_fp4(slots, positions, 16, weight_gain=0.1, weights_fill=fill)
+
+    zero, poison = write(0.0), write(float("nan"))
+    assert torch.equal(zero[2][valid], poison[2][valid])
+    assert torch.isnan(poison[2][~valid]).all()
+    assert torch.equal(zero[0][valid], poison[0][valid])
+    assert torch.equal(zero[1][valid], poison[1][valid])
+    assert torch.equal(zero[3], poison[3]) and torch.equal(zero[4], poison[4])
+
+    # DCP computes every scheduled row instead of skipping slot<0 rows.
+    monkeypatch.setattr(attention_mla, "get_dcp_world_size", lambda: 2)
+    dcp_zero, dcp_poison = write(0.0), write(float("nan"))
+    assert torch.equal(dcp_zero[2], dcp_poison[2])
+    assert not torch.isnan(dcp_poison[2]).any()
 
 
 def _written_cache_and_queries(batch, next_n, ctx_len, seed):

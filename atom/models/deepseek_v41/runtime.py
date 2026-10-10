@@ -54,10 +54,15 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_end_forward(hidden: torch.Tensor) -> None:
-    """Closes what `v41_begin_forward` opened, so it breaks for the same reason."""
+    """Closes what `v41_begin_forward` opened."""
     metadata = get_forward_context().attn_metadata
     if not metadata.step.requests:
         hidden.zero_()
+        return
+    if getattr(metadata, "staged_outside_forward", False):
+        # Staged and joined by the metadata builder, before this forward. Its
+        # fork was opened and closed out there; waiting on it from in here
+        # would be a captured stream waiting on uncaptured work.
         return
     rows = metadata.engram_embeddings
     if getattr(rows, "stage", None) is not None:

@@ -219,7 +219,7 @@ def _install_increment_version_pcp_shim() -> None:
     only surfaces under PCP + torch.compile.
 
     Under Prefill Context Parallel the sparse indexer must run through a
-    Dynamo-opaque custom op (``indexer_with_output``) so its runtime
+    Dynamo-opaque custom op (``sparse_attn_indexer_pcp``) so its runtime
     ``_pcp_active()`` branch is not baked to the warmup value. Inserting that op
     reshapes the pre-attention piecewise submodule, and torch's *inference*
     runtime wrapper (``keep_input_mutations=True``, hard-coded in
@@ -1596,7 +1596,7 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     topk_indices = torch.empty(
         hidden_states.shape[0],
         topk_tokens,
@@ -1611,7 +1611,7 @@ def sparse_attn_indexer(
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
         context.scheduled_bs * attn_metadata.max_seqlen_q
@@ -1661,12 +1661,13 @@ def sparse_attn_indexer(
             device=q_bf16.device,
             dtype=torch.uint8,
         )
-        # Zeroed, not empty: this call leaves `compute_all_q_rope` default, so
-        # the op skips `slot < 0` rows outright, while the decode scorer reads
-        # the full `batch_size * next_n`. A sequence short of the speculation
-        # width would otherwise weight its pad rows with whatever the allocator
-        # held. Zero is also the right weight for a row whose logits go unread.
-        weights_mqa = torch.zeros_like(weights)
+        # AITER requires contiguous [rows, heads] output. Non-DCP skips
+        # slot<0 rows, whose scorer bounds are empty; DCP computes every row.
+        weights_mqa = torch.empty(
+            weights.shape,
+            dtype=weights.dtype,
+            device=weights.device,
+        )
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_quant,
@@ -1688,13 +1689,6 @@ def sparse_attn_indexer(
             q_scale_out=q_fp4_scale,
             kv_cache_scale=indexer_module.k_cache.kv_cache_scale,
         )
-        # Only this op's fp32 *return* is synthesised. The kernel's `weights_out`
-        # must stay `q.dtype` under FP4 (`aiter/ops/cache.py`), so `weights_mqa`
-        # cannot simply be allocated fp32; converting it instead would put a copy
-        # kernel in all 21 captured layers. Zeroed rather than empty: what makes
-        # it unread is a refusal three files away in `Indexer.__init__`, while
-        # `sparse_attn_indexer_fake` promises torch.compile a real tensor.
-        weights = torch.zeros(weights.shape, device=weights.device, dtype=torch.float32)
     elif use_qk_rope_cache_fusion:
         q_bf16 = q_input
         q_quant = torch.empty_like(q_bf16, dtype=dtypes.fp8)
@@ -1739,7 +1733,7 @@ def sparse_attn_indexer(
         # so prefill runs dense (attention_mla.use_prefill_mla gates on the same
         # threshold).
         if attn_metadata.max_seqlen_k <= topk_tokens:
-            return weights
+            return
         prefill_metadata = attn_metadata
         num_prefills = context.scheduled_bs
         # Size the gathered-KV buffer off the KEY length, not the hidden/query
@@ -1956,7 +1950,7 @@ def sparse_attn_indexer(
                 ),
                 weights_scale=weights_scale,
             )
-            return weights
+            return
         # Non-DCP: this rank holds the whole plane, so its top-k is already the
         # global one.
         logits = torch.empty(
@@ -2029,59 +2023,18 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
             )
-    return weights
-
-
-def sparse_attn_indexer_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q_input: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
-    dcp_sparse_kv_indptr_buffer: torch.Tensor,
-    dcp_owned_counts_buffer: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    k_norm_bias: torch.Tensor,
-    k_norm_eps: float,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    weights_scale: float,
-    is_neox_style: bool,
-    use_qk_rope_cache_fusion: bool,
-    stable_topk: bool,
-) -> torch.Tensor:
-    # profile run
-    # NOTE(Chen): create the max possible flattened_kv. So that
-    # profile_run can get correct memory usage.
-    _flattened_kv = torch.empty(
-        [total_seq_lens, head_dim + 4], device=k.device, dtype=torch.uint8
-    )
-    _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
-    _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    # The DCP compact path rewrites the per-layer offsets/counts alongside the
-    # indices, so both must be declared or inductor may reorder the MLA read
-    # ahead of this write (same hazard as sparse_kv_indices_buffer).
     mutates_args=[
+        "kv_cache",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
     ],
-    fake_impl=sparse_attn_indexer_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )
 
 
@@ -2217,29 +2170,14 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().process_weights_after_loading()
 
 
-def _indexer_with_output_fake(
+def sparse_attn_indexer_pcp(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
     qr_scale: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
     sparse_kv_indices_buffer: torch.Tensor,
-) -> torch.Tensor:
-    # Identity-passthrough contract: the op returns a fresh tensor shaped like
-    # `qr` (see `indexer_with_output`). The caller consumes it as the query into
-    # `mla_attn`, which keeps the op alive and ordered even independent of the
-    # declared buffer mutation.
-    return torch.empty_like(qr)
-
-
-def indexer_with_output(
-    hidden_states: torch.Tensor,
-    qr: torch.Tensor,
-    qr_scale: torch.Tensor | None,
-    positions: torch.Tensor,
-    layer_name: str,
-    sparse_kv_indices_buffer: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Dynamo-opaque wrapper around ``Indexer.forward_impl``.
 
     Registered as a REGULAR custom op (like ``sparse_attn_indexer``), NOT a
@@ -2261,9 +2199,9 @@ def indexer_with_output(
     top-k result into ``sparse_kv_indices_buffer`` (via the nested eager
     ``sparse_attn_indexer`` op) and ``mla_attn`` reads that same buffer to know
     which KV to attend to. In the non-PCP path ``sparse_attn_indexer`` runs
-    *directly* in the traced graph and declares ``mutates_args=
-    ["sparse_kv_indices_buffer"]``, so inductor keeps the write ordered before
-    the MLA read. Nesting it inside this opaque op HIDES that write; with
+    *directly* in the traced graph and declares the sparse buffer mutated, so
+    inductor keeps the write ordered before the MLA read. Nesting it inside this
+    opaque op HIDES that write; with
     ``mutates_args=[]`` inductor thinks the buffer is unchanged and the MLA reads
     a stale / mis-ordered copy — visible as token-stutter corruption ("errerr",
     doubled fragments) even on PCP-noop prompts. So the buffer is threaded
@@ -2272,8 +2210,6 @@ def indexer_with_output(
     latent AOT-autograd ``increment_version`` bug on graphs with SymInt args,
     which ``_install_increment_version_pcp_shim`` neutralizes.)
 
-    The identity ``qr`` return, fed by the caller as the ``mla_attn`` query, is
-    kept as belt-and-suspenders ordering + DCE protection.
     """
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
@@ -2282,17 +2218,13 @@ def indexer_with_output(
     # sparse_attn_indexer). `self.sparse_kv_indices_buffer` is the same tensor
     # object passed in, so the declared mutation matches the real one.
     self.forward_impl(hidden_states, qr, qr_scale, positions)
-    # Fresh tensor equal to qr; consumed by the caller as the mla_attn query.
-    # Clone (not a bare return of qr) so the runtime output matches the fake's
-    # fresh-tensor contract and never aliases an input.
-    return qr.clone()
 
 
 direct_register_custom_op(
-    op_name="indexer_with_output",
-    op_func=indexer_with_output,
+    op_name="sparse_attn_indexer_pcp",
+    op_func=sparse_attn_indexer_pcp,
     mutates_args=["sparse_kv_indices_buffer"],
-    fake_impl=_indexer_with_output_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )
 
 
@@ -2402,7 +2334,7 @@ class Indexer(nn.Module):
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
         atom_config.compilation_config.static_forward_context[prefix] = self
 
-        # Rope module used by `forward_impl` (and the `indexer_with_output`
+        # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
         # splitting op, which can't take a module arg). Bound by the owning
         # DeepseekV2MLAAttention right after construction; mirrors V4's
         # `self.indexer.rotary_emb = self.rotary_emb`.
@@ -2417,20 +2349,16 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor:
+    ) -> None:
         # Under PCP, route the whole indexer through the Dynamo-opaque
-        # `indexer_with_output` splitting op so the runtime `_pcp_active()` branch
+        # `sparse_attn_indexer_pcp` op so the runtime `_pcp_active()` branch
         # (round-robin k all-gather + separate q/k rope) evaluates live instead of
         # being baked to its warmup value by torch.compile. `pcp_is_enabled()` is
         # a run-level constant (pcp world size is fixed for the process), so this
         # guard is compile-safe and a no-op — a direct `forward_impl` call, graph
         # unchanged — for non-PCP and plugin (SGLang / vLLM / RTP) backends.
         if pcp_is_enabled():
-            # Returns `qr` (identity); the caller feeds it to mla_attn so the
-            # opaque op stays live and ordered. The top-k result travels the
-            # side-buffer (declared mutated, so its write is ordered before the
-            # sparse-MLA read), not this return value.
-            return torch.ops.aiter.indexer_with_output(
+            torch.ops.aiter.sparse_attn_indexer_pcp(
                 hidden_states,
                 qr,
                 qr_scale,
@@ -2438,7 +2366,8 @@ class Indexer(nn.Module):
                 self.prefix,
                 self.sparse_kv_indices_buffer,
             )
-        return self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
+            return
+        self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
 
     def forward_impl(
         self,
@@ -2447,8 +2376,8 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor:
-        # The opaque `indexer_with_output` op can't pass a module, so it relies on
+    ) -> None:
+        # The opaque PCP op can't pass a module, so it relies on
         # the bound `self.rotary_emb`; direct callers (non-PCP / plugins) may still
         # pass their own rope explicitly, which takes precedence.
         if rotary_emb is None:
@@ -2515,7 +2444,7 @@ class Indexer(nn.Module):
         else:
             q_input = q
 
-        return self.sparse_attn_indexer_impl(
+        self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -2784,7 +2713,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     f"{prefix}.indexer",
                 )
                 # Bind the indexer's rope so forward_impl (and the opaque
-                # indexer_with_output splitting op) can rope without receiving a
+                # sparse_attn_indexer_pcp op) can rope without receiving a
                 # module argument. Mirrors deepseek_v4.Attention.__init__.
                 self.indexer.rotary_emb = self.indexer_rope_emb
         else:
@@ -2950,23 +2879,13 @@ class DeepseekV2MLAAttention(nn.Module):
             # The indexer's wk/weights_proj GEMMs run in BF16. When input_layernorm
             # fused the quant it emits a bf16 mirror (indexer_hidden); otherwise
             # hidden_states is already the bf16 normed activation.
-            idx_ret = self.indexer(
+            self.indexer(
                 indexer_hidden if indexer_hidden is not None else hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
                 positions,
                 self.indexer_rope_emb,
             )
-            if pcp_is_enabled():
-                # Under PCP the indexer runs through the opaque `indexer_with_output`
-                # split op, which returns `hidden_states_or_q_c` unchanged
-                # (identity). Feeding it forward as the mla_attn query is what keeps
-                # the op live under torch.compile — its real result (top-k) is a
-                # hidden write to the sparse buffer that mla_attn reads via `self` —
-                # and orders the write before that read. `pcp_is_enabled()` is a
-                # run-level constant, so baking this branch at trace time is correct
-                # (non-PCP / plugins keep discarding the return, graph unchanged).
-                hidden_states_or_q_c = idx_ret
 
         return self.mla_attn(
             hidden_states_or_q_c,

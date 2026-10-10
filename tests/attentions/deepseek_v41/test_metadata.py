@@ -16,7 +16,10 @@ pytest.importorskip("aiter", reason="the V4.1 backend and cache reach AITER")
 
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-from atom.model_ops.attentions.deepseek_v41.metadata import visible_buffer_name
+from atom.model_ops.attentions.deepseek_v41.metadata import (
+    StepPlan,
+    visible_buffer_name,
+)
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
@@ -326,7 +329,7 @@ def test_a_step_planner_reads_the_staged_rows_and_publishes_with_them():
         owners = staged["batch_id_per_q_token"].np[:rows]
         seen.append((visible.tolist(), owners.tolist()))
         staged["plan"].np[:] = (rows, visible.sum(), owners.max())
-        return {"plan": 3}
+        return StepPlan({"plan": 3})
 
     requests = (
         PagedRequest(17, 1, 0, 3, 3, (5, 1)),
