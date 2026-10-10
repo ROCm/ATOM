@@ -21,9 +21,13 @@ def _indptr_scan(
     RATIO: tl.constexpr,
     TOPK: tl.constexpr,
     EXTEND: tl.constexpr,
+    SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """One program: a running offset over the forward's whole token axis.
+
+    `SPLIT` (a BF16 decode, see `fill_step_indptrs`) keeps the window out of
+    the prefix: `pptr` counts the selection alone and `eptr` the window.
 
     V4's `_v4_decode_indptr_kernel`, for CSA2's classes: a prefix sum has to
     see every earlier token, so this is one serial scan rather than a grid, and
@@ -41,7 +45,7 @@ def _indptr_scan(
     refuses a config without.
     """
     tl.store(pptr, 0)
-    if EXTEND:
+    if EXTEND or SPLIT:
         tl.store(eptr, 0)
     prefix_total = 0
     extend_total = 0
@@ -60,14 +64,18 @@ def _indptr_scan(
             if DECODE
             else tl.load(positions + start, mask=live, other=0).to(tl.int32)
         )
-        count = tl.maximum(history_end - first, 0)
+        history = tl.where(live, tl.maximum(history_end - first, 0), 0)
+        count = tl.zeros_like(history) if SPLIT else history
         if TOPK:
             count += tl.minimum((pos + 1) // RATIO, TOPK)
         count = tl.where(live, count, 0)
         tl.store(pptr + idx + 1, prefix_total + tl.cumsum(count, axis=0), mask=in_range)
         prefix_total += tl.sum(count)
-        if EXTEND:
-            reach = tl.where(live, tl.minimum(idx - start + 1, WINDOW), 0)
+        if EXTEND or SPLIT:
+            if EXTEND:
+                reach = tl.where(live, tl.minimum(idx - start + 1, WINDOW), 0)
+            else:
+                reach = history
             tl.store(
                 eptr + idx + 1, extend_total + tl.cumsum(reach, axis=0), mask=in_range
             )
@@ -86,6 +94,7 @@ def _indptr_scan_all(
     WINDOW: tl.constexpr,
     RATIOS: tl.constexpr,
     TOPKS: tl.constexpr,
+    SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # Ratios have independent scans, but share one launch. Each program owns
@@ -104,6 +113,7 @@ def _indptr_scan_all(
                 RATIOS[i] or 1,
                 TOPKS[i],
                 not DECODE,
+                SPLIT,
                 BLOCK,
             )
 
@@ -137,7 +147,10 @@ def _indices(
     RUN_ROWS: tl.constexpr,
     PACKED: tl.constexpr,
     MAIN_ROW_BYTES: tl.constexpr,
+    HISTORY: tl.constexpr,
 ):
+    # `HISTORY`: the window rows at the tail of each prefix slice. A split
+    # decode has them in `_window_rows`'s list instead.
     t = tl.program_id(0)
     # One program row per layer of the group. Everything a layer's indices
     # depend on is shared across the run except its ring, which sits exactly
@@ -174,23 +187,69 @@ def _indices(
         else:
             row = pages * PAGE_ROWS + global_offset + ids % ROWS_PER_PAGE
         tl.store(prefix + pbegin + rank, row, valid)
-    slot = tl.load(slots + batch)
+    if HISTORY:
+        slot = tl.load(slots + batch)
+        row = window_row(
+            slot.to(tl.int64) if PACKED else slot,
+            first + i,
+            ring_start,
+            RING_SLOTS,
+            SLOT_ROWS,
+            RING_STRIDE,
+            RUN_ROWS,
+        )
+        if PACKED:
+            row = (row << 1) | 1
+        tl.store(prefix + pend - window_count + i, row, i < window_count)
+    if not DECODE:
+        count = tl.minimum(t - start + 1, WINDOW)
+        begin = tl.load(eptr + t)
+        tl.store(extend + begin + i, t - count + 1 + i, i < count)
+
+
+@triton.jit
+def _window_rows(
+    rows,
+    eptr,
+    positions,
+    batches,
+    slots,
+    BLOCK: tl.constexpr,
+    RING_SLOTS: tl.constexpr,
+    WINDOW: tl.constexpr,
+    SLOT_ROWS: tl.constexpr,
+    RING_STRIDE: tl.constexpr,
+    RUN_ROWS: tl.constexpr,
+):
+    """A decode row's window, relative to a layer's ring start: the same rows
+    for every layer, each reading them through its own ring's view."""
+    t = tl.program_id(0)
+    batch = tl.load(batches + t)
+    if batch < 0:
+        return
+    pos = tl.load(positions + t)
+    first = tl.maximum(0, pos - WINDOW + 1)
+    i = tl.arange(0, BLOCK)
     row = window_row(
-        slot.to(tl.int64) if PACKED else slot,
+        tl.load(slots + batch),
         first + i,
-        ring_start,
+        0,
         RING_SLOTS,
         SLOT_ROWS,
         RING_STRIDE,
         RUN_ROWS,
     )
-    if PACKED:
-        row = (row << 1) | 1
-    tl.store(prefix + pend - window_count + i, row, i < window_count)
-    if not DECODE:
-        count = tl.minimum(t - start + 1, WINDOW)
-        begin = tl.load(eptr + t)
-        tl.store(extend + begin + i, t - count + 1 + i, i < count)
+    tl.store(rows + tl.load(eptr + t) + i, row, i < pos + 1 - first)
+
+
+def splits_window(step, geometry):
+    """Whether this forward's attention reads its window as a second source.
+
+    A BF16 decode: every row's window is already in the ring, which is a view
+    the sparse kernel can take as its second source. A prefill's second is the
+    forward's own KV, and the packed pool's decode reads one tagged list.
+    """
+    return step.decode and not geometry.packed
 
 
 def fill_step_indptrs(step, geometry, buffers):
@@ -200,13 +259,17 @@ def fill_step_indptrs(step, geometry, buffers):
     load-bearing: a table a layer fills on a miss is one a capture's recorded
     pass skips, and a table at a fresh address each forward is one its replay
     reads at the capture's.
+
+    A split decode (`splits_window`) counts the selection alone in the prefix
+    and the window in the extend indptr, the same for every ratio.
     """
     ratios = geometry.layer_ratios
+    split = splits_window(step, geometry)
     built = {}
     for ratio in ratios:
         prefix, extend = buffers[ratio]
         pptr = prefix[: step.width + 1]
-        eptr = pptr if step.decode else extend[: step.width + 1]
+        eptr = pptr if step.decode and not split else extend[: step.width + 1]
         built[ratio] = (pptr, eptr, geometry.batch_topk(ratio))
     if ratios:
         _indptr_scan_all[(len(ratios),)](
@@ -220,9 +283,35 @@ def fill_step_indptrs(step, geometry, buffers):
             WINDOW=geometry.window_size,
             RATIOS=ratios,
             TOPKS=tuple(built[ratio][2] for ratio in ratios),
+            SPLIT=split,
             BLOCK=min(1024, triton.next_power_of_2(max(step.width, 1))),
         )
     return built
+
+
+def build_window_rows(step, geometry, window, eptr):
+    """A split decode's window rows (`_window_rows`), one list for every layer.
+
+    `window`: any layer's -- the rings differ only in their start, which these
+    rows leave to the reader's view.
+    """
+    rows = torch.empty(
+        step.width * geometry.window_size,
+        dtype=torch.int32,
+        device=step.positions.device,
+    )
+    if step.width:
+        _window_rows[(step.width,)](
+            rows,
+            eptr,
+            step.positions,
+            step.batch_ids,
+            step.slots,
+            BLOCK=triton.next_power_of_2(geometry.window_size),
+            WINDOW=geometry.window_size,
+            **window_constexprs(window),
+        )
+    return rows
 
 
 def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stride=0):
@@ -230,9 +319,14 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
 
     Only a decode groups: its `extend` is empty, so the run needs no second
     plane, and it is the pass whose cost is the launch rather than the work.
+    A split decode (`splits_window`) writes the selection alone, which every
+    layer of a group shares, so it builds one plane for the group.
     """
     if layers > 1 and not step.decode:
         raise ValueError("Only a decode batches its index build across layers")
+    history = not splits_window(step, geometry)
+    if layers > 1 and not history:
+        raise ValueError("A split decode's selection is one plane for the group")
     topk = 0 if selected is None else selected.shape[-1]
     pptr, eptr, reserved = step.indptrs[ratio]
     if topk != reserved:
@@ -240,7 +334,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
         # any scorer ran. Another width leaves every row a hole its reader
         # dereferences.
         raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
-    plane = step.width * (topk + geometry.window_size)
+    plane = step.width * (topk + geometry.window_size * history)
     prefix = torch.empty(
         layers * plane,
         dtype=torch.int64 if geometry.packed else torch.int32,
@@ -251,7 +345,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
         dtype=torch.int32,
         device=step.positions.device,
     )
-    if step.width:
+    if step.width and plane:
         _indices[(step.width, layers)](
             selected if topk else prefix,
             pptr,
@@ -277,6 +371,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
             TOPK=topk,
             BLOCK=triton.next_power_of_2(max(topk, geometry.window_size)),
             WINDOW=geometry.window_size,
+            HISTORY=history,
             **window_constexprs(window),
         )
     return prefix.view(layers, plane), pptr, extend, eptr

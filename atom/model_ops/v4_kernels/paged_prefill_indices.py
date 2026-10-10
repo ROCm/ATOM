@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """V4 paged-prefill index scatter — single Triton kernel writes the four
-per-fwd index buffers consumed by `sparse_attn_v4_paged_prefill`:
+per-fwd index buffers consumed by `sparse_attn_v4_paged_2src`:
 
   - ``kv_indices_extend``       : per-fwd `kv` tensor row indices for the
                                   in-chunk SWA tail (one shared buffer).

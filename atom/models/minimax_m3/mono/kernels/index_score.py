@@ -46,6 +46,7 @@ from atom.mono.device.ops import (
     fp8x8_bf16_pk,
     kernel_symbol,
     lane_gather,
+    launcher,
     mfma_bf16,
     permlane_swap,
     readlane,
@@ -447,7 +448,7 @@ def build_index_score_kernel(
             block_table, seq_lens, bt_width, heads=k_heads, q_frag_head=q_frag_head,
         )  # fmt: skip
 
-    @flyc.jit
+    @launcher(kernel_name)
     def launch_index_score(
         iq: Int64,
         index_cache: Int64,

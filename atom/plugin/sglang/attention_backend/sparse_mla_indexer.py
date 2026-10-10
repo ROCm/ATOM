@@ -1288,13 +1288,13 @@ def sparse_attn_indexer_sglang_plugin_mode(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     from atom.plugin.sglang.models.base_model_wrapper import get_current_forward_batch
 
     del kv_cache, total_seq_lens
     forward_batch = get_current_forward_batch()
     if forward_batch is None or forward_batch.forward_mode.is_idle():
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
 
     token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
     if token_to_kv_pool is None or not hasattr(
@@ -1401,7 +1401,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
             logits.stride(1),
             stable=stable_topk,
         )
-        return weights
+        return
 
     if indexer_graph_buffers is None:
         cu_starts, cu_ends = _build_sglang_query_ranges(forward_batch)
@@ -1453,64 +1453,11 @@ def sparse_attn_indexer_sglang_plugin_mode(
     topk_indices.copy_(
         torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
     )
-    return weights
-
-
-def sparse_attn_indexer_sglang_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q_input: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    k_norm_bias: torch.Tensor,
-    k_norm_eps: float,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    weights_scale: float,
-    is_neox_style: bool,
-    use_qk_rope_cache_fusion: bool,
-    stable_topk: bool,
-) -> torch.Tensor:
-    del (
-        hidden_states,
-        k_cache_prefix,
-        kv_cache,
-        q_input,
-        k,
-        quant_block_size,
-        scale_fmt,
-        topk_tokens,
-        head_dim,
-        max_model_len,
-        total_seq_lens,
-        topk_indices_buffer,
-        k_norm_weight,
-        k_norm_bias,
-        k_norm_eps,
-        positions,
-        cos_cache,
-        sin_cache,
-        weights_scale,
-        is_neox_style,
-        use_qk_rope_cache_fusion,
-        stable_topk,
-    )
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer_sglang_plugin_mode",
     op_func=sparse_attn_indexer_sglang_plugin_mode,
     mutates_args=["topk_indices_buffer"],
-    fake_impl=sparse_attn_indexer_sglang_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )

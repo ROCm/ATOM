@@ -11,6 +11,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
+from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import (
     quantize_query_fp4,
@@ -26,10 +27,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.utils import atom_parameter
-from atom.model_ops.v4_kernels import (
-    sparse_attn_v4_paged_decode,
-    sparse_attn_v4_paged_prefill,
-)
+from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils.forward_context import side_stream
 
 from .config import AttentionMode
@@ -145,6 +143,8 @@ class Indexer(nn.Module):
         `project` the query alone (the kernel applies `weight_scale`)."""
         spec = self.spec
         ragged = self._ragged(cache, step)
+        # a ragged layer's logits pack where the step laid its rows out
+        packed = score_layout(step, spec.ratio) if ragged is not None else None
         self._publish(
             *score_topk_quantized(
                 query,
@@ -161,6 +161,7 @@ class Indexer(nn.Module):
                 workspace=cache.workspace,
                 weight_scale=weight_scale,
                 ragged=ragged,
+                packed=packed,
                 **self._bounds(cache, step),
             ),
             step,
@@ -452,20 +453,15 @@ class Attention(nn.Module):
         # the main stream instead and there is nothing left to join here.
         if selecting is not None:
             selecting.wait_stream(self.index_stream)
-        prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
+        prefix, prefix_indptr, second, second_indptr = cache.attention_indices(
             self.spec, step
         )
         flat_query = query.flatten(0, 1)
         flat_out = attn_out.flatten(0, 1)
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
-            decode = packed_decode if cache.packed else sparse_attn_v4_paged_decode
-            # No `out=` on this kernel, and it is shared with V4, so the rows
-            # land in its own buffer and are copied to the caller's. The copy
-            # is what makes the address stable; the kernel's own allocation is
-            # free to move because this region runs eagerly.
-            flat_out.copy_(
-                decode(
+            if cache.packed:
+                output = packed_decode(
                     flat_query,
                     cache.pool,
                     prefix,
@@ -473,27 +469,42 @@ class Attention(nn.Module):
                     self.attn_sink,
                     self.softmax_scale,
                 )
-            )
+            else:
+                # The window, this step's rows included, is read through the
+                # ring: the second source, beside the selection in the pool.
+                output = sparse_attn_v4_paged_2src(
+                    flat_query,
+                    cache.pool,
+                    prefix,
+                    prefix_indptr,
+                    cache.ring_view(self.spec.layer_id),
+                    second,
+                    second_indptr,
+                    self.attn_sink,
+                    self.softmax_scale,
+                    out=flat_query,
+                )
         else:
-            prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_prefill
-            # `out=` is a request, not a guarantee: `packed_prefill` carries
-            # the same pointer check internally, which is the evidence that
-            # the underlying kernel may answer in a buffer of its own. Ignoring
-            # the return would leave `attn_out` holding whatever was there
-            # before, with nothing raised.
-            produced = prefill(
+            prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
+            output = prefill(
                 flat_query,
                 cache.pool,
                 prefix,
                 prefix_indptr,
                 kv.flatten(0, 1),
-                extend,
-                extend_indptr,
+                second,
+                second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
                 out=flat_out,
             )
-            if produced.data_ptr() != flat_out.data_ptr():
-                flat_out.copy_(produced)
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
+        # Outside the branch, because both reach it. `out=` is a request, not a
+        # guarantee: these kernels are shared with V4 and may answer in a
+        # buffer of their own, and the decode pair is not even offered one.
+        # Ignoring the return would leave `attn_out` holding whatever was there
+        # before, with nothing raised -- and this region has to write through
+        # the caller's buffer, which is what lets it be an eager break.
+        if output.data_ptr() != flat_out.data_ptr():
+            flat_out.copy_(output)

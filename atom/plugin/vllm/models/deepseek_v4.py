@@ -241,7 +241,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
       ``forward_impl`` — reconciled in the ``_sparse_attention`` override below,
       which is the one of the three that reads the real-sized metadata. (This is
       the path exercised by the launch config; without that clip the padded
-      ``q`` reaches ``sparse_attn_v4_paged_prefill`` while ``kv_indptr_prefix``
+      ``q`` reaches ``sparse_attn_v4_paged_2src`` while ``kv_indptr_prefix``
       is real-sized.)
 
     In both, slice every per-token input down to the real token count before the

@@ -38,7 +38,7 @@ from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.v4_kernels import scale_indexer_weights
 
 from .candidate_table import lift_candidate_selection
-from .indexer import pick_candidate_blocks
+from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
 from .score_workspace import plane_rows
 
 
@@ -120,9 +120,10 @@ def score_topk_paged(
     layer they bound) limits this layer to an earlier layer's blocks and
     `candidate_count` makes this layer that earlier one; never both.
 
-    Rows run in bands of `plane_rows(width)`, a bound rather than a knob: a
-    width that fits the whole batch in one band gets one. The band is taken
-    from `workspace` (`ScoreWorkspace`) when given, else allocated.
+    Rows run in bands of `plane_rows(width)`, or of what `workspace`
+    (`ScoreWorkspace`) holds when given, a bound rather than a knob: a width
+    that fits the whole batch in one band gets one. The band is taken from
+    `workspace` when given, else allocated.
     """
     rows, heads = weights.shape
     q_fp8, q_scale = quantize_query_rows(query)
@@ -160,6 +161,7 @@ def score_topk_quantized(
     workspace=None,
     weight_scale=1.0,
     ragged=None,
+    packed=None,
 ):
     """`score_topk_paged` past its query quantization, in `units`' format.
     FP8: `query` [rows, heads, dim] e4m3 and `scaled` [rows, heads] fp32, the
@@ -172,7 +174,25 @@ def score_topk_quantized(
     off the sequence's block table, sharing each key load, and `tiles` is then
     unused. Without it each row is its own sequence on its own `tiles` (or
     candidate) row; a candidate-bounded layer's rows always are.
+
+    `packed` (`PackedRows`, with `ragged`) scores into `workspace`'s packed
+    logits rather than a plane, the step's rows laid out band by band.
     """
+    if packed is not None:
+        assert ragged is not None and workspace is not None and workspace.packed
+        assert candidates is None, "candidate rows keep their own tables"
+        return _score_topk_packed(
+            query,
+            scaled,
+            units,
+            ragged,
+            packed,
+            workspace,
+            topk=topk,
+            block_size=block_size,
+            candidate_count=candidate_count,
+            weight_scale=weight_scale,
+        )
     rows = scaled.shape[0]
     tile = units.values.shape[1]
     # Producing candidates reads scores at their real columns, so a layer that
@@ -193,8 +213,7 @@ def score_topk_quantized(
     elif ragged is not None:
         # Every block of each request, PAGE by PAGE, and the row's own
         # visibility into it.
-        table, bound = ragged.block_tables, visible
-        width = table.shape[1] * ragged.pages_per_block * tile
+        table, bound, width = ragged.block_tables, visible, _ragged_width(ragged, tile)
     else:
         # Every block the request owns, and the row's own visibility into it.
         table, bound, width = tiles, visible, tiles.shape[1] * tile
@@ -205,7 +224,7 @@ def score_topk_quantized(
         if candidate_count
         else None
     )
-    band = plane_rows(width)
+    band = plane_rows(width) if workspace is None else workspace.band_rows(width)
     # One band's plane, reused; a short last band is a prefix of it.
     logits = (
         torch.empty(min(rows, band), width, dtype=torch.float32, device=device)
@@ -265,12 +284,97 @@ def score_topk_quantized(
     return selected, chosen
 
 
+def _ragged_width(ragged, tile):
+    """Columns of the plane `ragged`'s block tables span, `tile` rows a PAGE."""
+    return ragged.block_tables.shape[1] * ragged.pages_per_block * tile
+
+
+def _score_topk_packed(
+    query,
+    scaled,
+    units,
+    ragged,
+    packed,
+    workspace,
+    *,
+    topk,
+    block_size,
+    candidate_count,
+    weight_scale,
+):
+    """`score_topk_quantized` for a whole-context FP4 layer, its logits
+    packed: each band's rows scored, picked from and top-k'd in place. The
+    top-k is told the plane width the rows stand for, so it runs what that
+    plane would and picks what it would."""
+    plane_width = _ragged_width(ragged, units.values.shape[1])
+    rows, device = scaled.shape[0], scaled.device
+    selected = torch.empty(rows, topk, dtype=torch.int32, device=device)
+    chosen = (
+        torch.empty(rows, candidate_count, dtype=torch.int32, device=device)
+        if candidate_count
+        else None
+    )
+    logits, maxima = workspace.packed_logits(), workspace.packed_maxima()
+    for first, end in packed.bands:
+        span, count = slice(first, end), end - first
+        seen, offsets = packed.visible[span], packed.offsets[span]
+        _band_logits(
+            query,
+            scaled,
+            units,
+            span,
+            logits,
+            seen,
+            None,
+            plane_width,
+            weight_scale,
+            ragged.band(first, count, rows),
+            out_offsets=offsets,
+        )
+        if candidate_count:
+            pick_candidate_blocks_packed(
+                logits,
+                offsets,
+                maxima,
+                packed.block_offsets[span],
+                seen,
+                block_size,
+                chosen[span],
+                plane_width,
+            )
+        top_k_per_row_decode(
+            logits,
+            1,
+            seen,
+            selected[span],
+            count,
+            0,
+            1,
+            k=topk,
+            stable=True,
+            row_starts=offsets,
+            plane_width=plane_width,
+        )
+    return selected, chosen
+
+
 def _band_logits(
-    query, scaled, units, span, scores, seen, table, width, weight_scale, ragged
+    query,
+    scaled,
+    units,
+    span,
+    scores,
+    seen,
+    table,
+    width,
+    weight_scale,
+    ragged,
+    out_offsets=None,
 ):
     """Rows `span`'s logits into `scores`, each row seeing `seen` columns: FP8
     of the pages its `table` row lists, FP4 by `ragged`'s sequences, a
-    sequence's rows sharing each key load."""
+    sequence's rows sharing each key load. FP4 `out_offsets`: `scores` is flat,
+    row r at its offset."""
     page_rows = units.values.shape[1]
     if units.fp4:
         values, scales = query
@@ -284,6 +388,7 @@ def _band_logits(
             weight_scale=weight_scale,
             kv_block_size=page_rows,
             out=scores,
+            out_offsets=out_offsets,
             **ragged.kernel_args(
                 seen, heads=scaled.shape[1], page_size=page_rows, max_seq_len=width
             ),
