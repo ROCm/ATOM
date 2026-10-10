@@ -209,6 +209,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 rope,
             )
         self.replay = False
+        # Turned off at runtime by a caller that reads every row of the
+        # model's output or of a late layer's (TorchSpec hidden-state export).
+        self.replay_enabled = True
         self.late_aux_layers, self.aux_buffers = (), None
         if getattr(config, "enable_decoder_swa_bounded_replay", False):
             reason = decoder_replay_unsupported(config.hf_config)
@@ -243,6 +246,13 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     def end_forward(self, hidden, engram_embeddings):
         v41_end_forward(hidden)
 
+    def set_decoder_replay(self, enabled: bool) -> bool:
+        """Allow or forbid replaying prefills; returns whether replay is now
+        active. Forbidding it keeps the two graphs but runs the late one on
+        every row, so every row of every layer is computed."""
+        self.replay_enabled = enabled
+        return self.replay and enabled
+
     def set_aux_hidden_state_rows(self, layer_ids, buffers):
         """DSpark's aux capture buffers, one per id in ``layer_ids`` -- the
         tensors its hooks write. A replay's late layers capture the tail's rows
@@ -260,7 +270,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             return self.backbone(input_ids, positions, inputs_embeds)
         state = self.early(input_ids, inputs_embeds)
         forward = get_forward_context()
-        ring = replay_rows(forward, input_ids.numel(), inputs_embeds is not None)
+        ring = replay_rows(forward, state[0].shape[0]) if self.replay_enabled else None
         if ring is None:
             return self.late(*state)
         tail = build_late_layer_tail(forward.attn_metadata.step, ring, self.late_specs)

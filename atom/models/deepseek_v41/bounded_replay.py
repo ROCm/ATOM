@@ -68,17 +68,20 @@ def decoder_replay_unsupported(hf_config) -> str | None:
     return None
 
 
-def replay_rows(forward, num_tokens: int, has_inputs_embeds: bool) -> int | None:
+def replay_rows(forward, num_tokens: int) -> int | None:
     """The tail length when this forward replays, else None.
 
-    Only a prefill of text rows with a request longer than the ring replays.
-    Decode, warmup, draft, TBO microbatches, image rows and padded steps take
-    every row through the late layers.
+    A prefill with a request longer than the ring replays, image rows and
+    input embeddings included (the late layers' only image-aware op, the MoE
+    router, reads the tail's slice of the mask; see `late_layer_tail`).
+    Decode, warmup, draft and TBO microbatches take every row through the late
+    layers, and so does a padded step: prefill pads only under DP attention,
+    where the MoE collectives are sized by every rank's token count, which a
+    rank-local tail would change.
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
-        has_inputs_embeds
-        or context is None
+        context is None
         or not context.is_prefill
         or context.is_dummy_run
         or context.is_draft
@@ -89,7 +92,6 @@ def replay_rows(forward, num_tokens: int, has_inputs_embeds: bool) -> int | None
     if (
         step is None
         or step.decode
-        or getattr(metadata, "image_mask", None) is not None
         or num_tokens != step.width
         or step.width != step.scheduled
     ):
@@ -190,7 +192,7 @@ def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs) -> LateLay
 
 @contextlib.contextmanager
 def late_layer_tail(metadata, tail: LateLayerTail):
-    """The late layers' step is the tail's while they run.
+    """The late layers' step, and image mask, are the tail's while they run.
 
     Filling the tail's indptrs rewrites the cache's shared indptr buffers, and
     the late REINDEX layers rewrite its tile workspace. When the forward's step
@@ -205,11 +207,16 @@ def late_layer_tail(metadata, tail: LateLayerTail):
     tail.step.indptrs = fill_step_indptrs(
         tail.step, cache.geometry, cache.indptr_buffers
     )
-    full = metadata.step
+    full, image_mask = metadata.step, getattr(metadata, "image_mask", None)
     metadata.step = tail.step
+    if image_mask is not None:
+        # [1, tokens]: the late layers' MoE router routes image rows by it
+        metadata.image_mask = image_mask.index_select(1, tail.token_indices)
     try:
         yield
     finally:
         metadata.step = full
+        if image_mask is not None:
+            metadata.image_mask = image_mask
         full.indptrs = {}
         full.tiles.clear()

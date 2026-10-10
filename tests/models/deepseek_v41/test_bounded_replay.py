@@ -269,18 +269,45 @@ def _forward(lengths, **overrides):
         ([500], {"ctx.is_draft": True}, None),
         ([500], {"fwd.ubatch_slices": [object()]}, None),
         ([500], {"step.decode": True}, None),
-        ([500], {"md.image_mask": torch.ones(1)}, None),
-        ([500], {"step.width": 512}, None),  # padded step
+        # image rows replay: the router reads the tail's slice of the mask
+        ([500], {"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, 133),
+        ([500], {"step.width": 512}, None),  # padded (DP attention) step
     ],
 )
-def test_only_an_unpadded_text_prefill_replays(lengths, overrides, expected):
+def test_only_an_unpadded_prefill_replays(lengths, overrides, expected):
     forward = _forward(lengths, **overrides)
-    assert replay_rows(forward, forward.attn_metadata.step.width, False) == expected
+    assert replay_rows(forward, forward.attn_metadata.step.width) == expected
 
 
-def test_inputs_embeds_do_not_replay():
-    forward = _forward([500])
-    assert replay_rows(forward, 500, True) is None
+def test_the_late_layers_see_the_tails_image_mask():
+    """The late layers' MoE router reads the forward's image mask; during the
+    tail it must be the tail's rows, and the forward's afterwards."""
+    pytest.importorskip("triton")
+    from atom.models.deepseek_v41.bounded_replay import LateLayerTail, late_layer_tail
+
+    step = _step([300, 20], [0, 0])
+    rows = torch.tensor([167 + i for i in range(133)] + list(range(300, 320)))
+    mask = (torch.arange(320) % 3 == 0)[None]
+    tail_step = SimpleNamespace(indptrs={}, tiles={})
+    metadata = SimpleNamespace(
+        step=step,
+        image_mask=mask,
+        cache=SimpleNamespace(geometry=None, indptr_buffers=None),
+    )
+    from atom.model_ops.attentions.deepseek_v41 import indices
+
+    seen = {}
+    original = indices.fill_step_indptrs
+    indices.fill_step_indptrs = lambda *a: {}
+    try:
+        with late_layer_tail(metadata, LateLayerTail(rows, tail_step)):
+            seen["mask"] = metadata.image_mask.clone()
+            seen["step"] = metadata.step
+    finally:
+        indices.fill_step_indptrs = original
+    torch.testing.assert_close(seen["mask"], mask[:, rows])
+    assert seen["step"] is tail_step
+    assert metadata.image_mask is mask and metadata.step is step
 
 
 def test_late_rows_land_back_at_their_forward_rows(monkeypatch):
@@ -355,3 +382,36 @@ def _swap_step_only(metadata, tail):
             metadata.step = full
 
     return swap()
+
+
+def test_hidden_state_export_turns_replay_off(monkeypatch):
+    """With replay forbidden (TorchSpec export reads every row), a replayable
+    prefill runs the late layers on every row."""
+    pytest.importorskip("aiter")
+    from atom.models.deepseek_v41 import runtime
+
+    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
+    torch.nn.Module.__init__(model)
+    model.replay, model.replay_enabled, model.late_specs = True, True, ()
+    rows_seen = []
+    model.early = lambda input_ids, embeds: (
+        torch.zeros(input_ids.numel(), 4, 2),
+        torch.zeros(input_ids.numel(), 4),
+        torch.zeros(input_ids.numel(), 2),
+        torch.zeros(input_ids.numel(), 4),
+        torch.zeros(input_ids.numel(), 4, 4),
+    )
+    model.late = lambda *state: rows_seen.append(state[0].shape[0]) or state[0]
+    forward = _forward([500])
+    monkeypatch.setattr(runtime, "get_forward_context", lambda: forward)
+    monkeypatch.setattr(
+        runtime,
+        "build_late_layer_tail",
+        lambda *a: SimpleNamespace(token_indices=torch.arange(367, 500)),
+    )
+    monkeypatch.setattr(model, "_late_on_tail", lambda *a: rows_seen.append("tail"))
+    model(torch.zeros(500, dtype=torch.int64), None)
+    assert rows_seen == ["tail"]
+    assert model.set_decoder_replay(False) is False
+    model(torch.zeros(500, dtype=torch.int64), None)
+    assert rows_seen == ["tail", 500]
