@@ -99,19 +99,19 @@ on:
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c12,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c14,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c32,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c40,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c88,
+            kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c64,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128,
-            kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72
+            kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
 
           Kimi-K3 (profile suite, torch trace in minutes 5-6):
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile
