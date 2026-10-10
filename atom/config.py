@@ -351,7 +351,8 @@ class QuantizationConfig:
             self.quant_method = self.hf_quant_config.get("quant_method", "")
 
         # Online quantization: re-quantize float / FP8 / MXFP4 / MXFP8 / Quark
-        # models at load time.
+        # models at load time. For IQ2R only the non-IQ2R layers qualify;
+        # should_skip_online_quant keeps the IQ2R experts as they are.
         self.online_quant = False
         self.online_quant_config_raw = online_quant_config
         self.online_global_spec: LayerQuantConfig = LayerQuantConfig()
@@ -365,6 +366,7 @@ class QuantizationConfig:
             "quark",
             "modelopt",
             "compressed-tensors",
+            "iq2r",
         ]:
             self.online_quant = True
             if self.quant_method == "compressed-tensors":
@@ -2703,6 +2705,11 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # The sparse-attention indexer bakes max_model_len and max_num_seqs into
+        # the graph as constants, so a cache built for a smaller max_model_len
+        # faults on the first decode past the old width.
+        factors.append(self.max_model_len)
+        factors.append(self.max_num_seqs)
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
