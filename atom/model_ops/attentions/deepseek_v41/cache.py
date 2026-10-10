@@ -303,8 +303,26 @@ class PagedAttentionCache:
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
+        step.swa_replay_start = self._replay_start_zeros(
+            len(requests) if running_bs is None else running_bs
+        )
         step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
         return step
+
+    def _replay_start_zeros(self, running_bs):
+        """Every request's window from position 0: what a step that is not a
+        bounded-replay tail reads as `swa_replay_start`, indexed by batch id up
+        to `running_bs - 1`. One fixed buffer, sized for every slot up front,
+        so the index kernels a capture records keep reading it on replay."""
+        rows = max(running_bs, self.num_slots, 1)
+        zeros = getattr(self, "_replay_zeros", None)
+        if zeros is None or zeros.numel() < rows:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("The replay-start buffer cannot grow under capture")
+            zeros = self._replay_zeros = torch.zeros(
+                rows, dtype=torch.int32, device=self.indptr_device
+            )
+        return zeros
 
     def _private_plans(self, requests, tentative):
         """Plans into freshly allocated buffers, for a caller without any.

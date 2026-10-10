@@ -123,6 +123,34 @@ class SinglePassHCState:
             self.pre_mix,
         )
 
+    def fields(self):
+        """The five tensors, in constructor order."""
+        return (
+            self.residual,
+            self.pre_mix,
+            self.pending,
+            self.post_mix,
+            self.combination,
+        )
+
+    def take_rows(self, rows: torch.Tensor):
+        """This state at ``rows`` of its token axis (the one before ``hc``),
+        an owed post included -- bounded replay's late layers on a tail."""
+
+        def take(t):
+            if t is None:
+                return None
+            dim = self.residual.dim() - 3
+            return t.index_select(dim, rows)
+
+        return SinglePassHCState(
+            take(self.residual),
+            take(self.pre_mix),
+            take(self.pending),
+            take(self.post_mix),
+            take(self.combination),
+        )
+
     def collapse(self):
         """BF16 streams weighted by the FP32 pre-mix, settling an owed post.
 

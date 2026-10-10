@@ -473,6 +473,26 @@ def set_model_tag(tag: str):
 
 
 VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+# Cache dirs `VllmBackend` derived from the config and the first graph's
+# traced code, as opposed to one the user set (`_graph_tag`).
+_DERIVED_CACHE_DIRS: set[str] = set()
+
+
+def _hash_traced_files(files) -> str:
+    """md5 over the paths and contents of the files Dynamo traced; the code
+    factor of a graph's compile-cache key."""
+    import hashlib
+
+    content = []
+    for filepath in files:
+        content.append(filepath)
+        if filepath == "<string>" or filepath == "<frozen os>":
+            # This means the function was dynamically generated, with
+            # e.g. exec() or frozen os module. We can't actually check these.
+            continue
+        with open(filepath) as f:
+            content.append(f.read())
+    return hashlib.md5("\n".join(content).encode(), usedforsecurity=False).hexdigest()
 
 
 class VllmBackend:
@@ -550,6 +570,26 @@ class VllmBackend:
     #             self.post_grad_pass_manager.add(inductor_config[PASS_KEY])
     #     inductor_config[PASS_KEY] = self.post_grad_pass_manager
 
+    def _graph_tag(self) -> str:
+        """This graph's cache subdirectory when another graph of the model
+        derived the cache dir first.
+
+        The derived dir hashes only the files the FIRST graph traced, after
+        which `traced_files` is cleared. A later graph of the same model (the
+        DSpark drafter, V4.1's late layers under bounded replay) would
+        otherwise load a stale artifact after an edit to a file only it
+        traces, so its own traced files key its subdirectory. A cache dir the
+        user configured keeps the plain tag.
+        """
+        if self.compilation_config.cache_dir not in _DERIVED_CACHE_DIRS:
+            return self.prefix
+        files = sorted(self.compilation_config.traced_files)
+        self.compilation_config.traced_files.clear()
+        if not files:
+            return self.prefix
+        code = _hash_traced_files(files)[:10]
+        return f"{self.prefix}-{code}"
+
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
 
         vllm_config = self.vllm_config
@@ -578,27 +618,15 @@ class VllmBackend:
                 "Traced files (to be considered for compilation cache):\n%s",
                 "\n".join(forward_code_files),
             )
-            hash_content = []
-            for filepath in forward_code_files:
-                hash_content.append(filepath)
-                if filepath == "<string>" or filepath == "<frozen os>":
-                    # This means the function was dynamically generated, with
-                    # e.g. exec() or frozen os module. We can't actually check these.
-                    continue
-                with open(filepath) as f:
-                    hash_content.append(f.read())
-            import hashlib
-
-            code_hash = hashlib.md5(
-                "\n".join(hash_content).encode(), usedforsecurity=False
-            ).hexdigest()
-            factors.append(code_hash)
+            factors.append(_hash_traced_files(forward_code_files))
 
             # 3. compiler hash
             compiler_hash = self.compiler_manager.compute_hash(vllm_config)
             factors.append(compiler_hash)
 
             # combine all factors to generate the cache dir
+            import hashlib
+
             hash_key = hashlib.md5(
                 str(factors).encode(), usedforsecurity=False
             ).hexdigest()[:10]
@@ -611,6 +639,10 @@ class VllmBackend:
                 # "e6292aa343",
             )
             self.compilation_config.cache_dir = cache_dir
+            _DERIVED_CACHE_DIRS.add(cache_dir)
+            graph_tag = self.prefix
+        else:
+            graph_tag = self._graph_tag()
 
         cache_dir = self.compilation_config.cache_dir
         os.makedirs(cache_dir, exist_ok=True)
@@ -618,7 +650,7 @@ class VllmBackend:
         # rank = vllm_config.parallel_config.rank
         rank = torch.cuda.current_device()
         # dp_rank = vllm_config.parallel_config.data_parallel_rank
-        local_cache_dir = os.path.join(cache_dir, f"rank_{rank}", self.prefix)
+        local_cache_dir = os.path.join(cache_dir, f"rank_{rank}", graph_tag)
         os.makedirs(local_cache_dir, exist_ok=True)
         self.compilation_config.local_cache_dir = local_cache_dir
 
@@ -632,7 +664,7 @@ class VllmBackend:
             )
 
         self.compiler_manager.initialize_cache(
-            local_cache_dir, disable_cache, self.prefix
+            local_cache_dir, disable_cache, graph_tag
         )
 
         # when dynamo calls the backend, it means the bytecode
