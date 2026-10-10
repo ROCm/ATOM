@@ -1079,6 +1079,22 @@ def _v41_scheduled_batch(snapshot, slot_allocator, slots=None):
     """
     if slots is None:
         slots, _reset = slot_allocator.assign(snapshot.req_ids, snapshot.num_computed)
+        # Once per allocator, and a warning rather than info: an integer key
+        # here means `snapshot_v41_batch` fell back to the request's first
+        # block id, which is a working slot key and a broken one for anything
+        # outside the forward. The offload leg names requests the way vLLM
+        # does, so a fallback key makes its every lookup miss -- a tier that
+        # registers, is queried, answers correctly and stores nothing.
+        if not getattr(slot_allocator, "_atom_key_kind_logged", False):
+            slot_allocator._atom_key_kind_logged = True
+            first = snapshot.req_ids[0] if len(snapshot.req_ids) else None
+            logger.warning(
+                "V4.1 STATE slot keys are %s (e.g. %r). Anything that names a "
+                "request from outside the forward -- the KV-transfer leg -- "
+                "can only match these when they are vLLM's own request ids.",
+                type(first).__name__ if first is not None else "unknown",
+                first,
+            )
     return SimpleNamespace(
         is_dummy_run=False,
         req_ids=snapshot.req_ids,

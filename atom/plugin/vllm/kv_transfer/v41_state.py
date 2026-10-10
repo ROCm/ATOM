@@ -271,11 +271,12 @@ class V41StateWorkerLeg:
                         "allocator holds %d key(s), e.g. %r. If the keys look "
                         "like the same request spelled differently, the two "
                         "halves are naming it differently and no boundary will "
-                        "ever be stored.",
+                        "ever be stored. allocator=%#x",
                         store.req_id,
                         type(store.req_id).__name__,
                         len(getattr(self._slots, "_key_to_slot", {})),
                         known,
+                        id(self._slots),
                     )
                 refuse("worker_no_slot", store.op_id)
                 continue
