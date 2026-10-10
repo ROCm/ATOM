@@ -181,6 +181,22 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
 
 
+_uncaptured_decode_shape_warned = False
+
+
+def _warn_uncaptured_decode_shape(running_bs: int, max_seqlen_q: int) -> None:
+    global _uncaptured_decode_shape_warned
+    if _uncaptured_decode_shape_warned:
+        return
+    _uncaptured_decode_shape_warned = True
+    _logger.warning(
+        "No CUDA graph recorded at (bs=%d, q=%d): decode steps at an uncaptured "
+        "shape run eagerly. Expected only on a P/D producer that keeps a drafter.",
+        running_bs,
+        max_seqlen_q,
+    )
+
+
 @dataclass(frozen=True)
 class ForwardMode:
     """One step's shape, settled once, in the only two units ATOM has.
@@ -324,21 +340,24 @@ class ForwardMode:
         # was per-rank on two of them and every consumer had to know which.
         #
         # The ladder answers the batch question alone, but a recording is keyed
-        # by `(running_bs, max_seqlen_q)`. A runner can own an MTP drafter while
-        # running a target-only q=1 forward -- notably a P/D prefill producer,
-        # which hands off after T0 and never proposes -- and capture may hold
-        # only the q=mtp_k+1 shapes. Being on the ladder would then claim a
-        # recording nobody made at this width.
-        shape_captured = (
-            graph_shapes is None or (running_bs, max_seqlen_q) in graph_shapes
-        )
-        use_cudagraph = (
+        # by `(running_bs, max_seqlen_q)`. Only a P/D producer passes
+        # `graph_shapes`: it keeps its drafter, so capture holds the q=mtp_k+1
+        # shapes, while the scheduler never speculates for it and every decode
+        # it runs is q=1. That holds on every rank, its DP dummy included, and
+        # `running_bs` is the group's, so the lookup is DP-agreed: the group
+        # replays or runs eagerly as one.
+        replayable = (
             not is_prefill
             and unified
             and not (enforce_eager or step_needs_eager)
             and on_ladder
-            and shape_captured
         )
+        shape_captured = (
+            graph_shapes is None or (running_bs, max_seqlen_q) in graph_shapes
+        )
+        if replayable and not shape_captured:
+            _warn_uncaptured_decode_shape(running_bs, max_seqlen_q)
+        use_cudagraph = replayable and shape_captured
 
         running_tokens, piecewise_captured = cls._running_tokens(
             is_prefill=is_prefill,

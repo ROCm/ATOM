@@ -208,13 +208,16 @@ class tokenIDProcessor:
         self.is_pipeline_parallel = (
             getattr(runner.config, "pipeline_parallel_size", 1) > 1
         )
+        # The scheduler never speculates for a P/D producer, though the runner
+        # keeps its drafter loaded: every decode it runs is q=1.
+        self.is_pd_producer = _kv_config_has_producer(kv_cfg)
         # P/D hands off prompt-end state plus the first sampled token. Deferred
         # output makes the producer decode once more to surface that token, so
         # the consumer applies T0 to a state that already has it. Only a
         # recurrent state notices -- a paged write lands at T0's own position,
         # so repeating it is idempotent.
         hands_off_recurrent_state = (
-            _kv_config_has_producer(kv_cfg) and runner.attn_family.has_recurrent_state
+            self.is_pd_producer and runner.attn_family.has_recurrent_state
         )
         self.is_deferred_out = (
             not self.is_pipeline_parallel and not hands_off_recurrent_state
@@ -545,22 +548,17 @@ class tokenIDProcessor:
             # turned speculation off for it.
             if self.use_spec and self.is_pipeline_parallel:
                 raise NotImplementedError("pipeline parallel + speculative decode")
+            # PP verifies nothing locally and a P/D producer never speculates
+            # (its DP dummy included), so no row here carries drafts. One that
+            # did would need the deferred branch's per-request staging: under
+            # DP a block drafter's `max_seqlen_q` is the group's maximum, not
+            # this batch's row width.
+            assert batch.num_spec_step == 0, (
+                "non-deferred decode got a speculative batch "
+                f"(num_spec_step={batch.num_spec_step})"
+            )
 
             self.input_ids.np[:total_tokens_decode] = token_ids
-            # RAGGED needs no overwrite: scheduled_tokens is already the flat
-            # [anchor, drafts...]. The uniform case does, and `scheduled_tokens`
-            # is flat here too -- reshape to one row per request the way the
-            # deferred path below does, rather than indexing it as if it were
-            # already rectangular. The row width is `max_seqlen_q`: main no
-            # longer carries `num_spec_query_tokens` on the batch.
-            if (
-                self.use_spec
-                and batch.num_spec_step > 0
-                and getattr(batch, "dynamic_spec_query_tokens_per_req", None) is None
-            ):
-                self.input_ids.np[:total_tokens_decode].reshape(-1, max_seqlen_q)[
-                    :, 1:
-                ] = batch.scheduled_spec_decode_tokens
             return self._publish_input_ids(total_tokens_decode, publication_group)
 
         # PD consumer first decode: no prior prefill step initialized
@@ -1270,8 +1268,15 @@ class ModelRunner:
         overwrites. What -1 must NOT do is look like a request --
         `get_token_locations`.
         """
-        has_drafter = hasattr(self, "drafter")
-        mtp_k = self.drafter.mtp_k if has_drafter else 0
+        # The scheduler's spec width, not the drafter's. On a P/D producer the
+        # real decodes are q=1, and under DP an idle rank's dummy is unified
+        # with them: a q=mtp_k+1 dummy would hand the uniform decode
+        # collectives a different `running_tokens` than its peers'.
+        mtp_k = (
+            self.drafter.mtp_k
+            if hasattr(self, "drafter") and not self.tokenID_processor.is_pd_producer
+            else 0
+        )
         mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
@@ -2643,15 +2648,7 @@ class ModelRunner:
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
-            graph_shapes=(
-                None
-                if (
-                    self.enforce_eager
-                    or self._piecewise_cg_active()
-                    or not hasattr(self, "graphs")
-                )
-                else self.graphs.keys()
-            ),
+            graph_shapes=self._producer_graph_shapes(),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3505,6 +3502,25 @@ class ModelRunner:
             and self.config.parallel_config.data_parallel_size > 1
             and not self.tokenID_processor.is_pipeline_parallel
         )
+
+    def _producer_graph_shapes(self):
+        """The recorded `(bs, q)` keys, for the one runner allowed to miss them.
+
+        A P/D producer keeps its drafter, so capture records q=mtp_k+1, but
+        every decode it runs is q=1 -- on every rank, its DP dummy included --
+        so the lookup comes out the same on each and the group goes eager
+        together. Anywhere else a missing key is a capture gap, and it stays a
+        `KeyError` at replay.
+        """
+        if (
+            not self.tokenID_processor.is_pd_producer
+            or not hasattr(self, "drafter")
+            or self.enforce_eager
+            or self._piecewise_cg_active()
+            or not hasattr(self, "graphs")
+        ):
+            return None
+        return self.graphs.keys()
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
