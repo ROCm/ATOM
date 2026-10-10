@@ -774,6 +774,64 @@ models:
               max_num_seqs: 144
           env: *kimi_k3_agentic_lmcache192_env
 
+        # DSpark in the throughput band. InferenceX drops the draft from C48 up,
+        # but that is one aggregated node, where a faster decode only adds
+        # prefill to the same GPUs; here decode has a node of its own. Three
+        # drafts at InferenceX's golden AL for that length (3.00), with
+        # ReplaySSM on as in the mid band: without it the KDA state pool grows
+        # with the verify window. Everything else matches the no-draft cell at
+        # the same concurrency.
+        - &kimi_k3_agentic_hc_dspark3
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c48
+          display_topology: 1P1D-TP8-DCP8-DSPARK3
+          concurrency: [48]
+          server:
+            common_args: &kimi_k3_agentic_hc_dspark3_args
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 96
+              method: dspark
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 3.00
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+            prefill: *kimi_k3_agentic_lmcache128_env
+
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 112
+          env: &kimi_k3_agentic_hc_dspark3_lmcache192_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_hc_dspark3_lmcache192_env
+
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 176
+          env: *kimi_k3_agentic_hc_dspark3_lmcache192_env
+
         # Non-disaggregated counterpart to the C72 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
