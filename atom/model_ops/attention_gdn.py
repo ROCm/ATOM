@@ -466,8 +466,14 @@ class GatedDeltaNet(nn.Module):
                     has_initial_state=has_initial_state,
                 )
             else:
-                initial_state = ssm_state[non_spec_state_indices_in_tensor].contiguous()
-                initial_state[~has_initial_state, ...] = 0
+                # Slots and mask come per step from the metadata builder, so
+                # this is one gather and one masked fill per layer.
+                initial_state = ssm_state.index_select(
+                    0, gdn_metadata.non_spec_state_indices_in_i64
+                )
+                initial_state.masked_fill_(
+                    gdn_metadata.no_initial_state.view(-1, 1, 1, 1), 0
+                )
                 # With no spec tokens the non-spec rows are rows [0, T) of the
                 # op's output, so let the kernel write there instead of into a
                 # fresh `o` that step 3 would copy over (a 64 MiB memcpy per
@@ -494,8 +500,10 @@ class GatedDeltaNet(nn.Module):
                     keep_intermediate_states=ckpt is not None,
                 )
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
+            ssm_state.index_copy_(
+                0,
+                gdn_metadata.non_spec_state_indices_i64,
+                last_recurrent_state.to(ssm_state.dtype),
             )
             # SSM state cache: copy out every checkpoint this step reached.
             #
