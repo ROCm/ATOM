@@ -587,10 +587,16 @@ def expand_pools_and_append_tail(
 # The tail buffer: the in-progress pool's raw K and gate, per request
 # --------------------------------------------------------------------------
 #
-# Layout, per indexer layer: [num_slots, 2, POOL, HEAD_DIM] bf16, where index 0
+# Layout, per indexer layer: [num_slots, 2, RING, HEAD_DIM] bf16, where index 0
 # on the second axis is K and 1 is the gate score. A token at absolute position
-# `p` occupies row `p % POOL`. It rides the same per-request state slots KDA's
+# `p` occupies row `p % RING`. It rides the same per-request state slots KDA's
 # recurrent state uses, so it inherits their lifetime, forking and relocation.
+
+
+def _tail_ring_size(tail: torch.Tensor, pool_size: int) -> int:
+    ring = tail.shape[2]
+    assert tail.is_contiguous() and ring >= pool_size, (tail.shape, pool_size)
+    return ring
 
 
 @triton.jit
@@ -604,6 +610,7 @@ def _kpool_seed_tail_kernel(
     tail_ptr,
     HEAD_DIM: tl.constexpr,
     POOL: tl.constexpr,
+    RING: tl.constexpr,
 ):
     """Persist each prefill request's trailing incomplete pool.
 
@@ -629,8 +636,9 @@ def _kpool_seed_tail_kernel(
     if src_slot < 0 or dst_slot < 0:
         return
     offs = tl.arange(0, HEAD_DIM)
-    src_base = src_slot * (2 * POOL * HEAD_DIM) + j * HEAD_DIM
-    dst_base = dst_slot * (2 * POOL * HEAD_DIM) + j * HEAD_DIM
+    row = (seq_len - tail_count + j) % RING
+    src_base = src_slot * (2 * RING * HEAD_DIM) + row * HEAD_DIM
+    dst_base = dst_slot * (2 * RING * HEAD_DIM) + row * HEAD_DIM
     from_chunk = i >= q_start
     kval = tl.load(k_ptr + i * HEAD_DIM + offs, mask=from_chunk, other=0.0)
     gval = tl.load(gate_ptr + i * HEAD_DIM + offs, mask=from_chunk, other=0.0)
@@ -638,11 +646,11 @@ def _kpool_seed_tail_kernel(
     gval = tl.where(
         from_chunk,
         gval,
-        tl.load(tail_ptr + src_base + POOL * HEAD_DIM + offs),
+        tl.load(tail_ptr + src_base + RING * HEAD_DIM + offs),
     )
     tl.store(tail_ptr + dst_base + offs, kval)
     tl.store(
-        tail_ptr + dst_base + POOL * HEAD_DIM + offs,
+        tail_ptr + dst_base + RING * HEAD_DIM + offs,
         gval,
     )
 
@@ -672,6 +680,7 @@ def kpool_seed_tail(
         tail,
         HEAD_DIM=k.shape[-1],
         POOL=pool_size,
+        RING=_tail_ring_size(tail, pool_size),
     )
 
 
@@ -687,6 +696,7 @@ def _kpool_decode_stash_and_pool_kernel(
     out_ptr,
     HEAD_DIM: tl.constexpr,
     POOL: tl.constexpr,
+    RING: tl.constexpr,
 ):
     """Stash one decode token into the tail, then pool the (possibly complete)
     pool.
@@ -706,8 +716,9 @@ def _kpool_decode_stash_and_pool_kernel(
     pos = tl.load(positions_ptr + r).to(tl.int32)
     phase = pos % POOL
     offs = tl.arange(0, HEAD_DIM)
-    src_base = src_slot * (2 * POOL * HEAD_DIM)
-    dst_base = dst_slot * (2 * POOL * HEAD_DIM)
+    src_base = src_slot * (2 * RING * HEAD_DIM)
+    dst_base = dst_slot * (2 * RING * HEAD_DIM)
+    pool_start = pos - phase
     cur_k = tl.load(k_ptr + r * HEAD_DIM + offs)
     cur_g = tl.load(gate_ptr + r * HEAD_DIM + offs)
 
@@ -716,29 +727,31 @@ def _kpool_decode_stash_and_pool_kernel(
     # into a newly allocated slot.
     m = tl.full((HEAD_DIM,), float("-inf"), tl.float32)
     for s in tl.static_range(POOL):
+        row = ((pool_start + s) % RING) * HEAD_DIM
         g = tl.where(
             s == phase,
             cur_g,
-            tl.load(tail_ptr + src_base + POOL * HEAD_DIM + s * HEAD_DIM + offs),
+            tl.load(tail_ptr + src_base + RING * HEAD_DIM + row + offs),
         )
-        tl.store(tail_ptr + dst_base + POOL * HEAD_DIM + s * HEAD_DIM + offs, g)
+        tl.store(tail_ptr + dst_base + RING * HEAD_DIM + row + offs, g)
         g = g.to(tl.float32)
         a = tl.load(ape_ptr + s * HEAD_DIM + offs).to(tl.float32)
         m = tl.maximum(m, g + a)
     acc = tl.zeros((HEAD_DIM,), tl.float32)
     den = tl.zeros((HEAD_DIM,), tl.float32)
     for s in tl.static_range(POOL):
+        row = ((pool_start + s) % RING) * HEAD_DIM
         g = tl.where(
             s == phase,
             cur_g,
-            tl.load(tail_ptr + src_base + POOL * HEAD_DIM + s * HEAD_DIM + offs),
+            tl.load(tail_ptr + src_base + RING * HEAD_DIM + row + offs),
         ).to(tl.float32)
         kv = tl.where(
             s == phase,
             cur_k,
-            tl.load(tail_ptr + src_base + s * HEAD_DIM + offs),
+            tl.load(tail_ptr + src_base + row + offs),
         )
-        tl.store(tail_ptr + dst_base + s * HEAD_DIM + offs, kv)
+        tl.store(tail_ptr + dst_base + row + offs, kv)
         a = tl.load(ape_ptr + s * HEAD_DIM + offs).to(tl.float32)
         w = tl.exp(g + a - m)
         acc += w * kv.to(tl.float32)
@@ -786,5 +799,6 @@ def kpool_decode_stash_and_pool(
         out,
         HEAD_DIM=head_dim,
         POOL=pool_size,
+        RING=_tail_ring_size(tail, pool_size),
     )
     return out

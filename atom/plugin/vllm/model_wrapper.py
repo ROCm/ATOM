@@ -53,6 +53,7 @@ _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
     "DeepseekV32MTPModel",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
@@ -61,6 +62,7 @@ _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
     "Glm4MoeMTPModel",
+    "Glm5NextMTPModel",
 }
 _EAGLE3_DRAFT_ARCH_TO_ATOM_ARCH: dict[str, str] = {
     # vLLM/HF draft arch name: ATOM server-mode draft class
@@ -157,6 +159,10 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "DeepseekV32ForCausalLM": "atom.models.deepseek_v2:DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGeneration"
+    ),
+    "Glm5NextMTPModel": "atom.plugin.vllm.models.glm5_next:Glm5NextMTP",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepseekV32MTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",

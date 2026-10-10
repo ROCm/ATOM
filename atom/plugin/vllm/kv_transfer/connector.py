@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
     SupportsHMA,
 )
+from vllm.v1.request import RequestStatus
 
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
@@ -69,6 +70,12 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 logger = logging.getLogger("atom")
+
+_FINISHED_BY_SAMPLING = frozenset(
+    getattr(RequestStatus, name)
+    for name in ("FINISHED_STOPPED", "FINISHED_LENGTH_CAPPED", "FINISHED_REPETITION")
+    if hasattr(RequestStatus, name)
+)
 
 # How often the stale-save reconcile actually runs. `build_connector_meta` is
 # called every step, but the window it enforces is minutes long, so matching the
@@ -1179,7 +1186,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self._kda_planner is not None and self._kda_planner.has_pending_work():
             return True
-        return bool(self._deferred_frees or self._releases_in_flight)
+        if self._deferred_frees or self._releases_in_flight:
+            return True
+        pending = getattr(self._scheduler, "has_pending_work", None)
+        return bool(pending is not None and pending())
 
     # Steps a promised load may go undispatched before it is called out. Loads
     # are emitted on the step after the promise, so anything past a handful of
@@ -1425,6 +1435,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self._kda_planner.forget_request(str(req_id))
         seq = self._seqs.get(req_id)
         if seq is not None:
+            self._advance_frontier_on_sampled_finish(request, seq)
             self._scheduler.request_finished(seq)
             # Blocks may still be pinned by an in-flight save; ATOM says when.
             if self._scheduler.should_defer_free(seq):
@@ -1456,6 +1467,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 return True, None
             self._seqs.drop(req_id)
         return False, None
+
+    def _advance_frontier_on_sampled_finish(self, request, seq) -> None:
+        if getattr(request, "status", None) not in _FINISHED_BY_SAMPLING:
+            return
+        covered = len(seq.block_table) * int(self._scheduler.virtual_block_size)
+        final = min(int(seq.num_prompt_tokens), covered)
+        if final > int(seq.num_cached_tokens):
+            seq.set_num_cached_tokens(final)
 
 
 def _req_id_of(completion_id) -> str:

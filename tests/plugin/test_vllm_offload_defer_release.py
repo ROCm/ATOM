@@ -14,6 +14,7 @@ every metric otherwise healthy.
 
 from __future__ import annotations
 
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,8 @@ dense_mod = pytest.importorskip(
     "atom.kv_transfer.offload.dense.connector",
     reason="the dense scheduler pulls the offload stack",
 )
+
+from vllm.v1.request import RequestStatus
 
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload import config as offcfg
@@ -59,6 +62,8 @@ def _adapter(monkeypatch):
     adapter._scheduler = dense_mod.DenseOffloadScheduler(config)
     adapter._config = config
     adapter._seqs = SeqViewRegistry()
+    adapter._requests = {}
+    adapter._kda_planner = None
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
@@ -295,3 +300,74 @@ def test_the_store_completion_does_not_double_complete_the_save(monkeypatch):
 
     assert second.save_operation != first.save_operation
     assert scheduler._save_inflight == {"r0": second.save_operation}
+
+
+class _Pool:
+    def __init__(self, n: int = 8) -> None:
+        self.blocks = [SimpleNamespace(block_id=i) for i in range(n)]
+        self.held = Counter()
+
+    def touch(self, blocks) -> None:
+        self.held.update(b.block_id for b in blocks)
+
+    def free_blocks(self, blocks) -> None:
+        self.held.subtract(b.block_id for b in blocks)
+
+
+def _finish_after_first_chunk(adapter, status):
+    request, seq = _admit(adapter)
+    (first,) = _emit_save(adapter, seq, 128)
+    _report(adapter, first.save_operation)
+    request.status = status
+    return request, seq
+
+
+def test_a_request_finishing_on_its_last_chunk_still_saves_it(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    request, _seq = _finish_after_first_chunk(
+        adapter, RequestStatus.FINISHED_LENGTH_CAPPED
+    )
+
+    deferred, _ = adapter.request_finished(request, [])
+
+    assert deferred is True, "the last chunk is still to be saved"
+    (final,) = list(scheduler.build_connector_meta().requests)
+    assert final.save_spec.skip_leading_tokens == 128
+    assert len(final.token_ids) == PROMPT
+
+
+def test_an_abort_keeps_the_frontier_vllm_reported(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    request, _seq = _finish_after_first_chunk(adapter, RequestStatus.FINISHED_ABORTED)
+
+    assert adapter.request_finished(request, []) == (False, None)
+    assert list(scheduler.build_connector_meta().requests) == []
+
+
+def test_the_finish_frontier_stops_at_the_block_table(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    request, seq = _finish_after_first_chunk(adapter, RequestStatus.FINISHED_STOPPED)
+    seq.set_block_table([0, 1, 2])
+
+    adapter.request_finished(request, [])
+
+    (final,) = list(scheduler.build_connector_meta().requests)
+    assert len(final.token_ids) == 3 * BLOCK
+
+
+def test_an_idle_engine_keeps_stepping_until_the_final_save_lands(monkeypatch):
+    adapter, scheduler = _adapter(monkeypatch)
+    adapter._gpu_block_pool = pool = _Pool()
+    request, _seq = _finish_after_first_chunk(
+        adapter, RequestStatus.FINISHED_LENGTH_CAPPED
+    )
+
+    assert adapter.request_finished(request, []) == (False, None)
+    assert +pool.held == Counter({2: 1, 3: 1})
+    assert adapter.has_pending_push_work()
+
+    (final,) = list(scheduler.build_connector_meta().requests)
+    _report(adapter, final.save_operation)
+
+    assert +pool.held == Counter()
+    assert not adapter.has_pending_push_work()

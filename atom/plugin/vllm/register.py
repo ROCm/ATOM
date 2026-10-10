@@ -27,6 +27,10 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "DeepseekV32ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "Glm5NextForConditionalGeneration": (
+        "atom.plugin.vllm.models.glm5_next:Glm5NextForConditionalGenerationVllm"
+    ),
+    "Glm5NextMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     # vLLM 0.29 renamed the MTP draft arch of DSA targets (deepseek_v32,
     # glm_moe_dsa); it is the same draft block as DeepSeekMTPModel.
@@ -151,6 +155,15 @@ def register_platform() -> str | None:
         logger.info("Disable ATOM OOT plugin platforms")
         return None
 
+    try:
+        _apply_platform_patches()
+    except ImportError:
+        logger.debug("ATOM plugin: deferring platform patches", exc_info=True)
+
+    return "atom.plugin.vllm.platform.ATOMPlatform"
+
+
+def _apply_platform_patches() -> None:
     from atom.plugin.vllm.rocm_dcp_full_graph_patch import (
         apply_vllm_rocm_dcp_full_graph_patch,
     )
@@ -181,9 +194,6 @@ def register_platform() -> str | None:
 
     _register_kv_connectors()
 
-    # return the ATOM platform to vllm
-    return "atom.plugin.vllm.platform.ATOMPlatform"
-
 
 def _register_kv_connectors() -> None:
     """Expose ATOM's byte-level LMCache offload to vLLM's connector factory.
@@ -212,6 +222,67 @@ def _register_kv_connectors() -> None:
         name,
     )
     logger.info("Registered ATOM KV connector: %s", name)
+
+
+def _register_glm5_next_arch_config() -> None:
+    from vllm.transformers_utils import model_arch_config_convertor as convertors
+
+    if "glm5_next" in convertors.MODEL_ARCH_CONFIG_CONVERTORS:
+        return
+
+    class Glm5NextModelArchConfigConvertor(convertors.ModelArchConfigConvertorBase):
+        def is_deepseek_mla(self) -> bool:
+            return getattr(self.hf_text_config, "kv_lora_rank", None) is not None
+
+        def get_head_size(self) -> int:
+            from atom.plugin.vllm.glm5_kpool import GLM5_NEXT_MLA_ROPE_PAD
+
+            return self.hf_text_config.kv_lora_rank + GLM5_NEXT_MLA_ROPE_PAD
+
+    class Glm5NextMTPModelArchConfigConvertor(Glm5NextModelArchConfigConvertor):
+        def get_num_hidden_layers(self) -> int:
+            return getattr(self.hf_text_config, "num_nextn_predict_layers", 0)
+
+    convertors.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next"] = (
+        Glm5NextModelArchConfigConvertor
+    )
+    convertors.MODEL_ARCH_CONFIG_CONVERTORS["glm5_next_mtp"] = (
+        Glm5NextMTPModelArchConfigConvertor
+    )
+
+
+_vllm_draft_hf_config_override = None
+
+
+def glm5_next_draft_hf_config_override(hf_config):
+    if getattr(hf_config, "model_type", None) != "glm5_next":
+        if _vllm_draft_hf_config_override is None:
+            _register_glm5_next_mtp_draft_config()
+        return _vllm_draft_hf_config_override(hf_config)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    n_predict = int(getattr(text_config, "num_nextn_predict_layers", 1) or 1)
+    hf_config.model_type = "glm5_next_mtp"
+    hf_config.update({"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]})
+    return hf_config
+
+
+def _register_glm5_next_mtp_draft_config() -> None:
+    import typing
+
+    from vllm.config import speculative
+    from vllm.config.speculative import SpeculativeConfig
+
+    global _vllm_draft_hf_config_override
+    current = SpeculativeConfig.__dict__["hf_config_override"].__func__
+    if current is glm5_next_draft_hf_config_override:
+        return
+    _vllm_draft_hf_config_override = current
+    SpeculativeConfig.hf_config_override = staticmethod(
+        glm5_next_draft_hf_config_override
+    )
+    mtp_types = typing.get_args(speculative.MTPModelTypes)
+    if "glm5_next_mtp" not in mtp_types:
+        speculative.MTPModelTypes = typing.Literal[(*mtp_types, "glm5_next_mtp")]
 
 
 def _patch_vllm_attention_process_weights_after_loading(attention) -> None:
@@ -306,6 +377,7 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    _apply_platform_patches()
     # The general-plugin hook runs in the EngineCore process that owns the
     # scheduler/KVCacheManager; install this here as well as in the platform hook.
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
@@ -318,6 +390,8 @@ def register_model() -> None:
 
     register_gdn_attention_backend()
     _patch_vllm_harmony_parser_manager()
+    _register_glm5_next_arch_config()
+    _register_glm5_next_mtp_draft_config()
 
     import vllm.model_executor.models.registry as vllm_model_registry
 
