@@ -612,6 +612,15 @@ models:
             <<: *glm52_agentic_tp4_mtp5_decode
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+      # A/B only: GSM8K over the P/D landing path. Two passes, so the second
+      # reads its prefixes back from the offload tier.
+      accuracy:
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-lmcache-gsm8k-only
+          concurrency: [32]
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32, 32]
     accuracy:
       task: gsm8k
       fewshot: 20
