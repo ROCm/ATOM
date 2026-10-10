@@ -21,6 +21,7 @@ AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH-}"
 AIPERF_NUM_DATASET_ENTRIES="${AIPERF_NUM_DATASET_ENTRIES:-393}"
 AIPERF_BENCHMARK_DURATION="${AIPERF_BENCHMARK_DURATION:-3600}"
 AIPERF_WARMUP_REQUESTS_PER_LANE="${AIPERF_WARMUP_REQUESTS_PER_LANE:-10}"
+AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-0}"
 AIPERF_TRACE_IDLE_GAP_CAP_SECONDS="${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS:-300}"
 # `--agentic-warmup-grace-period`, NOT `--warmup-grace-period`: aiperf
 # synthesizes the agentic warmup from the profiling phase rather than a
@@ -190,6 +191,11 @@ run_aiperf_agentic() {
   [[ -n "${AIPERF_MAX_CONTEXT_LENGTH}" ]] \
     && ctx_args=(--max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}")
 
+  local -a template_args=()
+  if [[ "${AIPERF_APPLY_CHAT_TEMPLATE}" == "1" || "${AIPERF_APPLY_CHAT_TEMPLATE}" == "true" ]]; then
+    template_args=(--apply-chat-template)
+  fi
+
   mkdir -p "${out_dir}"
   # Weka intentionally skips inputs.json. Isolate the actual HF inputs for a
   # content ledger; a reused AIPerf mmap cache would bypass loading these files.
@@ -222,6 +228,7 @@ run_aiperf_agentic() {
     --no-gpu-telemetry \
     --tokenizer "${MODEL_PATH}" \
     --tokenizer-trust-remote-code \
+    "${template_args[@]}" \
     "${ctx_args[@]}" \
     --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
     --slice-duration "${AIPERF_SLICE_DURATION}" \

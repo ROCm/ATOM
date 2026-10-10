@@ -149,6 +149,11 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{bs} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
+            if envs.OFFLOAD_WARMUP:
+                # Allocation accounting and graph capture must finish first.
+                # The scheduler has not admitted requests, so scratch KV blocks
+                # are still unowned. Do not announce READY until every rank exits.
+                self.runner_mgr.call_func("warmup_kv_offload", wait_out=True)
             good = True
         finally:
             logger.info(

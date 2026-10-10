@@ -124,6 +124,14 @@ class LMCacheOffloadConnector(KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         self._impl.start_load_kv(metadata)
 
+    def warmup(self) -> None:
+        warmup = getattr(self._impl, "warmup", None)
+        if not callable(warmup):
+            raise TypeError(
+                "OFFLOAD_WARMUP supports the dense/Kimi-K3 CPU offload path"
+            )
+        warmup()
+
     def get_finished(self):
         return self._impl.get_finished()
 

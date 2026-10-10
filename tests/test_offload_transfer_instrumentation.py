@@ -130,3 +130,157 @@ def test_transfer_evidence_is_thread_local_and_returned_as_a_snapshot(monkeypatc
     assert results == [0, -1]
     assert connector.last_transfer_stats()["chunks"] == 0
     assert connector.last_transfer_stats()["stats_available"] == 1
+
+
+@pytest.fixture
+def startup_warmup(monkeypatch):
+    """Real transfer pipeline/CPU tensors; fake CUDA streams and storage only."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnector
+    from atom.kv_transfer.offload.hybrid.kimi_k3.connector import KimiK3OffloadConnector
+
+    gpu = _cpu_connector(monkeypatch)
+    gpu.codec.num_blocks = 16
+    cache = torch.arange(48, dtype=torch.uint8).reshape(16, 3)
+    before = cache.clone()
+    tls = threading.local()
+
+    def thread_state():
+        if not hasattr(tls, "harness"):
+            tls.harness = _PipelineHarness()
+        return tls.harness.state
+
+    monkeypatch.setattr(gpu, "_use_cuda", lambda: True)
+    monkeypatch.setattr(gpu, "_assert_fused_chunk_major_available", lambda: None)
+    monkeypatch.setattr(gpu, "_thread_state", thread_state)
+
+    def pack(buf, block_groups, stream):
+        blocks = [b for group in block_groups for b in group]
+        buf.copy_(cache[blocks].flatten())
+
+    def unpack(buf, block_groups, stream):
+        blocks = [b for group in block_groups for b in group]
+        cache[blocks] = buf.reshape(-1, 3)
+
+    gpu.codec.gpu_to_chunk_major_device_buffer = pack
+    gpu.codec.chunk_major_device_buffer_to_gpu = unpack
+
+    class Engine:
+        storage_manager = SimpleNamespace(
+            storage_backends={"LocalCPUBackend": object()}
+        )
+        async_loading = False
+        save_only_first_rank = False
+        gpu_connector = gpu
+
+        def __init__(self):
+            self.entries = {}
+            self.calls = []
+            self.cleared = []
+            self.failure = None
+
+        def store(self, tokens, **kwargs):
+            chunks = len(tokens) // 8
+            objects = [
+                SimpleNamespace(tensor=torch.zeros(6, dtype=torch.uint8))
+                for _ in range(chunks)
+            ]
+            gpu.batched_from_gpu(
+                objects,
+                list(range(0, len(tokens), 8)),
+                list(range(8, len(tokens) + 1, 8)),
+                **kwargs,
+            )
+            self.entries[tuple(tokens.tolist())] = objects
+            self.calls.append(
+                ("save", threading.get_ident(), dict(gpu.last_transfer_stats()))
+            )
+            if self.failure == "store":
+                raise RuntimeError("store failed after partial publication")
+
+        def lookup(self, tokens, **kwargs):
+            return len(tokens) if tuple(tokens.tolist()) in self.entries else 0
+
+        def retrieve(self, tokens, **kwargs):
+            if self.failure == "load":
+                raise RuntimeError("load failed")
+            objects = self.entries[tuple(tokens.tolist())]
+            if self.failure != "no_copy":
+                gpu.batched_to_gpu(
+                    objects,
+                    list(range(0, len(tokens), 8)),
+                    list(range(8, len(tokens) + 1, 8)),
+                    **kwargs,
+                )
+            self.calls.append(
+                ("load", threading.get_ident(), dict(gpu.last_transfer_stats()))
+            )
+            return torch.full((len(tokens),), self.failure != "miss", dtype=torch.bool)
+
+        def clear(self, tokens, **kwargs):
+            key = tuple(tokens.tolist())
+            self.cleared.append(key)
+            self.entries.pop(key, None)
+
+    engine = Engine()
+    worker = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    worker._engine, worker._codec = engine, gpu.codec
+    worker._rank = 0
+    worker._do_save = worker._do_load = True
+    worker.save_workers = worker.load_workers = 1
+    worker.chunk_size = 8
+    # A virtual block can cover DCP token stripes; physical block size is 2.
+    worker.block_size, worker.virtual_block_size = 2, 4
+    shell = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
+    shell._impl = worker
+    with ThreadPoolExecutor(1) as save_pool, ThreadPoolExecutor(1) as load_pool:
+        worker._save_executor, worker._load_executor = save_pool, load_pool
+        yield shell, worker, engine, cache, before
+
+
+def test_startup_warmup_restores_cpu_bytes_on_serving_threads(startup_warmup):
+    shell, worker, engine, cache, before = startup_warmup
+    shell.warmup()  # Traverse the public shell and Kimi's actual inherited method.
+    assert torch.equal(cache[7:13], before[1:7])
+    assert torch.equal(cache[:7], before[:7])
+    assert not engine.entries
+    assert len(engine.cleared) == 2
+    assert all(tokens[0] < 0 for tokens in engine.cleared)
+    assert [op for op, _, _ in engine.calls] == ["save", "load", "save", "load"]
+    loads = [call for call in engine.calls if call[0] == "load"]
+    assert [stats["groups"] for _, _, stats in loads] == [1, 2]
+    assert [stats["completed_bytes"] for _, _, stats in loads] == [6, 18]
+    assert len({tid for _, tid, _ in loads}) == 1
+    assert loads[0][1] == worker._load_executor.submit(threading.get_ident).result()
+    assert (
+        engine.calls[0][1] == worker._save_executor.submit(threading.get_ident).result()
+    )
+    assert len({tid for _, tid, _ in engine.calls}) == 2
+    assert all(tid != threading.get_ident() for _, tid, _ in engine.calls)
+    shell.warmup()  # No second write after startup.
+    assert len(engine.calls) == 4
+
+
+@pytest.mark.parametrize("failure", ["store", "load", "miss", "no_copy"])
+def test_startup_warmup_fails_and_cleans_partial_cpu_entries(startup_warmup, failure):
+    shell, worker, engine, _, _ = startup_warmup
+    engine.failure = failure
+    with pytest.raises(RuntimeError):
+        shell.warmup()
+    assert not engine.entries
+    assert len(engine.cleared) == 1
+    assert not getattr(worker, "_offload_warmed", False)
+
+
+@pytest.mark.parametrize(
+    "setting,value", [("load_workers", 2), ("save_workers", 2), ("_do_load", False)]
+)
+def test_startup_warmup_rejects_a_partially_warmed_configuration(
+    startup_warmup, setting, value
+):
+    shell, worker, engine, _, _ = startup_warmup
+    setattr(worker, setting, value)
+    with pytest.raises(RuntimeError):
+        shell.warmup()
+    assert not engine.calls
