@@ -469,6 +469,27 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
+        if (
+            model_arch in _DEEPSEEK_V41_ARCHES
+            and getattr(vllm_config, "speculative_config", None) is not None
+            and getattr(self.atom_config, "enable_decoder_swa_bounded_replay", False)
+        ):
+            # Decoder SWA bounded replay splits the forward into two compiled
+            # stages whose layer loop is `_Stage.run`, not the one in
+            # `model.py` that collects the draft's aux hidden states -- and it
+            # runs the late stage on a tail of the rows, which only the native
+            # drafter's hook path knows how to map back. On this path the
+            # speculator reads the aux states off the forward's return value,
+            # so the single-graph forward is the one that can produce them.
+            # Decided here rather than left to the user: the alternative is a
+            # boot that fails with a flag to pass, and the flag costs prefill
+            # throughput, not correctness.
+            self.atom_config.enable_decoder_swa_bounded_replay = False
+            logger.info(
+                "ATOM plugin: decoder SWA bounded replay is off because "
+                "DeepSeek-V4.1 is speculating; the draft's aux hidden states "
+                "come from the single-graph forward."
+            )
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
             "index_topk_pattern=%s",
