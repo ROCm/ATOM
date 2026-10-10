@@ -206,6 +206,8 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
+| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
+| **ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS** | int | 2048 | With the fusion above on, the attention output gate (`sigmoid(gate) * o` + FP8 quant) runs unfused above this many tokens, for the same reason. |
 
 ### Llama-style
 
