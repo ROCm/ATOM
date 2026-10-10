@@ -228,6 +228,7 @@ class V41StateWorkerLeg:
     def __init__(self, views: V41StateViews, tier, slot_allocator) -> None:
         self._views = views
         self._tier = tier
+        self._warned_no_slot = False
         self._slots = slot_allocator
         self._stage_of_op: dict[int, int] = {}
 
@@ -256,6 +257,26 @@ class V41StateWorkerLeg:
         cursors = iter(positions)
         for store, slot in candidates:
             if slot is None:
+                # Say which key missed and what the allocator does hold. The
+                # two halves of this leg name a request independently -- the
+                # scheduler half from `frontiers`, the worker half from the
+                # batch the forward ran -- so "no slot" is as often a key that
+                # does not match as a request that has none, and the counter
+                # alone cannot tell those apart.
+                if not self._warned_no_slot:
+                    self._warned_no_slot = True
+                    known = list(getattr(self._slots, "_key_to_slot", {}))[:4]
+                    logger.warning(
+                        "V4.1 state offload: no STATE slot for %r (%s); the "
+                        "allocator holds %d key(s), e.g. %r. If the keys look "
+                        "like the same request spelled differently, the two "
+                        "halves are naming it differently and no boundary will "
+                        "ever be stored.",
+                        store.req_id,
+                        type(store.req_id).__name__,
+                        len(getattr(self._slots, "_key_to_slot", {})),
+                        known,
+                    )
                 refuse("worker_no_slot", store.op_id)
                 continue
             committed = next(cursors)
