@@ -4,7 +4,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import numpy as np
 import torch
@@ -13,6 +13,10 @@ from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
+
+
+class TileWorkspace(Protocol):
+    def unit_table(self, ratio: int, tokens: int, width: int) -> torch.Tensor: ...
 
 
 @dataclass(frozen=True)
@@ -40,9 +44,9 @@ class BatchStep:
     and `running_bs` requests -- and not the scheduled batch, because a
     captured graph replays the width it was captured at whatever the batch
     turns out to be. The tail past `scheduled` is padding: a token there
-    carries batch id -1, which is what the scatters bail on, and a request
-    there is zero-length in `cu_seqlens_q`, which is what the per-request
-    kernels bail on.
+    carries batch id -1, which is what the scatters bail on. Query padding is
+    zero-length except for an idle rank's dummy query segment: sampling and
+    DSpark retain that segment while cache metadata still contains no requests.
     """
 
     requests: tuple[RequestSpan, ...]
@@ -82,6 +86,8 @@ class BatchStep:
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
+    # A one-token prefill, parent or microbatch, must not select decode kernels.
+    is_prefill: bool = False
     # Where each request starts, on the host. Built for `prefill_positions`
     # anyway, and published so the state lifecycle compares against the same
     # array rather than walking the spans again per forward.
@@ -93,6 +99,8 @@ class BatchStep:
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
     # name -> what a step planner worked out on the host (`StepPlan.host`)
     planned_host: dict[str, object] = field(default_factory=dict)
+    # TBO keeps memoized tile tables in a disjoint part of the parent budget.
+    tile_workspace: TileWorkspace | None = None
     # [requests] int32: the lowest position whose window row a request's
     # queries may read. Zeros (the cache's fixed buffer, so a capture records
     # one address) except on a bounded-replay tail step
@@ -126,7 +134,10 @@ class BatchStep:
     def decode(self):
         # Verification has ring slack for the entire tentative block. All rows
         # can use the same causal paged-decode kernel as autoregressive decode.
-        return self.tentative or all(request.length == 1 for request in self.requests)
+        return self.tentative or (
+            not self.is_prefill
+            and all(request.length == 1 for request in self.requests)
+        )
 
 
 class StepPlan(NamedTuple):
@@ -150,7 +161,9 @@ def prepare_batch_step(
     block_tables,
     page_limit=None,
     tentative=False,
+    is_prefill=False,
     buffers=None,
+    buffer_prefix="",
     running_bs=None,
     running_tokens=None,
     max_q_len=None,
@@ -262,19 +275,24 @@ def prepare_batch_step(
             device=device,
         )
     if publication_group is not None:
-        grouped_tables = "block_tables" in publication_group.indices
+        # A TBO microbatch's group names its members `{buffer_prefix}name`
+        # (`ub{i}_positions`, ...); match them by the parent's names.
+        def base(member):
+            return member.name.removeprefix(buffer_prefix)
+
+        grouped_tables = f"{buffer_prefix}block_tables" in publication_group.indices
         for i, member in enumerate(publication_group.members):
-            if member.name == "block_tables":
+            if base(member) == "block_tables":
                 publication_group.counts[i] = running_bs
-            elif member.name in required:
-                publication_group.counts[i] = required[member.name]
+            elif base(member) in required:
+                publication_group.counts[i] = required[base(member)]
             # Builder-staged members (plans, state slots, Engram rows) keep
             # their counts in this combined publication, before indptrs run.
         tables.publish(running_bs if grouped_tables else None, group=publication_group)
         published = {
-            member.name: member.destination[: required[member.name]]
+            base(member): member.destination[: required[base(member)]]
             for member in publication_group.members
-            if member.name in required
+            if base(member) in required
         }
     else:
         published = {
@@ -282,13 +300,18 @@ def prepare_batch_step(
             for name, count in required.items()
             if name not in ("block_tables", "cu_seqlens_q")
         }
-    published["cu_seqlens_q"] = (
-        cu.gpu[: running_bs + 1]
-        if query_prefix_ready
-        else cu.copy_to_gpu(
-            running_bs + 1, republish_reason=query_prefix_republish_reason
+    if "cu_seqlens_q" in published:
+        # The group published it with the rest of the step (a TBO microbatch's
+        # `ub{i}_` group holds its own copy).
+        published["cu_seqlens_q"] = cu.gpu[: running_bs + 1]
+    else:
+        published["cu_seqlens_q"] = (
+            cu.gpu[: running_bs + 1]
+            if query_prefix_ready
+            else cu.copy_to_gpu(
+                running_bs + 1, republish_reason=query_prefix_republish_reason
+            )
         )
-    )
     if "block_tables" not in published:
         published["block_tables"] = tables.publish(running_bs)
     return BatchStep(
@@ -305,6 +328,7 @@ def prepare_batch_step(
             else max_q_len
         ),
         tentative=tentative,
+        is_prefill=is_prefill,
         visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
         request_positions=starts,
         planned={name: published[name] for name in planned},

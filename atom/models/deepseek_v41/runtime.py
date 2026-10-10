@@ -8,6 +8,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils.backends import set_model_tag
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -34,15 +35,15 @@ def _fake_layer_output(hidden, layer_name):
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_begin_forward(hidden: torch.Tensor) -> None:
     """Read live request state on every execution, including graph capture."""
-    metadata = get_forward_context().attn_metadata
+    context = get_forward_context()
+    metadata = context.attn_metadata
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
     if hidden.shape[-2] != metadata.step.width:
         raise ValueError("Token rows disagree with the width this step declared")
-    stage = getattr(metadata.engram_embeddings, "stage", None)
-    if stage is not None:
-        stage()
+    if isinstance(metadata.engram_embeddings, EngramStagedRows):
+        metadata.engram_embeddings.stage()
 
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
@@ -52,7 +53,7 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
         hidden.zero_()
         return
     rows = metadata.engram_embeddings
-    if getattr(rows, "stage", None) is not None:
+    if isinstance(rows, EngramStagedRows):
         rows.join()
 
 

@@ -39,7 +39,7 @@ from atom.model_ops.v4_kernels import scale_indexer_weights
 
 from .candidate_table import lift_candidate_selection
 from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
-from .score_workspace import plane_rows
+from .score_workspace import logits_rows
 
 
 def quantize_query_rows(query):
@@ -120,10 +120,10 @@ def score_topk_paged(
     layer they bound) limits this layer to an earlier layer's blocks and
     `candidate_count` makes this layer that earlier one; never both.
 
-    Rows run in bands of `plane_rows(width)`, or of what `workspace`
-    (`ScoreWorkspace`) holds when given, a bound rather than a knob: a width
-    that fits the whole batch in one band gets one. The band is taken from
-    `workspace` when given, else allocated.
+    Rows run in bands bounded by both the index addressing limit and the
+    shared logits memory budget. In a 1M-context configuration, the address
+    limit alone allows an 8 GiB temporary, even for short live contexts.
+    The band is taken from `workspace` when given, else allocated.
     """
     rows, heads = weights.shape
     q_fp8, q_scale = quantize_query_rows(query)
@@ -224,7 +224,11 @@ def score_topk_quantized(
         if candidate_count
         else None
     )
-    band = plane_rows(width) if workspace is None else workspace.band_rows(width)
+    band = (
+        logits_rows(rows, width)
+        if workspace is None
+        else workspace.logits_rows(rows, width)
+    )
     # One band's plane, reused; a short last band is a prefix of it.
     logits = (
         torch.empty(min(rows, band), width, dtype=torch.float32, device=device)

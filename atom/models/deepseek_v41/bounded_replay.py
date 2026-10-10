@@ -75,9 +75,9 @@ def replay_rows(forward, num_tokens: int) -> int | None:
     input embeddings included (the late layers' only image-aware op, the MoE
     router, reads the tail's slice of the mask; see `late_layer_tail`).
     Decode, warmup, draft and TBO microbatches take every row through the late
-    layers, and so does a padded step: prefill pads only under DP attention,
-    where the MoE collectives are sized by every rank's token count, which a
-    rank-local tail would change.
+    layers, and so do DP attention and padded steps. DP's MoE collectives are
+    sized by every rank's token count, even when a rank needs no padding;
+    a rank-local tail would change those counts.
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
@@ -86,7 +86,14 @@ def replay_rows(forward, num_tokens: int) -> int | None:
         or context.is_dummy_run
         or context.is_draft
         or forward.ubatch_slices is not None
+        or getattr(forward, "dp_metadata", None) is not None
     ):
+        return None
+    # Workers clear ubatch_slices to prevent recursive splitting. Their live
+    # TBO context still identifies them, including the child at token offset 0.
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():
         return None
     step = getattr(metadata, "step", None)
     if (

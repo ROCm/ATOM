@@ -201,6 +201,7 @@ def test_unit_table_expands_the_page_table_in_place(units):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.deepseek_v41 import score_workspace as ws
     from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
     from atom.model_ops.deepseek_v41.index_write import write_index_rows
     from atom.model_ops.deepseek_v41.unit_table import unit_table
@@ -254,8 +255,10 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
 
     # Three rows per band, including a short last band. Verify through the
     # real quantized paged scorer and selector, not a mocked score function.
-    original_plane_rows = scoring.plane_rows
-    monkeypatch.setattr(scoring, "plane_rows", lambda width: 3)
+    # `logits_rows` resolves `plane_rows` in the module that defines it, so
+    # the band has to be forced there rather than through the scorer.
+    original_plane_rows = ws.plane_rows
+    monkeypatch.setattr(ws, "plane_rows", lambda width: 3)
     monkeypatch.setattr(scoring, "deepgemm_fp8_paged_mqa_logits", observe)
     actual, chosen = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
     actual_reindex, _ = scoring.score_topk_paged(
@@ -279,7 +282,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     graph.replay()
     # Compare the captured bands against an unbanded forward after live bounds
     # change. The empty row moves to the end and must not retain stale IDs.
-    monkeypatch.setattr(scoring, "plane_rows", original_plane_rows)
+    monkeypatch.setattr(ws, "plane_rows", original_plane_rows)
     expected, expected_candidates = scoring.score_topk_paged(
         *args, **kwargs, candidate_count=16
     )
