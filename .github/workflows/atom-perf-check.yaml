@@ -136,20 +136,22 @@ env:
   # between settings, so n=2 cannot separate them. Both sit inside the +-2.5
   # RESIDUAL_SPREAD_PCT this check documents.
   #
-  # Two cells argue against this setting and are not yet explained. Both
-  # repeat in one direction, which is not the spread RESIDUAL_SPREAD_PCT
-  # covers -- it is the second-half advantage the warmup exists to remove,
-  # still present at this length:
+  # One cell argues against this setting and is not yet explained:
   #
   #   GLM-5.2-FP8  c=256  total tput  +2.4 / +2.1 / +2.3%   (three runs)
-  #   Kimi-K3      c=32   TTFT       -12.1 / -11.6%         (two runs)
   #
-  # with TTFT and TPOT agreeing every time. The TTFT one is the worse of the
-  # two: TTFT is what confirms a throughput drop, so a bias of that size in
-  # that direction can cancel the confirmation a real regression would
-  # produce. Widening a constant to cover either buys quiet at the cost of
-  # sensitivity. Raise this to 10 -- for those entries or for all of them --
-  # once a run has shown whether the longer warmup removes them.
+  # with TTFT and TPOT agreeing each time. c=256 is the quiet level -- 0.5-1.2%
+  # run to run -- so three readings landing within 0.3 points of each other at
+  # +2.3% is not the spread RESIDUAL_SPREAD_PCT covers. It is the second-half
+  # advantage the warmup exists to remove, still present at this length for
+  # that cell, and widening a constant to cover it would buy quiet at the cost
+  # of sensitivity. Raise this to 10, for that entry or for all of them, once a
+  # run has shown whether the longer warmup removes it.
+  #
+  # Kimi-K3 at c=32 read -12.1% and -11.6% on TTFT in two runs and looked like
+  # a second one, but the run before them read -0.5%, and M3 at the same level
+  # gave +0.4% and +5.0%. That is this level behaving as the header already
+  # says it does, not a bias -- two readings out of three is not a direction.
   #
   # Not PERF_-prefixed like the others: workflow-level env is inherited
   # straight into every step, and perf_check_half.sh reads this name, so
