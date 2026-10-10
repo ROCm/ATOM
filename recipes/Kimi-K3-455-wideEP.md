@@ -1416,6 +1416,10 @@ first two are what make it boot and stay up at all:
 --max-num-seqs 8                 # unchanged -- do NOT raise it either
 ```
 
+On the [atom-dev 1009 stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes), use 0.90 instead of 0.94: at
+16384 batched tokens 0.94 runs out of memory on the first long prefill (see
+[Prefill chunk 16384 and the fp4 combine wire](#prefill-chunk-16384-and-the-fp4-combine-wire)).
+
 Measured effect of the utilization bump, everything else equal:
 
 ```
@@ -1860,6 +1864,47 @@ exec python3 -m atom.entrypoints.openai_server \
   --no-enable_prefix_caching \
   --disable_uvicorn_access_log
 ```
+
+### Prefill chunk 16384 and the fp4 combine wire
+
+Two settings that work on this stack. Measured 2026-10-10 on the same trays, after a reboot that loaded
+amdgpu with default parameters rather than perf_setup D (`noretry=-1`, so `HSA_XNACK=1`): compare these
+runs with each other, not with the table at the top of this section. Throughput is ATOM's standard
+benchmark (`scripts/run_benchmark.sh` settings): random 14336/500, range ratio 0.8, concurrency 32,
+320 prompts, 64 warm-ups, the same prompts for every run.
+
+| | set | result |
+|---|---|---|
+| **`--max-num-batched-tokens 16384`** | together with `--gpu-memory-utilization 0.90` | boots with `peak_torch` 294–298 GB and `available_for_kv` 54–56 GB per rank (82–86 GB at 2048). Gate passes, GSM8K (first 200) 0.975–0.985. A 14k prompt prefills in one step instead of seven: output throughput **+11% on mori** (258.9 vs 232.4 tok/s), **+16% on flydsl compact**; TTFT median 10.2 s instead of 14.2 s (mori); TPOT 2–3% higher |
+| **`ATOM_MEGA_COMBINE_WIRE=fp4`** | environment only | MegaMoE builds the mxfp4 combine reduce (`combine_quant=mxfp4` in the `Created MegaMoE` line). Prefill steps only; decode steps combine in bf16. GSM8K (first 200) 0.985–0.995. **No measurable throughput change** at 14k/500, at either chunk size |
+
+| dispatch, chunk, combine | output tok/s | TTFT median | TPOT median | GSM8K-200 |
+|---|---|---|---|---|
+| mori, 2048, bf16 (Config A's chunk) | 232.4 | 14.24 s | 93.2 ms | 0.975 |
+| mori, 16384, fp4 | 258.9 | 10.19 s | 95.5 ms | 0.985 |
+| flydsl compact, 2048, bf16 (two runs) | 247.2 / 244.3 | 12.62 / 13.86 s | 90.2 / 90.1 ms | 0.975 / 0.98 |
+| flydsl compact, 2048, fp4 | 239.3 | 13.55 s | 90.3 ms | 0.995 |
+| flydsl compact, 16384, bf16 | 285.0 | 7.75 s | 92.8 ms | 0.975 |
+| flydsl compact, 16384, fp4 | 284.9 | 8.54 s | 92.5 ms | 0.985 |
+
+"flydsl compact" is `MEGA_DISPATCH=flydsl` running aiter's compact plan on the fp4 dispatch wire, which this
+image's ATOM cannot select (see [the MoE dispatch backend](#the-moe-dispatch-backend-mori-and-why-mega_dispatchflydsl-does-nothing));
+it needs an ATOM change that is not merged yet. The two bf16 runs at 2048 bound the run-to-run spread: about
+1% in throughput and 10% in TTFT median. Every fp4-combine difference above is inside it.
+
+⚠️ **At 16384, 0.94 does not survive the first long prefill.** All four ranks on node0 (the ones checked) ran
+out of memory in aiter's grouped GEMM:
+
+```
+grouped_moe_gfx1250.py, in _grouped_a8w4_tdm_moe
+    grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 14.05 GiB. ... 4.91 GiB is free.
+```
+
+That is one bf16 row per route (about 131072 received tokens × 16), allocated at run time and not
+reserved by the memory budget. At 0.90 it fits. This applies to the
+[AgentX launch](#server-launch-for-agentx) and to Config B too: their 0.94 is from the 0918-ep8 image,
+and this stack needs 0.90.
 
 ### Other things this run showed
 
