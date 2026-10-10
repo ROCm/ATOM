@@ -493,10 +493,7 @@ class TestWorkPlanWiring:
         """#5809 removed FlyDSLs static/no-plan decode path."""
         import inspect
 
-        from atom.model_ops.base_attention import (
-            _flydsl_prepare_explicit_plan,
-            run_pa_decode,
-        )
+        from atom.model_ops.base_attention import run_pa_decode
 
         param = inspect.signature(run_pa_decode).parameters["work_plan"]
         assert param.default is None, "call sites may omit a capture-owned plan"
@@ -596,7 +593,8 @@ class TestWorkPlanWiring:
 
         monkeypatch.setattr(
             importlib.import_module("aiter.ops.flydsl.pa_decode"),
-            "plan_pa_decode", fake_plan,
+            "plan_pa_decode",
+            fake_plan,
         )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
@@ -741,7 +739,8 @@ class TestWorkPlanWiring:
 
         monkeypatch.setattr(
             importlib.import_module("aiter.ops.flydsl.pa_decode"),
-            "plan_pa_decode", lambda *a, **kw: _FakePlan(),
+            "plan_pa_decode",
+            lambda *a, **kw: _FakePlan(),
         )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
@@ -950,6 +949,7 @@ class TestExplicitPlan:
         import torch
 
         from atom.model_ops import base_attention as ba
+
         built = []
 
         def fake_plan(context_lens, num_kv_heads, **kw):
@@ -1155,7 +1155,7 @@ class TestPlanBatchLimit:
         monkeypatch.setattr(
             torch.ops.aiter, "pa_decode_gluon", lambda *a, **kw: seen.append(1)
         )
-        meta = lambda *shape: torch.empty(shape, device="meta")  # noqa: E731
+        meta = lambda *shape: torch.empty(shape, device="meta")
         ba.run_pa_decode(
             output=meta(n, 16, 128),
             q=meta(n, 16, 128),
@@ -1196,7 +1196,7 @@ class TestPlanBatchLimit:
             raise _Stop
 
         monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", record)
-        meta = lambda *shape: torch.empty(shape, device="meta")  # noqa: E731
+        meta = lambda *shape: torch.empty(shape, device="meta")
         with pytest.raises(_Stop):
             ba.run_pa_decode(
                 output=meta(n, 16, 128),
@@ -1237,7 +1237,7 @@ class TestPlanBatchLimit:
         monkeypatch.setattr(
             torch.ops.aiter, "pa_decode_gluon", lambda *a, **kw: seen.append(1)
         )
-        meta = lambda *shape: torch.empty(shape, device="meta")  # noqa: E731
+        meta = lambda *shape: torch.empty(shape, device="meta")
         ba.run_pa_decode(
             output=meta(n * 4, 16, 128),
             q=meta(n * 4, 16, 128),

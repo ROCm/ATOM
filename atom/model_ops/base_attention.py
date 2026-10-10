@@ -347,7 +347,7 @@ def _flydsl_context_bound(max_context_length, block_tables, k_cache):
     if max_context_length is None:
         return capacity
     if isinstance(max_context_length, bool):
-        raise ValueError("max_context_length must be a nonnegative host integer")
+        raise TypeError("max_context_length must be a host integer, not a bool")
     try:
         bound = int(max_context_length)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -541,9 +541,7 @@ def run_pa_decode(
     # nothing. A bound below the query window (e.g. an all-padding step) is
     # outside FlyDSL's contract; gluon takes it.
     if flydsl_seqs:
-        context_bound = _flydsl_context_bound(
-            max_context_length, block_tables, k_cache
-        )
+        context_bound = _flydsl_context_bound(max_context_length, block_tables, k_cache)
         if context_bound < max_seqlen_q:
             flydsl_seqs = None
     # Inside the guard, not before it: this runs 63 times per decode step and
