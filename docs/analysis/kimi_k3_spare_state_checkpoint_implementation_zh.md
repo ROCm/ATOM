@@ -123,9 +123,11 @@ K3 prefill 的 causal convolution 和最终 SSM 均写入 `state_slots[0]`；mai
 
 ## 8. `.github` 单机混部 Agentic 用例
 
-配置位于 [models_agentic.json](/mnt/raid0/mengqing/ATOM/.github/benchmark/models_agentic.json)，prefix 为 `kimi-k3`，variant suffix 为 `-agentic-dspark3-tp8-dcp8-lmcache-state`。在 **ATOM Agentic Benchmark** 中选择包含当前修改的分支、`profile=test`、`models=kimi-k3`；concurrency / duration 留空即运行 C48、3600 秒。`dry_run=true` 只展开矩阵，不分配 GPU。留空 models 会同时选中 test catalog 中的 DeepSeek 与 K3；nightly catalog 不变。
+配置位于 [models_agentic.json](/mnt/raid0/mengqing/ATOM/.github/benchmark/models_agentic.json)，prefix 为 `kimi-k3`，variant suffix 为 `-agentic-tp8-dcp8-lmcache-state`。在 **ATOM Agentic Benchmark** 中选择包含当前修改的分支、`profile=test`、`models=kimi-k3`；concurrency / duration 留空即运行 C48、3600 秒。`dry_run=true` 只展开矩阵，不分配 GPU。留空 models 会同时选中 test catalog 中的 DeepSeek 与 K3；nightly catalog 不变。
 
-新用例保留 TP8/DCP8、DP1、EP1（不启用 expert parallel）、关闭 DP attention、max_num_seqs=96、max_num_batched_tokens=8192、DSpark3 / AL=3.00、FP4 权重 / FP8 KV、LMCache DRAM 128 GiB/rank。STATE 开关为 1、reserve=8、ReplaySSM=0、interval=-1、demand=0；其余 ATOM/AITER/LMCache 参数参考提供的 2026-09-29 环境日志。
+新用例保留 TP8/DCP8、DP1、EP1（不启用 expert parallel）、关闭 DP attention、max_num_seqs=96、max_num_batched_tokens=8192、无投机解码、FP4 权重 / FP8 KV、LMCache DRAM 128 GiB/rank。STATE 开关为 1、reserve=8、ReplaySSM=0、interval=-1、demand=0；其余 ATOM/AITER/LMCache 参数参考提供的 2026-09-29 环境日志。
+
+2026-10-10 根据实际 baseline 的 `speculative_config=None / spec=0` 调整此用例：移除 `--method dspark`、draft model、3 个 speculative tokens 和强制 AL 参数；CUDA graph capture sizes 调整为 1–96。STATE checkpoint 仍开启，无投机且 ReplaySSM=0 时每请求 1 slot，max_num_seqs=96 对应 96 个固定 STATE slots。运行日志应显示 `speculative_config=None`、checkpoint layout 的 `spec=0`、`slots/request=1`，并且没有 forced acceptance / synthetic 文本启用提示。此修改对齐投机模式；旧 baseline 与当前用例的镜像、客户端参数等其他差异仍需核对，不能仅凭关闭 DSpark 就认定已经是完全相同的软件环境。此前 DSpark3 的实现支持与 UT 结论仍保留。
 
 该入口通过现有 benchmark template 直接启动一个 ATOM server，不调用 ATOMesh，不需要历史 Dynamo/ETCD 配置或 IP。Agentic 数据集沿用 `semianalysis_cc_traces_weka_062126`，context cap=1,048,576；请求长度来自真实 trace，不强制随机生成 1M/1k 的请求。AIPerf commit 固定为参考用例的 `754356e9a39acc6cc6afb242d123bb57c3fb6f75`。
 
