@@ -778,17 +778,19 @@ class PagedAttentionImpl(nn.Module):
         fwd_ctx: ForwardContext,
     ) -> bool:
         attn_metadata = fwd_ctx.attn_metadata
+        # A prefix-cache hit is allowed: by now k/v hold the gathered cached+new
+        # rows, so k can be longer than q, and the asm kernel's bottom-right
+        # causal mask handles sq < sk through cu_seqlens_q / cu_seqlens_k.
         return (
             envs.ATOM_AITER_FP8_PREFILL_ATTN
             and get_gfx() == "gfx950"
             and self.head_dim == 256
             and self.kv_cache_dtype.startswith("fp8")
-            and not attn_metadata.has_cached
             and self.sliding_window == -1
             and self.sinks is None
             and (self.logits_soft_cap is None or self.logits_soft_cap == 0.0)
             and getattr(attn_metadata, "dropout_p", 0.0) == 0.0
-            and q.shape[0] == k.shape[0] == v.shape[0]
+            and k.shape[0] == v.shape[0]
             and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
         )
 
@@ -801,10 +803,9 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         # Prefix-cache hit: gather cached+new KV from the paged cache into a
         # dense packed [total_kv, ...] tensor (new tokens were already written
-        # during rope_cache). flash_attn_varlen_func then attends over the full
-        # sequence; cu_seqlens_q / cu_seqlens_k carry the new vs cached+new
-        # lengths (sq < sk), which the varlen kernel handles via bottom-right
-        # causal.
+        # during rope_cache). The varlen kernel below (FP8 asm or BF16) then
+        # attends over the full sequence; cu_seqlens_q / cu_seqlens_k carry the
+        # new vs cached+new lengths (sq < sk), handled via bottom-right causal.
         if attn_metadata.has_cached:
             q, k, v, k_cache, v_cache, k_scale, v_scale = (
                 self._gather_prefix_and_concat_kv(
