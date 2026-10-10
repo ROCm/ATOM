@@ -1439,9 +1439,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         """
 
         config = self.model_runner.config
-        if (
-            int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1
-            or getattr(config, "enable_rapidserve", False)
+        if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1 or getattr(
+            config, "enable_rapidserve", False
         ):
             return False
         from atom.utils import get_hf_text_config

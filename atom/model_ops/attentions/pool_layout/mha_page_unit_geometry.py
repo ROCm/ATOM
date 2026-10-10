@@ -55,7 +55,7 @@ def mha_page_unit_regions(pools: Iterable) -> tuple[np.ndarray, np.ndarray]:
     for pool in pools:
         for role, tensor in pool.region_tensors():
             if not isinstance(tensor, torch.Tensor):
-                raise RuntimeError(f"MHA PAGE region {role} is not a tensor")
+                raise TypeError(f"MHA PAGE region {role} is not a tensor")
             if not tensor.is_contiguous():
                 raise RuntimeError(
                     "an MHA PAGE region must be contiguous to hold a GDN "
@@ -111,7 +111,7 @@ def mha_page_unit_views(
     for pool in pools:
         for role, tensor in pool.region_tensors():
             if not isinstance(tensor, torch.Tensor):
-                raise RuntimeError(f"MHA PAGE region {role} is not a tensor")
+                raise TypeError(f"MHA PAGE region {role} is not a tensor")
             if tensor.ndim < 1 or not tensor.is_contiguous():
                 raise RuntimeError(
                     "an MHA PAGE region must be contiguous to hold a GDN "
