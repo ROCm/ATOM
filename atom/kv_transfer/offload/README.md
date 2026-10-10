@@ -112,9 +112,9 @@ Four rules carry the module:
 | `mp/transfer.py` | Transfer identity, terminal detection and the fail-stop transfer deadline. |
 | `mp/page_views.py` | Shared validation of backend-published PAGE views. |
 | `mp/native_state_{layout,scheduler,worker}.py` | PAGE-backed native-state registration, scheduler leases, and worker transfer/restore lifecycle. |
-| `mooncake_store/config.py` | The `mooncake_store.*` settings, and the dense/DCP=1 startup refusals. |
+| `mooncake_store/config.py` | The `mooncake_store.*` settings (per-NIC Store pools included), and the dense/DCP=1 startup refusals. |
 | `mooncake_store/keys.py` | Layout namespace, the prompt's 16-byte chunk hash chain, and Store key spelling. |
-| `mooncake_store/nic.py` | One PCI-local RDMA device per worker; per-NIC Store pools. |
+| `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
 | `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
 | `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (Store lookups, digest-carrying requests) and worker (windowed put/get, startup probe). |
@@ -339,10 +339,10 @@ load: owners --batch_get_into--> run of slots of the registered pool --unpack (T
 ```
 
 A window whose slots are one run of the HBM pool is one chunk-major buffer, and
-the dense codec packs or unpacks it with one kernel and one stream sync
-(`direct_copy`). A window whose slots are scattered (quarantined slots broke
-the region up) goes through the block GPU connector's staging buffer instead:
-pack, then a copy into each slot (and the reverse).
+the dense codec packs or unpacks it in place with one kernel and one stream
+sync. A window whose slots are scattered (quarantined slots broke the region
+up) goes through the block GPU connector's staging buffer instead: pack, then
+a copy into each slot (and the reverse).
 
 - One Store object is one (PP/TP rank, 256-token chunk): the dense codec's
   opaque bytes of that rank's layers, 16 blocks in one contiguous range
@@ -392,8 +392,8 @@ pack, then a copy into each slot (and the reverse).
   others are in while any of them lives.
 - Lookup runs in the scheduler process over its own tcp Store client, opened on
   the first lookup (every PP stage builds a scheduler; only the head asks):
-  one `batch_is_exist` for every rank x chunk key (split at
-  `lookup_batch_keys`). The hit is the shortest run of present chunks from
+  one `batch_is_exist` for every rank x chunk key (split into calls of at most
+  8192 keys). The hit is the shortest run of present chunks from
   chunk 0 over all ranks, because a load is all-or-nothing across stages. Any
   error code or exception answers `None` -- "no answer", retried later --
   never a remembered miss. A lookup blocks the scheduler thread, and a master
@@ -465,9 +465,8 @@ pack, then a copy into each slot (and the reverse).
   that is down, a stage whose save slots are all quarantined) would otherwise
   re-pack the request's unsaved range on every PP stage every step.
 - At startup every worker sends one chunk of random bytes through the Store and
-  compares it back (`startup_probe`): an unregistered pool, an unreachable
-  owner or a misrouted NIC fails startup instead of turning every lookup into a
-  miss.
+  compares it back: an unregistered pool, an unreachable owner or a misrouted
+  NIC fails startup instead of turning every lookup into a miss.
 
 ### Configuration
 
@@ -481,7 +480,7 @@ settings. The same keys work in `kv_connector_extra_config` of
 |-----|:-------:|---------|
 | `mooncake_store.master` | required without `pools` | Master RPC address, `host:port`. |
 | `mooncake_store.metadata` | required without `pools` | Metadata server, `http://host:port/metadata` (or `P2PHANDSHAKE`). |
-| `mooncake_store.pools` | -- | Per-NIC pools instead: `{"rdma0": {"master": "h:p", "metadata": "<url>"}, ...}` (object or JSON text). A worker uses its NIC's pool. |
+| `mooncake_store.pools` | -- | Per-NIC pools instead, as a JSON object: `{"rdma0": {"master": "h:p", "metadata": "<url>"}, ...}`. A worker uses its NIC's pool; needs the `rdma` protocol. |
 | `mooncake_store.owner_rdma_devices` | `""` | Without pools, a worker whose NIC is listed here is refused. |
 | `mooncake_store.rdma_devices` | `""` | NIC override: one for every GPU, or one per local GPU ordinal. Default: the GPU's NIC in the PCI tree. |
 | `mooncake_store.protocol` | `rdma` | Worker transfer protocol (`rdma` or `tcp`). Lookups always use tcp. |
@@ -489,11 +488,7 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.chunk_tokens` | 256 | Tokens per Store object; a multiple of the KV block size. |
 | `mooncake_store.load_pool_mib` | 1024 | Load region per worker, MiB. |
 | `mooncake_store.save_pool_mib` | 256 | Save region per worker, MiB. |
-| `mooncake_store.lookup_batch_keys` | 8192 | Most keys per `batch_is_exist`. |
 | `mooncake_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source; must be > 0. |
-| `mooncake_store.startup_probe` | true | One-chunk round trip per worker at startup. |
-| `mooncake_store.chunk_groups` | true | Put every rank's object of a chunk in one Mooncake group, evicted whole. |
-| `mooncake_store.direct_copy` | true | With the pool on the GPU, pack and unpack each window in place in its slots (one kernel per window) instead of through the block GPU connector's staging buffer. |
 | `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way). |
 
 `OFFLOAD_COPY_WORKERS`, `OFFLOAD_LOAD_WORKERS`, `OFFLOAD_MIN_LOAD_TOKENS`,
@@ -554,17 +549,18 @@ it starts anything.
   above.
 - **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
-  `effective_gbps`) per operation, with Mooncake result codes in `errors=`.
+  `effective_gbps`) per operation, with `status=ok` or the failure that ended
+  it, whose rate-limited warning names the first Mooncake result code.
   Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, failures by
   code, quarantined slots) at most once a minute while it transfers. The
   scheduler logs `[OFFLOAD-LOOKUP-STATS]` once a minute: answered lookups,
   those whose ranks held prefixes of different lengths (`uneven_lookups`),
   and the rank objects they found past the shared prefix
   (`stranded_objects`), present but unusable while another rank lacks the
-  chunk. With chunk groups these are saves a slower stage is still writing:
-  each stage puts a prompt's chunks tail first, and its prefix grows only
-  when its head window lands. At c112, 13 of a run's 22 uneven lookups came
-  before the master's first eviction.
+  chunk. Because a chunk's objects are evicted as one group, these are saves
+  a slower stage is still writing: each stage puts a prompt's chunks tail
+  first, and its prefix grows only when its head window lands. At c112, 13 of
+  a run's 22 uneven lookups came before the master's first eviction.
 
 ### Not supported in phase 1
 
