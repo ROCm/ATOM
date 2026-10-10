@@ -42,7 +42,8 @@ Protocol, per decode rank (every rank has its own pool and connector):
    leaves its slot in flight on the stage.
 
 Credits never move between stages or ranks, so no slot is reused while a
-stage may still write it, and no side waits on another stream's progress.
+stage may still write it, and no side waits on another stage's or rank's
+progress.
 """
 
 from __future__ import annotations
@@ -67,6 +68,7 @@ from atom.kv_transfer.disaggregation.landing_scatter import (
     segment_table_capacity,
 )
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -79,6 +81,10 @@ MLA_LANDING_MIN_SLOTS = 2
 # Prefill: how long a send worker waits for a free landing slot before it
 # sends the rest of the transfer through the staged per-page path.
 MLA_LANDING_CREDIT_WAIT_S = 0.010
+# Decode: one rank's landing pool, held back from the KV budget and split
+# evenly across the prefill stages that send to the rank.
+MLA_LANDING_SLOT_BYTES = 8 << 20
+MLA_LANDING_POOL_BYTES = 256 << 20
 
 _STATS_INTERVAL_S = 30.0
 # A failed request still waiting on a stage this long is logged once.
@@ -164,8 +170,27 @@ class LandingCredits:
 # ---------------------------------------------------------------------------
 
 
+def mla_landing_reserve_bytes(config) -> int:
+    """HBM to hold back from the KV budget for this rank's MLA landing pool.
+
+    ``config`` holds one Mooncake connector's ``kv_transfer_config`` (see
+    ``KVConnectorFactory.kv_budget_reserve_bytes``). Only a ``kv_consumer``
+    running DCP on an MLA model allocates the pool, in ``register_kv_caches``
+    after the KV cache is sized.
+    """
+
+    if (
+        not envs.ATOM_PD_MLA_LANDING
+        or getattr(config, "decode_context_parallel_size", 1) <= 1
+        or not getattr(getattr(config, "hf_config", None), "kv_lora_rank", None)
+        or config.kv_transfer_config.get("kv_role") != "kv_consumer"
+    ):
+        return 0
+    return MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES * MLA_LANDING_SLOT_BYTES
+
+
 @dataclass
-class _Stream:
+class _StageTransfer:
     """One prefill stage's transfer of one request to this rank."""
 
     stage_addr: str
@@ -178,10 +203,9 @@ class _Stream:
 class _Request:
     nonce: int
     dst_block_ids: np.ndarray
-    streams: dict[int, _Stream]
-    expected: int
+    stages: dict[int, _StageTransfer]
+    # None once a scatter has waited on it.
     compute_event: torch.cuda.Event | None
-    event_waited: bool = False
     pending: int = 0
     failed: bool = False
     failed_at: float = 0.0
@@ -319,17 +343,14 @@ class LandingReceiver:
         )
         self._thread.start()
 
-    @property
-    def enabled(self) -> bool:
-        return not self._disabled
-
     # -- dispatch (main thread) ------------------------------------------------
 
     def advertise(self, stage_addr: str, num_stages: int) -> dict | None:
         """The ``mla_landing`` field for a write request to ``stage_addr``.
 
         The first request to a stage endpoint assigns it a partition of
-        ``pool_slots // num_stages`` slots; None once the pool is spent.
+        ``pool_slots // num_stages`` slots; None once the pool is spent or
+        landing is disabled (a scatter error).
         """
         with self._lock:
             if self._disabled:
@@ -368,10 +389,11 @@ class LandingReceiver:
         nonce: int,
         dst_block_ids: list[int],
         stage_addrs: dict[int, str],
-        expected: int,
     ) -> None:
         """Track a request before any write request for it goes out.
 
+        ``stage_addrs`` maps every prefill stage that writes the request to
+        its endpoint; the request settles only after each one's write-done.
         Records an event on the compute stream: the request's fresh pages may
         still be read by their previous owner's queued forward, and the
         scatter must not overwrite them before that finished.
@@ -380,22 +402,17 @@ class LandingReceiver:
         if self.device.type == "cuda":
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(self.device))
-        streams = {
-            pp: _Stream(addr, frozenset(self._partitions.get(addr, ())))
+        stages = {
+            pp: _StageTransfer(addr, frozenset(self._partitions.get(addr, ())))
             for pp, addr in stage_addrs.items()
         }
         with self._lock:
             self._requests[req_id] = _Request(
                 nonce=nonce,
                 dst_block_ids=np.asarray(dst_block_ids, dtype=np.int64),
-                streams=streams,
-                expected=expected,
+                stages=stages,
                 compute_event=event,
             )
-
-    def tracks(self, req_id: str) -> bool:
-        with self._lock:
-            return req_id in self._requests
 
     # -- notifications (listener thread) ---------------------------------------
 
@@ -429,8 +446,8 @@ class LandingReceiver:
                         slot,
                     )
             else:
-                stream = request.streams.get(pp_rank)
-                if stream is None or slot not in stream.slots:
+                stage = request.stages.get(pp_rank)
+                if stage is None or slot not in stage.slots:
                     logger.error(
                         "[PD-LANDING] req %s stage %d sent slot %d outside its "
                         "partition; failing the request",
@@ -439,13 +456,13 @@ class LandingReceiver:
                         slot,
                     )
                     self._fail_locked(request)
-                elif seq in stream.seen:
+                elif seq in stage.seen:
                     # A duplicate: the first copy, or the write-done that
                     # counted it lost, owns the credit.
                     pass
-                elif request.failed or stream.done:
-                    stream.seen.add(seq)
-                    credit_addr = stream.stage_addr
+                elif request.failed or stage.done:
+                    stage.seen.add(seq)
+                    credit_addr = stage.stage_addr
                 elif items is None:
                     logger.error(
                         "[PD-LANDING] req %s stage %d slot %d: malformed items; "
@@ -454,12 +471,12 @@ class LandingReceiver:
                         pp_rank,
                         slot,
                     )
-                    stream.seen.add(seq)
+                    stage.seen.add(seq)
                     self._fail_locked(request)
                     # The slot's RDMA write finished before READY: return it now.
-                    credit_addr = stream.stage_addr
+                    credit_addr = stage.stage_addr
                 else:
-                    stream.seen.add(seq)
+                    stage.seen.add(seq)
                     request.pending += 1
                     self._queue.put(
                         _Task(
@@ -473,7 +490,7 @@ class LandingReceiver:
         if credit_addr is not None:
             self._send_credits(credit_addr, [slot])
 
-    def stream_done(
+    def stage_done(
         self,
         req_id: str,
         pp_rank: int,
@@ -490,7 +507,6 @@ class LandingReceiver:
         """
         outcome = None
         lost: list[int] = []
-        credit_addr = None
         with self._lock:
             request = self._requests.get(req_id)
             if request is None:
@@ -500,10 +516,10 @@ class LandingReceiver:
                     "[PD-LANDING] write-done nonce mismatch for req %s", req_id
                 )
                 return True
-            stream = request.streams.get(pp_rank)
-            if stream is None or stream.done:
+            stage = request.stages.get(pp_rank)
+            if stage is None or stage.done:
                 return True
-            stream.done = True
+            stage.done = True
             if landed_slots is not None and not (
                 isinstance(landed_slots, list)
                 and all(isinstance(slot, int) for slot in landed_slots)
@@ -518,12 +534,11 @@ class LandingReceiver:
                 landed_slots, success = None, False
             if landed_slots:
                 for seq, slot in enumerate(landed_slots):
-                    if seq not in stream.seen and slot in stream.slots:
+                    if seq not in stage.seen and slot in stage.slots:
                         # Returned here: its READY, if a reconnect reordered
                         # it behind this write-done, is then a duplicate.
-                        stream.seen.add(seq)
+                        stage.seen.add(seq)
                         lost.append(slot)
-                credit_addr = stream.stage_addr
             if not success:
                 self._fail_locked(request)
             elif lost:
@@ -538,7 +553,7 @@ class LandingReceiver:
                 self._fail_locked(request)
             outcome = self._settle_locked(req_id, request)
         if lost:
-            self._send_credits(credit_addr, lost)
+            self._send_credits(stage.stage_addr, lost)
         if outcome is not None:
             self._finish(req_id, outcome)
         return True
@@ -561,7 +576,7 @@ class LandingReceiver:
                     and now - request.failed_at > _STALL_LOG_S
                 ):
                     request.stall_logged = True
-                    running = [pp for pp, s in request.streams.items() if not s.done]
+                    running = [pp for pp, s in request.stages.items() if not s.done]
                     stalled.append((req_id, now - request.failed_at, running))
             for key, at in list(self._tombstones.items()):
                 if now - at > _TOMBSTONE_TTL_S:
@@ -644,10 +659,9 @@ class LandingReceiver:
                 if request is None or request.nonce != task.nonce or request.failed:
                     continue
                 live.append((task, request))
-                if not request.event_waited:
-                    request.event_waited = True
-                    if request.compute_event is not None:
-                        events.append(request.compute_event)
+                if request.compute_event is not None:
+                    events.append(request.compute_event)
+                    request.compute_event = None
         bad: set[str] = set()
         parts = []
         landed_bytes = 0
@@ -740,8 +754,8 @@ class LandingReceiver:
                 if request is None or request.nonce != task.nonce:
                     continue
                 request.pending -= 1
-                stream = request.streams[task.pp_rank]
-                credits.setdefault(stream.stage_addr, []).append(task.slot)
+                stage = request.stages[task.pp_rank]
+                credits.setdefault(stage.stage_addr, []).append(task.slot)
                 if task.req_id in failed_ids:
                     self._fail_locked(request)
                 touched[task.req_id] = request
@@ -771,7 +785,7 @@ class LandingReceiver:
         """
         if request.pending:
             return None
-        if sum(s.done for s in request.streams.values()) < request.expected:
+        if not all(s.done for s in request.stages.values()):
             return None
         self._retire_locked(req_id, request)
         return request.failed
