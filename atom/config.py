@@ -2678,7 +2678,7 @@ class Config:
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.
-        factors.append(self.enable_decoder_swa_bounded_replay)
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
