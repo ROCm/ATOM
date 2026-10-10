@@ -97,6 +97,7 @@ from atom.model_ops.embed_head import (
     ReplicatedEmbedding,
     VocabParallelEmbedding,
 )
+from atom.model_ops.fp4_layout import mxfp4_scale_buffer_shape
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
@@ -478,6 +479,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
     shuffle: bool = True,
     scale_shuffle_padding: bool = True,
     output_unquantized_inp1: bool = False,
+    mxfp4_scale_layout: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -492,7 +494,11 @@ def _fuse_rmsnorm_fp4_quant_fake(
 
     scale_n_valid = (n1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
 
-    if scale_shuffle_padding:
+    if mxfp4_scale_layout is not None:
+        scale_m, scale_n = mxfp4_scale_buffer_shape(
+            m, scale_n_valid, mxfp4_scale_layout
+        )
+    elif scale_shuffle_padding:
         scale_m = ((m + 255) // 256) * 256
         scale_n = ((scale_n_valid + 7) // 8) * 8
     else:
@@ -511,15 +517,6 @@ def _fuse_rmsnorm_fp4_quant_fake(
 
     out1_unquantized = None
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
-
-
-def _mxfp4_activation_quant_layout(num_tokens: int) -> tuple[bool, bool]:
-    if use_fp4_non_shuffle_triton_gemm():
-        return False, False
-    if use_triton_gemm():
-        should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
-        return should_shuffle, should_shuffle
-    return True, True
 
 
 def _fused_rms_fp8_quant_fake(
@@ -578,6 +575,7 @@ def _fuse_rmsnorm_fp4_quant(
     shuffle: bool = True,
     scale_shuffle_padding: bool = True,
     output_unquantized_inp1: bool = False,
+    mxfp4_scale_layout: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -596,6 +594,7 @@ def _fuse_rmsnorm_fp4_quant(
             res1=res1,
             shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
+            scale_layout=mxfp4_scale_layout,
             output_unquantized_inp1=output_unquantized_inp1,
         )
     )
@@ -683,6 +682,7 @@ def _fuse_rmsnorm_quant(
     quant_type: int | None = None,
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = False,
+    mxfp4_scale_layout: int | None = None,
 ):
     if dtype_quant == dtypes.fp4x2:
         out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
@@ -697,6 +697,7 @@ def _fuse_rmsnorm_quant(
                 shuffle,
                 scale_shuffle_padding,
                 output_unquantized_inp1,
+                mxfp4_scale_layout,
             )
         )
     elif dtype_quant == dtypes.fp8 or dtype_quant == torch.bfloat16:
@@ -2783,6 +2784,14 @@ class DeepseekV2MLAAttention(nn.Module):
             and eff_dtype in (dtypes.fp8, dtypes.fp4x2)
         ):
             self.fuse_qknorm_quant = True
+        self.use_fused_qkv_norm_quant = (
+            self.fuse_qknorm_quant
+            and use_triton_gemm()
+            and (
+                self.quant_dtype != dtypes.fp4x2
+                or not use_fp4_non_shuffle_triton_gemm()
+            )
+        )
 
     def forward(
         self,
@@ -2801,8 +2810,16 @@ class DeepseekV2MLAAttention(nn.Module):
             else:
                 hidden_states, hidden_states_scale = hidden_states
 
+        # q/k norm quant feeds q_b_proj, so only reuse the fused producer when
+        # its cached scheme still matches that consumer after online quant.
+        fuse_qknorm_quant = False
         if self.q_lora_rank is not None:
-            if self.fuse_qknorm_quant and use_triton_gemm():
+            fuse_qknorm_quant = (
+                self.fuse_qknorm_quant
+                and self.quant_dtype == self.q_b_proj.params_dtype
+                and self.qknorm_quant_type == self.q_b_proj.quant_type.value
+            )
+            if self.use_fused_qkv_norm_quant and fuse_qknorm_quant:
                 q_c, q_c_scale, kv_c_normed, k_pe = (
                     _fuse_qkv_a_proj_reduce_rmsnorm_quant(
                         hidden_states,
@@ -2835,13 +2852,21 @@ class DeepseekV2MLAAttention(nn.Module):
                     dim=-1,
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
-                if self.fuse_qknorm_quant or self.fuse_qknorm:
-                    q_shuffle = False
-                    q_scale_shuffle_padding = False
-                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
-                        q_shuffle, q_scale_shuffle_padding = (
-                            _mxfp4_activation_quant_layout(q_c.shape[0])
-                        )
+                if fuse_qknorm_quant or self.fuse_qknorm:
+                    qknorm_dtype = (
+                        self.quant_dtype if fuse_qknorm_quant else torch.bfloat16
+                    )
+                    qknorm_quant_type = (
+                        self.qknorm_quant_type
+                        if fuse_qknorm_quant
+                        else QuantType.No.value
+                    )
+                    q_backend = self.q_b_proj.fp4_backend_spec
+                    mxfp4_scale_layout = (
+                        q_backend.activation_scale_layout
+                        if qknorm_dtype == dtypes.fp4x2 and q_backend is not None
+                        else None
+                    )
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
                         _,
@@ -2855,13 +2880,14 @@ class DeepseekV2MLAAttention(nn.Module):
                         self.kv_a_layernorm.weight,
                         self.kv_a_layernorm.eps,
                         None,
-                        dtype_quant=self.quant_dtype,
-                        shuffle=q_shuffle,
-                        scale_shuffle_padding=q_scale_shuffle_padding,
+                        dtype_quant=qknorm_dtype,
+                        shuffle=False,
+                        scale_shuffle_padding=False,
                         group_size=128,
-                        quant_type=self.qknorm_quant_type,
+                        quant_type=qknorm_quant_type,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
+                        mxfp4_scale_layout=mxfp4_scale_layout,
                     )
                 else:
                     hidden_states_or_q_c = self.q_a_layernorm(q_c)
@@ -2872,7 +2898,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.kv_lora_rank, self.qk_rope_head_dim],
                 dim=-1,
             )
-        if not self.fuse_qknorm_quant and not self.fuse_qknorm:
+        if not fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
         if self.is_v32 and self.indexer is not None and not self.skip_topk:
@@ -2980,6 +3006,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             if uses_quantized_attn_input(attn_input_quant_config):
                 self.quant_dtype = attn_input_quant_config.quant_dtype
                 self.input_norm_quant_type = attn_input_quant_config.quant_type.value
+        self.input_quant_consumer_name = attn_input_proj_name
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         # DSA models (e.g., GLM-5/DeepSeek-V3.2): the indexer's wk/weights_proj GEMMs
@@ -3087,12 +3114,19 @@ class DeepseekV2DecoderLayer(nn.Module):
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
             if self.quant_dtype == dtypes.fp4x2:
-                shuffle_input_norm_quant, scale_shuffle_padding = (
-                    _mxfp4_activation_quant_layout(hidden_states.shape[0])
+                shuffle_input_norm_quant = False
+                scale_shuffle_padding = False
+                input_consumer = getattr(self.self_attn, self.input_quant_consumer_name)
+                input_backend = input_consumer.fp4_backend_spec
+                mxfp4_scale_layout = (
+                    input_backend.activation_scale_layout
+                    if input_backend is not None
+                    else None
                 )
             else:
                 shuffle_input_norm_quant = True
                 scale_shuffle_padding = True
+                mxfp4_scale_layout = None
             if residual is None:
                 residual = hidden_states
                 (
@@ -3115,6 +3149,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     quant_type=self.input_norm_quant_type,
                     output_unquantized_inp1=self.emit_bf16_for_indexer,
                     transpose_scale=True,
+                    mxfp4_scale_layout=mxfp4_scale_layout,
                 )
             else:
                 (
@@ -3137,6 +3172,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                     quant_type=self.input_norm_quant_type,
                     output_unquantized_inp1=self.emit_bf16_for_indexer,
                     transpose_scale=True,
+                    mxfp4_scale_layout=mxfp4_scale_layout,
                 )
 
             # v32 indexer layers: pass the bf16 mirror as the 3rd tuple slot so the
