@@ -284,9 +284,17 @@ jobs:
               [[ "${job_state}" == "RUNNING" || "${job_state}" == "COMPLETING" ]] || continue
               [[ "${node_count}" =~ ^[1-9][0-9]*$ ]] || continue
               if [[ -n "${INSPECT_GPU_NODES}" ]]; then
-                bash .github/scripts/atomesh/pd_inspect_gpu_capacity.sh \
-                  "${INSPECT_GPU_NODES}" "${job_id}" \
-                  > "inspection/processes-${job_id}.log" 2>&1
+                IFS=',' read -r -a inspect_nodes <<< "${INSPECT_GPU_NODES}"
+                (( ${#inspect_nodes[@]} >= 1 && ${#inspect_nodes[@]} <= 2 ))
+                for node in "${inspect_nodes[@]}"; do
+                  [[ "${node}" =~ ^pit2-p03-g[0-9]+$ ]]
+                  [[ ",${ATOMESH_NODE_POOL}," == *",${node},"* ]]
+                  timeout --kill-after=5s 120s srun --jobid="${job_id}" --overlap \
+                    --nodelist="${node}" bash \
+                    "${GITHUB_WORKSPACE}/.github/scripts/atomesh/pd_inspect_processes.sh" \
+                    "${job_id}" "${node}" \
+                    > "inspection/processes-${job_id}-${node}.log" 2>&1 || true
+                done
                 continue
               fi
               timeout 10s srun --jobid="${job_id}" --overlap --help \

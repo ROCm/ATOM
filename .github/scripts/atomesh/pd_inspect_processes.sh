@@ -4,6 +4,10 @@ set -euo pipefail
 job_id="${1:?existing Slurm job ID required}"
 [[ "${job_id}" =~ ^[0-9]+$ ]]
 hostname
+if [[ -n "${2:-}" && "$(hostname -s)" != "$2" ]]; then
+  echo "Requested inspection node $2 was not selected" >&2
+  exit 1
+fi
 date -u
 grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Mlocked|Unevictable):' /proc/meminfo
 timeout 5s journalctl -k --since '30 minutes ago' --no-pager 2>&1 |

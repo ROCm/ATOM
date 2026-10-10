@@ -18,15 +18,10 @@ for device in sorted(Path('/sys/class/drm').glob('card[0-9]*/device')):
 print(json.dumps({'physical_gpu_memory': cards}))
 PY
   timeout 10s docker ps --format '{{.Names}} {{.Status}}'
-  if [[ -n "${2:-}" ]]; then
-    bash "$(dirname "$0")/pd_inspect_processes.sh" "$2"
-  fi
   exit
 fi
 
 nodes="${1:?node list required}"
-inspect_job_id="${2:-}"
-[[ -z "${inspect_job_id}" || "${inspect_job_id}" =~ ^[0-9]+$ ]]
 IFS=',' read -r -a selected <<< "${nodes}"
 (( ${#selected[@]} >= 1 && ${#selected[@]} <= 2 ))
 for node in "${selected[@]}"; do
@@ -40,8 +35,7 @@ timeout --kill-after=5s 150s srun \
   --qos amd-frameworks-qos --nodes "${#selected[@]}" \
   --ntasks "${#selected[@]}" --ntasks-per-node 1 --cpus-per-task 1 \
   --gpus 0 --time 00:02:00 --nodelist "${nodes}" \
-  bash "${GITHUB_WORKSPACE}/.github/scripts/atomesh/pd_inspect_gpu_capacity.sh" \
-  --worker "${inspect_job_id}" || rc=$?
+  bash "${GITHUB_WORKSPACE}/.github/scripts/atomesh/pd_inspect_gpu_capacity.sh" --worker || rc=$?
 # Bound even a diagnostic that stayed queued; only cancel its unique job name.
 while IFS='|' read -r job_id job_name; do
   if [[ "${job_id}" =~ ^[0-9]+$ && "${job_name}" == "${name}" ]]; then
