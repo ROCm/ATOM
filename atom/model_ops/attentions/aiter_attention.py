@@ -803,12 +803,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         (see build_for_cudagraph_capture) and its tensors must never be
         reallocated afterwards -- hence one entry per batch, kept forever, and
         refreshed in place before each replay. The refresh is a GPU kernel with
-        no readback. None when FlyDSL or the planner is off, or when the batch
-        is out of range.
+        no readback. None when FlyDSL is off, or when the batch is out of range.
         """
         # The plan only feeds FlyDSL; building one with FlyDSL off is a
         # refresh kernel per step that nothing reads.
-        if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
+        if not envs.ATOM_PA_FLYDSL:
             return None
         # From base_attention, not duplicated: the op checks the same bound.
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
@@ -834,20 +833,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
-            # Plans are only ever minted during cudagraph capture, where the
+            # This builder mints plans only during cudagraph capture, where the
             # batch is a ladder rung and the cost lands at startup. aiter's
             # planner takes batch as a tl.constexpr, so a new value is a kernel
             # specialization -- 65-72 ms cold -- and a plan that is never freed
             # because some captured graph may have baked its pointers in. A
-            # runtime batch with no plan is one no graph will replay, so the
-            # static path is the right answer for it rather than a stall.
+            # runtime batch with no capture-owned plan gets a runtime plan in
+            # run_pa_decode.
             # Only once a capture has happened: before the first one every
             # call lands here (profile run, eager warmup), and logging then
             # burns the one shot on a step that says nothing.
             if self._flydsl_plans and not self._flydsl_plan_unplanned:
                 self._flydsl_plan_unplanned = True
                 logger.info(
-                    "flydsl: batch %d has no plan, running the static path; "
+                    "flydsl: batch %d has no capture-owned plan; an explicit "
+                    "runtime plan will be used; "
                     "captured batches are %s",
                     n,
                     sorted({k[0] for k in self._flydsl_plans}),

@@ -630,6 +630,7 @@ class PagedAttentionImpl(nn.Module):
             # already holds, never the thread-local one: a TBO worker thread
             # that never installed its own shares the other ubatch's.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
+            max_context_length=attn_metadata.max_seqlen_k,
         )
 
         return o
@@ -1678,6 +1679,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=v_scale,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            plan_step_owner=decode_md,
         )
         self._index_q = None
         self._index_q_cache_key_info = None

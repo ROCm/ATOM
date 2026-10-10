@@ -575,6 +575,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             ps=use_ps,
+            # Not yet measured at aiter's default plan ceiling.
+            plan_partition_cap=max_context_partition_num,
         )
         return out
 

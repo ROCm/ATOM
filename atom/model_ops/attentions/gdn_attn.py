@@ -1577,9 +1577,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
 
         # Decode replays this graph, so the op must see a plan HERE: absent at
-        # capture time, the static path is what gets recorded and every later
-        # refresh feeds a graph that never reads it -- with no error, and an
-        # A/B of the planner that measures pure overhead.
+        # capture time, the graph records a per-call runtime-plan refresh
+        # instead of this builder's shared plan.
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens, create=True
         )

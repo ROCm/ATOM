@@ -1315,6 +1315,7 @@ def minimax_m3_sparse_attn_decode_asm(
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
     sparse_ctx: torch.Tensor | None = None,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
+    plan_step_owner=None,
 ) -> None:
     """Block-sparse decode attention over the page-16 SHUFFLE KV cache.
 
@@ -1338,6 +1339,9 @@ def minimax_m3_sparse_attn_decode_asm(
             topk_idx, block_table, seq_lens, block_page_stride=block_page_stride
         )
 
+    # All sparse layers of a step share per-row lengths (the tail block is
+    # always selected, so a length depends only on seq_len, given one
+    # topk/init/local config), so the FlyDSL plan is refreshed once per step.
     _sparse_pa_per_row(
         q,
         k_cache,
@@ -1349,6 +1353,7 @@ def minimax_m3_sparse_attn_decode_asm(
         output,
         k_scale,
         v_scale,
+        plan_step_owner=plan_step_owner,
     )
 
 
@@ -1364,6 +1369,7 @@ def _sparse_pa_per_row(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    plan_step_owner=None,
 ) -> None:
     """Run one sparse selection per row, on ASM where it pays and Gluon else.
 
@@ -1454,6 +1460,9 @@ def _sparse_pa_per_row(
         sinks=None,
         sliding_window=-1,
         ps=True,
+        plan_step_owner=plan_step_owner,
+        # Bounded topk window per row: keep the static split cap.
+        plan_partition_cap=max_context_partition_num,
     )
 
 

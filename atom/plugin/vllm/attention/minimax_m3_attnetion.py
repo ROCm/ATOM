@@ -759,6 +759,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
             block_page_stride=BLOCK_PAGE_STRIDE,
+            plan_step_owner=decode_md,
         )
 
     def _run_prefill_sparse_attention(
