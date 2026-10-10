@@ -2371,6 +2371,16 @@ class MegaMxfp4MoEMethod(Mxfp4MoEMethod):
         from atom.model_ops.fused_moe.flydsl_mega_experts import MegaFusedExperts
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        if envs.ATOM_ENABLE_MOONEP:
+            from atom.model_ops.fused_moe.moonep_mega_experts import MoonEPMegaExperts
+
+            self.fused_experts = MoonEPMegaExperts.for_layer(
+                layer,
+                self.moe,
+                model_dim=self.hidden_size,
+                inter_dim=self.intermediate_size,
+            )
+            return
         self.fused_experts = MegaFusedExperts(
             layer,
             model_dim=self.hidden_size,
