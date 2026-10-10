@@ -17,6 +17,7 @@ from .bounded_replay import (
     decoder_replay_unsupported,
     late_layer_start,
     late_layer_tail,
+    replay_rows,
 )
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
@@ -88,15 +89,15 @@ class RuntimeBlock(Block):
         return v41_engram(residual, self.layer_name)
 
 
-class _Layers(nn.Module):
-    """A contiguous run of the runtime model's layers, compiled on its own.
+class _Stage(nn.Module):
+    """A compiled piece of the runtime model's forward.
 
     The layers stay the owner's submodules (that is where the weights load);
     this holds the owner outside the module tree so parameter traversal does
     not reach them twice.
     """
 
-    def __init__(self, *, atom_config, owner, first, last):
+    def __init__(self, *, atom_config, owner, first=0, last=0):
         super().__init__()
         self.__dict__["owner"] = owner
         self.first, self.last = first, last
@@ -110,45 +111,72 @@ class _Layers(nn.Module):
         return state
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
+)
+class _Backbone(_Stage):
+    """The whole forward as one graph: every V4.1 deployment that does not
+    replay, exactly the graph the runtime model compiled before."""
+
+    def forward(self, input_ids, positions, inputs_embeds=None):
+        return self.owner.forward_hidden(
+            input_ids.unsqueeze(0),
+            None,
+            None,
+            image_mask=get_forward_context().attn_metadata.image_mask,
+            inputs_embeds=(
+                None if inputs_embeds is None else inputs_embeds.unsqueeze(0)
+            ),
+        ).squeeze(0)
+
+
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "inputs_embeds": 0})
-class _EarlyLayers(_Layers):
-    """Embedding, the Engram fork and the layers before ``last``, on every
-    row; the mHC state comes back as its five tensors."""
+class _EarlyLayers(_Stage):
+    """Under bounded replay: embedding, the Engram fork and the layers before
+    the split, on every row; the mHC state comes back as its five tensors,
+    rows first."""
 
     def forward(self, input_ids, inputs_embeds=None):
         m = self.owner
         hidden = (m.embed(input_ids) if inputs_embeds is None else inputs_embeds)[None]
         m.begin_forward(hidden, None)
         state = self.run(SinglePassHCState.from_embeddings(hidden, m.config.hc_mult))
-        return (
-            state.residual,
-            state.pre_mix,
-            state.pending,
-            state.post_mix,
-            state.combination,
+        return tuple(
+            None if t is None else t.squeeze(0)
+            for t in (
+                state.residual,
+                state.pre_mix,
+                state.pending,
+                state.post_mix,
+                state.combination,
+            )
         )
 
 
 @support_torch_compile(
     dynamic_arg_dims={
-        "residual": 1,
-        "pre_mix": 1,
-        "pending": 1,
-        "post_mix": 1,
-        "combination": 1,
+        "residual": 0,
+        "pre_mix": 0,
+        "pending": 0,
+        "post_mix": 0,
+        "combination": 0,
     }
 )
-class _LateLayers(_Layers):
-    """The layers from ``first`` on, the collapse and the Engram join, on
-    whichever rows they are handed: the forward's, or a replay's tail."""
+class _LateLayers(_Stage):
+    """Under bounded replay: the layers from the split on, the collapse and
+    the Engram join, on whichever rows they are handed -- the forward's, or a
+    replay's tail."""
 
     def forward(self, residual, pre_mix, pending, post_mix, combination):
-        state = self.run(
-            SinglePassHCState(residual, pre_mix, pending, post_mix, combination)
+        state = SinglePassHCState(
+            *(
+                None if t is None else t[None]
+                for t in (residual, pre_mix, pending, post_mix, combination)
+            )
         )
-        hidden = state.collapse()
+        hidden = self.run(state).collapse()
         self.owner.end_forward(hidden, None)
-        return hidden
+        return hidden.squeeze(0)
 
 
 class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
@@ -159,9 +187,10 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # `model_loader.deepseek_v41.engram_tables`, which the Engram runtime
     # imports directly and does not route through here.
     #
-    # Compiled as two graphs split after the last KV-source layer, so that a
-    # prefill can run the late one on each request's tail (decoder SWA bounded
-    # replay, `bounded_replay.py`). Decode runs both on every row.
+    # The forward is one compiled graph (`_Backbone`). Under
+    # `--enable-decoder-swa-bounded-replay` it is two, split after the last
+    # KV-source layer, so a prefill can run the late one on each request's
+    # tail (`bounded_replay.py`); decode then runs both on every row.
 
     block_cls = RuntimeBlock
 
@@ -178,29 +207,34 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 layer,
                 rope,
             )
-        hf = config.hf_config
-        layers = hf.num_hidden_layers
-        reason = decoder_replay_unsupported(hf)
-        split = late_layer_start(hf) if reason is None else layers
-        self.replay = reason is None and config.enable_decoder_swa_bounded_replay
-        if config.enable_decoder_swa_bounded_replay:
-            if self.replay:
-                logger.info(
-                    "Decoder SWA bounded replay: prefill runs layers %d..%d on "
-                    "each request's last window-ring rows",
-                    split,
-                    layers - 1,
-                )
+        self.replay = False
+        self.late_aux_layers, self.aux_buffers = (), None
+        if getattr(config, "enable_decoder_swa_bounded_replay", False):
+            reason = decoder_replay_unsupported(config.hf_config)
+            if reason is None:
+                self._build_replay_stages(config)
             else:
                 logger.warning("Decoder SWA bounded replay is off: %s.", reason)
+        if not self.replay:
+            self.backbone = _Backbone(atom_config=config, owner=self)
+
+    def _build_replay_stages(self, config):
+        hf = config.hf_config
+        layers, split = hf.num_hidden_layers, late_layer_start(hf)
+        self.replay = True
         self.late_specs = self.topology[split:layers]
-        self.early = _EarlyLayers(atom_config=config, owner=self, first=0, last=split)
+        self.early = _EarlyLayers(atom_config=config, owner=self, last=split)
         # Its own compile-cache tag: two graphs of one model must not share one.
         with set_model_tag("backbone_late"):
             self.late = _LateLayers(
                 atom_config=config, owner=self, first=split, last=layers
             )
-        self.aux_rows = []
+        logger.info(
+            "Decoder SWA bounded replay: prefill runs layers %d..%d on each "
+            "request's last window-ring rows",
+            split,
+            layers - 1,
+        )
 
     def begin_forward(self, hidden, engram_embeddings):
         v41_begin_forward(hidden)
@@ -209,64 +243,48 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         v41_end_forward(hidden)
 
     def set_aux_hidden_state_rows(self, layer_ids, buffers):
-        """DSpark's aux capture buffers of the late layers: a replay writes
-        their tail rows first and moves them to the forward's rows here."""
-        start = self.late.first
-        self.aux_rows = [b for i, b in zip(layer_ids, buffers) if i >= start]
+        """DSpark's aux captures: ``buffers()`` returns the drafter's current
+        capture buffers, one per id in ``layer_ids``. A replay's late layers
+        capture the tail's rows only, which ``_late_on_tail`` moves to their
+        forward rows."""
+        if self.replay:
+            start = self.late.first
+            self.late_aux_layers = tuple(
+                k for k, layer in enumerate(layer_ids) if layer >= start
+            )
+            self.aux_buffers = buffers
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         """Tensor-only serving entry; guarded ops read the live forward context."""
+        if not self.replay:
+            return self.backbone(input_ids, positions, inputs_embeds)
         state = self.early(input_ids, inputs_embeds)
-        tail = self._replay_tail(input_ids, inputs_embeds)
-        if tail is None:
-            return self.late(*state).squeeze(0)
+        forward = get_forward_context()
+        ring = replay_rows(forward, input_ids.numel(), inputs_embeds is not None)
+        if ring is None:
+            return self.late(*state)
+        tail = build_late_layer_tail(forward.attn_metadata.step, ring, self.late_specs)
         return self._late_on_tail(state, tail, input_ids.numel())
 
-    def _replay_tail(self, input_ids, inputs_embeds):
-        """The tail of a prefill that replays, or None: decode, warmup, draft,
-        TBO microbatches, image rows, padded steps and prompts no longer than
-        the tail take every row through the late layers."""
-        if not self.replay or inputs_embeds is not None:
-            return None
-        forward = get_forward_context()
-        context, metadata = forward.context, forward.attn_metadata
-        if (
-            context is None
-            or not context.is_prefill
-            or context.is_dummy_run
-            or context.is_draft
-            or forward.ubatch_slices is not None
-        ):
-            return None
-        step = getattr(metadata, "step", None)
-        if (
-            step is None
-            or step.decode
-            or getattr(metadata, "image_mask", None) is not None
-            or input_ids.numel() != step.width
-            or step.width != step.scheduled
-        ):
-            return None
-        ring = metadata.cache.geometry.ring_slots
-        if not any(span.length > ring for span in step.requests):
-            return None
-        return build_late_layer_tail(step, ring, self.late_specs, metadata.cache)
-
     def _late_on_tail(self, state, tail, num_tokens):
-        metadata = get_forward_context().attn_metadata
         rows = tail.token_indices
-        with late_layer_tail(metadata, tail):
-            hidden = self.late(*(t.index_select(1, rows) for t in state))
-        # Late-layer aux captures wrote the tail's rows first; put each at
-        # its forward row. The others hold stale values nothing reads: the
-        # draft's context write takes each request's last ring rows, all tail.
-        n = rows.numel()
-        for buffer in self.aux_rows:
-            buffer.index_copy_(0, rows, buffer[:n].clone())
-        # The trimmed rows' outputs are never read: the LM head takes each
-        # request's last row, which is in the tail.
+        with late_layer_tail(get_forward_context().attn_metadata, tail):
+            hidden = self.late(*SinglePassHCState(*state).take_rows(rows).fields())
+        # Late-layer aux captures wrote the tail's rows at the buffer's head;
+        # move each to its forward row. The other rows hold values nothing
+        # reads: the draft's context write takes each request's last ring rows,
+        # all of them in the tail.
+        if self.late_aux_layers:
+            buffers = self.aux_buffers()
+            n = rows.numel()
+            for k in self.late_aux_layers:
+                buffers[k].index_copy_(0, rows, buffers[k][:n].clone())
+        # Rows outside the tail are left unwritten: only each request's last
+        # row is read (the LM head's), and it is in the tail. `compute_logits`
+        # still norms every row; restricting it needs a per-forward signal
+        # that survives CUDA-graph replay, which skips this Python.
         out = hidden.new_empty(num_tokens, hidden.shape[-1])
-        out.index_copy_(0, rows, hidden[0])
+        out.index_copy_(0, rows, hidden)
         return out
 
     def compute_logits(self, hidden):

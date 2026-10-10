@@ -54,10 +54,11 @@ def _indptr_scan(
         pos = tl.load(positions + idx, mask=live, other=0).to(tl.int32)
         start = tl.load(cu + bid, mask=live, other=0)
         first = tl.maximum(pos - WINDOW + 1, 0)
-        # A request's window starts no lower than its replay start: 0 except
-        # on a bounded-replay tail, whose late layers wrote no window row below
-        # it (`BatchStep.swa_replay_start`).
-        first = tl.maximum(first, tl.load(replay_start + bid, mask=live, other=0))
+        if not DECODE:
+            # A request's window starts no lower than its replay start: 0
+            # except on a bounded-replay tail, a prefill whose late layers
+            # wrote no window row below it (`BatchStep.swa_replay_start`).
+            first = tl.maximum(first, tl.load(replay_start + bid, mask=live, other=0))
         # Decode sees its own token; a prefill chunk sees only what its first
         # token already had, the rest arriving as the extend segment.
         history_end = (
@@ -161,7 +162,9 @@ def _indices(
     start = tl.load(cu + batch)
     pos = tl.load(positions + t)
     first = tl.maximum(0, pos - WINDOW + 1)
-    first = tl.maximum(first, tl.load(replay_start + batch))
+    if not DECODE:
+        # see `_indptr_scan`: only a prefill can be a bounded-replay tail
+        first = tl.maximum(first, tl.load(replay_start + batch))
     history_end = pos + 1 if DECODE else tl.load(positions + start)
     window_count = tl.maximum(0, history_end - first)
     pbegin, pend = tl.load(pptr + t), tl.load(pptr + t + 1)
@@ -203,8 +206,9 @@ def _indices(
 
 
 def _replay_start(step):
-    """`step.swa_replay_start`; zeros for a step built outside the cache
-    (`PagedAttentionCache.begin_step` sets serving's fixed buffer)."""
+    """`step.swa_replay_start`. Serving's steps carry the cache's fixed zeros
+    (`PagedAttentionCache.begin_step`) or a replay tail's own; this fallback
+    only serves steps assembled outside the cache, in tests."""
     replay_start = getattr(step, "swa_replay_start", None)
     if replay_start is None:
         # one per request slot the step publishes, padding included

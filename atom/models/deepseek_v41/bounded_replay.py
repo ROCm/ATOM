@@ -11,24 +11,27 @@ early layers on every row and the late layers on each request's tail only.
 This is SGLang's ``--enable-decoder-swa-bounded-replay`` (``LateLayerTail``,
 ``late_layer_tail_layout``, ``enter_late_layer_tail``) and vLLM's
 ``--swa-bounded-replay`` (``DecoderReplayLayers``); the names follow SGLang.
-The runtime model compiles the early and late layers as two graphs
-(``runtime._EarlyLayers`` / ``_LateLayers``) and, on a replay, hands the late
-graph the tail's rows with the tail's step in the forward context.
+Under the flag the runtime model compiles the early and late layers as two
+graphs (``runtime._EarlyLayers`` / ``_LateLayers``) and, on a replay, hands
+the late graph the tail's rows with the tail's step in the forward context.
 
 The late layers see the tail as a chunked prefill that starts at the tail.
 Every global row before it is in the cache already (the early layers wrote it
 this forward); only the late layers' window rows below the tail were never
 computed, so the tail step carries ``swa_replay_start``, which keeps the index
-build from reading them. That truncated window is the approximation SGLang and
-vLLM make too: the tail's first rows see less local context in layer 21, and
-each later layer carries the difference at most one window further, so the
-last token's logits and the window rows decode reads are close to, not equal
-to, a full prefill's.
+build from reading them.
 
-The tail is the window ring (``geometry.ring_slots``: window + speculative
-tokens, 133 on V4.1-Flash with five DSpark tokens), so the prefill rewrites
-every ring slot and every row the draft's context write reads. SGLang keeps
-128; the five extra rows cost nothing measurable.
+Accuracy. The result is not a full prefill's. In layer 21 every tail row but
+the last few sees a window truncated at the tail start. The tail is the ring,
+``window + speculative tokens`` rows (133 on V4.1-Flash), only a few rows
+longer than the window, so from layer 22 on even the last token's window
+consists of rows that were themselves computed from truncated windows. The
+last token's logits and every ring row decode reads therefore differ from a
+full prefill's in all late layers. The global path -- the KV-source layers'
+compressed KV and the top-k selections the late layers reuse -- is exact,
+which is why the effect is small in practice (GSM8K and long-context
+retrieval unchanged within run-to-run noise on V4.1-Flash). SGLang and vLLM
+make the same approximation.
 """
 
 import contextlib
@@ -54,15 +57,44 @@ def decoder_replay_unsupported(hf_config) -> str | None:
     nothing (a KV source is the only layer with a compressor, so that holds by
     construction) and carries no Engram, whose n-gram rows read every token.
     """
-    sources = list(getattr(hf_config, "kv_source_layer_ids", ()) or ())
-    if not sources:
+    if not list(getattr(hf_config, "kv_source_layer_ids", ()) or ()):
         return "the model declares no kv_source_layer_ids"
-    start = max(sources) + 1
+    start = late_layer_start(hf_config)
     if start >= hf_config.num_hidden_layers:
         return "no layer follows the last KV source layer"
     if any(i >= start for i in getattr(hf_config, "engram_layer_ids", ())):
         return "an Engram layer sits after the last KV source layer"
     return None
+
+
+def replay_rows(forward, num_tokens: int, has_inputs_embeds: bool) -> int | None:
+    """The tail length when this forward replays, else None.
+
+    Only a prefill of text rows with a request longer than the ring replays.
+    Decode, warmup, draft, TBO microbatches, image rows and padded steps take
+    every row through the late layers.
+    """
+    context, metadata = forward.context, forward.attn_metadata
+    if (
+        has_inputs_embeds
+        or context is None
+        or not context.is_prefill
+        or context.is_dummy_run
+        or context.is_draft
+        or forward.ubatch_slices is not None
+    ):
+        return None
+    step = getattr(metadata, "step", None)
+    if (
+        step is None
+        or step.decode
+        or getattr(metadata, "image_mask", None) is not None
+        or num_tokens != step.width
+        or step.width != step.scheduled
+    ):
+        return None
+    ring = metadata.cache.geometry.ring_slots
+    return ring if any(span.length > ring for span in step.requests) else None
 
 
 def late_layer_tail_layout(step: BatchStep, tail_len: int):
@@ -98,35 +130,48 @@ class LateLayerTail:
     step: BatchStep
 
 
-def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs, cache):
+def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs) -> LateLayerTail:
     """``step`` cut down to each request's tail, with what the late layers read
-    off the early ones carried over by row."""
-    # Triton-backed; imported here so the host-side helpers above import
-    # without it.
-    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
-
+    off the early ones carried over by row. Host-side and kernel-free; the
+    tail's indptrs are filled by ``late_layer_tail``."""
     spans, indices, replay_start = late_layer_tail_layout(step, tail_len)
-    device = step.positions.device
-    token_indices = upload_numpy(indices, device)
-    lengths = np.asarray([span.length for span in spans], dtype=np.int32)
-    cu_seqlens_q = np.concatenate(([0], np.cumsum(lengths))).astype(np.int32)
+    lengths = np.asarray([span.length for span in spans], dtype=np.int64)
+    cu_seqlens_q = np.concatenate(([0], np.cumsum(lengths)))
+    # One upload for the four per-tail arrays, sliced apart on the device.
+    packed = upload_numpy(
+        np.concatenate(
+            (
+                indices,
+                cu_seqlens_q,
+                build_batch_ids(lengths).astype(np.int64),
+                replay_start.astype(np.int64),
+            )
+        ),
+        step.positions.device,
+    )
+    rows = len(indices)
+    token_indices = packed[:rows]
+    cu, batch_ids, swa_replay_start = (
+        part.to(torch.int32)
+        for part in packed[rows:].split((len(spans) + 1, rows, len(spans)))
+    )
 
-    def rows(t, dim=0):
+    def take(t, dim=0):
         return t.index_select(dim, token_indices)
 
     tail = BatchStep(
         spans,
-        rows(step.positions),
-        upload_numpy(cu_seqlens_q, device),
+        take(step.positions),
+        cu,
         step.slots[: len(spans)],
-        upload_numpy(build_batch_ids(lengths), device),
+        batch_ids,
         step.block_tables[: len(spans)],
-        scheduled=int(lengths.sum()),
+        scheduled=rows,
         max_q_len=int(lengths.max()),
-        visible={ratio: rows(v) for ratio, v in step.visible.items()},
+        visible={ratio: take(v) for ratio, v in step.visible.items()},
         plans=step.plans,
         request_positions=np.asarray([s.position for s in spans], dtype=np.int32),
-        swa_replay_start=upload_numpy(replay_start, device),
+        swa_replay_start=swa_replay_start,
     )
     # A REUSE layer reads its owner's selection and every layer from the
     # candidate source on reads its candidates. The owners and sources among
@@ -135,10 +180,9 @@ def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs, cache):
     late = {s.layer_id for s in late_specs}
     owners = {s.topk_owner for s in late_specs if s.topk_owner is not None}
     for owner in owners - late:
-        tail.selected[owner] = rows(step.selected[owner], dim=1)
+        tail.selected[owner] = take(step.selected[owner], dim=1)
     for source in {s.candidate_source for s in late_specs} - {None} - late:
-        tail.candidates[source] = rows(step.candidates[source])
-    tail.indptrs = fill_step_indptrs(tail, cache.geometry, cache.indptr_buffers)
+        tail.candidates[source] = take(step.candidates[source])
     return LateLayerTail(token_indices, tail)
 
 
@@ -146,9 +190,19 @@ def build_late_layer_tail(step: BatchStep, tail_len: int, late_specs, cache):
 def late_layer_tail(metadata, tail: LateLayerTail):
     """The late layers' step is the tail's while they run.
 
-    The forward's own indptrs are not restored afterwards: nothing after the
-    model reads them, and the next forward rebuilds its step.
+    Filling the tail's indptrs rewrites the cache's shared indptr buffers, and
+    the late REINDEX layers rewrite its tile workspace. The forward's step is
+    restored afterwards but those buffers keep the tail's contents: nothing
+    reads them after the model, and the next forward's ``begin_step`` refills
+    both.
     """
+    # Triton-backed; imported here so this module imports without it.
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+
+    cache = metadata.cache
+    tail.step.indptrs = fill_step_indptrs(
+        tail.step, cache.geometry, cache.indptr_buffers
+    )
     full = metadata.step
     metadata.step = tail.step
     try:

@@ -123,6 +123,16 @@ class SinglePassHCState:
             self.pre_mix,
         )
 
+    def fields(self):
+        """The five tensors, in constructor order."""
+        return (
+            self.residual,
+            self.pre_mix,
+            self.pending,
+            self.post_mix,
+            self.combination,
+        )
+
     def take_rows(self, rows: torch.Tensor):
         """This state at ``rows`` of its token axis (the one before ``hc``),
         an owed post included -- bounded replay's late layers on a tail."""
