@@ -22,6 +22,11 @@ _ASYNC_ADAPTER_ATTRS = (
     "_lookup_results",
 )
 
+_ASYNC_LOOKUP_FAILED = (
+    "LMCache MP async lookup failed for request %s in phase %s; "
+    "read locks it may hold are left to the read TTL"
+)
+
 
 @dataclass
 class _LookupState:
@@ -125,7 +130,8 @@ class _MPLookupClient:
             return self._advance(lookup_id)
         except Exception:
             # Let the synchronous path ask again and surface the error there.
-            self._drop_failed(lookup_id)
+            phase = self._drop_failed(lookup_id)
+            logger.warning(_ASYNC_LOOKUP_FAILED, lookup_id, phase, exc_info=True)
             return True
 
     def pending_ids(self):
@@ -164,26 +170,21 @@ class _MPLookupClient:
             try:
                 answered = self._advance(lookup_id)
             except Exception:
-                self._drop_failed(lookup_id)
+                phase = self._drop_failed(lookup_id)
+                logger.warning(_ASYNC_LOOKUP_FAILED, lookup_id, phase, exc_info=True)
                 continue
             if answered and lookup_id in self._orphans:
                 self._orphans.discard(lookup_id)
                 self._release_unconsumed(lookup_id)
 
-    def _drop_failed(self, lookup_id: str) -> None:
-        """Forget an async lookup that raised; call from its except block.
+    def _drop_failed(self, lookup_id: str) -> str | None:
+        """Forget an async lookup that raised; return the phase it failed in.
 
         Its hit is unknown, so read locks the server may already hold for it
         cannot be freed here and expire only with the L1 read TTL.
         """
         entry = self._async.pop(lookup_id, None)
-        logger.warning(
-            "LMCache MP async lookup failed for request %s in phase %s; "
-            "read locks it may hold are left to the read TTL",
-            lookup_id,
-            entry[2] if entry is not None else None,
-            exc_info=True,
-        )
+        return entry[2] if entry is not None else None
 
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)
@@ -221,7 +222,10 @@ class _MPLookupClient:
                     if self._advance(lookup_id):
                         break
                 except Exception:
-                    self._drop_failed(lookup_id)
+                    phase = self._drop_failed(lookup_id)
+                    logger.warning(
+                        _ASYNC_LOOKUP_FAILED, lookup_id, phase, exc_info=True
+                    )
                     raise
                 if time.monotonic() >= deadline:
                     logger.warning(
