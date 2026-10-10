@@ -553,6 +553,37 @@ decode_cudagraph_args=()
 build_cudagraph_args prefill prefill_cudagraph_args
 build_cudagraph_args decode decode_cudagraph_args
 
+# Where a worker's FlyDSL cache lives. Preferred: the node-wide AOT cache
+# pd_slurm_job.sh extracted from the image, used in place (FlyDSL locks each
+# key, so workers share it safely). Fallback: copy the AOT kernels into the
+# worker's private dir, from that shared dir if it is readable but not
+# writable, else from the image itself when this uid can read it. Otherwise the
+# private dir starts empty and every tuned kernel JIT-compiles on first use.
+resolve_flydsl_cache_dir() {
+  local role="$1"
+  local private_dir="$2"
+  local shared="${ATOMESH_FLYDSL_AOT_DIR:-}"
+  local src=""
+
+  if [[ -n "${shared}" && -f "${shared}/.complete" ]]; then
+    if [[ -w "${shared}" ]]; then
+      echo "[runtime] ${role} flydsl cache=${shared} (shared AOT)" >&2
+      echo "${shared}"
+      return 0
+    fi
+    src="${shared}"
+  fi
+  if [[ -z "${src}" ]]; then
+    src="$(python3 -c 'import importlib.util as u, os; s = u.find_spec("aiter"); print(os.path.join(os.path.dirname(s.origin), "jit", "flydsl_cache") if s else "")' 2>/dev/null || true)"
+  fi
+  if [[ -n "${src}" && -d "${src}" ]] && cp -R "${src}/." "${private_dir}/" 2>/dev/null; then
+    echo "[runtime] ${role} flydsl cache=${private_dir} (copied AOT from ${src})" >&2
+  else
+    echo "[runtime] WARN: ${role} flydsl cache=${private_dir} has no AOT kernels; tuned kernels JIT-compile on first use" >&2
+  fi
+  echo "${private_dir}"
+}
+
 build_server_cache_env() {
   local role="$1"
   local server_port="$2"
@@ -563,6 +594,9 @@ build_server_cache_env() {
   cache_root="${cache_base}/${role}-${server_port}"
   mkdir -p "${cache_root}"/{home,xdg,torchinductor,triton,aiter/jit,flydsl}
 
+  local flydsl_dir
+  flydsl_dir="$(resolve_flydsl_cache_dir "${role}" "${cache_root}/flydsl")"
+
   out=(
     "HOME=${cache_root}/home"
     "XDG_CACHE_HOME=${cache_root}/xdg"
@@ -570,7 +604,7 @@ build_server_cache_env() {
     "TRITON_CACHE_DIR=${cache_root}/triton"
     "AITER_CACHE_DIR=${cache_root}/aiter"
     "AITER_JIT_DIR=${cache_root}/aiter/jit"
-    "FLYDSL_RUNTIME_CACHE_DIR=${cache_root}/flydsl"
+    "FLYDSL_RUNTIME_CACHE_DIR=${flydsl_dir}"
   )
   echo "[runtime] ${role} cache root=${cache_root} (port=${server_port})"
 }
