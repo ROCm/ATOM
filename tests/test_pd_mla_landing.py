@@ -369,6 +369,62 @@ def test_malformed_landed_slots_fail_the_request(landed):
     assert dest.credits() == []
 
 
+@pytest.mark.parametrize("landed", [[10_000], [True]], ids=["outside", "bool"])
+def test_landed_slots_outside_the_partition_fail_the_request(landed):
+    # The stage was never given such a slot, so the list cannot be trusted:
+    # the request fails instead of settling without those rows.
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    dest.recv.stage_done("r", 0, 5, True, landed)
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == []
+
+
+@pytest.mark.parametrize("listed", ["other-slot", "missing"])
+def test_a_write_done_that_disagrees_with_its_readys_fails_the_request(listed):
+    # A READY that named another slot for its seq, or that the list leaves
+    # out, was scattered from a slot the stage may not have written.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
+    dest.pump()
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.stage_done("r", 0, 5, True, [s0[1]] if listed == "other-slot" else [])
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == []
+
+
+def test_a_ready_missing_from_its_write_done_fails_the_request():
+    # The write-done ended the stage without this READY, so its rows are not
+    # part of the request; its slot goes back once.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 2)["slots"]
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 0, 5, True, [])
+    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
+    assert dest.recv._queue.empty()
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.stage_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", True)]
+
+
+def test_a_trailing_ready_that_names_another_slot_fails_the_request():
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 2)["slots"]
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
+    assert dest.credits() == [("stage0", [s0[0]])]
+    dest.recv.on_ready(_ready("r", s0[1], 0, [[0, 0, 1, 0]]))
+    assert dest.recv._queue.empty()
+    assert dest.credits() == []
+    dest.recv.stage_done("r", 1, 5, True, [])
+    assert dest.finished == [("r", True)]
+
+
 def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
