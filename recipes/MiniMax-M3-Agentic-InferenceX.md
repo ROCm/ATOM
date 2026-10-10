@@ -54,7 +54,7 @@ env \
 
 ## FlyDSL paged decode
 
-`ATOM_PA_FLYDSL=1` is opt-in and off by default. It routes the paged decode to aiter's FlyDSL kernel instead of gluon, and brings aiter #5546's GPU work planner with it (`ATOM_PA_FLYDSL_PLAN`, on by default, and inert without `ATOM_PA_FLYDSL=1`).
+`ATOM_PA_FLYDSL=1` is opt-in and off by default. It routes the paged decode to aiter's FlyDSL kernel instead of gluon, and brings aiter's GPU work planner with it.
 
 gluon splits every request in a batch the same way. An agentic decode batch is not uniform — measured over 30,400 steps at CONC=32, the step-internal `max/min` context ratio is p50 2.49, p90 22.2, and 31.2% of steps exceed 4× — so one long request owns the critical path. The planner sizes each request's partition count from its real context length instead, under a workgroup budget.
 

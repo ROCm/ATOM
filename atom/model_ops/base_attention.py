@@ -4,6 +4,7 @@
 # from flash_attn import flash_attn_with_kvcache
 import functools
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import torch
@@ -18,6 +19,20 @@ from atom.utils.selector import Family, get_attn_backend
 from .attention_mla import MLAModules, _mla_output_width
 
 logger = logging.getLogger("atom")
+
+
+def _warn_removed_flydsl_plan_env() -> None:
+    """ATOM_PA_FLYDSL_PLAN is gone: with aiter #5809 every FlyDSL decode needs
+    a plan, so PLAN=0 could only mean gluon, which ATOM_PA_FLYDSL=0 already is."""
+    if "ATOM_PA_FLYDSL_PLAN" in os.environ:
+        logger.warning(
+            "ATOM_PA_FLYDSL_PLAN is no longer used and is ignored; FlyDSL "
+            "paged decode always uses its work planner. Set ATOM_PA_FLYDSL=0 "
+            "for gluon."
+        )
+
+
+_warn_removed_flydsl_plan_env()
 
 
 # frontend interface class for constructing attention
@@ -499,10 +514,7 @@ def run_pa_decode(
     validation so an unsupported shape falls back here instead of raising
     inside aiter.
     """
-    # aiter #5809 has no no-plan FlyDSL decode. Keep PLAN=0 useful as a clean
-    # A/B switch by routing it to Gluon instead of silently constructing an
-    # implicit planner inside the call.
-    flydsl_enabled = envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN
+    flydsl_enabled = envs.ATOM_PA_FLYDSL
     flydsl_seqs = flydsl_enabled and _flydsl_pa_decode_num_seqs(
         output=output,
         q=q,
@@ -542,10 +554,10 @@ def run_pa_decode(
     # new one on every prefill tail -- so keying on them leaks one entry and one
     # log line per distinct length for the life of the process.
     # `is not False` distinguishes the two falsy cases the `and` above produces:
-    # False means FlyDSL or its required planner is off (log nothing -- such a
-    # deployment must not pay for it, and this runs 63x per step on a piecewise
-    # split op that graph replay does not elide), None means both are on and the
-    # capability check rejected, which is exactly what the log exists to show.
+    # False means FlyDSL is off (log nothing -- such a deployment must not pay
+    # for it, and this runs 63x per step on a piecewise split op that graph
+    # replay does not elide), None means it is on and the capability check
+    # rejected, which is exactly what the log exists to show.
     # The residual cost when off is one envs read; hoisting that to a module
     # constant would make the env unpatchable, which the tests rely on.
     if (

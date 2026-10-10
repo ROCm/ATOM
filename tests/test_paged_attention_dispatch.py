@@ -439,35 +439,34 @@ class TestWorkPlanWiring:
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         assert builder.refresh_flydsl_plan(_fake_ctx(8), create=True) is not None
         assert "max_partitions" not in seen, f"ceiling was set: {seen}"
 
-    def test_planner_off_returns_no_plan(self, monkeypatch):
-        """With the env off the builder must return None, not a stale plan."""
+    def test_removed_plan_env_changes_nothing(self, monkeypatch, caplog):
+        """ATOM_PA_FLYDSL_PLAN is gone: a leftover 0 must not switch FlyDSL off
+        silently, and the operator is told it is ignored."""
+        import logging
+
+        from atom.model_ops import base_attention as ba
         from atom.model_ops.attentions import aiter_attention as aa
 
+        monkeypatch.setenv("ATOM_PA_FLYDSL_PLAN", "0")
+        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(
+            importlib.import_module("aiter.ops.flydsl.pa_decode"),
+            "plan_pa_decode",
+            lambda *a, **kw: _FakePlan(),
+        )
         builder = aa.AiterAttentionMetadataBuilder.__new__(
             aa.AiterAttentionMetadataBuilder
         )
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", False)
-        ctx = _fake_ctx(8)
-        assert builder.refresh_flydsl_plan(ctx) is None
-
-    def test_planner_off_routes_pa_decode_to_gluon(self):
-        """#5809 has no static FlyDSL path, so PLAN=0 is the clean A/B."""
-        import inspect
-
-        from atom.model_ops.base_attention import run_pa_decode
-
-        src = inspect.getsource(run_pa_decode)
-        assert (
-            "envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN" in src
-        ), "FlyDSL must require its planner switch"
+        assert builder.refresh_flydsl_plan(_fake_ctx(8), create=True) is not None
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            ba._warn_removed_flydsl_plan_env()
+        assert "ATOM_PA_FLYDSL_PLAN is no longer used" in caplog.text
 
     def test_batch_past_the_planner_limit_falls_back(self, monkeypatch):
         """M3's sparse prefill-as-decode folds query tokens into num_seqs.
@@ -485,7 +484,6 @@ class TestWorkPlanWiring:
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
         ctx = SimpleNamespace(
             shape=(_FLYDSL_PLAN_MAX_BATCH + 1,), device=SimpleNamespace(index=0)
         )
@@ -606,7 +604,6 @@ class TestWorkPlanWiring:
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         ctx = _fake_ctx
 
@@ -721,7 +718,6 @@ class TestWorkPlanWiring:
         builder._flydsl_plans = {}
         builder._flydsl_plan_unplanned = False
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         assert (
             builder.refresh_flydsl_plan(_fake_ctx(31)) is None
@@ -754,7 +750,6 @@ class TestWorkPlanWiring:
         builder._flydsl_plans = {}
         builder._flydsl_plan_unplanned = False
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         builder.refresh_flydsl_plan(_fake_ctx(31))
         assert not builder._flydsl_plan_unplanned, "nothing captured yet; stay quiet"
@@ -867,7 +862,7 @@ class TestWorkPlanWiring:
 
         src = inspect.getsource(ba.run_pa_decode)
         assert (
-            "envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN" in src
+            "flydsl_enabled = envs.ATOM_PA_FLYDSL\n" in src
             and "flydsl_enabled and _flydsl_pa_decode_num_seqs" in src
         ), "the env gate is gone, or no longer short-circuits the capability check"
 
@@ -888,7 +883,6 @@ class TestWorkPlanWiring:
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         for field, bad in (
             ("dtype", torch.int64),
@@ -917,7 +911,6 @@ class TestWorkPlanWiring:
         builder._flydsl_kv_heads = 1
         builder._flydsl_plans = {}
         monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL", False)
-        monkeypatch.setattr(aa.envs, "ATOM_PA_FLYDSL_PLAN", True)
 
         ctx = _fake_ctx(8)
         assert builder.refresh_flydsl_plan(ctx) is None
@@ -1152,7 +1145,6 @@ class TestPlanBatchLimit:
 
         n = ba._FLYDSL_PLAN_MAX_BATCH + 1
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL_PLAN", True)
         monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
 
         def no_flydsl(**kw):
@@ -1193,7 +1185,6 @@ class TestPlanBatchLimit:
 
         n = 4
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL_PLAN", True)
         monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
         seen = {}
 
@@ -1236,7 +1227,6 @@ class TestPlanBatchLimit:
 
         n = 4
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL_PLAN", True)
         monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
 
         def no_flydsl(**kw):

@@ -803,14 +803,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         (see build_for_cudagraph_capture) and its tensors must never be
         reallocated afterwards -- hence one entry per batch, kept forever, and
         refreshed in place before each replay. The refresh is a GPU kernel with
-        no readback. None when FlyDSL or the planner is off, or when the batch is
-        out of range. Since aiter #5809 requires an explicit plan, PLAN=0 also
-        routes the eventual PA call to Gluon rather than selecting a static
-        FlyDSL path that no longer exists.
+        no readback. None when FlyDSL is off, or when the batch is out of range.
         """
         # The plan only feeds FlyDSL; building one with FlyDSL off is a
         # refresh kernel per step that nothing reads.
-        if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
+        if not envs.ATOM_PA_FLYDSL:
             return None
         # From base_attention, not duplicated: the op checks the same bound.
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
