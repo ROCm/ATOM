@@ -3,6 +3,7 @@
 
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod multi_api;
 pub mod streaming_helpers;
 pub mod test_app;
 pub mod test_config;
@@ -20,7 +21,7 @@ use data_connector::{
 use mesh::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    core::{Job, LoadMonitor, WorkerRegistry},
+    core::{prepare_pool::PreparePoolRuntime, Job, LoadMonitor, WorkerRegistry},
     middleware::TokenBucket,
     policies::PolicyRegistry,
     protocols::common::{Function, Tool},
@@ -152,6 +153,7 @@ pub struct AppTestContext {
     pub router: Arc<dyn RouterTrait>,
     pub config: RouterConfig,
     pub app_context: Arc<AppContext>,
+    _prepare_runtime: PreparePoolRuntime,
 }
 
 impl AppTestContext {
@@ -195,7 +197,7 @@ impl AppTestContext {
             }
         }
 
-        let app_context = create_test_context(config.clone()).await;
+        let (app_context, prepare_runtime) = create_test_context(config.clone()).await;
 
         if !worker_urls.is_empty() {
             let job_queue = app_context
@@ -244,6 +246,7 @@ impl AppTestContext {
             router,
             config,
             app_context,
+            _prepare_runtime: prepare_runtime,
         }
     }
 
@@ -262,7 +265,8 @@ impl AppTestContext {
 }
 
 /// Helper function to create AppContext for tests
-pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
+pub async fn create_test_context(config: RouterConfig) -> (Arc<AppContext>, PreparePoolRuntime) {
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
@@ -303,6 +307,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 
     let app_context = Arc::new(
         AppContext::builder()
+            .prepare_pool(prepare_runtime.handle())
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
@@ -337,11 +342,14 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .set(engines)
         .expect("WorkflowEngines should only be initialized once");
 
-    app_context
+    (app_context, prepare_runtime)
 }
 
 /// Helper function to create AppContext for tests with parser factories initialized
-pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppContext> {
+pub async fn create_test_context_with_parsers(
+    config: RouterConfig,
+) -> (Arc<AppContext>, PreparePoolRuntime) {
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
@@ -387,6 +395,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
 
     let app_context = Arc::new(
         AppContext::builder()
+            .prepare_pool(prepare_runtime.handle())
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
@@ -421,7 +430,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         .set(engines)
         .expect("WorkflowEngines should only be initialized once");
 
-    app_context
+    (app_context, prepare_runtime)
 }
 
 // Tokenizer download configuration

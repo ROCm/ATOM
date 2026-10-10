@@ -9,7 +9,7 @@ use std::{
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{BasicWorkerBuilder, Worker},
+    core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, Worker},
     ext_proc::{
         proto::{
             envoy::{
@@ -30,13 +30,19 @@ struct Fixture {
     app: Arc<AppContext>,
     runtime: ExtProcRuntime,
     worker: Arc<dyn Worker>,
+    _prepare_runtime: PreparePoolRuntime,
 }
 
 impl Fixture {
     async fn new(mut config: RouterConfig) -> Self {
         config.ext_proc.enabled = true;
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://127.0.0.1:18001")
                 .model_id("test-model")
@@ -48,6 +54,7 @@ impl Fixture {
             app,
             runtime,
             worker,
+            _prepare_runtime: prepare_runtime,
         }
     }
 
@@ -747,7 +754,7 @@ async fn prefix_hash_requires_tokens_and_accepts_generate_input_ids() {
 async fn protocol_modes_encoding_and_api_paths_are_explicitly_rejected() {
     let fixture = Fixture::new(RouterConfig::default()).await;
     for (path, method, encoding, status) in [
-        ("/v1/responses", "POST", "identity", 404),
+        ("/v1/not-an-api", "POST", "identity", 404),
         ("/v1/chat/completions", "GET", "identity", 405),
         ("/v1/chat/completions", "POST", "gzip", 415),
     ] {
@@ -1405,7 +1412,12 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
     config.max_concurrent_requests = 1;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
     config.ext_proc.executor_listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     for kind in [
         WorkerType::Prefill {
             bootstrap_port: Some(9000),
@@ -1415,18 +1427,28 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = calls.clone();
-        let router = axum::Router::new().route(
-            "/v1/chat/completions",
-            axum::routing::post(
-                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
-                    if body["slow"] == true {
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
-                    }
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    axum::Json(serde_json::json!({"choices":[{"text":"ok"}]}))
-                },
-            ),
-        );
+        let key = match kind {
+            WorkerType::Prefill { .. } => "prefill-secret",
+            _ => "decode-secret",
+        };
+        let router =
+            axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(
+                    move |headers: http::HeaderMap,
+                          axum::Json(body): axum::Json<serde_json::Value>| async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {key}"));
+                        assert_eq!(headers.get_all("authorization").iter().count(), 1);
+                        assert!(!headers.contains_key("x-api-key"));
+                        assert_eq!(headers["x-request-id"], "pd-credentials");
+                        if body["slow"] == true {
+                            tokio::time::sleep(Duration::from_millis(1200)).await;
+                        }
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"choices":[{"text":"ok"}]}))
+                    },
+                ),
+            );
         servers.push(tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         }));
@@ -1434,6 +1456,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
             BasicWorkerBuilder::new(format!("http://{address}"))
                 .model_id("test-model")
                 .worker_type(kind)
+                .api_key(key)
                 .build(),
         );
         app.worker_registry.register(worker.clone());
@@ -1444,6 +1467,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         app: app.clone(),
         runtime,
         worker: workers[0].clone(),
+        _prepare_runtime: prepare_runtime,
     };
     let client = reqwest::Client::new();
     let body = br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#;
@@ -1452,7 +1476,19 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
             br#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"slow":true}"#;
         let body: &[u8] = if attempt == 4 { slow_body } else { body };
         let mut stream = fixture.open().await;
-        stream.headers_only().await;
+        stream
+            .send(Request::RequestHeaders(Stream::headers(
+                &[
+                    (":method", "POST"),
+                    (":path", "/v1/chat/completions"),
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer client-secret"),
+                    ("x-api-key", "client-key"),
+                    ("x-request-id", "pd-credentials"),
+                ],
+                false,
+            )))
+            .await;
         stream.body(body, true).await;
         let response = stream.recv().await;
         let Response::RequestHeaders(headers) = response else {
@@ -1521,6 +1557,9 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
         let response = client
             .post(&url)
             .header("x-mesh-execution-id", id)
+            .header("authorization", "Bearer client-secret")
+            .header("x-api-key", "client-key")
+            .header("x-request-id", "pd-credentials")
             .body(if attempt != 1 {
                 body.to_vec()
             } else {
@@ -2179,5 +2218,55 @@ async fn correlation_id_is_returned_when_admission_rejects_at_headers() {
         Some("rejected-id")
     );
     active.response_headers(true).await;
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn messages_and_responses_preserve_raw_input_and_use_api_errors() {
+    let fixture = Fixture::new(RouterConfig::default()).await;
+    for (path, body) in [
+        (
+            "/v1/messages?beta=1",
+            r#"{ "model":"test-model", "messages":[{"role":"user","content":[{"type":"text","text":"你好","vendor":1}]}],"max_tokens":3,"vendor":{"keep":true} }"#,
+        ),
+        (
+            "/v1/responses?beta=1",
+            r#"{ "model":"test-model", "input":[{"type":"custom_input","vendor":1}],"max_output_tokens":3,"vendor":{"keep":true} }"#,
+        ),
+    ] {
+        let mut stream = fixture.open().await;
+        stream.request_headers(path).await;
+        for (index, bytes) in body.as_bytes().chunks(3).enumerate() {
+            stream.body(bytes, (index + 1) * 3 >= body.len()).await;
+        }
+        assert!(matches!(stream.recv().await, Response::RequestHeaders(_)));
+        let Response::RequestBody(reply) = stream.recv().await else {
+            panic!("expected raw body");
+        };
+        let Some(pb::body_mutation::Mutation::StreamedResponse(reply)) =
+            reply.response.unwrap().body_mutation.unwrap().mutation
+        else {
+            panic!("expected raw mutation");
+        };
+        assert_eq!(reply.body, body.as_bytes());
+        drop(stream);
+        fixture.unloaded().await;
+    }
+    let mut stream = fixture.open().await;
+    stream.request_headers("/v1/messages").await;
+    stream
+        .body(
+            br#"{"model":"test-model","messages":[],"max_tokens":3}"#,
+            true,
+        )
+        .await;
+    let Response::ImmediateResponse(reply) = stream.recv().await else {
+        panic!("expected error");
+    };
+    assert_eq!(reply.status.unwrap().code, 400);
+    let error: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    drop(stream);
     fixture.runtime.shutdown().await.unwrap();
 }

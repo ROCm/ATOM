@@ -22,12 +22,32 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
 | `POST /v1/chat/completions` | Chat completions with streaming and tool calls |
 | `POST /v1/completions` | Text completions |
 | `POST /generate` | SGLang generate API |
-| `POST /v1/responses` | Background responses with status tracking |
+| `POST /v1/messages` | HTTP-backend Messages proxy, JSON and SSE |
+| `POST /v1/responses` | HTTP-backend Responses proxy, JSON and SSE; existing background/query support |
 | `POST /v1/tokenize` / `/v1/detokenize` | Tokenization with batch support |
 | `POST /parse/reasoning` / `/parse/function_call` | Reasoning and tool-call parsing |
 | `GET /health` / `/readiness` / `/liveness` | Health probes |
 | `GET /engine_metrics` | Aggregated worker engine Prometheus metrics |
 | `GET /v1/models` | Model metadata |
+
+Responses resource operations (GET, DELETE, cancel and input_items) probe regular
+HTTP backends that support `/v1/responses`. A `mesh.apis` label restricts supported
+APIs using comma-separated paths, such as `/v1/chat/completions,/v1/responses`;
+omitting the label preserves the default of accepting all supported API routes.
+
+Resource operations use the same credential rules as inference: a configured
+worker API key overrides client credentials, and eligible backends without a
+worker key receive the client's `authorization` and `x-api-key` headers.
+Workers sharing one backend address must have matching credential configuration.
+The first successful probe is returned immediately. If all probes fail, non-404
+client errors take precedence over server or connection errors; 404 is the
+fallback. Errors with equal priority are selected by backend address order.
+
+DP-aware forwarding writes the selected worker's rank to `data_parallel_rank` in
+the request body, including Messages and Responses, overriding any client value.
+The backend must consume that field to route to the selected rank. Verify support
+for each backend and API before including it in a DP worker's `mesh.apis` label;
+accepting an unknown JSON field does not establish rank-routing support.
 
 ## Installation
 
@@ -221,6 +241,21 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 ## Reliability
 
+- **Request preparation**: Parsing and tokenization use `--prepare-workers` threads
+  (default: 10). The waiting queue defaults to 10 jobs per resolved preparation
+  thread: 100 jobs by default, or 20 with `--prepare-workers 2`.
+  `--prepare-queue-capacity` overrides that limit. Queued jobs still have a
+  `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
+  their slot immediately. An enabled ext-proc parser-concurrency setting determines
+  the thread count when `--prepare-workers` is omitted.
+  `--prepare-max-retained-input-bytes` (default: 32 MiB) caps the raw input bytes
+  held during preparation, including queueing and result handoff. The charge is
+  released before upstream dispatch; forwarding and retries do not hold it.
+  Canceled synchronous work retains its charge until it actually exits.
+  This byte limit can fill before the job queue for large prompts, so size it for
+  the expected concurrent preparation input. Ext-proc's separate
+  `--ext-proc-max-buffered-bytes` limit continues to cover its request buffers
+  through rewriting and dispatch.
 - **Retries**: Up to 5 attempts with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)
 - **Circuit breakers**: Per-worker failure/success thresholds (`--cb-failure-threshold`, `--cb-timeout-duration-secs`)
 - **Rate limiting**: Token bucket via `--max-concurrent-requests`, optional queue (`--queue-size`, `--queue-timeout-secs`)

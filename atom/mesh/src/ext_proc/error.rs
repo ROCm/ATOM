@@ -25,11 +25,16 @@ impl ProcessingError {
         Self::new(400, "invalid_processing_sequence", message)
     }
 
-    pub fn response(&self, request_id: Option<&str>) -> pb::ProcessingResponse {
+    pub fn response(&self, request_id: Option<&str>, path: &str) -> pb::ProcessingResponse {
         let mut headers = Mutation::headers([
             ("content-type", b"application/json".as_slice()),
             ("x-mesh-error-code", self.code.as_bytes()),
         ]);
+        if self.status == 405 {
+            headers
+                .set_headers
+                .extend(Mutation::headers([("allow", b"POST".as_slice())]).set_headers);
+        }
         if let Some(id) = request_id {
             headers
                 .set_headers
@@ -42,11 +47,14 @@ impl ProcessingError {
                         code: i32::from(self.status),
                     }),
                     headers: Some(headers),
-                    body: serde_json::to_vec(&crate::routers::comm::error::payload(
-                        http::StatusCode::from_u16(self.status).unwrap(),
-                        self.code,
-                        &self.message,
-                    ))
+                    body: serde_json::to_vec(
+                        &crate::routers::comm::error::MeshLocalError::payload(
+                            path,
+                            http::StatusCode::from_u16(self.status).unwrap(),
+                            self.code,
+                            &self.message,
+                        ),
+                    )
                     .unwrap(),
                     details: format!("mesh_ext_proc_{}", self.code),
                     ..Default::default()
@@ -63,18 +71,32 @@ impl From<serde_json::Error> for ProcessingError {
     }
 }
 
+impl From<crate::routers::comm::error::IngressError> for ProcessingError {
+    fn from(error: crate::routers::comm::error::IngressError) -> Self {
+        Self::new(error.status.as_u16(), error.code, error.message)
+    }
+}
+
+impl From<crate::core::prepare_pool::PrepareError> for ProcessingError {
+    fn from(error: crate::core::prepare_pool::PrepareError) -> Self {
+        Self::from(crate::routers::comm::error::IngressError::from(error))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]
     async fn both_ingresses_share_error_envelope_and_code_header() {
-        let response = ProcessingError::new(429, "admission_full", "full").response(None);
+        let response =
+            ProcessingError::new(429, "admission_full", "full").response(None, "/v1/messages");
         let Some(pb::processing_response::Response::ImmediateResponse(response)) =
             response.response
         else {
             panic!("expected immediate error");
         };
-        let http = crate::routers::comm::error::create_error(
+        let http = crate::routers::comm::error::MeshLocalError::response(
+            "/v1/messages",
             http::StatusCode::TOO_MANY_REQUESTS,
             "admission_full",
             "full",
@@ -89,5 +111,17 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
             serde_json::from_slice::<serde_json::Value>(&http).unwrap()
         );
+    }
+    #[test]
+    fn messages_size_error_has_its_protocol_type() {
+        let response =
+            ProcessingError::new(413, "body_too_large", "too large").response(None, "/v1/messages");
+        let Some(pb::processing_response::Response::ImmediateResponse(response)) =
+            response.response
+        else {
+            panic!("expected immediate error");
+        };
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["type"], "request_too_large");
     }
 }

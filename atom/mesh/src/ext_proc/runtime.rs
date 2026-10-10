@@ -236,6 +236,9 @@ impl HealthService {
     }
 
     fn current_status(app: &AppContext, draining: &AtomicBool) -> i32 {
+        if app.prepare_pool.stats().failed {
+            return 2;
+        }
         let eligible: Vec<_> = app
             .worker_registry
             .get_all()
@@ -243,7 +246,8 @@ impl HealthService {
             .filter(|w| {
                 w.is_available()
                     && matches!(w.connection_mode(), ConnectionMode::Http)
-                    && (!super::request::RequestEnvelope::needs_tokens(app, Some(w.model_id()))
+                    && (!crate::routers::ingress::IngressRouting::new(app)
+                        .needs_tokens(Some(w.model_id()))
                         || app.tokenizer_registry.get(w.model_id()).is_some())
             })
             .collect();

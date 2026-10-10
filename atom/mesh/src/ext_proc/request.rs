@@ -1,27 +1,18 @@
-use std::{
-    collections::HashSet,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinHandle,
-};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use prost_types::value::Kind;
 
 use crate::{
     app_context::AppContext,
-    core::placement::{registry_adapters::PolicyRegistryAdapter, traits::PolicySource},
-    routers::prepare::chat_template::process_chat_messages,
+    core::prepare_pool::{InputLease, PrepareHandle},
+    routers::ingress::IngressRouting,
 };
 
 use super::{core, error::ProcessingError, pb};
-use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest, ParsedInference};
+use crate::routers::prepare::inference::{InferenceMetadata, ParsedInference};
 
 pub(super) struct RequestEnvelope {
     pub headers: HeaderMap,
@@ -38,6 +29,7 @@ pub(super) struct RequestEnvelope {
 pub(super) struct RoutingInput {
     pub metadata: InferenceMetadata,
     pub tokens: Option<Vec<u32>>,
+    pub state_reference: bool,
 }
 impl std::ops::Deref for RoutingInput {
     type Target = InferenceMetadata;
@@ -117,43 +109,15 @@ impl RequestEnvelope {
         }
         let path = path.ok_or_else(|| ProcessingError::invalid("missing :path"))?;
         let route = path.split('?').next().unwrap_or("");
-        if !matches!(
-            route,
-            "/v1/chat/completions" | "/v1/completions" | "/generate"
-        ) {
+        if crate::routers::ingress::EndpointSpec::find(route).is_none() {
             return Err(ProcessingError::new(
                 404,
                 "unsupported_path",
                 "unsupported inference API",
             ));
         }
-        if headers
-            .get("content-encoding")
-            .is_some_and(|v| v != "identity")
-        {
-            return Err(ProcessingError::new(
-                415,
-                "unsupported_encoding",
-                "decompress requests before ext-proc",
-            ));
-        }
-        if !headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("application/json")
-            })
-        {
-            return Err(ProcessingError::new(
-                415,
-                "unsupported_content_type",
-                "application/json is required",
-            ));
-        }
+        crate::routers::ingress::InferenceEnvelope::validate_headers(&headers)
+            .map_err(ProcessingError::from)?;
         headers.insert(
             "x-request-id",
             HeaderValue::from_str(&id)
@@ -162,7 +126,7 @@ impl RequestEnvelope {
         headers.remove(super::mutation::Mutation::DESTINATION);
         Ok(Self {
             headers,
-            path: route.to_owned(),
+            path,
             id,
             raw: Vec::new(),
             trailer_mutation: None,
@@ -273,181 +237,64 @@ impl RequestEnvelope {
         metrics::gauge!("mesh_ext_proc_buffered_request_bytes").increment(body.len() as f64);
         Ok(())
     }
-
-    pub fn needs_tokens(app: &AppContext, model: Option<&str>) -> bool {
-        if app.router_config.mode.is_pd_mode() {
-            app.policy_registry.get_prefill_policy().needs_tokens()
-                || app.policy_registry.get_decode_policy().needs_tokens()
-        } else {
-            PolicyRegistryAdapter::new(app.policy_registry.clone())
-                .regular_policy(model)
-                .needs_tokens()
-        }
-    }
-
-    pub fn parse(
-        &self,
-        app: &AppContext,
-        canceled: &AtomicBool,
-    ) -> Result<RoutingInput, ProcessingError> {
-        check_canceled(canceled)?;
-        let parsed =
-            ParsedInference::parse(&self.path, &self.raw).map_err(ProcessingError::invalid)?;
-        let metadata = parsed.metadata();
-        let model = metadata.model.as_deref();
-        let text = &metadata.text;
-        check_canceled(canceled)?;
-        if model.is_some_and(|model| model.trim().is_empty()) {
-            return Err(ProcessingError::invalid("model is required"));
-        }
-        let tokens = if Self::needs_tokens(app, model) {
-            if let Some(ids) = parsed.input_tokens().map_err(ProcessingError::invalid)? {
-                Some(ids)
-            } else {
-                let tokenizer = model
-                    .and_then(|model| app.tokenizer_registry.get(model))
-                    .ok_or_else(|| {
-                        ProcessingError::new(
-                            503,
-                            "tokenizer_unavailable",
-                            "token routing requires input_ids or a model with a registered tokenizer",
-                        )
-                    })?;
-                check_prompt_size(text, app.router_config.ext_proc.max_tokenize_bytes)?;
-                check_canceled(canceled)?;
-                let prompt = if let Some(chat) = parsed.chat() {
-                    process_chat_messages(chat, &*tokenizer)
-                        .map_err(ProcessingError::invalid)?
-                        .text
-                } else {
-                    text.clone()
-                };
-                check_canceled(canceled)?;
-                check_prompt_size(&prompt, app.router_config.ext_proc.max_tokenize_bytes)?;
-                Some(
-                    tokenizer
-                        .encode(&prompt, false)
-                        .map_err(|e| ProcessingError::invalid(e.to_string()))?
-                        .token_ids()
-                        .to_vec(),
-                )
-            }
-        } else {
-            None
-        };
-        check_canceled(canceled)?;
-        Ok(RoutingInput { metadata, tokens })
-    }
 }
 
-fn check_canceled(canceled: &AtomicBool) -> Result<(), ProcessingError> {
-    if canceled.load(Ordering::Acquire) {
-        Err(ProcessingError::new(
-            499,
-            "parser_canceled",
-            "request parsing canceled",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn check_prompt_size(prompt: &str, limit: usize) -> Result<(), ProcessingError> {
-    if prompt.len() > limit {
-        Err(ProcessingError::new(
-            413,
-            "tokenizer_input_too_large",
-            "prompt exceeds the synchronous tokenizer byte limit",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// Running synchronous work retains its slot and buffer budget until it exits.
-/// Cancellation stops queued work and is checked between parsing stages; an
-/// individual synchronous tokenizer call cannot be preempted.
+/// Parses owned requests on the shared preparation pool.
 pub(super) struct RequestParser {
-    app: Arc<AppContext>,
-    slots: Arc<Semaphore>,
+    routing: IngressRouting,
+    pool: PrepareHandle,
     pub budget: Arc<Semaphore>,
 }
 
-struct BlockingTask<T> {
-    task: JoinHandle<Result<T, ProcessingError>>,
-    canceled: Arc<AtomicBool>,
-}
-impl<T> Drop for BlockingTask<T> {
-    fn drop(&mut self) {
-        self.canceled.store(true, Ordering::Release);
-        self.task.abort(); // Also prevents a not-yet-started blocking job from running.
-    }
+struct PreparingRequest {
+    request: RequestEnvelope,
+    // Last: a canceled job releases its actual input before its preparation charge.
+    lease: InputLease,
 }
 
 impl RequestParser {
-    pub fn new(app: Arc<AppContext>) -> Self {
-        let count = app
-            .router_config
-            .ext_proc
-            .parser_concurrency
-            .min(app.router_config.ext_proc.max_streams);
+    pub fn new(app: &AppContext) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(count)),
+            routing: IngressRouting::new(app),
+            pool: app.prepare_pool.clone(),
             budget: Arc::new(Semaphore::new(
                 app.router_config.ext_proc.max_buffered_bytes,
             )),
-            app,
         }
-    }
-
-    async fn run<T: Send + 'static>(
-        &self,
-        job: impl FnOnce(&AtomicBool) -> Result<T, ProcessingError> + Send + 'static,
-    ) -> Result<T, ProcessingError> {
-        let permit =
-            self.slots.clone().acquire_owned().await.map_err(|_| {
-                ProcessingError::new(503, "parser_closed", "request parser is closed")
-            })?;
-        let canceled = Arc::new(AtomicBool::new(false));
-        let cancel = canceled.clone();
-        let mut task = BlockingTask {
-            canceled,
-            task: tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                check_canceled(&cancel)?;
-                // Log inside the job as well: its caller may already have disconnected.
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&cancel)))
-                    .unwrap_or_else(|panic| {
-                        let detail = panic
-                            .downcast_ref::<String>()
-                            .map(String::as_str)
-                            .or_else(|| panic.downcast_ref::<&str>().copied())
-                            .unwrap_or("non-string panic");
-                        tracing::error!(panic = detail, "request parser panicked");
-                        Err(ProcessingError::new(
-                            500,
-                            "parser_panicked",
-                            "request parser panicked",
-                        ))
-                    })
-            }),
-        };
-        (&mut task.task).await.map_err(|error| {
-            tracing::error!(%error, "request parser task failed");
-            ProcessingError::new(500, "parser_failed", "request parser task failed")
-        })?
     }
 
     pub async fn parse(
         &self,
         request: RequestEnvelope,
+        decision_deadline: Instant,
     ) -> Result<(RequestEnvelope, RoutingInput), ProcessingError> {
-        let app = self.app.clone();
-        self.run(move |canceled| {
-            let input = request.parse(&app, canceled)?;
-            Ok((request, input))
-        })
-        .await
+        let deadline = decision_deadline.min(self.pool.prepare_deadline());
+        let lease = self.pool.retain_input(request.raw.len())?;
+        let preparing = PreparingRequest { request, lease };
+        let routing = self.routing.clone();
+        let (input, preparing) = self
+            .pool
+            .submit(deadline, move |context| {
+                context.check()?;
+                let parsed =
+                    ParsedInference::parse(&preparing.request.path, &preparing.request.raw)
+                        .map_err(ProcessingError::invalid)?;
+                let (metadata, tokens) = routing.prepare(&parsed, context)?;
+                let input = RoutingInput {
+                    metadata,
+                    tokens,
+                    state_reference: parsed.requires_state_domain(),
+                };
+                Ok::<_, ProcessingError>((input, preparing))
+            })
+            .await?
+            .wait()
+            .await??;
+        // Handoff occurs only after the worker's final deadline/cancellation
+        // check succeeds. Forwarding retains its independent buffer budget.
+        let PreparingRequest { request, lease } = preparing;
+        drop(lease);
+        Ok((request, input))
     }
 }
 
@@ -461,7 +308,15 @@ impl Drop for RequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::core::prepare_pool::PreparePoolRuntime;
+    use crate::tokenizer::{
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+        MockTokenizer,
+    };
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     fn envelope(budget: Arc<Semaphore>, size: usize) -> RequestEnvelope {
         let mut request = RequestEnvelope::new(
@@ -490,6 +345,27 @@ mod tests {
         request
     }
 
+    fn inference_request(budget: Arc<Semaphore>) -> RequestEnvelope {
+        let mut body = br#"{"model":"test-model","text":"hello","vendor":{"kept":true}}"#.to_vec();
+        body.resize(512, b' ');
+        let mut request = envelope(budget, 0);
+        request.replace_body(body, 1024).unwrap();
+        request
+    }
+
+    async fn parser_with_budget(input_bytes: usize) -> (RequestParser, PreparePoolRuntime) {
+        let mut config = crate::config::RouterConfig::default();
+        config.policy = crate::config::PolicyConfig::RoundRobin;
+        config.prepare_pool.workers = Some(1);
+        config.prepare_pool.max_retained_input_bytes = input_bytes;
+        config.ext_proc.max_buffered_bytes = 1024;
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = AppContext::from_config(config, 5, runtime.handle())
+            .await
+            .unwrap();
+        (RequestParser::new(&app), runtime)
+    }
+
     #[test]
     fn buffer_budget_covers_capacity_growth_rewrites_and_drop() {
         let budget = Arc::new(Semaphore::new(1024));
@@ -508,16 +384,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarding_buffers_do_not_hold_the_preparation_budget() {
+        let (parser, mut runtime) = parser_with_budget(512).await;
+        let pool = runtime.handle();
+        let request = inference_request(parser.budget.clone());
+        let original = request.raw.clone();
+        let (first, _) = parser
+            .parse(request, pool.prepare_deadline())
+            .await
+            .unwrap();
+        assert_eq!(first.raw, original);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(parser.budget.available_permits(), 512);
+
+        // The preparation budget fits only one request, but the first forwarded
+        // request can remain buffered while the next request is prepared.
+        let (second, _) = parser
+            .parse(
+                inference_request(parser.budget.clone()),
+                pool.prepare_deadline(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.raw, original);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(parser.budget.available_permits(), 0);
+        drop(first);
+        assert_eq!(parser.budget.available_permits(), 512);
+        drop(second);
+        assert_eq!(parser.budget.available_permits(), 1024);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_body_rewrites_only_charge_the_transport_buffer_budget() {
+        let (parser, mut runtime) = parser_with_budget(512).await;
+        let pool = runtime.handle();
+        let (mut request, _) = parser
+            .parse(
+                inference_request(parser.budget.clone()),
+                pool.prepare_deadline(),
+            )
+            .await
+            .unwrap();
+        request.replace_body(vec![b'x'; 700], 1024).unwrap();
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+        assert_eq!(parser.budget.available_permits(), 0);
+        let error = request.replace_body(vec![b'y'; 1025], 2048).unwrap_err();
+        assert_eq!(error.code, "buffer_budget_exhausted");
+        assert_eq!(request.raw, vec![b'x'; 700]);
+        assert_eq!(pool.stats().retained_input_bytes, 0);
+
+        request.replace_body(vec![b'z'; 10], 1024).unwrap();
+        // A rewrite can retain the old allocation; release conservatively at drop.
+        assert_eq!(parser.budget.available_permits(), 0);
+        drop(request);
+        assert_eq!(parser.budget.available_permits(), 1024);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn tokenization_rejects_oversized_text_and_rendered_chat_prompt() {
         let mut config = crate::config::RouterConfig::default();
         config.policy = crate::config::PolicyConfig::PrefixHash {
             prefix_token_count: 4,
             load_factor: 1.25,
         };
-        config.ext_proc.max_tokenize_bytes = 4;
-        let mut app = AppContext::from_config(config, 5).await.unwrap();
+        config.prepare_pool.max_tokenize_bytes = Some(4);
+        let _runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let mut app = AppContext::from_config(config, 5, _runtime.handle())
+            .await
+            .unwrap();
         app.tokenizer_registry =
             crate::routers::test_mocks::tokenizer::tokenizer_registry_with_hf("test-model");
+        let parser = RequestParser::new(&app);
         for (path, body) in [
             (
                 "/v1/completions",
@@ -533,83 +473,138 @@ mod tests {
             request
                 .replace_body(body.as_bytes().to_vec(), 1024)
                 .unwrap();
-            let error = request.parse(&app, &AtomicBool::new(false)).err().unwrap();
+            let error = parser
+                .parse(request, parser.pool.prepare_deadline())
+                .await
+                .err()
+                .unwrap();
             assert_eq!(error.status, 413);
             assert_eq!(error.code, "tokenizer_input_too_large");
-            assert_eq!(
-                request
-                    .parse(&app, &AtomicBool::new(true))
-                    .err()
-                    .unwrap()
-                    .code,
-                "parser_canceled"
-            );
+            assert_eq!(parser.pool.stats().retained_input_bytes, 0);
+        }
+    }
+
+    struct GatedTokenizer {
+        inner: MockTokenizer,
+        started: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        gate: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Encoder for GatedTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.gate.lock().take();
+            if let Some(gate) = gate {
+                self.started.lock().take().unwrap().send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for GatedTokenizer {
+        fn decode(&self, tokens: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(tokens, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for GatedTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+        fn id_to_token(&self, token: u32) -> Option<String> {
+            self.inner.id_to_token(token)
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
     #[tokio::test]
-    async fn canceled_parser_holds_real_slot_and_buffer_until_job_exits() {
+    async fn cancellation_releases_waiting_buffers_but_keeps_running_buffers() {
         let mut config = crate::config::RouterConfig::default();
-        config.ext_proc.parser_concurrency = 1;
-        let parser = Arc::new(RequestParser::new(Arc::new(
-            AppContext::from_config(config, 5).await.unwrap(),
-        )));
-        let budget = Arc::new(Semaphore::new(1024));
-        let request = envelope(budget.clone(), 512);
+        config.policy = crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        };
+        config.prepare_pool.workers = Some(1);
+        config.prepare_pool.max_retained_input_bytes = 1024;
+        config.ext_proc.max_buffered_bytes = 1024;
+        let mut runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let pool = runtime.handle();
+        let app = AppContext::from_config(config, 5, pool.clone())
+            .await
+            .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let stages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task = tokio::spawn({
-            let parser = parser.clone();
-            let stages = stages.clone();
-            async move {
-                parser
-                    .run(move |canceled| {
-                        let _request = request;
-                        started_tx.send(()).unwrap();
-                        release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-                        check_canceled(canceled)?;
-                        stages.fetch_add(1, Ordering::SeqCst);
-                        Ok(())
-                    })
-                    .await
-            }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(GatedTokenizer {
+            inner: MockTokenizer::new(),
+            started: parking_lot::Mutex::new(Some(started_tx)),
+            gate: parking_lot::Mutex::new(Some(release_rx)),
+            calls: calls.clone(),
         });
+        app.tokenizer_registry
+            .load("gated-test", "test-model", "mock", || async {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+        let parser = Arc::new(RequestParser::new(&app));
+        let request = inference_request(parser.budget.clone());
+        let running_parser = parser.clone();
+        let deadline = pool.prepare_deadline();
+        let task = tokio::spawn(async move { running_parser.parse(request, deadline).await });
         started_rx.await.unwrap();
         task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(parser.slots.available_permits(), 0);
-        assert_eq!(budget.available_permits(), 512);
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("running parser was not canceled"),
+        }
+        assert_eq!(pool.stats().busy_workers, 1);
+        assert_eq!(pool.stats().retained_input_bytes, 512);
+        assert_eq!(parser.budget.available_permits(), 512);
+        assert!(matches!(
+            pool.retain_input(513),
+            Err(crate::core::prepare_pool::PrepareError::BudgetExceeded)
+        ));
 
-        let queued_request = envelope(budget.clone(), 512);
-        let queued_ran = Arc::new(AtomicBool::new(false));
-        let mut queued = Box::pin(parser.run({
-            let ran = queued_ran.clone();
-            move |_| {
-                let _request = queued_request;
-                ran.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }));
+        let queued_request = inference_request(parser.budget.clone());
+        let mut queued = Box::pin(parser.parse(queued_request, pool.prepare_deadline()));
         assert!(futures_util::poll!(&mut queued).is_pending());
+        assert_eq!(parser.budget.available_permits(), 0);
+        assert_eq!(pool.stats().retained_input_bytes, 1024);
+        assert_eq!(pool.stats().queued_jobs, 1);
         drop(queued);
-        assert_eq!(budget.available_permits(), 512);
+        // A canceled waiter has not dispatched work, so both budgets release now.
+        assert_eq!(parser.budget.available_permits(), 512);
+        assert_eq!(pool.stats().retained_input_bytes, 512);
+        assert_eq!(pool.stats().queued_jobs, 0);
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while parser.slots.available_permits() == 0 {
+            while pool.stats().retained_input_bytes != 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(budget.available_permits(), 1024);
-        assert_eq!(stages.load(Ordering::SeqCst), 0);
-        assert!(!queued_ran.load(Ordering::SeqCst));
-        let error = parser
-            .run::<()>(|_| panic!("test parser panic"))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "parser_panicked");
-        assert_eq!(parser.slots.available_permits(), 1);
+        assert_eq!(parser.budget.available_permits(), 1024);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        runtime.shutdown().await;
     }
 }

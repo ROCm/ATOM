@@ -1,4 +1,4 @@
-//! Real Envoy contract tests. Run explicitly with Docker available.
+//! Real Envoy contract tests. Set ENVOY_BINARY or run with Docker available.
 
 use std::{
     process::{Child, Command, Stdio},
@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{BasicWorkerBuilder, Worker},
+    core::{prepare_pool::PreparePoolRuntime, BasicWorkerBuilder, Worker},
     ext_proc::ExtProcRuntime,
 };
 use serde_json::{json, Value};
@@ -58,65 +58,91 @@ impl Envoy {
                 + "\nadmin:\n  address:\n    socket_address: {address: 127.0.0.1, port_value: 0}\n",
         )
         .unwrap();
-        let validation = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "host",
-                "--user",
-                "0",
-                "--env",
-                "ENVOY_UID=0",
-                "-v",
-            ])
-            .arg(format!("{}:/etc/envoy/envoy.yaml:ro", path.display()))
-            .args([
-                ENVOY_IMAGE,
-                "-c",
-                "/etc/envoy/envoy.yaml",
-                "--mode",
-                "validate",
-            ])
-            .output()
-            .unwrap();
+        let local_binary = std::env::var_os("ENVOY_BINARY");
+        let validation = if let Some(binary) = &local_binary {
+            Command::new(binary)
+                .arg("-c")
+                .arg(&path)
+                .args(["--mode", "validate"])
+                .output()
+                .unwrap()
+        } else {
+            Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--network",
+                    "host",
+                    "--user",
+                    "0",
+                    "--env",
+                    "ENVOY_UID=0",
+                    "-v",
+                ])
+                .arg(format!("{}:/etc/envoy/envoy.yaml:ro", path.display()))
+                .args([
+                    ENVOY_IMAGE,
+                    "-c",
+                    "/etc/envoy/envoy.yaml",
+                    "--mode",
+                    "validate",
+                ])
+                .output()
+                .unwrap()
+        };
         assert!(
             validation.status.success(),
             "Envoy config rejected: {}",
             String::from_utf8_lossy(&validation.stderr)
         );
-        let name = format!("atomesh-extproc-{}", uuid::Uuid::new_v4());
-        let child = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network",
-                "host",
-                "--user",
-                "0",
-                "--env",
-                "ENVOY_UID=0",
-                "--name",
-                &name,
-                "-v",
-            ])
-            .arg(format!("{}:/etc/envoy", config.path().display()))
-            .args([
-                ENVOY_IMAGE,
-                "-c",
-                "/etc/envoy/envoy.yaml",
-                "--disable-hot-restart",
-                "--admin-address-path",
-                "/etc/envoy/admin-address.txt",
-                "--concurrency",
-                "2",
-                "--log-level",
-                "error",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
+        let (name, child) = if let Some(binary) = &local_binary {
+            let child = Command::new(binary)
+                .arg("-c")
+                .arg(&path)
+                .arg("--disable-hot-restart")
+                .arg("--admin-address-path")
+                .arg(config.path().join("admin-address.txt"))
+                .args(["--concurrency", "2", "--log-level", "error"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            (String::new(), child)
+        } else {
+            let name = format!("atomesh-extproc-{}", uuid::Uuid::new_v4());
+            let child = Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--network",
+                    "host",
+                    "--user",
+                    "0",
+                    "--env",
+                    "ENVOY_UID=0",
+                    "--name",
+                    &name,
+                    "-v",
+                ])
+                .arg(format!("{}:/etc/envoy", config.path().display()))
+                .args([
+                    ENVOY_IMAGE,
+                    "-c",
+                    "/etc/envoy/envoy.yaml",
+                    "--disable-hot-restart",
+                    "--admin-address-path",
+                    "/etc/envoy/admin-address.txt",
+                    "--concurrency",
+                    "2",
+                    "--log-level",
+                    "error",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            (name, child)
+        };
         let mut envoy = Self {
             name,
             child,
@@ -210,11 +236,15 @@ impl Envoy {
 
 impl Drop for Envoy {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if self.name.is_empty() {
+            let _ = self.child.kill();
+        } else {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &self.name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let _ = self.child.wait();
     }
 }
@@ -252,7 +282,7 @@ impl Backend {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     let backend = Arc::new(Backend {
         calls: AtomicUsize::new(0),
@@ -269,7 +299,12 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
     config.ext_proc.max_body_bytes = 1024;
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{address}"))
             .model_id("test-model")
@@ -342,7 +377,7 @@ async fn real_envoy_routes_once_preserves_body_and_cleans_up_sse_cancel() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_preserves_chunked_body_and_bidirectional_trailers() {
     use http_body::Frame;
     use http_body_util::{BodyExt, StreamBody};
@@ -390,7 +425,12 @@ async fn real_envoy_preserves_chunked_body_and_bidirectional_trailers() {
     let mut config = RouterConfig::default();
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{worker_address}"))
             .model_id("test-model")
@@ -439,12 +479,17 @@ async fn real_envoy_preserves_chunked_body_and_bidirectional_trailers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_rejects_incompatible_modes_without_waiting_for_body() {
     let mut config = RouterConfig::default();
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let runtime = ExtProcRuntime::start(app).await.unwrap();
     for (field, mode) in [
         ("request_body_mode", "BUFFERED"),
@@ -469,7 +514,7 @@ async fn real_envoy_rejects_incompatible_modes_without_waiting_for_body() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_local_errors_keep_the_original_status_and_body() {
     let calls = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,7 +537,12 @@ async fn real_envoy_local_errors_keep_the_original_status_and_body() {
     let mut config = RouterConfig::default();
     config.ext_proc.enabled = true;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-    let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let app = Arc::new(
+        AppContext::from_config(config, 5, prepare_runtime.handle())
+            .await
+            .unwrap(),
+    );
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(format!("http://{address}"))
             .model_id("test-model")
@@ -654,18 +704,25 @@ impl PdBackend {
         });
         let mut workers = Vec::new();
         let mut servers = Vec::new();
-        let mut config = RouterConfig::default();
-        config.backend = kind;
-        config.mode = RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
+        let mut config = RouterConfig {
+            backend: kind,
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
         };
         config.ext_proc.enabled = true;
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
         config.ext_proc.executor_listen = "127.0.0.1:0".parse().unwrap();
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         for prefill in [true, false] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -832,25 +889,25 @@ impl PdBackend {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_atom_pd_executes_selected_pair_and_relays_kv() {
     PdBackend::verify(mesh::config::types::BackendType::Atom).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_vllm_pd_executes_selected_pair_and_cancels_prefill() {
     PdBackend::verify(mesh::config::types::BackendType::Vllm).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_sglang_pd_executes_selected_pair_and_cancels_decode() {
     PdBackend::verify(mesh::config::types::BackendType::Sglang).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker and envoyproxy/envoy:v1.37.0"]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
 async fn real_envoy_preserves_correlation_and_filters_client_headers() {
     async fn echo(headers: HeaderMap, Json(_): Json<Value>) -> Response {
         let headers: std::collections::BTreeMap<_, Vec<_>> = headers
@@ -887,7 +944,12 @@ async fn real_envoy_preserves_correlation_and_filters_client_headers() {
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
         config.request_id_headers =
             custom.then(|| vec!["x-customer-id".into(), "x-correlation-id".into()]);
-        let app = Arc::new(AppContext::from_config(config, 5).await.unwrap());
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let app = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
         let mut worker =
             BasicWorkerBuilder::new(format!("http://{address}")).model_id("test-model");
         if custom {
@@ -984,4 +1046,31 @@ async fn real_envoy_preserves_correlation_and_filters_client_headers() {
         runtime.shutdown().await.unwrap();
     }
     server.abort();
+}
+
+#[path = "common/multi_api.rs"]
+mod multi_api;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires ENVOY_BINARY or Docker and envoyproxy/envoy:v1.37.0"]
+async fn real_envoy_three_api_contract_matches_http() {
+    for key in [None, Some("worker-secret")] {
+        let mut backend = multi_api::Backend::start().await;
+        let (context, worker, _prepare_runtime) = backend.context(key).await;
+        let mut context = (*context).clone();
+        context.router_config.ext_proc.enabled = true;
+        context.router_config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
+        let runtime = ExtProcRuntime::start(Arc::new(context)).await.unwrap();
+        let envoy = Envoy::start(runtime.address.port()).await;
+        backend.verify_url(&envoy.url, key).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while worker.load() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(envoy);
+        runtime.shutdown().await.unwrap();
+    }
 }

@@ -8,15 +8,13 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
 
 #[cfg(test)]
+#[path = "../../tests/routing/http_pd_load_tests.rs"]
 mod load_tests;
 
 use memchr::memmem;
@@ -284,11 +282,13 @@ impl Drop for PrefillTask {
 
 #[derive(Clone)]
 struct PDRequestContext<'a> {
-    route: &'static str,
+    route: &'a str,
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<&'a str>,
+    tokens: Option<&'a [u32]>,
+    planner: Option<&'a dyn PdPlanner>,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
@@ -305,6 +305,8 @@ impl<'a> PDRequestContext<'a> {
             is_stream: metadata.stream,
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
+            tokens: None,
+            planner: None,
             model_id: model.or_else(|| metadata.model.as_deref().filter(|model| !model.is_empty())),
             headers: headers.cloned().map(Arc::new),
         }
@@ -473,9 +475,11 @@ impl PDRouter {
         headers: &HeaderMap,
         body: Value,
         metadata: &InferenceMetadata,
+        path: &str,
         placement: Arc<ReservedPair>,
     ) -> Response {
-        let context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        let mut context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        context.route = path;
         self.execute_reserved(Some(headers), body, context, placement)
             .await
     }
@@ -781,12 +785,13 @@ impl PDRouter {
             model_id: context.model_id,
             protocol: Some(Protocol::Http),
             text: context.request_text.as_deref(),
-            tokens: None,
+            tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
         };
-        let plan = self
+        let plan = context
             .planner
+            .unwrap_or(self.planner.as_ref())
             .plan(&descriptor)
             .await
             .map_err(|error| placement_err_to_response(error, context.model_id))?;
@@ -1720,7 +1725,7 @@ impl PDRouter {
         &self,
         client: &Client,
         worker: &dyn Worker,
-        route: &'static str,
+        route: &str,
         json_request: Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -1741,28 +1746,26 @@ impl PDRouter {
             )
         })?;
 
+        // Resolve credentials for each PD worker with the same rules as regular ingress.
+        let headers = header_utils::inference_request_headers(
+            headers.unwrap_or(&HeaderMap::new()),
+            route,
+            worker.api_key().as_deref(),
+        )
+        .map_err(|_| {
+            error::IngressError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "invalid_backend_credentials",
+                "configured worker credential is not a valid HTTP header",
+            )
+            .response(route)
+        })?;
         let mut request = client
             .post(worker.endpoint_url(route))
+            .headers(headers)
             .json(&prepared_request);
         if connection_close {
             request = request.header("Connection", "close");
-        }
-        let api_key = worker.api_key();
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                // bearer_auth appends, so omit client credentials when the worker has its own.
-                if name == AUTHORIZATION && api_key.is_some() {
-                    continue;
-                }
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-        if let Some(key) = api_key {
-            request = request.bearer_auth(key);
         }
         Ok(request)
     }
@@ -1954,6 +1957,44 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    async fn route_inference(
+        &self,
+        request: super::ingress::InferenceEnvelope,
+        app: &Arc<crate::app_context::AppContext>,
+    ) -> Response {
+        let routing = super::ingress::IngressRouting::new(app);
+        let route = request.metadata.route;
+        let (request, (metadata, tokens)) =
+            match request.prepare_routing(&app.prepare_pool, &routing).await {
+                Ok(prepared) => prepared,
+                Err(err) => return err.response(route),
+            };
+        let candidates = match routing.candidates(&metadata, request.parsed.requires_state_domain())
+        {
+            Ok(workers) => workers,
+            Err(err) => return err.response(metadata.route),
+        };
+        let (uri, headers, body) = match request.into_pd_parts() {
+            Ok(parts) => parts,
+            Err(err) => return err.response(metadata.route),
+        };
+        let planner = DefaultPlanner::new(
+            Arc::new(WorkerRegistryAdapter::with_candidates(
+                self.worker_registry.clone(),
+                candidates,
+            )),
+            Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone())),
+        );
+        let mut context = PDRequestContext::from_metadata(&metadata, Some(&headers), None);
+        context.planner = Some(&planner);
+        context.route = uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or(metadata.route);
+        context.tokens = tokens.as_deref();
+        self.dispatch_pd(Some(&headers), &body, context).await
+    }
+
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
@@ -2067,7 +2108,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                assert!(socket.read(&mut request).await.unwrap() > 0);
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
@@ -2153,6 +2194,8 @@ mod tests {
                 is_stream: false,
                 return_logprob: false,
                 request_text: None,
+                tokens: None,
+                planner: None,
                 model_id: None,
                 headers: None,
             };
@@ -2288,6 +2331,7 @@ mod tests {
                 &HeaderMap::new(),
                 serde_json::to_value(&request).unwrap(),
                 &metadata,
+                metadata.route,
                 pair,
             )
             .await;
@@ -2691,6 +2735,8 @@ mod tests {
             is_stream: false,
             return_logprob: false,
             request_text: None,
+            tokens: None,
+            planner: None,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

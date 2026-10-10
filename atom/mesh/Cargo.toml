@@ -28,6 +28,7 @@ name = "ext_proc_envoy"
 required-features = ["ext-proc"]
 
 [dependencies]
+http-body-util = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
@@ -39,6 +40,7 @@ serde_json = { version = "1.0", default-features = false, features = [
     "preserve_order",
 ] }
 bytes = "1.8.0"
+crossbeam-channel = "0.5"
 http-body = "1.0"
 rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
@@ -96,7 +98,6 @@ toml = "0.9"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
 tonic-v12 = { version = "0.12.3", package = "tonic" }

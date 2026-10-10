@@ -9,7 +9,9 @@ use data_connector::{
 use mesh::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{JobQueue, JobQueueConfig, LoadMonitor, WorkerRegistry},
+    core::{
+        prepare_pool::PreparePoolRuntime, JobQueue, JobQueueConfig, LoadMonitor, WorkerRegistry,
+    },
     middleware::TokenBucket,
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
@@ -20,12 +22,14 @@ use mesh::{
 };
 
 /// Create an Atomesh app context with in-memory stores and test-friendly queues.
-pub async fn create_mocker_context(config: RouterConfig) -> Arc<AppContext> {
+pub async fn create_mocker_context(config: RouterConfig) -> (Arc<AppContext>, PreparePoolRuntime) {
     create_mocker_context_inner(config, false).await
 }
 
 /// Create an Atomesh app context with parser factories initialized.
-pub async fn create_mocker_context_with_parsers(config: RouterConfig) -> Arc<AppContext> {
+pub async fn create_mocker_context_with_parsers(
+    config: RouterConfig,
+) -> (Arc<AppContext>, PreparePoolRuntime) {
     create_mocker_context_inner(config, true).await
 }
 
@@ -51,7 +55,11 @@ pub fn create_mocker_app_with_context(
     )
 }
 
-async fn create_mocker_context_inner(config: RouterConfig, with_parsers: bool) -> Arc<AppContext> {
+async fn create_mocker_context_inner(
+    config: RouterConfig,
+    with_parsers: bool,
+) -> (Arc<AppContext>, PreparePoolRuntime) {
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
     let client = reqwest::Client::new();
     let rate_limiter = match config.max_concurrent_requests {
         n if n <= 0 => None,
@@ -86,6 +94,7 @@ async fn create_mocker_context_inner(config: RouterConfig, with_parsers: bool) -
 
     let app_context = Arc::new(
         AppContext::builder()
+            .prepare_pool(prepare_runtime.handle())
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
@@ -117,5 +126,5 @@ async fn create_mocker_context_inner(config: RouterConfig, with_parsers: bool) -
         .set(engines)
         .expect("WorkflowEngines should only be initialized once");
 
-    app_context
+    (app_context, prepare_runtime)
 }
