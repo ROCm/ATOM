@@ -10,6 +10,7 @@ widths, and that failure shows up as a hang rather than as a wrong number.
 """
 
 import types
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -134,6 +135,48 @@ def test_forcing_eager_changes_the_dispatch_and_not_the_batch():
         capture_sizes=np.asarray([0], dtype=np.int32),
     )
     assert not unwarmed.use_cudagraph and unwarmed.running_bs == 5
+
+
+def test_a_width_nothing_recorded_declines_the_graph_and_not_the_batch():
+    """Fitting the ladder settles only half of the lookup.
+
+    A recording is keyed by `(running_bs, max_seqlen_q)`. A P/D prefill
+    producer owns a drafter, so capture holds only the q=mtp_k+1 shapes, while
+    the scheduler never speculates for it and it decodes at q=1. Replaying on
+    batch eligibility alone would claim a key nobody recorded. The batch is
+    the same either way: this is the dispatch question, asked separately.
+    """
+    producer = _decide(_batch(seqs=8, q=1), graph_shapes={(8, 4)})
+    assert not producer.use_cudagraph and producer.running_bs == 8
+
+    recorded = _decide(_batch(seqs=8, q=1), graph_shapes={(8, 1)})
+    assert recorded.use_cudagraph and recorded.running_bs == 8
+
+
+def test_not_being_told_the_shapes_leaves_the_dispatch_to_the_ladder():
+    """`None` is "the caller cannot enumerate them" -- eager, PIECEWISE, or a
+    runner that has not captured yet -- and must not read as an empty set,
+    which would force every step eager."""
+    assert _decide(_batch(seqs=8, q=1), graph_shapes=None).use_cudagraph
+
+
+def test_declining_a_graph_the_ladder_offered_is_reported_once(monkeypatch):
+    """Otherwise the only sign is a slower decode. Once, not per step, and
+    only when the missing recording is what kept the step from replaying."""
+    from atom.utils import forward_context
+
+    monkeypatch.setattr(forward_context, "_uncaptured_decode_shape_warned", False)
+    logger = mock.Mock()
+    monkeypatch.setattr(forward_context, "_logger", logger)
+
+    _decide(_batch(seqs=8, q=1), graph_shapes={(8, 1)})
+    _decide(_batch(seqs=8, q=1), graph_shapes={(8, 4)}, enforce_eager=True)
+    _decide(_batch(seqs=3, tokens=900, prefill_tokens=900), graph_shapes={(8, 4)})
+    logger.warning.assert_not_called()
+
+    for _ in range(3):
+        _decide(_batch(seqs=8, q=1), graph_shapes={(8, 4)})
+    logger.warning.assert_called_once()
 
 
 def test_the_batch_ignores_what_this_rank_alone_was_handed(monkeypatch):

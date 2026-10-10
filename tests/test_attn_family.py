@@ -28,11 +28,13 @@ import pytest
 
 from atom.utils.selector import Family, attn_family, has_mla_indexer
 
-GDN, KIMI_MLA, MHA, MLA, V4 = (
+CSA2, GDN, KIMI_MLA, MHA, MLA, QSA_GDN, V4 = (
+    Family.CSA2,
     Family.GDN,
     Family.KIMI_MLA,
     Family.MHA,
     Family.MLA,
+    Family.QSA_GDN,
     Family.V4,
 )
 
@@ -156,3 +158,32 @@ class TestWhatRidesAnMlaPool:
 
     def test_an_mla_model_without_an_indexer_does_not(self):
         assert not has_mla_indexer(cfg(model_type="deepseek_v3", kv_lora_rank=512))
+
+
+class TestWhatKeepsAnAccumulatingState:
+    """Which families a token's order matters to: a paged write lands at the
+    token's own position, so repeating it is idempotent; a recurrent state
+    advances, so it is not."""
+
+    @pytest.mark.parametrize(
+        "family, expected",
+        [
+            (KIMI_MLA, True),
+            (QSA_GDN, True),
+            (GDN, True),
+            (V4, False),
+            (MLA, False),
+            (MHA, False),
+            # CSA2 is slot-addressed too, but its window write lands at
+            # `(slot, position)` and stores the token's own KV, so replaying a
+            # token rewrites the same row with the same bytes.
+            (CSA2, False),
+        ],
+    )
+    def test_the_hybrids_and_pure_gdn_answer_together(self, family, expected):
+        assert family.has_recurrent_state is expected
+
+    def test_every_family_is_covered(self):
+        """A new family must state its answer rather than inherit False, the
+        one that fails silently: a state pool nobody knows about."""
+        assert set(Family) == {KIMI_MLA, QSA_GDN, GDN, V4, MLA, MHA, CSA2}
