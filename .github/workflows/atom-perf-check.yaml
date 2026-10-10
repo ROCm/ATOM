@@ -144,9 +144,19 @@ env:
   # run to run -- so three readings landing within 0.3 points of each other at
   # +2.3% is not the spread RESIDUAL_SPREAD_PCT covers. It is the second-half
   # advantage the warmup exists to remove, still present at this length for
-  # that cell, and widening a constant to cover it would buy quiet at the cost
-  # of sensitivity. Raise this to 10, for that entry or for all of them, once a
-  # run has shown whether the longer warmup removes it.
+  # that cell.
+  #
+  # Kept at 1 anyway, which is a decision rather than an oversight, and it
+  # costs something specific: a regression in that cell has to be about 2.3
+  # points deeper before c=256 reads as down, so for GLM-5.2-FP8 detection
+  # there starts near -4.3% rather than -2.0%. What it does not do is invent
+  # one -- the bias is positive, so it hides rather than fabricates, which is
+  # the direction an advisory check should fail in. The alternative buys those
+  # 2.3 points back by turning the warmup into a third full-length phase,
+  # taking the c=256 job from 29 minutes to about 50 and the matrix past 90
+  # minutes of wall clock. One cell's bias is not worth the whole run's
+  # schedule. Revisit if a second cell on a quiet level does the same, or if
+  # this one grows.
   #
   # Kimi-K3 at c=32 read -12.1% and -11.6% on TTFT in two runs and looked like
   # a second one, but the run before them read -0.5%, and M3 at the same level
