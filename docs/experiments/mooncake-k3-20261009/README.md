@@ -40,3 +40,9 @@ The source built successfully on both ranks, the official ROCm wheel passed HIP/
 A local isolated1.30.0 installation reproduces the exact import failure;1.31.0 passes. Source requirement audit also found xgrammar0.2.6 instead of0.2.8 and missing oss-harmony; xgrammar0.2.8 needs apache-tvm-ffi0.1.11. The pinned runtime requirements include these versions and restore image setuptools79.0.1 after native build tooling installs84. The active dependency imports and declared common/transitive requirements are checked locally. Remote startup now checks common requirements and imports both Mooncake connectors before model launch. Package manifests resolve the active distribution so image metadata cannot overwrite venv provenance.
 
 The next run uses idle g10/g12 per CPU inspection38021019640 at03:34:57 UTC, with identical model, transport, Store, performance and accuracy configuration. The vLLM source remains pure bacbbe187. Current contract and inputs are in this directory; detailed local evidence is in `/app/test_scripts/dspark_pd/mooncake-rocm-c16-20261009/retry-hub131/`.
+
+## Resource preflight on 2026-10-10
+
+Run38021290912 / Slurm6370 failed the GPU preflight before any model container: g10/g12 retained unrelated SGLang6342/6343 containers using roughly272–275GiB per GPU although the scheduler reported idle. CPU-only diagnostic38021697734 / job6371 (ReqTRES cpu2,node2, no GPUs) then measured g03 at about280GiB per GPU and g17 at about35GiB per GPU, both with unrelated containers. These workloads were left intact.
+
+The next model run requests exactly two8-GPU nodes from g01/g19/g23/g27 in the authorized pool, waiting for their scheduler-managed workloads to release resources. The matrix changes only the candidate list and retains num_nodes2. Actual GPU preflight remains required before serving. Dependency alignment from63995405 is unchanged and still lacks remote execution evidence because the previous run stopped before install.

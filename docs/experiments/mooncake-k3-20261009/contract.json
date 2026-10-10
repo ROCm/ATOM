@@ -13,7 +13,7 @@
     "Mooncake direct RDMA push instead of MoRI READ",
     "P-only Mooncake embedded Store instead of LMCache MP; same 1799 GiB aggregate CPU pool, 8 GiB private buffer",
     "Mooncake example proxy with health/models adapter instead of MoRI router",
-    "current idle g10/g12 in the same approved pool",
+    "two scheduler-selected nodes from g01/g19/g23/g27 in the same approved pool",
     "safetensors loader instead of fastsafetensors"
   ],
   "cpu_store_gib_total": 1799,
@@ -35,8 +35,10 @@
     "display_topology": "1P1D-TP8-DCP8",
     "pd_worker_layout": "multi_node",
     "nodes": [
-      "pit2-p03-g10",
-      "pit2-p03-g12"
+      "pit2-p03-g01",
+      "pit2-p03-g19",
+      "pit2-p03-g23",
+      "pit2-p03-g27"
     ],
     "num_nodes": 2,
     "isl": [
@@ -312,12 +314,11 @@
       }
     }
   },
-  "resume_from_run": 37953102503,
+  "resume_from_run": 38021290912,
   "retry_changes": [
-    "Install missing/outdated main Python dependencies from a pinned runtime list; keep native main unchanged.",
-    "Fix package provenance to report active venv distributions instead of shadowed image copies.",
-    "Validate main common requirements and actual Mooncake/Store imports before serving.",
-    "Use currently idle g10/g12 in the authorized pool; inspection38021019640."
+    "Use a four-node candidate list (g01/g19/g23/g27), allocate only two; wait for scheduler-managed workloads to release nodes.",
+    "Exclude g03/g10/g12/g17 with confirmed unrelated GPU occupants; no cleanup or cancellation of their work.",
+    "The runtime dependency fix remains to be validated remotely because run38021290912 failed preflight."
   ],
   "runtime_dependencies": {
     "huggingface_hub": "1.31.0",
