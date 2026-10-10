@@ -210,8 +210,8 @@ def attention_contract(monkeypatch, reference):
             return call
 
         with pytest.MonkeyPatch.context() as patch:
-            for name in ("sparse_attn_v4_paged_decode", "sparse_attn_v4_paged_prefill"):
-                patch.setattr(attention, name, checked(getattr(attention, name)))
+            name = "sparse_attn_v4_paged_2src"
+            patch.setattr(attention, name, checked(getattr(attention, name)))
             yield
         assert next(remaining, None) is None
 

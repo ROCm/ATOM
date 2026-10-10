@@ -1897,7 +1897,7 @@ def _populate_prefill(md, common, batch_np, pos_np, q_np, positions_gpu):
     # ``prefix_swa_count = chunk_start - swa_low`` exceed the window ``win``, and
     # the index kernel (``BLOCK_N = next_pow2(win) == win``) only writes the
     # first ``win`` slots, leaving the overflow slot UNINITIALIZED -> a garbage
-    # paged offset -> illegal memory access in sparse_attn_v4_paged_prefill.
+    # paged offset -> illegal memory access in sparse_attn_v4_paged_2src.
     # The first-token position is exact and guarantees token_pos_in_chunk >= 0
     # for every token, capping prefix_swa_count at ``win``. Both the CPU indptr
     # sizing below and the Triton scatter kernel read this same array, so they

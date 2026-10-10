@@ -171,17 +171,21 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("topk", [4, 64])
-def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk):
+def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
+    packed, ratio, topk
+):
     """The indptr reserves what the writer writes, per row, to the slot.
 
     `_indptr_scan` derives a row's length from its position; `_indices` writes
-    a window segment at one end and one id per non-negative selection at the
-    other. A row where the two disagree leaves the difference between them
-    untouched, and `sparse_attn_v4_paged_decode` is called with
-    `has_invalid=False` -- it dereferences every slot the indptr claims, so
-    that gap is an out-of-range read of whatever the allocation held.
+    one id per non-negative selection, and the window -- at the other end of
+    the same slice on the packed pool, as `_window_rows`'s own list on a BF16
+    decode. A row where the two disagree leaves the difference between them
+    untouched, and the decode kernel dereferences every slot the indptr
+    claims, so that gap is an out-of-range read of whatever the allocation
+    held.
 
     Checked against the writer's own rule rather than against the scan's,
     which is the only way the two can be caught disagreeing.
@@ -190,7 +194,15 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
     geo = V41PoolGeometry(
-        2, ((0, ratio),), 32, 8, 512, 32, layer_ratios=(ratio,), index_topk=topk
+        2,
+        ((0, ratio),),
+        32,
+        8,
+        512,
+        32,
+        packed=packed,
+        layer_ratios=(ratio,),
+        index_topk=topk,
     )
     cache = PagedAttentionCache(geo, 32, 4, "cuda")
     # Decode rows on both sides of the window boundary, and a request whose
@@ -213,19 +225,23 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(ratio, topk
     ).int()
     step.selected[0] = selection.unsqueeze(0)
     spec = LayerAttentionSpec(1, ratio, AttentionMode.REUSE, 0, 0)
-    _, pptr, _, _ = cache.attention_indices(spec, step)
+    _, pptr, _, wptr = cache.attention_indices(spec, step)
     window = (step.positions + 1).clamp(max=geo.window_size)
-    written = window + (selection >= 0).sum(-1)
+    selected = (selection >= 0).sum(-1)
+    written = selected + window if packed else selected
     assert torch.equal(pptr.diff().long(), written.long()), (
         f"reserved={pptr.diff().tolist()} written={written.tolist()} "
         f"window={window.tolist()} visible={visible.tolist()}"
     )
+    if not packed:
+        assert torch.equal(wptr.diff().long(), window.long())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
-    """A run's launch against the launches it replaces, plane by plane.
+    """A run's launch against the launches it replaces, plane by plane, on the
+    packed pool (whose decode lists each layer's window in its prefix).
 
     The run shares every input but its ring, so what this catches is the one
     thing the grid's second axis has to get right: layer `j` addressing layer
@@ -237,7 +253,15 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
 
     layers = 4
     geo = V41PoolGeometry(
-        layers, ((0, ratio),), 32, 8, 512, 32, layer_ratios=(ratio,), index_topk=8
+        layers,
+        ((0, ratio),),
+        32,
+        8,
+        512,
+        32,
+        packed=True,
+        layer_ratios=(ratio,),
+        index_topk=8,
     )
     cache = PagedAttentionCache(geo, 32, 4, "cuda")
     spans = (
@@ -276,6 +300,83 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
     # Two layers' rings must differ, or every stride passes.
     assert not torch.equal(alone[0], alone[1])
     assert all(torch.equal(a, b) for a, b in zip(alone, grouped, strict=True))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_a_bf16_decode_reads_each_layers_own_window_through_its_ring():
+    """A BF16 decode's window rows are one list for every layer, read through
+    the layer's own ring (`ring_view`); its selection is one plane a group.
+
+    What a layer gathers that way must be its own ring's entries at the row's
+    window positions -- checked against the state's `window` field, not a row
+    formula rewritten here, with every (slot, layer, ring position) holding a
+    distinct value, so a list offset by a layer or a slot gathers wrong ones.
+    """
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    layers = 4
+    geo = V41PoolGeometry(
+        layers, ((0, 2),), 32, 8, 512, 32, layer_ratios=(2,), index_topk=8
+    )
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    rings = cache.state.view("window")
+    ring_slots = rings.shape[2]
+    for layer in range(layers):
+        for slot in range(rings.shape[1]):
+            codes = torch.arange(ring_slots, device="cuda") + 8 * layer + 32 * slot
+            rings[layer, slot] = codes[:, None].to(rings.dtype)
+    spans = (
+        PagedRequest(1, 3, 0, 1, 0, (0, 1, 2)),
+        PagedRequest(2, 200, 1, 1, 1, tuple(range(3, 16))),
+    )
+    step = begin_step(cache, spans, running_bs=3, running_tokens=3, max_q_len=1)
+    assert step.decode
+    step.selected[0] = torch.where(
+        torch.arange(8, device="cuda") < ((step.positions + 1) // 2)[:, None],
+        torch.arange(8, device="cuda").expand(step.width, 8),
+        -1,
+    ).int()[None]
+    planes = set()
+    for layer in range(layers):
+        spec = LayerAttentionSpec(
+            layer, 2, AttentionMode.REUSE, 0, 0, index_group_size=layers
+        )
+        prefix, _, window, wptr = cache.attention_indices(spec, step)
+        planes.add(prefix.data_ptr())
+        view = cache.ring_view(layer)
+        bounds = wptr.tolist()
+        for t, request in enumerate(spans):
+            pos = request.position
+            ring = [p % ring_slots for p in range(max(0, pos - 7), pos + 1)]
+            rows = window[bounds[t] : bounds[t + 1]].long()
+            assert torch.equal(view[rows, 0], rings[layer, request.slot, ring, 0])
+        # the padding row reads nothing
+        assert bounds[-1] == bounds[len(spans)]
+    assert len(planes) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_a_bf16_decode_builds_an_ungrouped_layers_selection_from_its_own_owner():
+    """A layer that declares no index group names no group start (it defaults
+    to 0), yet on a BF16 decode it still reads its own owner's selection rather
+    than the one an earlier ungrouped layer built: two layers on one KV owner,
+    their selections in opposite orders."""
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+
+    geo = V41PoolGeometry(2, ((0, 2),), 32, 8, 512, 32, layer_ratios=(2,), index_topk=8)
+    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    spans = (PagedRequest(1, 200, 0, 1, 0, tuple(range(13))),)
+    step = begin_step(cache, spans, running_bs=1, running_tokens=1, max_q_len=1)
+    assert step.decode
+    ids = torch.arange(8, dtype=torch.int32, device="cuda")[None, None]
+    step.selected[0], step.selected[1] = ids, ids.flip(-1)
+    first = cache.attention_indices(
+        LayerAttentionSpec(0, 2, AttentionMode.FULL, 0, 0), step
+    )[0]
+    second = cache.attention_indices(
+        LayerAttentionSpec(1, 2, AttentionMode.REINDEX, 0, 1), step
+    )[0]
+    assert torch.equal(second, first.flip(-1))
 
 
 def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
@@ -442,12 +543,19 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("width", [0, 96, 1025])
 @pytest.mark.parametrize(
     "ratios", [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
 )
-def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratios):
+def test_shared_indptr_launch_matches_row_counts_and_replay(
+    packed, decode, width, ratios
+):
+    """A packed decode counts each row's window and selection in one prefix; a
+    BF16 decode (the window its own list, `splits_window`) counts the selection
+    there and the window in the extend indptr; a prefill counts its history
+    and selection, and its own rows' reach in the extend."""
     from types import SimpleNamespace
 
     from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
@@ -460,9 +568,11 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratio
         128,
         512,
         32,
+        packed=packed,
         layer_ratios=ratios,
         index_topk=64,
     )
+    split = decode and not packed
     live = max(0, width - 7)
     lengths = [live // 3, live // 3, live - 2 * (live // 3)]
     cu = torch.tensor(
@@ -509,20 +619,22 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(decode, width, ratio
             torch.tensor(pos + [0] * (width - live), device="cuda", dtype=torch.int32)
         )
         graph.replay()
+        pad = [0] * (width - live)
         for ratio, (prefix, extend, topk) in built.items():
             counts = [
-                w + (min((p + 1) // ratio, topk) if ratio else 0)
+                (0 if split else w) + (min((p + 1) // ratio, topk) if ratio else 0)
                 for w, p in zip(windows, pos)
-            ] + [0] * (width - live)
+            ] + pad
             expected = torch.tensor(
                 [0] + list(np.cumsum(counts)), device="cuda", dtype=torch.int32
             )
             torch.testing.assert_close(prefix, expected, rtol=0, atol=0)
-            if decode:
+            if decode and not split:
                 assert extend.data_ptr() == prefix.data_ptr()
             else:
+                second = windows if split else reaches
                 expected = torch.tensor(
-                    [0] + list(np.cumsum(reaches + [0] * (width - live))),
+                    [0] + list(np.cumsum(second + pad)),
                     device="cuda",
                     dtype=torch.int32,
                 )

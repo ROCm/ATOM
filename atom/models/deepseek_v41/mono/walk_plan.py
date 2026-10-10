@@ -7,7 +7,10 @@ laid out on the host while the step's metadata is staged
 
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import visible_buffer_name
+from atom.model_ops.attentions.deepseek_v41.metadata import (
+    StepPlan,
+    visible_buffer_name,
+)
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.config import MAX_ROWS
 from atom.mono.plan.execution import BLOCKS
@@ -39,11 +42,11 @@ class WalkPlanner:
             for ratio in self.ratios
         }
 
-    def __call__(self, buffers, rows: int) -> dict:
-        """Lay the plans out of ``buffers``' staged rows; the rows each plan
+    def __call__(self, buffers, rows: int) -> StepPlan:
+        """Lay the plans out of ``buffers``' staged rows: the rows each plan
         publishes, by buffer name."""
         if rows > MAX_ROWS:
-            return {}
+            return StepPlan({})
         owners = buffers["batch_id_per_q_token"].np[:rows]
         for ratio in self.ratios:
             ip.fill_walk_plan(
@@ -51,4 +54,4 @@ class WalkPlanner:
                 owners,
                 buffers[walk_plan_name(ratio)].np,
             )
-        return {walk_plan_name(ratio): BLOCKS for ratio in self.ratios}
+        return StepPlan({walk_plan_name(ratio): BLOCKS for ratio in self.ratios})
