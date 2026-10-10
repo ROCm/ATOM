@@ -422,7 +422,8 @@ class StateOffloadFace(ABC):
     forwarding through `getattr` to `_impl`, so presence could not distinguish
     them and every state call fell through to a dense impl's no-tier defaults
     (stores recorded failed, loads dropped, reports empty). Make the face an
-    explicit type: only `KimiK3OffloadScheduler` inherits it, so
+    explicit type: `KimiK3OffloadScheduler` inherits it, and
+    `QwenOffloadScheduler` inherits that, so
     `isinstance(impl, StateOffloadFace)` is the honest predicate.
 
     Narrow on purpose -- only the four tier methods. Other impl attributes the

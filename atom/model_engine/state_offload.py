@@ -210,8 +210,8 @@ class StateOffloadIndex:
 
 #: Offload layouts whose worker half builds a `StateOffloadTier`. Not every
 #: `lmcache_offload` does: `dense` has no per-request state at all and `hybrid`
-#: (DSV4) keeps its own in the SLOT sidecar, so only K3 offloads state.
-_STATE_TIER_LAYOUTS = frozenset({"kimi_k3"})
+#: (DSV4) keeps its own in the SLOT sidecar. `qwen` subclasses the K3 tier.
+_STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen"})
 
 #: Roles from which the worker will save / load. Mirrors `_do_save` / `_do_load`
 #: in `OffloadWorkerMixin`; the state legs ride those same halves.

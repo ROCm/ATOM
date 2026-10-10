@@ -136,6 +136,26 @@ def test_scheduler_shell_forwards_block_lifecycle_hooks():
     assert calls == [("sent", "request-1"), ("released", "request-2")]
 
 
+def test_page_only_refuses_per_request_state(monkeypatch):
+    class PageWorker:
+        def __init__(self, config):
+            self.config = config
+
+        def register_kv_caches(self, caches, tensors, num_blocks):
+            raise AssertionError("PAGE-only must not register recurrent state")
+
+    monkeypatch.setattr(mp_worker, "LMCacheMPConnector", PageWorker)
+    worker = LMCacheMPConnector(_config())
+    caches = {"layer_0": SimpleNamespace(per_request_state=True)}
+
+    try:
+        worker.register_kv_caches(caches, SimpleNamespace(), 7)
+    except ValueError as exc:
+        assert "per-request recurrent state" in str(exc)
+    else:
+        raise AssertionError("expected PAGE-only recurrent state to be refused")
+
+
 def test_plain_page_layout_uses_generic_implementations(monkeypatch):
     selected = []
 
