@@ -201,7 +201,8 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
             assert not step.selected
             assert embeddings.events == ([] if empty else ["stage", "join"])
     if level == 3:
-        assert len(calls) == len(model.compiled_codes) == 1
+        # one graph, as before bounded replay: the flag is off
+        assert len(calls) == len(model.backbone.compiled_codes) == 1
     else:
         assert not calls
     assert tuple(model.state_dict()) == names == ("embed.weight",)
@@ -261,6 +262,9 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.utils.forward_context import AttnState
     from tests.attentions.deepseek_v41.helpers import metadata_buffers
+    from tests.attentions.deepseek_v41.test_runtime_contract import (
+        _attach_uncompiled_backbone,
+    )
 
     geo = V41PoolGeometry(
         1, ((0, 2),), 32, 4, 512, 32, layer_ratios=(2,), index_block_rows=8
@@ -291,7 +295,7 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
 
     model = DeepseekV41RuntimeModel.__new__(DeepseekV41RuntimeModel)
     nn.Module.__init__(model)
-    model.do_not_compile = True
+    _attach_uncompiled_backbone(model)
     model.config = SimpleNamespace(hidden_size=8, hc_mult=4)
     model.layers = nn.ModuleList([TinyBlock()])
     model.layers[0].engram = Engram()

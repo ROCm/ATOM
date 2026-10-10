@@ -101,6 +101,7 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
         )
         steps.append(child.step)
         assert child.cache is parent.cache
+        assert child.step.swa_replay_start is parent.step.swa_replay_start
         assert child.step.width == end - start
         torch.testing.assert_close(
             child.step.positions, parent.step.positions[start:end]
@@ -1029,6 +1030,44 @@ def test_forward_does_not_repeat_request_admission(monkeypatch, dp_attention):
     # Admission rejects unsupported media before any distributed forward.
     # Repeating that check here could strand peers in their collectives.
     v41_begin_forward(hidden)
+
+
+@pytest.mark.parametrize("ubatch_idx", [0, 1])
+def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
+    import threading
+
+    from atom.models.deepseek_v41.bounded_replay import replay_rows
+    from atom.utils.tbo import ubatching
+
+    builder, metadata = make_parent("cpu")
+    slices = [
+        UBatchSlice(slice(0, 1), slice(0, 5)),
+        UBatchSlice(slice(0, 2), slice(5, 14)),
+    ]
+    parent = ForwardContext(
+        attn_metadata=metadata,
+        context=Context(
+            positions=metadata.step.positions,
+            is_prefill=True,
+            scheduled_bs=2,
+            scheduled_tokens=14,
+            running_bs=2,
+            running_tokens=14,
+        ),
+        ubatch_slices=slices,
+    )
+    wrapper = UBatchWrapper(torch.nn.Identity(), builder)
+    part = slices[ubatch_idx]
+    child = wrapper._make_ubatch_context(
+        parent, part, part.request_slice.stop, ubatch_idx=ubatch_idx
+    )
+    assert child.ubatch_slices is None
+    width = child.attn_metadata.step.width
+    assert replay_rows(child, width) == builder.geometry.ring_slots
+    monkeypatch.setitem(
+        ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), ubatch_idx
+    )
+    assert replay_rows(child, width) is None
 
 
 def test_tbo_rejects_compacted_scheduler_rows_before_slicing():

@@ -878,6 +878,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 extra_write=0,
             )
         if step.positions.is_cuda:
+            # TBO runs every row; share the parent's fixed, read-only zeros
+            # instead of allocating a replay floor for each child forward.
+            step.swa_replay_start = parent.swa_replay_start
             step.indptrs = fill_step_indptrs(
                 step, self.geometry, self._ubatch_indptrs[ubatch_idx]
             )

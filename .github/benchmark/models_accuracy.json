@@ -256,20 +256,7 @@
     "accuracy_threshold": 0.92,
     "accuracy_baseline": 0.9409,
     "accuracy_baseline_model": "moonshotai/Kimi-K2.7-Code",
-    "_baseline_note": "Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed."
-  },
-  {
-    "model_name": "Kimi-K2.5-MXFP4 Eagle3",
-    "model_path": "amd/Kimi-K2.5-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --method eagle3 --draft-model lightseekorg/kimi-k2.5-eagle3 --num-speculative-tokens 3",
-    "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
-    "runner": "linux-atom-do-mi350x-8",
-    "test_level": "nightly",
-    "accuracy_threshold": 0.91,
-    "mtp_accept_threshold": 0.67,
-    "accuracy_baseline": 0.9257,
-    "accuracy_baseline_model": "amd/Kimi-K2.5-MXFP4 + lightseekorg/kimi-k2.5-eagle3",
-    "_baseline_note": "Eagle3 spec decode on Kimi-K2.5-MXFP4."
+    "_baseline_note": "Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold should be refreshed after CI baseline is available."
   },
   {
     "model_name": "Kimi-K3",

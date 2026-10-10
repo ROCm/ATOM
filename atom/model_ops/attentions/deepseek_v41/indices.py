@@ -16,6 +16,7 @@ def _indptr_scan(
     pptr,
     eptr,
     tokens,
+    replay_start,
     DECODE: tl.constexpr,
     WINDOW: tl.constexpr,
     RATIO: tl.constexpr,
@@ -57,6 +58,11 @@ def _indptr_scan(
         pos = tl.load(positions + idx, mask=live, other=0).to(tl.int32)
         start = tl.load(cu + bid, mask=live, other=0)
         first = tl.maximum(pos - WINDOW + 1, 0)
+        if not DECODE:
+            # A request's window starts no lower than its replay start: 0
+            # except on a bounded-replay tail, a prefill whose late layers
+            # wrote no window row below it (`BatchStep.swa_replay_start`).
+            first = tl.maximum(first, tl.load(replay_start + bid, mask=live, other=0))
         # Decode sees its own token; a prefill chunk sees only what its first
         # token already had, the rest arriving as the extend segment.
         history_end = (
@@ -90,6 +96,7 @@ def _indptr_scan_all(
     prefixes,
     extends,
     tokens,
+    replay_start,
     DECODE: tl.constexpr,
     WINDOW: tl.constexpr,
     RATIOS: tl.constexpr,
@@ -108,6 +115,7 @@ def _indptr_scan_all(
                 prefixes[i],
                 extends[i],
                 tokens,
+                replay_start,
                 DECODE,
                 WINDOW,
                 RATIOS[i] or 1,
@@ -135,6 +143,7 @@ def _indices(
     ring_start,
     layer_stride,
     plane,
+    replay_start,
     DECODE: tl.constexpr,
     ROWS_PER_PAGE: tl.constexpr,
     PAGE_ROWS: tl.constexpr,
@@ -166,6 +175,9 @@ def _indices(
     start = tl.load(cu + batch)
     pos = tl.load(positions + t)
     first = tl.maximum(0, pos - WINDOW + 1)
+    if not DECODE:
+        # see `_indptr_scan`: only a prefill can be a bounded-replay tail
+        first = tl.maximum(first, tl.load(replay_start + batch))
     history_end = pos + 1 if DECODE else tl.load(positions + start)
     window_count = tl.maximum(0, history_end - first)
     pbegin, pend = tl.load(pptr + t), tl.load(pptr + t + 1)
@@ -252,6 +264,21 @@ def splits_window(step, geometry):
     return step.decode and not geometry.packed
 
 
+def _replay_start(step):
+    """`step.swa_replay_start`. Serving's steps carry the cache's fixed zeros
+    (`PagedAttentionCache.begin_step`) or a replay tail's own; this fallback
+    only serves steps assembled outside the cache, in tests."""
+    replay_start = getattr(step, "swa_replay_start", None)
+    if replay_start is None:
+        # one per request slot the step publishes, padding included
+        replay_start = step.swa_replay_start = torch.zeros(
+            max(step.cu_seqlens_q.numel() - 1, 1),
+            dtype=torch.int32,
+            device=step.positions.device,
+        )
+    return replay_start
+
+
 def fill_step_indptrs(step, geometry, buffers):
     """`{ratio: (prefix indptr, extend indptr, reserved top-k)}` for this step.
 
@@ -279,6 +306,7 @@ def fill_step_indptrs(step, geometry, buffers):
             tuple(built[ratio][0] for ratio in ratios),
             tuple(built[ratio][1] for ratio in ratios),
             step.width,
+            _replay_start(step),
             DECODE=step.decode,
             WINDOW=geometry.window_size,
             RATIOS=ratios,
@@ -362,6 +390,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
             window.ring_start,
             stride,
             plane,
+            _replay_start(step),
             DECODE=step.decode,
             ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
             PAGE_ROWS=geometry.page_bytes

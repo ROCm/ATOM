@@ -234,6 +234,19 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
                 return module
         return None
 
+    def _find_model_attr(self, name):
+        """`name` on the model or a module it wraps (`.model`), or None."""
+        module = self.model
+        for _ in range(8):
+            found = getattr(type(module), name, None)
+            if found is not None:
+                return getattr(module, name)
+            inner = getattr(module, "model", None)
+            if inner is None or inner is module:
+                return None
+            module = inner
+        return None
+
     def _register_hidden_state_hooks(self) -> bool:
         if self._model_forward_accepts_capture_arg():
             return False
@@ -305,6 +318,17 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         self._hook_capture_enabled = False
         self._hook_captured_hidden_states: dict[int, torch.Tensor] = {}
         self._use_hook_capture = self._register_hidden_state_hooks()
+        # The export stores every prefill row of the captured layers and of
+        # the final hidden states. DeepSeek-V4.1's decoder SWA bounded replay
+        # computes only each request's tail rows in its late layers, so it is
+        # turned off while exporting.
+        set_replay = self._find_model_attr("set_decoder_replay")
+        if set_replay is not None:
+            set_replay(False)
+            logger.info(
+                f"{self.label}: decoder SWA bounded replay disabled for "
+                "hidden-state export"
+            )
         logger.info(
             f"{self.label}: hidden states extraction enabled, "
             f"aux_layers={sorted(self._aux_layer_ids)}, "
