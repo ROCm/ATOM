@@ -136,27 +136,30 @@ env:
   # between settings, so n=2 cannot separate them. Both sit inside the +-2.5
   # RESIDUAL_SPREAD_PCT this check documents.
   #
-  # One cell argues against this setting and is not yet explained:
+  # One entry argues against this setting and is not yet explained. On the
+  # first complete matrix (run 38020010709) the other four sat inside +-0.5%
+  # at both levels, and GLM-5.2-FP8 did this:
   #
-  #   GLM-5.2-FP8  c=256  total tput  +2.4 / +2.1 / +2.3%   (three runs)
+  #   GLM-5.2-FP8  c=256  +2.4 / +2.1 / +2.3 / +2.2%   (four runs)
+  #   GLM-5.2-FP8  c=32   +3.1%                        (first clean reading)
   #
-  # with TTFT and TPOT agreeing each time. c=256 is the quiet level -- 0.5-1.2%
-  # run to run -- so three readings landing within 0.3 points of each other at
-  # +2.3% is not the spread RESIDUAL_SPREAD_PCT covers. It is the second-half
-  # advantage the warmup exists to remove, still present at this length for
-  # that cell.
+  # with TTFT and TPOT agreeing every time. c=256 is the quiet level, 0.5-1.2%
+  # run to run, so four readings inside 0.3 points of each other are not the
+  # spread RESIDUAL_SPREAD_PCT covers -- and c=32 says it is the entry rather
+  # than the level. It is the second-half advantage the warmup exists to
+  # remove, still present at this length for this model.
   #
   # Kept at 1 anyway, which is a decision rather than an oversight, and it
-  # costs something specific: a regression in that cell has to be about 2.3
-  # points deeper before c=256 reads as down, so for GLM-5.2-FP8 detection
-  # there starts near -4.3% rather than -2.0%. What it does not do is invent
+  # costs something specific: a GLM-5.2-FP8 regression has to be about 2.6
+  # points deeper at BOTH levels before either reads as down, so detection
+  # there starts near -4.6% rather than -2.0%. What it does not do is invent
   # one -- the bias is positive, so it hides rather than fabricates, which is
-  # the direction an advisory check should fail in. The alternative buys those
-  # 2.3 points back by turning the warmup into a third full-length phase,
-  # taking the c=256 job from 29 minutes to about 50 and the matrix past 90
-  # minutes of wall clock. One cell's bias is not worth the whole run's
-  # schedule. Revisit if a second cell on a quiet level does the same, or if
-  # this one grows.
+  # the direction an advisory check should fail in, and the nightly measures
+  # this model on real weights every night. The alternative buys those points
+  # back by turning the warmup into a third full-length phase, taking the
+  # c=256 job from 29 minutes to about 50 and the matrix past 90 minutes of
+  # wall clock. One entry's bias is not worth the whole run's schedule.
+  # Revisit if a second entry does the same, or if this one grows.
   #
   # Kimi-K3 at c=32 read -12.1% and -11.6% on TTFT in two runs and looked like
   # a second one, but the run before them read -0.5%, and M3 at the same level
