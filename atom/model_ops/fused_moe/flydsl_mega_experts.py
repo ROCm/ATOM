@@ -41,6 +41,7 @@ import os
 
 import torch
 
+from atom.model_ops.fused_moe.triton_zero_pad_rows import zero_pad_rows_
 from atom.plugin import is_plugin_mode
 from atom.utils import envs
 
@@ -337,8 +338,8 @@ def run_mega_moe(
         out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
     if pad_rows is not None and not combine_can_mask:
         # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
-        # an earlier call left there (possibly non-finite). Select zeros.
-        out = torch.where(pad_rows, 0, out)
+        # an earlier call left there (possibly non-finite). Zero those rows.
+        out = zero_pad_rows_(out, pad_rows)
     return out
 
 
