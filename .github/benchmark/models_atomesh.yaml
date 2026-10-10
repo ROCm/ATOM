@@ -1403,6 +1403,44 @@ models:
             <<: *dsv4_0813_agentic_dpa_decode
             cudagraph: "[1,2,3,4,5,6,7,8]"
 
+      # Manual-dispatch only (suite=adhoc): plain TP8 points not in the weekly
+      # DPA set, for comparison with the InferenceX SGLang TP arms.
+      adhoc:
+        # Plain TP8 (no DP attention, no TBO) at c32/c48, mirroring the
+        # InferenceX ATOM TP8 arm: round_robin routing, admission 2x CONC,
+        # decode graphs up to min(64, 2x CONC).
+        - &dsv4_0813_agentic_tp8_no_offload
+          <<: *dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-tp8-dspark3-agentic-no-offload-c32
+          router:
+            policy: round_robin
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DSPARK3
+          concurrency: [32]
+          server:
+            common_args:
+              max_num_seqs: 64
+              decode_max_num_seqs: 64
+          prefill:
+            workers: 1
+            tp: 8
+            cudagraph_mode: FULL
+            compilation_level: 3
+          decode:
+            workers: 1
+            tp: 8
+            cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64]"
+            cudagraph_mode: FULL
+            compilation_level: 3
+
+        - <<: *dsv4_0813_agentic_tp8_no_offload
+          name: ds-v4-0813-1p1d-tp8-dspark3-agentic-no-offload-c48
+          concurrency: [48]
+          server:
+            common_args:
+              max_num_seqs: 96
+              decode_max_num_seqs: 96
+
       # Manual accuracy suite: no performance workload or synthetic acceptance.
       accuracy:
         - name: ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
