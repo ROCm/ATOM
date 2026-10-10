@@ -5,10 +5,12 @@ import gc
 import logging
 import time
 import uuid
-from typing import Callable
+from collections.abc import Callable
+from multiprocessing import shared_memory
 
 import torch
-from multiprocessing import shared_memory
+
+from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD
 
 logger = logging.getLogger("atom")
 
@@ -35,6 +37,19 @@ def rebuild_ipc_handle(
     if device_id is not None:
         list_args[6] = device_id
     return func(*list_args)
+
+
+def _abort_weight_sync(core_mgr, path: str) -> None:
+    """Best-effort close of a sync whose sender stopped before its last bucket."""
+    try:
+        core_mgr.broadcast_utility_command_sync(
+            DISCARD_WEIGHT_SYNC_CMD,
+            timeout=30.0,
+            failed_cmd=path,
+            error=f"{path} sender abandoned the sync before its final bucket",
+        )
+    except Exception:
+        logger.exception("%s: failed to abort abandoned weight sync", path)
 
 
 def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
@@ -64,6 +79,8 @@ def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
     buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
 
     total_params = 0
+    started = False
+    completed = False
     try:
         offset = 0
         bucket_meta: dict = {}
@@ -78,6 +95,7 @@ def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
 
             # If this tensor would overflow the current bucket, flush first
             if bucket_meta and offset + tensor_nbytes > bucket_size:
+                started = True
                 core_mgr.broadcast_utility_command_sync(
                     "update_weights_shm",
                     shm_name=shm_name,
@@ -110,12 +128,14 @@ def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
 
         # Flush remaining parameters (or empty generator)
         if bucket_meta:
+            started = True
             core_mgr.broadcast_utility_command_sync(
                 "update_weights_shm",
                 shm_name=shm_name,
                 bucket_meta=bucket_meta,
                 is_last=True,
             )
+            completed = True
             total_params += len(bucket_meta)
         else:
             # Generator was empty – just clear KV cache
@@ -123,6 +143,8 @@ def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
             core_mgr.broadcast_utility_command("clear_kv_cache")
 
     finally:
+        if started and not completed:
+            _abort_weight_sync(core_mgr, "update_weights_shm")
         shm.close()
         shm.unlink()
 
@@ -211,6 +233,8 @@ def load_weights_via_ipc(
         # Single-GPU: use the primary buffer's IPC handle
         ipc_handle = reduce_tensor(buffer)
 
+    started = False
+    completed = False
     try:
         import itertools
 
@@ -228,6 +252,7 @@ def load_weights_via_ipc(
             # If this tensor would overflow the current bucket, flush first
             if bucket_meta and offset + tensor_nbytes > bucket_size:
                 torch.cuda.synchronize(device)
+                started = True
                 if use_per_gpu:
                     # D2D copy from primary buffer to each per-GPU buffer
                     src_slice = buffer[:offset]
@@ -276,6 +301,7 @@ def load_weights_via_ipc(
         # Flush remaining parameters
         if bucket_meta:
             torch.cuda.synchronize(device)
+            started = True
             if use_per_gpu:
                 src_slice = buffer[:offset]
                 for i in range(num_gpus):
@@ -297,9 +323,12 @@ def load_weights_via_ipc(
                     bucket_meta=bucket_meta,
                     is_last=True,
                 )
+            completed = True
             total_params += len(bucket_meta)
 
     finally:
+        if started and not completed:
+            _abort_weight_sync(core_mgr, "update_weights_ipc")
         del buffer
         del per_gpu_buffers
         del per_gpu_ipc_handles

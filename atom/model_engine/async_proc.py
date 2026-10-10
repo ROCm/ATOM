@@ -31,8 +31,15 @@ from aiter.dist.shm_broadcast import MessageQueue
 
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.model_engine.block_table_codec import (
+    FORWARD_RPC,
     BlockTableDeltaDecoder,
     BlockTableDeltaEncoder,
+)
+from atom.model_engine.collective_rpc import (
+    UTILITY_MANAGED_RUNNER_METHODS,
+    RpcPayload,
+    RpcResult,
+    checked_timeout,
 )
 from atom.utils import (
     envs,
@@ -85,6 +92,9 @@ class AsyncIOProc:
         runner_qualname: Fully qualified class name of the runner to instantiate.
         rank: TP rank of this worker.
         kv_output_addr: Optional ZMQ endpoint for KV aggregation output.
+        rpc_output_addr: Optional ZMQ endpoint for generic collective-RPC
+            replies. Every rank owns one, unlike the primary channel which
+            only rank 0 has, so the caller can prove all ranks answered.
     """
 
     # Function names whose output goes to the KV channel instead of primary
@@ -100,6 +110,7 @@ class AsyncIOProc:
         kv_output_addr: str | None = None,
         all_ranks_barrier=None,
         *args,
+        rpc_output_addr: str | None = None,
         **kwargs,
     ):
         # Bind this worker's lifetime to its parent EngineCore: if the parent
@@ -150,6 +161,7 @@ class AsyncIOProc:
             # degrade to an unbound worker rather than kill it.
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
         self.label = f"AsyncIOProc({label})"
+        self.rank = rank
         self.io_addrs = io_addrs
         self.io_queues = queue.Queue(), queue.Queue()
         self.io_threads: list[threading.Thread] = []
@@ -157,6 +169,11 @@ class AsyncIOProc:
         # KV aggregation output channel
         self.kv_output_addr = kv_output_addr
         self.kv_queue: queue.Queue | None = None
+
+        # Generic collective-RPC reply channel. Every rank has one, so a caller
+        # can tell "all ranks finished" from "rank 0 finished".
+        self.rpc_output_addr = rpc_output_addr
+        self.rpc_queue: queue.Queue | None = None
 
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
         import atexit
@@ -182,6 +199,17 @@ class AsyncIOProc:
             t = threading.Thread(
                 target=self.send_output_to_socket,
                 args=(self.kv_output_addr, self.kv_queue),
+                daemon=True,
+            )
+            t.start()
+            self.io_threads.append(t)
+
+        # Dedicated collective-RPC reply thread
+        if self.rpc_output_addr is not None:
+            self.rpc_queue = queue.Queue()
+            t = threading.Thread(
+                target=self.send_rpc_output_to_socket,
+                args=(self.rpc_output_addr, self.rpc_queue),
                 daemon=True,
             )
             t.start()
@@ -248,26 +276,81 @@ class AsyncIOProc:
                 serialized_obj = pickle.dumps(result)
                 socket.send(serialized_obj)
 
-    # Functions that require all TP ranks to synchronize via barrier before
-    # rank 0 returns, so the caller can safely reuse/overwrite shared buffers.
-    _BARRIER_FUNCS: ClassVar[set[str]] = {
-        "update_weights_from_ipc",
-        "update_weights_from_shm",
-    }
+    def send_rpc_output_to_socket(self, addr: str, output_queue: queue.Queue):
+        """Send request id separately, so a corrupt body stays attributable."""
+        with ExitStack() as stack, zmq.Context() as ctx:
+            socket = stack.enter_context(
+                make_zmq_socket(ctx, addr, zmq.PUSH, linger=4000)
+            )
+            logger.debug(f"{self.label}: RPC output socket connected")
+            while True:
+                result = output_queue.get()
+                socket.send_multipart(self._serialize_rpc_result(result))
+
+    @staticmethod
+    def _serialize_rpc_result(result: RpcResult) -> list[bytes]:
+        """Serialize once; turn an unpicklable value into a picklable failure."""
+        try:
+            body = pickle.dumps(result)
+        except Exception as exc:  # noqa: BLE001 - report over the same channel
+            result = RpcResult(
+                result.request_id,
+                result.tp_rank,
+                error=f"unpicklable RPC result: {type(exc).__name__}: {exc}",
+            )
+            body = pickle.dumps(result)
+        return [result.request_id.encode("utf-8"), body]
 
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
             func_name, args = self.get_func()
-            need_barrier = func_name in self._BARRIER_FUNCS
+            payload = (
+                args[0] if len(args) == 1 and isinstance(args[0], RpcPayload) else None
+            )
+            if payload is None:
+                call_args, call_kwargs = args, {}
+                need_barrier = False
+            else:
+                call_args = payload.args
+                call_kwargs = payload.call_kwargs()
+                need_barrier = payload.barrier
+
             for runner in self.runners:
-                func = getattr(runner, func_name, None)
-                if func is None:
-                    continue
-                out = func(*args)
+                if payload is not None:
+                    out = self._run_generic_rpc(
+                        runner, func_name, call_args, call_kwargs, payload
+                    )
+                else:
+                    func = getattr(runner, func_name, None)
+                    if func is None:
+                        continue
+                    out = func(*call_args)
                 if need_barrier and self.all_ranks_barrier is not None:
-                    self.all_ranks_barrier.wait()
-                if out is not None:
+                    try:
+                        self.all_ranks_barrier.wait()
+                    except threading.BrokenBarrierError:
+                        if payload is None:
+                            raise
+                        # Broken by the manager once a rank is found dead: that
+                        # rank can never arrive, and this one would otherwise
+                        # wait for it forever instead of answering.
+                        out = self._failure(
+                            payload,
+                            f"{func_name!r} ran, but the barrier broke "
+                            f"before every TP rank reached it",
+                        )
+                if payload is not None:
+                    # Generic replies go to this rank's own channel. Routing
+                    # them to the primary would drop every rank but 0, which is
+                    # the whole limitation the channel exists to remove.
+                    if self.rpc_queue is not None:
+                        self.rpc_queue.put_nowait(out)
+                    elif self.io_addrs[1] is not None:
+                        # No dedicated channel configured (older manager, or a
+                        # test): fall back rather than silently discard.
+                        self.io_queues[1].put_nowait(out)
+                elif out is not None:
                     if (
                         self.io_addrs[1] is not None
                         and func_name not in self._KV_FUNC_NAMES
@@ -279,9 +362,66 @@ class AsyncIOProc:
                 break
         logger.debug(f"{self.label}: exit busy_loop...")
 
+    def _run_generic_rpc(
+        self,
+        runner: object,
+        func_name: str,
+        call_args: tuple,
+        call_kwargs: dict,
+        payload: RpcPayload,
+    ) -> RpcResult:
+        """Invoke one generic RPC, converting every outcome into a reply.
+
+        Never raises and never returns ``None``: a missing or malformed method
+        name and a raising target become an ``RpcResult`` carrying ``error``;
+        the RPC sender converts an unpicklable value before it writes the
+        socket. Anything else would leave the caller
+        blocked in an untimed queue get, which is how a typo in a method name
+        currently costs five minutes and reports a timeout instead of the typo.
+        """
+        try:
+            func = getattr(runner, func_name, None)
+        except Exception as exc:  # noqa: BLE001 - reported to the caller instead
+            # getattr's default covers AttributeError only. A non-string name
+            # raises TypeError, which would otherwise end this worker's loop.
+            return self._failure(
+                payload,
+                f"cannot look up {func_name!r} on {type(runner).__name__}: "
+                f"{type(exc).__name__}: {exc}",
+            )
+        if func is None:
+            return self._failure(
+                payload, f"{type(runner).__name__} has no method {func_name!r}"
+            )
+        try:
+            result = RpcResult(
+                payload.request_id, self.rank, value=func(*call_args, **call_kwargs)
+            )
+        except Exception as exc:  # noqa: BLE001 - reported to the caller instead
+            return self._failure(payload, f"{type(exc).__name__}: {exc}")
+        return result
+
+    def _failure(self, payload: RpcPayload, error: str) -> RpcResult:
+        """This rank's reply to *payload* when the call could not succeed."""
+        return RpcResult(payload.request_id, self.rank, error=error)
+
     def get_func(self):
         method_name, *args = self.rpc_broadcast_mq.dequeue()
         return method_name, self._block_table_decoder.decode_rpc(method_name, args)
+
+
+def _alive(proc) -> bool:
+    """``is_alive()``, except that a process teardown has closed is not."""
+    try:
+        return proc.is_alive()
+    except ValueError:  # closed by shutdown_all_processes
+        return False
+
+
+@dataclass(frozen=True)
+class _RpcReceiveError:
+    request_id: str
+    error: str
 
 
 class AsyncIOProcManager:
@@ -301,6 +441,16 @@ class AsyncIOProcManager:
         runner: Fully qualified class name of the model runner.
         *args: Additional arguments forwarded to the runner constructor.
     """
+
+    # Names that collective_rpc refuses. Some belong to the engine's wire
+    # protocol; the utility-managed ones need EngineUtilityHandler to maintain
+    # engine state around their worker call.
+    _PROTOCOL_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {FORWARD_RPC, "exit", *AsyncIOProc._KV_FUNC_NAMES}
+    )
+    _RESERVED_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
+        {*_PROTOCOL_RPC_NAMES, *UTILITY_MANAGED_RUNNER_METHODS}
+    )
 
     def __init__(self, finalizer, proc_num: int, runner: str, *args):
         self.parent_finalizer = finalizer
@@ -334,6 +484,17 @@ class AsyncIOProcManager:
         self._pending_kv_aggregation: _PendingKvAggregation | None = None
         self.kv_output_threads: list[threading.Thread] = []
 
+        # Generic collective-RPC reply channels, one per rank
+        self.rpc_output_addrs = [get_open_zmq_ipc_path() for _ in range(proc_num)]
+        self.rpc_outputs_queues: list[queue.Queue] = [
+            queue.Queue() for _ in range(proc_num)
+        ]
+        self.rpc_output_threads: list[threading.Thread] = []
+        # Every call reads these same per-rank queues; see collective_rpc.
+        self._rpc_lock = threading.Lock()
+        # rank -> exit code, written by the monitor before it tears down.
+        self._dead_ranks: dict[int, int | None] = {}
+
         for i in range(proc_num):
             label = f"ModelRunner{i}/{proc_num}"
             # Only rank 0 gets the primary output address
@@ -352,6 +513,9 @@ class AsyncIOProcManager:
                     self.all_ranks_barrier,
                     *args,
                 ),
+                # Keyword-only on AsyncIOProc, so it cannot be mistaken for one
+                # of the *args forwarded to the runner's constructor.
+                kwargs={"rpc_output_addr": self.rpc_output_addrs[i]},
             )
             process.start()
             self.procs.append(process)
@@ -379,6 +543,17 @@ class AsyncIOProcManager:
             t.start()
             self.kv_output_threads.append(t)
 
+        # Per-worker collective-RPC reply channels
+        for i, output_addr in enumerate(self.rpc_output_addrs):
+            t = threading.Thread(
+                target=self.process_rpc_output_sockets,
+                name=f"{self.label}_rpc_output_thread_{i}",
+                args=(output_addr, i),
+                daemon=True,
+            )
+            t.start()
+            self.rpc_output_threads.append(t)
+
         self.monitor_procs()
 
     def exit(self):
@@ -395,6 +570,8 @@ class AsyncIOProcManager:
         self.procs = []
         self.output_thread.join(timeout=1)
         for thread in self.kv_output_threads:
+            thread.join(timeout=0.5)
+        for thread in self.rpc_output_threads:
             thread.join(timeout=0.5)
         logger.info(f"{self.label}: All runners are shutdown.")
         self.outputs_queue.put_nowait(SystemExit())
@@ -451,6 +628,246 @@ class AsyncIOProcManager:
         finally:
             output_socket.close(linger=0)
             logger.debug(f"{self.label}: kv output thread {worker_id} exit")
+
+    def process_rpc_output_sockets(self, output_address: str, worker_id: int):
+        """Receive generic collective-RPC replies from one worker."""
+        output_socket = make_zmq_socket(self.zmq_ctx, output_address, zmq.PULL)
+        try:
+            poller = zmq.Poller()
+            poller.register(output_socket, zmq.POLLIN)
+            while self.still_running:
+                socks = poller.poll(timeout=1000)
+                if not socks:
+                    continue
+                request_id_frame, body = output_socket.recv_multipart(copy=False)
+                request_id = bytes(request_id_frame).decode("utf-8", errors="replace")
+                try:
+                    obj = pickle.loads(body)
+                except Exception as exc:
+                    obj = _RpcReceiveError(
+                        request_id,
+                        f"could not decode RPC reply from TP rank {worker_id}: "
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                    logger.exception(obj.error)
+                self.rpc_outputs_queues[worker_id].put_nowait(obj)
+        finally:
+            output_socket.close(linger=0)
+            logger.debug(f"{self.label}: rpc output thread {worker_id} exit")
+
+    def collective_rpc(
+        self,
+        func_name: str,
+        payload: RpcPayload,
+        timeout: float = 300.0,
+    ) -> list[RpcResult]:
+        """Public worker RPC: utility-managed methods are not callable here."""
+        return self._collective_rpc(
+            func_name, payload, timeout, allow_utility_managed=False
+        )
+
+    def utility_rpc(
+        self,
+        func_name: str,
+        payload: RpcPayload,
+        timeout: float = 300.0,
+    ) -> list[RpcResult]:
+        """All-rank transport for EngineUtilityHandler-owned methods."""
+        return self._collective_rpc(
+            func_name, payload, timeout, allow_utility_managed=True
+        )
+
+    def _collective_rpc(
+        self,
+        func_name: str,
+        payload: RpcPayload,
+        timeout: float,
+        *,
+        allow_utility_managed: bool,
+    ) -> list[RpcResult]:
+        """Run *func_name* on every TP runner and return one reply per rank.
+
+        Unlike :meth:`call_func`, which surfaces only rank 0's return, this
+        collects from every rank's own channel, so "all ranks finished" is
+        observable.
+
+        Calls are serialized. Every caller reads the same per-rank channels, so
+        two outstanding at once would each take the other's replies, drop them
+        as stale, and time out. What the ``request_id`` buys here is that a late
+        reply from a call that already gave up is recognised and dropped,
+        rather than taken as the next call's answer.
+
+        Always returns ``proc_num`` results in rank order. A rank that died, or
+        that did not answer within *timeout*, yields a failed ``RpcResult``
+        rather than an exception or a short list -- the caller needs to know
+        *which* rank is missing, and a raise here would lose the ranks that did
+        answer.
+        """
+        if not isinstance(payload, RpcPayload):
+            raise TypeError(
+                f"collective_rpc needs an RpcPayload, got {type(payload).__name__}"
+            )
+        # Reached from the utility handler too, with whatever timeout the
+        # utility command carried.
+        timeout = checked_timeout(timeout)
+        is_private = (
+            isinstance(func_name, str)
+            and func_name.startswith("_")
+            and not allow_utility_managed
+        )
+        is_reserved = (
+            is_private
+            or func_name in self._PROTOCOL_RPC_NAMES
+            or (
+                func_name in UTILITY_MANAGED_RUNNER_METHODS
+                and not allow_utility_managed
+            )
+        )
+        if is_reserved:
+            # Each would break the protocol this path goes around. The workers'
+            # decoder resets its cached rows on a forward the encoder never saw,
+            # failing the next scheduled one. Exit tears down every worker's
+            # runner and ends its loop, behind a reply that reads as success.
+            # And a KV aggregation drains transfer completions the scheduler
+            # would then never see, stalling the requests waiting on them.
+            raise ValueError(
+                f"{self.label}: {func_name!r} is reserved for the engine's own "
+                f"protocol and cannot go through collective_rpc"
+            )
+
+        logger.debug(
+            f"{self.label}: collective_rpc {func_name} id={payload.request_id}"
+        )
+        with self._rpc_lock:
+            barrier = getattr(self, "all_ranks_barrier", None)
+            if payload.barrier and barrier is not None and barrier.broken:
+                error = (
+                    f"cannot run barrier RPC {func_name!r}: the TP barrier is "
+                    f"broken; restart the runner manager"
+                )
+                return [
+                    RpcResult(payload.request_id, rank, error=error)
+                    for rank in range(self.proc_num)
+                ]
+            self.rpc_broadcast_mq.enqueue((func_name, payload))
+
+            # This call's own copy: a worker's death makes the monitor run
+            # exit(), which empties self.procs while replies are still awaited.
+            procs = list(self.procs)
+            deadline = time.monotonic() + timeout
+            results: list[RpcResult] = []
+            for rank, output_queue in enumerate(self.rpc_outputs_queues):
+                results.append(
+                    self._await_rank_reply(
+                        rank, output_queue, func_name, payload, deadline, procs
+                    )
+                )
+        return results
+
+    def _await_rank_reply(
+        self,
+        rank: int,
+        output_queue: queue.Queue,
+        func_name: str,
+        payload: RpcPayload,
+        deadline: float,
+        procs: list,
+    ) -> RpcResult:
+        """Wait for one rank's reply, or synthesise the reason there is none."""
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                # Poll rather than block for the whole budget, so a worker that
+                # dies mid-call is reported promptly instead of at the deadline.
+                reply = output_queue.get(timeout=max(0.0, min(1.0, remaining)))
+            except queue.Empty:
+                # Before this call can give up: once it has, nothing else would
+                # release ranks still waiting on a dead one.
+                self._break_barrier_for_dead_ranks(procs)
+                # Death before the deadline, even once it has passed: waiting on
+                # another rank can use up the budget, and a rank that died is
+                # still the reason this one never answered.
+                dead = dict(self._dead_ranks)
+                if rank in dead:
+                    error = (
+                        f"TP rank {rank} died before answering {func_name!r} "
+                        f"(exitcode={dead[rank]})"
+                    )
+                elif not self.still_running:
+                    # Teardown stops every rank and their reply threads with
+                    # them, so no answer can come any more.
+                    cause = f", after TP rank(s) {sorted(dead)} died" if dead else ""
+                    error = (
+                        f"TP rank {rank} was shut down before answering "
+                        f"{func_name!r}{cause}"
+                    )
+                elif rank < len(procs) and not _alive(procs[rank]):
+                    error = f"TP rank {rank} died before answering {func_name!r}"
+                elif remaining <= 0:
+                    error = f"timed out waiting for {func_name!r} on TP rank {rank}"
+                else:
+                    continue
+            else:
+                if isinstance(reply, _RpcReceiveError):
+                    if reply.request_id != payload.request_id:
+                        logger.warning(
+                            "%s: dropping stale unreadable reply %s from rank %d "
+                            "while awaiting %s",
+                            self.label,
+                            reply.request_id,
+                            rank,
+                            payload.request_id,
+                        )
+                        continue
+                    error = reply.error
+                elif not isinstance(reply, RpcResult):
+                    error = (
+                        f"unexpected reply type {type(reply).__name__} from rank {rank}"
+                    )
+                elif reply.request_id != payload.request_id:
+                    # A late reply from an earlier call. Dropping it is correct:
+                    # that caller has already been answered or has given up.
+                    logger.warning(
+                        "%s: dropping stale reply %s from rank %d while awaiting %s",
+                        self.label,
+                        reply.request_id,
+                        rank,
+                        payload.request_id,
+                    )
+                    continue
+                elif reply.tp_rank != rank:
+                    error = (
+                        f"reply rank mismatch: channel {rank} carried {reply.tp_rank}"
+                    )
+                else:
+                    return reply
+            return RpcResult(payload.request_id, rank, error=error)
+
+    def _break_barrier_for_dead_ranks(self, procs: list) -> None:
+        """Release the ranks waiting at the barrier once one can never arrive.
+
+        A dead rank never reaches it, so the rest would wait there forever and
+        never answer. Breaking it hands each of them a BrokenBarrierError to
+        answer with instead. A rank that is only slow is left to the deadline:
+        it can still arrive, and a broken barrier stays broken for every later
+        call that needs one.
+
+        Checked while waiting on any call, not only barrier ones: a barrier
+        call that timed out on a slow rank leaves the rest waiting, and if that
+        rank dies afterwards, only a later call is there to notice. Not during
+        teardown, which stops every rank anyway.
+        """
+        barrier = getattr(self, "all_ranks_barrier", None)
+        if barrier is None or barrier.broken or not self.still_running:
+            return
+        dead = [rank for rank, proc in enumerate(procs) if not _alive(proc)]
+        if dead:
+            logger.error(
+                "%s: TP rank(s) %s died during a barrier call; releasing the rest",
+                self.label,
+                dead,
+            )
+            barrier.abort()
 
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Standard RPC call for non-KV operations."""
@@ -553,6 +970,9 @@ class AsyncIOProcManager:
                 return
             dead_proc = next(proc for proc in procs if proc.sentinel == died[0])
             dead_proc.join(timeout=5)
+            # Before exit() empties self.procs and stops every other rank, so
+            # a collective_rpc in flight can still name the one that died.
+            _self._dead_ranks[procs.index(dead_proc)] = dead_proc.exitcode
             logger.error(
                 f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
                 f"(exitcode={dead_proc.exitcode}), shutting down.",
