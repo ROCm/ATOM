@@ -1126,58 +1126,20 @@ class MLAAttention(nn.Module):
 
         if kv_fp8 is not None:
             raise ValueError("FP8 K/V require a supported FlyDSL FP8 prefill backend")
-
-        def _varlen(q_piece, k_piece, v_piece):
-            return flash_attn_varlen_func(
-                q=q_piece,
-                k=k_piece,
-                v=v_piece,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                min_seqlen_q=min_seqlen_q,
-                dropout_p=dropout_p,
-                softmax_scale=self.scale,
-                causal=causal,
-                return_lse=return_lse,
-            )
-
-        # gfx950 bf16 hd256 varlen is the causal-group kernel. TP8 (8 heads)
-        # completes GSM8K; TP4 (16 heads) faults on the first request. Heads
-        # are independent, so 8-head chunks match the passing shape. Slices
-        # are packed first: that kernel does not consume strides.
-        n_heads = q.shape[1]
-        chunk_heads = (
-            n_heads > 8
-            and n_heads % 8 == 0
-            and q.shape[-1] == 256
-            and v.shape[-1] == 256
-            and k.shape[1] == n_heads
-            and v.shape[1] == n_heads
+        return flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=dropout_p,
+            softmax_scale=self.scale,
+            causal=causal,
+            return_lse=return_lse,
         )
-        if not chunk_heads:
-            return _varlen(q, k, v)
-
-        outs = []
-        lses = []
-        for start in range(0, n_heads, 8):
-            head_slice = slice(start, start + 8)
-            piece = _varlen(
-                q[:, head_slice].contiguous(),
-                k[:, head_slice].contiguous(),
-                v[:, head_slice].contiguous(),
-            )
-            if return_lse:
-                outs.append(piece[0])
-                lses.append(piece[1])
-            else:
-                outs.append(piece)
-        out = torch.cat(outs, dim=1)
-        if return_lse:
-            # mha_varlen_fwd LSE is [nheads, total_q].
-            return out, torch.cat(lses, dim=0)
-        return out
 
     def _restore_query_heads(
         self, output: torch.Tensor, num_heads: int | None = None
@@ -2628,17 +2590,7 @@ class MLAAttention(nn.Module):
             paged_kv_indices = attn_metadata.kv_indices
             paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
             max_q_len = attn_metadata.max_seqlen_q
-            # MTP below index_topk attends to every token. Keep the dense
-            # per-request indptr (page_size=1, last_page_len=1) and its work
-            # buffers. The per-token sparse buffers are what the first live
-            # verify reads when the paged top-k scorer faults.
-            short_dense_mtp = (
-                self.is_sparse_mla
-                and self.dcp_world_size == 1
-                and attn_metadata.max_seqlen_q > 1
-                and int(attn_metadata.max_seqlen_k) <= int(self.topk_tokens)
-            )
-            if self.is_sparse_mla and not short_dense_mtp:
+            if self.is_sparse_mla:
                 if attn_metadata.max_seqlen_q > 1:
                     # MTP verify: per-token layout with max_q_len=1.
                     # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
@@ -2682,11 +2634,7 @@ class MLAAttention(nn.Module):
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
             # (max_seqlen_qo=2).
-            is_sparse_mtp = (
-                self.is_sparse_mla
-                and attn_metadata.max_seqlen_q > 1
-                and not short_dense_mtp
-            )
+            is_sparse_mtp = self.is_sparse_mla and attn_metadata.max_seqlen_q > 1
 
             if self._should_rebuild_sparse_dcp_persistent_metadata(use_persistent_mode):
                 self._rebuild_sparse_dcp_persistent_metadata(

@@ -1922,12 +1922,6 @@ def sparse_attn_indexer(
         num_rows = batch_size * next_n
         dcp_world_size = get_dcp_world_size()
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        # Same threshold as prefill: top-k would select every token. Skip the
-        # paged MQA scorer and HIP top_k_per_row_decode. Those are the kernels
-        # the MXFP4 MTP job imports on the first GSM8K request, immediately
-        # before the aperture. Attention uses the dense KV table instead.
-        if dcp_world_size == 1 and int(decode_metadata.max_seqlen_k) <= topk_tokens:
-            return
         if dcp_world_size > 1:
             # The fused exchange scores this rank's own shard and writes the KV
             # slots it owns -- ownership filter, slot localize and compaction all
@@ -1963,16 +1957,8 @@ def sparse_attn_indexer(
             [num_rows, max_model_len], dtype=torch.float32, device="cuda"
         )
         # top_k_per_row_decode and the paged scorer index KV with context_lens.
-        # A CUDA-graph fill longer than the logits row, or longer than this
-        # block table, is an HSA aperture.
-        block_table = attn_metadata.block_tables
-        context_limit = min(
-            int(max_model_len),
-            int(block_table.shape[1]) * int(runner_block_size),
-        )
-        context_lens = torch.clamp(
-            decode_metadata.context_lens, min=0, max=context_limit
-        )
+        # A CUDA-graph fill longer than this buffer is an HSA aperture.
+        context_lens = torch.clamp(decode_metadata.context_lens, max=max_model_len)
         if indexer_fp4:
             from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 

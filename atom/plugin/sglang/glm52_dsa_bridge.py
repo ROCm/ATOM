@@ -812,7 +812,23 @@ def resolve_target_verify_lens(
         )
     prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
     if use_positions:
-        context_lens = prefix_lens + draft_token_num
+        context_lens = prefix_lens + np.int32(draft_token_num)
+        # Capture rewrites every row to GLM52_GRAPH_SEQ_LEN_CAPACITY so the
+        # graph buffers are wide enough. Replay copies the real seq_lens over
+        # that sentinel; positions can still be the capture fill. Prefer the
+        # shorter real mirror, and collapse leftover sentinel padding so
+        # max_seqlen_k is not stuck at 10240.
+        seq_lens = get_seq_lens_cpu(forward_batch, bs)
+        sentinel = np.int32(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+        if seq_lens.shape[0] == bs and np.any(seq_lens < sentinel):
+            real = seq_lens.astype(np.int32)
+            context_lens = np.where(
+                real >= sentinel, context_lens, np.minimum(context_lens, real)
+            ).astype(np.int32)
+            context_lens = np.where(
+                context_lens >= sentinel, np.int32(draft_token_num), context_lens
+            ).astype(np.int32)
+            prefix_lens = np.maximum(context_lens - np.int32(draft_token_num), 0)
     else:
         position_context_lens = prefix_lens + draft_token_num
         context_lens = np.maximum(
