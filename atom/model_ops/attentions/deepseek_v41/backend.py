@@ -38,14 +38,7 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .indices import fill_step_indptrs
-from .metadata import (
-    RequestSpan,
-    StepBufferSpec,
-    prepare_batch_step,
-    step_buffer_specs,
-    visible_buffer_name,
-)
-from .prefill_storage import PrefillStoragePool
+from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
@@ -161,7 +154,26 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.device,
         )
         self.cache = self.copies = self.engram = None
-        self._tbo_storage = PrefillStoragePool()
+        # Prefill TBO microbatches publish their steps into `ub{i}_` copies of
+        # the step buffers, owned by the runner like every other builder's
+        # (V4, MLA, MHA): one set per microbatch, reuse gated by the runner's
+        # forward_vars event and its H2D publication owner.
+        if model_runner.config.enable_tbo:
+            model_runner.forward_vars.update(self._ubatch_step_buffers())
+            self._ubatch_indptrs = [
+                {
+                    ratio: tuple(
+                        torch.empty(
+                            self.max_num_batched_tokens + 1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for _ in range(2)
+                    )
+                    for ratio in self.geometry.layer_ratios
+                }
+                for _ in range(self._NUM_TBO_UBATCHES)
+            ]
         self.dummy_weights = bool(model_runner.config.load_dummy)
         if not self.dummy_weights and self.config.engram_layer_ids:
             self.engram = EngramInputPreparer.from_checkpoint(
@@ -379,7 +391,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.copies.warmup()
 
     def release_kv_pools(self):
-        self._tbo_storage.close()
         self.cache = self.copies = None
 
     def close(self):
@@ -679,31 +690,64 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             is_prefill=True,
         )
 
+    _NUM_TBO_UBATCHES = 2
+    # V4's ubatch publication protocol: resume the runner's sealed owner for a
+    # microbatch's staging, or check its groups writable first.
+    _ubatch_prefill_sources = DeepseekV4AttentionMetadataBuilder._ubatch_prefill_sources
+
+    def _check_ubatch_sources(self, prefix, *, sealed=False):
+        groups = getattr(self.model_runner, "h2d_groups", None)
+        if groups is None:
+            return
+        for suffix in ("v4_plans", "v41_step"):
+            group = groups.get(f"{prefix}{suffix}")
+            if group is None:
+                continue
+            if sealed:
+                for member in group.members:
+                    member._validate(0, None)
+            else:
+                group.check_writable()
+
+    def _ubatch_step_buffers(self):
+        """`ub{i}_` copies of every buffer a V4.1 step and its compress plans
+        are staged into, with the parent's shapes and dtypes."""
+        var = self.model_runner.forward_vars
+        names = ["positions", "cu_seqlens_q", "batch_id_per_q_token", "block_tables"]
+        names += [visible_buffer_name(r) for r, _ in self.geometry.compress_ratios]
+        for ratio, _ in self.geometry.compress_ratios:
+            names += compress_plan_buffer_names(ratio, key_rope=True).values()
+        buffers = {}
+        for i in range(self._NUM_TBO_UBATCHES):
+            prefix = f"ub{i}_"
+            for name in names:
+                src = var[name]
+                group = (
+                    "v4_plans" if src.publication_group == "v4_plans" else "v41_step"
+                )
+                buffers[f"{prefix}{name}"] = CpuGpuBuffer(
+                    *src.cpu.shape,
+                    dtype=src.cpu.dtype,
+                    device=self.device,
+                    pin_memory=self.device != "cpu",
+                    publication_group=f"{prefix}{group}",
+                )
+        return buffers
+
+    def _ubatch_buffers(self, ubatch_idx):
+        """This microbatch's step buffers under their parent names."""
+        prefix = f"ub{ubatch_idx}_"
+        var = self.model_runner.forward_vars
+        return {
+            name[len(prefix) :]: buffer
+            for name, buffer in var.items()
+            if name.startswith(prefix)
+        }
+
     @contextmanager
     def ubatch_forward(self, metadata):
-        with (
-            self._tbo_storage.forward(),
-            engram_staging(metadata.engram_embeddings, tbo=True),
-        ):
+        with engram_staging(metadata.engram_embeddings, tbo=True):
             yield
-
-    def _prefill_ubatch_storage(self, index):
-        var = self.model_runner.forward_vars
-        specs = step_buffer_specs(
-            (ratio for ratio, _ in self.geometry.compress_ratios),
-            tokens=var["positions"].gpu.numel(),
-            requests=var["cu_seqlens_q"].gpu.numel() - 1,
-            block_table_cols=var["block_tables"].gpu.shape[1],
-            position_dtype=var["positions"].cpu.dtype,
-        )
-        for ratio, _ in self.geometry.compress_ratios:
-            for name in compress_plan_buffer_names(ratio, key_rope=True).values():
-                specs[name] = StepBufferSpec(
-                    tuple(var[name].cpu.shape), var[name].cpu.dtype
-                )
-        return self._tbo_storage.acquire(
-            index, specs, self.geometry.layer_ratios, self.device
-        )
 
     def build_ubatch_prefill_metadata(
         self, metadata, ub_slice, running_bs, ubatch_idx=0
@@ -736,43 +780,47 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         width = ts.stop - ts.start
         if parent.requests and sum(span.length for span in spans) != width:
             raise ValueError("V4.1 microbatch request and token slices disagree")
-        storage = self._prefill_ubatch_storage(ubatch_idx)
-        buffers = storage.buffers
-        try:
-            with storage.upload():
-                step = prepare_batch_step(
-                    tuple(spans),
-                    self.device,
-                    block_tables=metadata.block_table_rows[rs],
-                    is_prefill=True,
-                    buffers=buffers,
-                    running_bs=running_bs,
-                    running_tokens=width,
-                    state_slot_out=parent.slots[rs],
-                    ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
-                )
-                if metadata.cache.workspace is not None:
-                    step.tile_workspace = metadata.cache.workspace.tile_slice(ts)
-                step.plans = make_compress_plans(
-                    np.asarray([span.length for span in spans], dtype=np.int32),
-                    np.asarray([span.end for span in spans], dtype=np.int32),
-                    self.geometry.compress_ratios,
-                    plan_buffers={
-                        ratio: {
-                            role: buffers[name]
-                            for role, name in compress_plan_buffer_names(
-                                ratio, key_rope=True
-                            ).items()
-                        }
-                        for ratio, _ in self.geometry.compress_ratios
-                    },
-                    extra_write=0,
-                )
-            if step.positions.is_cuda:
-                step.indptrs = fill_step_indptrs(step, self.geometry, storage.indptrs)
-        finally:
-            # Also cover preparation that fails before workers are launched.
-            storage.finish()
+        buffers = self._ubatch_buffers(ubatch_idx)
+        groups = getattr(self.model_runner, "h2d_groups", None)
+        prefix = f"ub{ubatch_idx}_"
+        with self._ubatch_prefill_sources(ubatch_idx):
+            step = prepare_batch_step(
+                tuple(spans),
+                self.device,
+                block_tables=metadata.block_table_rows[rs],
+                is_prefill=True,
+                buffers=buffers,
+                buffer_prefix=prefix,
+                running_bs=running_bs,
+                running_tokens=width,
+                state_slot_out=parent.slots[rs],
+                ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
+                publication_group=(
+                    None if groups is None else groups.get(f"{prefix}v41_step")
+                ),
+            )
+            if metadata.cache.workspace is not None:
+                step.tile_workspace = metadata.cache.workspace.tile_slice(ts)
+            step.plans = make_compress_plans(
+                np.asarray([span.length for span in spans], dtype=np.int32),
+                np.asarray([span.end for span in spans], dtype=np.int32),
+                self.geometry.compress_ratios,
+                plan_buffers={
+                    ratio: {
+                        role: buffers[name]
+                        for role, name in compress_plan_buffer_names(
+                            ratio, key_rope=True
+                        ).items()
+                    }
+                    for ratio, _ in self.geometry.compress_ratios
+                },
+                publication_group=self._compress_publication_group(prefix),
+                extra_write=0,
+            )
+        if step.positions.is_cuda:
+            step.indptrs = fill_step_indptrs(
+                step, self.geometry, self._ubatch_indptrs[ubatch_idx]
+            )
         return self._assemble_metadata(
             metadata.cache,
             step,

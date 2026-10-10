@@ -18,20 +18,6 @@ class TileWorkspace(Protocol):
 
 
 @dataclass(frozen=True)
-class StepBufferSpec:
-    shape: tuple[int, ...]
-    dtype: torch.dtype = torch.int32
-
-    def allocate(self, device):
-        return CpuGpuBuffer(
-            *self.shape,
-            dtype=self.dtype,
-            device=device,
-            pin_memory=torch.device(device).type != "cpu",
-        )
-
-
-@dataclass(frozen=True)
 class RequestSpan:
     request_id: int
     position: int
@@ -96,8 +82,6 @@ class BatchStep:
     # built once per forward and read by every owner that shares that ratio.
     plans: dict[int, object] = field(default_factory=dict)
     tentative: bool = False
-    # A one-token prefill, parent or microbatch, must not select decode kernels.
-    is_prefill: bool = False
     # Where each request starts, on the host. Built for `prefill_positions`
     # anyway, and published so the state lifecycle compares against the same
     # array rather than walking the spans again per forward.
@@ -107,6 +91,8 @@ class BatchStep:
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
+    # A one-token prefill, parent or microbatch, must not select decode kernels.
+    is_prefill: bool = False
     # TBO keeps memoized tile tables in a disjoint part of the parent budget.
     tile_workspace: TileWorkspace | None = None
 
@@ -146,19 +132,6 @@ def visible_buffer_name(ratio):
     return f"v41_index_visible_{ratio}"
 
 
-def step_buffer_specs(
-    ratios, *, tokens, requests, block_table_cols, position_dtype=torch.int32
-):
-    """One declaration for private allocation, capacity checks and TBO storage."""
-    return {
-        "positions": StepBufferSpec((tokens,), position_dtype),
-        "cu_seqlens_q": StepBufferSpec((requests + 1,)),
-        "batch_id_per_q_token": StepBufferSpec((tokens,)),
-        "block_tables": StepBufferSpec((requests, block_table_cols)),
-        **{visible_buffer_name(ratio): StepBufferSpec((tokens,)) for ratio in ratios},
-    }
-
-
 def prepare_batch_step(
     requests,
     device,
@@ -168,6 +141,7 @@ def prepare_batch_step(
     tentative=False,
     is_prefill=False,
     buffers=None,
+    buffer_prefix="",
     running_bs=None,
     running_tokens=None,
     max_q_len=None,
@@ -198,27 +172,34 @@ def prepare_batch_step(
         raise ValueError("Request metadata exceeds the declared batch/token capacity")
     if max_q_len is not None and lengths.size and max_q_len < int(lengths.max()):
         raise ValueError("A request is longer than the query width this forward runs")
-    specs = step_buffer_specs(
-        ratios,
-        tokens=running_tokens,
-        requests=running_bs,
-        block_table_cols=max((len(row) for row in block_tables), default=0),
-        position_dtype=(
-            torch.int32 if buffers is None else buffers["positions"].cpu.dtype
-        ),
-    )
     if buffers is None:
-        buffers = {name: spec.allocate(device) for name, spec in specs.items()}
-    required = {name: spec.shape[0] for name, spec in specs.items()}
-    for name, spec in specs.items():
-        buffer = buffers[name]
-        if buffer.cpu.dtype != spec.dtype or len(buffer.cpu.shape) != len(spec.shape):
-            raise ValueError(f"{name} metadata buffer has the wrong dtype or rank")
-        if any(
-            needed > available
-            for needed, available in zip(spec.shape, buffer.cpu.shape)
-        ):
-            raise ValueError(f"{name} metadata buffer cannot hold shape {spec.shape}")
+        width = max((len(row) for row in block_tables), default=0)
+        shapes = {
+            "positions": (running_tokens,),
+            "cu_seqlens_q": (running_bs + 1,),
+            "batch_id_per_q_token": (running_tokens,),
+            "block_tables": (running_bs, width),
+            **{visible_buffer_name(ratio): (running_tokens,) for ratio in ratios},
+        }
+        buffers = {
+            name: CpuGpuBuffer(
+                *shape,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=torch.device(device).type != "cpu",
+            )
+            for name, shape in shapes.items()
+        }
+    required = {
+        "positions": running_tokens,
+        "cu_seqlens_q": running_bs + 1,
+        "batch_id_per_q_token": running_tokens,
+        "block_tables": running_bs,
+        **{visible_buffer_name(ratio): running_tokens for ratio in ratios},
+    }
+    for name, count in required.items():
+        if count > buffers[name].np.shape[0]:
+            raise ValueError(f"{name} metadata buffer cannot hold {count} rows")
     if publication_group is not None:
         publication_group.check_writable()
     tables = block_table_state(buffers["block_tables"]).prepare(
@@ -271,19 +252,24 @@ def prepare_batch_step(
             device=device,
         )
     if publication_group is not None:
-        grouped_tables = "block_tables" in publication_group.indices
+        # A TBO microbatch's group names its members `{buffer_prefix}name`
+        # (`ub{i}_positions`, ...); match them by the parent's names.
+        def base(member):
+            return member.name.removeprefix(buffer_prefix)
+
+        grouped_tables = f"{buffer_prefix}block_tables" in publication_group.indices
         for i, member in enumerate(publication_group.members):
-            if member.name == "block_tables":
+            if base(member) == "block_tables":
                 publication_group.counts[i] = running_bs
-            elif member.name in required:
-                publication_group.counts[i] = required[member.name]
+            elif base(member) in required:
+                publication_group.counts[i] = required[base(member)]
             # Builder-staged members (plans, state slots, Engram rows) keep
             # their counts in this combined publication, before indptrs run.
         tables.publish(running_bs if grouped_tables else None, group=publication_group)
         published = {
-            member.name: member.destination[: required[member.name]]
+            base(member): member.destination[: required[base(member)]]
             for member in publication_group.members
-            if member.name in required
+            if base(member) in required
         }
     else:
         published = {
@@ -291,13 +277,18 @@ def prepare_batch_step(
             for name, count in required.items()
             if name not in ("block_tables", "cu_seqlens_q")
         }
-    published["cu_seqlens_q"] = (
-        cu.gpu[: running_bs + 1]
-        if query_prefix_ready
-        else cu.copy_to_gpu(
-            running_bs + 1, republish_reason=query_prefix_republish_reason
+    if "cu_seqlens_q" in published:
+        # The group published it with the rest of the step (a TBO microbatch's
+        # `ub{i}_` group holds its own copy).
+        published["cu_seqlens_q"] = cu.gpu[: running_bs + 1]
+    else:
+        published["cu_seqlens_q"] = (
+            cu.gpu[: running_bs + 1]
+            if query_prefix_ready
+            else cu.copy_to_gpu(
+                running_bs + 1, republish_reason=query_prefix_republish_reason
+            )
         )
-    )
     if "block_tables" not in published:
         published["block_tables"] = tables.publish(running_bs)
     return BatchStep(

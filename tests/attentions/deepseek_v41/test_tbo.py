@@ -10,12 +10,29 @@ pytest.importorskip("aiter")
 
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-from atom.model_ops.attentions.deepseek_v41.prefill_storage import PrefillStoragePool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils.forward_context import Context, ForwardContext, _forward_context_local
 from atom.utils.tbo.ubatch_splitting import UBatchSlice, _split_prefill_token_midpoint
 from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
+
+
+def attach_ubatch_buffers(builder, max_tokens):
+    """What `DeepseekV41MetadataBuilder.__init__` sets up under prefill TBO,
+    for a builder assembled without it: the `ub{i}_` step buffers in the
+    runner's forward_vars and each microbatch's indptrs."""
+    builder.max_num_batched_tokens = max_tokens
+    builder.model_runner.forward_vars.update(builder._ubatch_step_buffers())
+    builder._ubatch_indptrs = [
+        {
+            ratio: tuple(
+                torch.empty(max_tokens + 1, dtype=torch.int32, device=builder.device)
+                for _ in range(2)
+            )
+            for ratio in builder.geometry.layer_ratios
+        }
+        for _ in range(builder._NUM_TBO_UBATCHES)
+    ]
 
 
 def make_parent(device, lengths=(10, 4), starts=(3, 8)):
@@ -33,10 +50,10 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8)):
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.device, builder.geometry, builder.block_size = device, geo, 32
     builder.cache = cache
-    builder._tbo_storage = PrefillStoragePool()
     builder.model_runner = SimpleNamespace(
         forward_vars=metadata_buffers(4, 32, 4, device, geo)
     )
+    attach_ubatch_buffers(builder, 32)
     batch = SimpleNamespace(
         is_dummy_run=False,
         state_slots_committed=[3, 1][: len(lengths)],
@@ -108,8 +125,11 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
             torch.testing.assert_close(
                 child.step.visible[ratio], ((child.step.positions + 1) // ratio).int()
             )
+    # The parent's step buffers are untouched; the microbatches write only
+    # their own `ub{i}_` copies.
     for name, value in builder.model_runner.forward_vars.items():
-        torch.testing.assert_close(value.gpu, before[name], rtol=0, atol=0)
+        if not name.startswith(("ub0_", "ub1_")):
+            torch.testing.assert_close(value.gpu, before[name], rtol=0, atol=0)
     for ratio in steps[0].plans:
         assert (
             steps[0].plans[ratio].compress_plan_gpu.data_ptr()
@@ -363,7 +383,6 @@ def test_parent_engram_join_runs_when_a_microbatch_fails():
 
     parent = SimpleNamespace(engram_embeddings=Rows())
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
-    builder._tbo_storage = PrefillStoragePool()
     with (
         pytest.raises(RuntimeError, match="failed child"),
         builder.ubatch_forward(parent),
