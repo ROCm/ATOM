@@ -345,11 +345,8 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         # writing to the kv cache, so the fused-QKV buffer must be sized for
         # the larger (post-alignment) count.
         kv_cache = getattr(self, "kv_cache", None)
-        rtp_kv_heads: int | None = (
-            int(kv_cache.num_kv_heads)
-            if kv_cache is not None and int(kv_cache.num_kv_heads) > 0
-            else None
-        )
+        cache_kv_heads = int(getattr(kv_cache, "num_kv_heads", 0))
+        rtp_kv_heads: int | None = cache_kv_heads if cache_kv_heads > 0 else None
 
         for layer in self._atom_attn_pyobj._rtp_full_attn_layers:
             layer.prewarm_for_cuda_graph(
