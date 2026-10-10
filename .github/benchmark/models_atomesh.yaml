@@ -867,6 +867,9 @@ models:
               # PrefillDelayer coalesces queued prefill for up to 5 s.
               ATOM_PREFILL_DECODE_INTERVAL: "4"
               ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
+              # This server also prefills, so it needs the prefill workers'
+              # startup compile of every M-bucketed GEMM (env.prefill is unused).
+              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
 
