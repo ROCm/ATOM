@@ -637,6 +637,9 @@ def register_deepseek_v41_proxy_layer(
     return proxy
 
 
+_V41_SNAPSHOT_FALLBACK_LOGGED = False
+
+
 def snapshot_v41_batch(common_attn_metadata):
     """Host-side description of the step, with no device sync.
 
@@ -660,6 +663,13 @@ def snapshot_v41_batch(common_attn_metadata):
         from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
 
         input_batch = get_current_input_batch()
+        if input_batch is None and not _V41_SNAPSHOT_FALLBACK_LOGGED:
+            globals()["_V41_SNAPSHOT_FALLBACK_LOGGED"] = True
+            logger.warning(
+                "DeepSeek-V4.1: no batch on the req-id pass-through, so slot "
+                "keys fall back to first-block ids. The pass-through reports "
+                "whether it installed; this says whether it is delivering."
+            )
     # The accessor is an ATOM patch over another engine's internals; absent is
     # the caller's ordinary "fall back to the device tensors" case.
     except Exception:  # noqa: BLE001
@@ -683,20 +693,50 @@ def snapshot_v41_batch(common_attn_metadata):
     block_table_np = None
     req_ids = None
     if input_batch is not None:
+        # Two acquisitions, two `try`s, because they fail independently and
+        # only one of them matters. `req_ids` is the slot key; losing it means
+        # slots are keyed on first-block ids, which works for everything inside
+        # the forward and for nothing outside it. `block_table_np` is only a
+        # faster path to rows that `common_attn_metadata` also carries, and it
+        # is read from a different attribute on every runner generation
+        # (`block_table` on V1, `block_tables` on V2).
+        #
+        # They shared one `try` until vLLM 0.31: V2's `InputBatch` has no
+        # `block_table`, so the AttributeError it raised discarded the
+        # perfectly good `req_ids` fetched on the line above, and the snapshot
+        # fell back. Nothing reported it -- the fallback key is a working slot
+        # key -- and the KV-transfer leg, which names requests the way vLLM
+        # does, then missed every lookup and stored nothing.
         try:
             req_ids = list(input_batch.req_ids)[:num_reqs]
-            block_table_np = input_batch.block_table[0].block_table.np
-        except Exception:  # noqa: BLE001
-            # The accessor is an ATOM patch over another engine's internals;
-            # absent is the caller's ordinary "fall back" case.
+        except Exception as exc:  # noqa: BLE001
+            if not _V41_SNAPSHOT_FALLBACK_LOGGED:
+                globals()["_V41_SNAPSHOT_FALLBACK_LOGGED"] = True
+                logger.warning(
+                    "DeepSeek-V4.1: the batch carries no usable req_ids "
+                    "(%s: %s); slot keys fall back to first-block ids, which "
+                    "nothing outside the forward can match.",
+                    type(exc).__name__,
+                    exc,
+                )
             req_ids = None
-            block_table_np = None
-        else:
-            # Outside the fallback, deliberately. A row divergence is not a
-            # missing accessor: falling back on it would key state slots on
-            # first-block ids -- `-1` for every block-less row, so two such
-            # requests share one slot -- which is the wrong output this check
-            # exists to name. It has to reach the caller.
+        for attr in ("block_table", "block_tables"):
+            table = getattr(input_batch, attr, None)
+            if table is None:
+                continue
+            try:
+                block_table_np = table[0].block_table.np
+            except Exception:  # noqa: BLE001
+                block_table_np = None
+            if block_table_np is not None:
+                break
+        if req_ids is not None:
+            # Gated on the key, not on the block table, and outside any
+            # `except`: a row divergence is not a missing accessor. Falling
+            # back on it would key state slots on first-block ids -- `-1` for
+            # every block-less row, so two such requests share one slot --
+            # which is the wrong output this check exists to name. It has to
+            # reach the caller.
             _check_row_alignment(input_batch, num_computed, num_reqs)
     if block_table_np is None:
         block_table_np = common_attn_metadata.block_table_tensor.cpu().numpy()

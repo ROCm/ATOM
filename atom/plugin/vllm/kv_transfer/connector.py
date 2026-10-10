@@ -1378,7 +1378,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if inner is not None:
             self._worker.start_load_kv(inner)
         self._dispatch_kda_loads(metadata)
-        self._stash_kda_stores(metadata)
+        if not self._is_deepseek_v41:
+            # V4.1 snapshots after the forward instead; see `wait_for_save`.
+            self._stash_kda_stores(metadata)
         # ``kv_connector_no_forward`` builds a context with no attention
         # metadata and does not call ``wait_for_save``. There is no forward
         # and no mamba postprocess on that step, so flushing from
@@ -1449,6 +1451,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         recurrent state into the boundary page. A fence taken in
         ``start_load_kv`` lands before that copy.
         """
+        if self._is_deepseek_v41:
+            # After the forward, not before it, and the reason inverted when
+            # the step work moved into the metadata builder.
+            #
+            # It used to be the other way round: the step was staged inside the
+            # forward, so `advance_cursor` ran after `start_load_kv` and a
+            # snapshot taken here would have read a cursor already past the
+            # boundary. Staging now happens before the forward, so the cursor
+            # says where this step ends from the moment the builder runs --
+            # and the bytes only say so once the forward has written them.
+            # Here is the one point where the two agree.
+            self._stash_kda_stores(self._get_connector_metadata())
         self._flush_kda_stores()
 
     def _release_v41_slots(self, req_ids) -> None:
@@ -1870,6 +1884,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             groups = _group_block_ids(new_blocks)
             grown = list(groups[self._attn_group_id]) if groups else []
             seq.set_block_table(grown if replaces else seq.block_table + grown)
+        scheduled = {
+            str(k): int(v)
+            for k, v in (
+                getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+            ).items()
+        }
         frontiers: dict[str, int] = {}
         for req_id, num_tokens in _scheduled_frontiers(scheduler_output):
             # Unclamped, unlike the SeqView's copy below: that clamp exists to
@@ -1900,8 +1920,27 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
             for req_id in skip:
                 self._v41_planner.forget_request(req_id)
+            # Post-step frontiers for V4.1, not the pre-step ones the dense
+            # leg uses. Two independent reasons, and they agree:
+            #
+            # The prefill clip aims chunks to *end* on a boundary, so the
+            # boundary a step lands on is where it finishes, not where it
+            # started. Reading the pre-step frontier offered 8,192 for a step
+            # that ran 8,192 -> 8,960.
+            #
+            # And the slot's cursor is advanced while the metadata builder
+            # stages the step -- before the forward, and so before anything
+            # this connector is called for. By the time the worker half reads
+            # it, it already says where the step ends. Offering the pre-step
+            # frontier made the hard cursor contract refuse every snapshot
+            # (`cursor_mismatch`), which is the guard doing its job against a
+            # boundary this half was naming wrongly.
+            v41_frontiers = {
+                str(req_id): int(num_tokens) + int(scheduled.get(str(req_id), 0))
+                for req_id, num_tokens in frontiers.items()
+            }
             kda_stores = list(kda_stores) + self._v41_planner.collect_frontier_stores(
-                frontiers, self._requests, skip
+                v41_frontiers, self._requests, skip
             )
             kda_loads = list(kda_loads) + self._v41_planner.take_loads()
             self._v41_planner.log_stats()
