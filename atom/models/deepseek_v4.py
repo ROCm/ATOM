@@ -2529,6 +2529,10 @@ class DeepseekV4Attention(nn.Module):
         else:
             self.compressor = None
             self.indexer = None
+        # wq_b and indexer.wq_b both read q_norm's fused (qr, qr_scale).
+        self.q_norm.share_mxscale_shuffle(
+            [self.wq_b] + ([self.indexer.wq_b] if self.indexer is not None else [])
+        )
 
         # ----- KV cache splitting (paper §3.6.1) -----
         # Per-request sliding window: `swa_plane` is this layer's view of the
