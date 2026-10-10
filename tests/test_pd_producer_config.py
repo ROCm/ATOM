@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.kv_transfer.disaggregation import pd_producer
 from atom.kv_transfer.disaggregation.pd_producer import (
     index_staging_pool_size,
     mla_staging_reserve_bytes,
@@ -99,7 +98,7 @@ def test_index_staging_pool_matches_mooncake_worker_count(kv_transfer_config, ex
     assert index_staging_pool_size(config) == expected
 
 
-@pytest.mark.parametrize("worker_count", [0, -1, True, "32"])
+@pytest.mark.parametrize("worker_count", [None, 0, -1, True, "32"])
 def test_index_staging_pool_rejects_invalid_worker_count(worker_count):
     config = SimpleNamespace(
         kv_transfer_config={
@@ -126,22 +125,16 @@ def test_index_staging_pool_rejects_two_mooncake_producers():
         index_staging_pool_size(config)
 
 
-@pytest.mark.parametrize("worker_count", [None, 0, True, "32"])
-def test_send_worker_count_rejects_invalid_values(worker_count):
-    with pytest.raises(ValueError, match="positive integer"):
-        send_worker_count({"num_worker_threads": worker_count})
-
-
 def test_send_worker_count_defaults_to_sixteen():
     assert send_worker_count({"kv_connector": "mooncake"}) == 16
 
 
-def test_mla_staging_slots_are_capped_by_pool_bytes(monkeypatch):
+def test_mla_staging_slots_are_capped_by_pool_bytes():
     slot = 8 << 20
     assert mla_staging_slot_count(16, slot) == 16
     assert mla_staging_slot_count(128, slot) == 32  # 256 MiB cap
-    monkeypatch.setattr(pd_producer, "MLA_STAGING_POOL_BYTES", 1 << 20)
-    assert mla_staging_slot_count(128, slot) == 1  # never below one slot
+    # A slot wider than the cap still gets one, never an empty pool.
+    assert mla_staging_slot_count(128, (256 << 20) + 64) == 1
 
 
 def _mla_producer_config(workers, **overrides):

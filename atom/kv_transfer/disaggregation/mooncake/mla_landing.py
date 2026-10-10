@@ -110,7 +110,6 @@ class LandingCredits:
     def __init__(self) -> None:
         self._cv = threading.Condition()
         self._targets: dict[str, _TargetCredits] = {}
-        self.stats = {"landed": 0, "fallbacks": 0, "wait_s": 0.0}
 
     def sync(self, target: str, landing: dict) -> None:
         """Adopt the partition a write request advertises for ``target``."""
@@ -126,24 +125,20 @@ class LandingCredits:
 
     def acquire(self, target: str, epoch: int, timeout_s: float) -> int | None:
         """A free slot for ``target``, or None after ``timeout_s``."""
-        start = time.monotonic()
-        deadline = start + timeout_s
+        deadline = time.monotonic() + timeout_s
         with self._cv:
-            try:
-                while True:
-                    credits = self._targets.get(target)
-                    if credits is None or credits.epoch != epoch:
-                        return None
-                    if credits.free:
-                        slot = credits.free.pop()
-                        credits.in_flight.add(slot)
-                        return slot
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return None
-                    self._cv.wait(remaining)
-            finally:
-                self.stats["wait_s"] += time.monotonic() - start
+            while True:
+                credits = self._targets.get(target)
+                if credits is None or credits.epoch != epoch:
+                    return None
+                if credits.free:
+                    slot = credits.free.pop()
+                    credits.in_flight.add(slot)
+                    return slot
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cv.wait(remaining)
 
     def release(self, target: str, epoch: int, slots: list[int]) -> None:
         """Return slots the decode rank finished with (or that never landed)."""

@@ -18,9 +18,10 @@ import numpy as np
 import pytest
 import torch
 
+from atom.kv_transfer.disaggregation.mooncake.mla_landing import LandingCredits
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
-    pack_staging_slots,
+    pack_slots,
 )
 from atom.kv_transfer.disaggregation.types import INDEX_CACHE_ROLE, MLA_KV_ROLE
 
@@ -140,8 +141,8 @@ def test_staged_index_descriptors_stay_inside_one_destination_mr(monkeypatch):
     ]
 
 
-def test_pack_staging_slots_fills_and_splits_regions():
-    slots = pack_staging_slots([10, 10, 20], dst_pages=5, slot_bytes=60)
+def test_pack_slots_fills_and_splits_regions():
+    slots = pack_slots([10, 10, 20], num_units=5, slot_bytes=60, align=1)
     assert slots == [
         [(0, 0, 5, 0), (1, 0, 1, 50)],
         [(1, 1, 5, 0), (2, 0, 1, 40)],
@@ -158,9 +159,9 @@ def test_pack_staging_slots_fills_and_splits_regions():
         assert used <= 60
     assert covered == {r: list(range(5)) for r in range(3)}
     # Items from several regions share one slot when they fit.
-    assert pack_staging_slots([10, 10], 2, 40) == [[(0, 0, 2, 0), (1, 0, 2, 20)]]
+    assert pack_slots([10, 10], 2, 40, 1) == [[(0, 0, 2, 0), (1, 0, 2, 20)]]
     with pytest.raises(ValueError, match="cannot hold"):
-        pack_staging_slots([100], 1, 50)
+        pack_slots([100], 1, 50, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +231,6 @@ def _producer(mc, regions, *, pool_size=0, slot_pages=0):
         conn._mla_staging = torch.empty(
             (pool_size, slot_pages * PAGE_BYTES), dtype=torch.uint8
         )
-        conn._mla_staging_pool_size = pool_size
         conn._mla_staging_free = list(range(pool_size))
         conn._mla_staging_cv = threading.Condition()
         conn._stream = _Stream()
@@ -416,7 +416,7 @@ def test_staged_mla_cuts_descriptors_at_least_16x(monkeypatch):
     old_contig, new_contig = counts["contiguous"]
     # One descriptor per (region, slot) piece when destination pages are
     # adjacent: 20 regions x 1024 pages over 910-page slots.
-    slots = pack_staging_slots([PAGE_BYTES] * num_regions, dst_pages, 910 * PAGE_BYTES)
+    slots = pack_slots([PAGE_BYTES] * num_regions, dst_pages, 910 * PAGE_BYTES, 1)
     assert new_contig == sum(len(s) for s in slots)
     assert old_contig >= 1000 * new_contig
 
@@ -438,19 +438,73 @@ def test_staged_mla_workers_wait_for_a_shared_slot():
     assert got == [0]
 
 
-def test_send_workers_gather_on_their_own_streams(monkeypatch):
+@pytest.mark.parametrize("landing", [False, True], ids=["staged", "landed"])
+def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
+    """A staging slot goes back only once no gather queued into it can run.
+
+    Another send worker may take the slot as soon as it is released, so a
+    gather that raises still has its stream synchronized first.
+    """
     mc = _mooncake()
-    monkeypatch.setattr(mc.torch.cuda, "Stream", lambda device=None: _Stream())
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    conn = _producer(mc, _source_regions(2, 8), pool_size=1, slot_pages=4)
+    dst = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8) for _ in range(2)]
+    request = _request(2, 2, 0, 1, dst)
+    if landing:
+        monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+        offer = {"epoch": 1, "base": 0, "slot_bytes": 4 * PAGE_BYTES, "slots": [0]}
+        conn._landing_credits = LandingCredits()
+        conn._landing_credits.sync("consumer:1", offer)
+        request.update(mla_landing=offer, notify_host="decode", notify_port=1)
+    events = []
+    conn._stream.synchronize = lambda: events.append("sync")
+    release = conn._release_mla_staging_slot
+
+    def release_slot(idx):
+        events.append("release")
+        release(idx)
+
+    conn._release_mla_staging_slot = release_slot
+    index_select = torch.index_select
+    calls = []
+
+    def second_gather_fails(*args, **kwargs):
+        # Both regions share the slot: the first gather is already queued.
+        calls.append(None)
+        if len(calls) == 2:
+            raise RuntimeError("gather failed")
+        return index_select(*args, **kwargs)
+
+    monkeypatch.setattr(mc.torch, "index_select", second_gather_fails)
+    with pytest.raises(RuntimeError, match="gather failed"):
+        _run(mc, conn, request, range(4), [3, 5], object())
+    assert events == ["sync", "release"]
+    assert conn._mla_staging_free == [0]
+    if landing:
+        # Never announced, so the credit went back too.
+        assert conn._landing_credits.acquire("consumer:1", 1, 0) == 0
+
+
+def test_a_failed_index_gather_ends_before_its_slot_is_released(monkeypatch):
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     conn = object.__new__(mc.MooncakeConnector)
-    conn._cuda_device = 0
-    conn._send_worker_streams = threading.local()
-    mine = conn._send_worker_stream()
-    assert conn._send_worker_stream() is mine
-    other = []
-    worker = threading.Thread(target=lambda: other.append(conn._send_worker_stream()))
-    worker.start()
-    worker.join()
-    assert other[0] is not mine
+    events = []
+    stream = _Stream()
+    stream.synchronize = lambda: events.append("sync")
+    conn._send_worker_stream = lambda: stream
+    conn._acquire_index_staging_slot = lambda: 0
+    conn._release_index_staging_slot = lambda _idx: events.append("release")
+
+    def gather_fails(*_args):
+        raise RuntimeError("gather failed")
+
+    conn._gather_sharded_index = gather_fails
+    with pytest.raises(RuntimeError, match="gather failed"):
+        conn._execute_staged_index_layer_chunk(
+            "consumer:1", 0, 20000, 64, [3], "req", object()
+        )
+    assert events == ["sync", "release"]
 
 
 def test_staged_mla_needs_the_ready_event(monkeypatch):
@@ -510,7 +564,7 @@ def test_mla_staging_is_disabled_by_env(monkeypatch):
     conn.dcp_size = 1
     conn._has_slot_regions = False
     assert conn._build_mla_staging(object()) is None
-    assert conn._mla_staging_pool_size == 0
+    assert conn._mla_staging is None
 
 
 class _DeviceNic:
