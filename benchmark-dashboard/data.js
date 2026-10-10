@@ -1,86 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791620931921,
+  "lastUpdate": 1791624254784,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "ZhangLirong-amd",
-            "username": "ZhangLirong-amd",
-            "email": "lirzhang@amd.com"
-          },
-          "committer": {
-            "name": "ZhangLirong-amd",
-            "username": "ZhangLirong-amd",
-            "email": "lirzhang@amd.com"
-          },
-          "id": "9d3d0029432cc5c61c2fe08d72c91c07d80d336a",
-          "message": "ci(benchmark): try the agentic DP queue cap at 15s\n\nMeasured at 20s against the same config with the cap disabled: TTFT max\n-34% and p99 -18%, but both metrics InferenceX actually scores moved the\nwrong way -- tok/s/chip -2.1% and P90 interactivity (1/p90(ITL)) -14.5%,\nthe latter from ITL p90 26.66 -> 31.17 ms. TTFT is context in the recipe\ntable, not a scored axis.\n\n15s is not simply further down that slope. A 20s cap accumulates 20s of\nbacklog and then force-releases it in one batch, which is what puts ITL p99\nat 65 ms; firing earlier releases smaller batches more often, so the two\neffects -- how often decode is interrupted and how hard -- pull opposite\nways. ITL p90 against p99 says which one dominates.\n\nIf both land worse than 20s, the knob only costs under this scoring and\nbelongs either reverted or raised past the point where it ever fires.",
-          "timestamp": "2026-09-04T01:01:34Z",
-          "url": "https://github.com/ROCm/ATOM/commit/9d3d0029432cc5c61c2fe08d72c91c07d80d336a"
-        },
-        "date": 1788513518561,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=48 throughput (tok/s)",
-            "value": 919.12,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33824518673 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609031453"
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=48 Total Tput (tok/s)",
-            "value": 131073.94,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33824518673 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609031453"
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=48 TTFT (ms)",
-            "value": 10824.99,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33824518673 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609031453"
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=48 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=48 _tp",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=64 throughput (tok/s)",
-            "value": 1307.72,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33824518673 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609031453"
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=64 Total Tput (tok/s)",
-            "value": 161674.14,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33824518673 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609031453"
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=64 TTFT (ms)",
-            "value": 10008.41,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/33824518673 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609031453"
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=64 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "atom::DeepSeek-V4-Pro Agentic DPA MTP3 0/1024 c=64 _tp",
-            "value": 8,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -291469,6 +291391,58 @@ window.BENCHMARK_DATA = {
             "value": 0.8969,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38033504926 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610100245 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.166 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Wang, Yiting",
+            "username": "yitingw1",
+            "email": "yitiwang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "73defd9b868663be51985fedff06115ef9bcab3d",
+          "message": "[LMCache MP] Fix leaked L1 read locks from an unconsumed async lookup (#2518)\n\n* [LMCache MP] Fix leaked L1 read locks from an unconsumed async lookup\n\nAfter a load finishes, prefetch_lookups could reach the promoted request\nbefore admission (still WAITING_FOR_REMOTE_KVS, offload_loaded unset) and\nsubmit a second async lookup. The request resumes without matching, so the\nlookup was never consumed, and clear_lookup_status had already cleared the\nadapter's per-request hit slot, so _release_unconsumed skipped\nfree_lookup_locks. The read locks then lived until the L1 read TTL.\n\n- prefetch_lookups skips WAITING_FOR_REMOTE_KVS requests and requests that\n  resume without a match.\n- The MP lookup client records answered async hits itself, so releasing an\n  unconsumed lookup no longer depends on the adapter's result cache.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [LMCache MP] Share the offload resume predicate; warn on failed async lookups\n\n- resumes_offload_prefill() in sequence.py is now the single predicate used\n  by both Scheduler._is_offload_prefill_resume and prefetch_lookups, so the\n  prefetch skip cannot drift from admission.\n- A failed async lookup goes through one helper that warns that read locks\n  it may hold are left to the L1 read TTL.\n- Tests cover the offload_load_failed branch and assert prefetch submits iff\n  admission matches again.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* [LMCache MP] Log failed async lookups inside their except blocks\n\nRuff (BLE001, LOG014) treats the handlers as swallowing the exception once\nthe exc_info warning lives in a helper. Keep the warning in each handler and\nlet _drop_failed only forget the lookup and return its phase.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-10T09:18:12Z",
+          "url": "https://github.com/ROCm/ATOM/commit/73defd9b868663be51985fedff06115ef9bcab3d"
+        },
+        "date": 1791624254034,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::DeepSeek-V4-Pro-0813 mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3 1048576/1024 c=128 perf point",
+            "value": 241.0246,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37957502503 | docker_image=rocm/atom-dev:latest | precision=FP4 | display_topology=1P1D-DPA-TP8-DSPARK3 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9535%2C%22cache_hit_tokens%22%3A1707627264%2C%22cache_total_tokens%22%3A1790978467%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20FP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A14649%2C%22concurrency%22%3A128%2C%22config_label%22%3A%22mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Atrue%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22duration%22%3A3628.5902%2C%22e2el_ms%22%3A20412.4611%2C%22e2el_p90%22%3A37815.5962%2C%22e2el_p99%22%3A118537.84%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Alatest%22%2C%22input_tput%22%3A455719.4815%2C%22input_tput_per_gpu%22%3A28482.4676%2C%22interactivity%22%3A11.1681%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A14644%2C%22interactivity_p90_itl%22%3A78.9485%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A11.4852%2C%22itl_p90%22%3A12.6665%2C%22median_e2el_ms%22%3A14286.3231%2C%22median_itl_ms%22%3A11.6904%2C%22median_tpot_ms%22%3A11.6904%2C%22median_ttft_ms%22%3A7734.3217%2C%22model%22%3A%22DeepSeek-V4-Pro-0813%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A3%2C%22osl%22%3A1024%2C%22output_tput%22%3A3856.394%2C%22output_tput_per_gpu%22%3A241.0246%2C%22precision%22%3A%22fp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Atrue%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A3.7275%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-DeepSeek-V4-Pro-0813-1p1d_dpa-isl1048576-osl1024-conc128-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37957502503%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-3%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A459575.8755%2C%22tpot_ms%22%3A11.4852%2C%22tpot_p90%22%3A12.6665%2C%22tpot_p99%22%3A14.8604%2C%22tput_per_gpu%22%3A28723.4922%2C%22ttft_ms%22%3A8561.3913%2C%22ttft_p90%22%3A14534.4542%2C%22ttft_p99%22%3A31770.4113%7D"
+          },
+          {
+            "name": "Atomesh::DeepSeek-V4-Pro-0813 mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3 1048576/1024 c=16 perf point",
+            "value": 38.4017,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37957502503 | docker_image=rocm/atom-dev:latest | precision=FP4 | display_topology=1P1D-DPA-TP8-DSPARK3 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9612%2C%22cache_hit_tokens%22%3A305468928%2C%22cache_total_tokens%22%3A317804702%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20FP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A2279%2C%22concurrency%22%3A16%2C%22config_label%22%3A%22mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Atrue%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22duration%22%3A3615.5662%2C%22e2el_ms%22%3A8529.3436%2C%22e2el_p90%22%3A19448.4112%2C%22e2el_p99%22%3A71220.164%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Alatest%22%2C%22input_tput%22%3A87549.4829%2C%22input_tput_per_gpu%22%3A5471.8427%2C%22interactivity%22%3A40.8596%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A2276%2C%22interactivity_p90_itl%22%3A127.6261%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A7.1069%2C%22itl_p90%22%3A7.8354%2C%22median_e2el_ms%22%3A4194.1274%2C%22median_itl_ms%22%3A6.8658%2C%22median_tpot_ms%22%3A6.8658%2C%22median_ttft_ms%22%3A945.5281%2C%22model%22%3A%22DeepSeek-V4-Pro-0813%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A3%2C%22osl%22%3A1024%2C%22output_tput%22%3A614.4279%2C%22output_tput_per_gpu%22%3A38.4017%2C%22precision%22%3A%22fp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Atrue%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.6278%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-DeepSeek-V4-Pro-0813-1p1d_dpa-isl1048576-osl1024-conc16-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37957502503%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-3%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A88163.9108%2C%22tpot_ms%22%3A7.1069%2C%22tpot_p90%22%3A7.8354%2C%22tpot_p99%22%3A15.0524%2C%22tput_per_gpu%22%3A5510.2444%2C%22ttft_ms%22%3A1757.7107%2C%22ttft_p90%22%3A4379.3717%2C%22ttft_p99%22%3A10148.383%7D"
+          },
+          {
+            "name": "Atomesh::DeepSeek-V4-Pro-0813 mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3 1048576/1024 c=192 perf point",
+            "value": 282.1521,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37957502503 | docker_image=rocm/atom-dev:latest | precision=FP4 | display_topology=1P1D-DPA-TP8-DSPARK3 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9453%2C%22cache_hit_tokens%22%3A2187457024%2C%22cache_total_tokens%22%3A2313932232%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20FP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A17492%2C%22concurrency%22%3A192%2C%22config_label%22%3A%22mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Atrue%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22duration%22%3A3628.1137%2C%22e2el_ms%22%3A29426.0511%2C%22e2el_p90%22%3A57394.0072%2C%22e2el_p99%22%3A186047.7464%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Alatest%22%2C%22input_tput%22%3A588786.5106%2C%22input_tput_per_gpu%22%3A36799.1569%2C%22interactivity%22%3A6.8574%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A17485%2C%22interactivity_p90_itl%22%3A73.5191%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A12.3521%2C%22itl_p90%22%3A13.6019%2C%22median_e2el_ms%22%3A18504.92%2C%22median_itl_ms%22%3A12.5753%2C%22median_tpot_ms%22%3A12.5753%2C%22median_ttft_ms%22%3A10759.5518%2C%22model%22%3A%22DeepSeek-V4-Pro-0813%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A3%2C%22osl%22%3A1024%2C%22output_tput%22%3A4514.4334%2C%22output_tput_per_gpu%22%3A282.1521%2C%22precision%22%3A%22fp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Atrue%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A4.4509%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-DeepSeek-V4-Pro-0813-1p1d_dpa-isl1048576-osl1024-conc192-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37957502503%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-3%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A593300.944%2C%22tpot_ms%22%3A12.3521%2C%22tpot_p90%22%3A13.6019%2C%22tpot_p99%22%3A16.8284%2C%22tput_per_gpu%22%3A37081.309%2C%22ttft_ms%22%3A16894.4524%2C%22ttft_p90%22%3A26106.4817%2C%22ttft_p99%22%3A136789.816%7D"
+          },
+          {
+            "name": "Atomesh::DeepSeek-V4-Pro-0813 mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3 1048576/1024 c=2 perf point",
+            "value": 7.8609,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37957502503 | docker_image=rocm/atom-dev:latest | precision=FP4 | display_topology=1P1D-DPA-TP8-DSPARK3 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9467%2C%22cache_hit_tokens%22%3A48115712%2C%22cache_total_tokens%22%3A50825201%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20FP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A364%2C%22concurrency%22%3A2%2C%22config_label%22%3A%22mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Atrue%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22duration%22%3A3597.3754%2C%22e2el_ms%22%3A8606.4721%2C%22e2el_p90%22%3A26391.1118%2C%22e2el_p99%22%3A62869.9746%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Alatest%22%2C%22input_tput%22%3A14001.4287%2C%22input_tput_per_gpu%22%3A875.0893%2C%22interactivity%22%3A52.5246%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A363%2C%22interactivity_p90_itl%22%3A170.6693%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A5.6015%2C%22itl_p90%22%3A5.8593%2C%22median_e2el_ms%22%3A2809.4646%2C%22median_itl_ms%22%3A5.5935%2C%22median_tpot_ms%22%3A5.5935%2C%22median_ttft_ms%22%3A861.1516%2C%22model%22%3A%22DeepSeek-V4-Pro-0813%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A3%2C%22osl%22%3A1024%2C%22output_tput%22%3A125.7749%2C%22output_tput_per_gpu%22%3A7.8609%2C%22precision%22%3A%22fp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Atrue%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.1003%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-DeepSeek-V4-Pro-0813-1p1d_dpa-isl1048576-osl1024-conc2-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37957502503%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-3%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A14127.2036%2C%22tpot_ms%22%3A5.6015%2C%22tpot_p90%22%3A5.8593%2C%22tpot_p99%22%3A6.3733%2C%22tput_per_gpu%22%3A882.9502%2C%22ttft_ms%22%3A1495.9216%2C%22ttft_p90%22%3A3083.3354%2C%22ttft_p99%22%3A10593.4865%7D"
+          },
+          {
+            "name": "Atomesh::DeepSeek-V4-Pro-0813 mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3 1048576/1024 c=32 perf point",
+            "value": 65.8777,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/37957502503 | docker_image=rocm/atom-dev:latest | precision=FP4 | display_topology=1P1D-DPA-TP8-DSPARK3 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9682%2C%22cache_hit_tokens%22%3A638743040%2C%22cache_total_tokens%22%3A659690687%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20FP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A4059%2C%22concurrency%22%3A32%2C%22config_label%22%3A%22mi355x_atomesh-atom_fp4_1p1d_dpa_tp8_dspark3%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Atrue%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22duration%22%3A3624.1316%2C%22e2el_ms%22%3A10569.8716%2C%22e2el_p90%22%3A24112.51%2C%22e2el_p99%22%3A69713.0718%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Alatest%22%2C%22input_tput%22%3A167860.1287%2C%22input_tput_per_gpu%22%3A10491.258%2C%22interactivity%22%3A30.4157%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A4057%2C%22interactivity_p90_itl%22%3A110.1307%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A7.9387%2C%22itl_p90%22%3A9.0801%2C%22median_e2el_ms%22%3A5938.5946%2C%22median_itl_ms%22%3A7.9698%2C%22median_tpot_ms%22%3A7.9698%2C%22median_ttft_ms%22%3A1270.8787%2C%22model%22%3A%22DeepSeek-V4-Pro-0813%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A3%2C%22osl%22%3A1024%2C%22output_tput%22%3A1054.0429%2C%22output_tput_per_gpu%22%3A65.8777%2C%22precision%22%3A%22fp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Atrue%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.0328%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-DeepSeek-V4-Pro-0813-1p1d_dpa-isl1048576-osl1024-conc32-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F37957502503%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-3%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A168914.1716%2C%22tpot_ms%22%3A7.9387%2C%22tpot_p90%22%3A9.0801%2C%22tpot_p99%22%3A9.6577%2C%22tput_per_gpu%22%3A10557.1357%2C%22ttft_ms%22%3A2403.9356%2C%22ttft_p90%22%3A5924.5332%2C%22ttft_p99%22%3A13426.3227%7D"
           }
         ]
       }
