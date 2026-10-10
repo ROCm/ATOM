@@ -660,7 +660,7 @@ def test_agentic_custom_image_digest_resolution(monkeypatch):
     )
 
 
-def test_agentic_kimi_k3_c48_has_prefill_checkpoint_compatible_configuration():
+def test_agentic_kimi_k3_c48_has_non_speculative_state_checkpoints():
     import json
     import shlex
 
@@ -671,6 +671,8 @@ def test_agentic_kimi_k3_c48_has_prefill_checkpoint_compatible_configuration():
     (config,) = build_configs(inputs={"models": "kimi-k3"})
     assert config["bench_kind"] == "aiperf_agentic"
     assert json.loads(config["concurrency"]) == [48]
+    assert config["suffix"] == "-agentic-tp8-dcp8-lmcache-state"
+    assert "dspark" not in config["display"].lower()
     args = shlex.split(config["server_args"])
     expected = {
         "-tp": "8",
@@ -678,14 +680,21 @@ def test_agentic_kimi_k3_c48_has_prefill_checkpoint_compatible_configuration():
         "--data-parallel-size": "1",
         "--max-num-seqs": "96",
         "--max-num-batched-tokens": "8192",
-        "--method": "dspark",
-        "--num-speculative-tokens": "3",
-        "--spec-decode-acceptance-length": "3.00",
         "--state-checkpoint-interval-tokens": "-1",
         "--kv_cache_dtype": "fp8",
     }
     for flag, value in expected.items():
         assert args.count(flag) == 1 and args[args.index(flag) + 1] == value
+    # Match the observed baseline's speculative_config=None, including real
+    # output text instead of forced-acceptance synthetic text.
+    assert not {
+        "--method",
+        "--draft-model",
+        "--num-speculative-tokens",
+        "--speculative-config",
+        "--spec-decode-acceptance-length",
+        "--spec-decode-acceptance-rate",
+    }.intersection(args)
     assert "--enable_prefix_caching" in args
     assert (
         "--enable-expert-parallel" not in args and "--enable-dp-attention" not in args
@@ -695,7 +704,7 @@ def test_agentic_kimi_k3_c48_has_prefill_checkpoint_compatible_configuration():
         "kv_role": "offload",
     }
     assert json.loads(args[args.index("--cudagraph-capture-sizes") + 1]) == list(
-        range(1, 385)
+        range(1, 97)
     )
     env = dict(line.split("=", 1) for line in config["env_vars"].splitlines())
     assert env["ATOM_KDA_SPARE_STATE_CHECKPOINTS"] == "1"
