@@ -316,6 +316,7 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+| **ATOM_STATE_CHECKPOINT_END_ANCHOR** | bool | 1 (true) | Experimental. Set to `0` to stop placing the prompt-end checkpoint anchor. For a backend that cannot snapshot state midstep (DeepSeek-V4), the anchor cuts each prompt's prefill one chunk short of its end, which costs an extra (lockstep) step per request; without it the next turn resumes only from ladder or demand rungs, so reuse drops. |
 
 ### LMCache offload tier
 
@@ -338,6 +339,7 @@ derive a bound.
 | **OFFLOAD_LOOKUP_RETRY_STEPS** | int | 32 | Scheduler steps a failed tier lookup suppresses the next attempt. |
 | **OFFLOAD_ASYNC_LOOKUP_DEPTH** | int | 16 | `lmcache_mp` sends tier lookups for the head of the waiting queue before admission, as non-blocking requests, and admission consumes the answer; a request whose answer has not arrived is passed over (in arrival order) instead of blocking the scheduler. This is how many waiting requests per scheduling pass get a prefetched lookup. |
 | **OFFLOAD_LOOKUP_DEFER_S** | float | 2.0 | How long `lmcache_mp` admission may pass over a request whose prefetched lookup is still in flight before it waits for the answer (finite, ≥ 0). |
+| **OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT** | bool | 0 (false) | Admit a prefill without an external-tier lookup when its HBM prefix leaves fewer than `OFFLOAD_MIN_LOAD_TOKENS` uncached. No load below that size is ever armed, so the lookup cannot add reuse and only delays admission (and, under DP attention, holds the request out of lockstep steps). The HBM prefix chunk floor stands in for the lookup's save floor, so the resident prefix is not stored again. Prefetch skips such requests too. |
 | **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
 | **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
 | **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
