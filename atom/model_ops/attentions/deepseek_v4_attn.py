@@ -4165,7 +4165,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         actual `n_compress` / `n_write` (smallest grid, no padding).
         """
         from atom.model_ops.v4_kernels import make_compress_plans
-        from atom.model_ops.v4_kernels.compress_plan import compress_plan_buffer_names
 
         if not self._unique_compress_ratios_overlap:
             return {}
@@ -4182,12 +4181,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         plan_buffers = {}
         for ratio, _ in self._unique_compress_ratios_overlap:
-            plan_buffers[ratio] = {
-                role: var[name]
-                for role, name in compress_plan_buffer_names(
-                    ratio, key_rope=self._publishes_key_rope, prefix=buf_prefix_ubatch
-                ).items()
+            ratio_buffers = {
+                "compress": var[f"{buf_prefix_ubatch}v4_compress_plan_{ratio}"],
+                "write": var[f"{buf_prefix_ubatch}v4_write_plan_{ratio}"],
             }
+            if self._publishes_key_rope:
+                ratio_buffers["key_rope"] = var[
+                    f"{buf_prefix_ubatch}v41_key_rope_positions_{ratio}"
+                ]
+            plan_buffers[ratio] = ratio_buffers
         return make_compress_plans(
             extend_lens_np,
             context_lens_np,

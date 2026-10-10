@@ -85,12 +85,7 @@ def runtime_config(**overrides):
         "hf_config": SimpleNamespace(),
     }
     fields.update(overrides)
-    from atom.config import Config
-
-    class RuntimeConfig(SimpleNamespace):
-        attention_dp_size = Config.attention_dp_size
-
-    return RuntimeConfig(**fields)
+    return SimpleNamespace(**fields)
 
 
 @pytest.mark.parametrize(
@@ -440,13 +435,79 @@ def test_real_config_accepts_tbo_before_dpa_rank_expansion(
 
 
 @pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1), (2, 4)])
-def test_attention_rank_count_is_stable_across_normalization(tp, dp):
+def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
     cfg = runtime_config(
         enable_dp_attention=True,
+        enable_tbo=True,
         tensor_parallel_size=tp,
         parallel_config=SimpleNamespace(data_parallel_size=dp),
     )
-    assert cfg.attention_dp_size == tp * dp
-    cfg.parallel_config.data_parallel_size = cfg.attention_dp_size
-    cfg.tensor_parallel_size = 1
-    assert cfg.attention_dp_size == tp * dp
+    for _ in range(2):
+        if tp * dp > 1:
+            validate_runtime_config(cfg)
+        else:
+            with pytest.raises(ValueError, match="multi-rank DP attention"):
+                validate_runtime_config(cfg)
+        cfg.parallel_config.data_parallel_size = tp * dp
+        cfg.tensor_parallel_size = 1
+
+
+@pytest.mark.parametrize("explicit_parallel", [False, True])
+def test_legacy_engine_dp_is_normalized_before_v41_admission(
+    monkeypatch, explicit_parallel
+):
+    import atom.config as config_module
+    import atom.model_engine.llm_engine as engine_module
+    import atom.models.deepseek_v41.config as v41_config
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
+    hf = normalize_hf_config(json.loads(fixture.read_text()))
+    monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
+    monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
+    validated = []
+    validate = v41_config.validate_runtime_config
+
+    def checked(config):
+        validate(config)
+        assert (
+            config.tensor_parallel_size * config.parallel_config.data_parallel_size == 4
+        )
+        assert config.parallel_config.data_parallel_master_port == 27123
+        validated.append(config.parallel_config)
+
+    class ReachedTokenizer(Exception):
+        pass
+
+    def stop_before_startup(*args):
+        raise ReachedTokenizer
+
+    monkeypatch.setattr(v41_config, "validate_runtime_config", checked)
+    monkeypatch.setattr(engine_module, "_load_tokenizer", stop_before_startup)
+    kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}
+    if explicit_parallel:
+        parallel = config_module.ParallelConfig(
+            data_parallel_size=4,
+            data_parallel_size_local=2,
+            data_parallel_master_port=27123,
+        )
+        kwargs.update(
+            parallel_config=parallel,
+            data_parallel_size=8,
+            data_parallel_master_port=27124,
+        )
+    with pytest.raises(ReachedTokenizer):
+        engine_module.LLMEngine(
+            "v41-test",
+            tensor_parallel_size=1,
+            enable_dp_attention=True,
+            enable_tbo=True,
+            enable_tbo_decode=False,
+            enforce_eager=True,
+            kv_cache_dtype="bf16",
+            index_cache_dtype="fp8",
+            **kwargs,
+        )
+    assert len(validated) == 1
+    if explicit_parallel:
+        assert validated[0] is parallel
+        assert validated[0].data_parallel_size_local == 2

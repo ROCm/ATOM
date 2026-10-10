@@ -3,6 +3,7 @@
 
 import logging
 import threading
+import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TypeAlias
@@ -72,15 +73,10 @@ class UBatchWrapper(nn.Module):
             self._worker_job_ready[idx].clear()
             job = self._worker_jobs[idx]
             self._worker_jobs[idx] = None
-            if job is None:
-                continue
             try:
-                job()
+                if job is not None:
+                    job()
             finally:
-                # Idle workers must not pin the preceding batch's KV/metadata
-                # through their thread-local context or completed job closure.
-                _forward_context_local.ctx = None
-                job = None
                 self._worker_job_done[idx].set()
 
     def _ensure_workers(self, device: torch.device):
@@ -198,8 +194,6 @@ class UBatchWrapper(nn.Module):
                         model_output = self.model(ub_input_ids, ub_positions)
                     results.append((idx, self._validate_ubatch_output(model_output)))
                 except Exception as e:
-                    if tbo_ctxs[idx].cancelled:
-                        return
                     # logger.exception captures the full traceback. The partner
                     # thread is unblocked via TBOContext.partner.done (set in
                     # __exit__) so the main thread's done-wait returns promptly
@@ -214,46 +208,27 @@ class UBatchWrapper(nn.Module):
         _forward_context_local.ctx = None
 
         try:
-            # Start parent-owned prefetch after metadata construction, just
-            # before waking the workers, so it overlaps model computation.
-            with (
+            # The backend owns resources shared by both microbatches.
+            parent_forward = (
                 self.attn_metadata_builder.ubatch_forward(ctx.attn_metadata)
                 if self.attn_metadata_builder is not None
                 else nullcontext()
-            ):
-                submitted = []
-                try:
-                    for i in range(N):
-                        self._worker_job_done[i].clear()
-                        self._worker_jobs[i] = _make_job(i)
-                        submitted.append(i)
-                        self._worker_job_ready[i].set()
+            )
+            with parent_forward:
+                # Hand each ubatch job to its persistent worker and wake it.
+                for i in range(N):
+                    self._worker_job_done[i].clear()
+                    self._worker_jobs[i] = _make_job(i)
+                    self._worker_job_ready[i].set()
 
-                    self.ready_barrier.wait()
-                    tbo_ctxs[0].cpu_wait_event.set()
-                    for i in submitted:
-                        self._worker_job_done[i].wait()
-                except BaseException:
-                    # Cancel before waking anyone, including workers that have
-                    # not reached their first turn. Keep metadata and partner
-                    # links alive until every submitted job has unwound.
-                    for tbo_ctx in tbo_ctxs:
-                        tbo_ctx.cancelled = True
-                    self.ready_barrier.abort()
-                    for tbo_ctx in tbo_ctxs:
-                        tbo_ctx.cpu_wait_event.set()
-                    for i in submitted:
-                        self._worker_job_ready[i].set()
-                    for i in submitted:
-                        self._worker_job_done[i].wait()
-                    self.ready_barrier.reset()
-                    raise
+                # Same handshake as before: all reach the barrier, then wake thread 0.
+                self.ready_barrier.wait()
+                tbo_ctxs[0].cpu_wait_event.set()
+
+                # Wait for this step's jobs to finish (replaces Thread.join()).
+                for i in range(N):
+                    self._worker_job_done[i].wait()
         finally:
-            # Both workers have left their contexts. Break the partner cycle
-            # so child metadata is released without waiting for cyclic GC.
-            for tbo_ctx in tbo_ctxs:
-                tbo_ctx.partner = None
-                tbo_ctx.forward_context = None
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
 
@@ -345,7 +320,7 @@ class UBatchWrapper(nn.Module):
                     model_output = self.model(ub_input_ids, ub_positions)
                 results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
-                logger.exception("[TBO] ubatch %d graph capture failed", idx)
+                traceback.print_exc()
                 errors[idx] = e
 
         saved_ctx = getattr(_forward_context_local, "ctx", None)
@@ -470,8 +445,10 @@ class UBatchWrapper(nn.Module):
         context (the shared metadata is then reused, which is correct for the
         single-rank case). Otherwise returns a list of length ``N``.
 
-        Reuse the per-ubatch counts exchanged by ForwardMode.decide. Callers
-        without that table fall back to one CPU all_reduce per ubatch.
+        Each ubatch's per-rank token count is obtained with the same CPU
+        all_reduce that :meth:`DPMetadata.num_tokens_across_dp` uses, one per
+        ubatch. This is a CPU collective (cheap) and keeps every rank's
+        all_gatherv / reduce_scatterv consistently sized.
         """
         if ctx.dp_metadata is None:
             return None
@@ -480,15 +457,9 @@ class UBatchWrapper(nn.Module):
 
         parallel_config = get_current_atom_config().parallel_config
         metas = []
-        for i, ub_slice in enumerate(ctx.ubatch_slices):
+        for ub_slice in ctx.ubatch_slices:
             ub_tokens = ub_slice.token_slice.stop - ub_slice.token_slice.start
-            sizes = self._ub_tokens_across_dp(ctx, N, i)
-            counts = (
-                None
-                if sizes is None
-                else torch.tensor(sizes, dtype=torch.int32, device="cpu")
-            )
-            metas.append(DPMetadata.make(parallel_config, int(ub_tokens), counts))
+            metas.append(DPMetadata.make(parallel_config, int(ub_tokens), None))
         return metas
 
     @staticmethod
@@ -537,15 +508,15 @@ class UBatchWrapper(nn.Module):
         In TOKENS on both branches, which is why neither multiplies by
         ``dp_size``: pad_for_all_gather gathers across ranks itself.
 
-        For ragged prefill: each microbatch's local token count. A caller
-            explicitly requesting uniform execution uses the cross-DP MAX
-            from ForwardMode.decide, falling back to local sizes without DP.
+        For prefill (eager only): the cross-DP per-ubatch token MAX that
+            ``ForwardMode.decide`` already packed into the single DP
+            all_reduce (``ctx.ub_max_tokens_across_dp``). Falls back to
+            local sizes when DP is off / value not precomputed.
         For decode: the per-ubatch padded request count times ``max_seqlen_q``.
         """
         if ctx.context.is_prefill:
             if (
-                ctx.context.running_tokens_are_unified
-                and dp_size > 1
+                dp_size > 1
                 and ctx.ub_max_tokens_across_dp is not None
                 and len(ctx.ub_max_tokens_across_dp) == N
             ):
@@ -600,10 +571,6 @@ class UBatchWrapper(nn.Module):
             running_tokens = ub_running_bs * int(
                 getattr(ctx.attn_metadata, "max_seqlen_q", 1) or 1
             )
-        if running_tokens_across_dp is None and dp_metadata is not None:
-            # The fallback CPU collective already resolved this child's table.
-            # Never substitute the parent's counts for a microbatch's bounds.
-            running_tokens_across_dp = tuple(dp_metadata.get_sizes_across_dp())
         ub_context = Context(
             positions=ctx.context.positions[ub_slice.token_slice],
             is_prefill=ctx.context.is_prefill,
@@ -612,7 +579,6 @@ class UBatchWrapper(nn.Module):
             scheduled_tokens=ub_num_tokens,
             running_bs=ub_running_bs,
             running_tokens=running_tokens,
-            running_tokens_are_unified=ctx.context.running_tokens_are_unified,
             running_tokens_across_dp=running_tokens_across_dp,
             is_draft=ctx.context.is_draft,
             # Carry over per-ubatch slice of input_ids for hash MoE (PCP+TBO mode).

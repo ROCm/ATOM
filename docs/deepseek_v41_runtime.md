@@ -179,8 +179,8 @@ also validated with BF16 KV, FP8 index and native DSpark5; that configuration
 requires `MORI_SHMEM_HEAP_SIZE=17179869184` (16 GiB). This does not establish
 coverage for every EP backend or deployment shape.
 V4.1 prefill TBO requires DP attention with more than one effective DP rank.
-`Config.attention_dp_size` provides the normalized width to validation;
-CoreManager retains the existing DP/TP launch normalization:
+V4.1 validation uses the TP × DP rank count, which is unchanged by
+CoreManager's existing DP/TP launch normalization:
 TP4 with the default DP size of 1 launches four DP-attention ranks and is accepted.
 Plain TP and effective single-rank DPA are rejected. Microbatches use
 the configured compilation level; decode keeps its CUDA Graph path.
@@ -195,14 +195,15 @@ when DSpark is enabled; tentative verification retains decode semantics.
 
 Each microbatch preserves absolute token positions, request state slots and
 page tables, with separate compression plans, attention indptrs and cross-layer
-selection state. Ragged prefill retains local row counts and reuses the
-per-microbatch counts exchanged by ForwardMode.decide for variable-size MoE
-collectives. Callers without that count table retain the CPU-collective fallback.
+selection state. Ragged prefill uses the existing TBO DP padding contract:
+attention sees each microbatch's local rows, while MoE pads to the per-microbatch
+DP maximum before gathering and trims the padding after reduce-scatter.
+The shared worker scheduling, DP context and collective selection are unchanged.
 
 Engram snapshots the parent's n-gram history before its cursor advances.
 After metadata construction, the parent starts one side-stream lookup around
 both microbatches. Each consumes its token slice and waits at its Engram layer;
-the parent joins the lookup after both workers finish, including failure.
+the parent joins the lookup after both workers finish, including model errors.
 Already-staged rows are sliced identically when Engram overlap is disabled.
 
 V4.1 uses communication stream priority -1 as a fixed backend policy;

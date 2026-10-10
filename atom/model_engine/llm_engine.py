@@ -11,7 +11,7 @@ from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-from atom.config import Config
+from atom.config import Config, ParallelConfig
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
@@ -39,8 +39,15 @@ class LLMEngine:
     def __init__(self, model, tokenizer=None, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        data_parallel_size = kwargs.get("data_parallel_size", 1)
-        data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
+        # Normalize loose legacy DP kwargs before Config validates topology.
+        # An explicit ParallelConfig remains authoritative.
+        if "parallel_config" not in config_kwargs:
+            parallel = ParallelConfig(
+                data_parallel_size=kwargs.get("data_parallel_size", 1)
+            )
+            if kwargs.get("data_parallel_master_port") is not None:
+                parallel.data_parallel_master_port = kwargs["data_parallel_master_port"]
+            config_kwargs["parallel_config"] = parallel
         config = Config(model, **config_kwargs)
         self.config = config
         self.tokenizer = tokenizer or _load_tokenizer(
@@ -52,16 +59,6 @@ class LLMEngine:
         # separate eos_token_id from stop_token_ids
         stop_token_ids.discard(config.eos_token_id)
         config.stop_token_ids = list(stop_token_ids)
-        # Legacy path only: callers that pass DP topology as loose kwargs
-        # instead of a ParallelConfig. When a parallel_config was supplied it
-        # is already authoritative, and overwriting it here would reset a
-        # multi-node topology back to a single local rank.
-        if "parallel_config" not in config_kwargs:
-            config.parallel_config.data_parallel_size = data_parallel_size
-            if data_parallel_master_port is not None:
-                config.parallel_config.data_parallel_master_port = (
-                    data_parallel_master_port
-                )
         self.data_parallel_size = config.parallel_config.data_parallel_size
         # TBO's two concurrent ubatches are supported by the mori EP
         # dispatch/combine path. The EP collective fallback instead issues

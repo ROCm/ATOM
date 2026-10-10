@@ -257,216 +257,6 @@ def test_kv_release_keeps_persistent_ubatch_buffers_for_rebind(device):
     } == pointers
 
 
-def test_exceptional_exit_orders_comm_stream_before_compute(monkeypatch):
-    """A ubatch unwinding on the comm stream still fences its own buffers.
-
-    The parent records each child's reuse event on the compute stream, so a
-    comm stream left unordered lets that event report complete while comm
-    kernels are still reading the child's buffers -- and the next forward
-    overwrites them.
-    """
-    import threading
-
-    from atom.utils.tbo import ubatching
-
-    calls = []
-
-    class FakeStream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_event(self, event):
-            calls.append(("wait", self.name, event.name))
-
-    class FakeEvent:
-        def __init__(self, name):
-            self.name = name
-
-        def record(self, stream):
-            calls.append(("record", self.name, stream.name))
-
-    compute, comm = FakeStream("compute"), FakeStream("comm")
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
-    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
-    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [None])
-
-    ctx = ubatching.TBOContext(
-        ubatch_id=0,
-        compute_stream=compute,
-        comm_stream=comm,
-        forward_context=None,
-        ready_barrier=None,
-        cpu_wait_event=threading.Event(),
-        cpu_signal_event=threading.Event(),
-        gpu_comm_done_event=FakeEvent("comm_done"),
-        gpu_compute_done_event=FakeEvent("compute_done"),
-    )
-    # Where a forward that raised mid-communication leaves us.
-    ctx.current_stream = comm
-
-    assert ctx.__exit__(RuntimeError, RuntimeError("failed child"), None) is False
-
-    assert ("record", "comm_done", "comm") in calls
-    assert ("wait", "compute", "comm_done") in calls
-    assert ctx.current_stream is compute
-
-
-def test_failing_recv_hook_still_signals_partner_and_fences(monkeypatch):
-    """A receive hook that raises must not skip the exit's cleanup.
-
-    The partner wakes on `cpu_signal_event`/`done` and the parent fences this
-    ubatch's storage against the comm stream. Both hang off the same exit, so
-    an async receive failure that skipped them would wedge the partner and
-    leave comm kernels racing the next forward's writes.
-    """
-    import threading
-
-    from atom.utils.tbo import ubatching
-
-    calls = []
-
-    class FakeStream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_event(self, event):
-            calls.append(("wait", self.name, event.name))
-
-    class FakeEvent:
-        def __init__(self, name):
-            self.name = name
-
-        def record(self, stream):
-            calls.append(("record", self.name, stream.name))
-
-    compute, comm = FakeStream("compute"), FakeStream("comm")
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
-    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
-    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [None])
-
-    signal = threading.Event()
-    ctx = ubatching.TBOContext(
-        ubatch_id=0,
-        compute_stream=compute,
-        comm_stream=comm,
-        forward_context=None,
-        ready_barrier=None,
-        cpu_wait_event=threading.Event(),
-        cpu_signal_event=signal,
-        gpu_comm_done_event=FakeEvent("comm_done"),
-        gpu_compute_done_event=FakeEvent("compute_done"),
-    )
-    ctx.current_stream = comm
-    ctx.recv_hook = lambda: (_ for _ in ()).throw(RuntimeError("recv failed"))
-
-    # The hook's failure surfaces rather than being swallowed...
-    with pytest.raises(RuntimeError, match="recv failed"):
-        ctx.__exit__(None, None, None)
-
-    # ...and every piece of cleanup still ran.
-    assert ("record", "comm_done", "comm") in calls
-    assert ("wait", "compute", "comm_done") in calls
-    assert ctx.current_stream is compute
-    assert ctx.done is True
-    assert signal.is_set()
-
-
-@pytest.mark.parametrize("failure_point", ["record", "set_stream", "wait_event"])
-@pytest.mark.parametrize("unwinding", [False, True])
-def test_stream_cleanup_failure_always_releases_partner(
-    monkeypatch, failure_point, unwinding
-):
-    import threading
-
-    from atom.utils.tbo import ubatching
-
-    def fail_at(point):
-        if point == failure_point:
-            raise RuntimeError("async HIP failure")
-
-    class Stream:
-        def wait_event(self, event):
-            fail_at("wait_event")
-
-    class Event:
-        def record(self, stream):
-            fail_at("record")
-
-    compute, comm = Stream(), Stream()
-    signal, wait = threading.Event(), threading.Event()
-    wait.set()
-    ctx = ubatching.TBOContext(
-        ubatch_id=0,
-        compute_stream=compute,
-        comm_stream=comm,
-        forward_context=None,
-        ready_barrier=None,
-        cpu_wait_event=wait,
-        cpu_signal_event=signal,
-        gpu_comm_done_event=Event(),
-        gpu_compute_done_event=Event(),
-    )
-    ctx.current_stream = comm
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: fail_at("set_stream"))
-    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
-    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [ctx])
-    if unwinding:
-        assert ctx.__exit__(ValueError, ValueError("original failure"), None) is False
-    else:
-        with pytest.raises(RuntimeError, match="async HIP failure"):
-            ctx.__exit__(None, None, None)
-    assert ctx.done
-    assert signal.is_set()
-    assert not wait.is_set()
-    assert ubatching._CURRENT_CONTEXTS == [None]
-    assert threading.get_ident() not in ubatching._THREAD_ID_TO_CONTEXT
-
-
-def test_clean_exit_on_compute_adds_no_redundant_ordering(monkeypatch):
-    """Already on the compute stream, the exit records nothing of its own."""
-    import threading
-
-    from atom.utils.tbo import ubatching
-
-    calls = []
-
-    class FakeStream:
-        def __init__(self, name):
-            self.name = name
-
-        def wait_event(self, event):
-            calls.append(("wait", self.name, event.name))
-
-    class FakeEvent:
-        def __init__(self, name):
-            self.name = name
-
-        def record(self, stream):
-            calls.append(("record", self.name, stream.name))
-
-    compute, comm = FakeStream("compute"), FakeStream("comm")
-    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
-    monkeypatch.setitem(ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), 0)
-    monkeypatch.setattr(ubatching, "_CURRENT_CONTEXTS", [None])
-
-    ctx = ubatching.TBOContext(
-        ubatch_id=0,
-        compute_stream=compute,
-        comm_stream=comm,
-        forward_context=None,
-        ready_barrier=None,
-        cpu_wait_event=threading.Event(),
-        cpu_signal_event=threading.Event(),
-        gpu_comm_done_event=FakeEvent("comm_done"),
-        gpu_compute_done_event=FakeEvent("compute_done"),
-    )
-
-    ctx.__exit__(None, None, None)
-
-    assert calls == []
-    assert ctx.current_stream is compute
-
-
 def test_parent_engram_join_runs_when_a_microbatch_fails():
     from atom.model_ops.engram.device.staging import EngramStagedRows
 
@@ -956,10 +746,9 @@ def test_dp_moe_original_schedule_preserves_outputs(
         assert calls == expected
 
 
-@pytest.mark.parametrize("unified", [False, True])
-def test_prefill_microbatch_preserves_dp_shape_mode(monkeypatch, unified):
-    import atom.config as config_module
-    from atom.utils.forward_context import DPMetadata
+@pytest.mark.parametrize("parent_unified", [False, True])
+def test_prefill_microbatch_uses_existing_dp_padding(monkeypatch, parent_unified):
+    from atom.model_ops import moe
 
     builder, parent = make_parent("cpu")
     ctx = ForwardContext(
@@ -973,29 +762,19 @@ def test_prefill_microbatch_preserves_dp_shape_mode(monkeypatch, unified):
             running_bs=2,
             scheduled_tokens=14,
             running_tokens=14,
-            running_tokens_are_unified=unified,
+            running_tokens_are_unified=parent_unified,
         ),
         ubatch_slices=_split_prefill_token_midpoint(2, [10, 4], 2, None),
-        dp_metadata=object(),
-        ub_max_tokens_across_dp=[11, 12],
-        ub_tokens_across_dp=((7, 3, 5, 11), (7, 4, 6, 12)),
+        ub_max_tokens_across_dp=(11, 12),
     )
-    monkeypatch.setattr(
-        config_module,
-        "get_current_atom_config",
-        lambda: SimpleNamespace(
-            parallel_config=SimpleNamespace(data_parallel_size=4, data_parallel_rank=0)
-        ),
-    )
-
-    def unexpected_collective(*args):
-        pytest.fail("precomputed token counts must not trigger another collective")
-
-    monkeypatch.setattr(DPMetadata, "num_tokens_across_dp", unexpected_collective)
     wrapper = UBatchWrapper(torch.nn.Identity(), builder, dp_gather_scatter=True)
     counts = wrapper._compute_ub_running_tokens(ctx, 2, 2, 4, torch.device("cpu"))
-    assert counts == ([11, 12] if unified else [7, 7])
-    metadata = wrapper._make_ubatch_dp_metadata(ctx, 2)
+    assert counts == [11, 12]
+    # The collective itself is exercised in the multi-GPU integration run.
+    # Here retain its padded height so real unpadding must drop the tail.
+    monkeypatch.setattr(
+        moe, "get_dp_group", lambda: SimpleNamespace(reduce_scatter_tensor=lambda x: x)
+    )
     for i, part in enumerate(ctx.ubatch_slices):
         child = wrapper._make_ubatch_context(
             ctx,
@@ -1003,13 +782,18 @@ def test_prefill_microbatch_preserves_dp_shape_mode(monkeypatch, unified):
             part.request_slice.stop - part.request_slice.start,
             i,
             ub_running_tokens=counts[i],
-            dp_metadata=metadata[i],
-            running_tokens_across_dp=ctx.ub_tokens_across_dp[i],
         )
-        assert child.context.running_tokens_are_unified is unified
+        assert child.context.running_tokens_are_unified
         assert child.context.running_tokens == counts[i]
-        assert child.dp_metadata.get_sizes_across_dp() == list(
-            ctx.ub_tokens_across_dp[i]
+        assert child.attn_metadata.step.width == child.context.scheduled_tokens == 7
+        monkeypatch.setattr(_forward_context_local, "ctx", child, raising=False)
+        hidden = torch.arange(7, dtype=torch.float32)[:, None]
+        padded, local_tokens = moe.pad_for_all_gather(hidden)
+        assert padded.shape == (counts[i], 1)
+        torch.testing.assert_close(padded[:7], hidden)
+        padded[7:] = float("nan")
+        torch.testing.assert_close(
+            moe.reduce_scatter_with_unpadding(padded, local_tokens), hidden
         )
 
 
@@ -1130,3 +914,71 @@ def test_tbo_preserves_v4_forward_signature(monkeypatch):
     )
     torch.testing.assert_close(UBatchWrapper(Model())(ids, positions), ids + positions)
     torch.testing.assert_close(context.context.input_ids, ids)
+
+
+def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
+    import json
+    from pathlib import Path
+
+    from atom.model_ops.attentions.backends import CommonAttentionBuilder
+    from atom.models.deepseek_v41.config import normalize_hf_config
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
+    hf = normalize_hf_config(json.loads(fixture.read_text()))
+    runner = SimpleNamespace(
+        block_size=256,
+        forward_vars=metadata_buffers(2, 16, 8, "cpu"),
+        config=SimpleNamespace(
+            hf_config=hf,
+            speculative_config=None,
+            kv_cache_dtype="bf16",
+            index_cache_dtype="fp4",
+            enable_tbo=True,
+            load_dummy=True,
+            gpu_memory_utilization=0.75,
+        ),
+    )
+
+    def initialize_base(self, model_runner):
+        self.model_runner = model_runner
+        self.device = "cpu"
+        self.max_bs, self.max_num_batched_tokens, self.block_table_cols = 2, 16, 8
+
+    monkeypatch.setattr(CommonAttentionBuilder, "__init__", initialize_base)
+    recorded = []
+
+    class BudgetBuilder(DeepseekV41MetadataBuilder):
+        def _page_bound(self, utilization):
+            # These allocations must already exist when memory_allocated is
+            # subtracted from the PAGE budget; otherwise FP4 over-reserves.
+            assert len(self._ubatch_indptrs) == 2
+            for i in range(2):
+                assert f"ub{i}_positions" in runner.forward_vars
+                for name in self.step_planners[0]._names:
+                    assert f"ub{i}_{name}" in runner.forward_vars
+            used = sum(
+                v.gpu.numel() * v.gpu.element_size()
+                for v in runner.forward_vars.values()
+            )
+            used += sum(
+                t.numel() * t.element_size()
+                for indptrs in self._ubatch_indptrs
+                for pair in indptrs.values()
+                for t in pair
+            )
+            monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: used)
+            total = self.geometry.paged_bytes * 100
+            monkeypatch.setattr(
+                torch.cuda, "mem_get_info", lambda device: (total - used, total)
+            )
+            pages = super()._page_bound(utilization)
+            assert pages == max(
+                1, (int(total * utilization) - used) // self.geometry.paged_bytes
+            )
+            recorded.append(pages)
+            return pages
+
+    builder = BudgetBuilder(runner)
+    assert len(recorded) == 1
+    assert builder.score_workspace.packed
+    assert builder.step_planners[0].workspace is builder.score_workspace

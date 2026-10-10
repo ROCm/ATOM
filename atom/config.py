@@ -2096,13 +2096,6 @@ class Config:
     disagg_constrained: bool = False
 
     @property
-    def attention_dp_size(self) -> int:
-        """Attention ranks, invariant when CoreManager folds TP into DP."""
-        if not self.enable_dp_attention:
-            return 1
-        return self.parallel_config.data_parallel_size * self.tensor_parallel_size
-
-    @property
     def tp_world_size(self) -> int:
         """Number of TP worker processes actually launched.
 

@@ -31,7 +31,6 @@ from atom.model_ops.engram.device.staging import (
     engram_staging,
 )
 from atom.model_ops.v4_kernels import make_compress_plans
-from atom.model_ops.v4_kernels.compress_plan import compress_plan_buffer_names
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
@@ -46,6 +45,14 @@ logger = logging.getLogger("atom")
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
+
+
+def _compress_plan_buffer_names(ratio):
+    return {
+        "compress": f"v4_compress_plan_{ratio}",
+        "write": f"v4_write_plan_{ratio}",
+        "key_rope": f"v41_key_rope_positions_{ratio}",
+    }
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -151,30 +158,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             )
             | self._engram_rows_buffer(self.max_num_batched_tokens, self.device)
         )
-        # Before the memory profile, so the budget counts it; and so before
-        # the pool is sized, which its packed logits follow: the weights are
-        # in, so what is left of the budget bounds the PAGEs from above.
-        self.score_workspace = ScoreWorkspace(
-            self.geometry,
-            self.max_num_batched_tokens,
-            self.block_table_cols,
-            self.device,
-            pages=self._page_bound(model_runner.config.gpu_memory_utilization),
-        )
-        logger.info(
-            "V4.1 score workspace: %s logits, %.2f GiB",
-            "packed" if self.score_workspace.packed else "plane",
-            self.score_workspace.capacity * 4 / (1 << 30),
-        )
-        if self.score_workspace.packed:
-            self.add_step_planner(
-                ScorePlanner(
-                    self.score_workspace,
-                    (ratio for ratio, _ in self.geometry.compress_ratios),
-                    self.max_num_batched_tokens,
-                )
+        # The planner's fixed rows and their child copies count against the
+        # PAGE budget too. Bind the scorer after its storage has been sized.
+        score_planner = None
+        if self.geometry.index_fp4:
+            score_planner = ScorePlanner(
+                None,
+                (ratio for ratio, _ in self.geometry.compress_ratios),
+                self.max_num_batched_tokens,
             )
-        self.cache = self.copies = self.engram = None
+            self.add_step_planner(score_planner)
         # Prefill TBO microbatches publish their steps into `ub{i}_` copies of
         # the step buffers, owned by the runner like every other builder's
         # (V4, MLA, MHA): one set per microbatch, reuse gated by the runner's
@@ -198,6 +191,24 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 }
                 for _ in range(self._NUM_TBO_UBATCHES)
             ]
+        # Before the memory profile, so the budget counts it; and so before
+        # the pool is sized, which its packed logits follow: the weights are
+        # in, so what is left of the budget bounds the PAGEs from above.
+        self.score_workspace = ScoreWorkspace(
+            self.geometry,
+            self.max_num_batched_tokens,
+            self.block_table_cols,
+            self.device,
+            pages=self._page_bound(model_runner.config.gpu_memory_utilization),
+        )
+        logger.info(
+            "V4.1 score workspace: %s logits, %.2f GiB",
+            "packed" if self.score_workspace.packed else "plane",
+            self.score_workspace.capacity * 4 / (1 << 30),
+        )
+        if score_planner is not None:
+            score_planner.workspace = self.score_workspace
+        self.cache = self.copies = self.engram = None
         self.dummy_weights = bool(model_runner.config.load_dummy)
         if not self.dummy_weights and self.config.engram_layer_ids:
             self.engram = EngramInputPreparer.from_checkpoint(
@@ -234,7 +245,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         retained = max(geometry.speculative_tokens + 1, 1)
         buffers = {}
         for ratio, _ in geometry.compress_ratios:
-            names = compress_plan_buffer_names(ratio, key_rope=True)
+            names = _compress_plan_buffer_names(ratio)
             # Whichever regime is larger: a prefill's tight grid over its own
             # tokens, or the fixed `running_bs * per-seq bound` a CUDAGraph
             # decode cuts, which does not shrink with the batch. Sizing off
@@ -765,7 +776,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         names = ["positions", "cu_seqlens_q", "batch_id_per_q_token", "block_tables"]
         names += [visible_buffer_name(r) for r, _ in self.geometry.compress_ratios]
         for ratio, _ in self.geometry.compress_ratios:
-            names += compress_plan_buffer_names(ratio, key_rope=True).values()
+            names += _compress_plan_buffer_names(ratio).values()
         # Step planners (including packed FP4 score offsets) need independent
         # published rows for each child, just like positions and visibility.
         names += [
@@ -868,9 +879,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 plan_buffers={
                     ratio: {
                         role: buffers[name]
-                        for role, name in compress_plan_buffer_names(
-                            ratio, key_rope=True
-                        ).items()
+                        for role, name in _compress_plan_buffer_names(ratio).items()
                     }
                     for ratio, _ in self.geometry.compress_ratios
                 },

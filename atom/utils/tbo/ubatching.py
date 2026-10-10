@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import logging
-import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -11,8 +9,6 @@ import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
-
-logger = logging.getLogger(__name__)
 
 
 def tbo_overlap_enabled() -> bool:
@@ -408,7 +404,6 @@ class TBOContext:
         # Partner thread checks this in `_cpu_yield` so it doesn't sleep
         # forever if we exited (cleanly or via exception) ahead of it.
         self.done: bool = False
-        self.cancelled: bool = False
         # Filled by `make_tbo_contexts` — points to the OTHER ubatch's ctx.
         self.partner: TBOContext | None = None
 
@@ -418,66 +413,34 @@ class TBOContext:
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.ubatch_id
         _CURRENT_CONTEXTS[self.ubatch_id] = self
 
-        try:
-            self._check_cancelled()
-            # All threads reach the barrier, then the main thread wakes thread 0.
-            self.ready_barrier.wait()
-            self._wait_for_turn()
-            self._restore_context()
-            self.update_stream(self.compute_stream)
-            return self
-        except BaseException:
-            # Python does not call __exit__ when __enter__ raises. Release this
-            # worker's registration and publish done on an aborted rendezvous.
-            self.__exit__(*sys.exc_info())
-            raise
+        # All threads reach the barrier, then the main thread wakes thread 0
+        self.ready_barrier.wait()
+
+        # Wait for our turn (thread 0 is woken by the main thread)
+        self.cpu_wait_event.wait()
+        self.cpu_wait_event.clear()
+
+        self._restore_context()
+        self.update_stream(self.compute_stream)
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-        try:
-            self.maybe_run_recv_hook()
-        finally:
-            # The partner's wakeup and the parent's fence both hang off this
-            # cleanup, so a receive hook that raises — an async MoE receive
-            # failing, say — must not skip it: that would wedge the partner on
-            # its next yield and leave the comm stream unordered.
-            try:
-                self._leave_stream(
-                    exc_type is not None or sys.exc_info()[0] is not None
-                )
-            finally:
-                # Even a stream-ordering failure on a normal exit must wake
-                # the partner so the parent can surface the original error.
-                # Publish done before signalling: a later partner yield must
-                # not wait for another signal from this finished ubatch.
-                self.done = True
-                self.cpu_signal_event.set()
-                self.cpu_wait_event.clear()
+        self.maybe_run_recv_hook()
+        # Mark this ubatch done BEFORE the final signal so that if the partner
+        # is racing into its next `_cpu_yield` between our signal and its wait,
+        # it observes `partner.done == True` and skips the wait instead of
+        # sleeping forever. Without this, any asymmetry (e.g. partner exits
+        # mid-forward via exception) leaves the survivor wedged on the next
+        # yield: the dead partner only signals exactly once from __exit__,
+        # but the survivor still has ≥1 yield left to do.
+        self.done = True
+        # No CPU-blocking synchronize — GPU ordering is handled by
+        # torch.Event record/wait in switch_to_comm_sync / switch_to_compute_sync.
+        self.cpu_signal_event.set()
+        self.cpu_wait_event.clear()
         return False
-
-    def _leave_stream(self, unwinding: bool):
-        """Leave on the compute stream, with the comm stream ordered ahead.
-
-        A forward that raises mid-communication unwinds from `comm_stream`,
-        and the parent fences this ubatch's storage by recording an event on
-        the compute stream — which says nothing about comm kernels still
-        reading those buffers. Without this edge that fence reports complete
-        while they run, and the next forward overwrites what they are reading.
-        """
-        if self.current_stream is self.compute_stream:
-            return
-        try:
-            self.switch_to_compute_sync()
-        except Exception:
-            # Whatever broke CUDA is usually why we are unwinding; losing the
-            # edge must not replace the error that brought us here.
-            if not unwinding:
-                raise
-            logger.exception(
-                "[TBO] ubatch %d could not rejoin the compute stream",
-                self.ubatch_id,
-            )
 
     # -- stream management ------------------------------------------------
 
@@ -520,17 +483,6 @@ class TBOContext:
 
     # -- CPU yield (ping-pong) -------------------------------------------
 
-    def _check_cancelled(self):
-        if self.cancelled:
-            raise RuntimeError("TBO forward cancelled by parent")
-
-    def _wait_for_turn(self):
-        # Check on both sides: cancellation can precede the wait or wake it.
-        self._check_cancelled()
-        self.cpu_wait_event.wait()
-        self.cpu_wait_event.clear()
-        self._check_cancelled()
-
     def _cpu_yield(self):
         """Wake the next thread and sleep until woken.
 
@@ -540,13 +492,13 @@ class TBOContext:
         remaining yields and exit normally, so the main thread's `t.join()`
         can complete and any captured `errors[idx]` can be raised.
         """
-        self._check_cancelled()
         self.cpu_signal_event.set()
         if self.partner is not None and self.partner.done:
             self.cpu_wait_event.clear()
             self._restore_context()
             return
-        self._wait_for_turn()
+        self.cpu_wait_event.wait()
+        self.cpu_wait_event.clear()
         self._restore_context()
 
     def yield_(self):
