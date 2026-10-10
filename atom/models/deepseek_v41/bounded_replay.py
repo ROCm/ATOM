@@ -8,13 +8,23 @@ a prefill leaves behind in those layers is each request's last ring of rows,
 plus the logits and DSpark aux rows of its last token. So a prefill runs the
 early layers on every row and the late layers on each request's tail only.
 
+The last KV source itself (``cut_layer``, 20) is cut in two the same way
+(vLLM #59894). What its trimmed rows leave behind is only its compressed KV and
+index keys; its top-k, sparse attention, output projection and MoE feed the
+late layers alone. So its cache writes (``Attention.write_kv``) run on every
+row, and the rest of it on each request's last ``cut_layer_rows`` -- the ring
+plus the window below it, so that every ring row sees its whole window and the
+cut layer's ring rows, the late layers' input, come out exact. vLLM runs it on
+the late tail directly, reading the window rows below from its paged SWA KV;
+here the window is a ring and those rows are gone, hence the longer tail.
+
 On by default (``--no-decoder-swa-bounded-replay`` turns it off). This is
 SGLang's ``--enable-decoder-swa-bounded-replay`` (``LateLayerTail``,
 ``late_layer_tail_layout``, ``enter_late_layer_tail``) and vLLM's
 ``--swa-bounded-replay`` (``DecoderReplayLayers``, on by default there too);
-the names follow SGLang. With it the runtime model compiles the early and late layers as two
-graphs (``runtime._EarlyLayers`` / ``_LateLayers``) and, on a replay, hands
-the late graph the tail's rows with the tail's step in the forward context.
+the names follow SGLang. With it the runtime model compiles three graphs (``runtime._EarlyLayers``,
+``_CutLayer``, ``_LateLayers``) and, on a replay, hands the cut and the late
+graphs their tails' rows with each tail's step in the forward context.
 
 The late layers see the tail as a chunked prefill that starts at the tail.
 Every global row before it is in the cache already (the early layers wrote it
@@ -46,9 +56,21 @@ from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.utils import upload_numpy
 
 
+def cut_layer(hf_config) -> int:
+    """The last KV source: the layer a replay cuts in two."""
+    return max(hf_config.kv_source_layer_ids)
+
+
 def late_layer_start(hf_config) -> int:
     """The first layer after the last KV source."""
-    return max(hf_config.kv_source_layer_ids) + 1
+    return cut_layer(hf_config) + 1
+
+
+def cut_layer_rows(geometry) -> int:
+    """The rows the cut layer's attention runs on per request: the ring, and
+    below it the window its first row reaches back over. Every ring row then
+    sees its whole window, so the ring rows come out exact."""
+    return geometry.ring_slots + geometry.window_size - 1
 
 
 def decoder_replay_unsupported(hf_config) -> str | None:

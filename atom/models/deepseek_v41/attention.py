@@ -362,8 +362,18 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
-    def forward(self, hidden, hidden_scale, cache, step, rope):
-        compressed = self._fork_compress(hidden, cache, step, rope)
+    def write_kv(self, hidden, cache, step, rope):
+        """Only what this layer leaves in the cache for later layers: its
+        compressed KV and index keys (`_compress_batch`). Bounded replay runs
+        it on every row of the last KV source, then the rest of the layer on a
+        tail (`forward(..., kv_written=True)`)."""
+        self._compress_batch(hidden, cache, step, rope)
+
+    def forward(self, hidden, hidden_scale, cache, step, rope, kv_written=False):
+        """`kv_written`: `write_kv` already ran this forward, on every row."""
+        compressed = (
+            False if kv_written else self._fork_compress(hidden, cache, step, rope)
+        )
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         selecting = self._fork_select(
