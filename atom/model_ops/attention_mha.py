@@ -265,6 +265,24 @@ class PagedAttentionImpl(nn.Module):
                 q_raw, k_raw, v_raw = torch.split(
                     qkv, [q_size, kv_size, kv_size], dim=-1
                 )
+            if isinstance(self.q_norm, GemmaRMSNorm) and (
+                q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
+                and self._use_asm_cache_layout(
+                    k_cache, v_cache, use_triton_attn=use_triton_attn
+                )
+            ):
+                q, k, v = self._gemma_norm_rope_then_cache(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    position,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    attn_metadata,
+                )
+            elif isinstance(self.q_norm, GemmaRMSNorm):
                 # Reshape V cache to SHUFFLE layout for the Triton kernel
                 x = 16 // k_cache.element_size()
                 if k_cache.dim() == 5 and v_cache.dim() == 4:
@@ -406,6 +424,56 @@ class PagedAttentionImpl(nn.Module):
         # gathers. Keeping the gather out of here also means dispatch_backend
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _gemma_norm_rope_then_cache(
+        self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
+    ):
+        """Unfused twin of triton_fused_norm_rope_cache for long batches.
+
+        The one-kernel version loses at prefill sizes (113 us against 83 us for
+        the separate kernels at 16384 tokens, Qwen3.5 TP4 on MI355X), so
+        above ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS run them separately:
+        Gemma q/k norm in one launch, the Qwen3.5 MRoPE Triton kernel (or the
+        module's own rotary when that declines), then the per-token FP8 cache
+        write. Same SHUFFLE layout and scales the fused kernel writes.
+        """
+        from atom.model_ops.layernorm import DualRMSNorm
+        from atom.model_ops.triton_mrope import try_mrope_qk_fused
+
+        if getattr(self, "_dual_qk_norm", None) is None:
+            self._dual_qk_norm = DualRMSNorm(
+                self.q_norm,
+                self.k_norm,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                prefix=f"layer_{self.layer_num}.qk_norm",
+            )
+        q, k = self._dual_qk_norm(q, k)
+        roped = try_mrope_qk_fused(
+            self.rotary_emb,
+            position,
+            q,
+            k,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        q, k = roped if roped is not None else self.rotary_emb(position, q, k)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        aiter.reshape_and_cache_with_pertoken_quant(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            attn_metadata.slot_mapping,
+            asm_layout=True,
+        )
+        return q, k, v
 
     def _gather_prefix_and_concat_kv(
         self,
