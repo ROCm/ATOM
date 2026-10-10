@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+import logging
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -39,6 +40,9 @@ from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .indices import fill_step_indptrs
 from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
+from .score_planner import ScorePlanner
+
+logger = logging.getLogger("atom")
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
@@ -146,18 +150,37 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             )
             | self._engram_rows_buffer(self.max_num_batched_tokens, self.device)
         )
-        # Before the memory profile, so the budget counts it.
+        # Before the memory profile, so the budget counts it; and so before
+        # the pool is sized, which its packed logits follow: the weights are
+        # in, so what is left of the budget bounds the PAGEs from above.
         self.score_workspace = ScoreWorkspace(
             self.geometry,
             self.max_num_batched_tokens,
             self.block_table_cols,
             self.device,
+            pages=self._page_bound(model_runner.config.gpu_memory_utilization),
         )
+        logger.info(
+            "V4.1 score workspace: %s logits, %.2f GiB",
+            "packed" if self.score_workspace.packed else "plane",
+            self.score_workspace.capacity * 4 / (1 << 30),
+        )
+        if self.score_workspace.packed:
+            self.add_step_planner(
+                ScorePlanner(
+                    self.score_workspace,
+                    (ratio for ratio, _ in self.geometry.compress_ratios),
+                    self.max_num_batched_tokens,
+                )
+            )
         self.cache = self.copies = self.engram = None
         # Prefill TBO microbatches publish their steps into `ub{i}_` copies of
         # the step buffers, owned by the runner like every other builder's
         # (V4, MLA, MHA): one set per microbatch, reuse gated by the runner's
-        # forward_vars event and its H2D publication owner.
+        # forward_vars event and its H2D publication owner. These fixed
+        # allocations precede the memory profile: get_num_blocks accounts
+        # for them in peak/current PyTorch bytes, outside the KV pool. They
+        # remain resident across KV release, like the parent forward buffers.
         if model_runner.config.enable_tbo:
             model_runner.forward_vars.update(self._ubatch_step_buffers())
             self._ubatch_indptrs = [
@@ -187,8 +210,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     def add_step_planner(self, planner):
         """Have `planner` lay its per-step tables out of each step's staged rows
-        (`prepare_batch_step`), in buffers of its own published with the step.
-        Before the forward buffers are bound to their publication."""
+        (`prepare_batch_step`), in buffers of its own published with the step,
+        and hand the step what it works out on the host (`StepPlan`). Before
+        the forward buffers are bound to their publication."""
         self.model_runner.forward_vars.update(planner.buffers(self.device, "v41_step"))
         self.step_planners = (*self.step_planners, planner)
 
@@ -300,6 +324,27 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state_pool(STATE_SLOT_CLASS, self.geometry.state_bytes, entries_per_req=1),
         ]
 
+    def _page_bound(self, utilization):
+        """PAGEs the pool can reach at most: the budget the weights leave.
+
+        The pool is sized later from what the memory profile leaves, which
+        starts from at least what is allocated now.
+        """
+        total = torch.cuda.mem_get_info(self.device)[1]
+        left = int(total * utilization) - torch.cuda.memory_allocated(self.device)
+        return max(1, left // self.geometry.paged_bytes)
+
+    def step_needs_eager(self, batch):
+        """True when the step's rows cannot all be packed at once: a captured
+        graph scores one band, so such a step runs eagerly, in bands.
+
+        A row sees at most its request's context; shared prefixes, counted
+        once in the pool, are why the pool-sized buffer can fall short.
+        """
+        return not self.score_workspace.fits(
+            batch.num_scheduled_tokens, batch.context_lens
+        )
+
     def state_transfer(self):
         return StateTransfer.copy(self.geometry.layout_id)
 
@@ -391,6 +436,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.copies.warmup()
 
     def release_kv_pools(self):
+        # Release PAGE/STATE views only. Runner-owned forward buffers and
+        # ubatch indptrs are persistent, already counted in the KV budget.
+        # H2D publication retains their fixed addresses across sleep/wake.
         self.cache = self.copies = None
 
     def close(self):
@@ -717,6 +765,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         names += [visible_buffer_name(r) for r, _ in self.geometry.compress_ratios]
         for ratio, _ in self.geometry.compress_ratios:
             names += compress_plan_buffer_names(ratio, key_rope=True).values()
+        # Step planners (including packed FP4 score offsets) need independent
+        # published rows for each child, just like positions and visibility.
+        names += [
+            name
+            for name, buffer in var.items()
+            if isinstance(buffer, CpuGpuBuffer)
+            and buffer.publication_group == "v41_step"
+            and name not in names
+            and name != ENGRAM_ROWS
+        ]
         buffers = {}
         for i in range(self._NUM_TBO_UBATCHES):
             prefix = f"ub{i}_"
@@ -791,6 +849,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 is_prefill=True,
                 buffers=buffers,
                 buffer_prefix=prefix,
+                planners=self.step_planners,
                 running_bs=running_bs,
                 running_tokens=width,
                 state_slot_out=parent.slots[rs],

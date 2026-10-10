@@ -368,7 +368,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     0 (kernel bails on `bid<0` so the value is irrelevant)."""
 
     # ----- Prefill-only paged-prefill index buffers (set in `_build_paged_prefill_meta`) -----
-    # Two-source paged_prefill kernel reads:
+    # Two-source paged_2src kernel reads:
     #   prefix region from `unified_kv` (SWA history + CSA/HCA compress)
     #   extend region from per-fwd `kv` tensor (in-chunk SWA tail)
     # Per-ratio prefix buffers (SWA-only stride for Dense, SWA + compress
@@ -3039,7 +3039,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     else None
                 ),
             )
-        # Two-source paged_prefill index buffers (extend + per-ratio prefix).
+        # Two-source paged_2src index buffers (extend + per-ratio prefix).
         # Eager-only — direct H2D, no forward_vars staging required. Sets
         # attn_metadata.{kv_indices,kv_indptr}_{extend,prefix_swa,prefix_csa,prefix_hca}
         # plus skip_prefix_len_csa and envelope_rows.
@@ -3936,7 +3936,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         cu_q_per_seq_gpu: torch.Tensor | None = None,
         block_tables_gpu: torch.Tensor | None = None,
     ) -> None:
-        """Build per-fwd index buffers consumed by sparse_attn_v4_paged_prefill.
+        """Build per-fwd index buffers consumed by sparse_attn_v4_paged_2src.
 
         Two-source layout:
           - prefix region (per-ratio): SWA history from prior chunks + CSA topk

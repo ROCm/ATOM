@@ -118,8 +118,8 @@ from atom.model_ops.v4_kernels import (
     inverse_rope_inplace,
     qk_norm_rope_maybe_quant,
     scale_indexer_weights,
+    sparse_attn_v4_paged_2src,
     sparse_attn_v4_paged_decode,
-    sparse_attn_v4_paged_prefill,
     swa_write,
     update_compressor_states,
 )
@@ -1263,7 +1263,7 @@ class Compressor(nn.Module):
 
         Quant mode is auto-selected by `self.kv_cache.dtype`:
           - BF16 cache (CSA Main / HCA Main): raw BF16 row write into
-            `self.kv_cache` (consumed by paged_decode/paged_prefill via
+            `self.kv_cache` (consumed by paged_decode/paged_2src via
             `unified_kv` per-fwd indices).
           - FP8 cache (Indexer-inner): per-row amax → ue8m0 scale → fp8 cast
             → preshuffled (MFMA 16x16 tile) write into `self.kv_cache`, plus
@@ -2538,7 +2538,7 @@ class DeepseekV4Attention(nn.Module):
         # allocate_kv_cache. The 1-row register_buffer below is a warmup
         # fallback (warmup runs before allocate_kv_cache); after binding it is
         # setattr-replaced with the plane view and the original buffer is GC'd.
-        # `unified_kv` (paged_decode/paged_prefill base) is NOT pre-registered
+        # `unified_kv` (paged_decode/paged_2src base) is NOT pre-registered
         # — V4Attention.forward short-circuits the sparse_attn dispatch on
         # `is_dummy_run` so warmup never reads it.
         self.register_buffer(
@@ -3413,7 +3413,7 @@ class DeepseekV4Attention(nn.Module):
             # tensor unchanged. On bf16 the wrapper reuses out=qkn.q_sa as the
             # attention output buffer (q_sa is not needed after this call →
             # avoids an extra empty_like); fp8 ignores both q_sa and out.
-            o = sparse_attn_v4_paged_prefill(
+            o = sparse_attn_v4_paged_2src(
                 qkn.q_sa,
                 self.unified_kv,
                 kv_indices_prefix,
@@ -4786,12 +4786,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,  # [num_tokens] int
         positions: torch.Tensor,  # [num_tokens] int  required
-        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:  # [num_tokens, dim]  hidden_states
-        if inputs_embeds is not None:
-            raise ValueError(
-                "DeepSeek-V4 requires token IDs instead of input embeddings"
-            )
         # Stash input_ids on forward_context for the V4 hash MoE routing
         # callback (`MoE._hash_topk`), which runs inside the Dynamo-opaque
         # `maybe_dual_stream_forward` custom op and can't receive input_ids

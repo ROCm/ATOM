@@ -102,22 +102,18 @@ class UBatchWrapper(nn.Module):
             self.comm_stream = torch.cuda.Stream(priority=self.comm_stream_priority)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
+        self, input_ids: torch.Tensor, positions: torch.Tensor
     ) -> UBatchModelOutput:
         ctx = get_forward_context()
         if ctx.ubatch_slices is None:
-            return self.model(input_ids, positions, inputs_embeds=inputs_embeds)
-        return self._run_ubatches(input_ids, positions, ctx, inputs_embeds)
+            return self.model(input_ids, positions)
+        return self._run_ubatches(input_ids, positions, ctx)
 
     def _run_ubatches(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        inputs_embeds: torch.Tensor | None = None,
     ) -> UBatchModelOutput:
         """Launch threads that each call self.model() inside a TBOContext."""
         self._ensure_comm_stream()
@@ -199,16 +195,7 @@ class UBatchWrapper(nn.Module):
                 try:
                     ub_input_ids, ub_positions = ub_inputs[idx]
                     with tbo_ctxs[idx]:
-                        token_slice = ctx.ubatch_slices[idx].token_slice
-                        model_output = self.model(
-                            ub_input_ids,
-                            ub_positions,
-                            inputs_embeds=(
-                                None
-                                if inputs_embeds is None
-                                else inputs_embeds[token_slice]
-                            ),
-                        )
+                        model_output = self.model(ub_input_ids, ub_positions)
                     results.append((idx, self._validate_ubatch_output(model_output)))
                 except Exception as e:
                     if tbo_ctxs[idx].cancelled:
@@ -355,9 +342,7 @@ class UBatchWrapper(nn.Module):
 
                 ub_input_ids, ub_positions = ub_inputs[idx]
                 with tbo_ctxs[idx]:
-                    model_output = self.model(
-                        ub_input_ids, ub_positions, inputs_embeds=None
-                    )
+                    model_output = self.model(ub_input_ids, ub_positions)
                 results.append((idx, self._validate_ubatch_output(model_output)))
             except Exception as e:
                 logger.exception("[TBO] ubatch %d graph capture failed", idx)

@@ -45,19 +45,40 @@ The validated prefill and decode configurations are:
 | Parallelism | TP1 × PP4 | TP4 × DCP4 |
 | PP partition | `20,20,20,18` | N/A |
 | KV cache | FP8, block size 16 | FP8, block size 16 |
-| GPU memory utilization | 0.85 | 0.85 |
+| GPU memory utilization | 0.85 | 0.94 |
 | Maximum sequences | 512 | 512 |
 | Compilation | Level 3, enforce eager | Level 3 |
 | CUDAGraph | Disabled by enforce eager | Full mode, configured sizes up to 256 |
-| Batched-token budget | 8192 | 16384 (default) |
-| LMCache | 256 GiB CPU tier, 256-token chunks | Disabled |
+| Batched-token budget | 8192 | 2048 |
+| LMCache | 256 GiB CPU tier, 256-token chunks, lookup server on every PP stage | Disabled |
+| HTTP keep-alive | 900 s | 900 s |
 | Native prefix caching | Enabled | Enabled |
 | Speculative decoding | MTP3, forced AL 2.99 | MTP3, forced AL 2.99 |
 
 Both nodes use MXFP4 weights, online PTPC FP8 quantization,
 `ATOM_MLA_PAGE_SIZE=1`, `ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047`,
 `ATOM_ONLINE_QUANT_STREAMING=0`, and `ATOM_USE_TRITON_MLA=0`. The prefill node
-enables `OFFLOAD_PROFILE=1` and `OFFLOAD_MIN_LOAD_TOKENS=0`.
+enables `OFFLOAD_PROFILE=1` and `OFFLOAD_MIN_LOAD_TOKENS=0`. The decode node sets
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1`.
+
+Why these settings matter at high concurrency (c48 and above):
+
+- **`LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3` (prefill).** Run an LMCache
+  lookup server on every PP stage. If only stage 0 looks up, stages 1-3 never
+  refresh their LRU and evict in FIFO order. Once the CPU tier fills, the
+  stages disagree on which chunks exist, and loads fail all-or-nothing.
+- **`--timeout-keep-alive 900` (prefill and decode).** uvicorn's 5 s default
+  is shorter than the router's 50 s idle-connection timeout. The router can
+  reuse a socket the server just closed. It then retries both prefill and
+  decode, and the first prefill's KV is orphaned.
+- **Decode memory bundle.** Three decode settings together raise decode KV
+  blocks from about 154K to about 196K (+28%):
+  - `--gpu-memory-utilization 0.94`
+  - `--max-num-batched-tokens 2048`; MTP decode batches stay far below it.
+  - `AITER_REUSE_IDENTICAL_COMM_GROUPS=1`
+
+  Once prefill keeps up, decode KV caps the request rate. The retained prefix
+  pool also keeps P->D re-pulls down.
 
 #### Start the PD Deployment
 
@@ -106,6 +127,7 @@ env \
   LMCACHE_NUMA_MODE=auto \
   LMCACHE_MAX_LOCAL_CPU_SIZE=256 \
   LMCACHE_CHUNK_SIZE=256 \
+  LMCACHE_LOOKUP_SERVER_WORKER_IDS=0,1,2,3 \
   OFFLOAD_PROFILE=1 \
   OFFLOAD_MIN_LOAD_TOKENS=0 \
   nohup python3 -m atom.entrypoints.openai_server \
@@ -128,6 +150,7 @@ env \
     --pipeline-parallel-size 4 \
     --enforce-eager \
     --max-num-batched-tokens 8192 \
+    --timeout-keep-alive 900 \
     --kv-transfer-config \
       '{"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}' \
     >prefill.log 2>&1 &
@@ -154,13 +177,14 @@ export LD_LIBRARY_PATH="$(python3 -c \
 
 env \
   HIP_VISIBLE_DEVICES=4,5,6,7 \
+  AITER_REUSE_IDENTICAL_COMM_GROUPS=1 \
   nohup python3 -m atom.entrypoints.openai_server \
     --model "${MODEL_PATH}" \
     --host 0.0.0.0 \
     --trust-remote-code \
     --kv_cache_dtype fp8 \
     --block-size 16 \
-    --gpu-memory-utilization 0.85 \
+    --gpu-memory-utilization 0.94 \
     --max-num-seqs 512 \
     --enable_prefix_caching \
     --online_quant_config \
@@ -175,6 +199,8 @@ env \
     --cudagraph-mode FULL \
     --cudagraph-capture-sizes \
       '[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]' \
+    --max-num-batched-tokens 2048 \
+    --timeout-keep-alive 900 \
     --kv-transfer-config \
       '{"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"127.0.0.1","handshake_port":6301,"protocol":"rdma"}' \
     >decode.log 2>&1 &
@@ -540,6 +566,14 @@ local-chat-completions ({'model': '/shared/data/amd_int/models/GLM-5.2-MXFP4', '
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9704|±  |0.0047|
 |     |       |strict-match    |     5|exact_match|↑  |0.9712|±  |0.0046|
 ```
+
+The decode memory bundle was checked with full GSM8K (1319 samples, 20-shot
+`local-completions`, real MTP3 without forced acceptance), with and without the
+bundle. The decode configuration matches the one above. The prefill was the
+two-NUMA LMCache MP variant from the stacked PR. The results were strict 0.9287
+vs 0.9340 and flexible 0.9280 vs 0.9356. A paired McNemar test on the
+same questions gives p=0.53 (strict) and p=0.34 (flexible), so the difference
+is not significant.
 
 Validated GSM8K 5-shot accuracy for the PD-disaggregated deployment above
 (full 1319 samples, real MTP3 without synthetic acceptance):

@@ -235,6 +235,7 @@ class ForwardMode:
         dp_size: int,
         dp_group,
         enforce_eager: bool,
+        step_needs_eager: bool,
         capture_sizes: list[int],
         captured_tokens: list[int] | None,
         is_block_drafter: bool,
@@ -245,6 +246,9 @@ class ForwardMode:
         """Run the step's DP collective and settle its shape from the result.
 
         Any new force-eager condition belongs here, not in a caller-side check.
+        `step_needs_eager` is this rank's attention backend refusing a graph for
+        the step (`AttentionMetadataBuilder.step_needs_eager`); the DP group
+        agrees on it.
         """
         # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
         from atom.utils.tbo.ubatching import sync_dp_metadata
@@ -266,6 +270,7 @@ class ForwardMode:
                 scheduled_bs=scheduled_bs,
                 is_prefill=is_prefill,
                 tbo_on=tbo_on,
+                needs_eager=step_needs_eager,
                 local_meets_min_tokens=meets_min,
                 local_can_split=can_split,
                 local_ub_tokens=(ub0, ub1),
@@ -287,6 +292,9 @@ class ForwardMode:
             # group, and then each rank runs its own count through the
             # variable-length gather.
             unified = not sync.any_rank_has_prefill
+            # A graph replays its collectives: the group replays or runs
+            # eagerly as one.
+            step_needs_eager = sync.any_rank_needs_eager
         else:
             # One rank pads to nobody, so it has one height by construction, and
             # its TBO answer stands unvetoed.
@@ -312,7 +320,12 @@ class ForwardMode:
         # Whether the TARGET replays. It no longer decides how wide anything
         # is; when the batch answered four ways depending on this, `running_bs`
         # was per-rank on two of them and every consumer had to know which.
-        use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
+        use_cudagraph = (
+            not is_prefill
+            and unified
+            and not (enforce_eager or step_needs_eager)
+            and on_ladder
+        )
 
         running_tokens, piecewise_captured = cls._running_tokens(
             is_prefill=is_prefill,

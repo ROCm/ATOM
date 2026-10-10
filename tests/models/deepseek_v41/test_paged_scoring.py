@@ -35,7 +35,7 @@ def test_serving_workspace_respects_logits_budget(monkeypatch, budget_mb, index_
     )
     # Run the actual serving constructor without allocating multi-GiB buffers.
     rows, columns = 8192, 1048576 // geometry.block_size
-    workspace = ScoreWorkspace(geometry, rows, columns, "meta")
+    workspace = ScoreWorkspace(geometry, rows, columns, "meta", pages=columns)
     capacity = workspace._logits.numel()
     cap_bytes = min(budget_mb or 2048, 2048) * 1024**2
     assert 0 < capacity * workspace._logits.element_size() < cap_bytes

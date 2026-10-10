@@ -20,7 +20,8 @@ covers TP2 and TP4 without EP at level 3 FULL. See the
 fixed acceptance length used in those measurements.
 
 Data-parallel attention is also supported with BF16 KV and the FP8
-index plane. Text prefill can use TBO with tensor-sharded experts (EP disabled);
+index plane. Text prefill can use TBO with tensor-sharded experts or the
+validated DPA4 + MORI EP4 high-throughput configuration (16 GiB MoRI heap);
 see the [DPA and TBO configuration](deepseek_v41_runtime.md#data-parallel-attention).
 
 The existing quality/development baseline uses TP4 with whole-expert EP at

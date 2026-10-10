@@ -350,6 +350,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
+    # group's query heads locally, as decode does, instead of AllGather Q. The
+    # pynccl gather lands rank-major, so the dim=1 reshape after it also copies
+    # the whole gathered q back to token-major; this removes both. Costs a
+    # group-wide q GEMM + W_K bmm per prefill token. Off by default.
+    "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are

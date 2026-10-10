@@ -72,6 +72,7 @@ from atom.mono.device.ops import (
     hw_rsq,
     kernel_symbol,
     lane_gather,
+    launcher,
     ld_i32,
     row_sum,
     rsrc,
@@ -1151,7 +1152,7 @@ def build_attn_pre(key: AttnPreBuild):
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 
-    @flyc.jit
+    @launcher(name)
     def launch(
         res_in: Int64, pend: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64,
         hc_fn: Int64, hc_scale: Int64, hc_base: Int64, attn_w: Int64, wqkv: Int64,

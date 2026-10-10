@@ -64,7 +64,13 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8)):
         total_tokens_num=sum(lengths),
         total_seqs_num=len(lengths),
     )
-    parent, _ = builder._prepare(batch, len(lengths), sum(lengths))
+    # The runner publishes the query prefix before the public builder entry.
+    cu = builder.model_runner.forward_vars["cu_seqlens_q"]
+    cu.np[0] = 0
+    for i, length in enumerate(lengths):
+        cu.np[i + 1] = cu.np[i] + length
+    cu.copy_to_gpu(len(lengths) + 1)
+    parent, _ = builder.prepare_prefill(batch, len(lengths))
     parent.engram_embeddings = {
         layer: torch.arange(sum(lengths) * 4, device=device).view(1, -1, 4) + layer
         for layer in (1, 3)
@@ -153,6 +159,101 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
     if plan.num_compress and first.length >= 2:
         assert plan.compress_plan_gpu[0, 3].item() == first.position % 2
     assert parent.cache.pending is None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prefill_children_publish_independent_packed_score_plans(device):
+    """Main's packed scorer must see each child's absolute rows and bands."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from dataclasses import replace
+
+    from atom.model_ops.attentions.deepseek_v41.score_planner import (
+        ScorePlanner,
+        score_layout,
+    )
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+
+    builder, parent = make_parent(device)
+    workspace = ScoreWorkspace(
+        replace(builder.geometry, index_fp4=True, index_dim=128, index_block_rows=8),
+        32,
+        4,
+        device,
+        pages=8,
+    )
+    builder.add_step_planner(ScorePlanner(workspace, (1, 2), 32))
+    attach_ubatch_buffers(builder, 32)
+    parent.cache.workspace = workspace
+    parts = (
+        UBatchSlice(slice(0, 1), slice(0, 7)),
+        UBatchSlice(slice(0, 2), slice(7, 14)),
+    )
+    first = builder.build_ubatch_prefill_metadata(parent, parts[0], 1, 0)
+    snapshots = {name: rows.clone() for name, rows in first.step.planned.items()}
+    second = builder.build_ubatch_prefill_metadata(parent, parts[1], 2, 1)
+    for name, expected in snapshots.items():
+        torch.testing.assert_close(first.step.planned[name], expected)
+        assert (
+            first.step.planned[name].data_ptr() != second.step.planned[name].data_ptr()
+        )
+    for child, part in zip((first, second), parts):
+        for ratio in (1, 2):
+            layout = score_layout(child.step, ratio)
+            expected = ((parent.step.positions[part.token_slice] + 1) // ratio).int()
+            torch.testing.assert_close(layout.visible, expected)
+            spans = (expected + 63) // 64 * 64
+            offsets = torch.cumsum(spans, dim=0) - spans
+            torch.testing.assert_close(layout.offsets, offsets.int())
+            torch.testing.assert_close(
+                layout.block_offsets, (offsets // workspace.block_rows).int()
+            )
+            assert layout.bands == ((0, 7),)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_kv_release_keeps_persistent_ubatch_buffers_for_rebind(device):
+    """KV views can die while fixed-address execution metadata is reused."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    import gc
+    import weakref
+
+    builder, parent = make_parent(device)
+    buffers = builder._ubatch_buffers(0)
+    indptrs = builder._ubatch_indptrs[0]
+    pointers = {name: buf.gpu.data_ptr() for name, buf in buffers.items()}
+    cache_ref = weakref.ref(builder.cache)
+    builder.copies = object()
+    del parent
+    builder.release_kv_pools()
+    gc.collect()
+    assert cache_ref() is None
+    assert builder.cache is builder.copies is None
+    assert builder._ubatch_indptrs[0] is indptrs
+    assert {
+        name: buf.gpu.data_ptr() for name, buf in builder._ubatch_buffers(0).items()
+    } == pointers
+
+    builder.cache = PagedAttentionCache(builder.geometry, 8, 4, device, max_tokens=32)
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        state_slots_committed=[3, 1],
+        req_ids=(0, 1),
+        num_scheduled_tokens=(10, 4),
+        context_lens=(13, 12),
+        block_tables=((0, 1, 2, 3), (4, 5, 6, 7)),
+        total_tokens_num=14,
+        total_seqs_num=2,
+    )
+    parent, _ = builder.prepare_prefill(batch, 2)
+    part = UBatchSlice(slice(0, 2), slice(7, 14))
+    child = builder.build_ubatch_prefill_metadata(parent, part, 2, 0)
+    torch.testing.assert_close(child.step.positions, parent.step.positions[7:14])
+    assert child.cache is builder.cache
+    assert {
+        name: buf.gpu.data_ptr() for name, buf in builder._ubatch_buffers(0).items()
+    } == pointers
 
 
 def test_exceptional_exit_orders_comm_stream_before_compute(monkeypatch):
@@ -409,6 +510,7 @@ def test_narrowed_tile_rows_stay_compact_and_within_their_microbatch():
     units, alloc_columns, max_tokens = 2, 8, 8
     geometry = SimpleNamespace(
         index_fp4=False,
+        index_block_rows=8,
         owners=((0, 1),),
         index_blocks_per_page=lambda ratio: units,
         rows_per_page=lambda ratio: 16,
@@ -565,10 +667,7 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("cut", [1, 7, 10, 11, 13])
 def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
-    from atom.model_ops.v4_kernels import (
-        sparse_attn_v4_paged_decode,
-        sparse_attn_v4_paged_prefill,
-    )
+    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
     torch.manual_seed(37)
     builder, parent = make_parent("cuda")
@@ -586,12 +685,8 @@ def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
         q = query[start:end].clone()
         values = kv[:, start:end]
         prefix, pptr, extend, eptr = cache.attention_indices(spec, step)
-        if step.decode:
-            cache.write_window(0, values, step)
-            return sparse_attn_v4_paged_decode(
-                q, cache.pool, prefix, pptr, sink, 512**-0.5
-            )
-        output = sparse_attn_v4_paged_prefill(
+        assert step.is_prefill and not step.decode
+        output = sparse_attn_v4_paged_2src(
             q,
             cache.pool,
             prefix,
@@ -945,7 +1040,7 @@ def test_tbo_rejects_compacted_scheduler_rows_before_slicing():
         )
 
 
-def test_v4_wrapper_accepts_explicit_empty_embeddings(monkeypatch):
+def test_tbo_preserves_v4_forward_signature(monkeypatch):
     from atom.models import deepseek_v4
 
     monkeypatch.setattr(deepseek_v4, "_pcp_active", lambda: False)
@@ -970,5 +1065,3 @@ def test_v4_wrapper_accepts_explicit_empty_embeddings(monkeypatch):
     )
     torch.testing.assert_close(UBatchWrapper(Model())(ids, positions), ids + positions)
     torch.testing.assert_close(context.context.input_ids, ids)
-    with pytest.raises(ValueError, match="token IDs"):
-        UBatchWrapper(Model())(ids, positions, inputs_embeds=torch.zeros(4, 8))

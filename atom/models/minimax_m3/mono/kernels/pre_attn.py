@@ -66,6 +66,7 @@ from atom.mono.device.ops import (
     hw_rsq,
     kernel_symbol,
     lane_gather,
+    launcher,
     mfma_fp8,
     rows_to_lds,
     rsrc,
@@ -846,7 +847,7 @@ def build_pre_attn_kernel(
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
-    @flyc.jit
+    @launcher(kernel_name)
     def launch_pre_attn(
         ar: Int64,
         res: Int64,

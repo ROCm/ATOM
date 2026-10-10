@@ -16,7 +16,10 @@ pytest.importorskip("aiter", reason="the V4.1 backend and cache reach AITER")
 
 from atom.model_ops.attentions.deepseek_v41.backend import DeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-from atom.model_ops.attentions.deepseek_v41.metadata import visible_buffer_name
+from atom.model_ops.attentions.deepseek_v41.metadata import (
+    StepPlan,
+    visible_buffer_name,
+)
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
@@ -326,7 +329,7 @@ def test_a_step_planner_reads_the_staged_rows_and_publishes_with_them():
         owners = staged["batch_id_per_q_token"].np[:rows]
         seen.append((visible.tolist(), owners.tolist()))
         staged["plan"].np[:] = (rows, visible.sum(), owners.max())
-        return {"plan": 3}
+        return StepPlan({"plan": 3})
 
     requests = (
         PagedRequest(17, 1, 0, 3, 3, (5, 1)),
@@ -530,6 +533,9 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
         total_tokens_num=length,
         num_spec_step=length - 1,
     )
+    cu = builder.model_runner.forward_vars["cu_seqlens_q"]
+    cu.np[:2] = (0, length)
+    cu.copy_to_gpu(2)
     if phase == "prefill":
         metadata, positions = builder.prepare_prefill(batch, 1)
     else:
@@ -545,9 +551,12 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     assert not hasattr(builder, "_tbo_storage")
     if device == "cuda":
         for prefix, extend, _ in step.indptrs.values():
-            assert (prefix.data_ptr() != extend.data_ptr()) == (phase == "prefill")
+            # BF16 decode also splits the ring-window source from paged KV.
+            assert prefix.data_ptr() != extend.data_ptr()
             if phase == "prefill":
                 assert extend.tolist() == [0, 1]
+            else:
+                assert extend.tolist() == [4 * row for row in range(length + 1)]
         tiles = builder.cache.unit_tiles(step, 2)
         columns = (position + length + 31) // 32 if phase == "prefill" else 4
         assert tiles.shape == (length, columns * (geo.rows_per_page(2) // 8))

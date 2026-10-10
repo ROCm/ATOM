@@ -170,9 +170,14 @@ host table storage, so startup registration takes longer than TP4.
 
 ## Prefill two-batch overlap
 
-Add `--enable-tbo prefill` to the DPA command above, leaving EP disabled.
+Add `--enable-tbo prefill` to the DPA command above. Tensor-sharded experts
+use DP gather/scatter. DPA4 with MORI EP4 and the high-throughput backend was
+also validated with BF16 KV, FP8 index and native DSpark5; that configuration
+requires `MORI_SHMEM_HEAP_SIZE=17179869184` (16 GiB). This does not establish
+coverage for every EP backend or deployment shape.
 V4.1 prefill TBO requires DP attention with more than one effective DP rank.
-`Config.attention_dp_size` provides the normalized width to validation and launch:
+`Config.attention_dp_size` provides the normalized width to validation;
+CoreManager retains the existing DP/TP launch normalization:
 TP4 with the default DP size of 1 launches four DP-attention ranks and is accepted.
 Plain TP and effective single-rank DPA are rejected. Microbatches use
 the configured compilation level; decode keeps its CUDA Graph path.
@@ -197,36 +202,46 @@ both microbatches. Each consumes its token slice and waits at its Engram layer;
 the parent joins the lookup after both workers finish, including failure.
 Already-staged rows are sliced identically when Engram overlap is disabled.
 
-The execution config passes communication priority -1 for V4.1 and 0 for other
-models explicitly to the TBO wrapper. MoE keeps the existing
-compute-to-communication yield and event order. Shared `FusedMoE` records the
-compute consumer of gathered inputs and the scatter output immediately after
-switching back from communication. This protects all models using that shared
-path, before shared-expert combine or mHC consumes the output. The existing
+V4.1 declares communication priority -1 in its model configuration; the generic
+default is 0 and `--tbo-comm-stream-priority` can explicitly override either.
+MoE keeps the existing compute-to-communication yield and event order.
+The V4.1-local `v41_record_tbo_expert_output` runtime marker protects the routed
+output after dispatch and before downstream shared-expert combine or mHC.
+It remains an opaque custom op in compiled execution. Shared `FusedMoE` has no
+new `record_stream` calls in this change. MORI owns persistent per-ubatch
+transport buffers whose reuse is governed by its existing stream dependencies.
+The existing
 `create_comm_fused_moe_backend` factory rejects TBO and DP > 1, so TBO cannot
 enter the communication-fused backend. If comm-fused TBO support is added, its
 internal allocations and consumer boundaries must be audited separately.
-The shared `moe_forward` custom-op boundary keeps stream ownership at runtime
-in compiled execution; no V4.1-specific lifetime marker is required.
-Microbatches use the normal model call, including the optional `inputs_embeds`
-argument, and honor the
+The shared `moe_forward` custom-op boundary does not replace the V4.1 marker
+or protect unsupported communication-fused backend internals.
+Microbatches use the normal `(input_ids, positions)` model call and honor the
 configured compilation level. DPA remains text-only: image requests are
 rejected during request preprocessing, before sequences reach any DP worker,
 including when DSpark is disabled. TP vision runs without TBO.
 
-Step-buffer allocation and capacity checks share `step_buffer_specs`; parent
-and child metadata use one assembler. Compression-plan names come from the
+Parent and child metadata use one assembler and the same buffer capacity
+checks. Compression-plan names come from the
 plan publisher. TBO rejects compacted scheduler rows before applying a request
 slice, so scheduler indices cannot silently address another request.
 
-Each microbatch has two bounded pinned/device metadata slots, owned by a
-`PrefillStoragePool`. Completed storage is reused without waits; an in-flight
-slot switches to its alternate. If both slots are still busy, pinned staging
-waits only for its previous H2D. Device overwrites wait for prior consumers
-when the upload stream differs; same-stream order needs no additional event
-wait. Slots are fenced on preparation failure and after worker completion,
-and released with the KV pools. Two slots reduce waits but do not guarantee
-that a CPU running ahead of both can never wait.
+Each microbatch has one set of `ub{i}_` pinned/device step buffers in the
+runner's `forward_vars`, plus builder-owned attention indptrs. Packed FP4
+score plans use independent child buffers too. The runner's forward-buffer
+event and H2D publication ownership gate reuse; the child buffers keep fixed
+addresses and there is no separate `PrefillStoragePool` or alternating slot.
+
+These buffers are persistent execution memory, allocated in builder
+initialization before warmup and KV sizing. `ModelRunner.get_num_blocks()`
+subtracts peak/current PyTorch allocated bytes from the GPU budget, which
+already includes the device buffers and indptrs; pinned CPU memory is host
+memory. There is no second TBO-specific reservation. `release_kv_pools()`
+releases PAGE/STATE cache views, while these execution buffers remain resident
+across rollout sleep/wake, like the parent forward buffers and score workspace.
+Consequently sleep does not reclaim their VRAM; wake reuses the same buffers
+and allocates the saved KV pool size. Full execution-buffer reclamation would
+also require rebinding the runner's H2D publication and graph references.
 
 When the private Engram TP collective is unavailable, the TBO parent
 materializes one fallback gather per layer before launching workers; child

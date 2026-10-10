@@ -331,13 +331,21 @@ models:
             workers: 1
             tp: 1
             cudagraph: none
-            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
+            # uvicorn's 5 s keep-alive default is shorter than the router's
+            # 50 s pool idle timeout; a request sent on a socket the server just
+            # closed makes the router retry P+D and orphans the first KV.
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --timeout-keep-alive 900"
           decode:
             workers: 1
             tp: 4
             cudagraph: >-
               [1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256]
-            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL"
+            # Decode memory bundle (with AITER_REUSE_IDENTICAL_COMM_GROUPS=1
+            # below): about 28% more decode KV blocks. The retained prefix pool
+            # keeps P->D re-pulls down, and decode KV caps the request rate
+            # once prefill keeps up. MTP decode batches stay far below 2048
+            # tokens.
+            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL --gpu-memory-utilization 0.94 --max-num-batched-tokens 2048 --timeout-keep-alive 900"
           env:
             common: &glm52_agentic_lmcache_cpp4_dcp4_env_common
               MC_DISABLE_HIP: "1"
@@ -355,14 +363,57 @@ models:
               LMCACHE_NUMA_MODE: "auto"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               LMCACHE_CHUNK_SIZE: "256"
+              # Every PP stage runs a lookup server so each stage refreshes its
+              # own LRU; with only stage 0 looking up, stages 1-3 evict FIFO
+              # and loads fail all-or-nothing once the CPU tier is full.
+              LMCACHE_LOOKUP_SERVER_WORKER_IDS: "0,1,2,3"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
+              # Ranks share identical communicator groups instead of creating
+              # duplicates, freeing decode memory for KV.
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
+          concurrency: [64]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c72
+          concurrency: [72]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c80
+          concurrency: [80]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c96
+          concurrency: [96]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c112
+          concurrency: [112]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c128
+          concurrency: [128]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c144
+          concurrency: [144]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c160
+          concurrency: [160]
+
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c192
+          concurrency: [192]
 
         # 2-3) 1P1D: CPP4 prefill (PP4×TP1, GPU 0-3) + DPA4 decode (dp4×tp1,
         # GPU 4-7) on a single node. MTP4 with fixed acceptance length 3.33.
