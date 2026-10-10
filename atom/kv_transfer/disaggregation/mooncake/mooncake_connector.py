@@ -57,7 +57,13 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.model_engine.sequence import Sequence
 from atom.models.utils import get_pp_indices
-from atom.utils import envs, get_open_port, make_zmq_path, zmq_socket_ctx
+from atom.utils import (
+    envs,
+    get_open_port,
+    make_zmq_path,
+    make_zmq_socket,
+    zmq_socket_ctx,
+)
 from atom.utils.network import get_ip
 
 logger = logging.getLogger("atom")
@@ -87,6 +93,9 @@ except ImportError:
 MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
+# Fresh ports to try when another process takes the chosen one before the
+# write-done listener binds it.
+NOTIFY_BIND_ATTEMPTS = 8
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
@@ -792,7 +801,9 @@ class MooncakeConnector(KVConnectorBase):
         self._release_targets: dict[ReqId, tuple[str, int, int]] = {}
         self._release_count: dict[TransferId, int] = {}
         self._released_transfers: set[TransferId] = set()
-        self._notification_port = get_open_port()
+        # Consumer only: set by _bind_notification_socket once the write-done
+        # listener actually holds the port, before any pull request carries it.
+        self._notification_port: int | None = None
 
         # --- Completion tracking ---
         self.done_sending: set[str] = set()
@@ -1080,6 +1091,12 @@ class MooncakeConnector(KVConnectorBase):
             )
             self._write_listener_thread.start()
         else:
+            # Bound here, on this thread, and handed over: the listener thread
+            # is its only user from start() on, which is the barrier ZMQ asks
+            # for when a socket changes threads.
+            self._notification_ctx, self._notification_sock = (
+                self._bind_notification_socket()
+            )
             self._notification_listener_thread = threading.Thread(
                 target=self._notification_listener,
                 daemon=True,
@@ -2391,12 +2408,41 @@ class MooncakeConnector(KVConnectorBase):
     # Consumer: notification listener (ZMQ ROUTER)
     # -----------------------------------------------------------------
 
+    def _bind_notification_socket(self) -> tuple[zmq.Context, zmq.Socket]:
+        """Bind the write-done ROUTER and record its port.
+
+        `get_open_port()` only reports a port that was free a moment ago. The
+        listener used to bind it later, from its own thread; on a busy node
+        another process took the port in between, the bind raised EADDRINUSE,
+        the thread died, and this rank never saw a write-done again -- every KV
+        receive waited on it. Binding before the port is published closes that
+        window, and a lost bind retries with a fresh port instead.
+        """
+        ctx = zmq.Context()
+        for _ in range(NOTIFY_BIND_ATTEMPTS):
+            port = get_open_port()
+            path = make_zmq_path("tcp", "*", port)
+            try:
+                sock = make_zmq_socket(ctx, path, zmq.ROUTER, bind=True)
+            except zmq.ZMQError as e:
+                if e.errno != zmq.EADDRINUSE:
+                    ctx.destroy(linger=0)
+                    raise
+                logger.warning("Mooncake notification port %d taken; retrying", port)
+                continue
+            self._notification_port = port
+            logger.info("Mooncake notification listener bound to %s", path)
+            return ctx, sock
+        ctx.destroy(linger=0)
+        raise RuntimeError(
+            "Mooncake notification listener could not bind a free port in "
+            f"{NOTIFY_BIND_ATTEMPTS} attempts"
+        )
+
     def _notification_listener(self) -> None:
         """Receive write-done notifications from producers."""
-        path = make_zmq_path("tcp", "*", self._notification_port)
-        logger.info("Mooncake notification listener bound to %s", path)
-
-        with zmq_socket_ctx(path, zmq.ROUTER, bind=True) as sock:
+        sock = self._notification_sock
+        try:
             while True:
                 parts = sock.recv_multipart()
                 msg_type = parts[1]
@@ -2412,6 +2458,8 @@ class MooncakeConnector(KVConnectorBase):
                     )
                 else:
                     logger.error("Unknown notification type: %s", msg_type)
+        finally:
+            self._notification_ctx.destroy(linger=0)
 
     def _send_release(self, req_id: str) -> None:
         """Tell stage-0 this request's KV is fully received from every stage.
