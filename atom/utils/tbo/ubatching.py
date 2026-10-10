@@ -399,6 +399,7 @@ class TBOContext:
         # Partner thread checks this in `_cpu_yield` so it doesn't sleep
         # forever if we exited (cleanly or via exception) ahead of it.
         self.done: bool = False
+        self.cancelled: bool = False
         # Filled by `make_tbo_contexts` — points to the OTHER ubatch's ctx.
         self.partner: TBOContext | None = None
 
@@ -408,16 +409,19 @@ class TBOContext:
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.ubatch_id
         _CURRENT_CONTEXTS[self.ubatch_id] = self
 
-        # All threads reach the barrier, then the main thread wakes thread 0
-        self.ready_barrier.wait()
-
-        # Wait for our turn (thread 0 is woken by the main thread)
-        self.cpu_wait_event.wait()
-        self.cpu_wait_event.clear()
-
-        self._restore_context()
-        self.update_stream(self.compute_stream)
-        return self
+        try:
+            self._check_cancelled()
+            # All threads reach the barrier, then the main thread wakes thread 0.
+            self.ready_barrier.wait()
+            self._wait_for_turn()
+            self._restore_context()
+            self.update_stream(self.compute_stream)
+            return self
+        except BaseException:
+            # Python does not call __exit__ when __enter__ raises. Release this
+            # worker's registration and publish done on an aborted rendezvous.
+            self.__exit__(*sys.exc_info())
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         _CURRENT_CONTEXTS[self.ubatch_id] = None
@@ -507,6 +511,17 @@ class TBOContext:
 
     # -- CPU yield (ping-pong) -------------------------------------------
 
+    def _check_cancelled(self):
+        if self.cancelled:
+            raise RuntimeError("TBO forward cancelled by parent")
+
+    def _wait_for_turn(self):
+        # Check on both sides: cancellation can precede the wait or wake it.
+        self._check_cancelled()
+        self.cpu_wait_event.wait()
+        self.cpu_wait_event.clear()
+        self._check_cancelled()
+
     def _cpu_yield(self):
         """Wake the next thread and sleep until woken.
 
@@ -516,13 +531,13 @@ class TBOContext:
         remaining yields and exit normally, so the main thread's `t.join()`
         can complete and any captured `errors[idx]` can be raised.
         """
+        self._check_cancelled()
         self.cpu_signal_event.set()
         if self.partner is not None and self.partner.done:
             self.cpu_wait_event.clear()
             self._restore_context()
             return
-        self.cpu_wait_event.wait()
-        self.cpu_wait_event.clear()
+        self._wait_for_turn()
         self._restore_context()
 
     def yield_(self):

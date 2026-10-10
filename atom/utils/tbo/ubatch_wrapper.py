@@ -75,9 +75,10 @@ class UBatchWrapper(nn.Module):
             self._worker_job_ready[idx].clear()
             job = self._worker_jobs[idx]
             self._worker_jobs[idx] = None
+            if job is None:
+                continue
             try:
-                if job is not None:
-                    job()
+                job()
             finally:
                 # Idle workers must not pin the preceding batch's KV/metadata
                 # through their thread-local context or completed job closure.
@@ -210,6 +211,8 @@ class UBatchWrapper(nn.Module):
                         )
                     results.append((idx, self._validate_ubatch_output(model_output)))
                 except Exception as e:
+                    if tbo_ctxs[idx].cancelled:
+                        return
                     # logger.exception captures the full traceback. The partner
                     # thread is unblocked via TBOContext.partner.done (set in
                     # __exit__) so the main thread's done-wait returns promptly
@@ -231,15 +234,33 @@ class UBatchWrapper(nn.Module):
                 if self.attn_metadata_builder is not None
                 else nullcontext()
             ):
-                for i in range(N):
-                    self._worker_job_done[i].clear()
-                    self._worker_jobs[i] = _make_job(i)
-                    self._worker_job_ready[i].set()
+                submitted = []
+                try:
+                    for i in range(N):
+                        self._worker_job_done[i].clear()
+                        self._worker_jobs[i] = _make_job(i)
+                        submitted.append(i)
+                        self._worker_job_ready[i].set()
 
-                self.ready_barrier.wait()
-                tbo_ctxs[0].cpu_wait_event.set()
-                for i in range(N):
-                    self._worker_job_done[i].wait()
+                    self.ready_barrier.wait()
+                    tbo_ctxs[0].cpu_wait_event.set()
+                    for i in submitted:
+                        self._worker_job_done[i].wait()
+                except BaseException:
+                    # Cancel before waking anyone, including workers that have
+                    # not reached their first turn. Keep metadata and partner
+                    # links alive until every submitted job has unwound.
+                    for tbo_ctx in tbo_ctxs:
+                        tbo_ctx.cancelled = True
+                    self.ready_barrier.abort()
+                    for tbo_ctx in tbo_ctxs:
+                        tbo_ctx.cpu_wait_event.set()
+                    for i in submitted:
+                        self._worker_job_ready[i].set()
+                    for i in submitted:
+                        self._worker_job_done[i].wait()
+                    self.ready_barrier.reset()
+                    raise
         finally:
             # Both workers have left their contexts. Break the partner cycle
             # so child metadata is released without waiting for cyclic GC.

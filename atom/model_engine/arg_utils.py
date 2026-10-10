@@ -149,6 +149,7 @@ class EngineArgs:
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
     enable_tbo: str | None = None
+    tbo_comm_stream_priority: int | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
     method: str | None = None
@@ -390,6 +391,13 @@ class EngineArgs:
             help="Enable TBO (Two-Batch Overlap) for comm/compute overlap. "
             "'--enable-tbo' or '--enable-tbo prefill': TBO for prefill only. "
             "'--enable-tbo all': TBO for both prefill and decode.",
+        )
+        parser.add_argument(
+            "--tbo-comm-stream-priority",
+            type=int,
+            default=None,
+            help="TBO communication stream priority. Lower values have higher "
+            "priority. Omit to use the model default (otherwise 0).",
         )
         parser.add_argument(
             "--all2all-backend",
