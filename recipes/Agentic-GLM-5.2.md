@@ -339,10 +339,10 @@ decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 > Compare MTP and non-MTP runs at the same concurrency and QREP setting.
 >
 > Sparse prefill uses two DCP optimizations: `ATOM_DCP_PREFILL_QREP=1` builds
-> the DCP group's query heads locally instead of all-gathering them, and
-> `ATOM_DCP_SPARSE_PREFILL_NONPS=1` runs the non-persistent fp8 gqa64 MLA kernel,
-> which needs no work metadata (requires an aiter with ROCm/aiter#6132 and
-> `--max-num-batched-tokens` <= 32768). Together they cut prefill latency by ~20%
+> the DCP group's query heads locally instead of all-gathering them, and the
+> non-persistent fp8 gqa64 MLA kernel (`ATOM_DCP_SPARSE_PREFILL_NONPS`, on by
+> default) needs no work metadata; it needs an aiter with ROCm/aiter#6132 and
+> `--max-num-batched-tokens` <= 32768. Together they cut prefill latency by ~20%
 > on MI355X TP4/DCP4 (64K prompt: 4.73 s to 3.74 s; 16K: 1.23 s to 1.00 s), measured
 > as the time to the first token of a unique prompt with `max_tokens=1`, mean of
 > 4 runs per setting; the per-flag breakdown is in ROCm/ATOM#2506.
@@ -354,9 +354,8 @@ export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 
-# DCP sparse prefill: local query heads (QREP) + non-persistent MLA kernel
+# DCP sparse prefill: local query heads (QREP); the non-persistent MLA kernel is on by default
 export ATOM_DCP_PREFILL_QREP=1
-export ATOM_DCP_SPARSE_PREFILL_NONPS=1
 
 # LMCache-related settings
 export PYTHONHASHSEED=0

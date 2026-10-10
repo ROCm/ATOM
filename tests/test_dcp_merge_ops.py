@@ -977,6 +977,12 @@ def test_sparse_prefill_nonps_gate(
     assert mla_dcp_sparse_prefill_uses_nonps(dcp, heads, fp8, gfx950, mbt) is expected
 
 
+def test_sparse_prefill_nonps_is_on_by_default(monkeypatch):
+    monkeypatch.delenv("ATOM_DCP_SPARSE_PREFILL_NONPS", raising=False)
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    assert mla_dcp_sparse_prefill_uses_nonps(4, 64, True, True, 16384)
+
+
 @pytest.mark.parametrize("persistent, width", [(True, 64), (False, 128)])
 def test_sparse_prefill_nonps_overrides_mode_and_width(persistent, width):
     """The non-persistent gqa64 kernel runs non-persistent at exactly 64, whatever
