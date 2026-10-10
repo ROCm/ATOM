@@ -29,6 +29,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MSG_LANDING_READY,
     LandingCredits,
     LandingReceiver,
+    mla_landing_reserve_bytes,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
@@ -285,11 +286,11 @@ def test_ready_then_write_done_completes_only_after_the_scatter():
     dest = _Dest()
     slots = dest.recv.advertise("stage0", 1)["slots"]
     dst_blocks = [5, 9]
-    dest.recv.begin("r", 5, dst_blocks, {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, dst_blocks, {0: "stage0"})
     rows = torch.randint(0, 256, (20, TOKEN_BYTES), dtype=torch.uint8)
     dest.recv.on_ready(_ready("r", slots[0], 0, _land(dest, slots[0], 1, 0, rows)))
     # The write-done arrives while the slot is still queued: not complete.
-    assert dest.recv.stream_done("r", 0, 5, True, [slots[0]])
+    assert dest.recv.stage_done("r", 0, 5, True, [slots[0]])
     assert dest.finished == []
     dest.pump()
     assert dest.finished == [("r", False)]
@@ -303,7 +304,7 @@ def test_ready_then_write_done_completes_only_after_the_scatter():
 def test_duplicates_are_ignored_and_lost_ready_fails_the_request():
     dest = _Dest()
     slots = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1, 2], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1, 2], {0: "stage0"})
     rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
     ready = _ready("r", slots[0], 0, _land(dest, slots[0], 0, 0, rows))
     dest.recv.on_ready(ready)
@@ -312,8 +313,8 @@ def test_duplicates_are_ignored_and_lost_ready_fails_the_request():
     dest.pump()
     # The stage landed 2 slots, but the second READY never arrived: the
     # request fails and the lost slot still goes back to the stage.
-    dest.recv.stream_done("r", 0, 5, True, [slots[0], slots[1]])
-    dest.recv.stream_done("r", 0, 5, True, [slots[0], slots[1]])  # duplicate
+    dest.recv.stage_done("r", 0, 5, True, [slots[0], slots[1]])
+    dest.recv.stage_done("r", 0, 5, True, [slots[0], slots[1]])  # duplicate
     assert dest.finished == [("r", True)]
     assert dest.credits() == [("stage0", [slots[0]]), ("stage0", [slots[1]])]
 
@@ -326,14 +327,14 @@ def test_a_ready_behind_its_write_done_returns_its_slot_once():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     dest.recv.advertise("stage1", 2)
-    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.credits() == [("stage0", [s0[0]])]
     dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
     assert dest.recv._queue.empty()
     assert dest.credits() == []
     assert dest.finished == []  # stage 1 may still be writing
-    dest.recv.stream_done("r", 1, 5, True, [])
+    dest.recv.stage_done("r", 1, 5, True, [])
     assert dest.finished == [("r", True)]
     assert dest.credits() == []
 
@@ -344,9 +345,9 @@ def test_a_ready_after_its_request_retired_returns_nothing():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     dest.recv.advertise("stage1", 2)
-    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
-    dest.recv.stream_done("r", 1, 5, True, [])
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
+    dest.recv.stage_done("r", 1, 5, True, [])
     assert dest.finished == [("r", True)]
     assert dest.credits() == [("stage0", [s0[0]])]
     dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
@@ -362,8 +363,8 @@ def test_malformed_landed_slots_fail_the_request(landed):
     # it still settles, since the stage ended.
     dest = _Dest()
     dest.recv.advertise("stage0", 1)
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
-    dest.recv.stream_done("r", 0, 5, True, landed)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    dest.recv.stage_done("r", 0, 5, True, landed)
     assert dest.finished == [("r", True)]
     assert dest.credits() == []
 
@@ -372,8 +373,8 @@ def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     s1 = dest.recv.advertise("stage1", 2)["slots"]
-    dest.recv.begin("r", 5, [1, 2, 3], {0: "stage0", 1: "stage1"}, 2)
-    dest.recv.stream_done("r", 1, 5, False, [s1[0]])
+    dest.recv.begin("r", 5, [1, 2, 3], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 1, 5, False, [s1[0]])
     assert dest.credits() == [("stage1", [s1[0]])]
     assert dest.finished == []  # stage 0 may still be writing
     before = dest.regions[0].clone()
@@ -382,7 +383,7 @@ def test_a_failed_stage_waits_for_the_others_and_late_slots_are_dropped():
     dest.pump()
     assert torch.equal(dest.regions[0], before)  # never scattered
     assert dest.credits() == [("stage0", [s0[0]])]
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == [("r", True)]
     # A READY arriving after the request retired returns no credit: its
     # stage's write-done already returned every slot it listed.
@@ -395,30 +396,18 @@ def test_slot_outside_the_stage_partition_fails_the_request():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     s1 = dest.recv.advertise("stage1", 2)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
     dest.recv.on_ready(_ready("r", s1[0], 0, [[0, 0, 1, 0]], pp=0))
-    dest.recv.stream_done("r", 0, 5, True, [])
-    dest.recv.stream_done("r", 1, 5, True, [])
+    dest.recv.stage_done("r", 0, 5, True, [])
+    dest.recv.stage_done("r", 1, 5, True, [])
     assert dest.finished == [("r", True)]
     assert s0 and dest.credits() == []
-
-
-def test_items_out_of_range_fail_the_request_without_scattering():
-    dest = _Dest()
-    s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
-    before = [t.clone() for t in dest.regions]
-    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 17, 0]]))  # 1 page = 16 rows
-    dest.pump()
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
-    assert dest.finished == [("r", True)]
-    assert all(torch.equal(a, b) for a, b in zip(dest.regions, before))
-    assert dest.credits() == [("stage0", [s0[0]])]
 
 
 @pytest.mark.parametrize(
     "item",
     [
+        [0, 0, 17, 0],  # 1 page = 16 rows
         [0, 0, 1, -4],
         [0, 0, 0, 0],
         [0, 0, -1, 0],
@@ -427,6 +416,7 @@ def test_items_out_of_range_fail_the_request_without_scattering():
         [0, 0, 1, 2**63 - 4],
     ],
     ids=[
+        "rows-past-the-pages",
         "negative-offset",
         "no-rows",
         "negative-rows",
@@ -438,14 +428,15 @@ def test_items_out_of_range_fail_the_request_without_scattering():
 def test_malformed_items_fail_only_their_request(item):
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
     before = [t.clone() for t in dest.regions]
     dest.recv.on_ready(_ready("r", s0[0], 0, [item]))
     dest.pump()
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == [("r", True)]
-    assert dest.recv.enabled
     assert all(torch.equal(a, b) for a, b in zip(dest.regions, before))
+    assert dest.credits() == [("stage0", [s0[0]])]
+    assert dest.recv.advertise("stage0", 1) is not None  # landing stays on
 
 
 _NO_ITEMS = object()  # the READY has no items field
@@ -482,7 +473,7 @@ def test_unparsable_items_fail_their_request_and_return_the_slot(items):
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     dest.recv.advertise("stage1", 2)
-    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
     ready = _ready("r", s0[0], 0, items)
     if items is _NO_ITEMS:
         del ready["items"]
@@ -490,13 +481,13 @@ def test_unparsable_items_fail_their_request_and_return_the_slot(items):
     assert dest.recv._queue.empty()
     # The slot's RDMA write finished before READY, so it goes back at once.
     assert dest.credits() == [("stage0", [s0[0]])]
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == []  # stage 1 may still be writing
-    dest.recv.stream_done("r", 1, 5, True, [])
+    dest.recv.stage_done("r", 1, 5, True, [])
     assert dest.finished == [("r", True)]
     # Stage 0's write-done listed the slot, but it went back only once.
     assert dest.credits() == []
-    assert dest.recv.enabled
+    assert dest.recv.advertise("stage0", 2) is not None  # landing stays on
 
 
 def test_sweep_never_reports_a_failure_while_a_stage_still_runs():
@@ -505,21 +496,21 @@ def test_sweep_never_reports_a_failure_while_a_stage_still_runs():
     dest = _Dest()
     dest.recv.advertise("stage0", 2)
     dest.recv.advertise("stage1", 2)
-    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"}, 2)
-    dest.recv.stream_done("r", 1, 5, False, [])
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 1, 5, False, [])
     dest.recv._requests["r"].failed_at -= 3600
     dest.recv.sweep()
     dest.recv.sweep()
     assert dest.finished == []
     assert dest.recv._requests["r"].stall_logged
-    dest.recv.stream_done("r", 0, 5, True, [])
+    dest.recv.stage_done("r", 0, 5, True, [])
     assert dest.finished == [("r", True)]
 
 
 def test_scatter_errors_fail_the_slots_and_disable_landing():
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1, 2], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1, 2], {0: "stage0"})
 
     def boom(*_a):
         raise RuntimeError("gpu fault")
@@ -528,9 +519,10 @@ def test_scatter_errors_fail_the_slots_and_disable_landing():
     rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
     dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
     dest.pump()
-    dest.recv.stream_done("r", 0, 5, True, [s0[0]])
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.finished == [("r", True)]
-    assert not dest.recv.enabled
+    # Landing is off: no stage gets an offer, not even one with a partition.
+    assert dest.recv.advertise("stage0", 1) is None
     assert dest.recv.advertise("stage9", 1) is None
 
 
@@ -539,7 +531,7 @@ def test_ready_for_an_unknown_request_returns_nothing():
     # free one the stage holds for another transfer.
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
     dest.recv.on_ready(_ready("ghost", s0[1], 0, [[0, 0, 1, 0]]))
     dest.recv.on_ready(_ready("r", s0[1], 0, [[0, 0, 1, 0]], nonce=6))
     assert dest.recv._queue.empty()
@@ -551,7 +543,7 @@ def test_a_failed_credit_send_still_reports_the_request():
     # caller half done: a READY misreported as unread, a request never reported.
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
 
     def unreachable(_addr, _parts):
         raise RuntimeError("notify socket gone")
@@ -561,7 +553,7 @@ def test_a_failed_credit_send_still_reports_the_request():
     dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
     dest.recv.on_ready(_ready("r", s0[1], 1, [1]))  # malformed: returned at once
     dest.pump()  # slot 0 is returned once its task completes
-    dest.recv.stream_done("r", 0, 5, True, s0[:3])  # seq 2 lost: returned now
+    dest.recv.stage_done("r", 0, 5, True, s0[:3])  # seq 2 lost: returned now
     assert dest.finished == [("r", True)]
 
 
@@ -684,7 +676,7 @@ def _landed_vs_per_token(
     new._landing_credits.sync("consumer:1", landing)
     request = _request(num_regions, dcp_size, dcp_rank, dest.regions)
     request["mla_landing"] = landing
-    dest.recv.begin("req", 5, list(dst_ids), {0: "stage0"}, 1)
+    dest.recv.begin("req", 5, list(dst_ids), {0: "stage0"})
 
     def route(_path, parts):
         kind, payload = parts
@@ -718,7 +710,7 @@ def _landed_vs_per_token(
             time.sleep(0.005)
         stop.set()
         pumper.join()
-    dest.recv.stream_done("req", 0, 5, True, request.get("_mla_landed", []))
+    dest.recv.stage_done("req", 0, 5, True, request.get("_mla_landed", []))
     assert dest.finished == [("req", False)]
     for got, want in zip(dest.regions, reference):
         assert torch.equal(got, want)
@@ -793,7 +785,7 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
     dest.recv.advertise("stage0", 2)
     landing = dest.recv.advertise("stage1", 2)
-    dest.recv.begin("req", 5, [3], {0: "stage0", 1: "stage1"}, 2)
+    dest.recv.begin("req", 5, [3], {0: "stage0", 1: "stage1"})
     stage1 = _producer(mc, _source_regions(1, 8), staging_rows=16)
     stage1.pp_rank = 1
     stage1._landing_credits.sync("consumer:1", landing)
@@ -820,7 +812,7 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     )
     writer.start()
     assert started.wait(timeout=10)
-    dest.recv.stream_done("req", 0, 5, False, [])
+    dest.recv.stage_done("req", 0, 5, False, [])
     dest.recv._requests["req"].failed_at -= 3600
     dest.recv.sweep()
     assert dest.finished == []  # stage 1 is still writing page 3
@@ -828,7 +820,7 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     writer.join(timeout=10)
     assert result == [True]
     assert [label for label, _ in stage1._nic.labels] == ["staged-mla"]
-    dest.recv.stream_done("req", 1, 5, True, request.get("_mla_landed", []))
+    dest.recv.stage_done("req", 1, 5, True, request.get("_mla_landed", []))
     assert dest.finished == [("req", True)]
 
 
@@ -841,7 +833,7 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
     monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
     dest = _Dest(num_regions=1, pool_slots=1, slot_rows=16)
     landing = dest.recv.advertise("stage0", 1)
-    dest.recv.begin("req", 5, [3], {0: "stage0"}, 1)
+    dest.recv.begin("req", 5, [3], {0: "stage0"})
     new = _producer(mc, _source_regions(1, 8), staging_rows=16)
     new._landing_credits.sync("consumer:1", landing)
     request = _request(1, 4, 0, dest.regions)
@@ -863,7 +855,7 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
     new._notify_transfer_result(request, success=False)
     done = msgpack.loads(sent[0][1])
     assert done["landed_slots"] == landing["slots"]
-    dest.recv.stream_done(
+    dest.recv.stage_done(
         "req", done["pp_rank"], done["write_nonce"], False, done["landed_slots"]
     )
     assert dest.finished == [("req", True)]
@@ -917,7 +909,7 @@ def test_landing_requests_complete_through_the_receiver():
     conn.failed_recving = set()
     dest.recv._finish = conn._complete_recv
     s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
     rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
     dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
     conn._record_write_done("r", 0, 0, 5, success=True, landed_slots=[s0[0]])
@@ -958,7 +950,7 @@ def test_an_unreadable_ready_does_not_stop_the_listener(monkeypatch):
     mc = _mooncake()
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 1)["slots"]
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
     rows = torch.zeros((4, TOKEN_BYTES), dtype=torch.uint8)
     ready = _ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows))
     no_request_id = dict(ready)
@@ -981,7 +973,7 @@ def test_an_unreadable_ready_does_not_stop_the_listener(monkeypatch):
     assert dest.recv._requests["r"].pending == 1  # the good READY was queued
     dest.pump()
     assert dest.credits() == [("stage0", [s0[0]])]
-    dest.recv.stream_done("r", 0, 5, True, [s0[0], s0[1]])
+    dest.recv.stage_done("r", 0, 5, True, [s0[0], s0[1]])
     assert dest.finished == [("r", True)]
     assert dest.credits() == [("stage0", [s0[1]])]
 
@@ -991,7 +983,7 @@ def test_an_unreadable_write_done_does_not_stop_the_listener(monkeypatch):
     mc = _mooncake()
     dest = _Dest()
     dest.recv.advertise("stage0", 1)
-    dest.recv.begin("r", 5, [1], {0: "stage0"}, 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
     done = {"request_id": "r", "pp_rank": 0, "write_nonce": 5, "landed_slots": []}
     no_request_id = dict(done)
     del no_request_id["request_id"]
@@ -1115,29 +1107,16 @@ def _config(transfer, dcp=4, kv_lora_rank=512):
 
 
 def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch):
-    from atom.kv_transfer.disaggregation import pd_landing
-    from atom.kv_transfer.disaggregation.pd_landing import (
-        mla_landing_pool_shape,
-        mla_landing_reserve_bytes,
-    )
-
     consumer = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
     producer = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
-    assert mla_landing_reserve_bytes(_config(consumer)) > 0  # on by default
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
-    assert mla_landing_reserve_bytes(_config(consumer)) == 0
-    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "1")
-    assert mla_landing_pool_shape() == (32, 8 << 20)
-    # A pool that is not a whole number of slots keeps only the whole slots.
-    monkeypatch.setattr(pd_landing, "MLA_LANDING_POOL_BYTES", 100 << 20)
-    assert mla_landing_pool_shape() == (12, 8 << 20)
-    assert mla_landing_reserve_bytes(_config(consumer)) == 96 << 20
-    multi = {"kv_connector": "multi", "connectors": [consumer]}
-    assert mla_landing_reserve_bytes(_config(multi)) == 96 << 20
+    # On by default: the whole pool, 32 slots of 8 MiB.
+    assert mla_landing_reserve_bytes(_config(consumer)) == 256 << 20
     assert mla_landing_reserve_bytes(_config(producer)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
+    monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
+    assert mla_landing_reserve_bytes(_config(consumer)) == 0
 
 
 def test_mooncake_answers_the_runner_kv_budget_reserve(monkeypatch):

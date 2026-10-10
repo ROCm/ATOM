@@ -72,7 +72,6 @@ try:  # Triton is only needed on GPU; unit tests may import without it.
             tl.store(dst + do + o, v, mask=m, cache_modifier=".cs")
 
 except ImportError:  # pragma: no cover - exercised only without Triton
-    triton = None
     _segment_copy_kernel = None
 
 

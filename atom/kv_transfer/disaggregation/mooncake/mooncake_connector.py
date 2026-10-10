@@ -36,16 +36,15 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MLA_LANDING_CREDIT_WAIT_S,
     MLA_LANDING_MIN_SLOTS,
+    MLA_LANDING_POOL_BYTES,
+    MLA_LANDING_SLOT_BYTES,
     MSG_LANDING_CREDIT,
     MSG_LANDING_READY,
     LandingCredits,
     LandingReceiver,
-)
-from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
-from atom.kv_transfer.disaggregation.pd_landing import (
-    mla_landing_pool_shape,
     mla_landing_reserve_bytes,
 )
+from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
     mla_staging_reserve_bytes,
@@ -1151,9 +1150,9 @@ class MooncakeConnector(KVConnectorBase):
 
         Only a DCP consumer with MLA regions and no per-request slot regions
         lands. ``mla_landing_reserve_bytes`` holds the pool back from the KV
-        cache budget with the same gates.
+        cache budget before the regions are known, so it reserves the pool
+        for a DCP consumer of an MLA model with slot regions too.
         """
-        slots, slot_bytes = mla_landing_pool_shape()
         mla_regions = [
             idx
             for idx, role in enumerate(self._block_region_roles)
@@ -1162,15 +1161,16 @@ class MooncakeConnector(KVConnectorBase):
         if (
             self.is_producer
             or self.dcp_size <= 1
-            or slots == 0
+            or not envs.ATOM_PD_MLA_LANDING
             or self._has_slot_regions
             or not mla_regions
         ):
             return None
+        slots = MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES
         receiver = LandingReceiver(
             device=self._cuda_device,
             pool_slots=slots,
-            slot_bytes=slot_bytes,
+            slot_bytes=MLA_LANDING_SLOT_BYTES,
             block_size=self.block_size,
             consumer_key=f"{self.local_ip}:{self.rpc_port}",
             region_bases=self.kv_caches_base_addr,
@@ -1182,7 +1182,7 @@ class MooncakeConnector(KVConnectorBase):
         logger.info(
             "PD MLA landing: %d slots x %.1f MiB for %d MLA regions",
             slots,
-            slot_bytes / (1 << 20),
+            MLA_LANDING_SLOT_BYTES / (1 << 20),
             len(mla_regions),
         )
         return receiver
@@ -1441,7 +1441,7 @@ class MooncakeConnector(KVConnectorBase):
             # landing partition it may write (see mla_landing.py).
             stage_requests: dict[int, bytes] = {}
             landing = self._mla_landing
-            if landing is not None and landing.enabled:
+            if landing is not None:
                 for stage, addr in stage_addrs.items():
                     advertised = landing.advertise(addr, remote_pp_size)
                     if advertised is not None:
@@ -1454,13 +1454,7 @@ class MooncakeConnector(KVConnectorBase):
             # the slot and block records to already be there or it cannot
             # reclaim them.
             if stage_requests:
-                landing.begin(
-                    req_id,
-                    write_nonce,
-                    dst_block_ids,
-                    stage_addrs,
-                    expected_responses,
-                )
+                landing.begin(req_id, write_nonce, dst_block_ids, stage_addrs)
             self._pending_recv.add(req_id)
             # Only delta blocks need fencing; reused prefix blocks are coherent.
             self._pending_recv_blocks[req_id] = list(dst_block_ids)
@@ -2367,7 +2361,6 @@ class MooncakeConnector(KVConnectorBase):
                         "request_id": req_id,
                         "write_nonce": request_data.get("write_nonce", 0),
                         "pp_rank": self.pp_rank,
-                        "tp_rank": self.tp_rank,
                         "seq": seq,
                         "slot": slot,
                         "items": [
@@ -2983,7 +2976,7 @@ class MooncakeConnector(KVConnectorBase):
         and fails only once every stage ended (``_complete_recv``).
         """
         landing = self._mla_landing
-        if landing is not None and landing.stream_done(
+        if landing is not None and landing.stage_done(
             req_id, pp_rank, write_nonce, success, landed_slots
         ):
             return False
