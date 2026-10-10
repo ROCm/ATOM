@@ -42,7 +42,6 @@ _OFFLOAD_CONNECTORS = frozenset(
         "lmcache_mp",
         "lmcachempconnector",
         "mooncake_store",
-        "mooncakestoreoffloadconnector",
     }
 )
 

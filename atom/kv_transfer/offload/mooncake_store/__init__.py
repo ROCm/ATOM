@@ -9,11 +9,11 @@ across two nodes on the decode node too -- with no cache tier of their own in
 between. Scheduling, the KV byte layout and the completion protocol are the
 dense offload's; this package adds the transport:
 
-* ``config`` -- the ``mooncake_store.*`` settings;
+* ``config`` -- the ``mooncake_store.*`` settings, per-NIC pools included;
 * ``keys`` -- the layout namespace, the prompt's chunk hash chain, Store keys;
-* ``nic`` -- one PCI-local RDMA device per worker, and per-NIC pools;
+* ``nic`` -- one PCI-local RDMA device per worker;
 * ``client`` -- a pure zero-copy Store client;
-* ``pool`` -- the registered transfer slots, in HBM by default;
+* ``pool`` -- the registered transfer slots, in HBM;
 * ``scheduler`` -- Store lookups and the requests the workers receive;
 * ``worker`` -- windowed put/get through the pool, and the startup probe.
 

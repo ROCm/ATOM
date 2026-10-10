@@ -35,6 +35,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
     chain_seed,
+    chunk_digest,
     chunk_hash_chain,
     rank_key_prefix,
     store_namespace,
@@ -43,18 +44,16 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Seconds a lookup answers "no answer" after the Store could not be reached,
-# before it tries again, or ten times as long as the failed connect blocked
-# (`_LOOKUP_BACKOFF_FACTOR`), whichever is longer. Connecting blocks the
-# scheduler thread (Mooncake's setup holds the GIL, and retries a master that
-# does not answer for minutes), so a missing master must not cost that on
-# every step.
+# Seconds lookups answer "no answer" without asking after the Store could not
+# be reached. Connecting blocks the scheduler thread (Mooncake's setup holds
+# the GIL, and retries a master that does not answer for minutes), so a
+# missing master must not cost that on every step.
 _RECONNECT_INTERVAL_S = 30.0
-# After a lookup the Store failed to answer, lookups answer "no answer" without
-# asking it for this long, or for this many times as long as the failed one
-# blocked the scheduler thread, whichever is longer: a master that is down
+# The same after a lookup the Store failed to answer: a master that is down
 # holds each call for seconds, a hung one for coro_rpc's 30 s request timeout.
 _LOOKUP_BACKOFF_S = 10.0
+# Either pause lasts at least this many times as long as the failed call
+# blocked the scheduler thread (`_StoreLookup._pause`).
 _LOOKUP_BACKOFF_FACTOR = 10.0
 # Seconds between two warnings about failing lookups.
 _LOOKUP_WARNING_INTERVAL_S = 60.0
@@ -72,24 +71,6 @@ _LOOKUP_REUSE_S = 1.0
 # PP stage every step.
 _SAVE_RETRY_BASE_S = 1.0
 _SAVE_RETRY_MAX_S = 30.0
-
-
-class _PromptView:
-    """A sequence's prompt, standing in for its token ids in a lookup.
-
-    The chunked scheduler hands the lookup client whatever
-    ``_lookup_token_ids`` returns and tests it for emptiness. Copying a long
-    prompt into a list on every lookup would cost more than the lookup; this
-    carries the sequence, whose chunk digests are hashed once.
-    """
-
-    __slots__ = ("seq",)
-
-    def __init__(self, seq: Any) -> None:
-        self.seq = seq
-
-    def __len__(self) -> int:
-        return int(self.seq.num_prompt_tokens)
 
 
 def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
@@ -149,8 +130,7 @@ class _StoreLookup:
         self._masters = cfg.store_masters()
         self._clients: list[store_client.MooncakeStoreClient] | None = None
         self._executor: ThreadPoolExecutor | None = None
-        self._retry_connect_at = 0.0
-        self._retry_lookup_at = 0.0
+        self._paused_until = 0.0
         self._next_warning_at = 0.0
         # Answered lookups; those where the ranks held prefixes of different
         # lengths; and the rank objects past the shared prefix they found,
@@ -161,36 +141,29 @@ class _StoreLookup:
         self.stranded_objects = 0
         self._next_stats_at = time.monotonic() + _LOOKUP_STATS_INTERVAL_S
 
-    def lookup(self, token_ids: Any, lookup_id: str | None = None) -> int | None:
-        """Tokens of the prompt's prefix the Store holds on every rank.
+    def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
+        """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
 
         None, not 0, when the Store did not answer -- unreachable, a failed
         call, or any per-key error: the scheduler retries a non-answer later,
         where a 0 would be remembered as a miss.
         """
         started = time.perf_counter()
-        if isinstance(token_ids, _PromptView):
-            hashes = prompt_chunk_hashes(token_ids.seq, self._chunk_tokens)
-        else:
-            hashes = chunk_hash_chain(token_ids, self._chunk_tokens)
+        hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
         chunks = len(hashes) // DIGEST_BYTES
         if not chunks:
             return 0
-        if time.monotonic() < self._retry_lookup_at:
+        if time.monotonic() < self._paused_until:
             return None
         clients = self._connected_clients()
         if clients is None:
             return None
-        digests = [
-            hashes[index * DIGEST_BYTES : (index + 1) * DIGEST_BYTES].hex()
-            for index in range(chunks)
-        ]
-        keys = [
-            prefix + digest
-            for rank in range(self._world)
-            for prefix in (rank_key_prefix(self._namespace, rank, self._world),)
-            for digest in digests
-        ]
+        # Every rank's keys share the chunks' digests: each is hex-encoded once.
+        digests = [chunk_digest(hashes, index).hex() for index in range(chunks)]
+        keys = []
+        for rank in range(self._world):
+            prefix = rank_key_prefix(self._namespace, rank, self._world)
+            keys += [prefix + digest for digest in digests]
         asked_at = time.monotonic()
         try:
             codes = self._exists(clients, keys)
@@ -198,7 +171,7 @@ class _StoreLookup:
             self._warn(
                 "a Store lookup of %d keys failed; lookups pause for %.0fs",
                 len(keys),
-                self._back_off(asked_at),
+                self._pause(_LOOKUP_BACKOFF_S, asked_at),
                 exc_info=True,
             )
             return None
@@ -210,7 +183,7 @@ class _StoreLookup:
                 len(errors),
                 len(keys),
                 store_client.describe(errors[0]),
-                self._back_off(asked_at),
+                self._pause(_LOOKUP_BACKOFF_S, asked_at),
             )
             return None
         presents = []
@@ -235,14 +208,6 @@ class _StoreLookup:
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
 
-    def close(self) -> None:
-        clients, self._clients = self._clients or [], None
-        for client in clients:
-            _close_quietly(client)
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-
     def _exists(
         self, clients: list[store_client.MooncakeStoreClient], keys: list[str]
     ) -> list[int]:
@@ -259,19 +224,23 @@ class _StoreLookup:
                 merged.append(min(min(codes), 0))
         return merged
 
-    def _back_off(self, asked_at: float) -> float:
-        """Pause lookups after one the Store failed to answer; the seconds paused."""
+    def _pause(self, floor_s: float, since: float) -> float:
+        """Pause lookups after a failed call that started at ``since``.
+
+        For ``floor_s`` or `_LOOKUP_BACKOFF_FACTOR` times as long as the call
+        blocked, whichever is longer, counted from now: a failed setup can
+        return minutes after it started, and a pause counted from before it
+        would already be over. Returns the seconds paused.
+        """
         now = time.monotonic()
-        pause = max(_LOOKUP_BACKOFF_S, _LOOKUP_BACKOFF_FACTOR * (now - asked_at))
-        self._retry_lookup_at = now + pause
+        pause = max(floor_s, _LOOKUP_BACKOFF_FACTOR * (now - since))
+        self._paused_until = now + pause
         return pause
 
     def _connected_clients(self) -> list[store_client.MooncakeStoreClient] | None:
         if self._clients is not None:
             return self._clients
-        now = time.monotonic()
-        if now < self._retry_connect_at:
-            return None
+        started = time.monotonic()
         clients: list[store_client.MooncakeStoreClient] = []
         try:
             for pool in self._masters:
@@ -283,19 +252,12 @@ class _StoreLookup:
                         master_server_addr=pool.master,
                         protocol="tcp",
                         rdma_devices="",
-                        lookup_batch_keys=self._cfg.lookup_batch_keys,
                     )
                 )
         except Exception:
             for client in clients:
                 _close_quietly(client)
-            # From when the failed setup returned, which can be minutes after
-            # it started: a pause counted from before it would already be over.
-            failed_at = time.monotonic()
-            pause = max(
-                _RECONNECT_INTERVAL_S, _LOOKUP_BACKOFF_FACTOR * (failed_at - now)
-            )
-            self._retry_connect_at = failed_at + pause
+            pause = self._pause(_RECONNECT_INTERVAL_S, started)
             logger.warning(
                 "Mooncake Store offload: the scheduler cannot reach the Store "
                 "(%s); lookups answer nothing for the next %.0fs",
@@ -399,8 +361,13 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             cfg.save_abandon_timeout_s,
         )
 
-    def _lookup_token_ids(self, seq: Any) -> _PromptView:
-        return _PromptView(seq)
+    def _lookup_token_ids(self, seq: Any) -> Any:
+        """The sequence itself: the lookup hashes its prompt once per sequence.
+
+        Copying a long prompt into a list on every lookup would cost more than
+        the lookup (`prompt_chunk_hashes`).
+        """
+        return seq
 
     def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
         # Stamped before asking: the lease runs from the master's answer.
@@ -445,10 +412,6 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
     def _clear_pending_load(self, sid: str) -> None:
         super()._clear_pending_load(sid)
         self._looked_up_at.pop(sid, None)
-
-    def request_finished(self, seq: Any) -> None:
-        super().request_finished(seq)
-        self._looked_up_at.pop(str(seq.id), None)
 
     def _may_emit_save(self) -> bool:
         if time.monotonic() < self._saves_paused_until:

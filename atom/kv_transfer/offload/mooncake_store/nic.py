@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Which RDMA device, and which Store pool, a worker's Store client uses.
+"""Which RDMA device a worker's Store client uses.
 
 * **One NIC per worker, the GPU's own.** Under one shared master, where every
   stage reads every owner, a requester listing several NICs, or owners on the
@@ -14,16 +14,15 @@
   whose only NICs are their GPUs'), one master per NIC keeps each NIC to one
   stage and its own pool's owners: 4 x 37 GB/s with no retransmission across
   two nodes, where one master for the same 8 owners stalled a stage for good.
+  A worker uses its NIC's pool (``MooncakeStoreOffloadConfig.pool_of``).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 logger = logging.getLogger("atom")
 
@@ -69,7 +68,7 @@ def requester_rdma_device(device_index: int, cfg: Any) -> str:
         raise ValueError(f"RDMA device {device!r} from {origin} does not exist")
     owner_devices = list(cfg.owner_rdma_devices)
     # With per-NIC pools the owners on this device are its own pool's, the
-    # only ones this worker reads; store_pool_of checks the device has one.
+    # only ones this worker reads; `cfg.pool_of` checks the device has one.
     if device in owner_devices and not cfg.pools:
         raise ValueError(
             f"RDMA device {device!r} from {origin} is also a Store owner's "
@@ -83,86 +82,6 @@ def requester_rdma_device(device_index: int, cfg: Any) -> str:
         origin,
     )
     return device
-
-
-class StorePool(NamedTuple):
-    """The master of one per-NIC Store pool."""
-
-    master: str
-    metadata: str
-
-
-def parse_store_pools(value: Any) -> dict[str, StorePool]:
-    """Parse ``mooncake_store.pools``; None or blank means one shared pool.
-
-    Accepts the JSON object itself or its text.
-
-    Raises:
-        ValueError: Not a non-empty object mapping each RDMA device to
-            ``{"master": "host:port", "metadata": "<url>"}``.
-    """
-    if value is None:
-        return {}
-    if isinstance(value, str):
-        if not value.strip():
-            return {}
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"mooncake_store.pools is not JSON: {exc}") from exc
-    if not isinstance(value, Mapping) or not value:
-        raise ValueError(
-            "mooncake_store.pools must be a non-empty JSON object keyed by RDMA "
-            "device"
-        )
-    pools = {}
-    for device, pool in value.items():
-        fields = pool if isinstance(pool, Mapping) else {}
-        master, metadata = fields.get("master"), fields.get("metadata")
-        if not (
-            isinstance(device, str)
-            and device
-            and isinstance(master, str)
-            and master
-            and isinstance(metadata, str)
-            and metadata
-        ):
-            raise ValueError(
-                f"mooncake_store.pools[{device!r}] must be "
-                '{"master": "host:port", "metadata": "<url>"}'
-            )
-        pools[device] = StorePool(master, metadata)
-    return pools
-
-
-def store_pool_of(
-    device: str | None, pools: Mapping[str, StorePool]
-) -> StorePool | None:
-    """Return the per-NIC pool of a worker's RDMA device, None without pools.
-
-    Where owners must share the requesters' NICs (a node with only its own
-    GPUs' NICs), each NIC gets a master of its own: the worker on a NIC reads
-    only that pool's owners, and a NIC carries one requester and its own
-    pool's owners instead of every owner's reads.
-
-    Raises:
-        ValueError: Pools are set, but the worker has no RDMA device (tcp)
-            or no pool for its device.
-    """
-    if not pools:
-        return None
-    if device is None:
-        raise ValueError(
-            "mooncake_store.pools keys the Store pools by RDMA device; a tcp "
-            "Store client has none"
-        )
-    pool = pools.get(device)
-    if pool is None:
-        raise ValueError(
-            f"mooncake_store.pools has no pool for RDMA device {device!r} "
-            f"(pools: {', '.join(sorted(pools))})"
-        )
-    return pool
 
 
 def gpu_pci_bdf(device_index: int) -> str:

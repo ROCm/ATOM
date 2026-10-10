@@ -972,7 +972,7 @@ def test_only_one_producer_sub_is_allowed(monkeypatch):
         ("mooncake_store", "mooncake_store"),
         ("mooncake_store", "lmcache_mp"),
         # Aliases count as the backend they name.
-        ("mooncake", "MooncakeStoreOffloadConnector", "LMCacheConnectorV1"),
+        ("mooncake", "mooncake_store", "LMCacheConnectorV1"),
     ],
 )
 def test_two_offload_subs_are_refused_before_either_is_built(monkeypatch, sub_names):

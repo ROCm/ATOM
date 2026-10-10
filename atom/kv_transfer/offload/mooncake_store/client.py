@@ -35,7 +35,6 @@ from typing import Any
 logger = logging.getLogger("atom")
 
 # Mooncake Store ErrorCode values (mooncake-store/include/types.h, v0.3.14).
-OK = 0
 INTERNAL_ERROR = -1
 NO_AVAILABLE_HANDLE = -200
 INVALID_PARAMS = -600
@@ -66,6 +65,9 @@ _ERROR_NAMES = {
 # leaving the RDMA work it posted running (transfer_task.cpp,
 # wait_for_completion; timed on the wall clock).
 BATCH_WAIT_S = 60.0
+
+# Most keys one `batch_is_exist` call carries.
+_LOOKUP_BATCH_KEYS = 8192
 
 # Failures after which Mooncake has no transfer outstanding on the key's
 # buffer, however long the call took: it never issued one (no space, missing
@@ -154,15 +156,9 @@ class MooncakeStoreClient:
         master_server_addr: str,
         protocol: str,
         rdma_devices: str,
-        lookup_batch_keys: int = 8192,
     ) -> None:
-        if lookup_batch_keys <= 0:
-            raise ValueError("lookup_batch_keys must be positive")
         self.master_server_addr = master_server_addr
-        self.metadata_server = metadata_server
-        self.protocol = protocol
         self.rdma_devices = rdma_devices
-        self._lookup_batch_keys = int(lookup_batch_keys)
         self._stats_lock = threading.Lock()
         self._counts: Counter[str] = Counter()
         self._failures: Counter[str] = Counter()
@@ -218,13 +214,13 @@ class MooncakeStoreClient:
     def exists(self, keys: list[str]) -> list[int]:
         """Per key: 1 present, 0 absent, negative on error; order kept.
 
-        Split into calls of at most ``lookup_batch_keys`` keys. Every key found
+        Split into calls of at most ``_LOOKUP_BATCH_KEYS`` keys. Every key found
         gets a read lease on the master (10 s by default), which keeps it from
         being evicted before a get that follows promptly.
         """
         results: list[int] = []
-        for start in range(0, len(keys), self._lookup_batch_keys):
-            batch = keys[start : start + self._lookup_batch_keys]
+        for start in range(0, len(keys), _LOOKUP_BATCH_KEYS):
+            batch = keys[start : start + _LOOKUP_BATCH_KEYS]
             codes = list(self._store.batch_is_exist(batch))
             self._check_length("batch_is_exist", codes, batch)
             results.extend(int(code) for code in codes)
@@ -247,10 +243,6 @@ class MooncakeStoreClient:
         self._check_unique(keys)
         args: list[Any] = [list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]]
         if group_ids is not None:
-            if len(group_ids) != len(keys):
-                raise ValueError(
-                    f"{len(group_ids)} group ids for {len(keys)} keys; one per key"
-                )
             args.append(_new_replicate_config(group_ids))
         codes = [int(code) for code in self._store.batch_put_from(*args)]
         self._check_length("batch_put_from", codes, keys)
