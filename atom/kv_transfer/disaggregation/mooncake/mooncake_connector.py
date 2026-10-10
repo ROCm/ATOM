@@ -2298,10 +2298,11 @@ class MooncakeConnector(KVConnectorBase):
         (``landing_source_tokens``), packed across regions into slots of the
         partition the consumer advertised. Each slot is one RDMA descriptor,
         followed by ``MSG_LANDING_READY`` on the write-done socket, so the
-        consumer sees every READY before this stage's write-done. Without a
-        free slot within ``MLA_LANDING_CREDIT_WAIT_S`` the rest goes
-        out through the staged per-page path; slots are split only at page
-        boundaries, so the rest is whole pages. See ``mla_landing.py``.
+        consumer sees every READY before this stage's write-done unless a
+        reconnect reorders them. Without a free slot within
+        ``MLA_LANDING_CREDIT_WAIT_S`` the rest goes out through the staged
+        per-page path; slots are split only at page boundaries, so the rest
+        is whole pages. See ``mla_landing.py``.
         """
         landing = request_data["mla_landing"]
         epoch = int(landing["epoch"])
