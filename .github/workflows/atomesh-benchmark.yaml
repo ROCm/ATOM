@@ -290,7 +290,9 @@ jobs:
           timeout 15s sacctmgr --noheader --parsable2 show qos \
             format=Name,GrpTRES,MaxTRESPU,GrpJobs,MaxJobsPU \
             > inspection/qos-limits.txt 2>&1 || true
-          grep -F -- "-${SOURCE_RUN_ID}-" inspection/squeue.tmp > inspection/squeue.txt || true
+          awk -v run="${SOURCE_RUN_ID}" \
+            'index($4, "-" run "-") || $4 == "mooncake-store-smoke-" run' \
+            inspection/squeue.tmp > inspection/squeue.txt
           while read -r job_id _; do
             [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
             timeout 15s scontrol show job "${job_id}" \
@@ -333,6 +335,14 @@ jobs:
             /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-* \
             /it-share/ATOMESH_LOG/*-"${SOURCE_RUN_ID}"-*
           )
+          for store_root in /share_nfs/ATOMESH_RUNNER/atomesh-runner-*/_work/ATOM/ATOM/store-smoke-results; do
+            [[ -f "${store_root}/job.txt" ]] || continue
+            if awk -v name="mooncake-store-smoke-${SOURCE_RUN_ID}" \
+              '$2 == "JobName=" name { found=1 } END { exit !found }' \
+              "${store_root}/job.txt"; then
+              log_roots+=("${store_root}")
+            fi
+          done
           for marker in /share_nfs/ATOMESH_RUNNER/atomesh-runner-*/_work/ATOM/ATOM/atomesh-results/*.log-root; do
             log_root="$(cat "${marker}" 2>/dev/null)" || continue
             if [[ "${log_root}" == *-"${SOURCE_RUN_ID}"-* ]]; then
