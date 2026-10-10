@@ -452,10 +452,10 @@ class Qwen3NextAttention(nn.Module):
 
         if self.use_fused_sigmoid_mul_quant:
             from atom.model_ops.triton_fused_sigmoid_mul_quant import (
-                fused_sigmoid_mul_fp8_quant,
+                sigmoid_mul_fp8_group_quant,
             )
 
-            attn_output, attn_scale = fused_sigmoid_mul_fp8_quant(attn_output, gate)
+            attn_output, attn_scale = sigmoid_mul_fp8_group_quant(attn_output, gate)
             output = self.o_proj(attn_output, x_scale=attn_scale)
         elif self.attn_output_gate:
             gate = torch.sigmoid(gate)

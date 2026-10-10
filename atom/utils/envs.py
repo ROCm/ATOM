@@ -311,6 +311,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
     ),
+    # With that fusion on, batches above these token counts take the unfused
+    # kernels instead, because each one-kernel version loses at prefill sizes
+    # while saving launches at decode sizes. Crossovers measured for Qwen3.5
+    # TP4 on MI355X: Gemma q/k norm + RoPE + cache write between 8192 and
+    # 16384 tokens; sigmoid gate + FP8 quant between 2048 and 4096.
+    "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
+    ),
+    "ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS", "2048")
+    ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
     ),

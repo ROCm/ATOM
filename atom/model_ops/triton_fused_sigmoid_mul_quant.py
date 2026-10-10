@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 from aiter import QuantType
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.quant import per_group_quant_hip
 from torch import Tensor
 
 fp8_dtype = aiter.dtypes.fp8
@@ -286,6 +288,44 @@ def fused_sigmoid_mul_fp8_quant(
         out_scale = out_scale.view(M, num_scale_cols)
 
     return out_fp8, out_scale
+
+
+def _sigmoid_mul_fp8_group_quant_fake(
+    attn_output: Tensor, gate: Tensor
+) -> tuple[Tensor, Tensor]:
+    M, N = attn_output.shape
+    return (
+        torch.empty((M, N), dtype=fp8_dtype, device=attn_output.device),
+        torch.empty((M, N // 128), dtype=torch.float32, device=attn_output.device),
+    )
+
+
+# A custom op so the row-count choice happens at run time: inside the compiled
+# graph a branch on M would be fixed by whatever M was traced.
+@torch_compile_guard(gen_fake=_sigmoid_mul_fp8_group_quant_fake, mutates_args=[])
+def sigmoid_mul_fp8_group_quant(
+    attn_output: Tensor, gate: Tensor
+) -> tuple[Tensor, Tensor]:
+    """sigmoid(gate) * attn_output as FP8 with per-1x128 scales, laid out as
+    o_proj's own per_group_quant_hip would produce them.
+
+    Up to ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS rows this is the one-kernel
+    fused_sigmoid_mul_fp8_quant; above it, the elementwise gate and aiter's
+    per-group quant run separately, because the fused kernel's one program per
+    (row, 128-column group) grid is slower at prefill sizes (147 vs 87 us at
+    16384 rows, Qwen3.5 TP4 on MI355X).
+    """
+    from atom.utils import envs
+
+    if attn_output.shape[0] <= envs.ATOM_SIGMOID_MUL_QUANT_FUSION_MAX_TOKENS:
+        return fused_sigmoid_mul_fp8_quant(attn_output, gate)
+    gated = attn_output * torch.sigmoid(gate)
+    return per_group_quant_hip(
+        gated,
+        quant_dtype=fp8_dtype,
+        group_size=128,
+        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+    )
 
 
 def fused_sigmoid_mul_maybe_quant(
