@@ -16,9 +16,10 @@ while IFS= read -r container; do
   [[ "${container}" == atomesh-* && "${container}" =~ -${job_id}-[0-9]+(-benchmark|-eval)?$ ]] || continue
   printf 'Container: %s\n' "${container}"
   # shellcheck disable=SC2016
-  timeout --kill-after=5s 90s docker exec "${container}" bash -c '
+  timeout --kill-after=5s 90s docker exec --privileged --user 0 "${container}" bash -c '
     id
     ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
+    ps -eo pid,ppid,etimes,pcpu,stat,args | grep -E "[n]inja|[h]ipcc|[c]lang-22" | cut -c 1-1200
     spy="$(command -v py-spy || true)"
     if [[ -z "${spy}" ]]; then
       target=/tmp/atomesh-inspection-py-spy
@@ -38,8 +39,8 @@ while IFS= read -r container; do
       fi
       ((remaining <= 8)) || remaining=8
       printf "Process %s\n" "${pid}"
-      ps -L -p "${pid}" -o pid,tid,stat,wchan:32,comm || true
-      timeout --kill-after=1s "${remaining}s" "${spy}" dump --pid "${pid}" --native || true
+      ps -L -p "${pid}" -o stat=,wchan:32=,comm= | sort | uniq -c || true
+      timeout --kill-after=1s "${remaining}s" "${spy}" dump --pid "${pid}" || true
     done
   ' || true
 done < <(docker ps --format '{{.Names}}')
