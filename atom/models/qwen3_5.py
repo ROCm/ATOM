@@ -393,8 +393,26 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 
+        # Emit FP8 + per-1x128 scales straight from the norm for the projection
+        # that consumes it, as Qwen3NextDecoderLayer does; the inherited forward
+        # routes them. GemmaRMSNorm only fuses for per_1x128, so BF16 and MXFP4
+        # checkpoints keep the plain norm.
+        if quant_config is None:
+            input_norm_quant = None
+        elif self.layer_type == "full_attention":
+            input_norm_quant = quant_config.get_layer_quant_config(
+                f"{prefix}.self_attn.qkv_proj"
+            )
+        else:
+            input_norm_quant = quant_config.get_layer_quant_config(
+                f"{prefix}.linear_attn.in_proj_qkvz"
+            )
         self.input_layernorm = Qwen3_5RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            quant_config=input_norm_quant,
+            # in_proj_ba stays BF16, so the GDN layer needs the BF16 copy too.
+            write_bf16=self.layer_type == "linear_attention",
         )
         self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
