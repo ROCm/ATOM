@@ -814,19 +814,24 @@ def resolve_target_verify_lens(
     if use_positions:
         context_lens = prefix_lens + np.int32(draft_token_num)
         # Capture rewrites every row to GLM52_GRAPH_SEQ_LEN_CAPACITY so the
-        # graph buffers are wide enough. Replay copies the real seq_lens over
-        # that sentinel; positions can still be the capture fill. Prefer the
-        # shorter real mirror, and collapse leftover sentinel padding so
-        # max_seqlen_k is not stuck at 10240.
+        # graph buffers are wide enough. A live verify must not keep that
+        # fill: the paged indexer and hd256 FMHA both walk it. Prefer the
+        # CPU seq_lens mirror when it is a real length, and drop rows that
+        # are still the fill on both sides.
+        try:
+            capturing = bool(torch.cuda.is_current_stream_capturing())
+        except Exception:  # noqa: BLE001 - HIP compatibility fallback
+            capturing = False
         seq_lens = get_seq_lens_cpu(forward_batch, bs)
         sentinel = np.int32(GLM52_GRAPH_SEQ_LEN_CAPACITY)
-        if seq_lens.shape[0] == bs and np.any(seq_lens < sentinel):
+        if not capturing and seq_lens.shape[0] == bs:
             real = seq_lens.astype(np.int32)
             context_lens = np.where(
                 real >= sentinel, context_lens, np.minimum(context_lens, real)
             ).astype(np.int32)
+            stale_fill = (context_lens >= sentinel) & (real >= sentinel)
             context_lens = np.where(
-                context_lens >= sentinel, np.int32(draft_token_num), context_lens
+                stale_fill, np.int32(draft_token_num), context_lens
             ).astype(np.int32)
             prefix_lens = np.maximum(context_lens - np.int32(draft_token_num), 0)
     else:
