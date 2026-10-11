@@ -1239,7 +1239,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
 | LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM. The [optimized source stack](#optimized-source-stack--pending-verification) fixes it in aiter instead (#6120) |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together. On newer aiter (`main` of 2026-10-08) the symm-mem knob exists only with [aiter #5431](https://github.com/ROCm/aiter/pull/5431); without it custom all-reduce is disabled on any group spanning nodes. Every rank should log `Custom allreduce: using torch.symm_mem transport (mori backend)` — see [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
-| Answers that end in `!!!!!!…` up to `max_tokens`, or come back empty, with `--enable_prefix_caching` on the newer stack | Some DP ranks serve garbage from a corrupted cached prefix; GSM8K falls from 0.9575 to 0.8954. Measure accuracy with `--no-enable_prefix_caching`. See [Prefix caching corrupts some answers](#-prefix-caching-corrupts-some-answers-on-this-stack) |
+| Answers that end in `!!!!!!…` up to `max_tokens`, or come back empty, with `--enable_prefix_caching` on the newer stack | Two ATOM bugs: the DP dummy decode advances a live KDA state, and the Triton MLA decode addresses KV rows in int32. GSM8K falls from 0.9621 to 0.8954. Apply patches A and B from [Prefix caching corrupts some answers](#-prefix-caching-corrupts-some-answers-on-this-stack), which restore 0.9621 |
 | All DP ranks stop logging at once, mid-run, with no error. 30 min later all but one log `_sync_dp_state failed: ... Timed out waiting 1800000ms` | Seen once on the newer stack: one rank never left the DP LM head's custom all-gather (`aiter::ag_gfx1250_lastdim`). Take stacks and rocgdb `info dispatches` before killing anything. The workaround is the replicated head. See [A hang in the DP LM head's custom all-gather](#-a-hang-in-the-dp-lm-heads-custom-all-gather) |
 | `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe N) returned hipError 17` at model load, on more than one node | Newer aiter's MegaMoE turns on mori's TokOffExt by default, and TokOffExt IPC-maps every peer; IPC handles do not cross nodes. Set `MORI_EP_TOKOFF_EXT=0` — see [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
@@ -1798,6 +1798,10 @@ cd $SP/aiter_meta && git apply --check -R --include='csrc/*' /tmp/5431.diff && e
 
 `docker rm` discards the patches, as on 0918-ep8.
 
+To serve with `--enable_prefix_caching` (AgentX), also apply patches A and B from
+[Prefix caching corrupts some answers](#-prefix-caching-corrupts-some-answers-on-this-stack). Without them, some
+requests decode garbage.
+
 The runs marked "flydsl compact" below also need a third, open ATOM PR. It is not needed for the mori launch
 of this section:
 
@@ -1936,71 +1940,137 @@ and this stack needs 0.90.
 
 ### ⚠️ Prefix caching corrupts some answers on this stack
 
-Found on 2026-10-11, by a full GSM8K on the server of the
-[AgentX sweep](#agentx-sweep-flydsl-compact-fp4-combine-no-eplb-dp8ep8). That server ran
-`--enable_prefix_caching`, `ATOM_DP_SESSION_AFFINITY=1`, 16384 batched tokens and 0.90:
+**Two ATOM bugs, both found and fixed on 2026-10-11.** With the two patches below, a full GSM8K with prefix
+caching scores the same as without it. Without them, some requests decode garbage. A runaway answer stops
+making sense mid-sentence and repeats `!` up to `max_tokens`, for example `The two items add up to $25!!!!!!…`.
+The `!` is token 0, which is what argmax returns from NaN logits. An empty answer has no content at all.
+
+GSM8K (all 1319) on the server of the [AgentX sweep](#agentx-sweep-flydsl-compact-fp4-combine-no-eplb-dp8ep8):
+flydsl compact, fp4 combine, 16384 batched tokens, 0.90, `ATOM_DP_SESSION_AFFINITY=1`.
 
 | server | strict-match | wrong | empty answers | runaway answers |
 |---|---|---|---|---|
-| no prefix caching, mori, 2048 (top of this section) | 0.9575 | 56 | 1 | 0 |
-| **prefix caching**, flydsl compact, fp4 combine, 16384 | **0.8954** | 138 | 57 | 27 |
-| no prefix caching, flydsl compact, fp4 combine, 16384 | **0.9621** | 50 | 1 | 0 |
+| no prefix caching (reference) | 0.9621 | 50 | 1 | 0 |
+| prefix caching, unpatched | **0.8954** | 138 | 57 | 27 |
+| prefix caching, patch A only | 0.9143 | 113 | 36 | 34 |
+| **prefix caching, patches A + B** | **0.9621** | 50 | 1 | 0 |
 
-A runaway answer stops making sense mid-sentence and repeats `!` up to `max_tokens`, for example
-`The two items add up to $25!!!!!!…`. The `!` is token 0, which is what argmax returns from NaN logits. An empty
-answer has no content at all.
+The A + B run used the replicated LM head (`K3_LMHEAD=safe` in the kit), because its first attempt hit the
+[LM-head all-gather hang](#-a-hang-in-the-dp-lm-heads-custom-all-gather) on the last question. It had answered
+the other 1318 cleanly in 9 min 44 s. Mori dispatch with the bf16 combine showed the same corruption, so
+neither [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) nor the fp4 combine is involved.
 
-These 84 answers account for the drop:
+#### Bug A: the DP dummy decode writes into a live KDA state
 
-- None of them scored; 78 had been right on 2026-10-10.
-- On the other 1235 questions this run scores 0.9563, against 0.9595 for the 2026-10-10 run on the same questions.
+When any DP rank has work, a rank whose scheduler schedules nothing in that step runs
+`ModelRunner.dummy_execution`. That is one decode seq with id -1 and no state slot. TP-only serving never runs
+it. The bug, step by step:
 
-They came in bursts, not spread evenly:
+1. `GDNAttentionMetadataBuilder.prepare_state_indices` writes rows only for seqs that have a slot. The dummy's
+   row 0 therefore keeps the previous real batch's first slot.
+2. The KDA decode (`causal_conv1d_update`, `fused_sigmoid_gating_delta_rule_update`, in place) then advances
+   that request's conv and recurrent state with the dummy token.
+3. That request is often live but unscheduled for a step, for example between prefill chunks while the
+   PrefillDelayer holds.
+4. A PAGE checkpoint pending from the slot is drained with the next real batch. It stores the corrupted state
+   under the prefix hash, and every later hit on that rank restores garbage.
 
-- 10 among the first 100 questions. Seven of those were questions 1–9, at the very start of the run, while the
-  first 32 requests arrived together.
-- 49 among questions 700–799.
-- The other 25 spread over questions 500–1318.
+On the unpatched server this showed as:
 
-KV usage was 95% on seven of the eight ranks during the run; the KDA state checkpoints share that pool.
+- **Whole ranks bad.** One prompt sent under 24 session ids came back as `G.....GGG.G.GGGGG.G...GG`
+  (`G` = `!!!!`), identically for every prompt.
+- **A burst at the very start of the run.** Questions 1–9 came back empty.
 
-Prompts replayed against the same server after the run:
+With the patch, a debug counter logged dummy rows that still held a real slot, 20 or more per rank in one run,
+and the probes came back clean. The patch resets every row past the state-holding seqs to `PAD_SLOT_ID`,
+which the kernels skip:
 
-- **Garbage is per rank, and it persists.** One prompt sent under 24 session ids came back as
-  `G.....GGG.G.GGGGG.G...GG` (`G` = `!!!!`). DP session affinity maps each id to one rank. The pattern was
-  identical on a repeat and for a different question: some ranks answered every such request with garbage.
-- **A custom system message avoided it on that server.** With one, all 24 answered correctly, although they hit
-  the same 64 cached tokens. lm_eval sends no system message, so its requests share the default system prompt.
-  This is not a workaround: on the mori server below, one custom-system probe out of 48 still came back as
-  garbage.
-- **Chunked prefill is not the cause.** A unique 29,888-token prompt, prefilled in two 16384 chunks, answered
-  correctly.
-- **Without prefix caching, the same probes are clean.** On a server with the same configuration but
-  `--no-enable_prefix_caching`, run after a full GSM8K, all 96 probe requests answered correctly (two prompts,
-  default and custom system message, 24 session ids each).
-- **It is not from ATOM #2522 or the fp4 combine wire.** The same GSM8K ran with mori dispatch and the bf16
-  combine, and the same prefix caching, 16384 and 0.90:
-  - By question 922 it had generated about 535 tokens per question; without prefix caching the figure is
-    about 115.
-  - Probes during the run found `!!!!` on some ranks for both prompts.
-  - It was stopped at question 1114. Its runaway answers decoded at about 5 tok/s, too slow to reach
-    `max_tokens` inside lm_eval's 1800 s request timeout, so lm_eval would have retried them.
+```diff
+--- a/atom/model_ops/attentions/gdn_attn.py
++++ b/atom/model_ops/attentions/gdn_attn.py
+@@ -1077,6 +1077,10 @@
+             "state fork on the spec-decode path: spec_state_indices_tensor has "
+             "no read-side counterpart (BlockManager only forks onto prefill)"
+         )
++        num_state_rows = len(batch.state_slots)
++        non_spec_state_indices[num_state_rows:] = PAD_SLOT_ID
++        non_spec_state_indices_in[num_state_rows:] = PAD_SLOT_ID
++        spec_state_indices[num_state_rows:] = PAD_SLOT_ID
+         for idx, slots in enumerate(batch.state_slots):
+             non_spec_state_indices[idx] = 0
+             non_spec_state_indices_in[idx] = 0
+```
 
-The root cause was not determined. What was seen fits a cached prefix that is read before it is written, or
-after its block has been reused:
+#### Bug B: the Triton MLA decode addresses KV rows in int32
 
-- bursts at the start, when 32 requests sharing one prefix arrive together;
-- bursts under KV pressure;
-- whole ranks going bad for a stretch of the run, with quiet stretches in between (questions 800–1099 had
-  7 such answers).
+With `ATOM_USE_TRITON_MLA=1`, K3 uses `KimiTritonMLAGDNMetadataBuilder`. That builder hands aiter's
+`decode_attention_fwd` an **int32** table of token-level KV row ids. On ROCm, at 576-wide keys, the kernel
+computes `kv_loc * stride_buf_kbs` in the id's own type. The offset wraps at row 2^31 / 576 = 3,728,270,
+which is block 233,016 of 16. Past that row the decode reads outside the layer's KV.
+
+A rank's pool holds 253k–272k blocks at 0.90. Without prefix caching it never fills: KV usage stays near 0%.
+With prefix caching, the KDA checkpoint images (about 450 MB each, 2032 PAGE units) fill it past 90%. The
+allocator hands out low ids first, so the bursts:
+
+- start at about 90% occupancy;
+- hit every rank;
+- turn a request bad at the first token of its first block above 233,016;
+- stop once low ids free up.
+
+On the patch-A-only run, every corrupted block (64 of them) was ≥ 233,329. Writes are not affected: aiter's
+C++ cache kernels use `int64_t` slots.
+
+Kernel repro, on one GPU with 3.93M rows of fp8 KV:
+
+| table dtype | rows below the limit | rows above it |
+|---|---|---|
+| int32 | matches torch | GPU memory access fault |
+| int64 | matches torch | matches torch |
+
+The patch makes the table int64:
+
+```diff
+--- a/atom/model_ops/attentions/triton_mla.py
++++ b/atom/model_ops/attentions/triton_mla.py
+@@ -43,7 +43,7 @@
+             "triton_block_table": torch.zeros(
+                 self.max_bs,
+                 self.max_num_blocks_per_seq,
+-                dtype=torch.int32,
++                dtype=torch.int64,
+                 device=self.device,
+             ),
+             "triton_attn_logits": torch.empty(
+```
+
+Two other aiter kernels take int32 ids times a large stride and were not changed:
+
+- the shuffled Triton MLA decode;
+- the fused Triton `gather_kv_b_proj`, which is the cached-prefix prefill path when
+  `ATOM_UNFUSED_GATHER_KV_B_PROJ=0`.
+
+This stack's launch sets that variable to `1`, and #2380's torch gather indexes in int64.
+
+#### Applying the patches
+
+Apply both to the venv like the other [patches](#patches), in `site-packages`, with
+`git apply --include='atom/*'`. Then clear `/root/.cache/atom/*`. Both diffs apply to this image's ATOM.
+
+#### How it was found, for the record
+
+- **Per-step finiteness checks** on the state slots each decode reads showed every bad request going NaN in a
+  decode step, never at a restore.
+- **Checks on its written KV rows** showed exactly one bad row, at the current position.
+- **Checking the worker's slot mapping** against the block tables found them consistent, which left the
+  kernel's addressing.
+
+`rocgdb -p <pid> -batch -ex "info dispatches"` names the kernel a hung rank is in; see the hang below.
 
 What this means:
 
-- **Do not measure accuracy on this stack with prefix caching.** Use `--no-enable_prefix_caching`, as in
-  Config A.
-- **The AgentX numbers below may include garbage requests.** Both AgentX runs on this stack used prefix
-  caching. aiperf does not read the text it gets back, so their throughput and latency include whatever those
-  requests cost.
+- **Without both patches, do not measure accuracy on this stack with prefix caching.**
+- **The AgentX numbers below were measured without the patches.** Both runs used prefix caching, so some
+  requests decoded garbage. aiperf does not read the text it gets back.
 - **To check a running server,** send one realistic prompt under a couple of dozen session ids
   (`x-session-id` and `x-dynamo-session-id`) and look for `!!!!`.
 
@@ -2106,7 +2176,7 @@ cached prompt tokens over prompt tokens, from the same export.
 
 ### ⚠️ A hang in the DP LM head's custom all-gather
 
-Seen once, on 2026-10-11, during a full GSM8K on the server of the sweep above. The LM head was Config A's:
+Seen twice on 2026-10-11, each time during a full GSM8K with this LM head. The first, described below, was on the server of the sweep above. The LM head was Config A's:
 `ATOM_DP_LM_HEAD_MODE=allgather`, `ATOM_USE_CUSTOM_ALL_GATHER=1`, `AITER_CUSTOM_AR_USE_SYMM_MEM=1`. Three
 minutes in, at 180 of 1319 questions, all eight engines stopped, with no error:
 
@@ -2154,6 +2224,13 @@ The same head ran without a hang in every other run on this stack:
 - the four 3600 s runs above;
 - the same GSM8K re-run right afterwards, on a fresh server with the same configuration, for 55 min;
 - a full GSM8K without prefix caching, after that.
+
+It came back later the same day, on the last of 1319 questions, in a GSM8K with prefix caching and patches A
+and B. This time DP2 sat in `aiter::ag_gfx1250_lastdim<bf16, 8>` (grid [5120]), and the other seven sat in
+`tdm_compact_plan`. So it is rare, about once in a few hours of GSM8K, but it reproduces.
+
+A watchdog cannot rely on the log going quiet. A hung rank's peers keep printing `[aiter] No available shared
+memory broadcast block found in 60.0 seconds`, so watch the `Engine 00x: Avg` stats lines instead; they stop.
 
 **Workaround:** the replicated head, which uses no custom collective:
 `ATOM_DP_LM_HEAD_MODE=default ATOM_USE_CUSTOM_ALL_GATHER=0`, without `AITER_CUSTOM_AR_USE_SYMM_MEM`. Its
@@ -2906,4 +2983,5 @@ A correct run logs lines of this shape:
   - a valid AgentX run at concurrency 8 (the 3600 s run failed aiperf's coverage rule);
   - the replicated LM head's throughput cost;
   - A/Bs of `ATOM_UNFUSED_GATHER_KV_B_PROJ=0` (Triton 3.9's fused gather);
-  - A/Bs of the new gfx1250 asm MLA decode (`ATOM_USE_TRITON_MLA` unset).
+  - A/Bs of the new gfx1250 asm MLA decode (`ATOM_USE_TRITON_MLA` unset);
+  - AgentX with patches A and B. The sweep and the con32 run predate them.
