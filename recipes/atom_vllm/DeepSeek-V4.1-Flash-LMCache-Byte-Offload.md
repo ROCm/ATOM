@@ -119,13 +119,23 @@ some other site both call: `enforce_deepseek_v41_constraints` is called from
 the hook *and* from the model wrapper, so its line appearing once per worker
 and never from EngineCore says directly that the hook did not run there.
 
-## Why caching is off by default here
+## Prefix caching is on, and the tier is why it is allowed
 
-`--no-enable-prefix-caching` is deliberate, not a limitation. vLLM builds the
-block hasher when `enable_prefix_caching` **or** a KV connector is configured,
-and calls `get_num_new_matched_tokens` on the same condition, so the connector
-keeps its full key space while vLLM's own pool serves nothing locally -- which
-is what makes every hit pass through `cap_hit`.
+`--enable-prefix-caching` is the supported configuration now, and it is only
+legal alongside this connector. The runtime refuses it otherwise, at
+`load_model`, because a block-table hit restores the compressed pages but not
+the per-request CSA2 state read beside them -- vLLM's hash reuse would hand
+back a prefix whose window ring never existed.
+
+That has a consequence for every comparison in this document: **the OFF arm
+cannot have prefix caching either.** An on/off pair here is reuse against
+none, not tier against HBM, and a number from it that gets quoted as "what
+the offload tier buys over HBM caching" is quoted wrongly.
+
+vLLM's own local hits are declined (`cap_local_hit`), so the connector is
+asked about the whole prompt rather than the tail HBM could not serve. The
+reasoning, and why the obvious fix for it is unsound, is in that function.
+
 
 ## Verifying it is actually on
 
@@ -150,7 +160,14 @@ the withheld STATE tail (measured: 250,258 vs 249,801, i.e. 457 blocks =
 A hit's size is the discriminator: it is always a multiple of
 `state_interval`, because that is where a STATE image exists.
 
-## Measured
+## Measured (eager, superseded)
+
+> Taken at `cudagraph_mode=NONE`. Kept for the record of how the tier behaves
+> at three working points and what the prefill-chunk alignment was worth, but
+> the ratios here are **not** comparable to "Measured in graph mode" below,
+> and neither is the noise floor: eager repeats held ~1 %, graph-mode repeats
+> of one configuration spanned 2.5x on the harness that produced them.
+
 
 TP4, gfx950, BF16 pool, `--max-model-len 32768`, tier 16 GiB/rank,
 `state_interval 4096`. Prompts: 16,384-token shared prefix (pool of 4) +
@@ -295,7 +312,12 @@ length and prefix share attached.
 ITL is **worse** with the tier on, consistently ~14 %: the load threads
 contend with decode for the GIL. It is a real cost, not noise.
 
-## Accuracy
+## Accuracy (eager, superseded)
+
+> Superseded by "Accuracy in graph mode" below, which adds the two controls
+> this one lacks. `identical_text` is noted here as not a judgement; the
+> stronger statement is that it cannot be one -- the no-cache arm alone
+> differed on 4 of 8 answers.
 
 Two-pass marker recall (`tools/kv_offload_twopass_check.py`, 8 prompts of
 ~15,000 tokens, same seed on both arms):
@@ -310,123 +332,127 @@ tier, so the comparison has a positive control: it is not measuring
 recomputation. `identical_text` is not a judgement -- the engine is not
 bit-reproducible under concurrency.
 
-## Known issue: concurrency
+## The concurrency fault, and what it actually was
 
-**The engine dies at concurrency 8** with
-`ValueError: Request ... needs state at N, found N+1; replay from a
-recoverable boundary`. Concurrency 1 is clean over full 120 s windows with the
-tier actively storing and retrieving.
+**Fixed.** The engine used to die at concurrency 8 with
+`ValueError: Request ... needs state at N, found N+1`, and the condition was
+characterised then as "chunked prefill x KV connector x concurrency". That
+characterisation was right about when it fired and wrong about why.
 
-Characterised by two arms that differ in one variable, with the STATE leg
-structurally inert in **both**:
+The cause was a boundary admitted with no state load behind it.
+`update_state_after_alloc` called `resolve_load` and discarded the answer;
+False means nothing was queued -- the index no longer claims the boundary, or
+the request already has a load in flight -- while the admission went ahead,
+leaving PAGE restored at a position with nothing on its way to put STATE
+there. `resolve_load` also tested the frontier against `state_interval` when
+the boundaries that exist are block aligned, so it declined exactly the
+frontiers the hit cap had just accepted.
 
-| `state_interval` | `max-num-batched-tokens` | chunked prefill | result |
+Both are fixed: the test is on the block grid, and an admission whose load
+did not queue is refused into the existing miss path (the tier fails a
+destination it cannot resolve, `_join_kda` invalidates the blocks, vLLM
+recomputes). The row-alignment guard that used to fire alongside this was
+measured unsupportable on vLLM 0.31's V2 runner -- `num_computed_tokens_np`
+is not a coherent per-step snapshot there, and the two arrays were not even
+permutations of each other -- so it reports once instead of raising.
+
+Measured after, in graph mode at 24 lanes with a 4 GiB tier: 32 rounds with
+no stale cursor and no refused admission, 886 state loads of which 16 missed
+and recomputed.
+
+The old workaround in this section -- one-shot prefill -- is still not one,
+for the reason given then: the frontier jumps from 0 to the prompt length, no
+boundary is landed on, and the tier supplies nothing.
+
+## CUDA graphs
+
+Graphs run. `CUDAGRAPH=1` sets `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` and the
+server reports `cudagraph_mode=FULL_AND_PIECEWISE` with ~1.88 GiB of capture
+memory; the plugin turns the decoder's SWA bounded replay off for V4.1 of its
+own accord, because this path stages a step outside the forward and a
+replayed tail of rows no longer describes it.
+
+Everything in "Measured in graph mode" below was taken that way. The older
+sections above it were taken at `cudagraph_mode=NONE` and are kept for the
+record; their ratios are not comparable to the graph-mode ones, and neither
+their noise floor is -- eager repeats held ~1.3 %, graph-mode repeats of one
+configuration spanned 2.5x on the harness that produced them.
+
+The account of what used to block capture, and the attempts that stood it
+down, has been overtaken and is not reproduced.
+
+
+## Measured in graph mode
+
+The design was written and committed before any of these numbers existed
+(`DeepSeek-V4.1-LMCache-perf-preregistration.md`), and the statistic is a
+program rather than a hand calculation
+(`tools/kv_offload_throughput_verdict.py`), because "median of per-pair
+ratios, warm round discarded" left as prose is still computed after the data
+is in.
+
+Three ON/OFF pairs, **alternating boots**, three rounds each with the first
+discarded. TP4 on one node, `cudagraph_mode=FULL_AND_PIECEWISE` on both arms,
+240 requests at 24 lanes over 12 documents of ~7,600 tokens, `ignore_eos`
+with `max_tokens=64`. Both arms were read back out of their own logs rather
+than assumed: `state_leg=1 enable_prefix_caching=True` against
+`state_leg=0 enable_prefix_caching=False`, `graph_lines=4` on both, and
+identical totals of 1,822,800 prompt and 15,360 completion tokens in all 18
+rounds.
+
+| pair | ON median req/s | OFF median req/s | ratio |
 |---|---|---|---|
-| 2^30 (leg inert) | 4096 | on | **crash** |
-| 4096 | 32768 (= `max-model-len`) | off | 124.8 s clean |
+| 1 | 12.4493 | 5.1331 | 2.4253 |
+| 2 | 12.4573 | 5.1136 | 2.4361 |
+| 3 | 13.1898 | 5.1211 | 2.5756 |
 
-So the necessary condition is **chunked prefill x KV connector x
-concurrency**, and the tier's own activity is irrelevant -- it was doing
-nothing in either arm. The OFF arm runs the identical aiperf configuration at
-concurrency 8 for 120 s without incident, and concurrency 1 is clean with the
-tier actively storing and retrieving.
+**Headline: 2.4361x**, with the within-arm range at most 7.4 % against a
+143.6 % effect. Latency moves with it: p50 1.83-1.94 s on against 4.65-4.67 s
+off, p99 2.09-2.38 s against 7.80-8.09 s. The tier supplied 95.0-95.8 % of
+prompt tokens on every ON round and 0 on every OFF round.
 
-The second row is **not a workaround**: with one-shot prefill the frontier
-jumps straight from 0 to the prompt length, which is not a multiple of the
-interval, so no boundary is ever landed on and the tier supplies nothing
-(measured: `external_prefix_cache_hits_total` 0.0 against 1.45 M queries, and
-0.577 req/s -- *slower* than OFF). The STATE tier needs chunked prefill to
-reach a boundary during prefill, which is exactly what triggers the fault.
+**This is reuse against none.** The OFF arm cannot have prefix caching, for
+the reason in "Prefix caching is on". Do not quote 2.44x as what the tier
+buys over HBM caching; nothing here measured that.
 
-Two hypotheses were tested and refuted, both cheaply:
+### The old harness could not have produced this
 
-* The missing non-immediate-block-reuse patch (V4.1's layer name does not
-  match V4's substring markers). Real defect, fixed, **not** this one -- the
-  crash survives the fix.
-* Preemption advancing the cursor optimistically. The crash dump reads
-  `preempted_requests=0`.
+`l4.sh` asked six distinct prompts and sent twenty-four requests, so four
+copies of each prefix were in flight together and how many hit depended on
+whether they arrived together or staggered. Repeats of ONE configuration
+spanned 2.63 to 7.74 req/s. The replacement makes reuse a property of the
+design -- documents primed one at a time, a unique tail per request, decode
+work pinned by `ignore_eos`, window deltas rather than lifetime counters --
+and the same quantity now holds to 2.7 % within an arm.
 
-The failing step is a mixed batch -- one request on a 4,090-token prefill
-chunk, six on 1-token decode -- and the dumped `num_computed_tokens` contains
-the cursor's value but not the position the scheduler asked for. Fixing it
-means going into `_v41_scheduled_batch` / `_prepare` in the bridge, not the
-offload layer.
+## Accuracy in graph mode
 
-Two defects *were* found and fixed on the way, both of which put two requests
-on one state slot (signature: two requests straddling one cursor by a token
-each): `reserve` counted every key in the slot table as live, so a full table
-sent `_acquire` to its slot-0 fallback; and `assign` evicted reserved slots,
-which are absent from its batch by definition. A reservation can now also be
-refused -- `batch + reservations` may exceed the pool even though vLLM caps
-concurrency at its size -- and a refused restore recomputes instead.
+`tools/kv_offload_accuracy_arms.py`, three arms with four validity gates.
+A score alone is not evidence; what makes it evidence is the two controls.
 
-## CUDA graphs: why the numbers above are eager, and what blocks graphs
+| configuration | blind | cold (tier supply) | warm (tier supply) |
+|---|---|---|---|
+| inproc, ~17k prompts | 0/32 | 32/32 (0.0 %) | **32/32 (99.5 %)** |
+| inproc, ~2k prompts | 0/16 | 16/16 (0.0 %) | **16/16 (88.1 %)** |
+| mp, ~17k, 6 rounds | 0/16 | 16/16 (0.0 %) | **16/16 (93.8-99.7 %)** |
+| mp, ~2k, 2 rounds | 0/16 | 16/16 (0.0 %) | **16/16 (82.9-88.1 %)** |
 
-Every measurement in this document was taken with `cudagraph_mode=NONE`, on
-both arms. That is a real limit on what they mean: eager decode spends
-107-194 ms per inter-token interval here, and graphs would take a large bite
-out of exactly the part of the step that the offload speedup is measured
-against. **The ON/OFF ratios below are not extrapolable to a graph-mode
-deployment**, and the right reading of them is "offload helps this much when
-decode is eager", not "offload helps this much".
+Discriminating power is measured, not claimed: zeroing restored PAGE blocks
+while the cold arm held at 32/32 gave 15/16 at a quarter of blocks and 1/16
+at all of them. It saturates correctly and is sublinear, so read it as a
+sampling detector.
 
-Graphs were attempted, measured and stood down. The record, so the next
-attempt does not start from the beginning:
+It does not cover STATE and cannot. A state image that fails to restore is
+refused by the cursor check before a token is produced -- the request 500s and
+the engine stops -- so there is no wrong answer for this harness to score.
+PAGE has no such check. That is the division of labour and neither half
+substitutes for the other.
 
-**What was removed.** The stated reason V4.1 ran eager was that ATOM's plugin
-models are not fx-split, so vLLM's PIECEWISE mode had nothing to split on and
-would swallow the backbone whole. `VLLM_USE_BREAKABLE_CUDAGRAPH=1` ends the
-stream capture at runtime instead of splitting an fx graph, so that reason
-does not survive it. With it:
+### gsm8k cannot test the read path
 
-- `v41_stage_step` (`deepseek_v41_bridge.py`) carries the break around the
-  step's host work -- `_prepare` *and* `prepare_model_inputs` in one break,
-  because `_prepare` stages the step's index/indptr/slot tensors with kernels
-  of its own.
-- `cudagraph_mode` must be **PIECEWISE exactly**, not merely non-NONE:
-  `eager_break_during_capture` *skips the break* when the forward context
-  reports a FULL runtime mode. Under FULL the step work is recorded into the
-  graph and never runs again -- a frozen cursor, every replayed step
-  re-answering the first, with nothing raised.
-- The proxy builder's `AttentionCGSupport.NEVER` needs no change: vLLM's three
-  NEVER gates in `resolve_cudagraph_mode_and_sizes` all test FULL
-  (`mixed_mode`, `decode_mode`, `has_full_cudagraphs`), so PIECEWISE passes
-  them untouched and the honest declaration stays.
-- The dummy-batch cache must be reused, not rebuilt per call. `_prepare`'s
-  dummy branch allocated a scratch `PagedAttentionCache` each time; captured
-  kernels hold its addresses, it is freed when the capture returns, and the
-  first replay reads freed memory. Symptom: `illegal memory access`, reported
-  asynchronously inside an unrelated `copy_to_gpu`. Fixed by `_dummy_cache`.
-
-**What still blocks it.** With all of the above, V4.1 captures and serves
-without raising, and the answers degenerate into noise after the first few
-tokens (measured: 8/8 prompts, greedy, against a byte-identical eager arm that
-answers all 8 correctly). The attention is what stays behind: its kernels are
-launched with per-step host values -- the batch's longest KV extent among them
--- which a capture freezes at whatever length it recorded while every decode
-step grows past it.
-
-The ordinary remedy, an eager break on the attention op the way vLLM does for
-`unified_attention_with_output`, **does not apply as a decoration**: the
-decorator requires an in-place output buffer ("a fresh tensor returned by `fn`
-would change address each replay"), and V4.1's `Attention.forward` returns a
-fresh tensor. Applied anyway, it faults *inside capture*, not at replay.
-
-So capturing V4.1 is attention-level work -- a persistent per-layer output
-buffer plus a device-side length bound -- not configuration. Two routes, both
-real:
-
-1. V4's road: hoist every per-step host value into fixed-address buffers and
-   declare `UNIFORM_BATCH` (see `deepseek_v4_bridge.py`). Large, and V4.1's
-   step work is the thing its own builder docstring says must run inside the
-   forward.
-2. Give attention a persistent output buffer so it can legally carry the
-   break, and move the KV length bound to device memory. Costs one buffer per
-   layer at the captured width.
-
-**The gate is closed by default and deliberately.** `_breakable_cudagraph_available`
-returns False unless `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` is set, *in addition*
-to vLLM's own flag. vLLM auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH` for some
-architectures; without the second condition, a vLLM upgrade that adds V4.1 to
-that list would turn correct answers into noise with nothing in the log.
-`tests/plugin/test_vllm_deepseek_v41_cudagraph_mode.py` holds that shut.
+The CI acceptance cell passes with the connector attached (0.9303
+flexible-extract, against 0.9265 without it and a 0.91 floor), but its
+`external_prefix_cache_hits_total` is **0.0** against 4,359,985 queries and
+`loads_attempted` is 0. 20-shot gsm8k re-samples exemplars per question, so
+questions share no prefix. That run shows attaching the connector costs no
+accuracy; it shows nothing about whether the tier returns the right bytes.
