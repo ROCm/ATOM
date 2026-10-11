@@ -1322,6 +1322,7 @@ def _store_chunks(cluster, hashes, chunks, *, rank=0, world=1, master=MASTER):
 
 def test_scheduler_opens_its_store_client_on_the_first_lookup(cluster):
     scheduler = MooncakeStoreOffloadScheduler(_config())
+    scheduler._min_load_tokens = 0
     assert cluster.stores == []  # every PP stage builds one; only the head asks
     hashes = _hashes(40)
     _store_chunks(cluster, hashes, range(5))
@@ -1663,6 +1664,20 @@ def test_a_connect_that_blocked_pauses_ten_times_as_long(
     scheduler_clock.now += 10 * blocked_s
     assert lookup.lookup(_seq(0, 16)) == 0
     assert len(cluster.stores) == 2
+
+
+def test_a_prompt_too_short_to_load_is_not_looked_up(cluster):
+    scheduler = MooncakeStoreOffloadScheduler(_config())
+    scheduler._min_load_tokens = 4 * CHUNK
+    _store_chunks(cluster, _hashes(40), range(5))
+    # Its longest loadable hit, one token short of the prompt and floored to
+    # a chunk, is 3 chunks: below the threshold, so the Store is not asked.
+    assert scheduler.get_num_new_matched_tokens(_seq(1, 32)) == (0, False)
+    assert cluster.stores == []
+    # One token more and 4 chunks could load: asked.
+    assert scheduler.get_num_new_matched_tokens(_seq(2, 33)) == (32, True)
+    [store] = cluster.stores
+    assert sum(1 for call in store.calls if call[0] == "exists") == 1
 
 
 def test_lookup_hashes_a_sequence_prompt_once(cluster):
@@ -2756,6 +2771,7 @@ def test_worker_close_keeps_a_pool_a_transfer_may_still_reach(
 def test_the_scheduler_finds_what_the_worker_stored(cluster, make_worker):
     config = _config()
     scheduler = MooncakeStoreOffloadScheduler(config)
+    scheduler._min_load_tokens = 0
     worker, _ = make_worker(
         config=config, namespace=keys.store_namespace(config, CHUNK)
     )

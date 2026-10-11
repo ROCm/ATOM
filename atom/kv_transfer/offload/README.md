@@ -408,7 +408,11 @@ a copy into each slot (and the reverse).
   holds each call for seconds, so a pool that failed a lookup is not asked
   for 10 s, or ten times as long as the failed call blocked if that is
   longer, and one the scheduler could not reach for 30 s; with one pool,
-  lookups meanwhile answer `None` without asking.
+  lookups meanwhile answer `None` without asking. A prompt too short to load
+  whatever the Store holds -- its longest loadable hit, one token short of the
+  prompt and floored to a chunk, is below `OFFLOAD_MIN_LOAD_TOKENS` -- is not
+  looked up at all; its saves then cannot skip chunks the Store already holds,
+  and a put of those returns at once without a transfer.
 - With per-NIC pools the scheduler cannot tell which pool a rank writes to, so
   it asks every pool for every key, concurrently: a key is present if any pool
   holds it, and absent if a pool answered and none holds it, so a pool that

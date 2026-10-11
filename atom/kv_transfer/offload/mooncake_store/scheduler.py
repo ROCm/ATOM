@@ -529,6 +529,13 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         return seq
 
     def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+        # A prompt too short to load from the Store, whatever it holds, is not
+        # asked about: no hit is longer than the prompt less a token, floored
+        # to a chunk (`_loadable_hit`), and no shorter one reaches the load
+        # threshold. The lookup would block the scheduler thread for nothing.
+        num_prompt = int(seq.num_prompt_tokens)
+        if self._loadable_hit(num_prompt, num_prompt) < self._min_load_tokens:
+            return 0
         # Stamped before asking: the lease runs from the master's answer.
         self._looked_up_at[sid] = time.monotonic()
         return super()._fresh_tier_lookup(seq, sid)
