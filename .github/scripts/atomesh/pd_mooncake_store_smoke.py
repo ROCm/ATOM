@@ -158,6 +158,8 @@ def run_case(
     env.update(env_overrides or {})
     processes = []
     handles = []
+    setup_completed = False
+    timed_out = False
     master_log = (output / "master.log").open("w")
     master = subprocess.Popen(
         [str(Path(mooncake.__file__).parent / "mooncake_master"), "--port", str(port)],
@@ -237,6 +239,7 @@ def run_case(
             if time.monotonic() >= deadline:
                 raise TimeoutError("Store setup timed out")
             time.sleep(0.1)
+        setup_completed = True
         (output / "start-io").touch()
         while time.monotonic() < deadline:
             if all(
@@ -245,7 +248,10 @@ def run_case(
             ):
                 break
             time.sleep(1)
+        else:
+            raise TimeoutError("Store I/O or GPU registration timed out")
     except TimeoutError as exc:
+        timed_out = True
         (output / "timeout.txt").write_text(str(exc))
     finally:
         (output / "release").touch()
@@ -281,9 +287,12 @@ def run_case(
         "name": name,
         "ranks": reports,
         "serialized_setup": serialized,
-        "registration_passed": len(reports) == ranks
+        "timed_out": timed_out,
+        "registration_passed": setup_completed
+        and len(reports) == ranks
         and all(r.get("direct_init") == 0 and r.get("setup_rc") == 0 for r in reports),
-        "passed": len(reports) == ranks
+        "passed": not timed_out
+        and len(reports) == ranks
         and all(
             r.get("direct_init") == 0
             and r.get("setup_rc") == 0
