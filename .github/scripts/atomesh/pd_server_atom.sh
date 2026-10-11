@@ -1130,6 +1130,15 @@ require_mooncake_store_number() {
   fi
 }
 
+# mooncake_store_wait_timeout: MOONCAKE_STORE_WAIT_TIMEOUT in decimal, once
+# require_mooncake_store_number has validated it. Bash arithmetic reads a
+# leading zero as octal: 0600 would wait 384 s, and 0900 abort the launcher.
+mooncake_store_wait_timeout() {
+  local value
+  value="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)"
+  printf '%d' "$(( 10#${value} ))"
+}
+
 # Refuses a prefill setting the Store cannot run with, and fills the owner
 # plan. Independent of the node: the owners' devices and memory are checked
 # where the Store starts.
@@ -1521,7 +1530,7 @@ report_mooncake_store_owners() {
 # first there: numa_memory_budget.py compacts each NUMA node with pins in turn,
 # two at most, and stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
 mooncake_store_cross_node_timeout() {
-  awk -v wait="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)" \
+  awk -v wait="$(mooncake_store_wait_timeout)" \
     -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
     'BEGIN { s = wait + 2 * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
 }
@@ -1598,7 +1607,8 @@ start_mooncake_store() {
     capacity=$(( capacity + mooncake_pool_capacity[pool] ))
   done
   echo "[wait] mooncake-store pools=${#mooncake_pool_devices[@]} owners here=${#mooncake_owner_plan_numa[@]} capacity=${capacity} bytes"
-  local owners_timeout="${MOONCAKE_STORE_WAIT_TIMEOUT:-1200}"
+  local owners_timeout
+  owners_timeout="$(mooncake_store_wait_timeout)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
     # The decode node mounts its owners only once it has compacted its memory.
     owners_timeout="$(mooncake_store_cross_node_timeout)"
@@ -1637,7 +1647,7 @@ start_mooncake_store_decode_owners() {
   mooncake_store_names=()
   mooncake_store_master_count=0
   local timeout
-  timeout="$(mooncake_setting MOONCAKE_STORE_WAIT_TIMEOUT 1200)"
+  timeout="$(mooncake_store_wait_timeout)"
   # The prefill node starts its masters only once it has compacted its memory.
   wait_for_mooncake_store "prefill-node masters" "$(mooncake_store_cross_node_timeout)" \
     mooncake_masters_ready "${NODE0_ADDR}"

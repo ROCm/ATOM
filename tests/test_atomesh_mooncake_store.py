@@ -705,6 +705,37 @@ stop_mooncake_store
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
+    def test_a_wait_timeout_with_a_leading_zero_waits_that_many_seconds(self):
+        # Bash arithmetic would read 0600 as octal, 384 s, and refuse 0900
+        # with the Store already started.
+        for value, seconds in (("0600", 600), ("0900", 900)):
+            with self.subTest(value=value):
+                for name in ("segments", "master-up"):
+                    (self.root / name).unlink(missing_ok=True)
+                result = self.run_shell(
+                    """
+eval "$(declare -f wait_for_mooncake_store | sed '1s/^/real_/')"
+wait_for_mooncake_store() { echo "WAIT $1 $2"; real_wait_for_mooncake_store "$@"; }
+start_mooncake_store
+stop_mooncake_store
+""",
+                    MOONCAKE_STORE_OWNERS="0:8",
+                    MOONCAKE_STORE_WAIT_TIMEOUT=value,
+                )
+                self.assertIn(f"WAIT owners {seconds}\n", result.stdout)
+
+    def test_a_decode_node_reads_the_wait_timeouts_in_decimal(self):
+        result = self.run_shell(
+            'echo "WAIT=$(mooncake_store_wait_timeout) '
+            'CROSS=$(mooncake_store_cross_node_timeout)"\n',
+            MOONCAKE_STORE="0",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="0900",
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="0600",
+        )
+        # The cross-node wait adds two compactions of 600 s.
+        self.assertIn("WAIT=900 CROSS=2100", result.stdout)
+
     def test_several_prefill_workers_on_a_node_are_refused_before_anything_starts(
         self,
     ):
