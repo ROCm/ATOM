@@ -125,6 +125,35 @@ KV_CACHE_READY_EVENT_TTL_S = 600.0
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
+class SlotPool:
+    """Free slot indices of one staging pool, shared across threads.
+
+    ``acquire`` waits on a condition until a slot is free. Every holder
+    releases its slot once the copy or RDMA write using it returned, so the
+    wait always ends. The consumer staging rows, the DSA index staging slots
+    and the MLA staging slots each keep one.
+    """
+
+    def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
+        self.size = size
+        self.free = list(range(size))
+        # Logged with ``size`` whenever a caller has to wait.
+        self._exhausted_warning = exhausted_warning
+        self._cv = threading.Condition()
+
+    def acquire(self) -> int:
+        with self._cv:
+            if not self.free and self._exhausted_warning:
+                logger.warning(self._exhausted_warning, self.size)
+            self._cv.wait_for(lambda: self.free)
+            return self.free.pop()
+
+    def release(self, idx: int) -> None:
+        with self._cv:
+            self.free.append(idx)
+            self._cv.notify()
+
+
 def _swa_ring_ids(seq) -> list[int]:
     """The ids the SWA region transfer is keyed by: this request's ring slot.
 
@@ -801,18 +830,15 @@ class MooncakeConnector(KVConnectorBase):
         self._staging_base_addr: int = 0
         self._staging_slot_bytes: int = 0
         self._staging_pool_size: int = 0
-        self._staging_free: list[int] = []
-        self._staging_lock = threading.Lock()
+        self._staging_slots = SlotPool()
         self._index_staging_pool_size: int = 0
         self._index_staging_chunk_pages: int = 0
-        self._index_staging_free: list[int] = []
-        self._index_staging_lock = threading.Lock()
+        self._index_staging_slots = SlotPool()
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
         # MLA staging for DCP consumers (see _execute_staged_mla_regions).
         self._mla_staging: torch.Tensor | None = None
-        self._mla_staging_free: list[int] = []
-        self._mla_staging_cv = threading.Condition()
+        self._mla_staging_slots = SlotPool()
         # Each send worker gathers on its own stream (see _send_worker_stream).
         self._send_worker_streams = threading.local()
         # region_idx -> uint8 [num_blocks * block_size, token_bytes] alias
@@ -1006,11 +1032,18 @@ class MooncakeConnector(KVConnectorBase):
             self._staging_base_addr = tt.staging_region.base_addr
             self._staging_slot_bytes = tt.staging_region.unit_bytes
             self._staging_pool_size = tt.staging_pool_size
-            self._staging_free = list(range(tt.staging_pool_size))
+            self._staging_slots = SlotPool(
+                tt.staging_pool_size,
+                "Staging pool exhausted (size=%d), blocking until a slot is "
+                "freed. Increase ATOM_PD_STAGING_POOL if this happens frequently.",
+            )
         if tt.index_staging_region is not None:
             self._index_staging_pool_size = tt.index_staging_pool_size
             self._index_staging_chunk_pages = tt.index_staging_chunk_pages
-            self._index_staging_free = list(range(tt.index_staging_pool_size))
+            self._index_staging_slots = SlotPool(
+                tt.index_staging_pool_size,
+                "Index staging pool exhausted (size=%d), waiting for a slot",
+            )
             self._prepare_sharded_index = tt.prepare_sharded_index
             self._gather_sharded_index = tt.gather_sharded_index
 
@@ -1298,7 +1331,9 @@ class MooncakeConnector(KVConnectorBase):
         self._mla_staging = torch.empty(
             (pool_size, slot_bytes), dtype=torch.uint8, device=device
         )
-        self._mla_staging_free = list(range(pool_size))
+        # A worker holds at most one slot, so it may wait with fewer slots
+        # than workers; that is the byte cap at work, not worth a warning.
+        self._mla_staging_slots = SlotPool(pool_size)
         self._mla_token_views = token_views
         logger.info(
             "PD MLA staging: %d slots x %.1f MiB for %d MLA regions, "
@@ -1472,7 +1507,7 @@ class MooncakeConnector(KVConnectorBase):
                 # Acquire one staging pool slot for this request's state RDMA.
                 consumer_staging_addr = 0
                 if self._staging_pool_size > 0:
-                    consumer_staging_pool_idx = self._acquire_staging_slot()
+                    consumer_staging_pool_idx = self._staging_slots.acquire()
                     consumer_staging_addr = (
                         self._staging_base_addr
                         + consumer_staging_pool_idx * self._staging_slot_bytes
@@ -1592,60 +1627,8 @@ class MooncakeConnector(KVConnectorBase):
                 )
 
     # -----------------------------------------------------------------
-    # Staging pool management
+    # Send worker streams
     # -----------------------------------------------------------------
-
-    def _acquire_staging_slot(self) -> int:
-        with self._staging_lock:
-            if self._staging_free:
-                return self._staging_free.pop()
-        logger.warning(
-            "Staging pool exhausted (size=%d), blocking until a slot is freed. "
-            "Increase ATOM_PD_STAGING_POOL if this happens frequently.",
-            self._staging_pool_size,
-        )
-        while True:
-            time.sleep(0.001)
-            with self._staging_lock:
-                if self._staging_free:
-                    return self._staging_free.pop()
-
-    def _release_staging_slot(self, idx: int) -> None:
-        with self._staging_lock:
-            self._staging_free.append(idx)
-
-    def _acquire_index_staging_slot(self) -> int:
-        with self._index_staging_lock:
-            if self._index_staging_free:
-                return self._index_staging_free.pop()
-        logger.warning(
-            "Index staging pool exhausted (size=%d), waiting for a slot",
-            self._index_staging_pool_size,
-        )
-        while True:
-            time.sleep(0.001)
-            with self._index_staging_lock:
-                if self._index_staging_free:
-                    return self._index_staging_free.pop()
-
-    def _release_index_staging_slot(self, idx: int) -> None:
-        with self._index_staging_lock:
-            self._index_staging_free.append(idx)
-
-    def _acquire_mla_staging_slot(self) -> int:
-        """A free MLA staging slot, waiting for one if the pool is drained.
-
-        A worker holds at most one slot and releases it once its RDMA write
-        returns, so the wait always ends even with fewer slots than workers.
-        """
-        with self._mla_staging_cv:
-            self._mla_staging_cv.wait_for(lambda: self._mla_staging_free)
-            return self._mla_staging_free.pop()
-
-    def _release_mla_staging_slot(self, idx: int) -> None:
-        with self._mla_staging_cv:
-            self._mla_staging_free.append(idx)
-            self._mla_staging_cv.notify()
 
     def _send_worker_stream(self) -> torch.cuda.Stream:
         """The calling send worker's staging stream, created on first use.
@@ -2599,7 +2582,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_addrs, sizes)`` for the filled slot. The slot goes back to the
         pool once the write returned. Shared by the staged and landed paths.
         """
-        pool_idx = self._acquire_mla_staging_slot()
+        pool_idx = self._mla_staging_slots.acquire()
         try:
             staging = self._mla_staging[pool_idx]
             used = self._gather_mla_rows(stream, staging, pieces)
@@ -2615,7 +2598,7 @@ class MooncakeConnector(KVConnectorBase):
                 deadline=deadline,
             )
         finally:
-            self._release_mla_staging_slot(pool_idx)
+            self._mla_staging_slots.release(pool_idx)
 
     def _upload_mla_gather_index(
         self, host_index: np.ndarray, kv_cache_ready_event: torch.cuda.Event
@@ -2682,7 +2665,7 @@ class MooncakeConnector(KVConnectorBase):
     ) -> bool:
         """GPU-repack one index layer/chunk, then RDMA its local pages."""
 
-        pool_idx = self._acquire_index_staging_slot()
+        pool_idx = self._index_staging_slots.acquire()
         try:
             stream = self._send_worker_stream()
             try:
@@ -2740,7 +2723,7 @@ class MooncakeConnector(KVConnectorBase):
                 return False
             return True
         finally:
-            self._release_index_staging_slot(pool_idx)
+            self._index_staging_slots.release(pool_idx)
 
     def _execute_block_slot_transfer(
         self,
@@ -2950,7 +2933,7 @@ class MooncakeConnector(KVConnectorBase):
         producer_pool_idx = -1
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
         if self._gather_slot is not None and consumer_staging_addr:
-            producer_pool_idx = self._acquire_staging_slot()
+            producer_pool_idx = self._staging_slots.acquire()
             self._gather_slot(src_slot, producer_pool_idx)
             # Synchronize on the gather kernel before NIC starts reading the
             # staging buffer. Without this, the RDMA can race the still-in-flight
@@ -2986,7 +2969,7 @@ class MooncakeConnector(KVConnectorBase):
             logger.error("[PRODUCER] slot transfer failed for req %s", req_id)
 
         if producer_pool_idx >= 0:
-            self._release_staging_slot(producer_pool_idx)
+            self._staging_slots.release(producer_pool_idx)
         return slot_ok
 
     def _wait_for_prefill_data(self, req_id: str) -> dict | None:
@@ -3349,13 +3332,13 @@ class MooncakeConnector(KVConnectorBase):
         if failed:
             # Return the staging row to the pool. The scatter is deliberately
             # skipped -- the bytes never landed -- but the row itself must not
-            # leak, or _acquire_staging_slot() blocks forever once the pool is
+            # leak, or _staging_slots.acquire() blocks forever once the pool is
             # exhausted by repeated failures.
             slot_info = self._pending_recv_slots.pop(req_id, None)
             if slot_info is not None:
                 _, pool_idx = slot_info
                 if pool_idx >= 0:
-                    self._release_staging_slot(pool_idx)
+                    self._staging_slots.release(pool_idx)
             self._pending_recv_blocks.pop(req_id, None)
             with self._completion_lock:
                 self.failed_recving.add(req_id)
@@ -3371,7 +3354,7 @@ class MooncakeConnector(KVConnectorBase):
             compute_slot, pool_idx = slot_info
             if pool_idx >= 0:
                 self._scatter_slot(compute_slot, pool_idx)
-                self._release_staging_slot(pool_idx)
+                self._staging_slots.release(pool_idx)
         dst_blocks = self._pending_recv_blocks.pop(req_id, None)
         if dst_blocks:
             with self._fence_lock:

@@ -119,8 +119,7 @@ def test_staged_index_descriptors_stay_inside_one_destination_mr(monkeypatch):
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     conn = object.__new__(mc.MooncakeConnector)
     conn._MAX_RDMA_CHUNK_BYTES = 2 * 64 + 10  # two 64-byte pages per MR
-    conn._acquire_index_staging_slot = lambda: 0
-    conn._release_index_staging_slot = lambda _idx: None
+    conn._index_staging_slots = mc.SlotPool(1)
     conn._send_worker_stream = _Stream
     conn._gather_sharded_index = lambda *_args: (10000, 5)
     conn._nic = _Nic()
@@ -233,8 +232,7 @@ def _producer(mc, regions, *, pool_size=0, slot_pages=0):
         conn._mla_staging = torch.empty(
             (pool_size, slot_pages * PAGE_BYTES), dtype=torch.uint8
         )
-        conn._mla_staging_free = list(range(pool_size))
-        conn._mla_staging_cv = threading.Condition()
+        conn._mla_staging_slots = mc.SlotPool(pool_size)
         conn._stream = _Stream()
         conn._send_worker_stream = lambda: conn._stream
         conn._mla_token_views = {
@@ -354,7 +352,7 @@ def test_staged_mla_matches_per_token_bytes(
     assert new._nic.descriptors <= 3 * len(dst_ids)
     assert set(new._nic.labels) == {"staged-mla"}
     assert new._stream.waited  # ordered after the ready event
-    assert sorted(new._mla_staging_free) == [0, 1]  # every slot returned
+    assert sorted(new._mla_staging_slots.free) == [0, 1]  # every slot returned
     # The per-token path sends one descriptor per owned token per region.
     plan = build_dcp_shard_plan(
         src_ids, block_size=BLOCK_SIZE, dcp_size=dcp_size, dcp_rank=dcp_rank
@@ -427,15 +425,14 @@ def test_staged_mla_workers_wait_for_a_shared_slot():
     """Fewer slots than workers: a worker blocks until a slot is released."""
     mc = _mooncake()
     conn = _producer(mc, _source_regions(1, 1), pool_size=1, slot_pages=1)
-    assert conn._acquire_mla_staging_slot() == 0
+    pool = conn._mla_staging_slots
+    assert pool.acquire() == 0
     got = []
-    waiter = threading.Thread(
-        target=lambda: got.append(conn._acquire_mla_staging_slot())
-    )
+    waiter = threading.Thread(target=lambda: got.append(pool.acquire()))
     waiter.start()
     waiter.join(0.2)
     assert waiter.is_alive() and got == []
-    conn._release_mla_staging_slot(0)
+    pool.release(0)
     waiter.join(5)
     assert got == [0]
 
@@ -460,13 +457,13 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
         request.update(mla_landing=offer, notify_host="decode", notify_port=1)
     events = []
     conn._stream.synchronize = lambda: events.append("sync")
-    release = conn._release_mla_staging_slot
+    release = conn._mla_staging_slots.release
 
     def release_slot(idx):
         events.append("release")
         release(idx)
 
-    conn._release_mla_staging_slot = release_slot
+    conn._mla_staging_slots.release = release_slot
     index_select = torch.index_select
     calls = []
 
@@ -481,7 +478,7 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
     with pytest.raises(RuntimeError, match="gather failed"):
         _run(mc, conn, request, range(4), [3, 5], object())
     assert events == ["sync", "release"]
-    assert conn._mla_staging_free == [0]
+    assert conn._mla_staging_slots.free == [0]
     if landing:
         # Never announced, so the credit went back too.
         assert conn._landing_credits.acquire("consumer:1", 1, 0) == 0
@@ -495,8 +492,8 @@ def test_a_failed_index_gather_ends_before_its_slot_is_released(monkeypatch):
     stream = _Stream()
     stream.synchronize = lambda: events.append("sync")
     conn._send_worker_stream = lambda: stream
-    conn._acquire_index_staging_slot = lambda: 0
-    conn._release_index_staging_slot = lambda _idx: events.append("release")
+    conn._index_staging_slots = mc.SlotPool(1)
+    conn._index_staging_slots.release = lambda _idx: events.append("release")
 
     def gather_fails(*_args):
         raise RuntimeError("gather failed")

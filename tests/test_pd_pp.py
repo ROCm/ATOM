@@ -908,13 +908,15 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
 
     The consumer reserves a row before asking the producer to write. When the
     producer reports failure the bytes never landed, so the scatter is skipped
-    on purpose -- but the row still has to go back, or _acquire_staging_slot()
+    on purpose -- but the row still has to go back, or _staging_slots.acquire()
     blocks forever once repeated failures drain the pool.
     """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
     scattered = []
     conn = _make_connector(
-        _staging_lock=threading.Lock(),
-        _staging_free=[],
+        _staging_slots=mc.SlotPool(),
         _scatter_slot=lambda *args: scattered.append(args),
     )
     conn._pending_recv_expected["r1"] = 1
@@ -922,7 +924,7 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
 
     assert conn._record_write_done("r1", 0, 0, 0, success=False)
 
-    assert conn._staging_free == [3], "staging row was not returned to the pool"
+    assert conn._staging_slots.free == [3], "staging row was not returned to the pool"
     assert not scattered, "a failed transfer must not scatter its staging row"
     assert "r1" not in conn._pending_recv_slots
     assert "r1" in conn.failed_recving
@@ -930,10 +932,13 @@ def test_failed_write_done_returns_the_staging_row_to_the_pool():
 
 def test_failed_write_done_without_a_staging_row_is_a_noop():
     """Block-only transfers reserve no row; the failure path must not crash."""
-    conn = _make_connector(_staging_lock=threading.Lock(), _staging_free=[])
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = _make_connector(_staging_slots=mc.SlotPool())
     conn._pending_recv_expected["r1"] = 1
     assert conn._record_write_done("r1", 0, 0, 0, success=False)
-    assert conn._staging_free == []
+    assert conn._staging_slots.free == []
     assert "r1" in conn.failed_recving
 
 
@@ -1751,8 +1756,8 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
     conn = _matched_rail_producer()
-    conn._acquire_index_staging_slot = lambda: 3
-    conn._release_index_staging_slot = MagicMock()
+    conn._index_staging_slots = MagicMock()
+    conn._index_staging_slots.acquire.return_value = 3
     staging_stream = SimpleNamespace(synchronize=MagicMock())
     conn._send_worker_stream = lambda: staging_stream
     conn._gather_sharded_index = lambda *_args: (10000, 2)
@@ -1773,4 +1778,4 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
         deadline=None,
     )
     staging_stream.synchronize.assert_called_once()
-    conn._release_index_staging_slot.assert_called_once_with(3)
+    conn._index_staging_slots.release.assert_called_once_with(3)

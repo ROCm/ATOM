@@ -766,8 +766,7 @@ def _producer(mc, regions, *, staging_rows=None):
         conn._mla_staging = torch.empty(
             (2, staging_rows * TOKEN_BYTES), dtype=torch.uint8
         )
-        conn._mla_staging_free = [0, 1]
-        conn._mla_staging_cv = threading.Condition()
+        conn._mla_staging_slots = mc.SlotPool(2)
         conn._stream = _Stream()
         conn._send_worker_stream = lambda: conn._stream
         conn._mla_token_views = {
