@@ -481,19 +481,6 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             chunk_hashes=hashes[: (transfer_end // self.chunk_size) * DIGEST_BYTES],
         )
 
-    def _new_load_operation(self, seq: Any) -> LoadOperationId:
-        operation = super()._new_load_operation(seq)
-        # The worker restores KV straight into allocated blocks, which never
-        # pass through `hash_blocks()`. Naming where the load starts lets
-        # `Scheduler._mark_offload_load_ready` publish the loaded prefix into
-        # the HBM prefix index once the load succeeds, so a later turn hits it
-        # in HBM instead of loading it again; without it the suffix prefill
-        # finds its parent block unhashed and cannot register its own blocks
-        # either. Loads are dispatched only from a chunk-aligned post-allocate
-        # HBM frontier, which is always a hash-block boundary.
-        seq.offload_load_start_tokens = int(seq.num_cached_tokens)
-        return operation
-
     def save_abandon_timeout_s(self) -> float:
         """Seconds a deferred save may sit before the engine reclaims it.
 

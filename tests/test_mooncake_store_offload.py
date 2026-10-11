@@ -1740,7 +1740,6 @@ def test_dense_scheduler_load_request_is_unchanged(monkeypatch):
     assert request.token_ids == list(range(32))
     assert request.chunk_hashes is None
     assert request.block_ids == seq.block_table
-    assert not hasattr(seq, "offload_load_start_tokens")
 
 
 def test_scheduler_settings(cluster):
