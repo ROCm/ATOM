@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 static const size_t thp_size = 2UL * 1024 * 1024;
@@ -22,14 +23,29 @@ static const size_t thp_size = 2UL * 1024 * 1024;
 #endif
 
 static int populate_thp(void *address, size_t length, const char *kind) {
-    int rc = madvise(address, length, MADV_POPULATE_WRITE);
-    if (rc == 0)
-        rc = madvise(address, length, MADV_COLLAPSE);
-    int error = errno;
-    fprintf(stderr, "[DEBUG-mooncake-thp] populate=%s bytes=%zu address=%p rc=%d errno=%d\n",
-            kind, length, address, rc, rc == 0 ? 0 : error);
-    errno = error;
-    return rc;
+    /* Avoid synchronous huge-page compaction on every first-touch fault.
+     * Populate movable base pages before requesting the final THP backing. */
+    const int advice[] = {MADV_NOHUGEPAGE, MADV_POPULATE_WRITE,
+                          MADV_HUGEPAGE, MADV_COLLAPSE};
+    const char *phases[] = {"base-pages", "populate", "huge-pages", "collapse"};
+    for (size_t i = 0; i < sizeof(advice) / sizeof(advice[0]); ++i) {
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu begin\n",
+                kind, phases[i], length);
+        int rc = madvise(address, length, advice[i]);
+        int error = errno;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double seconds = (end.tv_sec - start.tv_sec) +
+                         (end.tv_nsec - start.tv_nsec) / 1e9;
+        fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu rc=%d errno=%d seconds=%.3f\n",
+                kind, phases[i], length, rc, rc == 0 ? 0 : error, seconds);
+        if (rc != 0) {
+            errno = error;
+            return rc;
+        }
+    }
+    return 0;
 }
 
 static int matches_size(const char *name, size_t size) {
@@ -56,7 +72,7 @@ void *aligned_alloc(size_t alignment, size_t size) {
         int rc = madvise(address, size, MADV_HUGEPAGE);
         if (rc == 0)
             rc = populate_thp(address, size, "local-buffer");
-        fprintf(stderr, "[DEBUG-mooncake-thp] local-buffer=%zu address=%p advice=%d\n",
+        fprintf(stderr, "[mooncake-store-thp] local-buffer=%zu address=%p advice=%d\n",
                 size, address, rc);
         if (rc != 0) {
             int error = errno;
@@ -79,7 +95,7 @@ long mbind(void *address, unsigned long length, int mode,
     long rc = syscall(SYS_mbind, address, length, effective_mode, nodes,
                       maxnode, flags);
     if (selected)
-        fprintf(stderr, "[DEBUG-mooncake-thp] numa-policy=%d requested=%d bytes=%lu rc=%ld\n",
+        fprintf(stderr, "[mooncake-store-thp] numa-policy=%d requested=%d bytes=%lu rc=%ld\n",
                 effective_mode, mode, length, rc);
     if (rc == 0 && selected)
         rc = populate_thp(address, length, "numa-region");
@@ -117,7 +133,7 @@ static void *map_segment(void *address, size_t length, int prot, int flags,
     if (suffix)
         munmap((void *)(start + length), suffix);
     int rc = madvise((void *)start, length, MADV_HUGEPAGE);
-    fprintf(stderr, "[DEBUG-mooncake-thp] global-segment=%zu address=%p advice=%d\n",
+    fprintf(stderr, "[mooncake-store-thp] global-segment=%zu address=%p advice=%d\n",
             length, (void *)start, rc);
     if (rc != 0) {
         int error = errno;
