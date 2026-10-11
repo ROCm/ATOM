@@ -283,6 +283,10 @@ jobs:
           timeout 20s squeue --noheader --format='%i %T %D %j %N %R %a %q' \
             > inspection/squeue.tmp 2> inspection/squeue-errors.txt || true
           cp inspection/squeue.tmp inspection/cluster-squeue.txt
+          # Read-only scheduling evidence; omit commands and environment fields.
+          timeout 20s scontrol show jobs 2> inspection/cluster-job-times.err \
+            | awk '/^JobId=|^[[:space:]]+(JobState=|RunTime=|StartTime=|NodeList=|ReqNodeList=|Partition=)/' \
+              > inspection/cluster-job-times.txt || true
           if [[ "${CANCEL_PENDING_STORE}" == "true" ]]; then
             while read -r job_id job_state _ job_name _; do
               [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
