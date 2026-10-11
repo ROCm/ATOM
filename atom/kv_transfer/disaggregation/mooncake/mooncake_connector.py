@@ -16,8 +16,10 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -2376,7 +2378,8 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         regions: list[tuple[int, int, int]],
         req_id: str,
-        kv_cache_ready_event: torch.cuda.Event,
+        stream: torch.cuda.Stream,
+        src_token_index: torch.Tensor,
         *,
         engine=None,
         deadline: float | None = None,
@@ -2388,13 +2391,12 @@ class MooncakeConnector(KVConnectorBase):
         staging slot is filled page-major with as many (region, page range)
         items as fit, so the NIC sees one descriptor per run of adjacent
         destination pages instead of one per token. The bytes written match
-        the per-token path exactly. ``first_pages`` skips each region's pages
-        before that index (already landed, see _execute_mla_regions).
+        the per-token path exactly. ``stream`` and ``src_token_index`` come
+        from ``_upload_mla_gather_index`` of ``source_token_per_dst_token``.
+        ``first_pages`` skips each region's pages before that index (already
+        landed, see _execute_mla_regions).
         """
         block_size = self.block_size
-        stream, src_token_index = self._upload_mla_gather_index(
-            plan.source_token_per_dst_token(), kv_cache_ready_event
-        )
         slots = pack_slots(
             [bpb for _, _, bpb in regions],
             len(dst_block_ids),
@@ -2403,55 +2405,56 @@ class MooncakeConnector(KVConnectorBase):
             first_pages,
         )
         for items in slots:
-            pool_idx = self._acquire_mla_staging_slot()
-            try:
-                staging = self._mla_staging[pool_idx]
-                self._gather_mla_rows(
-                    stream,
-                    staging,
-                    [
-                        (
-                            regions[pos][0],
-                            src_token_index[start * block_size : stop * block_size],
-                            off,
-                        )
-                        for pos, start, stop, off in items
-                    ],
+            pieces = [
+                (
+                    regions[pos][0],
+                    src_token_index[start * block_size : stop * block_size],
+                    off,
                 )
-                # Coalesced runs stop at the destination's MR chunk boundaries,
-                # which the per-token descriptors never cross either.
-                runs = []
-                for region_pos, page_start, page_stop, offset in items:
-                    _, dst_base, bpb = regions[region_pos]
-                    runs.append(
-                        plan.slice_pages(page_start, page_stop).staged_page_runs(
-                            dst_block_ids[page_start:page_stop],
-                            staging.data_ptr() + offset,
-                            dst_base,
-                            bpb // block_size,
-                            self._rdma_chunk_units(bpb),
-                        )
-                    )
-                src_addrs, dst_addrs, sizes = (
-                    np.concatenate(parts) for parts in zip(*runs)
-                )
-                if not self._rdma_write_with_retry(
-                    target,
-                    src_addrs.tolist(),
-                    dst_addrs.tolist(),
-                    sizes.tolist(),
-                    req_id,
-                    "staged-mla",
-                    engine=engine,
-                    deadline=deadline,
-                ):
-                    logger.error(
-                        "[PRODUCER] staged MLA transfer failed for req %s", req_id
-                    )
-                    return False
-            finally:
-                self._release_mla_staging_slot(pool_idx)
+                for pos, start, stop, off in items
+            ]
+            if not self._write_mla_slot(
+                stream,
+                pieces,
+                partial(self._staged_page_runs, plan, dst_block_ids, regions, items),
+                target,
+                req_id,
+                "staged-mla",
+                engine=engine,
+                deadline=deadline,
+            ):
+                logger.error("[PRODUCER] staged MLA transfer failed for req %s", req_id)
+                return False
         return True
+
+    def _staged_page_runs(
+        self,
+        plan,
+        dst_block_ids: list[int],
+        regions: list[tuple[int, int, int]],
+        items: list[tuple[int, int, int, int]],
+        staging: torch.Tensor,
+        _used: int,
+    ) -> tuple[list[int], list[int], list[int]]:
+        """RDMA descriptors of one staged slot: runs of adjacent dst pages.
+
+        Coalesced runs stop at the destination's MR chunk boundaries, which
+        the per-token descriptors never cross either.
+        """
+        runs = []
+        for region_pos, page_start, page_stop, offset in items:
+            _, dst_base, bpb = regions[region_pos]
+            runs.append(
+                plan.slice_pages(page_start, page_stop).staged_page_runs(
+                    dst_block_ids[page_start:page_stop],
+                    staging.data_ptr() + offset,
+                    dst_base,
+                    bpb // self.block_size,
+                    self._rdma_chunk_units(bpb),
+                )
+            )
+        src_addrs, dst_addrs, sizes = (np.concatenate(parts) for parts in zip(*runs))
+        return src_addrs.tolist(), dst_addrs.tolist(), sizes.tolist()
 
     def _execute_mla_regions(
         self,
@@ -2469,9 +2472,9 @@ class MooncakeConnector(KVConnectorBase):
         """Land a DCP rank's MLA rows in the consumer's slots; stage the rest.
 
         With a landing offer (``mla_landing``) the rows go out in rank order
-        without page padding (``landing_source_tokens``), packed across
-        regions into slots of the partition the consumer advertised. Each
-        slot is one RDMA descriptor, followed by ``MSG_LANDING_READY`` on the
+        without page padding (``landing_row_count``), packed across regions
+        into slots of the partition the consumer advertised. Each slot is
+        one RDMA descriptor, followed by ``MSG_LANDING_READY`` on the
         write-done socket, so the consumer sees every READY before this
         stage's write-done unless a reconnect reorders them. Rows that do not
         land go out through the staged per-page path: all of them without an
@@ -2479,23 +2482,24 @@ class MooncakeConnector(KVConnectorBase):
         frees up within ``MLA_LANDING_CREDIT_WAIT_S``. Slots are split only at
         page boundaries, so the rest is whole pages. See ``mla_landing.py``.
         """
-        first_pages = None
         deadline = request_data.get("_deadline")
+        # One upload serves both paths: the landing rows are the leading rows
+        # of the staged path's per-destination-token index.
+        stream, src_index = self._upload_mla_gather_index(
+            plan.source_token_per_dst_token(), kv_cache_ready_event
+        )
+        first_pages = None
         landing = request_data.get("mla_landing")
         if landing is not None:
             epoch = int(landing["epoch"])
             landing_slot_bytes = int(landing["slot_bytes"])
-            rows = plan.landing_source_tokens()
             slots = pack_slots(
                 [bpb // self.block_size for _, _, bpb in regions],
-                rows.size,
+                plan.landing_row_count(),
                 min(self._mla_staging.shape[1], landing_slot_bytes),
                 self.block_size,
             )
             if len(slots) >= MLA_LANDING_MIN_SLOTS:
-                stream, src_rows = self._upload_mla_gather_index(
-                    rows, kv_cache_ready_event
-                )
                 notify_path = make_zmq_path(
                     "tcp", request_data["notify_host"], request_data["notify_port"]
                 )
@@ -2504,23 +2508,21 @@ class MooncakeConnector(KVConnectorBase):
                     slot = credits.acquire(target, epoch, MLA_LANDING_CREDIT_WAIT_S)
                     if slot is None:
                         break
-                    pool_idx = self._acquire_mla_staging_slot()
+                    dst_addr = int(landing["base"]) + slot * landing_slot_bytes
                     written = False
                     try:
-                        staging = self._mla_staging[pool_idx]
-                        used = self._gather_mla_rows(
+                        written = self._write_mla_slot(
                             stream,
-                            staging,
                             [
-                                (regions[pos][0], src_rows[start:stop], off)
+                                (regions[pos][0], src_index[start:stop], off)
                                 for pos, start, stop, off in items
                             ],
-                        )
-                        written = self._rdma_write_with_retry(
+                            lambda staging, used, dst=dst_addr: (
+                                [staging.data_ptr()],
+                                [dst],
+                                [used],
+                            ),
                             target,
-                            [staging.data_ptr()],
-                            [int(landing["base"]) + slot * landing_slot_bytes],
-                            [used],
                             req_id,
                             "landed-mla",
                             engine=engine,
@@ -2533,7 +2535,6 @@ class MooncakeConnector(KVConnectorBase):
                             # lost READY.
                             request_data.setdefault("_mla_landed", []).append(slot)
                     finally:
-                        self._release_mla_staging_slot(pool_idx)
                         if not written:
                             # Never announced, so the consumer will not return it.
                             credits.release(target, epoch, [slot])
@@ -2571,11 +2572,50 @@ class MooncakeConnector(KVConnectorBase):
             dst_block_ids,
             regions,
             req_id,
-            kv_cache_ready_event,
+            stream,
+            src_index,
             engine=engine,
             deadline=deadline,
             first_pages=first_pages,
         )
+
+    def _write_mla_slot(
+        self,
+        stream: torch.cuda.Stream,
+        pieces: list[tuple[int, torch.Tensor, int]],
+        descriptors: Callable[
+            [torch.Tensor, int], tuple[list[int], list[int], list[int]]
+        ],
+        target: str,
+        req_id: str,
+        label: str,
+        *,
+        engine=None,
+        deadline: float | None = None,
+    ) -> bool:
+        """Gather ``pieces`` into a free MLA staging slot, then RDMA the slot.
+
+        ``descriptors(staging, used)`` gives the write's ``(src_addrs,
+        dst_addrs, sizes)`` for the filled slot. The slot goes back to the
+        pool once the write returned. Shared by the staged and landed paths.
+        """
+        pool_idx = self._acquire_mla_staging_slot()
+        try:
+            staging = self._mla_staging[pool_idx]
+            used = self._gather_mla_rows(stream, staging, pieces)
+            src_addrs, dst_addrs, sizes = descriptors(staging, used)
+            return self._rdma_write_with_retry(
+                target,
+                src_addrs,
+                dst_addrs,
+                sizes,
+                req_id,
+                label,
+                engine=engine,
+                deadline=deadline,
+            )
+        finally:
+            self._release_mla_staging_slot(pool_idx)
 
     def _upload_mla_gather_index(
         self, host_index: np.ndarray, kv_cache_ready_event: torch.cuda.Event

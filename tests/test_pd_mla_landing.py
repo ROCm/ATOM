@@ -74,7 +74,7 @@ def test_landing_rows_are_the_token_runs_in_destination_order(
             interleave_size=interleave,
             dst_pages=dst_pages,
         )
-        rows = plan.landing_source_tokens()
+        rows = plan.source_token_per_dst_token()[: plan.landing_row_count()]
         src, dst, length = plan.token_runs(dst_ids)
         want_src = np.concatenate(
             [np.arange(s, s + n) for s, n in zip(src, length)] or [np.empty(0)]
@@ -841,6 +841,12 @@ def _landed_vs_per_token(
         dest.recv.on_ready(msgpack.loads(payload))
 
     new._send_on_socket = route
+    uploads = []
+    upload = new._upload_mla_gather_index
+    new._upload_mla_gather_index = lambda index, event: (
+        uploads.append(index.size) or upload(index, event)
+    )
+    new.uploads = uploads
     stop = threading.Event()
 
     def pump():
@@ -906,6 +912,8 @@ def test_landing_falls_back_to_staged_pages_without_credits(monkeypatch):
     assert labels[0] == "landed-mla"
     assert labels.count("landed-mla") == 1
     assert "staged-mla" in labels
+    # The staged rest reuses the index uploaded for landing.
+    assert len(new.uploads) == 1
 
 
 def test_small_transfers_keep_the_staged_path(monkeypatch):

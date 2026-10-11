@@ -104,21 +104,20 @@ class DCPShardPlan:
         dst = dst_ids[self.dst_page[keep]] * self.block_size + self.dst_token[keep]
         return src, dst, self.run_length[keep]
 
-    def landing_source_tokens(self) -> np.ndarray:
-        """Producer token of every row a landing slot carries, in row order.
+    def landing_row_count(self) -> int:
+        """Rows a landing slot sequence carries, unpadded.
 
-        Rows are the valid destination tokens in destination order, unpadded.
-        The valid tokens are a prefix (see ``staged_page_runs``), so they are
-        the leading rows of ``source_token_per_dst_token`` and row ``j`` lands
-        at token ``j % block_size`` of destination page ``j // block_size``.
-        The decode side relies on exactly that mapping to scatter the rows
+        Rows are the valid destination tokens in destination order. They are
+        a prefix (see ``staged_page_runs``), so they are the leading rows of
+        ``source_token_per_dst_token`` and row ``j`` lands at token
+        ``j % block_size`` of destination page ``j // block_size``. The
+        decode side relies on exactly that mapping to scatter the rows
         (``landing_scatter.landing_segments``).
         """
 
         if self.valid.size and (self.valid[1:] > self.valid[:-1]).any():
             raise ValueError("DCP shard plan valid tokens are not a prefix")
-        num_rows = int(self.valid.sum()) * self.interleave_size
-        return self.source_token_per_dst_token()[:num_rows]
+        return int(self.valid.sum()) * self.interleave_size
 
     def source_token_per_dst_token(self) -> np.ndarray:
         """Source token index for every destination token, page-major.
@@ -199,8 +198,8 @@ def pack_slots(
     earlier units were already sent).
 
     The staged MLA path packs destination pages (``align`` 1). Landing packs
-    the unpadded ``DCPShardPlan.landing_source_tokens`` rows with ``align``
-    the block size, so the rows a sender has not landed yet always start on
+    the ``DCPShardPlan.landing_row_count`` unpadded rows with ``align`` the
+    block size, so the rows a sender has not landed yet always start on
     a destination page and can go out as whole pages.
     """
 
