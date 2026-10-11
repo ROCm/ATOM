@@ -11,7 +11,7 @@ import atom.distributed.qwen_qsa_cp as qsa_cp
 @pytest.mark.parametrize(
     "context,tp,below_gate,on_gate",
     [
-        (131072, 4, 23, 24),
+        (131072, 4, 15, 16),
         (131072, 2, 47, 48),
         (262144, 4, 1, 2),
         (262144, 2, 15, 16),

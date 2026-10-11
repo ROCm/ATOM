@@ -50,7 +50,7 @@ def get_qsa_cp_decode_group(*, rows: int, max_seq_len: int, tp_size: int):
     if bucket >= 65536:
         minimum_rows = 2 if tp_size == 4 else 16
     elif bucket >= 32768:
-        minimum_rows = 24 if tp_size == 4 else 48
+        minimum_rows = 16 if tp_size == 4 else 48
     else:
         return None
     if rows < minimum_rows:

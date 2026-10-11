@@ -14,11 +14,12 @@ without partitioning the KV cache or GDN/PLE state.
 Set `ATOM_QWEN38_MONO_HC=1` before starting ATOM. The default is off. Dispatch
 requires gfx950, contiguous BF16 data and weights, FP32 norm weights, and the
 Flash-Next geometry: HC=4, hidden=2560, low rank=320. The served decoder calls
-`mix_fused`, which uses three FlyDSL launches at exactly 4 or 8 decode tokens:
+`mix_fused`, which uses three FlyDSL launches at 4, 8, or 16 decode tokens:
 deferred combine plus grouped norm, fused down and injection projection, then
 up projection plus gated mean. It keeps the existing two-launch path at 1–2
-tokens and native GEMMs at 16 or more tokens, where the FlyDSL path did not
-improve latency. The standalone `mix` and `combine` calls used by the MTP
+tokens and native GEMMs above 16 tokens. The 16-row isolated `mix_fused` probe
+was about even, but enabling it improved the complete 128k TP4+EP4 QSA layer.
+The standalone `mix` and `combine` calls used by the MTP
 drafter use three launches at 1–16 tokens and one launch at 1–128 tokens,
 respectively. Unsupported shapes use the native operators. The kernel and its
 packed BF16 dot helper live in ATOM and use the FlyDSL build already used by
@@ -53,10 +54,10 @@ logits, the same benchmark measured:
 | 2 | 10.73 | 12.50 | 0.86× | Native |
 | 4 | 26.45 | 14.67 | 1.80× | FlyDSL |
 | 8 | 26.31 | 18.94 | 1.39× | FlyDSL |
-| 16 | 26.37 | 27.00 | 0.98× | Native |
+| 16 | 26.37 | 27.00 | 0.98× | FlyDSL in the complete layer |
 
 These are HC component times with synthetic weights. The production path's
-three launches at 4–8 tokens are part of a decoder layer with separate
+three launches at 4–16 tokens are part of a decoder layer with separate
 attention, MoE, communication, state update, and QSA launches; the table does
 not measure whole-layer latency or model throughput.
 
@@ -178,10 +179,13 @@ TP4 uses the registered gather through 1 MiB of per-rank payload, where it
 still beat RCCL by 12–22 µs; TP2 retains its 512 KiB limit. Both transports
 are warmed before native decode graph capture.
 
-The measured dispatch gates are 24/48 rows at the 128k score bucket for
+The measured dispatch gates are 16/48 rows at the 128k score bucket for
 TP4/TP2, and 2/16 rows at the 256k bucket. Smaller contexts retain native
-selection. These gates include distinct, shared-request, ragged and padded
-rows; the native path remains selected where the exchange can lose.
+selection. The TP4 128k gate was lowered from 24 to 16 after the complete
+16-row layer improved from 290.69 to 275.73 µs when CP and HC were enabled;
+its selected token IDs matched the unsplit path exactly. The other gates
+include distinct, shared-request, ragged and padded rows; the native path
+remains selected where the exchange can lose.
 
 Captured graph times on MI355X with a distinct permuted request per row,
 including both selection and local TP sparse attention. The 1/2/48/128-row
@@ -260,19 +264,142 @@ The generated gfx950 one-row and 48-row variants use 69 and 123 VGPR, no LDS
 allocation, and no scratch spills. These are core-only results, not full GDN
 layer or model speedups.
 
-## What MiniMax-M3 mono still does differently
+## Complete decoder-layer measurements
 
-M3's sparse layer uses one persistent launch with mailbox handoffs. It fuses
-the index projection and cache write into scoring, selects inside the
-attention split tasks, merges attention into output projection, performs both
-TP reductions in-kernel, then routes and runs MoE. The Qwen component kernels
-above do not yet share that schedule. The next full-layer work should follow
-these measured M3 choices where Qwen's math permits them:
+`tools/bench_qwen38_full_layer.py` constructs a real ATOM QSA or GDN decoder
+layer with HC, MoE, and both TP reductions on four MI355X GPUs using TP4 and
+EP4. It uses a local model config and `load_dummy="xavier"`; no checkpoint
+tensors are read or downloaded. It captures each complete layer as a GPU
+graph and averages 100 replays. The baseline disables the Qwen HC, QSA short,
+QSA index CP, and merged projection paths; GDN also uses the native recurrent
+path. The tuned run enables eligible paths. PLE, which exists on only one of
+the 48 model layers, is excluded. The numbers are layer latency, not model
+throughput.
+
+The new QSA projection path joins local QKV `[3584, 2560]` and replicated
+index Q/K `[640, 2560]` weights into one block-FP8 GEMM. Both branches use
+the same activation and dynamic quantization. A cached packed weight and
+scale are built after loading; the original parameters remain available for
+checkpoint semantics. Dispatch is opt-in with
+`ATOM_QWEN38_QSA_FUSED_PROJ=1`, limited to gfx950 BF16 decode at 4/8/16 rows,
+TP4's exact FP8 shapes, and preshuffled FP32 block scales. The index cache
+update remains in place. The two projection outputs matched the unfused
+outputs bit for bit in every complete-layer run. A separate graph microbench
+measured 32.9 → 20.4 µs at 4 rows and 35.6 → 21.5 µs at 16 rows.
+
+| Layer | Context | Rows | Baseline → tuned | Gain |
+| :--- | ---: | ---: | ---: | ---: |
+| QSA | 2k | 4 | 213.35 → 181.69 µs | 1.17× |
+| QSA | 2k | 8 | 224.77 → 197.32 µs | 1.14× |
+| QSA | 128k | 4 | 261.28 → 220.04 µs | 1.19× |
+| QSA | 128k | 8 | 276.35 → 242.03 µs | 1.14× |
+| QSA | 128k | 16 | 305.38 → 275.73 µs | 1.11× |
+| QSA | 256k | 4 | 284.72 → 238.06 µs | 1.20× |
+| QSA | 256k | 8 | 305.73 → 255.32 µs | 1.20× |
+| GDN, FP32 state | — | 4 | 165.51 → 142.86 µs | 1.16× |
+| GDN, FP32 state | — | 8 | 174.13 → 157.90 µs | 1.10× |
+
+The QSA scorer now uses 256 rather than 64 column programs on gfx950 for
+4/8-row, four-head, 128-dimension decode when a rank scores at least 16,384
+compressed groups. It uses the existing scorer kernel and changes only its
+grid. Full-layer measurements with the same synthetic setup showed tuned
+128k/4, 128k/8, 256k/4 and 256k/8 latency move from approximately
+231/248/244/268 µs to 220/241/238/255 µs. The scorer's score values and
+the selected IDs are unchanged because each program still writes disjoint
+columns. At 128k/16, 256 programs did not improve the complete layer; its
+index-CP scorer remains at 64 programs. With CP disabled, 256 programs gave
+278.20 µs at 128k/16 versus 275.58 µs with CP, so CP remains selected.
+Independent PyTorch index top-k still matched at both contexts for 4 and 8
+rows, with changed-input graph replay; sparse-attention NRMSE against the
+reference was at most 0.0028.
+
+At 128k/16, enabling index CP after merged projection improved the complete
+layer from 290.69 to 284.45 µs. Enabling the existing FlyDSL HC at 16 rows
+then reached 275.73 µs. The tuned layer still spends about 131 µs in the QSA
+sublayer, 79 µs in MoE, 31 µs in each HC stage, and 18 µs in the attention TP
+reduction when those stages are captured separately. Those stage times need
+not add to the complete-layer time because they use separate graphs and
+inputs.
+
+QSA selected token IDs were identical for the measured TP4 CP cases at
+128k/16 and 256k/4/8, and merged projection outputs were exact. Complete QSA
+layer stream/pending output NRMSE was at most 0.0028 on these synthetic
+weights. GDN/4's recurrent state NRMSE was 0.00004 and attention output NRMSE
+was 0.00148, but its deferred MoE output NRMSE was 0.032. The top-10 routed
+experts were identical before and after tuning; the synthetic constant FP8
+expert weights amplify small changes in the MoE input. Checkpoint-weight
+full-layer accuracy and generation remain unverified.
+
+Direct GEMM replacement was rejected: for the QSA `(M,N,K)=(4/8,3584,2560)`
+projection the existing CK path took about 14–15 µs, ASM 20–25 µs, and CK-Tile
+34 µs with the same operands. The merged projection uses the existing CK
+backend. No AITER or FlyDSL source change was made. The complete-layer gains
+are below the requested 2× target; MoE, the QSA scorer, and the separate TP/HC
+handoffs remain the main costs.
+
+## Why the complete layer is still far from 2×
+
+At 128k/8, the current complete layer is about 241 µs; the pre-tuning layer
+was about 283 µs, a 1.17× improvement across those runs. A 2× layer would
+need to finish near 141 µs, which means removing another roughly 100 µs.
+Two separately captured HC stages take about 24 µs each, attention about
+116 µs, attention TP reduction about 15 µs, and MoE about 77 µs. Those stage
+graphs do not sum exactly to the complete layer, but show why removing one
+quantization and GEMM cannot deliver a 2× layer. A single-replay kernel
+profile of 128k/4 without index CP placed stable QSA top-k at about 24 µs,
+the merged CK projection at 20 µs, MRoPE at 13 µs, and QSA scoring at 12 µs;
+MoE's separate graph was about 71 µs. The scorer grid change saves a few
+microseconds. The large remaining costs are selection, HC up projections,
+MoE routing/experts, and cross-rank handoffs.
+Forcing AITER's HIP top-k instead of its existing stable FlyDSL top-k raised
+the 128k/4 tuned layer from about 220 to 237 µs; that backend switch was
+rejected.
+
+MiniMax-M3's sparse layer has one persistent launch (`mono/runner.py` and
+`mono/kernels/post_attn.py`). Its fused K1 performs normalization, QKV/index
+projection and cache insertion; K4 then selects, attends, projects, reduces
+across TP, routes experts, runs MoE, and reduces across TP again through
+mailboxes. It supports at most 16 rows per step. Its first three dense layers
+still use a pre-kernel, native attention, and post-kernel. At 128k, M3 scores
+1,024 index blocks of 128 tokens and keeps 16 blocks, or 2,048 attention
+keys. Qwen scores 32,768 compressed groups of four tokens and keeps 512
+groups, also 2,048 tokens. Qwen therefore ranks 32 times as many candidates
+for the same sparse-attention budget. It also sums four per-head rectified
+scores, while M3's TP4 rank owns one index head.
+
+DeepSeek V4.1's `mono/runner.py` uses K1 (`attn_pre`) and a fused K2
+(`layer_post`) per layer. K2 joins index selection, sparse attention,
+output projection, the TP reduction, HC postprocessing, the MoE and its TP
+reduction; its attention-to-MoE row is published through a mailbox without
+a launch boundary. The compressor and Engram can still run between K1 and
+K2. V4.1's selection ranks 512 winners through an in-kernel segment tree of
+8,192-column segments (`mono/index_plan.py`); it is not a stand-alone AITER
+top-k over a materialized Qwen score row. Its maximum step width is 48 rows,
+versus M3's 16.
+
+Qwen currently calls independent HC, QSA or GDN, collective, HC and MoE
+operators from `Qwen4ExpDecoderLayer.forward`. The QSA path materializes
+scores and selected IDs; index CP additionally exchanges candidates and
+performs a second top-k. Its MoE has 512 routed experts, top-10 plus shared,
+320-wide block-FP8 experts, and EP4. M3 has 128 routed experts/top-4 and
+V4.1 has 384/top-6 with TP-sharded expert intermediates. Their expert and
+communication stages cannot be reused directly for Qwen's EP layout.
+
+A Qwen layer kernel needs its own row-width-specific expert schedule and
+mailbox handoffs: index selection into sparse attention, attention output
+into TP reduction and HC, then local expert work into the EP reduction.
+The GDN path also needs its recurrent state writeback in the schedule. That
+is the structural work needed to approach a 2× complete-layer result; it is
+not implemented by the component kernels in this PR.
+
+## MiniMax-M3 techniques applicable to Qwen
+
+These M3 choices give concrete starting points for Qwen's own layer kernel:
 
 | M3 choice | Qwen status and constraint |
 | :--- | :--- |
 | Skip scoring when every sparse block fits the budget | Added for Qwen contexts up to 2,048 tokens with exact IDs and sparse output. |
-| Fuse indexer, sparse attention, output projection, TP reduction, router, and MoE | Open. The separate QSA scorer/top-k workspace and collective still introduce launch and memory round trips. |
+| Fuse indexer, sparse attention, output projection, TP reduction, router, and MoE | The main QKV and index Q/K projections now share one quantization and GEMM at 4/8/16 rows. The QSA scorer/top-k workspace, sparse attention, collective, and MoE remain separate. |
 | Use a narrow MoE schedule for 1–4 rows and expert-grouped work from 5 rows | Open. Qwen has a single-token special case and AITER's general sorted MoE, but no persistent row-width schedule joining it to attention and HC. Its 512-expert top-10 block-FP8 format needs its own stage. |
 | Change TP reduction from one-hop exchange to reduce-scatter/all-gather at wider batches | Open; M3 switches at 12 rows. Qwen's collective choice needs separate TP2/TP4 crossover measurements for its 2,560-wide output. |
 | Reuse an earlier layer's selected blocks | Not applicable to Qwen's checkpoint: each of its 12 QSA layers owns a different indexer and compressed-key cache. Reusing another layer's IDs would change the model. |
@@ -287,7 +414,7 @@ expert kernel or reusing its selected IDs would be incorrect.
 
 `tests/model_ops/test_qwen38_mono_hyperconnection.py` checks 1/2/4/8/16-token
 mix+combine parity, 32/64/128-token combine parity, served `mix_fused` parity
-at 4/8 tokens including the final mixer without injection, fallback, and
+at 4/8/16 tokens including the final mixer without injection, fallback, and
 changed-input graph replay.
 `tests/model_ops/test_qwen38_qsa_short.py` checks exact all-visible selection
 for 64/512/2,048-token contexts with ragged/padded rows and changed metadata
@@ -299,10 +426,10 @@ the same QSA component with local sparse attention. Trained HC weights from
 the official checkpoint were separately parity checked.
 `tests/test_aiter_flydsl_gdn.py` checks gfx950 recurrent GDN dispatch, state
 writeback, padded decode, and graph replay.
-The full checkpoint
-is still incomplete locally, so whole-layer accuracy, generation accuracy,
-and InferenceMAX throughput remain unmeasured. M3's one-launch sparse layer
-also includes index selection, attention, both TP reductions and MoE; this PR
-does not yet implement that layer-level fusion for Qwen's GDN/QSA and block-FP8
-MoE. The 2–3× figures above are QSA component measurements, not full-model
-speedups.
+The full checkpoint is still incomplete locally. Synthetic full-layer timing
+and numerical comparisons are reported above; checkpoint-weight full-layer
+accuracy, generation accuracy, and InferenceMAX throughput remain unmeasured.
+M3's one-launch sparse layer also includes index selection, attention, both TP
+reductions and MoE; this PR does not yet implement that layer-level fusion for
+Qwen's GDN/QSA and block-FP8 MoE. The 2–3× figures above are QSA component
+measurements, not full-model speedups.

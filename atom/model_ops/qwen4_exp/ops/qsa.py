@@ -1068,9 +1068,20 @@ def qsa_paged_mqa_logits(
             num_warps=4,
         )
         return logits, visible_groups
-    column_programs = min(
-        triton.cdiv(columns, _SCORING_BLOCK_N), _SCORING_COLUMN_PROGRAMS
-    )
+    # Long decode rows have enough independent columns to keep more CUs busy.
+    # At 4/8 rows on gfx950, 256 column programs improved complete 128k and
+    # 256k TP4+EP4 layers; wider batches already fill the device at 64.
+    program_limit = _SCORING_COLUMN_PROGRAMS
+    if (
+        q.shape[0] in (4, 8)
+        and columns >= 16384
+        and q.shape[1:] == (4, 128)
+        and q.is_cuda
+        and torch.cuda.get_device_properties(q.device).gcnArchName.split(":")[0]
+        == "gfx950"
+    ):
+        program_limit = 256
+    column_programs = min(triton.cdiv(columns, _SCORING_BLOCK_N), program_limit)
     _qsa_paged_mqa_logits_kernel[(q.shape[0], column_programs)](
         q,
         compressed_k_cache,

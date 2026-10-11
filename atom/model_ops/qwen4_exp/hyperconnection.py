@@ -54,7 +54,11 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
         super().__init__()
         if group_size <= 0 or hidden_size % group_size:
             raise ValueError("group_size must divide hidden_size")
-        self.weight = atom_parameter(torch.zeros(hidden_size))
+        # ModelRunner constructs under the checkpoint's BF16 default dtype.
+        # Keep the norm parameter FP32: both the native norm and the gfx950
+        # FlyDSL HC path use FP32 scaling, and BF16 checkpoint values load
+        # exactly into this parameter.
+        self.weight = atom_parameter(torch.zeros(hidden_size, dtype=torch.float32))
         self.group_size = group_size
         self.variance_epsilon = eps
 
@@ -217,9 +221,10 @@ class Qwen4ExpHyperConnection(nn.Module):
         # The served decoder uses mix_fused, not mix/combine. At four and
         # eight rows the FlyDSL path folds deferred combine into norm and the
         # next injection projection into the down GEMV (three launches).
-        # The existing two-launch path wins at one/two rows; native GEMMs catch
-        # up by sixteen rows.
-        if hyper_input.shape[0] in (4, 8) and self._mono_supported(hyper_input, 8):
+        # The existing two-launch path wins at one/two rows. At sixteen rows,
+        # the full TP4+EP4 QSA layer benefits even though isolated HC timing
+        # is close to the native path.
+        if hyper_input.shape[0] in (4, 8, 16) and self._mono_supported(hyper_input, 16):
             fused_weight = getattr(self, "fused_w_cat", None)
             fused_rows = getattr(self, "fused_rank", 0) + (
                 self.hc_count if self.block_inject_weight is not None else 0

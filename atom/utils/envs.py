@@ -416,6 +416,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gfx950 decode: when every visible QSA group fits the 2048-token budget,
     # emit all logical token ids directly in one FlyDSL launch.
     "ATOM_QWEN38_QSA_SHORT": lambda: os.getenv("ATOM_QWEN38_QSA_SHORT", "0") == "1",
+    # Join the main QKV and index Q/K block-FP8 projections for 4/8/16-row
+    # gfx950 decode. Both branches read the same activation and quantization.
+    "ATOM_QWEN38_QSA_FUSED_PROJ": lambda: os.getenv("ATOM_QWEN38_QSA_FUSED_PROJ", "0")
+    == "1",
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
