@@ -93,6 +93,7 @@ MLA_LANDING_CREDIT_WAIT_S = 0.010
 # out to prefill stages first come, first served (``advertise``).
 MLA_LANDING_SLOT_BYTES = 8 << 20
 MLA_LANDING_POOL_BYTES = 256 << 20
+MLA_LANDING_POOL_SLOTS = MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES
 
 _STATS_INTERVAL_S = 30.0
 # A request still waiting on a stage this long is logged once.
@@ -178,23 +179,48 @@ class LandingCredits:
 # ---------------------------------------------------------------------------
 
 
-def mla_landing_reserve_bytes(config) -> int:
-    """HBM to hold back from the KV budget for this rank's MLA landing pool.
+def mla_landing_configured(config) -> bool:
+    """Whether a Mooncake connector with ``config`` gets an MLA landing pool.
 
     ``config`` holds one Mooncake connector's ``kv_transfer_config`` (see
     ``KVConnectorFactory.kv_budget_reserve_bytes``). Only a ``kv_consumer``
-    running DCP on an MLA model allocates the pool, in ``register_kv_caches``
-    after the KV cache is sized.
+    running DCP on an MLA model lands. The reserve and the allocation in
+    ``register_kv_caches`` both ask this, so no pool goes unreserved.
     """
 
-    if (
-        not envs.ATOM_PD_MLA_LANDING
-        or getattr(config, "decode_context_parallel_size", 1) <= 1
-        or not getattr(getattr(config, "hf_config", None), "kv_lora_rank", None)
-        or config.kv_transfer_config.get("kv_role") != "kv_consumer"
-    ):
+    return bool(
+        envs.ATOM_PD_MLA_LANDING
+        and getattr(config, "decode_context_parallel_size", 1) > 1
+        and getattr(getattr(config, "hf_config", None), "kv_lora_rank", None)
+        and config.kv_transfer_config.get("kv_role") == "kv_consumer"
+    )
+
+
+def mla_landing_table_segments(config) -> int:
+    """Segments a landing rank's scatter table holds, from ``config`` alone.
+
+    One per destination page of a full pool, plus 64 item splits per slot.
+    An MLA row takes at least ``kv_lora_rank`` bytes, so a page takes at
+    least ``block_size * kv_lora_rank``. A batch needing more segments is
+    copied in several chunks.
+    """
+
+    page_bytes = config.kv_cache_block_size * config.hf_config.kv_lora_rank
+    pages_per_slot = MLA_LANDING_SLOT_BYTES // page_bytes
+    return segment_table_capacity(MLA_LANDING_POOL_SLOTS * (pages_per_slot + 64))
+
+
+def mla_landing_reserve_bytes(config) -> int:
+    """HBM to hold back from the KV budget for this rank's MLA landing.
+
+    The pool plus the scatter's int64 ``[3, segments]`` device table, both
+    allocated in ``register_kv_caches`` after the KV cache is sized.
+    """
+
+    if not mla_landing_configured(config):
         return 0
-    return MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES * MLA_LANDING_SLOT_BYTES
+    table_bytes = 3 * 8 * mla_landing_table_segments(config)
+    return MLA_LANDING_POOL_SLOTS * MLA_LANDING_SLOT_BYTES + table_bytes
 
 
 @dataclass
@@ -281,6 +307,7 @@ class LandingReceiver:
         send: Callable[[str, list], None],
         finish: Callable[[str, bool], None],
         recv_deadline_s: float,
+        table_segments: int,
     ) -> None:
         if not mla_regions:
             raise ValueError("MLA landing needs at least one MLA region")
@@ -310,9 +337,8 @@ class LandingReceiver:
             (pool_slots, slot_bytes), dtype=torch.uint8, device=self.device
         )
         self._pool_slots = pool_slots
-        # Worst case per slot: every page of every row plus one split per item.
-        rows_per_slot = slot_bytes // int(self._region_block_bytes[mla_regions].min())
-        self._max_segments = segment_table_capacity(pool_slots * (rows_per_slot + 64))
+        # Reserved with the pool (``mla_landing_table_segments``).
+        self._max_segments = table_segments
         self._table_host = self._table_dev = self._stream = None
         if self.device.type == "cuda":
             self._table_host = torch.empty(
@@ -852,7 +878,13 @@ class LandingReceiver:
             for lo in range(0, src.size, self._max_segments):
                 hi = min(src.size, lo + self._max_segments)
                 n = segment_table(src[lo:hi], dst[lo:hi], nbytes[lo:hi], table)
-                self._table_dev[:, :n].copy_(self._table_host[:, :n], non_blocking=True)
+                # Row by row: each row slice is contiguous, so the copy reads
+                # the pinned table directly. A [:, :n] slice is not, and copy_
+                # would stage it through a pageable host buffer, synchronously.
+                for row in range(3):
+                    self._table_dev[row, :n].copy_(
+                        self._table_host[row, :n], non_blocking=True
+                    )
                 scatter_segments(self.pool, origin, self._table_dev, n)
                 if hi < src.size:
                     # The next chunk reuses the pinned table.

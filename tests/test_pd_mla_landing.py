@@ -23,6 +23,7 @@ import torch
 from atom.kv_transfer.disaggregation.landing_scatter import (
     landing_segments,
     segment_table,
+    segment_table_capacity,
 )
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MSG_LANDING_CREDIT,
@@ -30,6 +31,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     LandingCredits,
     LandingReceiver,
     mla_landing_reserve_bytes,
+    mla_landing_table_segments,
 )
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
@@ -239,6 +241,7 @@ class _Dest:
             send=lambda addr, parts: self.sent.append((addr, parts)),
             finish=lambda req, failed: self.finished.append((req, failed)),
             recv_deadline_s=recv_deadline_s,
+            table_segments=segment_table_capacity(pool_slots * 64),
         )
         pool = self.recv.pool
 
@@ -1322,27 +1325,95 @@ def test_gpu_scatter_matches_rows_across_allocations_and_slot_reuse():
 # ---------------------------------------------------------------------------
 
 
-def _config(transfer, dcp=4, kv_lora_rank=512):
+def _config(transfer, dcp=4, kv_lora_rank=512, block_size=1):
     from types import SimpleNamespace
 
     return SimpleNamespace(
         kv_transfer_config=transfer,
         decode_context_parallel_size=dcp,
+        kv_cache_block_size=block_size,
         hf_config=SimpleNamespace(kv_lora_rank=kv_lora_rank),
     )
 
 
-def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch):
+# A block_size=1 rank: 32 slots of 8 MiB, and a scatter table with one
+# segment per 512-byte page plus 64 splits per slot, 24 bytes each.
+LANDING_RESERVE = (256 << 20) + 24 * segment_table_capacity(32 * (16384 + 64))
+
+
+@pytest.mark.parametrize(
+    "transfer",
+    [
+        {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+        {"kv_connector": "mooncake", "kv_role": "kv_both"},
+        {"kv_connector": "mooncake"},
+    ],
+    ids=["producer", "both", "default-role"],
+)
+def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch, transfer):
     consumer = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
-    producer = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
     monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
-    # On by default: the whole pool, 32 slots of 8 MiB.
-    assert mla_landing_reserve_bytes(_config(consumer)) == 256 << 20
-    assert mla_landing_reserve_bytes(_config(producer)) == 0
+    # On by default: the whole pool and its scatter table.
+    assert mla_landing_reserve_bytes(_config(consumer)) == LANDING_RESERVE
+    assert mla_landing_reserve_bytes(_config(transfer)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
     assert mla_landing_reserve_bytes(_config(consumer)) == 0
+
+
+def test_landing_is_built_only_where_it_was_reserved(monkeypatch):
+    # The reserve and the allocation share mla_landing_configured: a decode
+    # with kv_role kv_both used to allocate the pool with nothing reserved.
+    mc = _mooncake()
+    monkeypatch.delenv("ATOM_PD_MLA_LANDING", raising=False)
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._block_region_roles = [MLA_KV_ROLE]
+    conn._has_slot_regions = False
+    assert conn._build_mla_landing() is None  # nothing reserved
+    both = {"kv_connector": "mooncake", "kv_role": "kv_both"}
+    assert not mc.mla_landing_configured(_config(both))
+    consumer = _config({"kv_connector": "mooncake", "kv_role": "kv_consumer"})
+    assert mc.mla_landing_configured(consumer)
+    assert mla_landing_table_segments(consumer) * 24 + (256 << 20) == (LANDING_RESERVE)
+
+
+def test_the_scatter_table_goes_up_row_by_row_in_chunks(monkeypatch):
+    # A [:, :n] slice of the [3, capacity] table is not contiguous, so
+    # copy_ staged it through a pageable host buffer and waited for it.
+    from atom.kv_transfer.disaggregation.mooncake import mla_landing as ml
+
+    dest = _Dest()
+    recv = dest.recv
+    recv._max_segments = 16
+    recv._table_host = torch.zeros((3, 16), dtype=torch.int64)
+    recv._table_dev = torch.full((3, 16), -1, dtype=torch.int64)
+
+    class _Stream:
+        def wait_event(self, _event):
+            pass
+
+        def synchronize(self):
+            pass
+
+    recv._stream = _Stream()
+    monkeypatch.setattr(ml.torch.cuda, "stream", lambda _s: nullcontext())
+    launches = []
+
+    def scatter(_pool, _origin, table, n):
+        assert table is recv._table_dev
+        launches.append(table[:, :n].clone())
+
+    monkeypatch.setattr(ml, "scatter_segments", scatter)
+    src = np.arange(40, dtype=np.int64) * 8
+    dst = np.arange(40, dtype=np.int64) * 4
+    nbytes = np.full(40, 4, dtype=np.int64)
+    LandingReceiver._copy_segments(recv, src, dst, nbytes, [])
+    assert [t.shape[1] for t in launches] == [16, 16, 8]
+    table = torch.cat(launches, dim=1)
+    assert torch.equal(table[0], torch.from_numpy(src // 4))
+    assert torch.equal(table[1], torch.from_numpy(dst // 4))
+    assert torch.equal(table[2], torch.ones(40, dtype=torch.int64))
 
 
 def test_mooncake_answers_the_runner_kv_budget_reserve(monkeypatch):
@@ -1367,9 +1438,9 @@ def test_mooncake_answers_the_runner_kv_budget_reserve(monkeypatch):
     # A prefill without DCP stages: one 8 MiB slot per send worker.
     assert reserve(producer, dcp=1) == 128 << 20
     # A DCP decode rank lands into its whole pool; the offload sub adds nothing.
-    assert reserve(consumer) == 256 << 20
+    assert reserve(consumer) == LANDING_RESERVE
     assert reserve({"kv_connector": "multi", "connectors": [consumer, offload]}) == (
-        256 << 20
+        LANDING_RESERVE
     )
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
     assert reserve(consumer) == 0

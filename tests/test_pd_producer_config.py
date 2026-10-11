@@ -133,8 +133,11 @@ def test_mla_staging_slots_are_capped_by_pool_bytes():
     slot = 8 << 20
     assert mla_staging_slot_count(16, slot) == 16
     assert mla_staging_slot_count(128, slot) == 32  # 256 MiB cap
-    # A slot wider than the cap still gets one, never an empty pool.
-    assert mla_staging_slot_count(128, (256 << 20) + 64) == 1
+    # A slot wider than 8 MiB (one wide MLA block) gets fewer slots, or none,
+    # rather than outgrow the reserve: 4 x 12 MiB used to take 48 of 32 MiB.
+    assert mla_staging_slot_count(4, 12 << 20) == 2
+    assert mla_staging_slot_count(1, 12 << 20) == 0
+    assert mla_staging_slot_count(128, (256 << 20) + 64) == 0
 
 
 def _mla_producer_config(workers, **overrides):
@@ -157,11 +160,12 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
     assert mla_staging_reserve_bytes(_mla_producer_config(128)) == 256 << 20
     # The connector rounds a slot down to whole pages, so the reserve bounds
     # what it allocates for any worker count.
-    page = 16 * 576
-    slot = (8 << 20) // page * page
-    for workers in (1, 16, 31, 32, 33, 128):
-        allocated = mla_staging_slot_count(workers, slot) * slot
-        assert allocated <= mla_staging_reserve_bytes(_mla_producer_config(workers))
+    for page in (16 * 576, 12 << 20):
+        slot = max(page, (8 << 20) // page * page)
+        for workers in (1, 4, 16, 31, 32, 33, 128):
+            allocated = mla_staging_slot_count(workers, slot) * slot
+            reserved = mla_staging_reserve_bytes(_mla_producer_config(workers))
+            assert allocated <= reserved
 
 
 @pytest.mark.parametrize(

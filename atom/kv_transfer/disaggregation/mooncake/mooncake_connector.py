@@ -36,17 +36,20 @@ from atom.kv_transfer.disaggregation.base import (
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MLA_LANDING_CREDIT_WAIT_S,
     MLA_LANDING_MIN_SLOTS,
-    MLA_LANDING_POOL_BYTES,
+    MLA_LANDING_POOL_SLOTS,
     MLA_LANDING_SLOT_BYTES,
     MSG_LANDING_CREDIT,
     MSG_LANDING_READY,
     LandingCredits,
     LandingReceiver,
+    mla_landing_configured,
     mla_landing_reserve_bytes,
+    mla_landing_table_segments,
 )
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
+    mla_staging_pool_bytes,
     mla_staging_reserve_bytes,
     mla_staging_slot_count,
     send_worker_count,
@@ -812,6 +815,12 @@ class MooncakeConnector(KVConnectorBase):
         # thread, and the producer's per-decode-rank slot credits.
         self._mla_landing: LandingReceiver | None = None
         self._landing_credits = LandingCredits() if self.is_producer else None
+        # Nonzero iff the KV budget reserved a landing pool and its scatter
+        # table (mla_landing_reserve_bytes); _build_mla_landing allocates
+        # nothing otherwise.
+        self._mla_landing_table_segments = (
+            mla_landing_table_segments(config) if mla_landing_configured(config) else 0
+        )
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -908,6 +917,7 @@ class MooncakeConnector(KVConnectorBase):
     # paths; register_kv_caches sets the instance values.
     _mla_staging: torch.Tensor | None = None
     _mla_landing: LandingReceiver | None = None
+    _mla_landing_table_segments = 0
 
     def _rdma_chunk_units(self, unit_bytes: int) -> int:
         """Units per MR chunk of a region registered by ``_rdma_chunk_sizes``.
@@ -1187,10 +1197,11 @@ class MooncakeConnector(KVConnectorBase):
     def _build_mla_landing(self) -> LandingReceiver | None:
         """The consumer's MLA landing pool; None keeps staged per-page pulls.
 
-        Only a DCP consumer with MLA regions and no per-request slot regions
-        lands. ``mla_landing_reserve_bytes`` holds the pool back from the KV
-        cache budget before the regions are known, so it reserves the pool
-        for a DCP consumer of an MLA model with slot regions too.
+        Only a connector whose config reserved the pool
+        (``mla_landing_configured``: a DCP ``kv_consumer`` of an MLA model)
+        lands, and only with MLA regions and no per-request slot regions. The
+        reserve is taken before the regions are known, so it also covers a
+        consumer with slot regions, which allocates nothing.
         """
         mla_regions = [
             idx
@@ -1198,14 +1209,12 @@ class MooncakeConnector(KVConnectorBase):
             if role == MLA_KV_ROLE
         ]
         if (
-            self.is_producer
-            or self.dcp_size <= 1
-            or not envs.ATOM_PD_MLA_LANDING
+            not self._mla_landing_table_segments
             or self._has_slot_regions
             or not mla_regions
         ):
             return None
-        slots = MLA_LANDING_POOL_BYTES // MLA_LANDING_SLOT_BYTES
+        slots = MLA_LANDING_POOL_SLOTS
         receiver = LandingReceiver(
             device=self._cuda_device,
             pool_slots=slots,
@@ -1218,6 +1227,7 @@ class MooncakeConnector(KVConnectorBase):
             send=self._send_on_socket,
             finish=self._complete_recv,
             recv_deadline_s=PD_RECV_DEADLINE_S,
+            table_segments=self._mla_landing_table_segments,
         )
         logger.info(
             "PD MLA landing: %d slots x %.1f MiB for %d MLA regions, held back "
@@ -1265,6 +1275,15 @@ class MooncakeConnector(KVConnectorBase):
         widest = max(tt.block_regions[idx].unit_bytes for idx in token_views)
         slot_bytes = max(widest, MLA_STAGING_SLOT_BYTES // widest * widest)
         pool_size = mla_staging_slot_count(self._num_send_workers, slot_bytes)
+        if pool_size == 0:
+            logger.warning(
+                "PD MLA staging off: a %.1f MiB MLA block does not fit the "
+                "%.1f MiB staging reserve; MLA rows to DCP decode ranks go "
+                "per token",
+                widest / (1 << 20),
+                mla_staging_pool_bytes(self._num_send_workers) / (1 << 20),
+            )
+            return None
         device = next(iter(token_views.values())).device
         self._mla_staging = torch.empty(
             (pool_size, slot_bytes), dtype=torch.uint8, device=device
