@@ -29,18 +29,20 @@ static int populate_thp(void *address, size_t length, const char *kind) {
                           MADV_HUGEPAGE, MADV_COLLAPSE};
     const char *phases[] = {"base-pages", "populate", "huge-pages", "collapse"};
     for (size_t i = 0; i < sizeof(advice) / sizeof(advice[0]); ++i) {
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu begin\n",
-                kind, phases[i], length);
-        int rc = madvise(address, length, advice[i]);
-        int error = errno;
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double seconds = (end.tv_sec - start.tv_sec) +
-                         (end.tv_nsec - start.tv_nsec) / 1e9;
-        fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu rc=%d errno=%d seconds=%.3f\n",
-                kind, phases[i], length, rc, rc == 0 ? 0 : error, seconds);
-        if (rc != 0) {
+        for (int attempt = 1; ; ++attempt) {
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu attempt=%d begin\n",
+                    kind, phases[i], length, attempt);
+            int rc = madvise(address, length, advice[i]);
+            int error = errno;
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            double seconds = (end.tv_sec - start.tv_sec) +
+                             (end.tv_nsec - start.tv_nsec) / 1e9;
+            fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu attempt=%d rc=%d errno=%d seconds=%.3f\n",
+                    kind, phases[i], length, attempt, rc, rc == 0 ? 0 : error, seconds);
+            if (rc == 0)
+                break;
             FILE *memory = fopen("/proc/self/smaps_rollup", "r");
             if (memory) {
                 char line[256];
@@ -51,6 +53,13 @@ static int populate_thp(void *address, size_t length, const char *kind) {
                                 phases[i], huge_kib);
                 }
                 fclose(memory);
+            }
+            /* Collapse can leave most of a large range backed by THP even
+             * when it reports a transient failure. Retry only that phase. */
+            if (advice[i] == MADV_COLLAPSE && attempt < 4 &&
+                (error == EAGAIN || error == ENOMEM)) {
+                usleep(100000);
+                continue;
             }
             errno = error;
             return rc;
