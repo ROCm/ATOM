@@ -2452,7 +2452,14 @@ def test_step_event_is_reused_only_once_its_transfers_are_terminal(
     The saving is only legitimate while no consumer still reads the event as
     naming an earlier step, so the worker holds an event back until every
     transfer that named it has reported.
+
+    Pooling is opt-in now -- measured, the lmcache_driven path is not immune
+    to a re-recorded event after all -- so this turns it on to reach the
+    refcount it is about. The refcount is still the right rule for anyone who
+    does; what it cannot cover is a consumer in another process, which is why
+    the default moved.
     """
+    monkeypatch.setattr(mp_worker, "_EVENT_POOL_ON", True)
     created = []
 
     class _FakeEvent:
@@ -2484,3 +2491,43 @@ def test_step_event_is_reused_only_once_its_transfers_are_terminal(
     worker.start_load_kv(_load_step(22))
     assert len(created) == 2
     assert sorted(event.records for event in created) == [1, 2]
+
+
+def test_by_default_every_step_records_a_fresh_event(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    """No reuse unless asked, because reuse crosses a process boundary.
+
+    `lmcache_driven_transfer.retrieve` waits on the producer event, so
+    re-recording it raises `HIP error: invalid argument` in the server. The
+    worker's refcount counts only the transfers in its own process and cannot
+    see a server holding an imported handle, so "every consumer is terminal"
+    is true locally and false in fact. Measured on DeepSeek-V4.1 TP4: pooled,
+    2 of 4 harness rounds failed and one killed the engine; unpooled, 6 of 6
+    clean.
+    """
+    created = []
+
+    class _FakeEvent:
+        def __init__(self, interprocess=False):
+            self.records = 0
+            created.append(self)
+
+        def record(self, stream=None):
+            self.records += 1
+
+    monkeypatch.setattr(mp_worker.torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+
+    worker.start_load_kv(_load_step(20))
+    for _, _, _, future in adapter.loads:
+        future.ready = True
+    worker._settle_transfers()
+    worker.get_finished()
+    worker.start_load_kv(_load_step(21))
+
+    assert len(created) == 2, "a settled event must not come back"
+    assert [event.records for event in created] == [1, 1]

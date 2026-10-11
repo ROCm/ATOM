@@ -66,11 +66,27 @@ _STEP_PROBE_ON = __import__("os").environ.get("ATOM_MP_STEP_PROBE") == "1"
 
 # Kill switch for the step-event pool: ATOM_MP_EVENT_POOL=0 exports a freshly
 # created interprocess event every step instead of re-recording a pooled one.
-# Pooling is safe on the lmcache_driven path (the server waits on its own
-# event, imported from the handle) and is bypassed outright on the
-# engine_driven path -- see `_share_step_event`.  The switch stays so a
-# suspected event-lifetime problem can be ruled in or out without a rebuild.
-_EVENT_POOL_ON = __import__("os").environ.get("ATOM_MP_EVENT_POOL", "1") != "0"
+# Opt-in, because the reason it was on by default has been measured false.
+# The claim was that pooling is safe on the lmcache_driven path, the server
+# waiting on its own event imported from the handle rather than on this
+# object. It does not: `lmcache_driven_transfer.retrieve` waits on the
+# producer event, and re-recording a pooled one under it raises the same
+# `HIP error: invalid argument` the engine_driven path was already bypassed
+# for. Measured on DeepSeek-V4.1 TP4, lmcache_driven, the long-prompt
+# accuracy harness: pooled -> 2 of 4 rounds failed, one fatally, 3 HIP errors
+# server-side and 25 "transfer not terminal after 1200s" in the engine;
+# unpooled -> 6 of 6 rounds clean, both counters zero.
+#
+# The refcount cannot cover this. It counts the transfers IN THIS PROCESS
+# that named the event, and a server that imported the handle is a consumer
+# it cannot see -- so "every consumer reported terminal" is true locally and
+# false in fact.
+#
+# What it costs to leave off: ~1.3 ms to record a fresh interprocess event
+# against ~20 us to re-record a pooled one, once per step.
+# ATOM_MP_EVENT_POOL=1 takes it back for a configuration that has measured
+# the pair itself.
+_EVENT_POOL_ON = __import__("os").environ.get("ATOM_MP_EVENT_POOL", "0") == "1"
 
 # tag -> [calls, total_s, max_s, [samples since the last report]]. A mean alone
 # cannot tell a uniformly expensive call from a cheap one with a rare stall, and
@@ -242,8 +258,13 @@ class LMCacheMPConnector(KVConnectorBase):
         # async_engine_driven._prepare_gather_and_commit.  Measured on K3 TP8
         # conc16: pooled -> 5 failed stores, 5 write-locked orphans, tier 95.6%
         # full, nothing ever stored; unpooled -> 0 failures, 0 orphans, 4
-        # objects stored.  lmcache_driven is unaffected because the server waits
-        # on a separate event imported from the handle, not on this object.
+        # objects stored.
+        #
+        # This flag only says whether the event needs an IPC handle, which is
+        # a property of the transfer mode. Whether a handed-out event may be
+        # RE-RECORDED is a different question and is `_EVENT_POOL_ON`, which
+        # is now off by default: the lmcache_driven path was assumed immune
+        # and is not.
         self._share_step_event = True
 
     def register_kv_caches(
