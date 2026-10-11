@@ -5,6 +5,11 @@ if [[ "${1:-}" == --worker ]]; then
   hostname
   date -u
   scontrol show job "${SLURM_JOB_ID:-${SPUR_JOB_ID}}"
+  grep -E '^(MemTotal|MemFree|MemAvailable|SwapFree|Mlocked|Unevictable):' /proc/meminfo
+  for memory_info in /sys/devices/system/node/node*/meminfo; do
+    grep -E 'MemTotal:|MemFree:|Active\(file\):|Inactive\(file\):|AnonHugePages:' "${memory_info}" || true
+  done
+  cat /proc/buddyinfo
   python3 - <<'PY'
 import json
 from pathlib import Path

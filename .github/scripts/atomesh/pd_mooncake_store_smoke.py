@@ -384,6 +384,12 @@ def capacity_cases(root, nics):
 
 def thp_store_cases(root):
     library = os.environ["ATOMESH_THP_ALLOCATOR_LIBRARY"]
+    nic_nodes = {
+        int(path.read_text())
+        for path in Path("/sys/class/infiniband").glob("*/device/numa_node")
+    }
+    if nic_nodes != {0, 1}:
+        raise RuntimeError(f"Untested NIC NUMA topology: {nic_nodes}")
     results = []
     for name, count, segment in (
         ("eight-all-small-thp", 8, 64 * 1024**2),
@@ -402,6 +408,7 @@ def thp_store_cases(root):
                 "ATOMESH_THP_GLOBAL_SEGMENT_BYTES": str(segment),
                 "ATOMESH_THP_NUMA_REGION_BYTES": str(segment // 2),
                 "ATOMESH_THP_NUMA_FALLBACK": "1",
+                "ATOMESH_THP_NUMA_INTERLEAVE": "1",
             },
             timeout=900 if count == 8 and segment > 1024**3 else 180,
             gpu_bytes=20 * 1024**3 if segment > 1024**3 else 0,

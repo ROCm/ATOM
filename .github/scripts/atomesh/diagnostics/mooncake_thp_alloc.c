@@ -110,8 +110,17 @@ long mbind(void *address, unsigned long length, int mode,
     int selected = mode == MPOL_BIND && (uintptr_t)address % thp_size == 0 &&
                    matches_size("ATOMESH_THP_NUMA_REGION_BYTES", length);
     const char *fallback = getenv("ATOMESH_THP_NUMA_FALLBACK");
+    const char *interleave = getenv("ATOMESH_THP_NUMA_INTERLEAVE");
     int effective_mode = selected && fallback && fallback[0] == '1' &&
                          fallback[1] == '\0' ? MPOL_PREFERRED_MANY : mode;
+    /* The harness verifies NIC NUMA nodes [0, 1]. Equal base-page placement
+     * lets collapse choose either node instead of one exhausted local node. */
+    const unsigned long interleave_nodes = 3;
+    if (selected && interleave && interleave[0] == '1' && interleave[1] == '\0') {
+        effective_mode = MPOL_INTERLEAVE;
+        nodes = &interleave_nodes;
+        maxnode = 2;
+    }
     long rc = syscall(SYS_mbind, address, length, effective_mode, nodes,
                       maxnode, flags);
     if (selected)
