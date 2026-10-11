@@ -119,7 +119,8 @@ long mbind(void *address, unsigned long length, int mode,
     if (selected && interleave && interleave[0] == '1' && interleave[1] == '\0') {
         effective_mode = MPOL_INTERLEAVE;
         nodes = &interleave_nodes;
-        maxnode = 2;
+        /* Linux subtracts one before copying the nodemask bitmap. */
+        maxnode = sizeof(interleave_nodes) * 8 + 1;
     }
     long rc = syscall(SYS_mbind, address, length, effective_mode, nodes,
                       maxnode, flags);
