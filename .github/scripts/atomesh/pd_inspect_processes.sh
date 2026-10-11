@@ -24,6 +24,15 @@ while IFS= read -r container; do
     id
     ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
     ps -eo pid,ppid,etimes,pcpu,stat,args | grep -E "[n]inja|[h]ipcc|[c]lang-22" | cut -c 1-1200
+    store_pids=$(pgrep -f "pd_mooncake_store_smoke.py --worker" || true)
+    if [[ -n "${store_pids}" ]]; then
+      for pid in ${store_pids}; do
+        printf "Store process %s memory and thread states\n" "${pid}"
+        grep -E "^(Rss|Anonymous|AnonHugePages|Swap|Locked):" "/proc/${pid}/smaps_rollup" || true
+        ps -L -p "${pid}" -o stat=,wchan:32=,comm= | sort | uniq -c || true
+      done
+      exit 0
+    fi
     spy="$(command -v py-spy || true)"
     if [[ -z "${spy}" ]]; then
       target=/tmp/atomesh-inspection-py-spy
