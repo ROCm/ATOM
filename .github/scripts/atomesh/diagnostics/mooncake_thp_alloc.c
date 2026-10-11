@@ -41,6 +41,17 @@ static int populate_thp(void *address, size_t length, const char *kind) {
         fprintf(stderr, "[mooncake-store-thp] kind=%s phase=%s bytes=%zu rc=%d errno=%d seconds=%.3f\n",
                 kind, phases[i], length, rc, rc == 0 ? 0 : error, seconds);
         if (rc != 0) {
+            FILE *memory = fopen("/proc/self/smaps_rollup", "r");
+            if (memory) {
+                char line[256];
+                unsigned long huge_kib;
+                while (fgets(line, sizeof(line), memory)) {
+                    if (sscanf(line, "AnonHugePages: %lu kB", &huge_kib) == 1)
+                        fprintf(stderr, "[mooncake-store-thp] failed-phase=%s process_anon_huge_kib=%lu\n",
+                                phases[i], huge_kib);
+                }
+                fclose(memory);
+            }
             errno = error;
             return rc;
         }

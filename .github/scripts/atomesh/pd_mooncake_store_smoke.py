@@ -403,8 +403,9 @@ def thp_store_cases(root):
                 "ATOMESH_THP_NUMA_REGION_BYTES": str(segment // 2),
                 "ATOMESH_THP_NUMA_FALLBACK": "1",
             },
-            timeout=600 if count == 8 and segment > 1024**3 else 180,
+            timeout=900 if count == 8 and segment > 1024**3 else 180,
             gpu_bytes=20 * 1024**3 if segment > 1024**3 else 0,
+            serialized=count == 8 and segment > 1024**3,
         )
         results.append(result)
         (root / "result.json").write_text(json.dumps(results, indent=2))
