@@ -320,7 +320,7 @@ start_vllm_server() {
     "${!args_var}")" || return $?
   apply_role_env "ATOMESH_${prefix}_ENV_" "${host_ip}"
   if [[ "${ATOMESH_VLLM_MOONCAKE_ENABLED:-0}" == "1" ]]; then
-    prepare_mooncake_store "${role}"
+    prepare_mooncake_store "${role}" || return $?
   fi
   if [[ "${SERVED_MODEL_NAME}" == "Kimi-K3" && "${AITER_SITUV2_A4W4:-}" == "1" ]]; then
     python3 "${ATOMESH_SCRIPT_DIR}/../k3-a4w4/check_aiter_paths.py"

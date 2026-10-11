@@ -24,12 +24,12 @@ PY
 prepare_mooncake_store() {
   [[ "$1" == "prefill" ]] || return 0
   export MOONCAKE_CONFIG_PATH="${RUNTIME_LOG_DIR}/mooncake-store-rank-${NODE_RANK}.json"
-  python3 "${ATOMESH_SCRIPT_DIR}/pd_mooncake_config.py" store > "${MOONCAKE_CONFIG_PATH}"
+  python3 "${ATOMESH_SCRIPT_DIR}/pd_mooncake_config.py" store > "${MOONCAKE_CONFIG_PATH}" || return $?
   local master
-  master="$(python3 -c 'import pathlib, mooncake; print(pathlib.Path(mooncake.__file__).parent / "mooncake_master")')"
+  master="$(python3 -c 'import pathlib, mooncake; print(pathlib.Path(mooncake.__file__).parent / "mooncake_master")')" || return $?
   start_logged_process mooncake_master_pid "${RUNTIME_LOG_DIR}/mooncake-master.log" \
-    "${master}" --port "${MOONCAKE_MASTER_PORT}"
-  python3 - "${MOONCAKE_MASTER_PORT}" <<'PY'
+    "${master}" --port "${MOONCAKE_MASTER_PORT}" || return $?
+  python3 - "${MOONCAKE_MASTER_PORT}" <<'PY' || return $?
 import socket
 import sys
 import time

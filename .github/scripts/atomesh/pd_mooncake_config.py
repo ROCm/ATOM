@@ -37,13 +37,16 @@ def connector(role):
 
 
 def store():
+    protocol = os.environ.get("ATOMESH_MOONCAKE_STORE_PROTOCOL", "rdma")
+    if protocol not in ("rdma", "tcp"):
+        raise ValueError(f"Unsupported embedded Store protocol: {protocol}")
     return {
         "mode": "embedded",
         "metadata_server": "P2PHANDSHAKE",
         "master_server_address": f"127.0.0.1:{os.environ['MOONCAKE_MASTER_PORT']}",
         "global_segment_size": os.environ["ATOMESH_VLLM_MOONCAKE_GLOBAL_SEGMENT_SIZE"],
         "local_buffer_size": os.environ["ATOMESH_VLLM_MOONCAKE_LOCAL_BUFFER_SIZE"],
-        "protocol": "rdma",
+        "protocol": protocol,
         "device_name": "",
         "enable_offload": False,
     }
