@@ -1119,7 +1119,7 @@ reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 | PAGE coverage precedes AOS1 put | worker `_do_save_req` | The sidecar is the commit marker; it must never authorize missing PAGE chunks. |
 | AOS1 identity, size, TP, and CRC match | `decode_checkpoint` | Stale geometry, wrong rank, truncation, and corruption all recompute rather than restore. |
 | Exact save generations aggregate across TP | `SaveOperationId`, aggregator | A failed or delayed rank from another save cannot commit a boundary. |
-| Dense save packs wait on the step's producer event | dense `start_load_kv`, `batched_from_gpu` | A non-final prefill chunk yields no token, so nothing else orders the save thread's pack stream after the producing kernels; `producer_fenced` in the transfer stats reports the wait was enqueued. |
+| Dense save packs wait on the step's producer event | dense `start_load_kv`, `batched_from_gpu` | A non-final prefill chunk yields no token, so nothing else orders the save thread's pack stream after the producing kernels; `producer_fenced` in the transfer stats reports the wait was enqueued. Under PP the save frontier runs ahead of the forwards (`schedule()` advances it at dispatch), but it never covers the chunk of the batch whose metadata carries the save, and every stage takes metadata and batches in dispatch order: each records the event after enqueueing the forward of every chunk the save reads. |
 
 ### Failure handling
 

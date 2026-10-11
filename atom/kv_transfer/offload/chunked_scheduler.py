@@ -72,18 +72,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        if self._do_save and int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
-            # `Scheduler.advance_on_schedule` bumps num_cached_tokens inside
-            # schedule(), before that chunk's forward. The save frontier below
-            # reads the same field, so under PP a save can cover an in-flight
-            # chunk that the dense producer fence (recorded at dispatch) does
-            # not order after. Named here rather than asserted because PP
-            # offload has no supported configuration yet.
-            logger.warning(
-                "Offload scheduler: pipeline parallelism advances the "
-                "prefill frontier before the forward runs; dense saves may "
-                "include a chunk the producer fence does not cover"
-            )
         self.block_size = offcfg._strict_integer(
             "Offload block size",
             config.kv_cache_block_size,
@@ -673,9 +661,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        # Saves: store fully computed prompt chunks. Under scheduler-side
-        # chunked prefill, seq.num_cached_tokens advances after each prefill
-        # chunk's forward has completed; use it as the D2H-safe frontier.
+        # Saves: store prompt chunks up to the computed frontier,
+        # seq.num_cached_tokens. Without PP it advances once a chunk's forward
+        # has returned. Under PP, schedule() advances it as it dispatches a
+        # chunk, right after it builds this metadata, so the frontier covers
+        # the chunks of every batch dispatched before this one, some of them
+        # still running on later stages. The producer fence still orders each
+        # save after the forwards it reads: every stage takes metadata and
+        # batches in dispatch order, one RPC at a time, and records its fence
+        # when it takes this metadata (dense `start_load_kv`), after it has
+        # enqueued every earlier forward on the same stream.
         tracker_sids = list(self._save_tracker.keys())
         if tracker_sids and self._save_rr_last in self._save_tracker:
             start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)

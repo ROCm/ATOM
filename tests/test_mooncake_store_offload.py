@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import types
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -2323,6 +2324,121 @@ def test_the_scheduler_finds_what_the_worker_stored(cluster, make_worker):
     # A later turn of the same conversation finds every stored chunk.
     turn = _seq(41, 60)
     assert scheduler.get_num_new_matched_tokens(turn) == (40, True)
+
+
+def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
+    """The PP save frontier runs ahead of the forwards; the fence still covers it.
+
+    Under PP `schedule()` advances `num_cached_tokens` as it dispatches a
+    chunk, before any stage has run it, and the save frontier reads that field.
+    A stage records a save's producer fence when it takes the save's metadata.
+    Every save must cover only chunks whose forward that stage enqueued before.
+    """
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import EngineCore
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    engine = Scheduler(
+        MockConfig(
+            pipeline_parallel_size=4,
+            kv_cache_block_size=BLOCK,
+            num_kvcache_blocks=64,
+            max_model_len=128,
+            max_num_batched_tokens=16,
+        )
+    )
+    offload = MooncakeStoreOffloadScheduler(_config("offload", pp=4, layers=8))
+    offload.bind_block_manager(engine.block_manager)
+    engine.kv_connector = offload
+    seq = Sequence(list(range(64)), BLOCK, sampling_params=SamplingParams())
+    engine.add(seq)
+
+    def runner(rpcs, *, store_saves=False):
+        """A stage's workers: they run each call in order, on one stream."""
+
+        def call_func(name, *args, **_kwargs):
+            if name == "forward":
+                rpcs.append(("forward", args[0]))
+            elif name == "process_kvconnector_output":
+                rpcs.append(("fence", args[0]))  # `start_load_kv` records it
+                # Store each save at once, so that every step emits the next.
+                for request in args[0].requests if store_saves else []:
+                    assert request.save_spec is not None  # nothing to load
+                    offload.connector_completion(
+                        ConnectorCompletion(
+                            DENSE_PAGE_STORE_CHANNEL, request.save_operation, True
+                        )
+                    )
+
+        return SimpleNamespace(call_func=call_func)
+
+    head_rpcs, sent = [], []
+    head = SimpleNamespace(
+        pp_size=4,
+        scheduler=engine,
+        kv_transfer_enabled=True,
+        _in_flight=deque(),
+        _defer_prefix_hash=False,
+        _next_idle_kv_drain=0.0,
+        runner_mgr=runner(head_rpcs, store_saves=True),
+        # The socket to the downstream stages; no stage ever returns a token.
+        pp_transport=SimpleNamespace(
+            send_metadata=sent.append, recv_tokens=lambda **_: None
+        ),
+        _poll_kv_transfer_progress=lambda: None,
+    )
+    for name, owner in (
+        ("_dispatch_connector_only_batch", PPEngineCoreProc),
+        ("_dispatch_idle_offload_work", PPEngineCoreProc),
+        ("_advance_idle_kv_transfer", EngineCore),
+    ):
+        setattr(head, name, getattr(owner, name).__get__(head))
+    # The prompt's four chunks go out back to back. The next step has only
+    # the last chunk's save to dispatch, while that chunk still runs.
+    PPEngineCoreProc._pp_head_step(head)
+    PPEngineCoreProc._pp_head_step(head)
+    assert [batch.req_ids for batch, *_ in head._in_flight] == [[seq.id]]
+
+    stage_rpcs = []
+    queued = deque(sent)
+    stage = SimpleNamespace(
+        is_last=False,
+        kv_transfer_enabled=True,
+        utility_queue=None,
+        utility_handler=SimpleNamespace(
+            process_queue=lambda *_: None, push_metrics=lambda **_: None
+        ),
+        scheduler=SimpleNamespace(
+            publish_kv_events=lambda: None, shutdown_kv_events=lambda: None
+        ),
+        runner_mgr=runner(stage_rpcs),
+        pp_transport=SimpleNamespace(
+            recv_metadata=lambda **_: queued.popleft() if queued else None
+        ),
+        pull_and_process_input_queue=lambda: not queued,  # stop once drained
+        _is_idle_rl_weights_offloaded=lambda: False,
+        _poll_and_send_kv_status=lambda: None,
+    )
+    PPEngineCoreProc._downstream_busy_loop(stage)
+
+    for rpcs in (head_rpcs, stage_rpcs):
+        enqueued, saves = 0, []
+        for kind, item in rpcs:
+            if kind == "forward":
+                [start] = item.num_cached_tokens
+                [tokens] = item.num_scheduled_tokens
+                enqueued = start + int(tokens)
+                continue
+            for request in item.requests:
+                end = len(request.chunk_hashes) // keys.DIGEST_BYTES * CHUNK
+                # The fence recorded here orders the save after these only.
+                assert end <= enqueued
+                saves.append((request.save_spec.skip_leading_tokens, end))
+        # Each chunk is saved by the step after its own, before any stage
+        # returned it, and the head and the stage see the same saves.
+        assert saves == [(0, 16), (16, 32), (32, 48), (48, 64)]
 
 
 def test_a_failing_save_is_retried_after_a_pause_that_grows(
