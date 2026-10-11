@@ -105,20 +105,17 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
         self._kimi_graph_block_tables[:bs].copy_(
             (token_table[:, ::page_size] // page_size).to(dtype=torch.int32)
         )
+        if num_padding > 0:
+            self._kimi_graph_block_tables[real_bs:bs].zero_()
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        # The replay buffer is the captured bucket, padded with 0. Copying
+        # all of it writes those zeros back over the -1 sentinel and the
+        # padded rows store into request 0's KV slot.
+        self._kimi_graph_slot_mapping[:bs].fill_(-1)
         if torch.is_tensor(out_cache_loc):
-            num_real_tokens = int(out_cache_loc.numel())
-            if num_real_tokens > bs:
-                raise RuntimeError(
-                    "Kimi-K3 decode graph received more cache slots than its "
-                    f"bucket: slots={num_real_tokens}, bucket_bs={bs}"
-                )
-            # SGLang pads graph decode batches but keeps out_cache_loc compact.
-            # Mark padded write slots as invalid so they cannot alias request 0.
-            self._kimi_graph_slot_mapping[:bs].fill_(-1)
-            self._kimi_graph_slot_mapping[:num_real_tokens].copy_(out_cache_loc)
-        else:
-            self._kimi_graph_slot_mapping[:bs].fill_(-1)
+            n = min(int(out_cache_loc.numel()), real_bs)
+            if n:
+                self._kimi_graph_slot_mapping[:n].copy_(out_cache_loc[:n])
 
         metadata = AttentionMetaData(
             cu_seqlens_q=self._kimi_graph_cu_seqlens_q[: bs + 1],

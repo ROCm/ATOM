@@ -16,6 +16,46 @@ from atom.plugin.sglang.models.glm52_dsa_attention import (
 )
 
 
+def _install_short_verify_indexer_skip(module: Any) -> None:
+    """Skip paged MQA top-k when the verify context is already inside top-k.
+
+    The native op writes that score on the decode path. Below ``index_topk``
+    every token is selected, so attention reads the dense KV table instead.
+    Installed on the plugin indexer object; ``deepseek_v2.py`` stays unchanged.
+    """
+
+    indexer = getattr(module, "indexer", None)
+    if indexer is None or getattr(indexer, "_atom_glm52_short_verify_skip", False):
+        return
+    if getattr(module, "skip_topk", False):
+        return
+
+    original = indexer.sparse_attn_indexer_impl
+
+    def _sparse_attn_indexer(*args: Any, **kwargs: Any):
+        from atom.distributed.dcp_utils import get_dcp_world_size
+        from atom.utils.forward_context import get_forward_context
+
+        context = get_forward_context()
+        metadata = getattr(context, "attn_metadata", None)
+        is_prefill = bool(
+            getattr(getattr(context, "context", None), "is_prefill", False)
+        )
+        max_seqlen_k = int(getattr(metadata, "max_seqlen_k", 0) or 0)
+        topk_tokens = int(getattr(indexer, "topk_tokens", 0) or 0)
+        if (
+            not is_prefill
+            and get_dcp_world_size() == 1
+            and topk_tokens > 0
+            and max_seqlen_k <= topk_tokens
+        ):
+            return None
+        return original(*args, **kwargs)
+
+    indexer.sparse_attn_indexer_impl = _sparse_attn_indexer
+    indexer._atom_glm52_short_verify_skip = True
+
+
 def setup_glm52_dsa_for_sglang(model: Any) -> None:
     """Patch GLM-5.2 for native ATOM sparse MLA under SGLang.
 
@@ -59,6 +99,7 @@ def setup_glm52_dsa_for_sglang(model: Any) -> None:
             )
 
         if getattr(module, "is_v32", False):
+            _install_short_verify_indexer_skip(module)
             owns_active_indexer = getattr(
                 module, "indexer", None
             ) is not None and not getattr(module, "skip_topk", False)
