@@ -118,9 +118,13 @@ PD_TRANSFER_DEADLINE_S = 120.0
 # Added to a producer's write window (see _write_window_s) for the 1 ns per
 # byte Mooncake adds to a sync write's timeout, up to 60 GB per batch.
 PD_WRITE_WINDOW_SLACK_S = 60.0
-# A final prefill's KV-ready event is dropped this long after it was recorded
-# if no finished transfer dropped it first (see _drop_stale_kv_ready_events).
+# A final prefill's KV-ready event is replaced by a shared, long-complete one
+# this long after it was recorded, if no finished transfer dropped it first
+# (see _drop_stale_kv_ready_events).
 KV_CACHE_READY_EVENT_TTL_S = 600.0
+# Requests whose ready event aged out are remembered up to this many, oldest
+# dropped first, so a late transfer still finds that its prefill is complete.
+KV_CACHE_READY_EXPIRED_MAX = 1 << 16
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
@@ -887,6 +891,11 @@ class MooncakeConnector(KVConnectorBase):
         self._kv_cache_ready_batches: deque[
             tuple[float, torch.cuda.Event, list[ReqId]]
         ] = deque()
+        # Stands in for every ready event past its TTL: long complete, so a
+        # late transfer that waits on it waits on nothing.
+        self._kv_ready_done_event: torch.cuda.Event | None = None
+        # Requests that hold the stand-in, oldest first (a dict as an ordered set).
+        self._kv_ready_expired: dict[ReqId, None] = {}
         self._completed_prefills_lock = threading.Lock()
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._transfer_refcount: dict[ReqId, int] = {}
@@ -1398,21 +1407,33 @@ class MooncakeConnector(KVConnectorBase):
             self._drop_stale_kv_ready_events(now)
 
     def _drop_stale_kv_ready_events(self, now: float) -> None:
-        """Forget ready events older than ``KV_CACHE_READY_EVENT_TTL_S``.
+        """Free ready events older than ``KV_CACHE_READY_EVENT_TTL_S``.
 
         A finished transfer drops its event, but the runner reports every
         final prefill chunk, and some never get one: requests without P/D,
-        aborted requests, requests no decode pulls and failed transfers. A
-        transfer that still comes later has no event, so its MLA rows go
-        per token and a DSA index transfer fails. Caller holds
-        ``_completed_prefills_lock``.
+        aborted requests, requests no decode pulls and failed transfers.
+        Their events are freed here. Each such request keeps one shared,
+        long-complete event instead, so a transfer that still comes waits on
+        nothing and keeps its staged paths rather than failing. The newest
+        ``KV_CACHE_READY_EXPIRED_MAX`` such requests are remembered. Caller
+        holds ``_completed_prefills_lock``.
         """
         batches = self._kv_cache_ready_batches
+        events, expired = self._kv_cache_ready_events, self._kv_ready_expired
         while batches and now - batches[0][0] > KV_CACHE_READY_EVENT_TTL_S:
             _, event, req_ids = batches.popleft()
+            if self._kv_ready_done_event is None:
+                # Recorded over a TTL ago, so it has completed.
+                self._kv_ready_done_event = event
             for req_id in req_ids:
-                if self._kv_cache_ready_events.get(req_id) is event:
-                    del self._kv_cache_ready_events[req_id]
+                if events.get(req_id) is event:
+                    events[req_id] = self._kv_ready_done_event
+                    expired[req_id] = None
+        while len(expired) > KV_CACHE_READY_EXPIRED_MAX:
+            req_id = next(iter(expired))
+            del expired[req_id]
+            if events.get(req_id) is self._kv_ready_done_event:
+                del events[req_id]
 
     def _get_kv_cache_ready_event(self, req_id: ReqId) -> torch.cuda.Event | None:
         with self._completed_prefills_lock:
@@ -1677,6 +1698,10 @@ class MooncakeConnector(KVConnectorBase):
         if self._mla_landing is not None:
             self._mla_landing.sweep()
         self._expire_pending_recvs()
+        if self.is_producer:
+            # Also when prefill goes idle and records no new batch.
+            with self._completed_prefills_lock:
+                self._drop_stale_kv_ready_events(time.monotonic())
         with self._completion_lock:
             ds = self.done_sending.copy()
             dr = self.done_recving.copy()

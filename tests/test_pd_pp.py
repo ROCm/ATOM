@@ -1462,6 +1462,8 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
     connector._kv_cache_ready_batches = deque()
+    connector._kv_ready_done_event = None
+    connector._kv_ready_expired = {}
     connector._completed_prefills_lock = threading.Lock()
     ready_event = MagicMock()
     producer_stream = object()
@@ -1478,35 +1480,78 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
 
 
-def test_ready_events_no_transfer_takes_are_dropped_after_their_ttl(monkeypatch):
-    """Without the TTL, every final prefill with no finished transfer leaked
-    its event: requests without P/D, aborts, unpulled requests, failures."""
-    mc = pytest.importorskip(
-        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
-    )
+def _ready_event_producer(mc, monkeypatch):
     connector = object.__new__(mc.MooncakeConnector)
     connector.is_producer = True
     connector._index_staging_pool_size = 1
     connector._cuda_device = 0
     connector._kv_cache_ready_events = {}
     connector._kv_cache_ready_batches = deque()
+    connector._kv_ready_done_event = None
+    connector._kv_ready_expired = {}
     connector._completed_prefills_lock = threading.Lock()
-    events = iter([MagicMock(), MagicMock(), MagicMock()])
-    monkeypatch.setattr(mc.torch.cuda, "Event", lambda: next(events))
+    monkeypatch.setattr(mc.torch.cuda, "Event", MagicMock)
     monkeypatch.setattr(mc.torch.cuda, "current_stream", lambda _d: None)
     clock = [1000.0]
     monkeypatch.setattr(mc.time, "monotonic", lambda: clock[0])
+    return connector, clock
 
+
+def test_ready_events_no_transfer_takes_are_freed_after_their_ttl(monkeypatch):
+    """Without the TTL, every final prefill with no finished transfer leaked
+    its event: requests without P/D, aborts, unpulled requests, failures.
+
+    A transfer that still comes later finds a long-complete stand-in, so a
+    DSA index transfer goes ahead instead of failing on a missing event.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector, clock = _ready_event_producer(mc, monkeypatch)
     connector.record_kv_cache_ready(["a", "b"])
     first = connector._kv_cache_ready_events["a"]
     clock[0] += 10
     connector.record_kv_cache_ready(["b"])  # recorded again, by a later batch
     clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S - 5
     connector.record_kv_cache_ready(["c"])
-    # The first batch expired; "b" keeps its later event.
-    assert set(connector._kv_cache_ready_events) == {"b", "c"}
+    # The first batch aged out: "a" holds the shared stand-in (that batch's
+    # own event, complete long ago); "b" keeps its later event.
+    done = connector._kv_ready_done_event
+    assert done is first
+    assert connector._get_kv_cache_ready_event("a") is done
     assert connector._kv_cache_ready_events["b"] is not first
+    assert list(connector._kv_ready_expired) == ["a"]
     assert len(connector._kv_cache_ready_batches) == 2
+
+
+def test_ready_events_age_out_while_prefill_is_idle(monkeypatch):
+    """get_finished runs every step, so no new prefill batch is needed."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector, clock = _ready_event_producer(mc, monkeypatch)
+    for name, value in vars(_make_connector()).items():
+        setattr(connector, name, value)
+    connector.done_sending = set()
+    connector.record_kv_cache_ready(["a"])
+    clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S + 1
+    connector.get_finished()
+    assert not connector._kv_cache_ready_batches
+    assert list(connector._kv_ready_expired) == ["a"]
+
+
+def test_requests_whose_event_aged_out_are_remembered_up_to_a_cap(monkeypatch):
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "KV_CACHE_READY_EXPIRED_MAX", 2)
+    connector, clock = _ready_event_producer(mc, monkeypatch)
+    connector.record_kv_cache_ready(["a", "b", "c"])
+    clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S + 1
+    connector.record_kv_cache_ready(["d"])
+    assert list(connector._kv_ready_expired) == ["b", "c"]
+    assert connector._get_kv_cache_ready_event("a") is None
+    assert connector._get_kv_cache_ready_event("c") is connector._kv_ready_done_event
 
 
 # ---------------------------------------------------------------------------
