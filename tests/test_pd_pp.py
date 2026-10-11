@@ -772,7 +772,7 @@ def _make_connector(**overrides):
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
-    conn._pending_recv_started = {}
+    conn._pending_recv_acks = {}
     conn._pending_recv = set()
     conn._pending_recv_blocks = {}
     conn._pending_recv_slots = {}
@@ -966,8 +966,8 @@ def test_failed_write_done_waits_for_every_producer_rank():
     assert not conn._pending_recv_failed
 
 
-def test_silent_producer_ranks_fail_the_receive_at_the_deadline():
-    """A rank silent past PD_RECV_DEADLINE_S is dead or past its own deadline.
+def test_silent_producer_ranks_fail_the_receive_after_their_window():
+    """An acknowledged rank silent past its write window has stopped writing.
 
     Without a bound, one failed stage plus one dead stage kept the request,
     its decode blocks and stage-0's page table forever.
@@ -979,17 +979,23 @@ def test_silent_producer_ranks_fail_the_receive_at_the_deadline():
     conn = _make_connector(
         _release_targets={"old": ("stage0", "t1", 1)},
         _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
+        _mla_landing=None,
     )
-    now = time.monotonic()
-    for req_id, started in (("old", now - mc.PD_RECV_DEADLINE_S - 1), ("new", now)):
+    for req_id in ("old", "new"):
         conn._pending_recv_expected[req_id] = 2
-        conn._pending_recv_started[req_id] = started
         conn._pending_recv.add(req_id)
     assert not conn._record_write_done("old", 1, 0, 0, success=False)
+    ack = {"request_id": "old", "pp_rank": 0, "tp_rank": 0, "write_window_s": 60}
+    conn._record_write_ack(ack)
+    conn._record_write_ack({**ack, "request_id": "new"})
+    conn._record_write_ack({**ack, "request_id": "new", "pp_rank": 1})
+    conn._expire_pending_recvs()
+    assert conn.failed_recving == set()  # the windows are still open
+    conn._pending_recv_acks["old"][(0, 0)] = time.monotonic() - 1
     conn._expire_pending_recvs()
     assert conn.failed_recving == {"old"} and conn.done_recving == set()
     assert sent == [("stage0", mc.MSG_RELEASE)]
-    assert list(conn._pending_recv_started) == ["new"]
+    assert list(conn._pending_recv_acks) == ["new"]
     assert conn._pending_recv == {"new"}
     assert not conn._pending_recv_failed and "old" not in conn._pending_recv_stages
     # The dead stage's write-done, should it ever come, changes nothing.
@@ -997,8 +1003,53 @@ def test_silent_producer_ranks_fail_the_receive_at_the_deadline():
     assert conn.done_recving == set()
 
 
+def test_a_rank_that_never_acknowledged_keeps_the_receive_open():
+    """It may still get the request and write, however long that takes."""
+    pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
+    conn = _make_connector(_mla_landing=None)
+    conn._pending_recv_expected["r1"] = 2
+    conn._pending_recv.add("r1")
+    assert not conn._record_write_done("r1", 1, 0, 0, success=False)
+    conn._record_write_ack(
+        {"request_id": "r1", "pp_rank": 1, "tp_rank": 0, "write_window_s": 1}
+    )
+    conn._pending_recv_acks["r1"][(1, 0)] = time.monotonic() - 1
+    conn._expire_pending_recvs()
+    assert conn.failed_recving == set()
+
+
+@pytest.mark.parametrize("window", [None, -1, 0, float("inf"), True, "60"])
+def test_an_ack_without_a_usable_window_starts_no_deadline(window):
+    pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
+    conn = _make_connector(_mla_landing=None)
+    conn._pending_recv_expected["r1"] = 1
+    conn._record_write_ack(
+        {"request_id": "r1", "pp_rank": 0, "tp_rank": 0, "write_window_s": window}
+    )
+    assert conn._pending_recv_acks == {}
+
+
+@pytest.mark.parametrize(
+    "raw, seconds",
+    [(None, 30.0), ("60", 60.0), ("2", 5.0), ("abc", 5.0), (" 45s", 45.0)],
+)
+def test_the_write_window_follows_mooncakes_transfer_timeout(monkeypatch, raw, seconds):
+    """Read the way Mooncake reads MC_TRANSFER_TIMEOUT (atoi, 5 s floor)."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    if raw is None:
+        monkeypatch.delenv("MC_TRANSFER_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("MC_TRANSFER_TIMEOUT", raw)
+    assert mc._mc_transfer_timeout_s() == seconds
+    assert mc._write_window_s() == (
+        mc.PD_TRANSFER_DEADLINE_S + seconds + mc.PD_WRITE_WINDOW_SLACK_S
+    )
+
+
 def test_no_rdma_attempt_starts_past_the_transfer_deadline():
-    """A stage stops writing at its deadline, before the consumer gives up."""
+    """A stage stops writing at its deadline, inside the window it acknowledged."""
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
     )
@@ -1013,7 +1064,6 @@ def test_no_rdma_attempt_starts_past_the_transfer_deadline():
         *args, engine=engine, deadline=time.monotonic() - 1
     )
     assert engine.batch_transfer_sync_write.call_count == 1
-    assert mc.PD_RECV_DEADLINE_S > mc.PD_TRANSFER_DEADLINE_S + 60
 
 
 def test_write_done_pp_only_dedup():

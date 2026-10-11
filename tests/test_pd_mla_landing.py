@@ -218,7 +218,6 @@ class _Dest:
         num_blocks=48,
         pool_slots=8,
         slot_rows=64,
-        recv_deadline_s=300.0,
     ):
         gen = torch.Generator().manual_seed(11)
         self.regions = [
@@ -240,7 +239,6 @@ class _Dest:
             mla_regions=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
             finish=lambda req, failed: self.finished.append((req, failed)),
-            recv_deadline_s=recv_deadline_s,
             table_segments=segment_table_capacity(pool_slots * 64),
         )
         pool = self.recv.pool
@@ -606,19 +604,24 @@ def test_sweep_never_reports_a_failure_while_a_stage_still_runs():
 
 
 @pytest.mark.parametrize("first", ["failure", "success", "none"])
-def test_stages_silent_past_the_deadline_fail_the_request(first):
-    # A stage still running stops writing at its transfer deadline, before
-    # the receive deadline, so one silent past it is presumed dead: without
-    # this its request, pages and credits waited forever.
+def test_stages_silent_past_their_window_fail_the_request(first):
+    # A stage that acknowledged the request and stays silent past the write
+    # window it named has stopped writing (its transfer deadline started
+    # before the ack), so the request fails instead of waiting forever with
+    # its pages and credits.
     dest = _Dest()
     s0 = dest.recv.advertise("stage0", 2)["slots"]
     dest.recv.advertise("stage1", 2)
     dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    now = time.monotonic()
+    assert dest.recv.stage_acked("r", 0, 5, now + 60)
     if first != "none":
         dest.recv.stage_done("r", 1, 5, first == "success", [])
+    else:
+        assert dest.recv.stage_acked("r", 1, 5, now - 1)
     dest.recv.sweep()
-    assert dest.finished == []
-    dest.recv._requests["r"].started_at -= 301
+    assert dest.finished == []  # stage 0's window is still open
+    dest.recv._requests["r"].stages[0].window_end = now - 1
     dest.recv.sweep()
     assert dest.finished == [("r", True)]
     assert "r" not in dest.recv._requests
@@ -630,6 +633,35 @@ def test_stages_silent_past_the_deadline_fail_the_request(first):
     assert dest.finished == [("r", True)]
 
 
+def test_a_stage_that_never_acknowledged_keeps_the_request_open():
+    # It may still get the request (ZMQ holds a write request until it can
+    # deliver it) and then write, so no time alone can fail the request.
+    dest = _Dest()
+    dest.recv.advertise("stage0", 2)
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    dest.recv.stage_done("r", 1, 5, False, [])
+    dest.recv._requests["r"].started_at -= 3600
+    dest.recv.sweep()
+    assert dest.finished == []
+    assert dest.recv._requests["r"].stall_logged
+    # Its ack starts the window; the request fails once that ends.
+    assert dest.recv.stage_acked("r", 0, 5, time.monotonic() - 1)
+    dest.recv.sweep()
+    assert dest.finished == [("r", True)]
+
+
+def test_an_ack_for_another_nonce_starts_no_window():
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    assert dest.recv.stage_acked("r", 0, 6, time.monotonic() - 1)
+    assert dest.recv.stage_acked("r", 7, 5, time.monotonic() - 1)  # no stage 7
+    assert not dest.recv.stage_acked("other", 0, 5, time.monotonic() - 1)
+    dest.recv.sweep()
+    assert dest.finished == []
+
+
 def test_an_expired_request_settles_after_its_queued_scatter():
     # The scatter writes the request's pages, so the failure waits for it.
     dest = _Dest()
@@ -638,7 +670,7 @@ def test_an_expired_request_settles_after_its_queued_scatter():
     before = dest.regions[0].clone()
     rows = torch.ones((4, TOKEN_BYTES), dtype=torch.uint8)
     dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
-    dest.recv._requests["r"].started_at -= 301
+    assert dest.recv.stage_acked("r", 0, 5, time.monotonic() - 1)
     dest.recv.sweep()
     dest.recv.sweep()
     assert dest.finished == []
@@ -646,6 +678,23 @@ def test_an_expired_request_settles_after_its_queued_scatter():
     assert torch.equal(dest.regions[0], before)  # the failed request is skipped
     assert dest.finished == [("r", True)]
     assert dest.credits() == [("stage0", [s0[0]])]
+
+
+def test_a_failed_report_does_not_stop_the_sweep():
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    for req_id in ("a", "b"):
+        dest.recv.begin(req_id, 5, [1], {0: "stage0"})
+        assert dest.recv.stage_acked(req_id, 0, 5, time.monotonic() - 1)
+
+    def finish(req_id, failed):
+        if req_id == "a":
+            raise RuntimeError("notify socket gone")
+        dest.finished.append((req_id, failed))
+
+    dest.recv._finish = finish
+    dest.recv.sweep()
+    assert dest.finished == [("b", True)]
 
 
 def test_tombstones_expire_oldest_first():
@@ -1091,7 +1140,7 @@ def test_landing_requests_complete_through_the_receiver():
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
-    conn._pending_recv_started = {}
+    conn._pending_recv_acks = {}
     conn._release_targets = {}
     conn.done_recving = set()
     conn.failed_recving = set()
@@ -1233,6 +1282,70 @@ def test_an_unreadable_write_done_does_not_stop_the_listener(monkeypatch):
         [(mc.MSG_WRITE_DONE, payload) for payload in payloads],
     )
     assert dest.finished == [("r", False)]
+
+
+def test_the_write_listener_acknowledges_a_request_that_asks(monkeypatch):
+    # The ack starts the consumer's receive deadline for this rank, so it goes
+    # out only after this rank's own transfer deadline was stamped.
+    mc = _mooncake()
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._side_channel_port = 1
+    conn.pp_rank, conn.tp_rank = 2, 1
+    sent, submitted = [], []
+
+    def send(path, parts, repeat=1):
+        assert submitted == [] or "_deadline" in submitted[-1]
+        sent.append((path, parts))
+
+    class _Executor:
+        def submit(self, _fn, request_data):
+            submitted.append(request_data)
+
+    conn._send_on_socket = send
+    conn._send_executor = _Executor()
+    request = {
+        "request_id": "r",
+        "write_nonce": 7,
+        "notify_host": "decode",
+        "notify_port": 9,
+        "consumer_host": "d",
+        "consumer_rpc_port": 1,
+    }
+    _listen(
+        monkeypatch,
+        mc,
+        conn._write_listener,
+        [
+            (mc.MSG_WRITE_REQUEST, msgpack.dumps(request)),  # an older consumer
+            (mc.MSG_WRITE_REQUEST, msgpack.dumps({**request, "write_ack": True})),
+        ],
+    )
+    assert len(submitted) == 2 and all("_deadline" in r for r in submitted)
+    [(path, (kind, payload))] = sent
+    assert path == "tcp://decode:9" and kind == mc.MSG_WRITE_ACK
+    assert msgpack.loads(payload) == {
+        "request_id": "r",
+        "write_nonce": 7,
+        "pp_rank": 2,
+        "tp_rank": 1,
+        "write_window_s": mc._write_window_s(),
+    }
+
+
+def test_the_notification_listener_starts_a_landing_stage_window(monkeypatch):
+    mc = _mooncake()
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    ack = {"request_id": "r", "write_nonce": 5, "pp_rank": 0, "write_window_s": 60}
+    _listen(
+        monkeypatch,
+        mc,
+        _consumer(mc, dest)._notification_listener,
+        [(mc.MSG_WRITE_ACK, b"\xc1"), (mc.MSG_WRITE_ACK, msgpack.dumps(ack))],
+    )
+    window_end = dest.recv._requests["r"].stages[0].window_end
+    assert window_end is not None and window_end > time.monotonic() + 50
 
 
 def test_unreadable_landing_fields_do_not_stop_the_write_listener(monkeypatch):

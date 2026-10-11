@@ -111,14 +111,13 @@ MOONCAKE_DEFAULT_PROTOCOL = "rdma"
 PREFILL_LOOKUP_TIMEOUT = 60
 PREFILL_LOOKUP_POLL_INTERVAL = 0.01
 # A producer stage starts no RDMA write for a request this long after its write
-# listener received the request; it reports the transfer failed instead.
+# listener received the request; it reports the transfer failed instead. The
+# time a request waits for a send worker counts too, so under a long enough
+# burst a transfer fails before its first write and the decode recomputes it.
 PD_TRANSFER_DEADLINE_S = 120.0
-# A consumer fails a request whose producer stages have not all sent their
-# write-done this long after its write requests went out. That is more than
-# the producer deadline plus one Mooncake sync write (MC_TRANSFER_TIMEOUT, 30 s
-# by default, plus about 1 s per GB), so a stage still running has stopped
-# writing by then, and one that has not answered is presumed dead.
-PD_RECV_DEADLINE_S = 300.0
+# Added to a producer's write window (see _write_window_s) for the 1 ns per
+# byte Mooncake adds to a sync write's timeout, up to 60 GB per batch.
+PD_WRITE_WINDOW_SLACK_S = 60.0
 # A final prefill's KV-ready event is dropped this long after it was recorded
 # if no finished transfer dropped it first (see _drop_stale_kv_ready_events).
 KV_CACHE_READY_EVENT_TTL_S = 600.0
@@ -152,6 +151,28 @@ class SlotPool:
         with self._cv:
             self.free.append(idx)
             self._cv.notify()
+
+
+def _mc_transfer_timeout_s() -> float:
+    """Mooncake's sync-write timeout, read as Mooncake reads it.
+
+    ``MC_TRANSFER_TIMEOUT`` in seconds, parsed like ``atoi`` (an unparsable
+    value is 0) and raised to Mooncake's 5 s floor; 30 s when unset.
+    """
+    raw = os.getenv("MC_TRANSFER_TIMEOUT")
+    if raw is None:
+        return 30.0
+    match = re.match(r"\s*[+-]?\d+", raw)
+    return float(max(5, int(match.group()) if match else 0))
+
+
+def _write_window_s() -> float:
+    """Seconds after receiving a write request by which this stage stops writing.
+
+    It starts no RDMA write after ``PD_TRANSFER_DEADLINE_S``, and Mooncake ends
+    a sync write within ``MC_TRANSFER_TIMEOUT`` plus about 1 s per GB.
+    """
+    return PD_TRANSFER_DEADLINE_S + _mc_transfer_timeout_s() + PD_WRITE_WINDOW_SLACK_S
 
 
 def _swa_ring_ids(seq) -> list[int]:
@@ -338,6 +359,9 @@ def _configure_mooncake_transport(protocol: str) -> None:
 # ZMQ side-channel message types
 MSG_WRITE_REQUEST = b"write_request"
 MSG_WRITE_DONE = b"write_done"
+# Producer -> consumer on receipt of a write request that asks for it: starts
+# the consumer's receive deadline for that rank (see _record_write_ack).
+MSG_WRITE_ACK = b"write_ack"
 MSG_GET_META = b"get_meta"
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
@@ -885,13 +909,14 @@ class MooncakeConnector(KVConnectorBase):
         # is published only with the last rank's write-done, as success is:
         # producers are never cancelled, so a rank still running (or not yet
         # dispatched) may write the request's pages after the scheduler reuses
-        # them. A rank that never answers is bounded by PD_RECV_DEADLINE_S.
+        # them. A rank that acknowledged but never answers is bounded by its
+        # write window (see _expire_pending_recvs).
         self._pending_recv_failed: set[ReqId] = set()
         # Per-request nonce for write-done corruption detection.
         self._pending_recv_nonce: dict[ReqId, int] = {}
-        # When each request's write requests went out (time.monotonic()), in
-        # that order, for _expire_pending_recvs.
-        self._pending_recv_started: dict[ReqId, float] = {}
+        # Producer ranks that acknowledged a request, and when each one's write
+        # window ends (time.monotonic()).
+        self._pending_recv_acks: dict[ReqId, dict[tuple[int, int], float]] = {}
         # PP-prefill: consumer stashes stage-0's release address per request, and
         # the producer (stage-0) counts releases to defer freeing the shared page
         # table until every stage has written the KV out.
@@ -1269,7 +1294,6 @@ class MooncakeConnector(KVConnectorBase):
             mla_regions=mla_regions,
             send=self._send_on_socket,
             finish=self._complete_recv,
-            recv_deadline_s=PD_RECV_DEADLINE_S,
             table_segments=self._mla_landing_table_segments,
         )
         logger.info(
@@ -1496,6 +1520,9 @@ class MooncakeConnector(KVConnectorBase):
                 "notify_port": self.notification_port,
                 "consumer_tp_size": self.tp_size,
                 "write_nonce": write_nonce,
+                # Ask each producer rank to acknowledge receipt: that starts
+                # this rank's receive deadline for it (_record_write_ack).
+                "write_ack": True,
                 # DCP relayout: which shard of each block this rank owns.
                 "consumer_dcp_size": self.dcp_size,
                 "consumer_dcp_rank": self.dcp_rank,
@@ -1589,7 +1616,6 @@ class MooncakeConnector(KVConnectorBase):
                 with self._completion_lock:
                     self._pending_recv_expected[req_id] = remote_pp_size
                     self._pending_recv_nonce[req_id] = write_nonce
-                    self._pending_recv_started[req_id] = time.monotonic()
             self._pending_recv.add(req_id)
             # Only delta blocks need fencing; reused prefix blocks are coherent.
             self._pending_recv_blocks[req_id] = list(dst_block_ids)
@@ -1736,10 +1762,12 @@ class MooncakeConnector(KVConnectorBase):
                     elif msg_type == MSG_WRITE_REQUEST:
                         request_data = msgpack.loads(parts[2])
                         # Counted from receipt, so time queued for a send
-                        # worker counts too (see PD_RECV_DEADLINE_S).
+                        # worker counts too (see PD_TRANSFER_DEADLINE_S).
                         request_data["_deadline"] = (
                             time.monotonic() + PD_TRANSFER_DEADLINE_S
                         )
+                        if request_data.get("write_ack"):
+                            self._ack_write_request(request_data)
                         logger.debug(
                             "[PRODUCER] Received write_request for req %s "
                             "(transfer_id=%s, consumer=%s:%s)",
@@ -1788,6 +1816,33 @@ class MooncakeConnector(KVConnectorBase):
         except BaseException as exc:
             self._publish_listener_state(exc)
             raise
+
+    def _ack_write_request(self, request_data: dict) -> None:
+        """Tell the consumer this rank has the request, and for how long it writes.
+
+        Sent right after the transfer deadline is stamped, so the consumer's
+        receive deadline for this rank starts after it and never ends while
+        this rank can still start a write, however long the request took to
+        arrive. Without the ack the consumer waits for the write-done with no
+        deadline, which is safe.
+        """
+        ack = {
+            "request_id": request_data["request_id"],
+            "write_nonce": request_data.get("write_nonce", 0),
+            "pp_rank": self.pp_rank,
+            "tp_rank": self.tp_rank,
+            "write_window_s": _write_window_s(),
+        }
+        path = make_zmq_path(
+            "tcp", request_data["notify_host"], request_data["notify_port"]
+        )
+        try:
+            self._send_on_socket(path, [MSG_WRITE_ACK, msgpack.dumps(ack)])
+        except Exception:
+            logger.exception(
+                "[PRODUCER] acknowledging write request %s failed",
+                request_data["request_id"],
+            )
 
     def _record_release(self, transfer_id: TransferId, consumer_tp_size: int) -> None:
         """Count a consumer-rank release; free the shared page after all ranks.
@@ -3190,6 +3245,12 @@ class MooncakeConnector(KVConnectorBase):
                         except Exception:
                             # Every later receive on this rank needs this thread.
                             logger.exception("[CONSUMER] handling a write-done failed")
+                    elif msg_type == MSG_WRITE_ACK:
+                        try:
+                            self._record_write_ack(msgpack.loads(parts[2]))
+                        except Exception:
+                            # No deadline for that rank: its write-done is awaited.
+                            logger.exception("[CONSUMER] unreadable write ack dropped")
                     elif (
                         msg_type == MSG_LANDING_READY and self._mla_landing is not None
                     ):
@@ -3250,7 +3311,8 @@ class MooncakeConnector(KVConnectorBase):
         A request with MLA landing slots settles in ``LandingReceiver``
         instead: it completes only once its landed slots are scattered too,
         and fails only once every stage ended (``_complete_recv``). Either
-        way, ranks that stay silent past ``PD_RECV_DEADLINE_S`` fail it.
+        way, ranks that acknowledged and then stay silent past their write
+        window fail it (``_expire_pending_recvs``).
         """
         landing = self._mla_landing
         if landing is not None and landing.stage_done(
@@ -3289,43 +3351,91 @@ class MooncakeConnector(KVConnectorBase):
             del self._pending_recv_expected[req_id]
             self._pending_recv_stages.pop(req_id, None)
             self._pending_recv_nonce.pop(req_id, None)
-            self._pending_recv_started.pop(req_id, None)
+            self._pending_recv_acks.pop(req_id, None)
             failed = req_id in self._pending_recv_failed
             self._pending_recv_failed.discard(req_id)
 
         self._complete_recv(req_id, failed)
         return True
 
-    def _expire_pending_recvs(self) -> None:
-        """Fail requests whose producer ranks stayed silent past the deadline.
+    def _record_write_ack(self, data: dict) -> None:
+        """Start the receive deadline of the producer rank that sent ``data``.
 
-        By ``PD_RECV_DEADLINE_S`` a rank still running has passed its own
-        transfer deadline and stopped writing, so the request's pages can go
-        back to the scheduler; a rank that never answers is presumed dead.
-        Requests are checked oldest first and only while they are expired.
+        The rank's window (``write_window_s``) starts here, after the rank's
+        own transfer deadline started, so once it ends that rank has stopped
+        writing. A malformed window is ignored: that rank keeps no deadline.
+        """
+        req_id = data["request_id"]
+        pp_rank = int(data.get("pp_rank", 0))
+        tp_rank = int(data.get("tp_rank", 0))
+        nonce = data.get("write_nonce", 0)
+        window = data.get("write_window_s")
+        if (
+            isinstance(window, bool)
+            or not isinstance(window, (int, float))
+            or not 0 < window < float("inf")
+        ):
+            logger.error(
+                "[CONSUMER] write ack for req %s carries no usable window: %r",
+                req_id,
+                window,
+            )
+            return
+        deadline = time.monotonic() + window
+        landing = self._mla_landing
+        if landing is not None and landing.stage_acked(
+            req_id, pp_rank, nonce, deadline
+        ):
+            return
+        with self._completion_lock:
+            if req_id not in self._pending_recv_expected:
+                return
+            expected_nonce = self._pending_recv_nonce.get(req_id, 0)
+            if expected_nonce and nonce != expected_nonce:
+                return
+            self._pending_recv_acks.setdefault(req_id, {})[
+                (pp_rank, tp_rank)
+            ] = deadline
+
+    def _expire_pending_recvs(self) -> None:
+        """Fail requests whose outstanding producer ranks all overran their windows.
+
+        Such a rank acknowledged the request and has stopped writing since, so
+        the request's pages can go back to the scheduler; it is presumed dead,
+        or its write-done lost. A request with a rank that has neither sent its
+        write-done nor acknowledged is never expired: that rank may still get
+        the request and write. Checks the requests that have an ack.
         """
         now = time.monotonic()
         expired: list[tuple[ReqId, list[tuple[int, int]]]] = []
         with self._completion_lock:
-            for req_id, started in self._pending_recv_started.items():
-                if now - started <= PD_RECV_DEADLINE_S:
-                    break
-                expired.append((req_id, []))
-            for req_id, reported in expired:
-                del self._pending_recv_started[req_id]
+            for req_id, acks in self._pending_recv_acks.items():
+                expected = self._pending_recv_expected.get(req_id)
+                if expected is None:
+                    continue
+                done = self._pending_recv_stages.get(req_id, set())
+                silent = [end for rank, end in acks.items() if rank not in done]
+                if silent and len(done) + len(silent) >= expected and max(silent) < now:
+                    expired.append((req_id, sorted(done)))
+            for req_id, _ in expired:
+                del self._pending_recv_acks[req_id]
                 self._pending_recv_expected.pop(req_id, None)
+                self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
                 self._pending_recv_failed.discard(req_id)
-                reported.extend(sorted(self._pending_recv_stages.pop(req_id, ())))
         for req_id, reported in expired:
             logger.error(
-                "[CONSUMER] req %s: no write-done from every producer rank "
-                "within %.0fs (reported (pp, tp): %s); failing it",
+                "[CONSUMER] req %s: producer ranks that acknowledged it sent no "
+                "write-done within their write window (reported (pp, tp): %s); "
+                "failing it",
                 req_id,
-                PD_RECV_DEADLINE_S,
                 reported,
             )
-            self._complete_recv(req_id, failed=True)
+            try:
+                self._complete_recv(req_id, failed=True)
+            except Exception:
+                # The other expired requests still have to be reported.
+                logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
 
     def _complete_recv(self, req_id: str, failed: bool) -> None:
         """Publish a finished receive and let stage-0 free its page table."""
