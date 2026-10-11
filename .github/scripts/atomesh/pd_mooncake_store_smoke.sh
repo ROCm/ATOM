@@ -24,8 +24,13 @@ if [[ "${1:-}" == --container ]]; then
     ibv_devinfo -v || true
     rdma resource show || true
   } > /results/registration-environment.txt 2>&1
+  cc -shared -fPIC -O2 -Wall -Wextra -Werror \
+    /scripts/diagnostics/mooncake_thp_alloc.c -ldl -o /results/mooncake_thp_alloc.so
+  export ATOMESH_THP_ALLOCATOR_LIBRARY=/results/mooncake_thp_alloc.so
+  sha256sum /scripts/diagnostics/mooncake_thp_alloc.c \
+    /results/mooncake_thp_alloc.so > /results/allocator-sha256.txt
   /tmp/mooncake-store-smoke-venv/bin/python \
-    /scripts/pd_mooncake_store_smoke.py --output /results/cases --plan capacity
+    /scripts/pd_mooncake_store_smoke.py --output /results/cases --plan thp-store
   cat /proc/meminfo > /results/meminfo-after.txt
   if [[ -r /sys/fs/cgroup/memory.events ]]; then
     cat /sys/fs/cgroup/memory.events > /results/memory-events-after.txt

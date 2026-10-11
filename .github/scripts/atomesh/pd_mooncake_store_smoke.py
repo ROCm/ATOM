@@ -76,6 +76,7 @@ def worker(args):
     }
     direct = None
     store = None
+    gpu_buffer = None
     deadline = time.monotonic() + args.timeout
     try:
         torch.cuda.set_device(args.rank)
@@ -110,6 +111,17 @@ def worker(args):
             result["get_type"] = type(received).__name__
             result["get_length"] = len(received) if received is not None else None
             result["roundtrip"] = received == payload
+            if args.gpu_bytes:
+                gpu_buffer = torch.empty(
+                    args.gpu_bytes, dtype=torch.uint8, device="cuda"
+                )
+                result["gpu_bytes"] = args.gpu_bytes
+                result["direct_gpu_register_rc"] = direct.register_memory(
+                    gpu_buffer.data_ptr(), args.gpu_bytes
+                )
+                result["store_gpu_register_rc"] = store.register_buffer(
+                    gpu_buffer.data_ptr(), args.gpu_bytes
+                )
     except (RuntimeError, ValueError, TypeError, OSError) as exc:
         traceback.print_exc()
         result["error"] = repr(exc)
@@ -133,6 +145,7 @@ def run_case(
     timeout=180,
     local_buffer=1024**3,
     env_overrides=None,
+    gpu_bytes=0,
 ):
     import mooncake
 
@@ -180,6 +193,8 @@ def run_case(
                         str(segment),
                         "--local-buffer",
                         str(local_buffer),
+                        "--gpu-bytes",
+                        str(gpu_bytes),
                         "--port",
                         str(port),
                         "--output",
@@ -274,6 +289,15 @@ def run_case(
             and r.get("setup_rc") == 0
             and r.get("put_rc") == 0
             and r.get("roundtrip") is True
+            and "error" not in r
+            and (
+                not gpu_bytes
+                or (
+                    r.get("gpu_bytes") == gpu_bytes
+                    and r.get("direct_gpu_register_rc") == 0
+                    and r.get("store_gpu_register_rc") == 0
+                )
+            )
             and r["process_rc"] == 0
             for r in reports
         ),
@@ -349,6 +373,34 @@ def capacity_cases(root, nics):
     (root / "result.json").write_text(json.dumps(results, indent=2))
 
 
+def thp_store_cases(root):
+    library = os.environ["ATOMESH_THP_ALLOCATOR_LIBRARY"]
+    results = []
+    for name, count, segment in (
+        ("eight-all-small-thp", 8, 64 * 1024**2),
+        ("single-all-full-thp", 1, int(224.875 * 1024**3)),
+        ("eight-all-full-thp", 8, int(224.875 * 1024**3)),
+    ):
+        result = run_case(
+            root,
+            name,
+            count,
+            [""] * count,
+            segment,
+            env_overrides={
+                "LD_PRELOAD": library,
+                "ATOMESH_THP_LOCAL_BUFFER_BYTES": str(1024**3),
+                "ATOMESH_THP_GLOBAL_SEGMENT_BYTES": str(segment),
+            },
+            timeout=600 if count == 8 and segment > 1024**3 else 180,
+            gpu_bytes=20 * 1024**3 if segment > 1024**3 else 0,
+        )
+        results.append(result)
+        (root / "result.json").write_text(json.dumps(results, indent=2))
+        if not result["passed"]:
+            break
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
@@ -356,8 +408,11 @@ def main():
     parser.add_argument("--device", default="")
     parser.add_argument("--segment", type=int, default=64 * 1024**2)
     parser.add_argument("--local-buffer", type=int, default=1024**3)
+    parser.add_argument("--gpu-bytes", type=int, default=0)
     parser.add_argument(
-        "--plan", choices=["registration", "capacity"], default="registration"
+        "--plan",
+        choices=["registration", "capacity", "thp-store"],
+        default="registration",
     )
     parser.add_argument("--port", type=int)
     parser.add_argument("--output", required=True)
@@ -374,6 +429,9 @@ def main():
         raise RuntimeError(f"Expected eight RDMA NICs, found {nics}")
     if args.plan == "capacity":
         capacity_cases(root, nics)
+        return
+    if args.plan == "thp-store":
+        thp_store_cases(root)
         return
     small = 64 * 1024**2
     results = [run_case(root, "single-all", 1, [""], small)]
