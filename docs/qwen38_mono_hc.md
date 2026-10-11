@@ -13,11 +13,9 @@ Set `ATOM_QWEN38_MONO_HC=1` before starting ATOM. The default is off. Dispatch
 requires gfx950, contiguous BF16 data and weights, FP32 norm weights, and the
 Flash-Next geometry: HC=4, hidden=2560, low rank=320. Mix uses three FlyDSL
 launches at 1–16 tokens; combine uses one launch at 1–128 tokens. Larger and
-unsupported shapes use the native operators.
-The HC kernels require
-[ROCm/FlyDSL#1265](https://github.com/ROCm/FlyDSL/pull/1265), including its typed
-`fx.rocdl.dot2_bf16` intrinsic wrapper. The installed FlyDSL 0.2.4 predates
-this compiler API and cannot compile the specialization.
+unsupported shapes use the native operators. The kernel and its packed BF16
+dot helper live in ATOM and use the FlyDSL build already used by ATOM's mono
+kernels. No FlyDSL source change or companion PR is required.
 
 The four stages are grouped Gemma RMSNorm, down projection with scaled SiLU,
 up projection with gated mean, and injection with residual update. The
@@ -26,20 +24,20 @@ consume it. BF16 rounding at projection and scaled-activation boundaries is
 preserved. Each CTA owns its output; there is no persistent scratch or
 cross-CTA synchronization, so changed-input CUDA Graph replay is safe.
 
-`python -m kernels.monokernel.qwen38.tools.benchmark --repeats 5` benchmarks an
+`python tools/bench_qwen38_hc.py --repeats 5` benchmarks an
 actual ATOM `Qwen4ExpHyperConnection` with synthetic BF16 weights on one idle
 MI355X. Times are median graph GPU microseconds for one mix+combine pair:
 
 | Decode tokens | Native | FlyDSL | Speedup |
 | ---: | ---: | ---: | ---: |
-| 1 | 33.29 | 12.59 | 2.64× |
-| 2 | 35.06 | 13.46 | 2.61× |
-| 4 | 35.58 | 15.71 | 2.27× |
-| 8 | 36.41 | 20.08 | 1.81× |
-| 16 | 36.17 | 28.07 | 1.29× |
+| 1 | 33.41 | 13.08 | 2.56× |
+| 2 | 35.58 | 13.87 | 2.57× |
+| 4 | 36.44 | 16.27 | 2.24× |
+| 8 | 36.65 | 20.43 | 1.79× |
+| 16 | 36.58 | 28.41 | 1.29× |
 
-The 16-token FlyDSL stage times were 2.58 µs norm, 7.08 µs down, 12.88 µs
-up, and 3.16 µs combine. The up projection is the larger-batch bottleneck.
+The 16-token FlyDSL stage times were 2.61 µs norm, 7.19 µs down, 13.25 µs
+up, and 3.21 µs combine. The up projection is the larger-batch bottleneck.
 For 16/32/64/128 tokens, the combine stage alone measured 3.34/3.39/3.48/
 3.95 µs versus 9.92/9.93/10.15/10.08 µs native, or 2.98/2.93/2.92/2.55×.
 The 32–128-token mix remains native.
@@ -47,7 +45,7 @@ The 32–128-token mix remains native.
 ### Generated gfx950 ISA
 
 The benchmark's `--dump-ir-dir` option saves the final AMDGCN assembly. The
-one-token build at `/tmp/qwen38-rocdl-dot2-isa2` yielded:
+one-token build at `/tmp/qwen38-atom-internal-isa` yielded:
 
 | Stage | VGPR | LDS bytes | `v_dot2c_f32_bf16` | DPP moves | Buffer loads | Barriers | Scratch ops |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -56,8 +54,8 @@ one-token build at `/tmp/qwen38-rocdl-dot2-isa2` yielded:
 | Up + gated mean | 13 | 0 | 12 | 24 | 19 | 0 | 0 |
 | Injection + combine | 49 | 16 | 20 | 6 | 50 | 2 | 0 |
 
-The BF16 GEMVs use packed `v_dot2c_f32_bf16` through a typed FlyDSL wrapper;
-the HC implementation contains no inline assembly or raw LLVM operations.
+The BF16 GEMVs use packed `v_dot2c_f32_bf16` through an ATOM-side typed helper;
+the Qwen HC kernel contains no inline assembly or raw LLVM operations.
 There is no MFMA at one token.
 No stage spills. The up stage's four gate reductions account for its 24 DPP
 moves and four exponentials/reciprocals; it is compute and reduction heavy as
@@ -69,7 +67,7 @@ instructions, 32 bytes LDS, and no scratch operations.
 At 16 tokens, the grouped down CTA uses 96 VGPR, 80 packed dot2 instructions,
 100 buffer loads, and no scratch spills. The up CTA uses 15 VGPR, 24 dot2
 instructions, 26 buffer loads, eight exponentials and eight reciprocals, with
-no LDS or spills. It takes 13.24 µs of the 28.56 µs pair; giving each up CTA
+no LDS or spills. It takes 13.25 µs of the 28.41 µs pair; giving each up CTA
 four rows raised VGPR to 25 and made the up stage slower (13.61 µs), so the
 two-row schedule is retained. Direct FlyDSL mix probes at 32/64/128 rows took
 38.0/67.8/142.9 µs versus 25.3/27.5/30.1 µs native; mix therefore falls

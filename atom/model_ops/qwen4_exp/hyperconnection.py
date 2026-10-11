@@ -143,7 +143,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         broadcast multiply and the mean over streams are one fused pass.
         """
         if self._mono_supported(hyper_input, 16):
-            from kernels.monokernel.qwen38 import mix
+            from atom.model_ops.qwen4_exp.ops.hc_flydsl import mix
 
             return mix(self, hyper_input)
         normed = self.hc_norm(hyper_input)
@@ -178,7 +178,7 @@ class Qwen4ExpHyperConnection(nn.Module):
             and self.block_inject_weight.weight.device == hyper_input.device
             and self.block_inject_weight.weight.is_contiguous()
         ):
-            from kernels.monokernel.qwen38 import combine
+            from atom.model_ops.qwen4_exp.ops.hc_flydsl import combine
 
             return combine(self, block_output, residuals)
         raw = self.block_inject_weight(normed, otype=normed.dtype)
