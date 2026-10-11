@@ -108,6 +108,8 @@ class FakeCluster:
         self.groups: dict[str, dict[str, str]] = {}
         self.stores: list[FakeStore] = []
         self.setup_rc = 0
+        # Per master: a setup result other than `setup_rc`.
+        self.setup_rc_of: dict[str, int] = {}
         # A get that reports success but never writes: the probe must notice.
         self.silent_gets = False
         # The result of every put not in a store's put_codes, if set.
@@ -147,8 +149,9 @@ class FakeStore:
 
     def setup(self, *args):
         self.setup_args = args
-        if self.cluster.setup_rc:
-            return self.cluster.setup_rc
+        rc = self.cluster.setup_rc_of.get(args[6], self.cluster.setup_rc)
+        if rc:
+            return rc
         self.objects = self.cluster.objects.setdefault(args[6], {})
         self.groups = self.cluster.groups.setdefault(args[6], {})
         return 0
@@ -1326,11 +1329,11 @@ def test_lookup_answers_nothing_on_any_store_error(cluster):
     assert lookup.lookup(_seq(0, 24)) is None
     store.exist_codes.clear()
     store.raise_on = "exists"
-    lookup._paused_until = 0.0  # past the pause the failure started
+    lookup._pools[0].paused_until = 0.0  # past the pause the failure started
     assert lookup.lookup(_seq(0, 24)) is None
     assert store.calls[-1][0] == "exists"
     # None is a non-answer: the scheduler does not remember it as a miss.
-    lookup._paused_until = 0.0
+    lookup._pools[0].paused_until = 0.0
     assert scheduler.get_num_new_matched_tokens(_seq(3, 25)) == (0, False)
     assert scheduler._lookup_results == {}
 
@@ -1367,9 +1370,91 @@ def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
         key: store_client.RPC_FAIL for key in cluster.objects["10.0.0.1:26151"]
     }
     assert lookup.lookup(_seq(0, 32)) == 32
-    # ... and makes the answer a non-answer where no pool does.
+    # ... and is then not asked for a while: the other pool's answers stand,
+    # so stage 0's chunks, which only the paused pool holds, are absent.
     cluster.objects["10.0.0.1:26151"].clear()
-    assert lookup.lookup(_seq(0, 32)) is None
+    assert lookup.lookup(_seq(0, 32)) == 0
+    assert [p.paused_until > 0 for p in lookup._pools] == [True, False]
+
+
+def _two_pools(world=2):
+    pools = {
+        "rdma0": {"master": "10.0.0.1:26051", "metadata": METADATA},
+        "rdma1": {"master": "10.0.0.1:26151", "metadata": METADATA},
+    }
+    extra = _extra(master=None, metadata=None, protocol="rdma", pools=pools)
+    return MooncakeStoreOffloadScheduler(_config(pp=world, extra=extra))
+
+
+@pytest.mark.parametrize("failure", ["raise", "codes"])
+def test_a_failing_pool_leaves_the_others_answering(cluster, scheduler_clock, failure):
+    lookup = _two_pools()._lookup_client
+    hashes = _hashes(32)
+    # Both stages read pool rdma0; rdma1 holds nothing of this prompt.
+    for rank in range(2):
+        _store_chunks(cluster, hashes, range(4), rank=rank, world=2)
+    assert lookup.lookup(_seq(0, 32)) == 32
+    down = cluster.store_of("10.0.0.1:26151")
+    if failure == "raise":
+        down.raise_on = "exists"  # its master is down
+    else:
+        down.exist_codes = {
+            key: store_client.RPC_FAIL for key in cluster.objects[MASTER]
+        }
+    assert lookup.lookup(_seq(0, 32)) == 32
+    asked = len(down.calls)
+    # Paused: not asked again for a while, and the hit stands meanwhile.
+    scheduler_clock.now += 1.0
+    assert lookup.lookup(_seq(0, 32)) == 32
+    assert len(down.calls) == asked
+
+
+def test_a_pool_that_cannot_connect_leaves_the_others_open(cluster, scheduler_clock):
+    lookup = _two_pools()._lookup_client
+    hashes = _hashes(32)
+    for rank in range(2):
+        _store_chunks(cluster, hashes, range(4), rank=rank, world=2)
+    cluster.setup_rc_of["10.0.0.1:26151"] = store_client.RPC_FAIL
+    assert lookup.lookup(_seq(0, 32)) == 32
+    up = cluster.store_of("10.0.0.1:26051")
+    assert not up.closed
+    # The pool that failed is tried again only after its pause.
+    scheduler_clock.now += scheduler_mod._RECONNECT_INTERVAL_S - 1.0
+    assert lookup.lookup(_seq(0, 32)) == 32
+    assert len(cluster.stores) == 2
+    del cluster.setup_rc_of["10.0.0.1:26151"]
+    scheduler_clock.now += 2.0
+    assert lookup.lookup(_seq(0, 32)) == 32
+    assert len(cluster.stores) == 3 and not up.closed
+
+
+def test_a_lookup_answers_what_unanswered_keys_cannot_change(cluster):
+    scheduler = MooncakeStoreOffloadScheduler(_config(pp=2))
+    lookup = scheduler._lookup_client
+    namespace = scheduler._namespace
+    hashes = _hashes(48)
+    _store_chunks(cluster, hashes, range(6), rank=0, world=2)
+    _store_chunks(cluster, hashes, [0, 1, 2, 4, 5], rank=1, world=2)  # 3 absent
+    assert lookup.lookup(_seq(0, 48)) == 3 * CHUNK
+    [store] = cluster.stores
+    # An error past the hit cannot lengthen it: the hit stands.
+    store.exist_codes = {
+        _key(hashes, 4, rank=0, world=2, namespace=namespace): store_client.RPC_FAIL
+    }
+    lookup._pools[0].paused_until = 0.0
+    assert lookup.lookup(_seq(0, 48)) == 3 * CHUNK
+    # An error before it could shorten it: no answer.
+    store.exist_codes = {
+        _key(hashes, 1, rank=0, world=2, namespace=namespace): store_client.RPC_FAIL
+    }
+    lookup._pools[0].paused_until = 0.0
+    assert lookup.lookup(_seq(0, 48)) is None
+    # Neither can an error on the rank whose miss decides the hit.
+    store.exist_codes = {
+        _key(hashes, 3, rank=1, world=2, namespace=namespace): store_client.RPC_FAIL
+    }
+    lookup._pools[0].paused_until = 0.0
+    assert lookup.lookup(_seq(0, 48)) is None
 
 
 def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
@@ -1383,7 +1468,7 @@ def test_a_failed_lookup_pauses_the_next_ones(cluster, scheduler_clock):
         return sum(1 for call in store.calls if call[0] == "exists")
 
     for failure in ("raise", "code"):
-        lookup._paused_until = 0.0
+        lookup._pools[0].paused_until = 0.0
         if failure == "raise":
             store.raise_on = "exists"
         else:
@@ -1416,7 +1501,7 @@ def test_a_lookup_that_blocked_pauses_ten_times_as_long(cluster, scheduler_clock
 
     store.batch_is_exist = dead_master
     assert lookup.lookup(_seq(0, 16)) is None
-    assert lookup._paused_until == pytest.approx(scheduler_clock.now + 43.0)
+    assert lookup._pools[0].paused_until == pytest.approx(scheduler_clock.now + 43.0)
 
 
 def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
@@ -1427,7 +1512,7 @@ def test_lookup_retries_an_unreachable_store_only_after_a_pause(cluster):
     assert lookup.lookup(_seq(0, 16)) is None
     assert len(cluster.stores) == 1  # no reconnect on every step
     cluster.setup_rc = 0
-    lookup._paused_until = 0.0
+    lookup._pools[0].paused_until = 0.0
     assert lookup.lookup(_seq(0, 16)) == 0
     assert len(cluster.stores) == 2
 
@@ -1449,7 +1534,9 @@ def test_a_connect_that_blocked_pauses_ten_times_as_long(
     monkeypatch.setattr(FakeStore, "setup", unanswered_setup)
     assert lookup.lookup(_seq(0, 16)) is None
     # Paused from the failure, not from before the setup that blocked.
-    assert lookup._paused_until == pytest.approx(scheduler_clock.now + 10 * blocked_s)
+    assert lookup._pools[0].paused_until == pytest.approx(
+        scheduler_clock.now + 10 * blocked_s
+    )
     scheduler_clock.now += 0.01  # the next request's lookup
     assert lookup.lookup(_seq(0, 16)) is None
     assert len(cluster.stores) == 1
@@ -1647,7 +1734,7 @@ def _park_after_a_wait_for_blocks(cluster, scheduler_clock, store_engine, meanwh
     elif meanwhile == "store_error":
         store.exist_codes[key] = store_client.RPC_FAIL
     elif meanwhile == "lookups_paused":  # another prompt's lookup just failed
-        offload._lookup_client._paused_until = scheduler_clock.now + 10.0
+        offload._lookup_client._pools[0].paused_until = scheduler_clock.now + 10.0
     store_engine.withheld.on = False
     batch, _ = engine.schedule()
     # Admitted and parked, and its load dispatched in the same step.

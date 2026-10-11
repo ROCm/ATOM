@@ -392,27 +392,32 @@ a copy into each slot (and the reverse).
   lacks is a miss, and the rest would only hold memory. A key that already
   exists keeps its group, so a rank that re-puts a chunk joins the group the
   others are in while any of them lives.
-- Lookup runs in the scheduler process over its own tcp Store client, opened on
-  the first lookup (every PP stage builds a scheduler; only the head asks):
-  one `batch_is_exist` for every rank x chunk key (split into calls of at most
-  8192 keys). The hit is the shortest run of present chunks from
-  chunk 0 over all ranks, because a load is all-or-nothing across stages. Any
-  error code or exception answers `None` -- "no answer", retried later --
-  never a remembered miss. A lookup blocks the scheduler thread, and a master
-  that is down holds each call for seconds, so after a failed one lookups
-  answer `None` without asking for 10 s, or ten times as long as the failed
-  call blocked if that is longer.
+- Lookup runs in the scheduler process over its own tcp Store client per
+  pool, each opened on the first lookup that asks it (every PP stage builds a
+  scheduler; only the head asks): one `batch_is_exist` for every rank x chunk
+  key (split into calls of at most 8192 keys). The hit is the shortest run of
+  present chunks from chunk 0 over all ranks, because a load is
+  all-or-nothing across stages. A key no pool answered (an error code, or a
+  pool that raised or is paused) leaves the lookup `None` -- "no answer",
+  retried later, never a remembered miss -- where it could change the hit; an
+  error past the hit cannot lengthen it, and the hit stands. A lookup blocks
+  the scheduler thread, and a master that is down holds each call for
+  seconds, so a pool that failed a lookup is not asked for 10 s, or ten times
+  as long as the failed call blocked if that is longer, and one the scheduler
+  could not reach for 30 s; with one pool, lookups meanwhile answer `None`
+  without asking.
 - With per-NIC pools the scheduler cannot tell which pool a rank writes to, so
-  it asks every pool for every key, concurrently, and ORs the answers. That is
-  exact while every server on the pools puts each rank on the same NIC (one
-  prefill server per node, as the launcher runs). Servers that place a rank
-  on different NICs -- two on one node, or DP ranks -- see each other's
-  objects as hits their workers then miss: the load fails, the request
-  recomputes and saves the chunks into its own pool, once per prefix, never
-  with another layout's bytes; and a pool that fails a lookup makes every
-  lookup with an absent key answer "no answer" for each of them. Asking each
-  rank's own pool needs the workers' NIC placement in the scheduler (a
-  follow-up).
+  it asks every pool for every key, concurrently: a key is present if any pool
+  holds it, and absent if a pool answered and none holds it, so a pool that
+  fails or is paused counts as absent for every key another pool answers.
+  That never makes a hit longer, and the pools that answer keep loading
+  whatever they hold. It is exact while every server on the pools puts each
+  rank on the same NIC (one prefill server per node, as the launcher runs).
+  Servers that place a rank on different NICs -- two on one node, or DP ranks
+  -- see each other's objects as hits their workers then miss: the load
+  fails, the request recomputes and saves the chunks into its own pool, once
+  per prefix, never with another layout's bytes. Asking each rank's own pool
+  needs the workers' NIC placement in the scheduler (a follow-up).
 - `batch_is_exist` gives each present key a 10 s read lease (master default),
   and only the lease keeps it from eviction. A request that waits for KV
   blocks after its lookup outlives it, so a hit more than a second old is

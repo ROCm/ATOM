@@ -30,6 +30,7 @@ from atom.kv_transfer.offload.metadata import LMCacheReqMeta, LoadSpec, SaveSpec
 from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store.config import (
     MooncakeStoreOffloadConfig,
+    StorePool,
     check_engine_compatibility,
     parse_mooncake_store_config,
 )
@@ -45,18 +46,18 @@ from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Seconds lookups answer "no answer" without asking after the Store could not
-# be reached. Connecting blocks the scheduler thread (Mooncake's setup holds
-# the GIL, and retries a master that does not answer for minutes), so a
-# missing master must not cost that on every step.
+# Seconds lookups do not ask a pool the scheduler could not reach. Connecting
+# blocks the scheduler thread (Mooncake's setup holds the GIL, and retries a
+# master that does not answer for minutes), so a missing master must not cost
+# that on every step.
 _RECONNECT_INTERVAL_S = 30.0
-# The same after a lookup the Store failed to answer: a master that is down
-# holds each call for seconds, a hung one for coro_rpc's 30 s request timeout.
+# The same for a pool that failed a lookup: a master that is down holds each
+# call for seconds, a hung one for coro_rpc's 30 s request timeout.
 _LOOKUP_BACKOFF_S = 10.0
 # Either pause lasts at least this many times as long as the failed call
 # blocked the scheduler thread (`_StoreLookup._pause`).
 _LOOKUP_BACKOFF_FACTOR = 10.0
-# Seconds between two warnings about failing lookups.
+# Seconds between two warnings about one pool's failing lookups.
 _LOOKUP_WARNING_INTERVAL_S = 60.0
 # Seconds between two `[OFFLOAD-LOOKUP-STATS]` lines.
 _LOOKUP_STATS_INTERVAL_S = 60.0
@@ -134,6 +135,23 @@ def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
     return hashes
 
 
+class _PoolLookups:
+    """One Store pool as the scheduler's lookups reach it.
+
+    Its client is opened on the first lookup that asks it. A pool that cannot
+    be reached, or fails a lookup, is not asked until ``paused_until``: every
+    call to it blocks the scheduler thread, and the other pools answer
+    meanwhile.
+    """
+
+    __slots__ = ("client", "paused_until", "pool")
+
+    def __init__(self, pool: StorePool) -> None:
+        self.pool = pool
+        self.client: store_client.MooncakeStoreClient | None = None
+        self.paused_until = 0.0
+
+
 class _StoreLookup:
     """The chunked scheduler's lookup client, answered by the Store's masters.
 
@@ -145,10 +163,18 @@ class _StoreLookup:
     asks again before it dispatches a load whose hit is older than
     ``_LOOKUP_REUSE_S``.
 
-    The Store client is opened on the first lookup, not at construction: every
-    PP stage builds a scheduler, and only the head ever schedules. A lookup
-    blocks the scheduler thread, so one the Store fails to answer pauses the
-    next ones (``_LOOKUP_BACKOFF_S``).
+    Every pool is asked for every key (the scheduler cannot see which NIC a
+    rank writes through). A key is present if any pool holds it, absent if a
+    pool answered and none holds it, and unanswered if no pool answered: a
+    pool that fails is absent for every key another pool answers. A lookup
+    answers only what the unanswered keys cannot change, so a pool that fails
+    never makes a hit longer.
+
+    A pool's Store client is opened on the first lookup that asks it, not at
+    construction: every PP stage builds a scheduler, and only the head ever
+    schedules. A lookup blocks the scheduler thread, so a pool the scheduler
+    cannot reach, or that fails a lookup, is not asked for a while
+    (``_RECONNECT_INTERVAL_S``, ``_LOOKUP_BACKOFF_S``).
     """
 
     def __init__(
@@ -163,15 +189,21 @@ class _StoreLookup:
         self._namespace = namespace
         self._world = int(world)
         self._chunk_tokens = int(chunk_tokens)
-        # Per-NIC pools: a rank's chunks live in the pool of its NIC, which the
-        # scheduler cannot see, so every pool is asked for every key. Exact
-        # while every server on these pools puts each rank on the same NIC;
-        # see the offload README for what a different placement costs.
-        self._masters = cfg.store_masters()
-        self._clients: list[store_client.MooncakeStoreClient] | None = None
-        self._executor: ThreadPoolExecutor | None = None
-        self._paused_until = 0.0
-        self._next_warning_at = 0.0
+        # Exact while every server on these pools puts each rank on the same
+        # NIC; see the offload README for what a different placement costs.
+        self._pools = [_PoolLookups(pool) for pool in cfg.store_masters()]
+        # Several pools are asked at once; the executor starts no thread until
+        # the first lookup.
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=len(self._pools),
+                thread_name_prefix="mooncake-store-lookup",
+            )
+            if len(self._pools) > 1
+            else None
+        )
+        # Per pool master: when its next warning may be logged.
+        self._next_warning_at: dict[str, float] = {}
         # Answered lookups; those where the ranks held prefixes of different
         # lengths; and the rank objects past the shared prefix they found,
         # present but unusable while another rank lacks the chunk -- evicted,
@@ -184,56 +216,44 @@ class _StoreLookup:
     def lookup(self, seq: Any, lookup_id: str | None = None) -> int | None:
         """Tokens of ``seq``'s prompt prefix the Store holds on every rank.
 
-        None, not 0, when the Store did not answer -- unreachable, a failed
-        call, or any per-key error: the scheduler retries a non-answer later,
-        where a 0 would be remembered as a miss.
+        None, not 0, when the Store did not answer -- no pool reached, or the
+        keys no pool answered decide the hit: the scheduler retries a
+        non-answer later, where a 0 would be remembered as a miss.
         """
         started = time.perf_counter()
         hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
         chunks = len(hashes) // DIGEST_BYTES
         if not chunks:
             return 0
-        if time.monotonic() < self._paused_until:
-            return None
-        clients = self._connected_clients()
-        if clients is None:
-            return None
         # Every rank's keys share the chunks' digests: each is hex-encoded once.
         digests = [chunk_digest(hashes, index).hex() for index in range(chunks)]
         keys = []
         for rank in range(self._world):
             prefix = rank_key_prefix(self._namespace, rank, self._world)
             keys += [prefix + digest for digest in digests]
-        asked_at = time.monotonic()
-        try:
-            codes = self._exists(clients, keys)
-        except Exception:  # noqa: BLE001  # any failure is a non-answer
-            self._warn(
-                "a Store lookup of %d keys failed; lookups pause for %.0fs",
-                len(keys),
-                self._pause(_LOOKUP_BACKOFF_S, asked_at),
-                exc_info=True,
-            )
+        merged = self._ask(keys)
+        if merged is None:
             return None
-        errors = [code for code in codes if code < 0]
-        if errors:
-            self._warn(
-                "a Store lookup got %d error(s) for %d keys, first %s; lookups "
-                "pause for %.0fs",
-                len(errors),
-                len(keys),
-                store_client.describe(errors[0]),
-                self._pause(_LOOKUP_BACKOFF_S, asked_at),
-            )
-            return None
-        presents = []
+        # Per rank, the run of chunks from chunk 0 some pool holds: at least
+        # `held` (an unanswered key counts as absent), at most `bound` (as
+        # present).
+        held, bound = [], []
         for rank in range(self._world):
-            shard = codes[rank * chunks : (rank + 1) * chunks]
-            presents.append(
-                next((index for index, code in enumerate(shard) if code != 1), chunks)
+            shard = merged[rank * chunks : (rank + 1) * chunks]
+            held.append(next((i for i, code in enumerate(shard) if code != 1), chunks))
+            bound.append(next((i for i, code in enumerate(shard) if code == 0), chunks))
+        hit_chunks = min(held)
+        if min(bound) != hit_chunks:
+            logger.debug(
+                "[OFFLOAD-LOOKUP] lookup_id=%s chunks=%d: keys no pool answered "
+                "decide the hit (%d to %d chunks); no answer",
+                lookup_id,
+                chunks,
+                hit_chunks,
+                min(bound),
             )
-        hit_chunks = min(presents)
-        self._count_lookup(sum(present - hit_chunks for present in presents))
+            return None
+        self._count_lookup(sum(present - hit_chunks for present in held))
         hit = hit_chunks * self._chunk_tokens
         logger.debug(
             "[OFFLOAD-LOOKUP] lookup_id=%s chunks=%d keys=%d hit=%d elapsed_ms=%.2f",
@@ -248,24 +268,89 @@ class _StoreLookup:
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
 
-    def _exists(
-        self, clients: list[store_client.MooncakeStoreClient], keys: list[str]
-    ) -> list[int]:
-        """One answer per key: 1 if any pool holds it, else an error, else 0."""
-        if len(clients) == 1:
-            return clients[0].exists(keys)
-        assert self._executor is not None
-        answers = list(self._executor.map(lambda client: client.exists(keys), clients))
-        merged = []
+    def _ask(self, keys: list[str]) -> list[int | None] | None:
+        """Per key: 1 if a pool holds it, 0 if a pool answered and none holds
+        it, None if no pool answered. None when no pool answered any key.
+        """
+        pools = self._pools_to_ask()
+        if not pools:
+            return None
+        answers = [
+            answer for answer in self._exists_on(pools, keys) if answer is not None
+        ]
+        merged: list[int | None] = []
         for codes in zip(*answers):
             if 1 in codes:
                 merged.append(1)
+            elif 0 in codes:
+                merged.append(0)
             else:
-                merged.append(min(min(codes), 0))
+                merged.append(None)
+        if all(code is None for code in merged):
+            return None
         return merged
 
-    def _pause(self, floor_s: float, since: float) -> float:
-        """Pause lookups after a failed call that started at ``since``.
+    def _pools_to_ask(self) -> list[_PoolLookups]:
+        """The pools not paused, each connected, connecting those not yet."""
+        now = time.monotonic()
+        return [
+            pool
+            for pool in self._pools
+            if now >= pool.paused_until
+            and (pool.client is not None or self._connect(pool))
+        ]
+
+    def _exists_on(
+        self, pools: list[_PoolLookups], keys: list[str]
+    ) -> list[list[int] | None]:
+        """Each pool's codes for ``keys``, concurrently; None for one that raised.
+
+        A pool that raised or answered an error is paused (`_pause`).
+        """
+        asked_at = time.monotonic()
+        futures = (
+            [self._executor.submit(pool.client.exists, keys) for pool in pools]
+            if self._executor is not None
+            else None
+        )
+        answers: list[list[int] | None] = []
+        for index, pool in enumerate(pools):
+            try:
+                codes = (
+                    futures[index].result()
+                    if futures is not None
+                    else pool.client.exists(keys)
+                )
+            except Exception as exc:  # noqa: BLE001  # the pool is not asked a while
+                self._warn(
+                    pool,
+                    "the Store pool at %s failed a lookup of %d keys; it is not "
+                    "asked for %.0fs",
+                    pool.pool.master,
+                    len(keys),
+                    self._pause(pool, _LOOKUP_BACKOFF_S, asked_at),
+                    exc_info=exc,
+                )
+                answers.append(None)
+                continue
+            errors = [code for code in codes if code < 0]
+            if errors:
+                self._warn(
+                    pool,
+                    "the Store pool at %s got %d error(s) for %d keys, first %s; "
+                    "it is not asked for %.0fs",
+                    pool.pool.master,
+                    len(errors),
+                    len(keys),
+                    store_client.describe(errors[0]),
+                    self._pause(pool, _LOOKUP_BACKOFF_S, asked_at),
+                )
+            answers.append(codes)
+        return answers
+
+    @staticmethod
+    def _pause(pool: _PoolLookups, floor_s: float, since: float) -> float:
+        """Pause ``pool`` after a failed call that started at ``since``.
 
         For ``floor_s`` or `_LOOKUP_BACKOFF_FACTOR` times as long as the call
         blocked, whichever is longer, counted from now: a failed setup can
@@ -274,48 +359,35 @@ class _StoreLookup:
         """
         now = time.monotonic()
         pause = max(floor_s, _LOOKUP_BACKOFF_FACTOR * (now - since))
-        self._paused_until = now + pause
+        pool.paused_until = now + pause
         return pause
 
-    def _connected_clients(self) -> list[store_client.MooncakeStoreClient] | None:
-        if self._clients is not None:
-            return self._clients
+    def _connect(self, pool: _PoolLookups) -> bool:
+        """Open ``pool``'s client; on failure pause it and return False."""
         started = time.monotonic()
-        clients: list[store_client.MooncakeStoreClient] = []
         try:
-            for pool in self._masters:
-                # Lookups are master RPCs only; tcp needs no NIC of its own.
-                clients.append(
-                    store_client.MooncakeStoreClient(
-                        local_hostname=self._cfg.local_hostname,
-                        metadata_server=pool.metadata,
-                        master_server_addr=pool.master,
-                        protocol="tcp",
-                        rdma_devices="",
-                    )
-                )
+            # Lookups are master RPCs only; tcp needs no NIC of its own.
+            pool.client = store_client.MooncakeStoreClient(
+                local_hostname=self._cfg.local_hostname,
+                metadata_server=pool.pool.metadata,
+                master_server_addr=pool.pool.master,
+                protocol="tcp",
+                rdma_devices="",
+            )
         except Exception:
-            for client in clients:
-                _close_quietly(client)
-            pause = self._pause(_RECONNECT_INTERVAL_S, started)
+            pause = self._pause(pool, _RECONNECT_INTERVAL_S, started)
             logger.warning(
                 "Mooncake Store offload: the scheduler cannot reach the Store "
-                "(%s); lookups answer nothing for the next %.0fs",
-                ", ".join(pool.master for pool in self._masters),
+                "pool at %s; lookups do not ask it for the next %.0fs",
+                pool.pool.master,
                 pause,
                 exc_info=True,
             )
-            return None
-        if len(clients) > 1:
-            self._executor = ThreadPoolExecutor(
-                max_workers=len(clients), thread_name_prefix="mooncake-store-lookup"
-            )
-        self._clients = clients
+            return False
         logger.info(
-            "Mooncake Store offload: scheduler lookups use %s",
-            ", ".join(pool.master for pool in self._masters),
+            "Mooncake Store offload: scheduler lookups use %s", pool.pool.master
         )
-        return clients
+        return True
 
     def _count_lookup(self, stranded: int) -> None:
         """Count an answered lookup, logging the totals once a minute."""
@@ -334,24 +406,16 @@ class _StoreLookup:
             self.stranded_objects,
         )
 
-    def _warn(self, message: str, *args: Any, exc_info: bool = False) -> None:
+    def _warn(
+        self, pool: _PoolLookups, message: str, *args: Any, exc_info: Any = None
+    ) -> None:
+        """At most one warning per pool and `_LOOKUP_WARNING_INTERVAL_S`."""
         now = time.monotonic()
-        if now < self._next_warning_at:
+        if now < self._next_warning_at.get(pool.pool.master, 0.0):
             logger.debug("Mooncake Store offload: " + message, *args)
             return
-        self._next_warning_at = now + _LOOKUP_WARNING_INTERVAL_S
-        logger.warning(
-            "Mooncake Store offload: " + message + "; the request prefills instead",
-            *args,
-            exc_info=exc_info,
-        )
-
-
-def _close_quietly(client: store_client.MooncakeStoreClient) -> None:
-    try:
-        client.close()
-    except Exception:
-        logger.debug("Mooncake Store offload: client close failed", exc_info=True)
+        self._next_warning_at[pool.pool.master] = now + _LOOKUP_WARNING_INTERVAL_S
+        logger.warning("Mooncake Store offload: " + message, *args, exc_info=exc_info)
 
 
 class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
