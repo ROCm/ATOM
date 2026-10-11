@@ -1187,6 +1187,7 @@ def qsa_select_paged_tokens(
     logits_workspace_bytes: int = DEFAULT_LOGITS_WORKSPACE_BYTES,
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
+    index_cp: tuple[int, int, object] | None = None,
 ) -> torch.Tensor:
     """Score, select and expand in one call.
 
@@ -1216,6 +1217,18 @@ def qsa_select_paged_tokens(
         bucket = 1 << (max(reachable, 1) - 1).bit_length()
         columns = max(1, min(columns, bucket))
         block_topk = max(1, min(block_topk, bucket))
+    if index_cp is not None:
+        rank, world, _ = index_cp
+        groups_per_page = compressed_k_cache.shape[1]
+        if (
+            world < 2
+            or not 0 <= rank < world
+            or columns % (world * groups_per_page)
+            or columns // world < block_topk
+        ):
+            raise ValueError(
+                "QSA index CP needs equal page shards with local top-k capacity"
+            )
     output_width = block_topk * compress_ratio + compress_ratio - 1
 
     if out is None:
@@ -1229,6 +1242,18 @@ def qsa_select_paged_tokens(
 
     # Chunk over query rows so the FP32 logits buffer stays within budget.
     rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
+    if index_cp is not None:
+        rank, world, group = index_cp
+        local_columns = columns // world
+        first_group = rank * local_columns
+        first_page = first_group // compressed_k_cache.shape[1]
+        local_table = page_table[
+            :, first_page : first_page + local_columns // compressed_k_cache.shape[1]
+        ]
+        local_positions = query_positions - first_group * compress_ratio
+        local_lens = (context_lens - first_group * compress_ratio).clamp(
+            min=0, max=local_columns * compress_ratio
+        )
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
@@ -1238,12 +1263,14 @@ def qsa_select_paged_tokens(
         logits, visible_groups = qsa_paged_mqa_logits(
             q[row_slice],
             compressed_k_cache,
-            page_table,
+            local_table if index_cp is not None else page_table,
             token_to_request[row_slice],
-            query_positions[row_slice],
-            context_lens,
+            local_positions[row_slice]
+            if index_cp is not None
+            else query_positions[row_slice],
+            local_lens if index_cp is not None else context_lens,
             compress_ratio,
-            max_columns=columns,
+            max_columns=local_columns if index_cp is not None else columns,
             row_starts=row_starts,
             allow_flydsl=allow_flydsl,
         )
@@ -1264,6 +1291,52 @@ def qsa_select_paged_tokens(
             # single-token decode and multi-token verification.
             stable=True,
         )
+        if index_cp is not None:
+            # Local top-k is exact: no global winner can be discarded from a
+            # shard that keeps at least the global k. The gathered payload is
+            # bounded by rows * world * k, independent of context length.
+            valid = (selected_groups >= 0) & (selected_groups < visible_groups[:, None])
+            local_scores = torch.gather(
+                logits, 1, selected_groups.clamp(min=0, max=local_columns - 1).long()
+            ).masked_fill(~valid, -float("inf"))
+            global_ids = torch.where(valid, selected_groups + first_group, -1)
+            payload = torch.stack((local_scores.view(torch.int32), global_ids), dim=-1)
+            from atom.distributed.qwen_qsa_cp import exchange_qsa_candidates
+
+            gathered = exchange_qsa_candidates(payload, group)
+            # Rank-major gather becomes row-major candidates. The local
+            # selector is stable, and contiguous shards preserve global-id
+            # order across equal scores when the merge is stable too.
+            candidates = (
+                gathered.permute(1, 0, 2, 3)
+                .contiguous()
+                .view(row_end - row_start, world * block_topk, 2)
+            )
+            # AITER's selector accepts a column-stride argument but its stable
+            # merge path still assumes contiguous score columns in practice.
+            # Materialize this small (world*k) matrix before selecting.
+            candidate_scores = candidates[..., 0].view(torch.float32).contiguous()
+            candidate_ids = candidates[..., 1]
+            candidate_lens = torch.full(
+                (row_end - row_start,),
+                world * block_topk,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            merged_offsets = torch.empty_like(selected_groups)
+            top_k_per_row_prefill(
+                candidate_scores,
+                row_starts,
+                candidate_lens,
+                merged_offsets,
+                None,
+                candidate_scores.shape[0],
+                candidate_scores.stride(0),
+                candidate_scores.stride(1),
+                block_topk,
+                stable=True,
+            )
+            selected_groups = torch.gather(candidate_ids, 1, merged_offsets.long())
         qsa_expand_block_indices(
             selected_groups,
             query_positions[row_slice],

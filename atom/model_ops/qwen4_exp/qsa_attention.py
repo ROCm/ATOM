@@ -53,6 +53,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_sparse_paged_gqa,
     qsa_store_rows,
 )
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -217,6 +218,20 @@ class Qwen4ExpAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.tp_size = tp_size
+        self.qsa_index_cp = envs.ATOM_QWEN38_QSA_CP
+        if self.qsa_index_cp and (
+            tp_size not in (2, 4)
+            or self.total_num_kv_heads != 2
+            or int(config.indexer_n_heads) != 4
+            or int(config.indexer_compress_ratio) != 4
+            or getattr(atom_config, "enable_tbo", False)
+            or getattr(atom_config, "enable_tbo_decode", False)
+        ):
+            raise ValueError(
+                "Qwen QSA index CP currently requires TP2/TP4, two KV heads, "
+                "four index heads, ratio four and no TBO"
+            )
 
         # The checkpoint's q_proj is [24 heads x 2*head_dim] with q and the
         # sigmoid output gate INTERLEAVED per head. QKVGParallelLinear
@@ -327,6 +342,23 @@ class Qwen4ExpAttention(nn.Module):
             self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
         )
 
+        forward_context = get_forward_context()
+        index_cp = None
+        if self.qsa_index_cp and not forward_context.context.is_prefill:
+            # The fixed candidate exchange costs more than the saved score
+            # work for short contexts and small decode batches.
+            rows = index_q.shape[0]
+            minimum_work = 16 * 1024 * 1024 if self.tp_size == 4 else 32 * 1024 * 1024
+            if rows * qsa.max_seq_len >= minimum_work:
+                from aiter.dist.parallel_state import get_tp_group
+
+                group = get_tp_group()
+                index_cp = (
+                    group.rank_in_group,
+                    group.world_size,
+                    group,
+                )
+
         return qsa_select_paged_tokens(
             index_q,
             self.compressed_key_cache,
@@ -337,7 +369,8 @@ class Qwen4ExpAttention(nn.Module):
             self.indexer.token_topk,
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
-            allow_flydsl=get_forward_context().context.is_prefill,
+            allow_flydsl=forward_context.context.is_prefill,
+            index_cp=index_cp,
         )
 
     def forward(

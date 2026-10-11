@@ -44,6 +44,7 @@ from atom.model_ops.qwen4_exp.ops.hc_fused import (
 HC_ROWS_MAX = 2
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
 
 
 class Qwen4ExpGroupedRMSNorm(nn.Module):
@@ -101,6 +102,38 @@ class Qwen4ExpHyperConnection(nn.Module):
             else None
         )
 
+    def _mono_supported(self, x: torch.Tensor, max_rows: int) -> bool:
+        """Only the measured Flash-Next decode geometry uses the fused path."""
+        if not envs.ATOM_QWEN38_MONO_HC:
+            return False
+        if (
+            self.hidden_size != 2560
+            or self.hc_count != 4
+            or self.hc_norm.weight.shape != (10240,)
+            or self.hc_norm.weight.dtype != torch.float32
+            or self.hc_norm.weight.device != x.device
+            or not self.hc_norm.weight.is_contiguous()
+            or self.input_mix_weight_down.weight.shape != (320, 10240)
+            or self.input_mix_weight_up.weight.shape != (10240, 320)
+            or x.ndim != 2
+            or not 1 <= x.shape[0] <= max_rows
+            or x.shape[1] != 10240
+            or x.dtype != torch.bfloat16
+            or not x.is_cuda
+            or not x.is_contiguous()
+        ):
+            return False
+        arch = getattr(torch.cuda.get_device_properties(x.device), "gcnArchName", "")
+        if arch.split(":")[0] != "gfx950":
+            return False
+        weights = (self.input_mix_weight_down.weight, self.input_mix_weight_up.weight)
+        return all(
+            weight.dtype == torch.bfloat16
+            and weight.device == x.device
+            and weight.is_contiguous()
+            for weight in weights
+        )
+
     def mix(
         self, hyper_input: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -109,6 +142,10 @@ class Qwen4ExpHyperConnection(nn.Module):
         Only the two low-rank projections are GEMMs; the sigmoid, the
         broadcast multiply and the mean over streams are one fused pass.
         """
+        if self._mono_supported(hyper_input, 16):
+            from kernels.monokernel.qwen38 import mix
+
+            return mix(self, hyper_input)
         normed = self.hc_norm(hyper_input)
         gate = scaled_silu(
             self.input_mix_weight_down(normed, otype=normed.dtype), self.hc_count
@@ -126,6 +163,24 @@ class Qwen4ExpHyperConnection(nn.Module):
         if self.block_inject_weight is None:
             raise RuntimeError("combine was disabled for this hyper-connection")
         hyper_input, normed = residuals
+        if (
+            self._mono_supported(hyper_input, 128)
+            and block_output.shape == (hyper_input.shape[0], self.hidden_size)
+            and block_output.dtype == torch.bfloat16
+            and block_output.device == hyper_input.device
+            and block_output.is_contiguous()
+            and normed.shape == hyper_input.shape
+            and normed.dtype == torch.bfloat16
+            and normed.device == hyper_input.device
+            and normed.is_contiguous()
+            and self.block_inject_weight.weight.shape == (4, 10240)
+            and self.block_inject_weight.weight.dtype == torch.bfloat16
+            and self.block_inject_weight.weight.device == hyper_input.device
+            and self.block_inject_weight.weight.is_contiguous()
+        ):
+            from kernels.monokernel.qwen38 import combine
+
+            return combine(self, block_output, residuals)
         raw = self.block_inject_weight(normed, otype=normed.dtype)
         return combine_inject(hyper_input, block_output, raw, self.hc_count).to(
             hyper_input.dtype

@@ -3906,8 +3906,10 @@ class ModelRunner:
         # dummy batch is prefill-only, and prefill stays on the TP path with no
         # all-to-all. No-op unless the flag is on.
         from atom.distributed.indexer_cp import warmup_exchange
+        from atom.distributed.qwen_qsa_cp import warmup_qsa_cp_exchange
 
         warmup_exchange(self.device)
+        warmup_qsa_cp_exchange(self.device)
 
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
