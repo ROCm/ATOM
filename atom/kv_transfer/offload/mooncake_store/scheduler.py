@@ -272,6 +272,29 @@ class _StoreLookup:
         )
         return hit
 
+    def renew(self, seq: Any, start: int, end: int) -> int:
+        """Renew the read leases of every rank's chunks in tokens ``[start, end)``.
+
+        Right before a load reads them: the leases of the lookup behind it may
+        have run out while the request waited for KV blocks. Returns how many
+        of those objects some pool holds; the load goes ahead whatever the
+        answer, and its all-or-nothing get fails on a chunk the Store lost.
+        A pool that fails is paused as after a lookup.
+        """
+        hashes = prompt_chunk_hashes(seq, self._chunk_tokens)
+        first = int(start) // self._chunk_tokens
+        last = min(int(end) // self._chunk_tokens, len(hashes) // DIGEST_BYTES)
+        pools = self._pools_to_ask() if first < last else []
+        if not pools:
+            return 0
+        digests = [chunk_digest(hashes, index).hex() for index in range(first, last)]
+        keys = []
+        for rank in range(self._world):
+            prefix = rank_key_prefix(self._namespace, rank, self._world)
+            keys += [prefix + digest for digest in digests]
+        answers = [a for a in self._exists_on(pools, keys) if a is not None]
+        return sum(1 for codes in zip(*answers) if 1 in codes)
+
     def clear_lookup_status(self, lookup_id: str) -> None:
         """Nothing to release: a Store read lease expires by itself."""
 
@@ -511,13 +534,14 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         return super()._fresh_tier_lookup(seq, sid)
 
     def _ensure_lookup_pin(self, seq: Any, sid: str, spec: LoadSpec) -> bool:
-        """Renew a hit's read leases before its load, which always goes ahead.
+        """Renew the read leases of what a load reads; the load always goes ahead.
 
         The base trusts a hit it still holds from this request's lookup, a
         live pin for LMCache. A Store lookup holds its chunks only for its
-        read lease, which a request waiting for KV blocks outlives, so a hit
-        older than ``_LOOKUP_REUSE_S``, or one answered from the memo, is
-        looked up again: that renews the lease right before the get.
+        read lease, which a request waiting for KV blocks outlives, so for a
+        hit older than ``_LOOKUP_REUSE_S``, or one answered from the memo, the
+        chunks the load reads, ``[hbm, transfer_end)`` of every rank, are asked
+        for again: that renews their leases right before the get.
 
         The answer does not decide the load. The engine parked the request
         when it admitted it, before this dispatch, and only the load's report
@@ -529,20 +553,27 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         looked_up_at = self._looked_up_at.get(sid)
         pending = self._lookup_results.get(sid)
         if (
-            pending is None
-            or pending[0] is not seq
-            or looked_up_at is None
-            or time.monotonic() - looked_up_at > _LOOKUP_REUSE_S
+            pending is not None
+            and pending[0] is seq
+            and looked_up_at is not None
+            and time.monotonic() - looked_up_at <= _LOOKUP_REUSE_S
         ):
-            hit = self._fresh_tier_lookup(seq, sid)
-            if hit is None or hit < int(spec.lmcache_cached_tokens):
-                logger.debug(
-                    "[OFFLOAD-LOOKUP] seq=%s the Store now answers %s for a load "
-                    "of %d tokens; dispatched anyway, a missing chunk fails it",
-                    seq.id,
-                    hit,
-                    int(spec.lmcache_cached_tokens),
-                )
+            return True
+        start = int(spec.hbm_cached_tokens)
+        end = int(
+            spec.lmcache_cached_tokens
+            if spec.transfer_end_tokens is None
+            else spec.transfer_end_tokens
+        )
+        held = self._lookup_client.renew(seq, start, end)
+        logger.debug(
+            "[OFFLOAD-LOOKUP] seq=%s renewed the leases of tokens [%d, %d): the "
+            "Store holds %d of their objects; dispatched whatever it holds",
+            seq.id,
+            start,
+            end,
+            held,
+        )
         return True
 
     def _clear_pending_load(self, sid: str) -> None:

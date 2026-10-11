@@ -423,13 +423,14 @@ a copy into each slot (and the reverse).
   needs the workers' NIC placement in the scheduler (a follow-up).
 - `batch_is_exist` gives each present key a 10 s read lease (master default),
   and only the lease keeps it from eviction. A request that waits for KV
-  blocks after its lookup outlives it, so a hit more than a second old is
-  looked up again when its load is dispatched (`_ensure_lookup_pin`): that
-  renews the lease right before the get. The load goes ahead whatever that
-  lookup answers -- the engine parked the request when it admitted it, and
-  only the load's report wakes it -- so a prefix evicted meanwhile fails the
-  get like any other miss. Workers have nothing to unpin. A miss at get time
-  fails the load and the request recomputes, once.
+  blocks after its lookup outlives it, so for a hit more than a second old
+  the chunks its load reads, `[hbm, transfer_end)` of every rank, are asked
+  for again when the load is dispatched (`_ensure_lookup_pin`): that renews
+  their leases right before the get. The load goes ahead whatever that
+  answers -- the engine parked the request when it admitted it, and only the
+  load's report wakes it -- so a prefix evicted meanwhile fails the get like
+  any other miss. Workers have nothing to unpin. A miss at get time fails the
+  load and the request recomputes, once.
 - After a load succeeds, the scheduler publishes the loaded prefix into the HBM
   prefix index (`offload_load_start_tokens`), so a later turn finds it in HBM
   instead of loading it again, and the suffix the request computes chains its

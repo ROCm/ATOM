@@ -1776,6 +1776,26 @@ def test_a_hit_that_waited_for_blocks_is_looked_up_again_before_its_load(
     assert not scheduler.has_pending_work()
 
 
+@pytest.mark.parametrize(("end", "read"), [(None, range(2, 5)), (48, range(2, 6))])
+def test_a_stale_hit_renews_only_the_leases_its_load_reads(
+    cluster, scheduler_clock, end, read
+):
+    scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer", pp=2))
+    seq = _seq(53, 50)
+    _arm_load(scheduler, seq, hbm=16, lmc=40, end=end)
+    scheduler_clock.now += 5.0  # its lookup's leases have run out
+    [request] = scheduler.build_connector_meta().requests
+    assert request.load_spec.lmcache_cached_tokens == 40
+    [store] = cluster.stores
+    # One call: [hbm, transfer end) of every rank, not the whole prompt.
+    [asked] = [call[1] for call in store.calls if call[0] == "exists"]
+    assert asked == [keys.STORE_TAINT_KEY] + [
+        _key(_hashes(48), index, rank=rank, world=2, namespace=scheduler._namespace)
+        for rank in range(2)
+        for index in read
+    ]
+
+
 def test_a_fresh_hit_is_loaded_without_asking_again(cluster, scheduler_clock):
     scheduler = MooncakeStoreOffloadScheduler(_config("kv_consumer"))
     scheduler._min_load_tokens = 0
