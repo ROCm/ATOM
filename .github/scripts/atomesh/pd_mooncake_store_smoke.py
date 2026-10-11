@@ -67,7 +67,13 @@ def worker(args):
     from mooncake.store import MooncakeDistributedStore
 
     output = Path(args.output)
-    result = {"rank": args.rank, "device": args.device, "segment": args.segment}
+    result = {
+        "rank": args.rank,
+        "device": args.device,
+        "segment": args.segment,
+        "local_buffer": args.local_buffer,
+        "glibc_tunables": os.environ.get("GLIBC_TUNABLES", ""),
+    }
     direct = None
     store = None
     deadline = time.monotonic() + args.timeout
@@ -85,12 +91,15 @@ def worker(args):
             host,
             "P2PHANDSHAKE",
             args.segment,
-            1024**3,
+            args.local_buffer,
             "rdma",
             args.device,
             f"127.0.0.1:{args.port}",
         )
         result["setup_seconds"] = time.monotonic() - start
+        (output / f"smaps-{args.rank}.txt").write_text(
+            Path("/proc/self/smaps_rollup").read_text()
+        )
         (output / f"setup-{args.rank}.json").write_text(json.dumps(result, indent=2))
         wait_for(output / "start-io", deadline)
         if result["setup_rc"] == 0:
@@ -114,7 +123,17 @@ def worker(args):
         store.close()
 
 
-def run_case(root, name, ranks, devices, segment, serialized=False, timeout=180):
+def run_case(
+    root,
+    name,
+    ranks,
+    devices,
+    segment,
+    serialized=False,
+    timeout=180,
+    local_buffer=1024**3,
+    env_overrides=None,
+):
     import mooncake
 
     output = root / name
@@ -123,6 +142,7 @@ def run_case(root, name, ranks, devices, segment, serialized=False, timeout=180)
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = os.environ.copy()
+    env.update(env_overrides or {})
     processes = []
     handles = []
     master_log = (output / "master.log").open("w")
@@ -158,6 +178,8 @@ def run_case(root, name, ranks, devices, segment, serialized=False, timeout=180)
                         devices[rank],
                         "--segment",
                         str(segment),
+                        "--local-buffer",
+                        str(local_buffer),
                         "--port",
                         str(port),
                         "--output",
@@ -261,12 +283,82 @@ def run_case(root, name, ranks, devices, segment, serialized=False, timeout=180)
     return result
 
 
+def capacity_cases(root, nics):
+    results = []
+    probe = Path(__file__).with_name("pd_mooncake_registration_probe.py")
+    for backend in ("verbs", "mooncake"):
+        for thp in (False, True):
+            for size, count in ((1024**3, 8), (8 * 1024**3, 1)):
+                name = f"{backend}-{'thp' if thp else 'base'}-{size}-{count}"
+                command = [
+                    sys.executable,
+                    str(probe),
+                    "--backend",
+                    backend,
+                    "--size",
+                    str(size),
+                    "--count",
+                    str(count),
+                    "--output",
+                    str(root / f"{name}.json"),
+                ]
+                if thp:
+                    command.append("--thp")
+                with (root / f"{name}.log").open("w") as log:
+                    try:
+                        rc = subprocess.run(
+                            command,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                            timeout=60,
+                            check=False,
+                        ).returncode
+                    except subprocess.TimeoutExpired:
+                        rc = 124
+                (root / f"{name}.rc").write_text(str(rc))
+    small = 64 * 1024**2
+    results.append(
+        run_case(root, "eight-all-small-buffer", 8, [""] * 8, small, local_buffer=small)
+    )
+    thp_env = {"GLIBC_TUNABLES": "glibc.malloc.hugetlb=1"}
+    results.append(
+        run_case(
+            root,
+            "single-all-full-thp",
+            1,
+            [""],
+            int(224.875 * 1024**3),
+            local_buffer=small,
+            env_overrides=thp_env,
+            timeout=180,
+        )
+    )
+    if results[-1]["passed"]:
+        results.append(
+            run_case(
+                root,
+                "eight-all-full-thp",
+                8,
+                [""] * 8,
+                int(224.875 * 1024**3),
+                local_buffer=small,
+                env_overrides=thp_env,
+                timeout=420,
+            )
+        )
+    (root / "result.json").write_text(json.dumps(results, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--device", default="")
     parser.add_argument("--segment", type=int, default=64 * 1024**2)
+    parser.add_argument("--local-buffer", type=int, default=1024**3)
+    parser.add_argument(
+        "--plan", choices=["registration", "capacity"], default="registration"
+    )
     parser.add_argument("--port", type=int)
     parser.add_argument("--output", required=True)
     parser.add_argument("--timeout", type=int, default=180)
@@ -280,6 +372,9 @@ def main():
     nics = sorted(path.name for path in Path("/sys/class/infiniband").iterdir())
     if len(nics) != 8:
         raise RuntimeError(f"Expected eight RDMA NICs, found {nics}")
+    if args.plan == "capacity":
+        capacity_cases(root, nics)
+        return
     small = 64 * 1024**2
     results = [run_case(root, "single-all", 1, [""], small)]
     results.append(run_case(root, "eight-all", 8, [""] * 8, small))

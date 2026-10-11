@@ -11,8 +11,25 @@ if [[ "${1:-}" == --container ]]; then
   export MC_GID_INDEX=1
   cat /proc/meminfo > /results/meminfo-before.txt
   ulimit -a > /results/ulimits.txt
+  {
+    uname -a
+    ldd --version | head -1
+    for path in /sys/kernel/mm/transparent_hugepage/enabled \
+      /sys/kernel/mm/transparent_hugepage/defrag \
+      /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current \
+      /sys/fs/cgroup/memory.events /sys/fs/cgroup/rdma.max \
+      /sys/fs/cgroup/rdma.current /proc/self/cgroup; do
+      [[ ! -r "${path}" ]] || { echo "${path}"; cat "${path}"; }
+    done
+    ibv_devinfo -v || true
+    rdma resource show || true
+  } > /results/registration-environment.txt 2>&1
   /tmp/mooncake-store-smoke-venv/bin/python \
-    /scripts/pd_mooncake_store_smoke.py --output /results/cases
+    /scripts/pd_mooncake_store_smoke.py --output /results/cases --plan capacity
+  cat /proc/meminfo > /results/meminfo-after.txt
+  if [[ -r /sys/fs/cgroup/memory.events ]]; then
+    cat /sys/fs/cgroup/memory.events > /results/memory-events-after.txt
+  fi
   exit
 fi
 
