@@ -1969,13 +1969,22 @@ Prompts replayed against the same server after the run:
 - **Garbage is per rank, and it persists.** One prompt sent under 24 session ids came back as
   `G.....GGG.G.GGGGG.G...GG` (`G` = `!!!!`). DP session affinity maps each id to one rank. The pattern was
   identical on a repeat and for a different question: some ranks answered every such request with garbage.
-- **A custom system message avoids it.** With one, all 24 answered correctly, although they hit the same
-  64 cached tokens. lm_eval sends no system message, so its requests share the default system prompt.
+- **A custom system message avoided it on that server.** With one, all 24 answered correctly, although they hit
+  the same 64 cached tokens. lm_eval sends no system message, so its requests share the default system prompt.
+  This is not a workaround: on the mori server below, one custom-system probe out of 48 still came back as
+  garbage.
 - **Chunked prefill is not the cause.** A unique 29,888-token prompt, prefilled in two 16384 chunks, answered
   correctly.
 - **Without prefix caching, the same probes are clean.** On a server with the same configuration but
   `--no-enable_prefix_caching`, run after a full GSM8K, all 96 probe requests answered correctly (two prompts,
   default and custom system message, 24 session ids each).
+- **It is not from ATOM #2522 or the fp4 combine wire.** The same GSM8K ran with mori dispatch and the bf16
+  combine, and the same prefix caching, 16384 and 0.90:
+  - By question 922 it had generated about 535 tokens per question; without prefix caching the figure is
+    about 115.
+  - Probes during the run found `!!!!` on some ranks for both prompts.
+  - It was stopped at question 1114. Its runaway answers decoded at about 5 tok/s, too slow to reach
+    `max_tokens` inside lm_eval's 1800 s request timeout, so lm_eval would have retried them.
 
 The root cause was not determined. What was seen fits a cached prefix that is read before it is written, or
 after its block has been reused:
