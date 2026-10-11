@@ -284,7 +284,7 @@ def run_case(
 
 
 def capacity_cases(root, nics):
-    results = []
+    results = [run_case(root, "eight-all-original", 8, [""] * 8, 64 * 1024**2)]
     probe = Path(__file__).with_name("pd_mooncake_registration_probe.py")
     for backend in ("verbs", "mooncake"):
         for thp in (False, True):
