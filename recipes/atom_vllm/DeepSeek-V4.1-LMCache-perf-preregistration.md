@@ -49,7 +49,16 @@ spread. Averaging over that measures the scheduler's luck, not the arm.
 Three pairs, **alternating boots**: ON, OFF, ON, OFF, ON, OFF. Not all ON then
 all OFF -- the arms need separate servers, so the only defence against drift
 over the hours is time adjacency. Three measured rounds per boot, the first of
-which is discarded as the warm round. That is 18 kept rounds, 9 per arm.
+which is discarded as the warm round. That is 18 rounds run and **12 kept, 6
+per arm**.
+
+> Corrected before the run, not after: this line first said "18 kept rounds,
+> 9 per arm", which is the total run rather than the total kept and is not
+> divisible by two arms either. The design is unchanged -- three pairs, three
+> rounds, discard the first -- only the arithmetic describing it was wrong.
+> The warm round is worth its cost: in a trial pair the ON arm went 6.52 then
+> 13.47 req/s between rounds 1 and 2 of one boot, so including round 1 would
+> have halved the arm it belongs to.
 
 ## Decided now, so it cannot be decided later
 
