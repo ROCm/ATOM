@@ -1872,6 +1872,39 @@ jobs:
           compression-level: 0
           if-no-files-found: ignore
 
+      - name: Locate Compass records
+        if: always()
+        id: compass
+        env:
+          MATRIX_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          # Cases with env.common.ATOMESH_COMPASS=1 write per-rank Compass
+          # records under slurm_job-*/compass/. pd_submit.sh keeps them out of
+          # atomesh-results, so read them from the case's shared log root.
+          log_root_file="atomesh-results/${MATRIX_ID}.log-root"
+          log_root=""
+          if [[ -s "${log_root_file}" ]]; then
+            log_root="$(tr -d '\n' < "${log_root_file}")"
+          fi
+          if [[ -n "${log_root}" ]] \
+            && [[ -n "$(find "${log_root}" -path '*/compass/*' -name '*.jsonl' -print -quit 2>/dev/null)" ]]; then
+            echo "has_records=true" >> "$GITHUB_OUTPUT"
+            echo "log_root=${log_root}" >> "$GITHUB_OUTPUT"
+            find "${log_root}" -path '*/compass/*' -type f -printf '%s\t%P\n' | sort -k2
+          else
+            echo "has_records=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Compass records
+        if: ${{ always() && steps.compass.outputs.has_records == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: atomesh-compass-${{ matrix.id }}-${{ github.run_attempt }}
+          path: ${{ steps.compass.outputs.log_root }}/slurm_job-*/compass/
+          if-no-files-found: ignore
+          retention-days: 15
+
       - name: Upload model benchmark artifacts
         if: always()
         uses: actions/upload-artifact@v7

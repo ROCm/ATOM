@@ -827,6 +827,11 @@ purge_lmcache_disk() {
 cleanup_processes() {
   local rc=$?
   local pid
+  if [[ "${ATOMESH_COMPASS:-0}" == "1" ]]; then
+    # The idle engine closes an open op window and flushes its rows within
+    # ~2s; let it, rather than relying on the SIGTERM shutdown path.
+    sleep 5
+  fi
   for pid in "$@"; do
     terminate_process_group "${pid}"
   done
@@ -873,6 +878,19 @@ build_torch_profiler_args() {
   out_args=(--torch-profiler-dir "${dir}")
 }
 
+# ATOM Compass recording (atom/metrics/compass.py), on when a case sets
+# env.common.ATOMESH_COMPASS=1. Each server writes its own directory under the
+# shared RUN_DIR, which the workflow uploads from the log root.
+build_compass_env() {
+  local log_name="$1"
+  local -n out_env="$2"
+  out_env=()
+  [[ "${ATOMESH_COMPASS:-0}" == "1" ]] || return 0
+  local dir="${RUN_DIR}/compass/${log_name}"
+  mkdir -p "${dir}"
+  out_env=("ATOM_COMPASS_DIR=${dir}")
+}
+
 start_prefill() {
   local log_name="$1"
   local server_port="${2:-${PREFILL_PORT}}"
@@ -902,6 +920,8 @@ start_prefill() {
   fi
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
+  local -a prefill_compass_env=()
+  build_compass_env "${log_name}" prefill_compass_env
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -915,7 +935,7 @@ start_prefill() {
     ${PREFILL_SERVER_ARGS}
   )
   dump_launch_info "PREFILL" "${prefill_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${prefill_cache_env[@]}" "${prefill_dp_env[@]}" "${prefill_compass_env[@]}" "${prefill_cmd[@]}"
 }
 
 start_decode() {
@@ -961,6 +981,8 @@ start_decode() {
   fi
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
+  local -a decode_compass_env=()
+  build_compass_env "${log_name}" decode_compass_env
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -975,7 +997,7 @@ start_decode() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "DECODE" "${decode_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${decode_cache_env[@]}" "${decode_dp_env[@]}" "${decode_compass_env[@]}" "${decode_cmd[@]}"
 }
 
 # The aggregated server reads the `decode` service block and `env.decode`: it is
@@ -1017,6 +1039,8 @@ start_aggregated() {
   fi
   local -a server_profiler_args=()
   build_torch_profiler_args "${log_name}" server_profiler_args
+  local -a server_compass_env=()
+  build_compass_env "${log_name}" server_compass_env
   echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a server_cmd=(
     python3 -m atom.entrypoints.openai_server
@@ -1031,7 +1055,7 @@ start_aggregated() {
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "SERVER" "${server_cmd[@]}"
-  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" env "${ATOM_SOURCE_ENV[@]}" "${server_cache_env[@]}" "${server_dp_env[@]}" "${server_compass_env[@]}" "${server_cmd[@]}"
 }
 
 start_router() {

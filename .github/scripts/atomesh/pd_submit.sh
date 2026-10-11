@@ -510,9 +510,9 @@ fi
 
 if [[ -d "${LOG_ROOT}" ]]; then
   mkdir -p "${RESULT_DIR}/${ATOMESH_CELL_ID}"
-  # Torch profiler traces run to GBs per case. The workflow uploads them from
-  # LOG_ROOT as their own artifact, so they stay out of the results copy that
-  # every summarize job downloads.
+  # Torch profiler traces and Compass records run to GBs per case. The
+  # workflow uploads them from LOG_ROOT as their own artifacts, so they stay
+  # out of the results copy that every summarize job downloads.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
     tar \
       --exclude='.cache' \
@@ -520,14 +520,17 @@ if [[ -d "${LOG_ROOT}" ]]; then
       --exclude='.aiter' \
       --exclude='./.aiter' \
       --exclude='./slurm_job-*/torch_traces' \
+      --exclude='./slurm_job-*/compass' \
       -C "${LOG_ROOT}" \
       -cf - . | tar \
       --no-same-owner \
       --no-same-permissions \
       -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" \
       -xf - || true
-  elif compgen -G "${LOG_ROOT}/slurm_job-*/torch_traces" >/dev/null; then
-    tar --exclude='./slurm_job-*/torch_traces' -C "${LOG_ROOT}" -cf - . \
+  elif compgen -G "${LOG_ROOT}/slurm_job-*/torch_traces" >/dev/null \
+    || compgen -G "${LOG_ROOT}/slurm_job-*/compass" >/dev/null; then
+    tar --exclude='./slurm_job-*/torch_traces' --exclude='./slurm_job-*/compass' \
+      -C "${LOG_ROOT}" -cf - . \
       | tar -C "${RESULT_DIR}/${ATOMESH_CELL_ID}" -xpf - || true
   else
     cp -a "${LOG_ROOT}/." "${RESULT_DIR}/${ATOMESH_CELL_ID}/" || true

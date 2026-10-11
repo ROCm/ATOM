@@ -829,7 +829,8 @@ models:
         # Non-disaggregated counterpart to the C72 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
-        - <<: *kimi_k3_agentic_no_dspark
+        - &kimi_k3_agentic_agg
+          <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72
           topology: agg
           display_topology: AGG-TP8-DCP8
@@ -845,7 +846,7 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 144
           env:
-            common:
+            common: &kimi_k3_agentic_agg_env_common
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             # The aggregated server reads env.decode. These are the C72 prefill's
@@ -853,7 +854,7 @@ models:
             # that anchor also carries the mooncake half of the `multi`
             # connector, which has no peer to stream KV to here. What is left is
             # the same 192 GiB CPU tier behind a standalone offload connector.
-            decode:
+            decode: &kimi_k3_agentic_agg_env_decode
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
               LMCACHE_CHUNK_SIZE: "1024"
@@ -870,6 +871,23 @@ models:
               ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        # The AGG C72 cell with ATOM Compass recording (atom/metrics/compass.py):
+        # per-rank forward rows plus sampled per-op windows land under
+        # slurm_job-*/compass/ and upload as atomesh-compass-<case>-<attempt>.
+        # Recording costs a few percent of throughput, so its numbers are not
+        # the AGG cell's; select it by name for data collection only.
+        - <<: *kimi_k3_agentic_agg
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72-compass
+          display_topology: AGG-TP8-DCP8-COMPASS
+          env:
+            common:
+              <<: *kimi_k3_agentic_agg_env_common
+              ATOMESH_COMPASS: "1"
+              ATOM_COMPASS_OP_STEPS: "6"
+              ATOM_COMPASS_OP_EVERY: "2000"
+              ATOM_COMPASS_OP_MAX_WINDOWS: "20"
+            decode: *kimi_k3_agentic_agg_env_decode
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
