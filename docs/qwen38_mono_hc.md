@@ -66,6 +66,14 @@ to join partials. The combine grid grows with rows, which keeps it effective
 through 128 tokens.
 The separately dumped 128-token combine build still has 49 VGPR, 20 dot2
 instructions, 32 bytes LDS, and no scratch operations.
+At 16 tokens, the grouped down CTA uses 96 VGPR, 80 packed dot2 instructions,
+100 buffer loads, and no scratch spills. The up CTA uses 15 VGPR, 24 dot2
+instructions, 26 buffer loads, eight exponentials and eight reciprocals, with
+no LDS or spills. It takes 13.24 µs of the 28.56 µs pair; giving each up CTA
+four rows raised VGPR to 25 and made the up stage slower (13.61 µs), so the
+two-row schedule is retained. Direct FlyDSL mix probes at 32/64/128 rows took
+38.0/67.8/142.9 µs versus 25.3/27.5/30.1 µs native; mix therefore falls
+back above 16 rows while the fused combine remains enabled through 128.
 
 ## QSA long context and index CP
 
