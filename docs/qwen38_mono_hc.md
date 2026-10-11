@@ -95,13 +95,20 @@ million on TP2. The following TP4 graph benchmark gives every row a distinct
 | ---: | ---: | ---: | ---: | ---: |
 | 128k | 64 | 170.28 µs | 134.31 µs | 1.27× |
 | 128k | 128 | 314.94 µs | 171.96 µs | 1.83× |
+| 128k | 256 | 635.20 µs | 285.07 µs | 2.23× |
+| 128k | 512 | 1061.81 µs | 435.51 µs | 2.44× |
 | 256k | 64 | 329.15 µs | 171.27 µs | 1.92× |
 | 256k | 128 | 619.24 µs | 257.82 µs | 2.40× |
+| 256k | 256 | 1132.38 µs | 423.08 µs | 2.68× |
+| 256k | 512 | 2074.04 µs | 676.34 µs | 3.07× |
 
 For 256k/128 rows, including local TP sparse attention measured 688.76 µs
-unsplit versus 330.95 µs with CP (2.08×). Sparse attention outputs were exact
-matches. TP2 selection at 256k/128 rows measured 1.61×, or 1.41× including
-sparse attention.
+unsplit versus 330.95 µs with CP (2.08×). At 256k/512 rows, it measured
+2355.56 versus 937.29 µs (2.51×). At 128k/512 rows it measured 1303.68 versus
+678.47 µs (1.92×). Sparse attention outputs were exact matches. TP2 selection
+at 256k/128 rows measured 1.61×, or 1.41× including sparse attention.
+The larger-batch improvement budgets the score workspace against each rank's
+local shard width, allowing fewer row chunks and candidate exchanges.
 Ragged requests, graph padding, and all-zero score ties were also checked for
 exact parity.
 The QSA CP path reuses the M3-style registered all-gather when available and

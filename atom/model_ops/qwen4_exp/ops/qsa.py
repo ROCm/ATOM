@@ -1240,8 +1240,6 @@ def qsa_select_paged_tokens(
     if rows == 0:
         return out
 
-    # Chunk over query rows so the FP32 logits buffer stays within budget.
-    rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
     if index_cp is not None:
         rank, world, group = index_cp
         local_columns = columns // world
@@ -1254,6 +1252,10 @@ def qsa_select_paged_tokens(
         local_lens = (context_lens - first_group * compress_ratio).clamp(
             min=0, max=local_columns * compress_ratio
         )
+    # Each CP rank allocates logits for its shard only. Budget against that
+    # allocation so larger batches avoid unnecessary candidate exchanges.
+    score_columns = local_columns if index_cp is not None else columns
+    rows_per_chunk = max(1, logits_workspace_bytes // max(score_columns * 4, 1))
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
@@ -1265,9 +1267,11 @@ def qsa_select_paged_tokens(
             compressed_k_cache,
             local_table if index_cp is not None else page_table,
             token_to_request[row_slice],
-            local_positions[row_slice]
-            if index_cp is not None
-            else query_positions[row_slice],
+            (
+                local_positions[row_slice]
+                if index_cp is not None
+                else query_positions[row_slice]
+            ),
             local_lens if index_cp is not None else context_lens,
             compress_ratio,
             max_columns=local_columns if index_cp is not None else columns,
