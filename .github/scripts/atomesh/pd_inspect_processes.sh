@@ -10,6 +10,11 @@ if [[ -n "${2:-}" && "$(hostname -s)" != "$2" ]]; then
 fi
 date -u
 grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree|Mlocked|Unevictable):' /proc/meminfo
+for memory_info in /sys/devices/system/node/node*/meminfo; do
+  grep -E 'MemTotal:|MemFree:|Active\(file\):|Inactive\(file\):|AnonHugePages:' "${memory_info}" || true
+done
+cat /proc/buddyinfo
+grep -E '^(compact_|thp_fault_|thp_collapse_)' /proc/vmstat
 timeout 5s journalctl -k --since '30 minutes ago' --no-pager 2>&1 |
   grep -Ei 'oom|out of memory|killed process|amdgpu|gpu reset|permission|no journal' |
   tail -n 80 || true
