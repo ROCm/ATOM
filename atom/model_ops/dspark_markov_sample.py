@@ -92,11 +92,17 @@ def _dspark_markov_argmax_stage1(
     stride_w1_vocab,
     stride_embed_row,
     stride_w2_vocab,
+    vocab_offset,
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """One (V tile, row tile): bias GEMV, add base logits, reduce to (max, id)."""
+    """One (V tile, row tile): bias GEMV, add base logits, reduce to (max, id).
+
+    ``base_ptr`` holds ``vocab_size`` columns starting at vocab id
+    ``vocab_offset`` (a TP rank's shard of the LM head; 0 for the whole
+    vocab), so W2 is read from that row on and the ids published are global.
+    """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
@@ -129,7 +135,9 @@ def _dspark_markov_argmax_stage1(
         # W2^T tile, [BLOCK_K, BLOCK_V]. W2 is stored [V, r] so the rank axis
         # is the contiguous one: each vocab column is one 2*BLOCK_K-byte run.
         w2 = tl.load(
-            w2_ptr + offs_v[None, :] * stride_w2_vocab + offs_k[:, None],
+            w2_ptr
+            + (vocab_offset + offs_v[None, :]) * stride_w2_vocab
+            + offs_k[:, None],
             mask=v_mask[None, :] & k_mask[:, None],
             other=0.0,
         )
@@ -150,6 +158,9 @@ def _dspark_markov_argmax_stage1(
         (vals == tile_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
     )
     tile_idx = tl.min(cand, axis=1)
+    # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
+    # recognizes before adding the offset back in.
+    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
 
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
@@ -164,9 +175,15 @@ def _dspark_markov_argmax_stage2(
     num_tiles,
     vocab_size,
     stride_out,
+    packed_ptr,
     BLOCK_TILE: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
-    """One row: pick the winning V tile, lowest id among tiles that tie."""
+    """One row: pick the winning V tile, lowest id among tiles that tie.
+
+    ``PACKED`` writes ``(max, id)`` as two fp32 to ``packed_ptr`` instead of
+    the id to ``out_ptr``: the TP form, whose ranks then compare their bests.
+    """
     row = tl.program_id(0)
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
@@ -179,12 +196,22 @@ def _dspark_markov_argmax_stage2(
         part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=vocab_size
     )
     best = tl.max(vals, axis=0)
-    cand = tl.where((vals == best) & tile_mask, idxs, vocab_size)
+    # Ids are global, so the sentinel is anything past every tile's id.
+    cand = tl.where((vals == best) & tile_mask, idxs, 2147483647)
     winner = tl.min(cand, axis=0)
+    if PACKED:
+        # An all-NaN row keeps the sentinel; publish id 0 with the NaN, which
+        # `torch.argmax` across ranks then treats as the max, as it would the
+        # whole row's.
+        winner = tl.where(winner == 2147483647, 0, winner)
+        # ids < 2**24 are exact in fp32 (V4.1's vocab is 129280).
+        tl.store(packed_ptr + row * 2, best)
+        tl.store(packed_ptr + row * 2 + 1, winner.to(tl.float32))
+        return
     # NaN never equals itself, so no lane passes its `== max` test and every
     # candidate keeps the out-of-range sentinel. Answer 0, as `torch.argmax`
     # does, so a caller gathering `W1[x]` cannot read past the table.
-    winner = tl.where(winner == vocab_size, 0, winner)
+    winner = tl.where(winner == 2147483647, 0, winner)
     # Strided and in the destination's own dtype: the caller's `[B, T + 1]`
     # block is int32, and the copy this replaces was narrowing as well as
     # moving -- doing one and not the other would just relocate the cast.
@@ -316,10 +343,17 @@ def dspark_markov_argmax(
         return _torch_dspark_markov_argmax(
             base_logits, prev_ids, markov_w1, markov_w2, out
         )
+    return _launch(base_logits, prev_ids, markov_w1, markov_w2, out, 0, None)
+
+
+def _launch(base_logits, prev_ids, markov_w1, markov_w2, out, vocab_offset, packed):
+    """Both stages over ``base_logits``' columns, which are vocab ids
+    ``vocab_offset ..``; ids to ``out``, or ``(max, id)`` to ``packed``."""
+    num_rows, vocab_size = base_logits.shape
+    rank = markov_w2.shape[1]
     markov_embed = torch.empty(
         num_rows, rank, dtype=markov_w1.dtype, device=base_logits.device
     )
-
     num_tiles = triton.cdiv(vocab_size, _BLOCK_V)
     block_row = min(
         _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
@@ -335,7 +369,6 @@ def dspark_markov_argmax(
     part_idx = torch.empty(
         (num_tiles, num_rows), dtype=torch.int32, device=base_logits.device
     )
-
     _dspark_markov_argmax_stage1[(num_tiles, triton.cdiv(num_rows, block_row))](
         base_logits,
         prev_ids,
@@ -352,6 +385,7 @@ def dspark_markov_argmax(
         stride_w1_vocab=markov_w1.stride(0),
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
+        vocab_offset=vocab_offset,
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,
@@ -361,13 +395,50 @@ def dspark_markov_argmax(
     _dspark_markov_argmax_stage2[(num_rows,)](
         part_val,
         part_idx,
-        out,
+        out if packed is None else part_idx,
         num_rows,
         num_tiles,
         vocab_size,
-        out.stride(0),
+        out.stride(0) if packed is None else 0,
+        part_val if packed is None else packed,
         BLOCK_TILE=triton.next_power_of_2(num_tiles),
+        PACKED=packed is not None,
         num_warps=4,
         num_stages=1,
     )
+    return markov_embed
+
+
+def dspark_markov_argmax_tp(
+    base_logits: torch.Tensor,
+    prev_ids: torch.Tensor,
+    markov_w1: torch.Tensor,
+    markov_w2: torch.Tensor,
+    out: torch.Tensor,
+    vocab_start: int,
+    tp_group,
+    use_custom: bool = True,
+) -> torch.Tensor:
+    """``dspark_markov_argmax`` over a TP-sharded vocab.
+
+    ``base_logits`` is this rank's ``[B, V / tp]`` slice of the LM head, ids
+    ``vocab_start ..``; the Markov tables are whole. Each rank reduces its
+    slice to ``(max, id)`` and only those ``[B, 2]`` cross ranks, rather than
+    the ``[B, V]`` logits. Bit-identical to the whole-vocab op: each column's
+    bias is the same ``r``-term dot product in the same K order whichever tile
+    holds it, the base logit is the same bf16 value, and the cross-rank pick
+    takes the lowest rank among equal maxima -- the lowest id, as
+    ``torch.argmax`` does.
+    """
+    num_rows = base_logits.shape[0]
+    if num_rows == 0:
+        return markov_w1.new_empty(0, markov_w1.shape[1])
+    packed = torch.empty((num_rows, 2), dtype=torch.float32, device=base_logits.device)
+    markov_embed = _launch(
+        base_logits, prev_ids, markov_w1, markov_w2, out, vocab_start, packed
+    )
+    gathered = tp_group.all_gather(packed, dim=0, use_custom=use_custom)
+    gathered = gathered.view(tp_group.world_size, num_rows, 2)
+    winner = gathered[:, :, 0].argmax(dim=0)
+    out.copy_(gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0))
     return markov_embed

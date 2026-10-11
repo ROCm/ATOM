@@ -182,6 +182,9 @@ class DPSyncResult:
     max_bs_across_dp: int
     # True iff ANY rank has at least one prefill seq this step.
     any_rank_has_prefill: bool
+    # True iff ANY rank's backend cannot run this step from a graph: a graph
+    # replays its collectives, so the group replays or runs eagerly as one.
+    any_rank_needs_eager: bool
     # True iff TBO on AND OR(meets_min_tokens) AND AND(can_split) AND uniform.
     # (One rank clearing the min-token bar turns TBO on for all; under-filled
     # but splittable ranks are force-split to stay collective-aligned. Any rank
@@ -209,14 +212,16 @@ def sync_dp_metadata(
     scheduled_bs: int,
     is_prefill: bool,
     tbo_on: bool,
+    needs_eager: bool = False,
     local_meets_min_tokens: bool = False,
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
     max_seqlen_q: int | None = None,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
-    step needs synchronized: DP token padding, the prefill fan-out, the
-    cross-DP TBO gate, and (when active) the DSpark graph-shape MAX.
+    step needs synchronized: DP token padding, the prefill fan-out, whether the
+    group runs eagerly, the cross-DP TBO gate, and (when active) the DSpark
+    graph-shape MAX.
 
     A block drafter folds its per-seq length sync in here too (one extra field),
     so the step issues one collective instead of two.
@@ -224,8 +229,8 @@ def sync_dp_metadata(
     Pre-Plan-B this required up to 3 separate all_reduces per step
     (``get_dp_padding`` / this sync / a third inside
     ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
-    per rank suffices. When TBO is off only the first 3 fields are
-    exchanged (saves 57 % payload + skips :func:`local_tbo_precompute`
+    per rank suffices. When TBO is off only the first 4 fields are
+    exchanged (saves half the payload + skips :func:`local_tbo_precompute`
     at the call site).
 
     Layout (``sync`` is ``[n_fields, dp_size]``):
@@ -233,10 +238,11 @@ def sync_dp_metadata(
       row 0 : scheduled_tokens         -> num_tokens_across_dp
       row 1 : scheduled_bs             -> max_bs_across_dp (MAX)
       row 2 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
-      row 3 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
-      row 4 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
-      row 5 : ub0_tokens               -> ub_{max,total}_tokens_across_dp[0]      [TBO only]
-      row 6 : ub1_tokens               -> ub_{max,total}_tokens_across_dp[1]      [TBO only]
+      row 3 : needs_eager (0/1)        -> any_rank_needs_eager (OR)
+      row 4 : meets_min_tokens (0/1)   -> OR  -> any rank reached the min-token bar [TBO only]
+      row 5 : can_split (0/1)          -> AND -> every rank can split              [TBO only]
+      row 6 : ub0_tokens               -> ub_{max,total}_tokens_across_dp[0]      [TBO only]
+      row 7 : ub1_tokens               -> ub_{max,total}_tokens_across_dp[1]      [TBO only]
       row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
 
     Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
@@ -252,18 +258,19 @@ def sync_dp_metadata(
     0 already carry them, and a step that reaches the reduction with every rank
     decoding has `scheduled_tokens` == its decode total on every rank.
     """
-    tbo_fields = 7 if tbo_on else 3
+    tbo_fields = 8 if tbo_on else 4
     dspark_on = max_seqlen_q is not None
     n_fields = tbo_fields + (1 if dspark_on else 0)
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
     local[2] = 1 if is_prefill else 0
+    local[3] = 1 if needs_eager else 0
     if tbo_on:
-        local[3] = 1 if local_meets_min_tokens else 0
-        local[4] = 1 if local_can_split else 0
-        local[5] = local_ub_tokens[0]
-        local[6] = local_ub_tokens[1]
+        local[4] = 1 if local_meets_min_tokens else 0
+        local[5] = 1 if local_can_split else 0
+        local[6] = local_ub_tokens[0]
+        local[7] = local_ub_tokens[1]
     if dspark_on:
         local[tbo_fields + 0] = max_seqlen_q
 
@@ -276,6 +283,7 @@ def sync_dp_metadata(
     num_tokens_across_dp = sync[0]
     max_bs_across_dp = int(sync[1].max())
     any_rank_has_prefill = bool(sync[2].any())
+    any_rank_needs_eager = bool(sync[3].any())
     tbo_collective_active = False
     ub_max_tokens_across_dp: tuple[int, int] | None = None
     ub_tokens_across_dp: tuple[tuple[int, ...], ...] | None = None
@@ -285,7 +293,7 @@ def sync_dp_metadata(
         # that rank would run 1 ubatch while peers run 2 → per-ubatch collective
         # size mismatch → RCCL hang. Under-filled-but-splittable ranks are then
         # force-split (see maybe_create_ubatch_slices force=True) to stay aligned.
-        tbo_collective_active = bool(sync[3].any()) and bool(sync[4].all())
+        tbo_collective_active = bool(sync[4].any()) and bool(sync[5].all())
         # Mixed-mode guard: ALWAYS require a uniform batch mode (all prefill or
         # all decode) across DP. A prefill rank running 2 ubatches alongside a
         # decode rank running 2 ubatches still issues different collectives per
@@ -296,7 +304,7 @@ def sync_dp_metadata(
             uniform_mode = prefill_rank_count == 0 or prefill_rank_count == dp_size
             tbo_collective_active = uniform_mode
         if tbo_collective_active:
-            ub_tokens_across_dp = (tuple(sync[5].tolist()), tuple(sync[6].tolist()))
+            ub_tokens_across_dp = (tuple(sync[6].tolist()), tuple(sync[7].tolist()))
             ub_max_tokens_across_dp = tuple(max(row) for row in ub_tokens_across_dp)
 
     max_seqlen_q_across_dp: int | None = None
@@ -307,6 +315,7 @@ def sync_dp_metadata(
         num_tokens_across_dp=num_tokens_across_dp,
         max_bs_across_dp=max_bs_across_dp,
         any_rank_has_prefill=any_rank_has_prefill,
+        any_rank_needs_eager=any_rank_needs_eager,
         tbo_collective_active=tbo_collective_active,
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         ub_tokens_across_dp=ub_tokens_across_dp,
@@ -401,7 +410,6 @@ class TBOContext:
     # -- context manager protocol ----------------------------------------
 
     def __enter__(self):
-        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.ubatch_id
         _CURRENT_CONTEXTS[self.ubatch_id] = self
 
@@ -417,7 +425,6 @@ class TBOContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _CURRENT_CONTEXTS[self.ubatch_id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         self.maybe_run_recv_hook()
@@ -601,7 +608,7 @@ def make_tbo_contexts(
     Threading events are arranged in a ring so that each context's
     ``cpu_signal_event`` is the *next* context's ``cpu_wait_event``.
     """
-    global _NUM_UBATCHES, _CURRENT_CONTEXTS
+    global _NUM_UBATCHES
     assert num_micro_batches > 1
 
     _NUM_UBATCHES = num_micro_batches

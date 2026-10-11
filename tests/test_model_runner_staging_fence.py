@@ -47,6 +47,17 @@ def _attribute_calls(method: ast.FunctionDef, attribute: str) -> list[ast.Call]:
     ]
 
 
+def _processor_flags(method: ast.FunctionDef) -> set[str]:
+    """Names this method reads off ``self.tokenID_processor``."""
+    return {
+        node.attr
+        for node in ast.walk(method)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "tokenID_processor"
+    }
+
+
 def _parent_map(root: ast.AST) -> dict[ast.AST, ast.AST]:
     return {
         child: parent
@@ -99,6 +110,18 @@ def test_dummy_forward_participates_in_staging_lifetime():
         < calls_by_name["_mark_staging_h2d_enqueued"][0].lineno
         < run_model[0].lineno
     )
+
+
+def test_draft_lockstep_reads_pipeline_parallel_not_deferred_output():
+    """Only PP may be excluded from DP draft lockstep, and only by name.
+
+    `is_deferred_out` is off under PP, which once made it a usable stand-in,
+    but it is also off on a P/D producer -- a rank that keeps its drafter
+    loaded and still owes its DP peers the collectives `propose()` carries.
+    """
+    assert _processor_flags(_method("_dp_draft_lockstep_active")) == {
+        "is_pipeline_parallel"
+    }
 
 
 def test_prefill_ready_events_are_recorded_after_model_submission():

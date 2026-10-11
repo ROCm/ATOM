@@ -211,6 +211,101 @@ def test_fp4_rows_by_sequence_select_what_rows_alone_do(monkeypatch, band, lengt
     assert torch.equal(select(ragged), select(None))
 
 
+def _packed_workspace(capacity):
+    """A `ScoreWorkspace`'s packed side alone, `capacity` elements, NaN
+    between rows so a read past one shows."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+
+    logits = torch.full((capacity,), float("nan"), dtype=torch.float32, device="cuda")
+    maxima = torch.full(
+        (capacity // PAGE,), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    workspace = SimpleNamespace(
+        packed=True, capacity=capacity, block_rows=PAGE,
+        packed_logits=lambda: logits, packed_maxima=lambda: maxima,
+    )  # fmt: skip
+    workspace.pack = lambda *rows: ScoreWorkspace.pack(workspace, *rows)
+    return workspace
+
+
+def _plan_step(workspace, seen):
+    """A step's rows at ratio 1 through `ScorePlanner`, its buffers published
+    by plain copies: the step's `PackedRows` (`score_layout`)."""
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from atom.model_ops.attentions.deepseek_v41.metadata import visible_buffer_name
+    from atom.model_ops.attentions.deepseek_v41.score_planner import (
+        ScorePlanner,
+        score_layout,
+    )
+
+    planner = ScorePlanner(workspace, (1,), len(seen))
+    buffers = planner.buffers("cpu", None)
+    buffers[visible_buffer_name(1)] = SimpleNamespace(np=np.asarray(seen, np.int32))
+    plan = planner(buffers, len(seen))
+    step = SimpleNamespace(
+        visible={1: torch.tensor(seen, dtype=torch.int32, device="cuda")},
+        planned={
+            name: torch.from_numpy(buffers[name].np[:count]).cuda()
+            for name, count in plan.rows.items()
+        },
+        planned_host=plan.host,
+    )
+    return score_layout(step, 1)
+
+
+@pytest.mark.parametrize("capacity", [1 << 16, 640])
+def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity):
+    """A whole-context layer's logits packed (`PackedRows`: each row at its
+    band offset in a flat buffer) select the same rows and pick the same
+    candidate blocks as the plane: one band, and bands of a row or two
+    (``640``)."""
+
+    from atom.model_ops.deepseek_v41 import paged_scoring as scoring
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+
+    torch.manual_seed(5)
+    pages, per_page = 8, 128
+    _, _, units = _pool(pages, per_page)
+    for t in (units.values, units.scales):
+        t.copy_(torch.randint(0, 256, t.shape, dtype=torch.uint8, device="cuda"))
+    units.scales.clamp_(120, 132)
+    tables = torch.tensor(
+        [[2, 0, 3, 1], [5, 7, 4, 6]], dtype=torch.int32, device="cuda"
+    )
+    # 3 rows of a 302-row context, 2 of a 512-row one, 2 padding rows
+    seen = [300, 301, 302, 511, 512, 0, 0]
+    starts = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+    visible = torch.tensor(seen, dtype=torch.int32, device="cuda")
+    rows = visible.numel()
+    query = scoring.quantize_query_fp4(
+        torch.randn(rows, HEADS, DIM, device="cuda").bfloat16(), _rope(),
+        torch.randint(0, 1 << 16, (rows,), device="cuda"),
+    )  # fmt: skip
+    weights = torch.rand(rows, HEADS, device="cuda").bfloat16()
+    ragged = Fp4MqaRaggedMetadata(starts, 3, tables, per_page // PAGE)
+
+    workspace = _packed_workspace(capacity)
+    packed = _plan_step(workspace, seen)
+    assert (len(packed.bands) > 1) == (capacity == 640)
+
+    def score(packed):
+        return scoring.score_topk_quantized(
+            query, weights, units, None, visible, topk=64,
+            weight_scale=(HEADS * DIM) ** -0.5, ragged=ragged, block_size=PAGE,
+            candidate_count=16, workspace=workspace if packed else None,
+            packed=packed,
+        )  # fmt: skip
+
+    want, got = score(None), score(packed)
+    assert torch.equal(got[0], want[0])
+    assert torch.equal(got[1], want[1])
+
+
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_only_a_full_layers_fp4_rows_score_by_sequence(ratio):
     """`Indexer._ragged`: a FULL layer's FP4 rows, prefill and decode alike,

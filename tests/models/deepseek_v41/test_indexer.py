@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """The contract the paged index scorer rests on: one id per visible row."""
 
+import itertools
+
 import pytest
 import torch
 
@@ -649,13 +651,10 @@ def _workspace_geometry():
 def test_score_workspace_holds_no_tile_tables_for_the_fp4_plane():
     """The FP4 plane's scorers read the PAGE table itself, so the workspace
     reserves no tile table, and asking for one is refused rather than met."""
-    from types import SimpleNamespace
-
     import atom.model_ops.deepseek_v41.score_workspace as ws
 
     fp8 = ws.ScoreWorkspace(_workspace_geometry(), 40, 9, "cpu")
-    fp4_geometry = SimpleNamespace(**{**vars(_workspace_geometry()), "index_fp4": True})
-    fp4 = ws.ScoreWorkspace(fp4_geometry, 40, 9, "cpu")
+    fp4 = ws.ScoreWorkspace(_pool_geometry(True), 40, 9, "cpu", pages=1)
     assert fp8.unit_table(1, 40, 9 * 8).numel() == 40 * 9 * 8
     assert not fp4._tiles
     with pytest.raises(ValueError, match="FP4"):
@@ -695,6 +694,104 @@ def test_score_workspace_band_stops_at_the_int32_reach(monkeypatch):
     assert space.logits(2, 3 * 64).shape == (2, 3 * 64)
     with pytest.raises(ValueError):
         space.logits(3, 3 * 64)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_packed_bands_hold_each_row_aligned_and_fill_before_cutting(seed):
+    """Bands partition the rows in order; a row starts on `ROW_ALIGN`, at its
+    band's running total; no band is past the capacity, and none could have
+    taken the next row."""
+    import numpy as np
+
+    from atom.model_ops.deepseek_v41 import score_workspace as ws
+
+    rng = np.random.default_rng(seed)
+    visible = rng.integers(0, 700, size=50).astype(np.int32)
+    visible[::7] = 0
+    capacity = 2048
+    offsets = np.full(50, -1, dtype=np.int32)
+    bands = ws.band_offsets(visible, capacity, offsets)
+    spans = ws.aligned_spans(visible.astype(np.int64))
+    assert bands[0][0] == 0 and bands[-1][1] == 50
+    assert all(a[1] == b[0] for a, b in itertools.pairwise(bands))
+    for first, end in bands:
+        within = spans[first:end]
+        assert np.array_equal(offsets[first:end], np.cumsum(within) - within)
+        assert int(within.sum()) <= capacity
+        if end < 50:
+            assert int(within.sum() + spans[end]) > capacity
+    assert not (offsets % ws.ROW_ALIGN).any()
+    with pytest.raises(ValueError, match="exceeds"):
+        ws.band_offsets(np.array([capacity + 1], np.int32), capacity, offsets)
+
+
+def _pool_geometry(index_fp4, speculative_tokens=5):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        **{**vars(_workspace_geometry()), "index_fp4": index_fp4},
+        speculative_tokens=speculative_tokens,
+    )
+
+
+def test_packed_capacity_follows_the_pool_up_to_the_plane():
+    """Every decode row of a full pool at the widest ratio, its alignment
+    for every token row, and never more than the plane it replaces."""
+    from atom.model_ops.deepseek_v41 import score_workspace as ws
+
+    geometry = _pool_geometry(True, speculative_tokens=3)
+    # widest ratio 1: 64 rows a PAGE, 4 rows a request
+    assert ws.packed_capacity(geometry, 10, 7, 1 << 30) == 10 * 64 * 4 + 7 * 64
+    assert ws.packed_capacity(geometry, 10, 7, 100) == 100
+
+
+def test_score_workspace_packs_only_the_fp4_plane_and_holds_its_maxima():
+    """Given the pool's PAGEs, the FP4 workspace packs its logits, and holds
+    the block maxima beside them, each row's starting at its logits' over the
+    block; an FP8 one keeps its plane."""
+    import numpy as np
+
+    from atom.model_ops.deepseek_v41 import score_workspace as ws
+
+    fp4 = ws.ScoreWorkspace(_pool_geometry(True), 40, 9, "cpu", pages=10)
+    fp8 = ws.ScoreWorkspace(_pool_geometry(False), 40, 9, "cpu", pages=10)
+    assert fp4.packed and fp4.capacity == 10 * 64 * 6 + 40 * 64
+    assert fp4.packed_logits().numel() == fp4.capacity
+    assert fp4.packed_maxima().numel() == fp4.capacity // 8
+    visible = np.array([5, 0, 70, 64], np.int32)
+    offsets, block_offsets = np.empty(4, np.int32), np.empty(4, np.int32)
+    assert fp4.pack(visible, offsets, block_offsets) == ((0, 4),)
+    assert offsets.tolist() == [0, 64, 64, 192]
+    assert block_offsets.tolist() == [0, 8, 8, 24]
+    # 192 elements: rows 0-2 (64 + 0 + 128), then row 3
+    small = ws.ScoreWorkspace(_pool_geometry(True, 0), 2, 9, "cpu", pages=1)
+    assert small.pack(visible, offsets, block_offsets) == ((0, 3), (3, 4))
+    assert not fp8.packed and fp8.capacity == 40 * 9 * 64
+    with pytest.raises(ValueError, match="FP4"):
+        fp8.packed_logits()
+
+
+@pytest.mark.parametrize("ratio,longest", [(1, 640), (2, 1409)])
+def test_a_step_fits_one_packed_band_exactly_while_its_rows_do(ratio, longest):
+    """A step fits (and so runs from a graph, `step_needs_eager`) exactly
+    while its rows -- each seeing its request's context in rows of the widest
+    ratio, aligned -- fit one band beside the padding rows a graph adds (at
+    ratio 1 each sees a row). Ten PAGEs, 40 token rows: ratio 1 leaves 3840
+    elements, six rows of 640; ratio 2 leaves 4480, six of 704 (contexts to
+    1409 tokens). A plane always fits."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
+
+    def fits(geometry, context):
+        workspace = ScoreWorkspace(geometry, 40, 9, "cpu", pages=10)
+        return workspace.fits((6,), (context,))
+
+    fp4 = SimpleNamespace(**{**vars(_pool_geometry(True)), "owners": ((0, ratio),)})
+    assert fits(fp4, longest)
+    assert not fits(fp4, longest + 1)
+    fp8 = SimpleNamespace(**{**vars(fp4), "index_fp4": False})
+    assert fits(fp8, 1 << 20)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

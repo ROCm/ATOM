@@ -132,6 +132,7 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
+    enable_decoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
@@ -505,6 +506,21 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--decoder-swa-bounded-replay",
+            "--enable-decoder-swa-bounded-replay",
+            dest="enable_decoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: in prefill, run the layers after the last "
+                "KV-source layer on each request's last window-ring rows only "
+                "(window + speculative tokens). Faster prefill; not numerically "
+                "equivalent to a full prefill. On by default, as vLLM's "
+                "--swa-bounded-replay; --no-decoder-swa-bounded-replay turns it "
+                "off. No effect on other models."
+            ),
+        )
+        parser.add_argument(
             "--state-checkpoint-demand",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -512,8 +528,8 @@ class EngineArgs:
                 "Let a hit that was refused for want of a checkpoint place a "
                 "rung of its own. --no-state-checkpoint-demand leaves the "
                 "prompt-end anchor as the only placement. On measured traces a "
-                "demand is 47% of all checkpoint writes but reads back 2.8% of "
-                "the time, against 85.2% for an anchor, so the rung's write "
+                "demand is 47%% of all checkpoint writes but reads back 2.8%% of "
+                "the time, against 85.2%% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
         )
