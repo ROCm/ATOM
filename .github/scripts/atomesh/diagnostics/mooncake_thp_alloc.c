@@ -3,13 +3,34 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <linux/mempolicy.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 static const size_t thp_size = 2UL * 1024 * 1024;
+
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+
+static int populate_thp(void *address, size_t length, const char *kind) {
+    int rc = madvise(address, length, MADV_POPULATE_WRITE);
+    if (rc == 0)
+        rc = madvise(address, length, MADV_COLLAPSE);
+    int error = errno;
+    fprintf(stderr, "[DEBUG-mooncake-thp] populate=%s bytes=%zu address=%p rc=%d errno=%d\n",
+            kind, length, address, rc, rc == 0 ? 0 : error);
+    errno = error;
+    return rc;
+}
 
 static int matches_size(const char *name, size_t size) {
     const char *value = getenv(name);
@@ -33,6 +54,8 @@ void *aligned_alloc(size_t alignment, size_t size) {
     void *address = original(selected ? thp_size : alignment, size);
     if (selected && address) {
         int rc = madvise(address, size, MADV_HUGEPAGE);
+        if (rc == 0)
+            rc = populate_thp(address, size, "local-buffer");
         fprintf(stderr, "[DEBUG-mooncake-thp] local-buffer=%zu address=%p advice=%d\n",
                 size, address, rc);
         if (rc != 0) {
@@ -43,6 +66,16 @@ void *aligned_alloc(size_t alignment, size_t size) {
         }
     }
     return address;
+}
+
+long mbind(void *address, unsigned long length, int mode,
+           const unsigned long *nodes, unsigned long maxnode,
+           unsigned int flags) {
+    long rc = syscall(SYS_mbind, address, length, mode, nodes, maxnode, flags);
+    if (rc == 0 && mode == MPOL_BIND && (uintptr_t)address % thp_size == 0 &&
+        matches_size("ATOMESH_THP_NUMA_REGION_BYTES", length))
+        rc = populate_thp(address, length, "numa-region");
+    return rc;
 }
 
 static void *map_segment(void *address, size_t length, int prot, int flags,

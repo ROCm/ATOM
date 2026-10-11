@@ -24,7 +24,7 @@ while IFS= read -r container; do
     id
     ps -eo pid,ppid,etimes,pcpu,stat,wchan:24,comm
     ps -eo pid,ppid,etimes,pcpu,stat,args | grep -E "[n]inja|[h]ipcc|[c]lang-22" | cut -c 1-1200
-    store_pids=$(pgrep -f "pd_mooncake_store_smoke.py --worker" || true)
+    store_pids=$(pgrep -f "^[^ ]*python[^ ]* .*/pd_mooncake_store_smoke.py --worker( |$)" || true)
     if [[ -n "${store_pids}" ]]; then
       for pid in ${store_pids}; do
         printf "Store process %s memory and thread states\n" "${pid}"
