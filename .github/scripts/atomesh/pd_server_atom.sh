@@ -1369,7 +1369,9 @@ check_mooncake_store_capacity() {
 # Returns non-zero when a Store process died before it was stopped, or a
 # master lost owner capacity during the run.
 stop_mooncake_store() {
-  terminate_process_group "${mooncake_page_cache_dropper_pid}"
+  if mooncake_page_cache_dropper_running; then
+    terminate_process_group "${mooncake_page_cache_dropper_pid}"
+  fi
   mooncake_page_cache_dropper_pid=""
   mooncake_store_running || return 0
   save_mooncake_store_metrics
@@ -1478,6 +1480,26 @@ start_mooncake_page_cache_dropper() {
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
     --every 45 --for 1800 "${MODEL_PATH}" &
   mooncake_page_cache_dropper_pid=$!
+  # Until the child execs, its cmdline is this shell's, and a cleanup in that
+  # window would take the dropper for another process and leave it running:
+  # wait for the exec, two seconds at most.
+  local i
+  for ((i = 0; i < 100; i++)); do
+    mooncake_page_cache_dropper_running && return 0
+    kill -0 "${mooncake_page_cache_dropper_pid}" 2>/dev/null || return 0
+    sleep 0.02
+  done
+}
+
+# Whether the page-cache dropper this shell started still runs. It exits on its
+# own after --for, and the kernel may have given its pid to another process
+# since, which no signal of the cleanup may reach: the pid must still run the
+# dropper.
+mooncake_page_cache_dropper_running() {
+  local pid="${mooncake_page_cache_dropper_pid}" cmdline
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || return 1
+  [[ "${cmdline}" == *"/drop_page_cache.py --every "* ]]
 }
 
 # start_mooncake_store_owners <master addr>: starts this node's owners

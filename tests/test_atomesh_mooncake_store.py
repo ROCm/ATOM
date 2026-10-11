@@ -56,7 +56,8 @@ PYTHON_STUB = textwrap.dedent("""\
         echo "${master} ${bytes}" >> "${STUB_DIR}/segments"
         exec sleep 60
         ;;
-      *" --every "*) exec sleep 60 ;;
+      # The page-cache dropper keeps its command line, as python3 would.
+      *" --every "*) exec -a "$0 $*" sleep 60 ;;
       *"/numa_memory_budget.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
     esac
     exit 0
@@ -789,6 +790,24 @@ cleanup_processes $!
         self.assertIn("mooncake-master-rank-0.metrics", at_term, result.stdout)
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
+
+    def test_cleanup_signals_the_page_cache_dropper_only_while_it_runs(self):
+        # The dropper exits on its own after --for; by cleanup, its pid may
+        # name another process, here one the shell started after it.
+        result = self.run_shell("""
+start_mooncake_page_cache_dropper
+mooncake_page_cache_dropper_running && echo "DROPPER RUNS"
+kill -KILL "${mooncake_page_cache_dropper_pid}"
+wait "${mooncake_page_cache_dropper_pid}" 2>/dev/null || true
+setsid sleep 60 &
+other=$!
+mooncake_page_cache_dropper_pid="${other}"
+stop_mooncake_store
+kill -0 "${other}" && echo "OTHER SURVIVES"
+kill -KILL "${other}"
+""")
+        self.assertIn("DROPPER RUNS", result.stdout)
+        self.assertIn("OTHER SURVIVES", result.stdout)
 
     def test_an_owner_dying_before_ready_stops_the_store(self):
         self.run_shell(
