@@ -2608,6 +2608,35 @@ def test_a_failing_save_is_retried_after_a_pause_that_grows(
     assert step() == 1
 
 
+def test_a_failed_save_the_base_retires_pauses_no_other_save(
+    cluster, make_worker, scheduler_clock
+):
+    config = _config()
+    scheduler = MooncakeStoreOffloadScheduler(config)
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    finished = _seq(47, 16)
+    scheduler.update_state_after_alloc(finished)
+    finished.num_cached_tokens = 16
+    [request] = scheduler.build_connector_meta().requests
+    # Its request finishes while the save runs (teardown marks it so), and
+    # the Store refuses the save: the base retires it rather than retry it.
+    finished._offload_finished = True
+    cluster.put_code = store_client.NO_AVAILABLE_HANDLE
+    worker._do_save_req(request)
+    scheduler.process_completions(worker.get_finished())
+    assert "47" not in scheduler._save_tracker
+    # Nothing is retried, so nothing is paced: no pause, no streak.
+    assert scheduler._failed_saves_in_a_row == 0
+    assert scheduler._saves_paused_until == 0.0
+    cluster.put_code = None
+    live = _seq(48, 16, offset=100)
+    scheduler.update_state_after_alloc(live)
+    live.num_cached_tokens = 16
+    assert [r.req_id for r in scheduler.build_connector_meta().requests] == [48]
+
+
 @pytest.mark.parametrize("stored_last", [True, False])
 def test_a_save_stored_after_another_failed_ends_the_pause(
     cluster, make_worker, scheduler_clock, stored_last

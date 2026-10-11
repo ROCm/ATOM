@@ -482,13 +482,15 @@ a copy into each slot (and the reverse).
   (`/proc/sys/kernel/random/boot_id`) cannot be read, since every save would
   then read nothing.
 - A put of a key that already exists succeeds (Mooncake reports 0).
-- After a failed save no save is emitted for 1 s, doubled for each further
-  failure in a row up to 30 s. A stored save ends the pause and starts the
-  doubling over, also when it reports after a failure that set the pause
-  (saves run concurrently). The base retries a failed save on the next step;
-  a failure that repeats (a full Store, a master that is down, a stage whose
-  save slots are all quarantined) would otherwise re-pack the request's
-  unsaved range on every PP stage every step.
+- After a failed save that the base retries, no save is emitted for 1 s,
+  doubled for each further such failure in a row up to 30 s. A stored save
+  ends the pause and starts the doubling over, also when it reports after a
+  failure that set the pause (saves run concurrently). The base retries a
+  failed save on the next step; a failure that repeats (a full Store, a
+  master that is down, a stage whose save slots are all quarantined) would
+  otherwise re-pack the request's unsaved range on every PP stage every step.
+  A failed save the base retires instead (its request finished, or its ID was
+  reused) has nothing to pace and pauses nothing.
 - At startup every worker sends one chunk of random bytes through the Store and
   compares it back: an unregistered pool, an unreachable owner or a misrouted
   NIC fails startup instead of turning every lookup into a miss.

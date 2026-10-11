@@ -1128,7 +1128,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._save_retry_blocked.get(sid) == operation:
             self._retry_or_retire_failed_save(operation)
 
-    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> None:
+    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> bool:
+        """Retry a failed save that every rank stopped reading, or retire it.
+
+        Returns whether a retry was set up: False when its request has
+        finished, its ID was reused, or nothing of it is tracked any more.
+        """
         sid = str(operation.req_id)
         if self._save_retry_blocked.get(sid) == operation:
             self._save_retry_blocked.pop(sid, None)
@@ -1140,9 +1145,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         entry = self._save_tracker.get(sid)
         owner = self._save_previous_owner.pop(operation, None)
         if entry is None or previous is None:
-            return
+            return False
         if owner is not None and entry[0] is not owner:
-            return  # request ID was reused
+            return False  # request ID was reused
         if getattr(entry[0], "_offload_finished", False):
             # Teardown may already have returned the source blocks to the pool.
             # A missing cache entry is safer than a retry against recycled KV.
@@ -1156,13 +1161,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 # suffix; no further save reads it once the request retires.
                 self._pending_source_safe_releases.append(frozenset(remaining))
                 self.total_source_safe_released_blocks += len(remaining)
-            return
+            return False
         entry[1] = min(int(entry[1]), previous)
         logger.warning(
             "LMCache offload: retrying failed dense save req=%s from token %d",
             sid,
             previous,
         )
+        return True
 
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):

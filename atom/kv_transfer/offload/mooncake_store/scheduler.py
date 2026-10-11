@@ -64,9 +64,9 @@ _LOOKUP_STATS_INTERVAL_S = 60.0
 # dispatched. Only the lookup's read lease (10 s by default) keeps the chunks
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
-# After a failed save, no save is emitted for this long, doubled for each
-# further failure in a row up to `_SAVE_RETRY_MAX_S`. A stored save ends the
-# pause and starts the doubling over, whenever it reports.
+# After a failed save the base retries, no save is emitted for this long,
+# doubled for each further such failure in a row up to `_SAVE_RETRY_MAX_S`. A
+# stored save ends the pause and starts the doubling over, whenever it reports.
 # The base retries a failed save on the next step, and a failure that repeats
 # -- a full Store, a master that is down, a stage whose save slots are all
 # quarantined -- would otherwise re-pack the request's unsaved range on every
@@ -468,9 +468,14 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             self._saves_paused_until = 0.0
         super()._store_finished(operation, succeeded=succeeded)
 
-    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> None:
-        """Pace the retry the base sets up; see `_SAVE_RETRY_BASE_S`."""
-        super()._retry_or_retire_failed_save(operation)
+    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> bool:
+        """Pace the retry the base sets up; see `_SAVE_RETRY_BASE_S`.
+
+        A save the base retires instead (its request finished, or its ID was
+        reused) has nothing to pace, and pauses no other request's saves.
+        """
+        if not super()._retry_or_retire_failed_save(operation):
+            return False
         self._failed_saves_in_a_row += 1
         pause = min(
             _SAVE_RETRY_MAX_S,
@@ -479,6 +484,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         self._saves_paused_until = max(
             self._saves_paused_until, time.monotonic() + pause
         )
+        return True
 
     def _build_save_request(
         self,
