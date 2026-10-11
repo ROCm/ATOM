@@ -39,6 +39,7 @@ when it is non-zero is to align the scheduler's token budget to the interval.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -51,6 +52,16 @@ from atom.model_engine.state_offload import StateOffloadIndex
 from .kda_state import KdaLoad, KdaStore, boundary_prefix_hash
 
 logger = logging.getLogger("atom")
+
+
+#: Serve vLLM's own prefix-cache hits by capping them to one block below a
+#: claimed CSA2 boundary and letting the tier supply that block. Off until
+#: the race in the paragraph in `cap_local_hit` is closed.
+_LOCAL_PREFIX_HITS_ENABLED = os.environ.get("ATOM_V41_LOCAL_PREFIX_HITS") in (
+    "1",
+    "true",
+    "True",
+)
 
 # How many intervals `cap_hit` walks back before giving up. The same bound K3
 # uses: a hit far past every stored boundary is a cold tier, and descending
@@ -365,6 +376,12 @@ class V41BoundaryPlanner:
         # unchanged by that -- still about one per interval of progress -- so
         # it buys coverage rather than bandwidth.
         self._last_offered: dict[str, int] = {}
+        # req_id -> boundary claimed for a purely local prefix hit, read
+        # once by `update_state_after_alloc` and dropped there.
+        self._local_caps: dict[str, int] = {}
+        # Requests whose local cap the tier failed to back. They decline
+        # on the retry rather than being deferred again and again.
+        self._local_cap_withdrawn: set[str] = set()
         self._counters: dict[str, int] = {
             "sweep_offered": 0,
             "sweep_stores": 0,
@@ -405,6 +422,8 @@ class V41BoundaryPlanner:
             # measures what prefix caching costs on a model whose state the
             # block pool does not carry.
             "local_cap_declined": 0,
+            "local_cap_kept": 0,
+            "local_cap_withdrawn": 0,
         }
         # One warning per planner, not per hit: an unarmed cap fires once
         # per request on whatever path is missing its arming.
@@ -515,6 +534,20 @@ class V41BoundaryPlanner:
         # So: walk the block grid for one interval, then the interval ladder
         # for the rest of the budget. Near-field precision at the old reach,
         # and at most `2 * _MAX_CAP_DESCENT` index lookups.
+        boundary = self._claimed_boundary_at_or_below(block_hashes, hit)
+        if boundary <= 0:
+            self._counters["cap_declined"] += 1
+            return 0
+        self._counters["cap_kept"] += 1
+        return min(hit, boundary)
+
+    def _claimed_boundary_at_or_below(self, block_hashes, hit: int) -> int:
+        """The highest boundary <= *hit* the index still claims, or 0.
+
+        Shared by both cap paths so they cannot disagree about which
+        boundaries exist: a local hit capped by a different rule than the
+        external one is a local hit whose state nobody stored.
+        """
         block = self.hash_block_size
         boundary = (hit // block) * block
         near = min(_MAX_CAP_DESCENT, max(1, self.state_interval // block))
@@ -524,48 +557,95 @@ class V41BoundaryPlanner:
         ):
             for _ in range(phase_len):
                 if boundary <= 0:
-                    self._counters["cap_declined"] += 1
                     return 0
                 h = self.boundary_hash(block_hashes, boundary)
                 if h is not None and self._index.could_serve(h):
-                    self._counters["cap_kept"] += 1
-                    return min(hit, boundary)
+                    return boundary
                 boundary -= phase_step
-        self._counters["cap_declined"] += 1
         return 0
 
     def cap_local_hit(self, request, hit: int) -> int:
-        """Shorten vLLM's *own* prefix-cache hit to a claimed boundary.
+        """Shorten vLLM's *own* prefix-cache hit so the tier can back it.
 
         The connector-side `cap_hit` only sees hits vLLM asked it about. With
         prefix caching on, vLLM's block pool answers first and keeps whatever
         it can serve locally -- a path the connector is never consulted on. A
         request admitted that way arrives with its PAGE prefix restored and a
         state slot that was never written, which `_report_stale_state` turns
-        into a dead engine.
+        into a dead engine. That is a hard `raise`, not a degradation, so a
+        local hit may only be served if something is *guaranteed* to restore
+        the state behind it.
 
-        So the local hit is capped by the same rule and the same index. Unlike
-        the connector path there is no armed lookup to read, so the request is
-        the only context and is taken directly.
+        Nothing can be guaranteed from here: vLLM forbids parking a request
+        that has no external tokens (`assert num_external_computed_tokens > 0`
+        under `load_kv_async`), so a purely local hit runs its forward in the
+        same step the load is issued, and a load that misses then has no step
+        left in which to invalidate anything.
+
+        So the hit is capped one block *below* the claimed boundary rather
+        than to it. The tier is then asked for that last block, the request
+        parks on it like any external hit, and the whole proven path applies:
+        PAGE and STATE arrive together, and a miss invalidates the blocks and
+        recomputes instead of killing the engine. The win is that the other
+        `boundary - block` tokens come from HBM rather than over PCIe -- the
+        earlier code declined the local hit outright and paid for the entire
+        prefix from the tier.
+
+        If the tier cannot supply that last block the cap is withdrawn by
+        `get_num_new_matched_tokens`, which defers the request one step; the
+        mark it leaves makes this decline on the retry, which is the old
+        behaviour and is safe.
         """
         hit = int(hit)
+        req_id = str(getattr(request, "request_id", "") or "")
+        self._local_caps.pop(req_id, None)
         if hit <= 0:
             return hit
-        # Refused outright, not shortened. Shortening a local hit to a
-        # boundary the index holds looks right and is not: nothing then
-        # *restores* that state. `resolve_load` runs only for tokens the
-        # connector supplied, so a locally served prefix arrives with its
-        # pages in HBM and a slot that was never written -- measured as
-        # `needs state at 8192, found 0`, the cap having picked 8192 and
-        # nobody having filled it.
-        #
-        # For this model PAGE reuse and STATE restore are one operation, and
-        # only the connector performs both. Declining here does not lose the
-        # reuse: the connector is asked about the whole prompt next and serves
-        # the same prefix from the tier, with its state. What it costs is the
-        # HBM-speed path, which for V4.1 was never admissible on its own.
-        self._counters["local_cap_declined"] += 1
-        return 0
+        if not _LOCAL_PREFIX_HITS_ENABLED:
+            # Off by default: measured, this path still loses a race under
+            # concurrency. With 24 lanes it produced `needs state at 7936,
+            # found 5` -- a request admitted at a boundary whose slot held
+            # another tenant's five tokens -- on the second round of a run
+            # whose first eight rounds had been clean. Eight clean rounds are
+            # not proof when the failure is a race; the cursor check is, and
+            # it says this is not ready. Declining costs the HBM-speed path
+            # and keeps the tier serving the whole prefix, which is correct.
+            self._counters["local_cap_declined"] += 1
+            return 0
+        if req_id in self._local_cap_withdrawn:
+            # Asked once, the tier had nothing. Declining sends the whole
+            # prefix through the connector, which is what used to happen
+            # always.
+            self._counters["local_cap_declined"] += 1
+            return 0
+        block_hashes = getattr(request, "block_hashes", None) or ()
+        boundary = self._claimed_boundary_at_or_below(block_hashes, hit)
+        if boundary <= self.hash_block_size:
+            # Nothing claimed, or the only boundary is the first block and
+            # capping below it would leave nothing local to keep.
+            self._counters["local_cap_declined"] += 1
+            return 0
+        self._local_caps[req_id] = boundary
+        self._counters["local_cap_kept"] += 1
+        return min(hit, boundary - self.hash_block_size)
+
+    def withdraw_local_cap(self, request) -> bool:
+        """Give up on a local cap the tier did not back. True if there was one.
+
+        The caller defers the request a step. The mark is what keeps that from
+        repeating: on the retry the cap declines and the request takes the
+        connector path for its whole prefix.
+        """
+        req_id = str(getattr(request, "request_id", "") or "")
+        if self._local_caps.pop(req_id, None) is None:
+            return False
+        self._local_cap_withdrawn.add(req_id)
+        self._counters["local_cap_withdrawn"] += 1
+        return True
+
+    def confirm_local_cap(self, request) -> None:
+        """The tier answered; the cap stands and needs no retry mark."""
+        self._local_caps.pop(str(getattr(request, "request_id", "")), None)
 
     def _prompt_anchor(self, request) -> int:
         """The last block-aligned point at or before the end of the prompt.
@@ -738,7 +818,16 @@ class V41BoundaryPlanner:
         entirely from vLLM's own pool never reaches here.
         """
         boundary = int(num_total_computed)
-        if boundary <= 0 or boundary % self.state_interval:
+        # The BLOCK grid, not the interval ladder. `cap_hit` accepts any
+        # block-aligned boundary the index claims -- the store side offers
+        # frontiers spaced an interval apart plus the prompt-end anchor, so
+        # the boundaries that exist are not multiples of the interval. Testing
+        # for one here declined exactly the hits the cap had just accepted,
+        # leaving PAGE restored with no state load queued behind it. The
+        # authority on whether a boundary exists is the index, which
+        # `request_load` below consults; this test only rejects a frontier
+        # that cannot be hashed at all.
+        if boundary <= 0 or boundary % self.hash_block_size:
             return False
         prefix_hash = self.boundary_hash(
             getattr(request, "block_hashes", None) or (), boundary
@@ -782,6 +871,8 @@ class V41BoundaryPlanner:
         """
         self._swept.pop(str(req_id), None)
         self._last_offered.pop(str(req_id), None)
+        self._local_caps.pop(str(req_id), None)
+        self._local_cap_withdrawn.discard(str(req_id))
 
     # -- observability ---------------------------------------------------
     def stats(self) -> dict[str, int]:

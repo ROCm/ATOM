@@ -639,6 +639,7 @@ def register_deepseek_v41_proxy_layer(
 
 _V41_SNAPSHOT_FALLBACK_LOGGED = False
 _V41_ROW_CHECK_INERT_LOGGED = False
+_V41_ROW_CHECK_NOISY = False
 
 
 def _v41_scheduled_request_count(common_attn_metadata) -> int:
@@ -1151,30 +1152,47 @@ def _check_row_alignment(input_batch, num_computed, query_lens, num_reqs: int) -
             "DeepSeek-V4.1: input_batch has "
             f"{mine.shape[0]} rows but the step describes {num_computed.shape[0]}"
         )
-    # Convention-agnostic, because the two runner generations do not share one.
-    # V1's array is the count BEFORE this step; V2's is after it. Comparing
-    # against one of them names every row on the other runner -- which is what
-    # this guard did when it was first made to fire on 0.31, reporting
-    # "7105 vs 6912" for a row whose order was perfectly fine (7105 being the
-    # whole prompt, 6912 the frontier it started the step at).
+    # NOT a raise, and not a row-order check. Measured on 0.31's V2 runner,
+    # `num_computed_tokens_np` is not a coherent per-step snapshot: within one
+    # eight-row batch the rows read, variously, this step's start, one token
+    # below it, a frontier 9,613 tokens stale, and zero for a row added that
+    # step. The decisive observation is that the two arrays were not
+    # permutations of each other --
     #
-    # Misordering is what this is for, and it shows as a row matching NEITHER
-    # end of its own step. Accepting both ends costs the ability to notice a
-    # swap between two requests that happen to sit exactly one step apart; it
-    # buys a guard that works on both runners, which is worth more than a case
-    # no run has produced.
+    #   batch [9594, 9594, 9610, 9603, 9597,  8192, 7936, 0]
+    #   step  [9594, 9594, 9611, 9604, 9598, 17805, 7936, 0]
+    #
+    # -- so no reordering can explain the difference, and reordering is what
+    # this guard was written to name. It was inert on 0.31 until V4.1 began
+    # serving local prefix hits, and the first thing it did once reachable
+    # was kill the engine over a value the runner had not written yet. A
+    # guard that has never fired is a guard whose premise has never been
+    # tested against data.
+    #
+    # The hard contract that does catch a slot keyed by the wrong request is
+    # `_report_stale_state` in the attention leg, which compares the state
+    # cursor against the position it is wanted at -- against real bytes. This
+    # stays as a one-shot report so the disagreement remains visible.
     after = num_computed + np.asarray(query_lens[:num_reqs], dtype=np.int64)
-    bad = np.flatnonzero((mine != num_computed) & (mine != after))
-    if bad.size:
-        row = int(bad[0])
-        raise ValueError(
-            "DeepSeek-V4.1: the persistent batch and this step's attention "
-            f"metadata disagree at row {row}: input_batch says "
-            f"{int(mine[row])} computed tokens, the step runs "
-            f"{int(num_computed[row])} -> {int(after[row])}. Their row orders "
-            "have diverged, so req_ids and block tables cannot be trusted for "
-            "this step."
-        )
+    odd = np.flatnonzero((mine != num_computed) & (mine != after))
+    if odd.size:
+        global _V41_ROW_CHECK_NOISY
+        if not _V41_ROW_CHECK_NOISY:
+            _V41_ROW_CHECK_NOISY = True
+            logger.info(
+                "DeepSeek-V4.1: %d of %d batch rows carry a computed count "
+                "that is neither end of their own step (first: row %d says "
+                "%d, the step runs %d -> %d). On this runner that array is "
+                "not a per-step snapshot, so this is reported once and not "
+                "acted on; the cursor check in the attention leg is what "
+                "refuses a state slot that does not match its position.",
+                int(odd.size),
+                int(num_reqs),
+                int(odd[0]),
+                int(mine[odd[0]]),
+                int(num_computed[odd[0]]),
+                int(after[odd[0]]),
+            )
 
 
 def _v41_scheduled_batch(snapshot, slot_allocator, slots=None):

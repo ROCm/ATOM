@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.plugin.vllm.kv_transfer import v41_state
 from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
 
 CHUNK = 256
@@ -430,21 +431,104 @@ def test_a_refused_store_holds_no_staging_slab():
 # ---- local prefix-cache hits -------------------------------------------
 
 
-def test_a_local_hit_is_refused_even_at_a_claimed_boundary():
-    """Shortening a local hit is not enough; nothing restores the state.
+@pytest.fixture
+def local_hits_on(monkeypatch):
+    """Turn on the local-prefix-hit path for the tests that describe it.
 
-    `resolve_load` runs only for tokens the connector supplied, so a locally
-    served prefix arrives with its pages in HBM and a slot nobody wrote --
-    measured as `needs state at 8192, found 0`, the cap having picked 8192.
-    PAGE reuse and STATE restore are one operation here, and only the
-    connector performs both.
+    It ships off: measured, it still loses a race under 24-lane concurrency
+    (`needs state at 7936, found 5`). The behaviour below is what it does when
+    it is on, and `test_the_local_path_is_off_by_default` pins that it is not.
+    """
+    monkeypatch.setattr(v41_state, "_LOCAL_PREFIX_HITS_ENABLED", True)
+
+
+def test_the_local_path_is_off_by_default():
+    """Default-off is the contract, not an accident of the environment."""
+    assert v41_state._LOCAL_PREFIX_HITS_ENABLED is False
+
+
+def test_with_the_path_off_every_local_hit_is_declined():
+    """The old behaviour, which is safe: the tier serves the whole prefix."""
+    planner = make_planner()
+    request = make_request()
+    planner._index.note_stored(
+        planner.boundary_hash(request.block_hashes, INTERVAL * 2)
+    )
+    assert planner.cap_local_hit(request, INTERVAL * 3) == 0
+    assert planner.stats()["local_cap_declined"] == 1
+
+
+def test_a_local_hit_is_capped_one_block_below_the_claimed_boundary(local_hits_on):
+    """Not to the boundary: to one block below it, so the tier is asked.
+
+    Capping *to* the boundary is the dead end this used to decline --
+    `resolve_load` runs only for tokens the connector supplied, and vLLM
+    forbids parking a request with no external tokens, so a hit capped to the
+    boundary reaches the forward with a slot nobody wrote (`needs state at
+    8192, found 0`). One block lower, the tier is asked for that block, the
+    request parks on it, and PAGE and STATE arrive together.
     """
     planner = make_planner()
     request = make_request()
     claimed = INTERVAL * 2
     planner._index.note_stored(planner.boundary_hash(request.block_hashes, claimed))
-    assert planner.cap_local_hit(request, INTERVAL * 3 + 50) == 0
+    capped = planner.cap_local_hit(request, INTERVAL * 3 + 50)
+    assert capped == claimed - planner.hash_block_size
+    assert planner.stats()["local_cap_kept"] == 1
+
+
+def test_the_whole_local_hit_is_never_kept(local_hits_on):
+    """Whatever else it does, the cap must leave a block for the tier.
+
+    The returned value is what vLLM treats as locally computed. If it ever
+    equalled the claimed boundary the request would need state there and
+    nothing would be loading it.
+    """
+    planner = make_planner()
+    request = make_request()
+    claimed = INTERVAL * 2
+    planner._index.note_stored(planner.boundary_hash(request.block_hashes, claimed))
+    for hit in (claimed, claimed + 1, INTERVAL * 4):
+        planner._local_caps.clear()
+        planner._local_cap_withdrawn.clear()
+        assert planner.cap_local_hit(request, hit) < claimed
+
+
+def test_a_withdrawn_local_cap_declines_on_the_retry(local_hits_on):
+    """The tier did not back it, so the retry takes the whole-prefix path.
+
+    Without the mark the request would be capped again, found unbacked again,
+    and deferred again -- a livelock dressed as a scheduling decision.
+    """
+    planner = make_planner()
+    request = make_request()
+    planner._index.note_stored(
+        planner.boundary_hash(request.block_hashes, INTERVAL * 2)
+    )
+    assert planner.cap_local_hit(request, INTERVAL * 3) > 0
+    assert planner.withdraw_local_cap(request) is True
+    assert planner.cap_local_hit(request, INTERVAL * 3) == 0
     assert planner.stats()["local_cap_declined"] == 1
+    assert planner.stats()["local_cap_withdrawn"] == 1
+
+
+def test_withdrawing_a_cap_that_was_never_taken_says_so():
+    """The connector asks on every unparked lookup, most of which never capped."""
+    planner = make_planner()
+    assert planner.withdraw_local_cap(make_request()) is False
+    assert planner.stats()["local_cap_withdrawn"] == 0
+
+
+def test_a_confirmed_cap_leaves_no_retry_mark(local_hits_on):
+    """The tier answered, so a later hit by the same request may cap again."""
+    planner = make_planner()
+    request = make_request()
+    planner._index.note_stored(
+        planner.boundary_hash(request.block_hashes, INTERVAL * 2)
+    )
+    planner.cap_local_hit(request, INTERVAL * 3)
+    planner.confirm_local_cap(request)
+    assert planner.cap_local_hit(request, INTERVAL * 3) > 0
 
 
 def test_a_local_hit_with_no_stored_boundary_is_declined():
@@ -454,11 +538,11 @@ def test_a_local_hit_with_no_stored_boundary_is_declined():
     assert planner.stats()["local_cap_declined"] == 1
 
 
-def test_local_and_external_caps_are_counted_apart():
+def test_local_and_external_caps_are_counted_apart(local_hits_on):
     """They answer different questions and must not be summed by accident.
 
     The external one measures the tier. The local one measures how much reuse
-    prefix caching is being denied on this model -- which is all of it.
+    prefix caching is actually serving from HBM.
     """
     planner = make_planner()
     request = make_request()
@@ -467,14 +551,18 @@ def test_local_and_external_caps_are_counted_apart():
     planner.begin_lookup(request)
     planner.cap_hit(SimpleNamespace(id="r0"), INTERVAL * 2)
     stats = planner.stats()
-    assert stats["local_cap_declined"] == 1 and stats["cap_kept"] == 1
+    assert stats["local_cap_kept"] == 1 and stats["cap_kept"] == 1
 
 
-def test_a_local_hit_needs_no_armed_lookup():
+def test_a_local_hit_needs_no_armed_lookup(local_hits_on):
     """Unlike the connector path there is no lookup in progress to read."""
     planner = make_planner()
+    request = make_request()
+    planner._index.note_stored(
+        planner.boundary_hash(request.block_hashes, INTERVAL * 2)
+    )
     assert planner._lookup_ctx is None
-    assert planner.cap_local_hit(make_request(), INTERVAL) == 0
+    assert planner.cap_local_hit(request, INTERVAL * 3) > 0
 
 
 def test_the_worker_reads_every_cursor_in_one_device_round_trip():
@@ -601,8 +689,17 @@ class TestTheSilentBranchesAreCounted:
         assert p.collect_frontier_stores({"r0": INTERVAL}, {}) == []
         assert p._counters["sweep_unknown_request"] == 1
 
-    def test_the_dead_counter_is_gone(self):
-        # `local_cap_kept` could never increment: `cap_local_hit` returns 0
-        # unconditionally. A counter that is structurally zero reads as
-        # "measured and absent" rather than "not measured".
-        assert "local_cap_kept" not in make_planner()._counters
+    def test_both_local_cap_counters_can_move(self, local_hits_on):
+        # Both directions have to be reachable, or the pair reads as
+        # "measured and absent" when one is structurally zero --
+        # `local_cap_kept` was exactly that while `cap_local_hit` returned 0
+        # unconditionally.
+        planner = make_planner()
+        request = make_request()
+        assert planner.cap_local_hit(request, INTERVAL * 3) == 0
+        planner._index.note_stored(
+            planner.boundary_hash(request.block_hashes, INTERVAL * 2)
+        )
+        assert planner.cap_local_hit(request, INTERVAL * 3) > 0
+        stats = planner.stats()
+        assert stats["local_cap_declined"] == 1 and stats["local_cap_kept"] == 1

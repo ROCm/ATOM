@@ -1726,7 +1726,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
-    ) -> tuple[int, bool]:
+    ) -> tuple[int | None, bool]:
         """How many extra prompt tokens the offload tier can supply.
 
         ``num_computed_tokens`` is vLLM's HBM-prefix-cache frontier; ATOM reads
@@ -1777,10 +1777,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 self._kda_planner.end_lookup()
             if self._v41_planner is not None:
                 self._v41_planner.end_lookup()
-        if need <= 0:
+        parked = need > 0 and self._scheduler.should_park_for_load_after_alloc(seq)
+        if self._v41_planner is not None and not parked:
+            # `cap_local_hit` shortened vLLM's own hit by one block on the
+            # promise that the tier would supply that block and the state
+            # behind it. The tier did not, and the request cannot be parked
+            # without external tokens -- so the promise has to be withdrawn
+            # before anything is allocated against it. Returning None defers
+            # the request one step; the withdrawal mark makes the cap decline
+            # on the retry, which is the path that serves the whole prefix
+            # from the tier.
+            if self._v41_planner.withdraw_local_cap(request):
+                logger.debug(
+                    "ATOM LMCache offload: V4.1 local cap for %s unbacked by "
+                    "the tier; deferring a step so it takes the whole-prefix "
+                    "path",
+                    request.request_id,
+                )
+                return None, False
+        if not parked:
             return 0, False
-        if not self._scheduler.should_park_for_load_after_alloc(seq):
-            return 0, False
+        if self._v41_planner is not None:
+            self._v41_planner.confirm_local_cap(request)
         # [steps_undispatched, first_token_of_promise, tokens_promised].
         # The range is kept because a promise that is never honoured has to be
         # withdrawn, and withdrawing it means naming the blocks it reserved.
