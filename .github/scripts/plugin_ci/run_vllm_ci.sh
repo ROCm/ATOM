@@ -48,6 +48,9 @@ CLIENT_COMMAND="${MATRIX_CLIENT_COMMAND:-}"
 ENV_VARS="${MATRIX_ENV_VARS:-}"
 LM_EVAL_NUM_FEWSHOT="${MATRIX_LM_EVAL_NUM_FEWSHOT:-3}"
 ACCURACY_TEST_THRESHOLD="${MATRIX_ACCURACY_TEST_THRESHOLD:-0.0}"
+# Empty unless the cell speculates: an acceptance floor only means
+# something where there is a draft.
+MTP_ACCEPT_THRESHOLD="${MATRIX_MTP_ACCEPT_THRESHOLD:-}"
 
 if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
   echo "ERROR: MATRIX_MODEL_NAME and MATRIX_MODEL_PATH are required" >&2
@@ -262,3 +265,33 @@ if [[ "${result}" -eq 1 ]]; then
 fi
 
 echo "Accuracy test passed for ${MODEL_NAME}"
+
+# gsm8k accuracy CANNOT guard a speculative cell. Verification is lossless
+# w.r.t. the target model, so a draft head that has been broken outright --
+# reading the wrong hidden states, or an output projection no checkpoint
+# ever filled -- leaves every answer correct and shows up only as acceptance
+# falling to the floor. The nightly workflow already gates on this; a PR
+# cell that speculates without it is blind to the one failure its own
+# feature has. `atom_oot_test.sh` scraped the number from the live /metrics
+# endpoint into the same result JSON the accuracy check above just read.
+if [[ -n "${MTP_ACCEPT_THRESHOLD}" ]]; then
+  mtp_overall="$(python3 - "${result_file}" <<'MTPPY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(data.get("atom_ci_metadata", {}).get("mtp_acceptance_overall", ""))
+MTPPY
+)"
+  if [[ -z "${mtp_overall}" ]]; then
+    echo "ERROR: mtp_acceptance_overall missing -- spec-decode /metrics were not captured. Treating as a failure." >&2
+    exit 1
+  fi
+  echo "MTP overall acceptance: ${mtp_overall} (threshold ${MTP_ACCEPT_THRESHOLD})"
+  if awk -v v="${mtp_overall}" -v t="${MTP_ACCEPT_THRESHOLD}" 'BEGIN {exit !(v < t)}'; then
+    echo "MTP acceptance test failed: ${mtp_overall} < ${MTP_ACCEPT_THRESHOLD}" >&2
+    exit 1
+  fi
+  echo "MTP acceptance test passed for ${MODEL_NAME}"
+fi

@@ -2,10 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Which V4.1 forwards take the mono path.
 
-The V4.1 runtime model is itself the ``support_torch_compile`` class, so the
-routing cannot live in its forward: ``install_mono_decode`` wraps the loaded
-model instead, the way the TBO ``UBatchWrapper`` does, and every other attribute
-passes through to it.
+``install_mono_decode`` wraps the loaded model, the way the TBO
+``UBatchWrapper`` does, and every other attribute passes through to it. The
+runtime model's own forward dispatches to its compiled graphs (``runtime``);
+mono routing sits outside them, before any compiled code runs.
 
 The configuration is checked once (``config.config_refusal``). A target step
 is then routed only when it is a DSpark verify of up to ``MAX_ROWS`` rows (a

@@ -153,6 +153,77 @@ def _get_mha_block_size() -> int:
     return _get_attn_backend_block_size(AiterMhaBackendForVllm)
 
 
+def _split_v41_proxy_layers(kv_cache_spec):
+    """Separate V4.1's pool-sizing proxy layer from any draft-model layers."""
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+
+    proxy = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME)
+    }
+    rest = {name: spec for name, spec in kv_cache_spec.items() if name not in proxy}
+    return proxy, rest
+
+
+def _spec_is_v41_proxy_with_draft(kv_cache_spec) -> bool:
+    proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
+    return bool(proxy) and bool(rest)
+
+
+def _build_v41_proxy_draft_groups(kv_cache_spec):
+    """One group for ATOM's pool, one for the draft's own KV.
+
+    vLLM's single-pool path first tries to unify page sizes, and neither way
+    out of that works here: V4.1's proxy page (ATOM's own paged geometry) is
+    not a whole multiple of the DSpark draft's MLA page, and padding the draft
+    page is undone by `SlidingWindowMLASpec.__post_init__`, which re-derives
+    `page_size_padded` from its own alignment. The two pools have nothing to
+    gain from sharing a page anyway -- ATOM owns the target's, vLLM owns the
+    draft's -- so keep each side's block size and give each its own group.
+    """
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+
+    proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
+    proxy_specs = list(proxy.values())
+    draft_specs = list(rest.values())
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=list(proxy),
+            kv_cache_spec=proxy_specs[0].merge(proxy_specs),
+        ),
+        KVCacheGroupSpec(
+            layer_names=list(rest),
+            kv_cache_spec=draft_specs[0].merge(draft_specs),
+        ),
+    ]
+    logger.info(
+        "ATOM plugin: V4.1 target pool and draft KV kept in separate groups "
+        "(proxy page %d B at block %d, draft page %d B at block %d).",
+        groups[0].kv_cache_spec.page_size_bytes,
+        groups[0].kv_cache_spec.block_size,
+        groups[1].kv_cache_spec.page_size_bytes,
+        groups[1].kv_cache_spec.block_size,
+    )
+    return groups
+
+
+def _groups_have_v41_proxy(kv_cache_groups) -> bool:
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+
+    if len(kv_cache_groups) < 2:
+        return False
+    return any(
+        name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME)
+        for group in kv_cache_groups
+        for name in group.layer_names
+    )
+
+
 def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
     try:
         from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
@@ -355,6 +426,37 @@ def _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups):
     return total
 
 
+def _heterogeneous_pool_bytes_per_block(kv_cache_groups) -> int:
+    """Bytes one block index costs across both pools.
+
+    vLLM's own divisor is the *largest* group's per-block bytes, because its
+    groups are overlaid on one allocation. The two pools built above are not:
+    every layer gets its own slice, so one block index costs the sum, and the
+    divisor has to say so. It is not only a sizing detail -- when ranks profile
+    different amounts of free memory, `get_kv_cache_configs` re-plans the
+    larger ranks with `min_num_blocks * _pool_bytes_per_block(groups)`, and a
+    divisor that disagrees with the builder's yields a different `num_blocks`
+    per rank, which the scheduler then rejects.
+    """
+    return sum(
+        layer_spec.page_size_bytes
+        for group in kv_cache_groups
+        if not getattr(group, "host_resident", False)
+        for _layer_name, layer_spec in _iter_group_layer_specs(group)
+    )
+
+
+def _iter_group_layer_specs(group):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        yield from spec.kv_cache_specs.items()
+    else:
+        for layer_name in group.layer_names:
+            yield layer_name, spec
+
+
 def _patch_heterogeneous_eagle3_kv_cache() -> None:
     """Patch vLLM KV-cache grouping/allocation for heterogeneous KV cache so
     MLA target can coexist with an MHA EAGLE3 draft.
@@ -387,13 +489,17 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
                 "and MHA EAGLE3 draft - with separate per-group pools."
             )
             return _build_heterogeneous_kv_cache_groups(kv_cache_spec)
+        if _spec_is_v41_proxy_with_draft(kv_cache_spec):
+            return _build_v41_proxy_draft_groups(kv_cache_spec)
         return orig_get_groups(vllm_config, kv_cache_spec)
 
     @functools.wraps(orig_config_from_groups)
     def patched_get_kv_cache_config_from_groups(
         vllm_config, kv_cache_groups, available_memory
     ):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(kv_cache_groups) or _groups_have_v41_proxy(
+            kv_cache_groups
+        ):
             return _build_heterogeneous_kv_cache_config_from_groups(
                 vllm_config, kv_cache_groups, available_memory
             )
@@ -401,10 +507,23 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
 
     @functools.wraps(orig_max_mem)
     def patched_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups):
-        if _groups_are_heterogeneous_mla_mha(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(kv_cache_groups) or _groups_have_v41_proxy(
+            kv_cache_groups
+        ):
             return _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups)
         return orig_max_mem(vllm_config, kv_cache_groups)
 
+    orig_pool_bytes = vllm_kv_cache_utils._pool_bytes_per_block
+
+    @functools.wraps(orig_pool_bytes)
+    def patched_pool_bytes_per_block(kv_cache_groups):
+        if _groups_are_heterogeneous_mla_mha(kv_cache_groups) or _groups_have_v41_proxy(
+            kv_cache_groups
+        ):
+            return _heterogeneous_pool_bytes_per_block(kv_cache_groups)
+        return orig_pool_bytes(kv_cache_groups)
+
+    vllm_kv_cache_utils._pool_bytes_per_block = patched_pool_bytes_per_block
     vllm_kv_cache_utils.get_kv_cache_groups = patched_get_kv_cache_groups
     vllm_kv_cache_utils.get_kv_cache_config_from_groups = (
         patched_get_kv_cache_config_from_groups

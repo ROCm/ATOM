@@ -900,16 +900,18 @@ run_benchmark() {
   local bench_root="/tmp/atomesh-inferencex"
   local bench_repo_url="https://github.com/SemiAnalysisAI/InferenceX.git"
   local bench_repo_dir="${bench_root}/InferenceX"
-  local bench_serving_dir="${bench_repo_dir}/utils/bench_serving"
-  local bench_script="${bench_serving_dir}/benchmark_serving.py"
+  local bench_pkg_root="${bench_repo_dir}/inferencex-e2e"
+  local bench_script="${bench_pkg_root}/infx/bench_serving/benchmark_serving.py"
   if [[ ! -f "${bench_script}" ]] || [[ "$(git -C "${bench_repo_dir}" config --get remote.origin.url 2>/dev/null || true)" != "${bench_repo_url}" ]]; then
     rm -rf "${bench_root}"
     mkdir -p "${bench_root}"
     git clone --depth 1 --filter=blob:none --sparse "${bench_repo_url}" "${bench_repo_dir}"
   fi
-  # The compatibility entrypoint imports infx from the repository root.
-  # Update cached checkouts too: older runs only populated utils/bench_serving.
-  git -C "${bench_repo_dir}" sparse-checkout set utils/bench_serving infx
+  git -C "${bench_repo_dir}" sparse-checkout set inferencex-e2e/infx
+  if [[ ! -f "${bench_script}" ]]; then
+    echo "[bench][FAIL] ${bench_script} not found in ${bench_repo_url}" >&2
+    return 1
+  fi
   IFS=',' read -r -a isls <<< "${ISL_LIST}"
   IFS=',' read -r -a concs <<< "${CONC_LIST}"
   local safe_model="${MODEL_NAME//\//-}"
@@ -917,7 +919,9 @@ run_benchmark() {
     for conc in "${concs[@]}"; do
       local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${isl}-osl${OSL}-conc${conc}-${RANDOM_RANGE_RATIO}.json"
       echo "[bench] ${result_file}"
-      PYTHONDONTWRITEBYTECODE=1 python "${bench_script}" \
+      # benchmark_serving uses package-relative imports, so it must run as a module.
+      PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${bench_pkg_root}${PYTHONPATH:+:${PYTHONPATH}}" \
+        python -m infx.bench_serving.benchmark_serving \
         --model="${MODEL_PATH}" \
         --backend=vllm \
         --base-url="http://127.0.0.1:${ROUTER_PORT}" \

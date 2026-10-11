@@ -469,6 +469,35 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
+        if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
+            self.atom_config, "enable_decoder_swa_bounded_replay", False
+        ):
+            # Bounded replay re-enters the model with a tail of the rows,
+            # and on this path the step those rows belong to was already
+            # staged -- outside the forward, once, against the full padded
+            # width (`atom_deepseek_v41_forward_context`). The staged step
+            # does not describe the tail, so the two disagree on how many
+            # rows there are:
+            #
+            #     RuntimeError: shape '[1389, -1, 512]' is invalid for input
+            #     of size 1048576        (cache.rope_quant_window)
+            #
+            # measured on the default plugin configuration, no speculation
+            # involved. It also bypasses the layer loop in `model.py` -- its
+            # stages run their own (`_Stage.run`) -- so a draft's aux hidden
+            # states would come back silently empty.
+            #
+            # Native keeps both: its drafter taps the layers with forward
+            # hooks and maps the tail's captures back itself
+            # (`_late_on_tail`). The plugin has neither half, so it does not
+            # get the optimization. Decided here rather than left to the
+            # operator: the alternative is a crash with a flag to pass.
+            self.atom_config.enable_decoder_swa_bounded_replay = False
+            logger.info(
+                "ATOM plugin: decoder SWA bounded replay is off for "
+                "DeepSeek-V4.1; this path stages a step outside the forward, "
+                "which a replayed tail of rows no longer describes."
+            )
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
             "index_topk_pattern=%s",
@@ -963,6 +992,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.get_eagle3_default_aux_hidden_state_layers = (
             self._resolve_eagle3_aux_hidden_state_layers
         )
+        if self.is_dspark:
+            # A DSpark draft has no output projection of its own and expects
+            # the target's under the name vLLM uses. Nothing fails without it:
+            # the draft keeps an unfilled head and drafts noise.
+            from atom.plugin.vllm.v41_draft_lm_head import attach_v41_target_lm_head
+
+            attach_v41_target_lm_head(self, model)
 
     def _resolve_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         # Following ATOM server mode, perfer the draft's configured IDs that

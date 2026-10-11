@@ -93,6 +93,12 @@ class BatchStep:
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
     # name -> what a step planner worked out on the host (`StepPlan.host`)
     planned_host: dict[str, object] = field(default_factory=dict)
+    # [requests] int32: the lowest position whose window row a request's
+    # queries may read. Zeros (the cache's fixed buffer, so a capture records
+    # one address) except on a bounded-replay tail step
+    # (`models.deepseek_v41.bounded_replay`), whose late layers wrote no
+    # window row below the tail (SGLang's `swa_replay_start`).
+    swa_replay_start: torch.Tensor | None = None
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.

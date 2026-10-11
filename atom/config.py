@@ -1955,6 +1955,10 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). On by default;
+    # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
+    enable_decoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -2671,6 +2675,10 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
+        # graphs (early + late layers) instead of one; both compile under the
+        # `backbone` tag, so the flag must key the artifacts.
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

@@ -364,28 +364,45 @@ def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
     )
 
 
-def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
-    """These two must be changed together or the pool is sized short.
+def test_the_pool_is_sized_from_the_speculation_that_is_admitted():
+    """The pool width and the gate have to agree, in both directions.
 
-    `v41_proxy_geometry` passes `speculative_tokens=0`, which is only correct
-    while speculative decoding is refused -- the slack it leaves out is real
-    pool bytes (`ring_slots` and `compress_ring_slots` both carry it). Whoever
-    lifts the refusal has to lift this too, and this test is what says so.
+    The slack a verify step needs is real pool bytes -- `ring_slots` and
+    `compress_ring_slots` both carry `speculative_tokens` -- so sizing from a
+    hardcoded zero was only safe while every speculative config was refused.
+    The predecessor of this test said exactly that and is what caught the
+    refusal being lifted without the width following it.
+
+    Now both move: the geometry reads vLLM's `num_speculative_tokens`, and the
+    gate admits DSpark alone. Asserted on the pair rather than on either half,
+    because a gate that admits a method the pool is not sized for is the
+    failure neither one shows on its own.
     """
-    import re
-    from pathlib import Path
+    config = _vllm_config()
+    # The gate reads `model_config.architectures`; the fixture only carries
+    # them on `hf_config`, which is where everything else in this file looks.
+    config.model_config.architectures = list(
+        config.model_config.hf_config.architectures
+    )
+    assert bridge.v41_speculative_tokens(config) == 0
 
-    src = Path("atom/plugin/vllm/deepseek_v41_bridge.py").read_text()
-    assert re.search(r"speculative_tokens=0", src), (
-        "v41_proxy_geometry no longer hardcodes speculative_tokens=0 -- if "
-        "speculative decoding is now supported, drop this test; if not, the "
-        "pool is being sized from an unverified source"
-    )
-    platform = Path("atom/plugin/vllm/platform.py").read_text()
-    assert "does not support speculative" in platform, (
-        "the hardcoded speculative_tokens=0 is only safe while the platform "
-        "refuses speculative decoding, and that refusal is gone"
-    )
+    spec = SimpleNamespace(num_speculative_tokens=5, method="dspark")
+    config.speculative_config = spec
+    assert bridge.v41_speculative_tokens(config) == 5
+
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=3, method="mtp")
+    with pytest.raises(ValueError, match="DSpark speculation only"):
+        atom_platform_module().enforce_deepseek_v41_constraints(config)
+
+    config.speculative_config = spec
+    # Admitted, and nothing else about the config refused along the way.
+    atom_platform_module().enforce_deepseek_v41_constraints(config)
+
+
+def atom_platform_module():
+    import importlib
+
+    return importlib.import_module("atom.plugin.vllm.platform")
 
 
 def test_the_proxy_backend_answers_block_sizes_with_or_without_a_spec():
