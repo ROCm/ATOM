@@ -72,6 +72,7 @@ from atom.kv_transfer.offload.mooncake_store.pool import (
     Slot,
     SlotPoolExhausted,
     TransferSlotPool,
+    pool_allocation_bytes,
 )
 from atom.kv_transfer.offload.mooncake_store.scheduler import (
     monotonic_clock_id,
@@ -181,6 +182,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._source_read_window_s = timeout - min(
             _MAX_SOURCE_READ_MARGIN_S, timeout / 5
         )
+
+    @classmethod
+    def kv_budget_reserve_bytes(cls, config: Any) -> int:
+        """The transfer slot pool, which `register_kv_caches` allocates in HBM."""
+        kvc = getattr(config, "kv_transfer_config", {}) or {}
+        cfg = parse_mooncake_store_config(kvc)
+        return pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
 
     def close(self) -> None:
         """Join the executors, then release the GPU connector, pool and client."""

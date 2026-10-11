@@ -72,6 +72,16 @@ def _round_up(value: int, multiple: int) -> int:
     return -(-int(value) // multiple) * multiple
 
 
+def pool_allocation_bytes(save_bytes: int, load_bytes: int) -> int:
+    """The GPU bytes a pool of these regions allocates, whatever its chunk size.
+
+    Both regions whole, and room to put the base on a huge page. The worker
+    reserves exactly this from the KV budget before the KV cache is sized,
+    when no chunk size is known yet (``kv_budget_reserve_bytes``).
+    """
+    return int(save_bytes) + int(load_bytes) + _BASE_ALIGN
+
+
 class TransferSlotPool:
     """Chunk slots of one registered allocation, handed out per transfer window.
 
@@ -111,8 +121,12 @@ class TransferSlotPool:
                 )
         self._capacity = capacity
         self.nbytes = (capacity["save"] + capacity["load"]) * self.slot_stride
+        # The slots use `nbytes` of it; the rest of a region short of a whole
+        # slot stays unused.
         backing = torch.empty(
-            (self.nbytes + _BASE_ALIGN,), dtype=torch.uint8, device=self.device
+            (pool_allocation_bytes(save_bytes, load_bytes),),
+            dtype=torch.uint8,
+            device=self.device,
         )
         offset = (-int(backing.data_ptr())) % _BASE_ALIGN
         self._backing = backing

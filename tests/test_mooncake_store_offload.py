@@ -3093,6 +3093,41 @@ def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
     assert store.closed and store.registered == {}
 
 
+def test_the_kv_budget_holds_back_the_transfer_pool_it_allocates(cluster, one_rank):
+    config = _config(extra=_extra(save_pool_mib=3, load_pool_mib=5))
+    # Asked through the factory, before any connector exists, as the model
+    # runner sizes the KV cache: both regions and the base's alignment.
+    reserve = KVConnectorFactory.kv_budget_reserve_bytes(config)
+    assert reserve == (3 + 5) * (1 << 20) + (2 << 20)
+    # Beside a P/D connector that reserves nothing, under `multi`, as
+    # ATOM_KV_OFFLOAD composes it.
+    multi = copy.copy(config)
+    multi.kv_transfer_config = {
+        "kv_connector": "multi",
+        "connectors": [{"kv_connector": "pool_free"}, config.kv_transfer_config],
+    }
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(
+            KVConnectorFactory._registry,
+            "pool_free",
+            {
+                "worker_module": "atom.kv_transfer.disaggregation.base",
+                "worker_class": "KVConnectorBase",
+                "scheduler_module": "atom.kv_transfer.disaggregation.base",
+                "scheduler_class": "KVConnectorSchedulerBase",
+            },
+        )
+        patch.setitem(KVConnectorFactory._aliases, "pool_free", "pool_free")
+        assert KVConnectorFactory.kv_budget_reserve_bytes(multi) == reserve
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        # What registration allocates is what was held back.
+        assert worker._pool._backing.numel() == reserve
+    finally:
+        worker.close()
+
+
 def test_a_failed_probe_stops_startup_and_releases_the_pool(cluster, one_rank):
     cluster.silent_gets = True
     worker = MooncakeStoreOffloadConnector(_registering_config())

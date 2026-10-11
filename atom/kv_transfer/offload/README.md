@@ -600,10 +600,10 @@ this worker config.
 - **Leases and timeouts.** A read lease lasts 10 s (`--default_kv_lease_ttl`);
   a get that completes later returns `LEASE_EXPIRED` and fails its load. Every
   transfer batch waits at most 60 s, hard-coded in Mooncake.
-- **HBM.** The pool (1.25 GiB per worker by default) is allocated after the KV
-  cache and is not held back from the KV budget: it comes out of the headroom
-  `--gpu-memory-utilization` leaves. `MC_MAX_MR_SIZE=1 GiB` splits its
-  registration into 1 GiB regions.
+- **HBM.** The pool (1.25 GiB per worker by default, plus 2 MiB to align it)
+  is allocated after the KV cache, and the model runner holds exactly that
+  back from the KV budget (`kv_budget_reserve_bytes`).
+  `MC_MAX_MR_SIZE=1 GiB` splits its registration into 1 GiB regions.
 - **Store contents outlive the server.** The namespace covers the layout and
   the revision an HF config names, not the bytes of local weights: restart
   the Store (or `remove_all`) after changing weights under the same model
