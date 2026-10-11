@@ -624,12 +624,31 @@ def test_stages_silent_past_their_window_fail_the_request(first):
     dest.recv._requests["r"].stages[0].window_end = now - 1
     dest.recv.sweep()
     assert dest.finished == [("r", True)]
-    assert "r" not in dest.recv._requests
-    # The silent stage's late messages change nothing.
+    # Still tracked: the silent stage's late messages return its slots, once,
+    # and are never scattered.
     dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
-    assert dest.recv.stage_done("r", 0, 5, True, [s0[0]])
     assert dest.recv._queue.empty()
-    assert dest.credits() == []
+    assert dest.credits() == [("stage0", [s0[0]])]
+    assert dest.recv.stage_done("r", 0, 5, True, [s0[0], s0[1]])
+    assert dest.credits() == [("stage0", [s0[1]])]  # its READY never came
+    if first == "none":
+        assert dest.recv.stage_done("r", 1, 5, True, [])
+    assert "r" not in dest.recv._requests
+    assert dest.finished == [("r", True)]  # reported once
+
+
+def test_an_expired_request_is_dropped_once_its_silent_stage_is_given_up():
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    assert dest.recv.stage_acked("r", 0, 5, time.monotonic() - 1)
+    dest.recv.sweep()
+    assert dest.finished == [("r", True)] and "r" in dest.recv._requests
+    dest.recv._requests["r"].expired_at -= 601
+    dest.recv.sweep()
+    assert "r" not in dest.recv._requests
+    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
+    assert dest.credits() == []  # dropped like any retired request's READY
     assert dest.finished == [("r", True)]
 
 

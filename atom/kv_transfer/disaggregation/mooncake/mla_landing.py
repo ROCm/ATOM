@@ -281,8 +281,13 @@ class _Request:
     started_at: float
     pending: int = 0
     failed: bool = False
-    # Failed once its silent stages overran their windows: settles without them.
+    # Failed once its silent stages overran their windows (at ``expired_at``):
+    # reported without waiting for them, once nothing is pending.
     expired: bool = False
+    expired_at: float = 0.0
+    # The connector has heard the outcome; still tracked while a stage that
+    # may yet report holds slots, so its late messages return them.
+    reported: bool = False
     stall_logged: bool = False
 
 
@@ -736,17 +741,31 @@ class LandingReceiver:
         now = time.monotonic()
         stalled: list[tuple[str, float, list[int]]] = []
         expired: list[tuple[str, list[int]]] = []
+        abandoned: list[tuple[str, list[int]]] = []
         outcomes: list[tuple[str, bool]] = []
         with self._lock:
             for req_id, request in list(self._requests.items()):
                 if request.expired:
-                    continue  # a scatter still runs; _complete settles it
+                    # Reported, or waiting for a scatter (_complete settles it).
+                    # A stage still silent this long after has died or lost its
+                    # messages: whatever slots it holds stay in flight.
+                    if request.reported and now - request.expired_at > (
+                        _TOMBSTONE_TTL_S
+                    ):
+                        self._retire_locked(req_id, request)
+                        abandoned.append(
+                            (
+                                req_id,
+                                [pp for pp, s in request.stages.items() if not s.done],
+                            )
+                        )
+                    continue
                 silent = {pp: s for pp, s in request.stages.items() if not s.done}
                 if silent and all(
                     s.window_end is not None and s.window_end < now
                     for s in silent.values()
                 ):
-                    request.expired = True
+                    request.expired, request.expired_at = True, now
                     self._fail_locked(request)
                     expired.append((req_id, list(silent)))
                     outcome = self._settle_locked(req_id, request)
@@ -784,6 +803,13 @@ class LandingReceiver:
             logger.error(
                 "[PD-LANDING] req %s: stage(s) %s acknowledged it but sent no "
                 "write-done within their write window; failing it",
+                req_id,
+                silent,
+            )
+        for req_id, silent in abandoned:
+            logger.error(
+                "[PD-LANDING] req %s: stage(s) %s never reported after it "
+                "failed; the landing slots they hold stay out of use",
                 req_id,
                 silent,
             )
@@ -991,16 +1017,27 @@ class LandingReceiver:
         request.failed = True
 
     def _settle_locked(self, req_id: str, request: _Request) -> bool | None:
-        """Retire the request once nothing is pending and every stage ended.
+        """Report and retire the request when it is ready; the outcome to report.
 
-        An expired request does not wait for its silent stages. Returns
-        whether it failed, or None if it is still open.
+        A request is reported once nothing is pending and every stage ended,
+        or, expired, once nothing is pending. An expired request stays
+        tracked until its silent stages end too, so their late READYs and
+        write-done still return the slots they name, the way they would for
+        a request still open. Returns whether it failed when the connector
+        is to hear of it now, else None.
         """
         if request.pending:
             return None
-        if not request.expired and not all(s.done for s in request.stages.values()):
+        ended = all(s.done for s in request.stages.values())
+        if request.reported:
+            if ended:
+                self._retire_locked(req_id, request)
             return None
-        self._retire_locked(req_id, request)
+        if not (ended or request.expired):
+            return None
+        request.reported = True
+        if ended:
+            self._retire_locked(req_id, request)
         return request.failed
 
     def _retire_locked(self, req_id: str, request: _Request) -> None:
