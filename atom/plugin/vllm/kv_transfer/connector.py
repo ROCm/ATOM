@@ -33,6 +33,7 @@ reports a load finished once both halves have landed.
 """
 
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -202,6 +203,47 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
         )
 
 
+def _refuse_v41_speculation_with_offload(vllm_config) -> None:
+    """Refuse V4.1 speculative decoding alongside this connector, for now.
+
+    The plugin used to refuse every KV connector for V4.1 and then, later,
+    every speculative method; both refusals have since been lifted
+    independently -- DSpark is admitted, and this connector is how V4.1 gets
+    prefix caching at all -- so the combination is now reachable without
+    anyone having run it.
+
+    It is not a small combination. `speculative_tokens` moves both
+    `page_bytes` and `state_bytes`, so every registered plane changes size;
+    the boundary machinery reads a frontier that, with drafts, can move
+    backwards when a verify rejects them; and `wait_for_save` already has to
+    sequence V4.1's snapshot against `postprocess_mamba`. Any of those going
+    wrong shows up as a stale cursor -- an engine death -- or, worse, as a
+    prefix restored over the wrong state.
+
+    So it is refused at construction, where the message can say what to do,
+    rather than left to fail at the first boundary. The geometry itself is
+    consistent (both halves size the pool through `ensure_v41_proxy_bound`);
+    what is missing is a measurement, and this is here to be deleted by
+    whoever takes it.
+    """
+    if os.environ.get("ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD") in ("1", "true", "True"):
+        return
+    from atom.plugin.vllm.deepseek_v41_bridge import v41_speculative_tokens
+
+    n = int(v41_speculative_tokens(vllm_config) or 0)
+    if n <= 0:
+        return
+    raise ValueError(
+        "DeepSeek-V4.1: AtomLMCacheOffloadConnector has not been run with "
+        f"speculative decoding ({n} draft tokens). Both are supported alone "
+        "and the pair is unmeasured: drafts change every plane's size and let "
+        "a request's frontier move backwards, which this connector's boundary "
+        "machinery has never seen. Drop --speculative-config, drop the "
+        "connector, or set ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1 to run it "
+        "knowing that."
+    )
+
+
 class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     """Drives ``atom.kv_transfer.offload`` from vLLM's connector API.
 
@@ -292,6 +334,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
 
         self._is_deepseek_v41 = is_deepseek_v41_vllm_config(vllm_config)
+        if self._is_deepseek_v41:
+            _refuse_v41_speculation_with_offload(vllm_config)
         # Worker half of the recurrent leg.
         self._kda_tier = None
         # Set only when the state rides the PAGE object; the own-pool codec

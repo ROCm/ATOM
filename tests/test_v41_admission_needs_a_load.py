@@ -108,3 +108,45 @@ def test_every_admitted_boundary_either_loads_or_refuses(boundary):
         planner.refuse_admission(request, (3,))
     (load,) = planner.take_loads()
     assert load.req_id == "r0"
+
+
+def test_speculation_and_this_connector_are_refused_together():
+    """Both are supported alone; the pair has never been run.
+
+    The plugin once refused every KV connector for V4.1, and separately every
+    speculative method. Both refusals were lifted independently -- DSpark is
+    admitted, and this connector is how V4.1 gets prefix caching at all -- so
+    the combination became reachable with nobody having measured it. Drafts
+    resize every registered plane and let a frontier move backwards, which is
+    precisely what the boundary machinery assumes cannot happen.
+    """
+    import atom.plugin.vllm.kv_transfer.connector as conn
+
+    cfg = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=3)
+    )
+    with pytest.raises(ValueError, match="has not been run with"):
+        conn._refuse_v41_speculation_with_offload(cfg)
+
+
+def test_no_speculation_is_not_refused():
+    """The positive control: the guard must not refuse the measured path."""
+    import atom.plugin.vllm.kv_transfer.connector as conn
+
+    conn._refuse_v41_speculation_with_offload(SimpleNamespace(speculative_config=None))
+
+
+def test_the_refusal_can_be_overridden_on_purpose():
+    """Whoever measures it needs a way in that is not editing this file."""
+    import os
+
+    import atom.plugin.vllm.kv_transfer.connector as conn
+
+    cfg = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=3)
+    )
+    os.environ["ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD"] = "1"
+    try:
+        conn._refuse_v41_speculation_with_offload(cfg)
+    finally:
+        del os.environ["ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD"]

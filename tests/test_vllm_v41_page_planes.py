@@ -207,28 +207,39 @@ def test_the_state_tier_derives_its_size_and_identity_from_the_geometry():
     assert views.layout_id == cache.geometry.layout_id
 
 
-def test_the_bridge_sizes_the_pool_for_no_speculation_and_refuses_it():
-    """These two must be changed together or the pool is sized short.
+def test_the_pool_and_the_offload_leg_size_speculation_from_one_source():
+    """The invariant the old `speculative_tokens=0` assertion stood in for.
 
-    `v41_proxy_geometry` passes `speculative_tokens=0`, which is only correct
-    while speculative decoding is refused -- the slack it leaves out is real
-    pool bytes. Whoever lifts the refusal has to lift this too, and this test
-    is what says so.
+    That assertion said the bridge hardcoded zero drafts, which was only safe
+    while the platform refused speculative decoding. The platform now admits
+    DSpark, so the hardcode is gone and the test that guarded it would only
+    be noise. What still has to hold is that nobody sizes these bytes from a
+    second opinion: `speculative_tokens` moves both `page_bytes` and
+    `state_bytes`, so a bridge and an offload leg that disagree about it
+    disagree about every plane.
+
+    Checked at the source, because the two halves run in different processes
+    and no single call exercises both.
     """
     import re
 
     with open("atom/plugin/vllm/deepseek_v41_bridge.py") as handle:
-        src = handle.read()
-    assert re.search(r"speculative_tokens=0", src), (
-        "v41_proxy_geometry no longer hardcodes speculative_tokens=0 -- if "
-        "speculative decoding is now supported, drop this test; if not, the "
-        "pool is being sized from an unverified source"
+        bridge = handle.read()
+    assert re.search(r"speculative_tokens=v41_speculative_tokens\(", bridge), (
+        "the proxy pool no longer sizes its speculative slack through "
+        "v41_speculative_tokens; if it has a new source, the offload leg "
+        "needs the same one"
     )
-    with open("atom/plugin/vllm/platform.py") as handle:
-        platform = handle.read()
-    assert "does not support speculative" in platform, (
-        "the hardcoded speculative_tokens=0 is only safe while the platform "
-        "refuses speculative decoding, and that refusal is gone"
+    with open("atom/plugin/vllm/kv_transfer/connector.py") as handle:
+        conn = handle.read()
+    assert "ensure_v41_proxy_bound" in conn, (
+        "the offload leg no longer takes its geometry from the bound proxy "
+        "pool, so it is free to disagree with the bridge about plane sizes"
+    )
+    assert not re.search(r"build_v41_pool_geometry\(", conn), (
+        "the offload leg builds its own geometry instead of reading the "
+        "bound one -- a second opinion about speculative_tokens is exactly "
+        "how the planes stop matching"
     )
 
 
