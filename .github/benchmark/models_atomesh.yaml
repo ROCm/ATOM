@@ -879,7 +879,7 @@ models:
       served_model_name: Kimi-K3
       source:
         repo: https://github.com/whx-sjtu/vllm
-        sha: bacbbe187885db62859f5a4a1443f8ec3006e987
+        sha: 5b6b28a93b1df3e1a33030de78774e3240476fce
       mooncake:
         enabled: 1
         global_segment_size: 224.875GB
