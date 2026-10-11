@@ -91,9 +91,20 @@ cancel_diagnostic() {
   done < <(timeout 15s squeue --noheader --format='%i|%j')
 }
 trap cancel_diagnostic EXIT
+run_rc=0
 timeout --kill-after=20s 21000s srun --job-name "${name}" \
   --account amd-frameworks --partition amd-spur --qos amd-frameworks-qos \
   --exclusive --nodes 1 --ntasks 1 --cpus-per-task 16 --gpus 8 \
   --time 00:20:00 --nodelist "${nodes}" \
   bash "${script_dir}/pd_mooncake_store_smoke.sh" --worker "${image}" "${output}" \
-  > "${output}/slurm.log" 2>&1
+  > "${output}/slurm.log" 2>&1 || run_rc=$?
+printf '%s\n' "${run_rc}" > "${output}/srun.rc"
+if [[ -f "${output}/job.txt" ]] &&
+    grep -Fq "JobName=${name}" "${output}/job.txt"; then
+  job_id="$(sed -n 's/^JobId=\([0-9][0-9]*\) .*/\1/p' "${output}/job.txt")"
+  if [[ "${job_id}" =~ ^[0-9]+$ ]]; then
+    timeout 15s scontrol show job "${job_id}" \
+      > "${output}/job-after-srun.txt" 2>&1 || true
+  fi
+fi
+exit "${run_rc}"
