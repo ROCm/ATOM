@@ -1188,6 +1188,7 @@ def qsa_select_paged_tokens(
     max_seq_len: int | None = None,
     allow_flydsl: bool = False,
     index_cp: tuple[int, int, object] | None = None,
+    allow_shortcut: bool = False,
 ) -> torch.Tensor:
     """Score, select and expand in one call.
 
@@ -1239,6 +1240,36 @@ def qsa_select_paged_tokens(
         out = out[:, :output_width]
     if rows == 0:
         return out
+
+    # At or below the sparse budget, stable top-k keeps every complete group
+    # in logical order and the expansion appends the incomplete causal tail.
+    # The served gfx950 decode can write that exact selection in one launch.
+    if (
+        allow_shortcut
+        and index_cp is None
+        and max_seq_len is not None
+        and 0 <= max_seq_len <= token_topk
+        and columns * compress_ratio >= max_seq_len
+        and query_positions.shape == (rows,)
+        and query_positions.dtype == torch.int64
+        and query_positions.is_contiguous()
+        and token_to_request.shape == (rows,)
+        and token_to_request.dtype == torch.int32
+        and token_to_request.is_contiguous()
+        and context_lens.shape == (page_table.shape[0],)
+        and context_lens.dtype == torch.int32
+        and context_lens.is_contiguous()
+        and context_lens.numel() > 0
+        and out.dtype == torch.int32
+        and out.is_contiguous()
+        and getattr(
+            torch.cuda.get_device_properties(q.device), "gcnArchName", ""
+        ).split(":")[0]
+        == "gfx950"
+    ):
+        from atom.model_ops.qwen4_exp.ops.qsa_short_flydsl import select_all_visible
+
+        return select_all_visible(query_positions, token_to_request, context_lens, out)
 
     if index_cp is not None:
         rank, world, group = index_cp

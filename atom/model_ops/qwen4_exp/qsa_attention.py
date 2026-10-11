@@ -57,6 +57,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_sparse_paged_gqa,
     qsa_store_rows,
 )
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -372,6 +373,9 @@ class Qwen4ExpAttention(nn.Module):
             max_seq_len=qsa.max_seq_len,
             allow_flydsl=forward_context.context.is_prefill,
             index_cp=index_cp,
+            allow_shortcut=(
+                envs.ATOM_QWEN38_QSA_SHORT and not forward_context.context.is_prefill
+            ),
         )
 
     def forward(

@@ -32,7 +32,7 @@ def decode_device_supported(device):
         torch.version.hip is not None
         and device.type == "cuda"
         and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-        == "gfx942"
+        in ("gfx942", "gfx950")
     )
 
 

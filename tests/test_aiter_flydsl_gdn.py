@@ -1,4 +1,4 @@
-"""Real MI308 numerical tests against ATOM's original GDN pipeline."""
+"""ROCm numerical tests against ATOM's original GDN pipeline."""
 
 import pytest
 import torch
@@ -14,9 +14,10 @@ from atom.model_ops.fla_ops.chunk import (
 )
 from atom.model_ops.fla_ops.fused_recurrent import fused_recurrent_gated_delta_rule
 
-requires_gfx942 = pytest.mark.skipif(
-    torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx942",
-    reason="FlyDSL GDN decode is supported only on gfx942",
+requires_gdn_decode_arch = pytest.mark.skipif(
+    torch.cuda.get_device_properties().gcnArchName.split(":")[0]
+    not in ("gfx942", "gfx950"),
+    reason="FlyDSL GDN decode needs gfx942 or gfx950",
 )
 
 
@@ -147,7 +148,7 @@ def baseline_decode(q, k, v, a, b, state, log, bias, reads, writes):
 
 
 @pytest.mark.parametrize("batch", [1, 3, 4, 16, 64, 128])
-@requires_gfx942
+@requires_gdn_decode_arch
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("physical_vk", [True])
 def test_decode(batch, state_dtype, physical_vk):
@@ -168,7 +169,7 @@ def test_decode(batch, state_dtype, physical_vk):
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("physical_vk", [True])
-@requires_gfx942
+@requires_gdn_decode_arch
 def test_decode_graph_mixed_padding(state_dtype, physical_vk):
     q, k, v, a, b, log, bias = inputs(4)
     original = torch.randn(8, 24, 128, 128, device="cuda", dtype=state_dtype) * 0.1
@@ -289,7 +290,7 @@ def test_qwen_backend_binds_zero_copy_vk_state(
         assert result.v_cache is raw
 
 
-@requires_gfx942
+@requires_gdn_decode_arch
 def test_align_flydsl_decode_accepts_strided_and_padded_indices():
     q, k, v, a, b, log, bias = inputs(4)
     state = torch.randn(8, 24, 128, 128, device="cuda", dtype=torch.float32)
@@ -323,7 +324,7 @@ def test_unsupported_device_decode_fallback(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda device: SimpleNamespace(gcnArchName="gfx950"),
+        lambda device: SimpleNamespace(gcnArchName="gfx900"),
     )
     assert not fly.decode_supported(q, k, v, a, b, vk, log, bias, reads, writes)
     with pytest.raises(ValueError, match="Unsupported"):
@@ -368,7 +369,7 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
     from atom.utils import envs
 
     if mode == "flydsl" and not fly.decode_device_supported(torch.device("cuda")):
-        pytest.skip("FlyDSL decode numerical coverage requires gfx942")
+        pytest.skip("FlyDSL decode numerical coverage needs gfx942 or gfx950")
     q, k, v, a, b, log, bias = inputs(3)
     raw = torch.randn(3, 24, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.1
     reference = raw.clone()

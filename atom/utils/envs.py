@@ -413,6 +413,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Compute-only QSA index context partition over TP2/TP4. The K/V cache and
     # sparse attention remain TP-owned; only compressed-key scoring is split.
     "ATOM_QWEN38_QSA_CP": lambda: os.getenv("ATOM_QWEN38_QSA_CP", "0") == "1",
+    # Gfx950 decode: when every visible QSA group fits the 2048-token budget,
+    # emit all logical token ids directly in one FlyDSL launch.
+    "ATOM_QWEN38_QSA_SHORT": lambda: os.getenv("ATOM_QWEN38_QSA_SHORT", "0") == "1",
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
