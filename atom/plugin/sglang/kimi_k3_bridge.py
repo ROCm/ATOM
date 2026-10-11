@@ -618,6 +618,14 @@ def build_kimi_k3_attention_metadata(
         metadata.dtype_q = dtype_q
         return _attach_sglang_mla_metadata(metadata)
 
+    num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+    real_bs = max(bs - num_padding, 0)
+    if num_padding > 0:
+        # Graph / DP padding rows arrive as seq_len=1 with out_cache_loc on
+        # request 0. Zero the length and invalidate the write slot in place
+        # on the tensors this metadata publishes.
+        seq_lens = seq_lens.clone()
+        seq_lens[real_bs:].zero_()
     max_seq_len = (
         int(req_to_token_pool.req_to_token.shape[1])
         if _is_stream_capturing()
@@ -635,6 +643,9 @@ def build_kimi_k3_attention_metadata(
         max_seq_len=max_seq_len,
     )
     slot_mapping = forward_batch.out_cache_loc[:bs]
+    if num_padding > 0 and torch.is_tensor(slot_mapping):
+        slot_mapping = slot_mapping.clone()
+        slot_mapping[real_bs:].fill_(-1)
     metadata = AttentionMetaData(
         cu_seqlens_q=torch.arange(
             0, bs + 1, dtype=torch.int32, device=positions.device

@@ -88,7 +88,6 @@ def install_upstream_glm52_graph_metadata_adapter() -> None:
             req_to_token_pool=self.req_to_token_pool,
             atom_config=atom_config,
             use_positions=True,
-            in_capture=in_capture,
         )
         batch_size = int(forward_batch.batch_size)
         fixed_by_bs = getattr(
@@ -216,8 +215,6 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
         self,
         forward_batch,
         positions,
-        *,
-        in_capture: bool = False,
     ):
         from atom.config import get_current_atom_config
         from atom.plugin.sglang.glm52_dsa_bridge import (
@@ -231,7 +228,6 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             req_to_token_pool=self.req_to_token_pool,
             atom_config=get_current_atom_config(),
             use_positions=True,
-            in_capture=in_capture,
         )
 
     def _publish_target_verify_graph_metadata(self, forward_batch, metadata):
@@ -307,13 +303,16 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
 
             bs = int(forward_batch.batch_size)
             if in_capture:
-                positions = torch.repeat_interleave(
-                    forward_batch.seq_lens[:bs].to(torch.int64) - draft_token_num,
-                    draft_token_num,
-                ) + torch.arange(
-                    draft_token_num, dtype=torch.int64, device=self.device
-                ).repeat(
-                    bs
+                # Size capture storage to the graph context capacity. Replay
+                # writes the real short verify lengths into the same tensors.
+                prefix_len = GLM52_GRAPH_SEQ_LEN_CAPACITY - draft_token_num
+                positions = (
+                    torch.arange(
+                        draft_token_num,
+                        dtype=torch.int64,
+                        device=self.device,
+                    ).repeat(bs)
+                    + prefix_len
                 )
                 metadata_batch = SimpleNamespace(
                     forward_mode=forward_mode,
@@ -331,7 +330,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                     spec_info=SimpleNamespace(draft_token_num=draft_token_num),
                 )
                 fixed = self._build_target_verify_graph_metadata(
-                    metadata_batch, positions, in_capture=True
+                    metadata_batch, positions
                 )
                 self._target_verify_graph_metadata[bs] = fixed
                 return self._publish_target_verify_graph_metadata(metadata_batch, fixed)
@@ -398,13 +397,14 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                     "GLM target-verify graph capture requires draft_token_num"
                 )
             seq_lens_cpu = seq_lens.detach().cpu()
-            positions = torch.repeat_interleave(
-                seq_lens.to(torch.int64) - draft_token_num,
-                draft_token_num,
-            ) + torch.arange(
-                draft_token_num, dtype=torch.int64, device=self.device
-            ).repeat(
-                int(bs)
+            prefix_len = GLM52_GRAPH_SEQ_LEN_CAPACITY - draft_token_num
+            positions = (
+                torch.arange(
+                    draft_token_num,
+                    dtype=torch.int64,
+                    device=self.device,
+                ).repeat(int(bs))
+                + prefix_len
             )
             forward_batch = SimpleNamespace(
                 forward_mode=forward_mode,
@@ -422,7 +422,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                 spec_info=SimpleNamespace(draft_token_num=draft_token_num),
             )
             metadata = self._build_target_verify_graph_metadata(
-                forward_batch, positions, in_capture=True
+                forward_batch, positions
             )
             self._target_verify_graph_metadata[int(bs)] = metadata
             return self._publish_target_verify_graph_metadata(forward_batch, metadata)

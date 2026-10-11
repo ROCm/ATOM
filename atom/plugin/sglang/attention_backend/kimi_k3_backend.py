@@ -94,7 +94,12 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
         token_pool, req_pool = self._kimi_pools()
         page_size = int(token_pool.page_size)
         max_blocks = self._kimi_graph_block_tables.shape[1]
+        num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+        real_bs = max(bs - num_padding, 0)
         self._kimi_graph_context_lens[:bs].copy_(forward_batch.seq_lens[:bs])
+        if num_padding > 0:
+            # Padded graph lanes must not keep the fill seq_len=1 on request 0.
+            self._kimi_graph_context_lens[real_bs:bs].zero_()
         req_indices = forward_batch.req_pool_indices[:bs]
         token_table = req_pool.req_to_token[req_indices, : max_blocks * page_size]
         self._kimi_graph_block_tables[:bs].copy_(
@@ -109,11 +114,11 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
                     f"bucket: slots={num_real_tokens}, bucket_bs={bs}"
                 )
             # SGLang pads graph decode batches but keeps out_cache_loc compact.
-            # Route padded lanes to slot 0, matching its native graph backends.
-            self._kimi_graph_slot_mapping[:bs].zero_()
+            # Mark padded write slots as invalid so they cannot alias request 0.
+            self._kimi_graph_slot_mapping[:bs].fill_(-1)
             self._kimi_graph_slot_mapping[:num_real_tokens].copy_(out_cache_loc)
         else:
-            self._kimi_graph_slot_mapping[:bs].zero_()
+            self._kimi_graph_slot_mapping[:bs].fill_(-1)
 
         metadata = AttentionMetaData(
             cu_seqlens_q=self._kimi_graph_cu_seqlens_q[: bs + 1],
