@@ -227,6 +227,19 @@ class _Task:
     items: np.ndarray
 
 
+def _ready_index(value) -> int:
+    """A READY's ``slot`` or ``seq``: a non-negative int, else ``ValueError``.
+
+    The listener drops a READY that raises here as unreadable, and its stage's
+    write-done then counts it lost. A negative ``seq`` must never get further:
+    ``stage_done`` reads ``landed_slots[seq]``, which would index from the end
+    and match another READY's slot.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"landing READY index {value!r} is not a non-negative int")
+    return value
+
+
 def _ready_items(data: dict) -> np.ndarray | None:
     """A READY's items as an int64 ``(n, 4)`` array, n >= 1; None if malformed."""
     try:
@@ -426,8 +439,8 @@ class LandingReceiver:
         req_id = data["request_id"]
         nonce = data.get("write_nonce", 0)
         pp_rank = data.get("pp_rank", 0)
-        slot = int(data["slot"])
-        seq = int(data["seq"])
+        slot = _ready_index(data["slot"])
+        seq = _ready_index(data["seq"])
         # Malformed items fail only their request (below), never the listener
         # thread or the scatter batch.
         items = _ready_items(data)
@@ -534,7 +547,7 @@ class LandingReceiver:
         READYs that arrived, fails the request and returns nothing.
         """
         outcome = None
-        lost: list[int] = []
+        lost: dict[int, int] = {}
         with self._lock:
             request = self._requests.get(req_id)
             if request is None:
@@ -547,7 +560,8 @@ class LandingReceiver:
             stage = request.stages.get(pp_rank)
             if stage is None or stage.done:
                 return True
-            stage.done = True
+            # Every check runs before the stage ends, so none can leave it
+            # ended with the request unsettled.
             if landed_slots is not None and not (
                 isinstance(landed_slots, list)
                 and all(
@@ -578,12 +592,15 @@ class LandingReceiver:
                 )
                 success = False
             elif landed_slots:
-                for seq, slot in enumerate(landed_slots):
-                    if seq not in stage.seen:
-                        # Returned here: its READY, if a reconnect reordered
-                        # it behind this write-done, is then a duplicate.
-                        stage.seen[seq] = slot
-                        lost.append(slot)
+                lost = {
+                    seq: slot
+                    for seq, slot in enumerate(landed_slots)
+                    if seq not in stage.seen
+                }
+            stage.done = True
+            # Returned here: a lost READY that a reconnect reordered behind
+            # this write-done is then a duplicate.
+            stage.seen.update(lost)
             if not success:
                 self._fail_locked(request)
             elif lost:
@@ -598,7 +615,7 @@ class LandingReceiver:
                 self._fail_locked(request)
             outcome = self._settle_locked(req_id, request)
         if lost:
-            self._send_credits(stage.stage_addr, lost)
+            self._send_credits(stage.stage_addr, list(lost.values()))
         if outcome is not None:
             self._finish(req_id, outcome)
         return True

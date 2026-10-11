@@ -355,6 +355,37 @@ def test_a_ready_after_its_request_retired_returns_nothing():
     assert dest.credits() == []
 
 
+@pytest.mark.parametrize("seq", [-1, True, 1.0, "0"])
+def test_a_ready_with_a_bad_seq_counts_as_lost(seq):
+    # A negative seq used to index landed_slots from the end: it matched the
+    # write-done's slot for seq 0, which was then returned as lost while the
+    # queued scatter returned it again. Now the READY is unreadable (the
+    # listener drops it) and the write-done returns its slot once.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    with pytest.raises(ValueError):
+        dest.recv.on_ready(_ready("r", s0[0], seq, [[0, 0, 1, 0]]))
+    assert dest.recv._queue.empty()
+    dest.recv.stage_done("r", 0, 5, True, [s0[0]])
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == [("stage0", [s0[0]])]
+
+
+def test_a_dropped_ready_does_not_stop_its_request_settling():
+    # With landed_slots=[] the negative seq used to raise IndexError after
+    # the stage was marked done, so every retried write-done was ignored and
+    # the request never settled.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    with pytest.raises(ValueError):
+        dest.recv.on_ready(_ready("r", s0[0], -1, [[0, 0, 1, 0]]))
+    dest.recv.stage_done("r", 0, 5, True, [])
+    assert dest.finished == [("r", False)]  # the write-done names no slot
+    assert dest.credits() == []
+
+
 @pytest.mark.parametrize(
     "landed", [5, [[1]], "ab", [None]], ids=["int", "nested", "string", "none-slot"]
 )
