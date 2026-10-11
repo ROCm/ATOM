@@ -75,10 +75,14 @@ def _kpool_write_completed_pools(
         )
         from_tail = abs_slot < chunk_start[req_idx][:, None]
         read_slots = state_slot_idx if state_slot_idx_in is None else state_slot_idx_in
-        safe_slots = read_slots[req_idx].clamp_min(0)
-        stash = tail_cache[safe_slots]
-        pool_k = torch.where(from_tail[..., None], stash[:, 0], pool_k)
-        pool_gate = torch.where(from_tail[..., None], stash[:, 1], pool_gate)
+        safe_slots = read_slots[req_idx].clamp_min(0)[:, None]
+        rows = abs_slot.clamp_min(0) % tail_cache.shape[2]
+        pool_k = torch.where(
+            from_tail[..., None], tail_cache[safe_slots, 0, rows], pool_k
+        )
+        pool_gate = torch.where(
+            from_tail[..., None], tail_cache[safe_slots, 1, rows], pool_gate
+        )
 
     pooled = kpool.pool_and_rotate(pool_k, pool_gate, compress_ape)
     abs_pos = positions.to(torch.int64)

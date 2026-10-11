@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import dcp_persistent_supported
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS, mla_dcp_kernel_num_heads
+from atom.model_ops.glm5_next import geometry as kpool_geometry
 from atom.plugin.vllm.attention.layer_mla import (
     disabled_mla_persistent_metadata,
     mla_fold_kv_metadata_triton,
@@ -413,6 +414,7 @@ class AiterMlaSparseMetadataForVllm:
     reduce_indptr: torch.Tensor | None = None
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
+    kpool: object | None = None
 
 
 @dataclass
@@ -2151,6 +2153,15 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         return attn_metadata
 
 
+def sparse_selection_counts(
+    causal_lens: torch.Tensor, index_topk: int, index_kpool: int
+) -> torch.Tensor:
+    if index_kpool <= 1:
+        return torch.clamp(causal_lens, max=index_topk)
+    pooled = torch.clamp(causal_lens // index_kpool, max=index_topk // index_kpool)
+    return pooled * index_kpool + causal_lens % index_kpool
+
+
 class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
     """vLLM-only metadata builder for sparse MLA main attention."""
 
@@ -2187,7 +2198,15 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = config.model_config.hf_config.index_topk
+        text_config = self.model_config.hf_text_config
+        self.index_topk = int(text_config.index_topk)
+        self.index_kpool = kpool_geometry.effective_kpool_size(
+            int(getattr(text_config, "index_kpool", 1) or 1)
+        )
+        self.topk_tokens = kpool_geometry.topk_output_width(
+            self.index_topk, self.index_kpool
+        )
+        self._kpool_tail_store = None
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2391,9 +2410,10 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             query_lens,
             seq_lens,
             common_attn_metadata.query_start_loc,
-            self.topk_tokens,
+            self.index_topk,
             num_tokens,
             common_attn_metadata.max_query_len,
+            index_kpool=self.index_kpool,
         )
         torch.cumsum(
             sparse_seqlen,
@@ -2444,13 +2464,13 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
             if seq_lens_cpu is None:
                 seq_lens_cpu = seq_lens.cpu()
-            clamped_seq_lens = torch.clamp(
-                seq_lens_cpu[:num_reqs], max=self.topk_tokens
+            selected_counts = sparse_selection_counts(
+                seq_lens_cpu[:num_reqs], self.index_topk, self.index_kpool
             )
             metadata_key = (
                 num_tokens,
                 self.padded_num_heads,
-                clamped_seq_lens.to(torch.int32).numpy().tobytes(),
+                selected_counts.to(torch.int32).numpy().tobytes(),
             )
         if metadata_key is None or metadata_key != self._prev_metadata_key:
             get_mla_metadata_v1(
@@ -2503,8 +2523,24 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
             reduce_final_map=self._mla_reduce_final_map,
             reduce_partial_map=self._mla_reduce_partial_map,
         )
+        if self.index_kpool > 1:
+            attn_metadata.kpool = self._build_kpool_metadata(common_attn_metadata)
 
         return attn_metadata
+
+    def _build_kpool_metadata(self, common_attn_metadata):
+        from atom.plugin.vllm import glm5_kpool
+
+        if self._kpool_tail_store is None:
+            self._kpool_tail_store = glm5_kpool.find_tail_store(
+                self.vllm_config, self.model_config.hf_text_config
+            )
+        return glm5_kpool.build_kpool_metadata(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+            index_kpool=self.index_kpool,
+            tail_store=self._kpool_tail_store,
+        )
 
     def build_for_drafting(self, common_attn_metadata, draft_index):
         """Sync-free per-draft-step build for sparse MLA main attention.
