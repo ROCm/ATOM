@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791651112021,
+  "lastUpdate": 1791737642868,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3816,6 +3816,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8893,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38067143991 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610101503 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1501 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "wanzhenchn",
+            "username": "wanzhenchn",
+            "email": "wanzhenchn@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "2479251d31f4c745b43d64213cd2657f60fa7856",
+          "message": "ci(atomesh): Add aggregated-service CI, AgentX runtime fixes and Kimi-K3 2P1D/agg cells (#2528)\n\n* feat(ci-mesh) support aggregated service CI with pd pipeline\n\n* feat(ci-mesh) add kimi-k3 2p1d cases\n\n* fix(ci-mesh) let Slurm pick idle nodes on atomesh-cicd\n\n* fix(ci-mesh): K3 AgentX cells — FP8 prefill attention and capture from bs=1 (#2417)\n\n* fix(ci-mesh): align Kimi-K3 AgentX cells with the recipe (#2382)\n\nSync the K3 P/D nightly cells with recipes/Agentic-Kimi-K3.md as of\nd8cdd4e2:\n\n- ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 on every band\n- PrefillDelayer (ATOM_PREFILL_DECODE_INTERVAL=4,\n  ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000) from CONC 16 up\n- `cudagraph: auto` captures the dense range from bs=1 instead of 2\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(ci-mesh): drop PrefillDelayer env from K3 P/D cells\n\nIts benefit was measured on the aggregated recipe server; on the P/D\nsplit the decode instance never installs it and the prefill instance\nhas no decode batch to protect, so keep the cells unchanged there.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: ganyi <ygan@amd.com>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* feat(ci-mesh): capture torch profiler traces inside the AgentX profiling phase\n\n* feat(ci-mesh): choose the image's ATOM or the mounted checkout per dispatch\n\n* ci(atomesh): add P90 Interactivity to benchmark summary\n\n- Rename the agentic column to \"P90 E2E Normalized Interactivity\" (1/p90(ITL + TTFT/OSL)).\n- Add a \"P90 Interactivity\" column (1/p90(ITL)) from interactivity_p90_itl; \"--\" for fixed ISL/OSL rows.\n- Dashboard: parse old and new headers, read the new column, and use both names in axis, popup and table labels.\n\n* ci(atomesh): compute agentic throughput the InferenceX way\n- Compute input/output/total tok/s as the summed ISL/OSL of the successful\n  profiling records over the span from the first request start to the last\n  request end, as InferenceX's compute_throughput_stats does. AIPerf's\n  time-sliced *_token_throughput reads lower on agentic runs\n\n* ci(atomesh): enable PrefillDelayer on Kimi-K3 agg C72 to match InferenceX\n\n* ci(atomesh): reuse the image's AOT FlyDSL kernels instead of JIT-compiling at runtime\n\n* ci(atomesh): link the image's prebuilt aiter modules into the per-worker AITER_JIT_DIR\n\nWith AITER_JIT_DIR set, aiter imports modules only from that dir, so the\nempty per-worker dir made every worker JIT-rebuild modules the image already\nships (e.g. a 300 s stall at the first CUDA-graph capture), and any module\nfirst needed mid-benchmark stalled the engine. Unsetting the override is not\nan option: for a non-root uid aiter then copies the whole 7.3 GB jit dir into\nHOME and fails on the root-only FlyDSL cache files. Symlink the image's .so\nfiles into the writable dir instead; modules it lacks still build there.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): rework the Kimi-K3 cases and sync their list\n\nAdd a 1P1D C88 cell (max_num_seqs 176, 192 GiB CPU tier, as from C56 up).\nDrop the 1P1D C40 and 2P1D C64 cells; the 2P1D anchor moves to C72, so\nC72/C128/C256 resolve unchanged.\n\nThe case_names help also listed K3 C12, C14 and C80, which no suite\ndefines, and omitted the agg C72 cell. ATOM_WARMUP_GEMM_M_BUCKETS on that\ncell has no reader on main.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: gbyu-amd <Guanbao.Yu@amd.com>\nCo-authored-by: ganyi <ygan@amd.com>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-10-11T10:55:44Z",
+          "url": "https://github.com/ROCm/ATOM/commit/2479251d31f4c745b43d64213cd2657f60fa7856"
+        },
+        "date": 1791737642093,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38154964906 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610111450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38154964906 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610111450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.08,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38154964906 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610111450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8961,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38154964906 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610111450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1736 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
