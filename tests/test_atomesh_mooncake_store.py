@@ -376,6 +376,8 @@ start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
 }
 build_server_cache_env() { local -n out="$3"; out=("HOME=/cache/$1"); }
+build_torch_profiler_args() { local -n out="$2"; out=(); }
+ATOM_SOURCE_ENV=()
 server_common=(--model /models/m)
 prefill_parallel=(-tp 4)
 decode_parallel=(-tp 4)
@@ -944,6 +946,19 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
                 self.assertIn(message, result.stderr)
         self.assertEqual(self.store_calls("mooncake_master"), [])
 
+    def test_an_aggregated_cell_with_the_store_is_refused(self):
+        # start_prefill starts the Store, and an aggregated cell has no prefill.
+        result = self.run_shell(
+            "validate_mooncake_store_settings\n",
+            expect_rc=2,
+            ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
+            AGGREGATED="1",
+        )
+        self.assertIn("an aggregated cell starts none", result.stderr)
+        self.run_shell(
+            "validate_mooncake_store_settings\n", MOONCAKE_STORE="0", AGGREGATED="1"
+        )
+
     def test_the_p_d_connector_alone_passes(self):
         for config in (
             P_D_PRODUCER,
@@ -1155,9 +1170,11 @@ class LauncherWiringTest(unittest.TestCase):
             r"^(?:if|elif) .*; then$|^else$", dispatch, flags=re.MULTILINE
         )
         branches = branches[1:]
-        self.assertEqual(len(branches), 8)
+        self.assertEqual(len(branches), 9)
         for branch in branches:
-            starts = re.search(r"^\s*start_(?:prefill|decode)\b", branch, re.MULTILINE)
+            starts = re.search(
+                r"^\s*start_(?:prefill|decode|aggregated)\b", branch, re.MULTILINE
+            )
             trap = re.search(
                 r"^\s*trap 'cleanup_processes [^']*' EXIT$", branch, re.MULTILINE
             )
