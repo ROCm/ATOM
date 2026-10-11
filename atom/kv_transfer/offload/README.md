@@ -371,10 +371,12 @@ a copy into each slot (and the reverse).
   `ATOM_FORCE_ATTN_TRITON`: same block size, bytes arranged differently), the
   GPU arch and the torch dtypes AITER stores the KV and index caches in (`fp8`
   is e4m3fnuz on gfx942 and e4m3fn on gfx950, one byte each; a DSA index cache
-  is fp8 under a bf16 KV cache too), the RoPE settings, every `--hf-overrides`
-  field, the checkpoint revision when the HF config names one
+  is fp8 under a bf16 KV cache too), how K and V are encoded on their way into
+  the cache (the RoPE settings under every name a model reads them by, such as
+  MiMo-V2's `swa_rope_theta`, and MiMo-V2's `attention_value_scale` on V), every
+  `--hf-overrides` field, the checkpoint revision when the HF config names one
   (`_commit_hash`), and the codec version. Scheduler and workers derive it
-  from the same `Config` and environment; the RoPE settings, like the HF
+  from the same `Config` and environment; the K/V encoding, like the HF
   geometry, from a snapshot `Config` takes before either process gets it,
   since a worker changes the live `hf_config` while it builds the model.
 - `digest` is a 16-byte prefix chain over the prompt's full chunks:

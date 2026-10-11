@@ -781,25 +781,47 @@ def test_namespace_fingerprints_rope_overrides_and_revision():
     assert keys.store_namespace(revised, CHUNK) != base
 
 
-def test_namespace_hashes_the_rope_the_config_snapshotted():
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        # MiMo-V2's sliding-window layers rotate K with a base of their own.
+        ("swa_rope_theta", (10_000.0, 40_000.0)),
+        # MiMo-V2 scales V on its way into the cache.
+        ("attention_value_scale", (0.707, 1.0)),
+    ],
+)
+def test_namespace_fingerprints_how_mimo_v2_encodes_k_and_v(field, values):
+    namespaces = set()
+    for value in values:
+        config = _config()
+        config.hf_config.rope_theta = 5_000_000.0
+        setattr(config.hf_config, field, value)
+        # As `Config` ships it to the scheduler and the workers.
+        config.offload_kv_encoding = offcfg.snapshot_kv_encoding(config.hf_config)
+        namespaces.add(keys.store_namespace(config, CHUNK))
+    # Same geometry, so the same chunk size: only the namespace tells them apart.
+    assert len(namespaces) == 2
+
+
+def test_namespace_hashes_the_kv_encoding_the_config_snapshotted():
     shipped = _config()
     shipped.hf_config.rope_parameters = {"rope_type": "default", "rope_theta": 1e4}
-    shipped.offload_rope_config = offcfg.snapshot_rope_config(shipped.hf_config)
+    shipped.offload_kv_encoding = offcfg.snapshot_kv_encoding(shipped.hf_config)
     scheduler, worker = copy.deepcopy(shipped), copy.deepcopy(shipped)
     # What llama.py writes into the live config while a worker builds it.
     worker.hf_config.rope_parameters["original_max_position_embeddings"] = 8192
     assert keys.store_namespace(scheduler, CHUNK) == keys.store_namespace(worker, CHUNK)
     # Without the snapshot the two diverge and every lookup would miss.
-    del scheduler.offload_rope_config, worker.offload_rope_config
+    del scheduler.offload_kv_encoding, worker.offload_kv_encoding
     assert keys.store_namespace(scheduler, CHUNK) != keys.store_namespace(worker, CHUNK)
 
 
-def test_the_rope_snapshot_never_raises():
+def test_the_kv_encoding_snapshot_never_raises():
     hf = SimpleNamespace(
         rope_scaling={"factor": float("nan"), "type": object()},
         text_config=SimpleNamespace(rope_theta=5e5),
     )
-    snapshot = json.loads(offcfg.snapshot_rope_config(hf))
+    snapshot = json.loads(offcfg.snapshot_kv_encoding(hf))
     assert snapshot["text_config"]["rope_theta"] == 5e5
     assert snapshot["rope_scaling"]["factor"] != snapshot["rope_scaling"]["factor"]
 

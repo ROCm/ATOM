@@ -10,10 +10,10 @@ a prompt, exactly as the dense codec packs them. Its key is
 
 * ``namespace`` fingerprints everything that changes those bytes -- model,
   dtypes and the formats this GPU stores them in, block and chunk size, world,
-  the HF geometry, RoPE settings and overrides, the speculative config, each
-  PP stage's layer span and the environment switches that pick the attention
-  backend's KV layout -- so a Store shared by differently configured servers
-  never serves one of them another's layout.
+  the HF geometry, how K and V are encoded (RoPE, a V scale) and overrides,
+  the speculative config, each PP stage's layer span and the environment
+  switches that pick the attention backend's KV layout -- so a Store shared by
+  differently configured servers never serves one of them another's layout.
 * ``digest`` is the chunk's link in a prefix chain over the prompt's tokens, so
   a chunk's key names the whole prefix up to and including it.
 
@@ -126,17 +126,18 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
     server and is shared by others: the PP layer split -- PP4 x TP1 and
     PP1 x TP4 have the same world -- the online quantization, the KV layout
     the environment selects (`kv_layout_selectors`), the storage formats the
-    GPU resolves them to (`kv_storage_formats`), the RoPE settings K is cached
-    with, every ``--hf-overrides`` field, the checkpoint revision when the
-    config names one, and the codec's byte layout.
+    GPU resolves them to (`kv_storage_formats`), how K and V are encoded on
+    their way into the cache (the RoPE settings, MiMo-V2's V scale), every
+    ``--hf-overrides`` field, the checkpoint revision when the config names
+    one, and the codec's byte layout.
     """
     world = offcfg.lmcache_replica_world_size(config)
     hf = config.hf_config
     # Taken when the Config was built: a worker changes the live hf_config
-    # while it builds the model (`snapshot_rope_config`).
-    rope = getattr(config, "offload_rope_config", None)
-    if rope is None:
-        rope = offcfg.snapshot_rope_config(hf)
+    # while it builds the model (`snapshot_kv_encoding`).
+    kv_encoding = getattr(config, "offload_kv_encoding", None)
+    if kv_encoding is None:
+        kv_encoding = offcfg.snapshot_kv_encoding(hf)
     document = {
         "page": offcfg.build_page_namespace(
             config, SimpleNamespace(chunk_size=int(chunk_tokens)), world
@@ -147,7 +148,7 @@ def store_namespace(config: Any, chunk_tokens: int) -> str:
         ),
         "kv_layout": kv_layout_selectors(),
         "storage": kv_storage_formats(config),
-        "rope": rope,
+        "kv_encoding": kv_encoding,
         "hf_overrides": json.dumps(
             getattr(config, "hf_overrides", None), sort_keys=True, default=str
         ),
