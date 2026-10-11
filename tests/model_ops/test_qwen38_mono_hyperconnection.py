@@ -54,6 +54,20 @@ def hc(monkeypatch):
     return module
 
 
+def _assert_deferred_streams_close(actual, expected, rows, has_pending):
+    if rows == 16 and has_pending:
+        # The deferred combine has only a few BF16 ties among 163,840 values.
+        # Bound both their count and their bit distance instead of relaxing
+        # the tolerance for the whole residual stream.
+        differing = actual != expected
+        assert int(differing.sum()) <= 8
+        actual_bits = actual.view(torch.int16).to(torch.int32)
+        expected_bits = expected.view(torch.int16).to(torch.int32)
+        assert torch.all((actual_bits[differing] - expected_bits[differing]).abs() == 1)
+    else:
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
+
+
 @pytest.mark.parametrize("rows", [1, 2, 4, 8, 16])
 def test_fused_hc_matches_native_and_large_batch_falls_back(hc, monkeypatch, rows):
     x = (
@@ -163,17 +177,7 @@ def test_served_mix_fused_matches_native(hc, monkeypatch, rows, has_pending):
     monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
     actual, (actual_streams, actual_raw) = hc.mix_fused(x, pending)
     torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
-    if rows == 16 and has_pending:
-        # The deferred combine has only a few BF16 ties among 163,840 values.
-        # Bound both their count and their bit distance instead of relaxing
-        # the tolerance for the whole residual stream.
-        differing = actual_streams != expected_streams
-        assert int(differing.sum()) <= 8
-        actual_bits = actual_streams.view(torch.int16).to(torch.int32)
-        expected_bits = expected_streams.view(torch.int16).to(torch.int32)
-        assert torch.all((actual_bits[differing] - expected_bits[differing]).abs() == 1)
-    else:
-        torch.testing.assert_close(actual_streams, expected_streams, atol=1e-5, rtol=0)
+    _assert_deferred_streams_close(actual_streams, expected_streams, rows, has_pending)
     torch.testing.assert_close(actual_raw, expected_raw, atol=0.004, rtol=0.02)
 
 
@@ -203,10 +207,10 @@ def test_served_mix_fused_graph_replay(hc, monkeypatch, rows):
         torch.testing.assert_close(inject, expected_inject, atol=0.004, rtol=0.02)
 
 
-def test_final_mixer_without_injection(hc, monkeypatch):
+@pytest.mark.parametrize("rows", [4, 16])
+def test_final_mixer_without_injection(hc, monkeypatch, rows):
     hc.block_inject_weight = None
     hc.process_weights_after_loading()
-    rows = 4
     x = (
         torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16) * 0.5
     ).contiguous()
@@ -222,4 +226,4 @@ def test_final_mixer_without_injection(hc, monkeypatch):
     actual, (actual_streams, actual_raw) = hc.mix_fused(x, pending)
     assert expected_raw is None and actual_raw is None
     torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
-    torch.testing.assert_close(actual_streams, expected_streams, atol=1e-5, rtol=0)
+    _assert_deferred_streams_close(actual_streams, expected_streams, rows, True)

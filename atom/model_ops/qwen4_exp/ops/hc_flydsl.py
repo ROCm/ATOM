@@ -15,8 +15,9 @@ import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
+from aiter.tuned_gemm import tgemm
 from flydsl.expr import gpu, range_constexpr
-from flydsl.expr.typing import Int64, Stream, T
+from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from atom.mono.device.ops import (
     dot2_bf16,
@@ -65,6 +66,44 @@ def _wave_sum(value):
     for offset in (32, 16, 8, 4, 2, 1):
         value = xred(value, offset, lambda a, b: a + b)
     return value
+
+
+@flyc.kernel(known_block_size=[THREADS, 1, 1])
+def _gated_mean_kernel(normed: Int64, gate: Int64, mixed: Int64):
+    row = gpu.block_idx.x
+    hidden = gpu.block_idx.y * THREADS + gpu.thread_idx.x
+    if hidden < HIDDEN:
+        x_rsrc, g_rsrc, out_rsrc = rsrc(normed), rsrc(gate), rsrc(mixed)
+        total = fx.Float32(0.0)
+        for stream in range_constexpr(HC):
+            offset = row * WIDTH + stream * HIDDEN + hidden
+            x = fx.Float32(
+                fx.BFloat16(bo.buffer_load(x_rsrc, offset, vec_width=1, dtype=T.bf16))
+            )
+            g = fx.Float32(
+                fx.BFloat16(bo.buffer_load(g_rsrc, offset, vec_width=1, dtype=T.bf16))
+            )
+            total += rcp(fx.Float32(1.0) + exp(-g)) * x
+        bo.buffer_store(
+            fx.BFloat16(total * fx.Float32(1.0 / HC)),
+            out_rsrc,
+            row * HIDDEN + hidden,
+        )
+
+
+@flyc.jit
+def _launch_gated_mean(
+    normed: Int64,
+    gate: Int64,
+    mixed: Int64,
+    samples: Int32,
+    stream: Stream = _CURRENT_STREAM,
+):
+    _gated_mean_kernel(normed, gate, mixed).launch(
+        grid=(samples, (HIDDEN + THREADS - 1) // THREADS, 1),
+        block=(THREADS, 1, 1),
+        stream=stream,
+    )
 
 
 @functools.cache
@@ -540,7 +579,9 @@ def mix_fused(hc, hyper_input: torch.Tensor, pending=None):
     """Run the served HC path: deferred combine, norm, mix and next injection.
 
     The deferred combine shares the norm CTA, and the next injection logits
-    share the down-projection CTA. The up projection is the third launch.
+    share the down-projection CTA. At 16 rows the up projection uses the
+    existing MFMA GEMM, followed by a FlyDSL gated mean; smaller batches use
+    one FlyDSL up-and-mean launch.
     """
     samples, device = hyper_input.shape[0], hyper_input.device
     if not 1 <= samples <= 16:
@@ -605,13 +646,23 @@ def mix_fused(hc, hyper_input: torch.Tensor, pending=None):
         raw_out.data_ptr() if has_inject else low.data_ptr(),
         stream=stream,
     )
-    up(
-        normed.data_ptr(),
-        low.data_ptr(),
-        hc.input_mix_weight_up.weight.data_ptr(),
-        mixed.data_ptr(),
-        stream=stream,
-    )
+    if samples == 16:
+        projected = tgemm.mm(low, hc.input_mix_weight_up.weight, otype=torch.bfloat16)
+        _launch_gated_mean(
+            normed.data_ptr(),
+            projected.data_ptr(),
+            mixed.data_ptr(),
+            samples,
+            stream=stream,
+        )
+    else:
+        up(
+            normed.data_ptr(),
+            low.data_ptr(),
+            hc.input_mix_weight_up.weight.data_ptr(),
+            mixed.data_ptr(),
+            stream=stream,
+        )
     return mixed, (h_new, raw_out)
 
 

@@ -14,11 +14,11 @@ without partitioning the KV cache or GDN/PLE state.
 Set `ATOM_QWEN38_MONO_HC=1` before starting ATOM. The default is off. Dispatch
 requires gfx950, contiguous BF16 data and weights, FP32 norm weights, and the
 Flash-Next geometry: HC=4, hidden=2560, low rank=320. The served decoder calls
-`mix_fused`, which uses three FlyDSL launches at 4, 8, or 16 decode tokens:
+`mix_fused`, which uses three FlyDSL launches at 4 and 8 decode tokens:
 deferred combine plus grouped norm, fused down and injection projection, then
-up projection plus gated mean. It keeps the existing two-launch path at 1–2
-tokens and native GEMMs above 16 tokens. The 16-row isolated `mix_fused` probe
-was about even, but enabling it improved the complete 128k TP4+EP4 QSA layer.
+up projection plus gated mean. At 16 tokens it uses the same first two FlyDSL
+launches, the existing AITER CK MFMA up GEMM, and a FlyDSL gated mean. It keeps
+the existing two-launch path at 1–2 tokens and native GEMMs above 16 tokens.
 The standalone `mix` and `combine` calls used by the MTP
 drafter use three launches at 1–16 tokens and one launch at 1–128 tokens,
 respectively. Unsupported shapes use the native operators. The kernel and its
@@ -54,10 +54,10 @@ logits, the same benchmark measured:
 | 2 | 10.73 | 12.50 | 0.86× | Native |
 | 4 | 26.45 | 14.67 | 1.80× | FlyDSL |
 | 8 | 26.31 | 18.94 | 1.39× | FlyDSL |
-| 16 | 26.37 | 27.00 | 0.98× | FlyDSL in the complete layer |
+| 16 | 26.29 | 20.97 | 1.25× | FlyDSL norm/down/mean, CK MFMA up |
 
 These are HC component times with synthetic weights. The production path's
-three launches at 4–16 tokens are part of a decoder layer with separate
+three launches at 4–8 tokens and four at 16 are part of a decoder layer with separate
 attention, MoE, communication, state update, and QSA launches; the table does
 not measure whole-layer latency or model throughput.
 
@@ -95,8 +95,8 @@ three compiled stages:
 | Down + injection | 65 | 32 | 40 | 1 | 0 |
 | Up + gated mean | 15 | 0 | 24 | 0 | 0 |
 
-The down and up stages retain `v_dot2c_f32_bf16`; none of the served stages
-spill. The norm stage recomputes the rounded combined values after its
+At 4–8 rows, the down and up stages retain `v_dot2c_f32_bf16`; none of the
+served FlyDSL stages spill. The norm stage recomputes the rounded combined values after its
 reduction, avoiding a read of data it has just written through a buffer
 resource. That read produced incorrect normalized values during bring-up.
 
@@ -111,11 +111,16 @@ through 128 tokens.
 The separately dumped 128-token combine build still has 49 VGPR, 20 dot2
 instructions, 32 bytes LDS, and no scratch operations.
 At 16 tokens, the grouped down CTA uses 96 VGPR, 80 packed dot2 instructions,
-100 buffer loads, and no scratch spills. The up CTA uses 15 VGPR, 24 dot2
+100 buffer loads, and no scratch spills. The standalone `mix` up CTA uses 15 VGPR, 24 dot2
 instructions, 26 buffer loads, eight exponentials and eight reciprocals, with
 no LDS or spills. It takes 13.27 µs of the 28.52 µs pair; giving each up CTA
 four rows raised VGPR to 25 and made the up stage slower (13.61 µs), so the
-two-row schedule is retained. Direct FlyDSL mix probes at 32/64/128 rows took
+two-row schedule is retained for standalone `mix`. The served 16-row path
+instead uses CK's existing MFMA up GEMM and a FlyDSL gated mean. The latter's
+gfx950 ISA has 14 VGPR, zero LDS or scratch, eight buffer loads, four
+exponentials and four reciprocals. That changed the isolated served HC from
+26.29 to 20.97 µs and the complete 128k/16 QSA layer from about 276 to
+265 µs. Direct FlyDSL mix probes at 32/64/128 rows took
 38.0/67.8/142.9 µs versus 25.3/27.5/30.1 µs native; mix therefore falls
 back above 16 rows while the fused combine remains enabled through 128.
 
@@ -293,11 +298,13 @@ measured 32.9 → 20.4 µs at 4 rows and 35.6 → 21.5 µs at 16 rows.
 | QSA | 2k | 8 | 224.77 → 197.32 µs | 1.14× |
 | QSA | 128k | 4 | 261.28 → 220.04 µs | 1.19× |
 | QSA | 128k | 8 | 276.35 → 242.03 µs | 1.14× |
-| QSA | 128k | 16 | 305.38 → 275.73 µs | 1.11× |
+| QSA | 128k | 16 | 305.13 → 264.85 µs | 1.15× |
 | QSA | 256k | 4 | 284.72 → 238.06 µs | 1.20× |
 | QSA | 256k | 8 | 305.73 → 255.32 µs | 1.20× |
+| QSA | 256k | 16 | 370.02 → 279.17 µs | 1.33× |
 | GDN, FP32 state | — | 4 | 165.51 → 142.86 µs | 1.16× |
 | GDN, FP32 state | — | 8 | 174.13 → 157.90 µs | 1.10× |
+| GDN, FP32 state | — | 16 | 202.94 → 180.97 µs | 1.12× |
 
 The QSA scorer now uses 256 rather than 64 column programs on gfx950 for
 4/8-row, four-head, 128-dimension decode when a rank scores at least 16,384
@@ -307,27 +314,31 @@ grid. Full-layer measurements with the same synthetic setup showed tuned
 231/248/244/268 µs to 220/241/238/255 µs. The scorer's score values and
 the selected IDs are unchanged because each program still writes disjoint
 columns. At 128k/16, 256 programs did not improve the complete layer; its
-index-CP scorer remains at 64 programs. With CP disabled, 256 programs gave
-278.20 µs at 128k/16 versus 275.58 µs with CP, so CP remains selected.
+index-CP scorer remains at 64 programs. Before the new 16-row HC up schedule,
+disabling CP with 256 scorer programs gave 278.20 µs versus 275.58 µs with
+CP, so CP remains selected.
 Independent PyTorch index top-k still matched at both contexts for 4 and 8
 rows, with changed-input graph replay; sparse-attention NRMSE against the
 reference was at most 0.0028.
 
 At 128k/16, enabling index CP after merged projection improved the complete
-layer from 290.69 to 284.45 µs. Enabling the existing FlyDSL HC at 16 rows
-then reached 275.73 µs. The tuned layer still spends about 131 µs in the QSA
-sublayer, 79 µs in MoE, 31 µs in each HC stage, and 18 µs in the attention TP
+layer from 290.69 to 284.45 µs. The original 16-row FlyDSL HC path reached
+275.73 µs; the MFMA-up and FlyDSL-mean schedule reached 264.85 µs. The tuned
+layer still spends about 131 µs in the QSA sublayer, 79 µs in MoE, 25 µs in
+each HC stage, and 18 µs in the attention TP
 reduction when those stages are captured separately. Those stage times need
 not add to the complete-layer time because they use separate graphs and
 inputs.
 
 QSA selected token IDs were identical for the measured TP4 CP cases at
-128k/16 and 256k/4/8, and merged projection outputs were exact. Complete QSA
+128k/16 and 256k/4/8/16, and merged projection outputs were exact. Complete QSA
 layer stream/pending output NRMSE was at most 0.0028 on these synthetic
 weights. GDN/4's recurrent state NRMSE was 0.00004 and attention output NRMSE
 was 0.00148, but its deferred MoE output NRMSE was 0.032. The top-10 routed
 experts were identical before and after tuning; the synthetic constant FP8
-expert weights amplify small changes in the MoE input. Checkpoint-weight
+expert weights amplify small changes in the MoE input. At GDN/16, one row
+had 9/10 routing overlap and the deferred MoE output NRMSE was 0.0048.
+Checkpoint-weight
 full-layer accuracy and generation remain unverified.
 
 Direct GEMM replacement was rejected: for the QSA `(M,N,K)=(4/8,3584,2560)`
@@ -426,7 +437,7 @@ the same QSA component with local sparse attention. Trained HC weights from
 the official checkpoint were separately parity checked.
 `tests/test_aiter_flydsl_gdn.py` checks gfx950 recurrent GDN dispatch, state
 writeback, padded decode, and graph replay.
-The full checkpoint is still incomplete locally. Synthetic full-layer timing
+The full checkpoint is incomplete locally. Synthetic full-layer timing
 and numerical comparisons are reported above; checkpoint-weight full-layer
 accuracy, generation accuracy, and InferenceMAX throughput remain unmeasured.
 M3's one-launch sparse layer also includes index selection, attention, both TP
