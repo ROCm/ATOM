@@ -75,29 +75,57 @@ def test_a_chunk_too_small_for_even_one_block_is_left_alone():
     assert wrapper()(FakeScheduler(), request(), 0, 200) == 200
 
 
-def test_the_last_chunk_is_exempt_by_default():
-    """The anchor clip is off, and the reason is a measured failure.
+def test_the_last_chunk_takes_the_anchor_by_default():
+    """The anchor clip is on, and the reason it was once off is now fixed.
 
-    Splitting a prompt that would run in one chunk is the only way a short
-    prompt gets a mid-prefill boundary, and the state machinery does not
-    survive one: the chunk after the split arrives with `starts` at the anchor
-    while the slot's cursor reads something unrelated. Isolated on one binary,
-    same prompts: clip off 8/8 with zero refusals, clip on dead on the second
-    request.
+    It splits a prompt that would run in one chunk, which is the only way a
+    prompt shorter than `state_interval` ever gets a boundary at all. The
+    chunk after the split used to arrive with `starts` at the anchor and the
+    slot holding something unrelated -- "needs state at 1280, found 3". The
+    split was never the cause: `resolve_load` tested the frontier against
+    `state_interval`, and an anchor is block aligned without being a multiple
+    of one, so the admission went through with no load queued behind it.
+
+    5,000 tokens anchors at 4,864, so the last chunk stops 136 short of the
+    prompt end and the request owns a boundary there.
     """
+    w = wrapper()
+    assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 4864 - 4096
+
+
+def test_the_anchor_clip_can_still_be_turned_off(monkeypatch):
+    """Kept as a switch for bisecting a prefill-shape problem, not as a
+    default anyone should need."""
+    monkeypatch.setenv("ATOM_V41_PROMPT_ANCHOR_CLIP", "0")
     w = wrapper()
     assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 904
 
 
-def test_the_anchor_clip_can_still_be_asked_for(monkeypatch):
-    """Kept behind a switch for whoever picks up the cursor bug.
+def test_an_anchor_boundary_is_one_resolve_load_accepts():
+    """The pair that made this safe, checked together.
 
-    5,000 tokens anchors at 4,864, so the last chunk stops 136 short of the
-    prompt end.
+    The clip is only correct while a boundary it produces is one the state
+    leg will queue a load for. An anchor is block aligned and, in general,
+    not a multiple of `state_interval` -- which is exactly the shape the old
+    `resolve_load` test rejected while the admission went ahead regardless.
     """
-    monkeypatch.setenv("ATOM_V41_PROMPT_ANCHOR_CLIP", "1")
-    w = wrapper()
-    assert w(FakeScheduler(), request(prompt=5000), 4096, 904) == 4864 - 4096
+    from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
+
+    planner = V41BoundaryPlanner(
+        hash_block_size=256,
+        chunk_size=256,
+        state_interval=INTERVAL,
+        max_num_batched_tokens=INTERVAL * 2,
+        world_size=1,
+    )
+    anchor = 4864
+    assert anchor % 256 == 0
+    assert anchor % INTERVAL != 0, "this test is only about non-interval anchors"
+    req = SimpleNamespace(request_id="r0", block_hashes=tuple(range(1, 40)))
+    h = planner.boundary_hash(req.block_hashes, anchor)
+    assert h is not None, "an anchor must be hashable or it can never be stored"
+    planner._index.note_stored(h)
+    assert planner.resolve_load(req, anchor, (1,)) is True
 
 
 def test_a_last_chunk_already_past_the_anchor_is_left_alone():

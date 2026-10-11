@@ -234,33 +234,38 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
             # so every boundary ABOVE the prompt is reached anyway and
             # clipping for those would only delay the prompt.
             #
-            # The one below it is different, and it is the valuable one: the
-            # prompt-end anchor is the last block-aligned point at or before
-            # `total`, and once the frontier is past it nothing returns to it.
-            # A prompt whose length is not a whole number of blocks reaches it
-            # only if a chunk ends there, which is this clip.
-            # The prompt-end anchor is NOT taken by default, and this is a
-            # correctness limit rather than a preference.
+            # The one below it is different, and it is the valuable one:
+            # the prompt-end anchor is the last block-aligned point at or
+            # before `total`, and once the frontier is past it nothing returns
+            # to it. A prompt whose length is not a whole number of blocks
+            # reaches it only if a chunk ends there, which is this clip.
             #
-            # Clipping here splits a prompt that would otherwise run in one
-            # chunk, which is the only way a short prompt ever acquires a
-            # mid-prefill boundary. The state machinery does not survive one:
-            # the chunk after the split arrives with `starts` at the anchor and
-            # the slot's cursor reading something else entirely -- measured as
-            # "needs state at 1280, found 3" on the second request of a run,
-            # with no reuse involved at all, and an isolation pair that settles
-            # it (clip off: 8/8 and zero refusals; clip on, same binary, same
-            # prompts: dead on request two).
+            # Taken by default again. It was off because clipping splits a
+            # prompt that would otherwise run in one chunk, and the chunk
+            # after the split used to arrive with `starts` at the anchor and
+            # the slot holding something else -- "needs state at 1280, found
+            # 3". The cause was not the split: `resolve_load` tested the
+            # frontier against `state_interval`, and an anchor is block
+            # aligned without being a multiple of one, so the admission went
+            # through with no state load queued behind it. Testing the block
+            # grid instead is what fixes it, and refusing an admission whose
+            # load did not queue is what catches the rest.
             #
-            # The cost is real and worth stating: without this, a prompt
-            # shorter than `state_interval` has no boundary, so the tier
-            # stores nothing for it -- which is exactly the gap the anchor was
-            # added to close. Prompts longer than one interval keep their rung
-            # boundaries and are unaffected.
+            # A 2x2 over those two changes, clip on throughout, short prompts
+            # (~2k, below one interval), 24 lanes:
             #
-            # ATOM_V41_PROMPT_ANCHOR_CLIP=1 takes it anyway, for whoever picks
-            # up the mid-prefill cursor bug.
-            if os.environ.get("ATOM_V41_PROMPT_ANCHOR_CLIP") in ("1", "true", "True"):
+            #   interval test, no refusal -> dead, "needs state at 1792"
+            #   interval test, refusal    -> lives, tier supplies 44.0%
+            #   block grid,    no refusal -> lives, tier supplies 78.3%
+            #   block grid,    refusal    -> lives, tier supplies 78.3%
+            #
+            # The supply column is the point of the anchor: without it a
+            # prompt shorter than `state_interval` has no boundary and the
+            # tier stores nothing for it.
+            #
+            # ATOM_V41_PROMPT_ANCHOR_CLIP=0 turns it off, for bisecting a
+            # prefill-shape problem against the old behaviour.
+            if os.environ.get("ATOM_V41_PROMPT_ANCHOR_CLIP") not in ("0", "false", "False"):
                 anchor = (total // block) * block
                 if start < anchor < end:
                     return anchor - start
