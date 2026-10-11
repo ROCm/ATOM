@@ -39,6 +39,10 @@ import torch
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.distributed.qwen_qsa_cp import (
+    get_qsa_cp_decode_group,
+    qsa_cp_enabled,
+)
 from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm
 from atom.model_ops.linear import (
     QKVGParallelLinear,
@@ -53,7 +57,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_sparse_paged_gqa,
     qsa_store_rows,
 )
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -219,7 +222,7 @@ class Qwen4ExpAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.tp_size = tp_size
-        self.qsa_index_cp = envs.ATOM_QWEN38_QSA_CP
+        self.qsa_index_cp = qsa_cp_enabled()
         if self.qsa_index_cp and (
             tp_size not in (2, 4)
             or self.total_num_kv_heads != 2
@@ -345,14 +348,12 @@ class Qwen4ExpAttention(nn.Module):
         forward_context = get_forward_context()
         index_cp = None
         if self.qsa_index_cp and not forward_context.context.is_prefill:
-            # The fixed candidate exchange costs more than the saved score
-            # work for short contexts and small decode batches.
-            rows = index_q.shape[0]
-            minimum_work = 16 * 1024 * 1024 if self.tp_size == 4 else 32 * 1024 * 1024
-            if rows * qsa.max_seq_len >= minimum_work:
-                from aiter.dist.parallel_state import get_tp_group
-
-                group = get_tp_group()
+            group = get_qsa_cp_decode_group(
+                rows=index_q.shape[0],
+                max_seq_len=qsa.max_seq_len,
+                tp_size=self.tp_size,
+            )
+            if group is not None:
                 index_cp = (
                     group.rank_in_group,
                     group.world_size,

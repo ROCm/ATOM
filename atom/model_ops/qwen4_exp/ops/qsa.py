@@ -1299,33 +1299,22 @@ def qsa_select_paged_tokens(
             # Local top-k is exact: no global winner can be discarded from a
             # shard that keeps at least the global k. The gathered payload is
             # bounded by rows * world * k, independent of context length.
-            valid = (selected_groups >= 0) & (selected_groups < visible_groups[:, None])
-            local_scores = torch.gather(
-                logits, 1, selected_groups.clamp(min=0, max=local_columns - 1).long()
-            ).masked_fill(~valid, -float("inf"))
-            global_ids = torch.where(valid, selected_groups + first_group, -1)
-            payload = torch.stack((local_scores.view(torch.int32), global_ids), dim=-1)
             from atom.distributed.qwen_qsa_cp import exchange_qsa_candidates
-
-            gathered = exchange_qsa_candidates(payload, group)
-            # Rank-major gather becomes row-major candidates. The local
-            # selector is stable, and contiguous shards preserve global-id
-            # order across equal scores when the merge is stable too.
-            candidates = (
-                gathered.permute(1, 0, 2, 3)
-                .contiguous()
-                .view(row_end - row_start, world * block_topk, 2)
+            from atom.model_ops.qwen4_exp.ops.qsa_candidates_flydsl import (
+                gather_candidates,
+                pack_candidates,
+                unpack_candidates,
             )
-            # AITER's selector accepts a column-stride argument but its stable
-            # merge path still assumes contiguous score columns in practice.
-            # Materialize this small (world*k) matrix before selecting.
-            candidate_scores = candidates[..., 0].view(torch.float32).contiguous()
-            candidate_ids = candidates[..., 1]
-            candidate_lens = torch.full(
-                (row_end - row_start,),
-                world * block_topk,
-                dtype=torch.int32,
-                device=q.device,
+
+            payload = pack_candidates(
+                logits, selected_groups, visible_groups, first_group, world
+            )
+            gathered = exchange_qsa_candidates(payload, group)
+            # The stable merge reads rank-major candidates in rank order and
+            # needs contiguous score columns. One FlyDSL unpack produces those
+            # columns, their global ids, and the per-row width.
+            candidate_scores, candidate_ids, candidate_lens = unpack_candidates(
+                gathered
             )
             merged_offsets = torch.empty_like(selected_groups)
             top_k_per_row_prefill(
@@ -1340,7 +1329,7 @@ def qsa_select_paged_tokens(
                 block_topk,
                 stable=True,
             )
-            selected_groups = torch.gather(candidate_ids, 1, merged_offsets.long())
+            selected_groups = gather_candidates(candidate_ids, merged_offsets)
         qsa_expand_block_indices(
             selected_groups,
             query_positions[row_slice],
