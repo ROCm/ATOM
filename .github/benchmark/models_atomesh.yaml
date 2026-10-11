@@ -775,14 +775,6 @@ models:
             prefill: *kimi_k3_agentic_lmcache128_env
 
         - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c40
-          concurrency: [40]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 80
-
-        - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48
           concurrency: [48]
           server:
@@ -823,6 +815,15 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 144
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
           env: *kimi_k3_agentic_lmcache192_env
 
         # Non-disaggregated counterpart to the C72 cell above: one server does
@@ -867,19 +868,16 @@ models:
               # PrefillDelayer coalesces queued prefill for up to 5 s.
               ATOM_PREFILL_DECODE_INTERVAL: "4"
               ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
-              # This server also prefills, so it needs the prefill workers'
-              # startup compile of every M-bucketed GEMM (env.prefill is unused).
-              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c64
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
           topology: 2p1d
           display_topology: 2P1D-TP8-DCP8
           nodes: "${ATOMESH_2P1D_NODES}"
-          concurrency: [64]
+          concurrency: [72]
           prefill:
             workers: 2
             tp: 8
@@ -887,16 +885,8 @@ models:
           server:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 128
-          env: *kimi_k3_agentic_lmcache192_env
-
-        - <<: *kimi_k3_agentic_2p1d
-          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
-          concurrency: [72]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 144
+          env: *kimi_k3_agentic_lmcache192_env
 
         - <<: *kimi_k3_agentic_2p1d
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128
