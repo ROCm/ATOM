@@ -56,6 +56,7 @@ def run(
     with_attention: bool,
     ragged: bool,
     zero_index: bool,
+    cp_logits_workspace_bytes: int,
 ) -> dict:
     if context not in (131072, 262144) or rows < 1:
         raise ValueError("this benchmark targets 128k/256k and positive rows")
@@ -126,6 +127,7 @@ def run(
             ratio,
             max_seq_len=context,
             index_cp=(rank, group.world_size, group),
+            logits_workspace_bytes=cp_logits_workspace_bytes,
         )
 
     reference = native()
@@ -213,7 +215,10 @@ def main() -> None:
     parser.add_argument("--with-attention", action="store_true")
     parser.add_argument("--ragged", action="store_true")
     parser.add_argument("--zero-index", action="store_true")
+    parser.add_argument("--cp-logits-workspace-mib", type=int, default=128)
     args = parser.parse_args()
+    if args.cp_logits_workspace_mib < 1:
+        parser.error("--cp-logits-workspace-mib must be positive")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -238,6 +243,7 @@ def main() -> None:
                 args.with_attention,
                 args.ragged,
                 args.zero_index,
+                args.cp_logits_workspace_mib * 1024 * 1024,
             )
             for context in args.contexts
             for rows in args.rows

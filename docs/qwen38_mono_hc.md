@@ -59,6 +59,12 @@ three launches at 4–8 tokens are part of a decoder layer with separate
 attention, MoE, communication, state update, and QSA launches; the table does
 not measure whole-layer latency or model throughput.
 
+A one-launch resident FlyDSL HC experiment for 1–2 rows matched the native
+outputs and graph replay, but took 15.8/20.6 µs versus the native two-launch
+path's 8.5/10.6 µs. Its cross-CTA norm/down/up handoffs cost more than the
+saved launch, even with zero ISA spills. That experiment is not dispatched or
+included in this PR; 1–2 row HC remains native.
+
 The 16-token standalone FlyDSL stage times were 2.69 µs norm, 7.08 µs down,
 13.27 µs up, and 3.18 µs combine. The up projection is the larger-batch
 bottleneck.
@@ -130,35 +136,48 @@ TP sparse attention. The selected tokens matched the unsplit path exactly at
 stable top-k needs contiguous candidate scores; a strided view produced wrong
 selections during bring-up, so the merge materializes a compact score row.
 
-The fixed exchange cost is a loss at small batches. Production dispatch uses
-the native selection below 16 million row-context tokens on TP4 and 32
-million on TP2. The following TP4 graph benchmark gives every row a distinct
-128k or 256k request and a disjoint, permuted physical page range:
+The candidate exchange now uses three small FlyDSL kernels: pack local
+score/id pairs, unpack rank-major gathered pairs into contiguous row-major
+scores and ids, then map merged offsets to global ids. They replace multiple
+PyTorch gather, mask, stack, permute, copy, fill and gather launches. AITER's
+stable top-k and the existing QSA scorer and sparse attention remain in use.
+The generated 48-row gfx950 kernels use 6/6/5 VGPR, no LDS, and no spills.
+TP4 uses the registered gather through 1 MiB of per-rank payload, where it
+still beat RCCL by 12–22 µs; TP2 retains its 512 KiB limit. Both transports
+are warmed before native decode graph capture.
 
-| Context | Rows | Unsplit selection | Index CP selection | Speedup |
-| ---: | ---: | ---: | ---: | ---: |
-| 128k | 64 | 170.28 µs | 134.31 µs | 1.27× |
-| 128k | 128 | 314.94 µs | 171.96 µs | 1.83× |
-| 128k | 256 | 635.20 µs | 285.07 µs | 2.23× |
-| 128k | 512 | 1061.81 µs | 435.51 µs | 2.44× |
-| 256k | 64 | 329.15 µs | 171.27 µs | 1.92× |
-| 256k | 128 | 619.24 µs | 257.82 µs | 2.40× |
-| 256k | 256 | 1132.38 µs | 423.08 µs | 2.68× |
-| 256k | 512 | 2074.04 µs | 676.34 µs | 3.07× |
+The measured dispatch gates are 24/48 rows at the 128k score bucket for
+TP4/TP2, and 2/16 rows at the 256k bucket. Smaller contexts retain native
+selection. These gates include distinct, shared-request, ragged and padded
+rows; the native path remains selected where the exchange can lose.
 
-For 256k/128 rows, including local TP sparse attention measured 688.76 µs
-unsplit versus 330.95 µs with CP (2.08×). At 256k/512 rows, it measured
-2355.56 versus 937.29 µs (2.51×). At 128k/512 rows it measured 1303.68 versus
-678.47 µs (1.92×). Sparse attention outputs were exact matches. TP2 selection
-at 256k/128 rows measured 1.61×, or 1.41× including sparse attention.
-The larger-batch improvement budgets the score workspace against each rank's
-local shard width, allowing fewer row chunks and candidate exchanges.
-Ragged requests, graph padding, and all-zero score ties were also checked for
-exact parity.
-The QSA CP path reuses the M3-style registered all-gather when available and
-warms both transport choices before graph capture. It is separate from full
-PCP/DCP, whose Qwen backend guard remains in place because those modes need
-partitioned cache/page metadata, recurrent state and attention contracts.
+Median captured graph times on MI355X with a distinct permuted request per
+row, including both selection and local TP sparse attention:
+
+| TP | Context | Rows | Unsplit | Index CP | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 128k | 24 | 92.72 µs | 83.32 µs | 1.11× |
+| 4 | 128k | 48 | 164.66 µs | 105.18 µs | 1.57× |
+| 4 | 128k | 96 | 286.83 µs | 150.04 µs | 1.91× |
+| 4 | 256k | 2 | 77.66 µs | 67.37 µs | 1.15× |
+| 4 | 256k | 32 | 209.49 µs | 110.71 µs | 1.89× |
+| 4 | 256k | 48 | 276.87 µs | 135.88 µs | 2.04× |
+| 4 | 256k | 128 | 651.31 µs | 273.44 µs | 2.38× |
+| 4 | 256k | 160 | 817.14 µs | 338.36 µs | 2.42× |
+| 2 | 128k | 48 | 165.56 µs | 131.85 µs | 1.26× |
+| 2 | 256k | 16 | 120.56 µs | 106.19 µs | 1.14× |
+| 2 | 256k | 48 | 281.07 µs | 191.61 µs | 1.47× |
+| 2 | 256k | 128 | 650.24 µs | 411.25 µs | 1.58× |
+
+The selected tokens and sparse outputs matched the unsplit path exactly on
+all listed shapes. TP4 256k/513-row selection, split into 512+1-row workspace
+chunks, was exact under changed-input graph replay and took 2240.05 to
+693.94 µs (3.23×) with `--cp-logits-workspace-mib 32`; sparse attention was
+not included in that case. Ragged,
+padded and all-zero tie cases were also exact at 128k/256k on TP2 and TP4.
+The QSA CP path is separate from full PCP/DCP, whose Qwen backend guard
+remains because those modes require partitioned cache, page metadata and
+recurrent-state contracts.
 
 ## Validation scope
 
@@ -167,7 +186,12 @@ mix+combine parity, 32/64/128-token combine parity, served `mix_fused` parity
 at 4/8 tokens including the final mixer without injection, fallback, and
 changed-input graph replay.
 `tools/bench_qwen38_qsa_cp.py` checks exact selection and changed-input graph
-replay on two or four GPUs. No local Flash-Next checkpoint was available, so
-whole-layer accuracy, real-checkpoint generation, and InferenceMAX throughput
-remain unmeasured. The 2–3× figures above apply to the named HC or QSA
-component and measured shape, not to the full model.
+replay on two or four GPUs; the additional 128k/256k measurements above used
+the same QSA component with local sparse attention. Trained HC weights from
+the official checkpoint were separately parity checked. The full checkpoint
+is still incomplete locally, so whole-layer accuracy, generation accuracy,
+and InferenceMAX throughput remain unmeasured. M3's one-launch sparse layer
+also includes index selection, attention, both TP reductions and MoE; this PR
+does not yet implement that layer-level fusion for Qwen's GDN/QSA and block-FP8
+MoE. The 2–3× figures above are QSA component measurements, not full-model
+speedups.
