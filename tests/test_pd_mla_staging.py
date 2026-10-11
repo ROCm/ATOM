@@ -584,6 +584,10 @@ class _DeviceNic:
     ):
         for s, d, n in zip(src, dst, sizes):
             self._at(d, n).copy_(self._at(s, n))
+        if torch.cuda.is_available():
+            # Synchronous like the real write: the caller reuses the staging
+            # slot as soon as this returns, from another stream.
+            torch.cuda.current_stream().synchronize()
         self.labels.append(label)
         return True
 
