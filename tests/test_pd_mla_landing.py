@@ -1078,6 +1078,53 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
     assert new._landing_credits.acquire("consumer:1", landing["epoch"], 0) == 0
 
 
+@pytest.mark.parametrize("outcome", ["failed", "past-deadline"])
+def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
+    # Mooncake gives up on a sync write without cancelling what it posted, so
+    # a failed write may still land in the slot. Reused at once, another
+    # request's rows written and announced there could be overwritten before
+    # their scatter. A write the deadline stopped before anything was sent
+    # leaves the slot usable.
+    mc = _mooncake()
+    monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
+    monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+    dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
+    landing = dest.recv.advertise("stage0", 1)
+    new = _producer(mc, _source_regions(1, 8), staging_rows=16)
+    new._landing_credits.sync("consumer:1", landing)
+    request = _request(1, 4, 0, dest.regions)
+    request["mla_landing"] = landing
+    if outcome == "failed":
+        new._rdma_write_with_retry = lambda *_a, **_k: False
+    else:
+        request["_deadline"] = time.monotonic() - 1
+    assert not mc.MooncakeConnector._execute_block_transfer(
+        new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
+    )
+    assert "_mla_landed" not in request  # nothing to announce
+    credits = new._landing_credits
+    got = {credits.acquire("consumer:1", landing["epoch"], 0) for _ in range(3)}
+    if outcome == "failed":
+        assert got == {landing["slots"][0], None}
+    else:
+        assert got == set(landing["slots"]) | {None}
+    assert new._mla_staging_slots.free  # the source slot goes back either way
+
+
+def test_quarantined_credits_never_come_back():
+    credits = LandingCredits()
+    credits.sync("d0", {"epoch": 1, "slots": [0, 1]})
+    first = credits.acquire("d0", 1, 0)
+    credits.quarantine("d0", 1, first)
+    credits.release("d0", 1, [first])  # a stray return changes nothing
+    second = credits.acquire("d0", 1, 0)
+    assert second != first
+    credits.quarantine("d0", 1, second)
+    assert credits.acquire("d0", 1, 0) is None  # every transfer stages now
+    credits.sync("d0", {"epoch": 2, "slots": [0, 1]})  # a restarted decode
+    assert credits.acquire("d0", 2, 0) is not None
+
+
 # ---------------------------------------------------------------------------
 # connector wiring
 # ---------------------------------------------------------------------------

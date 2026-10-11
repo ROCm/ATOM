@@ -2547,7 +2547,7 @@ class MooncakeConnector(KVConnectorBase):
                     if slot is None:
                         break
                     dst_addr = int(landing["base"]) + slot * landing_slot_bytes
-                    written = False
+                    written = None
                     try:
                         written = self._write_mla_slot(
                             stream,
@@ -2573,9 +2573,13 @@ class MooncakeConnector(KVConnectorBase):
                             # lost READY.
                             request_data.setdefault("_mla_landed", []).append(slot)
                     finally:
-                        if not written:
-                            # Never announced, so the consumer will not return it.
+                        # Never announced, so the consumer will not return it.
+                        if written is None:
+                            # Nothing was sent to it: it can be used again.
                             credits.release(target, epoch, [slot])
+                        elif not written:
+                            # The failed write may still land in it.
+                            credits.quarantine(target, epoch, slot)
                     if not written:
                         logger.error(
                             "[PRODUCER] landed MLA transfer failed for req %s", req_id
@@ -2630,13 +2634,26 @@ class MooncakeConnector(KVConnectorBase):
         *,
         engine=None,
         deadline: float | None = None,
-    ) -> bool:
+    ) -> bool | None:
         """Gather ``pieces`` into a free MLA staging slot, then RDMA the slot.
 
         ``descriptors(staging, used)`` gives the write's ``(src_addrs,
         dst_addrs, sizes)`` for the filled slot. The slot goes back to the
         pool once the write returned. Shared by the staged and landed paths.
+
+        Returns True once the write completed, False if it failed (it may
+        still land: Mooncake does not cancel work it gave up on), and None if
+        the transfer deadline had passed, so nothing was sent.
         """
+        if deadline is not None and time.monotonic() > deadline:
+            logger.error(
+                "[PRODUCER] %s write for req %s passed its %.0fs transfer "
+                "deadline; failing it",
+                label,
+                req_id,
+                PD_TRANSFER_DEADLINE_S,
+            )
+            return None
         pool_idx = self._mla_staging_slots.acquire()
         try:
             staging = self._mla_staging[pool_idx]

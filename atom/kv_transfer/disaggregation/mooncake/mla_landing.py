@@ -117,6 +117,8 @@ class _TargetCredits:
     epoch: int
     free: list[int]
     in_flight: set[int] = field(default_factory=set)
+    # Out of use for good: a failed write may still land in them.
+    quarantined: set[int] = field(default_factory=set)
 
 
 class LandingCredits:
@@ -158,6 +160,30 @@ class LandingCredits:
                 if remaining <= 0:
                     return None
                 self._cv.wait(remaining)
+
+    def quarantine(self, target: str, epoch: int, slot: int) -> None:
+        """Keep a slot out of use after a write to it failed.
+
+        Mooncake gives up on a sync write without cancelling the work it
+        posted, so that write may still land in the slot. Another request
+        writing and announcing the slot meanwhile would then be scattered
+        with the wrong rows. The partition shrinks instead; once no slot is
+        left, every transfer to ``target`` takes the staged path.
+        """
+        with self._cv:
+            credits = self._targets.get(target)
+            if credits is None or credits.epoch != epoch:
+                return
+            credits.in_flight.discard(slot)
+            credits.quarantined.add(slot)
+            left = len(credits.free) + len(credits.in_flight)
+        logger.warning(
+            "[PD-LANDING] %s slot %d is out of use for good after a failed write; "
+            "%d slots left",
+            target,
+            slot,
+            left,
+        )
 
     def release(self, target: str, epoch: int, slots: list[int]) -> None:
         """Return slots the decode rank finished with (or that never landed)."""
