@@ -1068,7 +1068,12 @@ to run.
 > [optimized source stack](#optimized-source-stack--pending-verification) — the
 > flydsl column no longer holds. The environment variable stays inert either
 > way: the ATOM comment above dates from 2026-09-01 (ATOM #2018), and ATOM
-> still hard-wires `mori` for fp4/fp8.
+> still hard-wires `mori` for fp4/fp8. [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522)
+> (open) removes that: `mori` stays the default, and `MEGA_DISPATCH=flydsl`
+> runs aiter's compact plan on the fp4/fp8 wire. aiter's other flydsl plan
+> (EP mask, token-major) gave wrong and run-to-run different output on the fp4
+> wire, so #2522 does not select it. Measured on the
+> [newer stack](#prefill-chunk-16384-and-the-fp4-combine-wire).
 
 **Switching to flydsl means giving up fp4 on the wire.** It is a pair, not a
 single knob:
@@ -1234,6 +1239,7 @@ max_tokens=3500  -> content='...#### 72'  finish_reason=stop
 | `available_for_kv` negative, server never starts | Lower `--max-num-batched-tokens` (2048 here). `--cudagraph-mode` does not affect this on the native engine — see [KV budget](#kv-budget) |
 | LLVM PHI assertion on long input at concurrency | Triton `gather_kv_b_proj` codegen. Needs [PR #2380](https://github.com/ROCm/ATOM/pull/2380) **and** `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` — the env var alone does nothing on stock ATOM. The [optimized source stack](#optimized-source-stack--pending-verification) fixes it in aiter instead (#6120) |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` must be set together. On newer aiter (`main` of 2026-10-08) the symm-mem knob exists only with [aiter #5431](https://github.com/ROCm/aiter/pull/5431); without it custom all-reduce is disabled on any group spanning nodes. Every rank should log `Custom allreduce: using torch.symm_mem transport (mori backend)` — see [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
+| All DP ranks stop logging at once, mid-run, with no error. 30 min later all but one log `_sync_dp_state failed: ... Timed out waiting 1800000ms` | Seen once on the newer stack: one rank never left the DP LM head's custom all-gather (`aiter::ag_gfx1250_lastdim`). Take stacks and rocgdb `info dispatches` before killing anything. The workaround is the replicated head. See [A hang in the DP LM head's custom all-gather](#-a-hang-in-the-dp-lm-heads-custom-all-gather) |
 | `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe N) returned hipError 17` at model load, on more than one node | Newer aiter's MegaMoE turns on mori's TokOffExt by default, and TokOffExt IPC-maps every peer; IPC handles do not cross nodes. Set `MORI_EP_TOKOFF_EXT=0` — see [Newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) |
 | MoE GUGU layout error | `ATOM_MOE_GU_ITLV=1` |
 | `ATOM_USE_TRITON_MOE_DECODE=1` asserts | K3's activation is `situ`, not SiLU |
@@ -1791,6 +1797,17 @@ cd $SP/aiter_meta && git apply --check -R --include='csrc/*' /tmp/5431.diff && e
 
 `docker rm` discards the patches, as on 0918-ep8.
 
+The runs marked "flydsl compact" below also need a third, open ATOM PR. It is not needed for the mori launch
+of this section:
+
+| PR | why |
+|---|---|
+| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | lets `MEGA_DISPATCH=flydsl` work on the fp8/fp4 dispatch wire. This ATOM hard-wires `mori` there (see [the MoE dispatch backend](#the-moe-dispatch-backend-mori-and-why-mega_dispatchflydsl-does-nothing)). With the PR, `mori` stays the default, and `flydsl` runs aiter's compact plan (`stage1_fused=True`), with its VMM reserved. It adds no environment variable. A server running it logs `dispatch=flydsl stage1_fused=True` in its `Created MegaMoE` line |
+
+Apply it the same way, after #2380: in `$SP`, run `git apply --include='atom/*' /tmp/2522.diff`.
+`--include` drops the PR's tests and docs. To verify, `git apply --check -R --include='atom/*' /tmp/2522.diff`
+must pass. Checked on this image: #2522's head `6eb6b9e` applies on top of #2380.
+
 ### Environment and CLI — delta from Config A
 
 | | Config A | here | why |
@@ -1889,7 +1906,7 @@ benchmark (`scripts/run_benchmark.sh` settings): random 14336/500, range ratio 0
 
 "flydsl compact" is `MEGA_DISPATCH=flydsl` running aiter's compact plan on the fp4 dispatch wire, which this
 image's ATOM cannot select (see [the MoE dispatch backend](#the-moe-dispatch-backend-mori-and-why-mega_dispatchflydsl-does-nothing));
-it needs an ATOM change that is not merged yet. The two bf16 runs at 2048 bound the run-to-run spread: about
+it needs [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522), applied as in [Patches](#patches). The two bf16 runs at 2048 bound the run-to-run spread: about
 1% in throughput and 10% in TTFT median. Every fp4-combine difference above is inside it.
 
 ⚠️ **At 16384, 0.94 does not survive the first long prefill.** All four ranks on node0 (the ones checked) ran
@@ -1935,6 +1952,151 @@ Half the GPUs carry 13% more tokens, and TTFT is 3.6x lower on average, but ever
 slower: inter-token latency is 28% higher, so interactivity p90 drops 9%. The two columns differ in
 stack, scale, driver parameters and utilization (0.90 against 0.94) at once, so none of these deltas can be
 pinned on one cause.
+
+### AgentX sweep: flydsl compact, fp4 combine, no EPLB (dp8ep8)
+
+A baseline across concurrency, measured 2026-10-11 on CT2 + CT3 with default amdgpu parameters, as above.
+
+**Server.** The launch of this section, plus:
+
+- `--max-num-batched-tokens 16384` and `--gpu-memory-utilization 0.90`;
+- `--enable_prefix_caching` and `ATOM_DP_SESSION_AFFINITY=1`;
+- `ATOM_MEGA_COMBINE_WIRE=fp4`;
+- `MEGA_DISPATCH=flydsl`: the compact plan on the fp4 dispatch wire, which needs [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522).
+
+There is **no EPLB of any kind**: no `--fake-eplb` (Config B and the run above use it) and no `--enable-eplb`.
+Before each client run, the configuration was read back from the running server:
+
+- the `Created MegaMoE` line: `dispatch=flydsl stage1_fused=True`, `combine_quant=mxfp4`;
+- the engine kwargs: `'fake_eplb': False`, `'eplb_enable': False`, `'enable_prefix_caching': True`,
+  `'max_num_batched_tokens': 16384`;
+- `ATOM_DP_SESSION_AFFINITY` in the API server's environment.
+
+**Client.** ATOM CI's agentic method, unchanged. It runs `.github/scripts/aiperf_agentic.sh` from ATOM `main`:
+`agentic_prepare`, then `run_aiperf_agentic`, with every `AIPERF_*` at its default:
+
+- 3600 s of profiling;
+- 10 warm-up requests per lane;
+- scenario `inferencex-agentx-mvp`;
+- aiperf `754356e9`.
+
+The script turns the session headers on by itself, because the server arguments contain
+`--enable-dp-attention`. Each concurrency got a fresh server launch.
+
+**Interactivity** is reported in ATOM's definitions (`.github/scripts/atomesh/interactivity.py`, computed per
+request from aiperf's `profile_export.jsonl`):
+
+- E2E-normalized, the dashboard default: `1 / p90(ITL + TTFT / OSL)`;
+- `1 / p90(ITL)`.
+
+Neither is aiperf's `output_token_throughput_per_user` p90, which the AgentX tables above report. The con32 run
+above scores 2.31 by aiperf, 0.290 E2E-normalized and 0.421 by `1 / p90(ITL)`.
+
+| concurrency | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | prefix cache hit | valid |
+|---|---|---|---|---|---|
+| 8 | 0.241 | 0.775 | 123.3 (987) | 96.65% | **no**: coverage TTFT 90.3%, ITL 94.6% |
+| 16 | 0.237 | 0.531 | 155.4 (1243) | 89.85% | yes |
+| 32 | **0.354** | 0.435 | 391.8 (3134) | 86.15% | yes |
+| 48 | 0.213 | 0.286 | **447.2** (3577) | 74.23% | yes |
+
+Throughput is aiperf's `total_token_throughput` (input plus output tokens) over 8 GPUs. Prefix cache hit is
+cached prompt tokens over prompt tokens, from the same export.
+
+| concurrency | warm-up | profiling: completed / cancelled, errors | TTFT p50 | ITL p50 | KV usage while profiling |
+|---|---|---|---|---|---|
+| 8 | 87 requests, 10 min | 35 / 10, 0 | 192.3 s | 1.27 s | — |
+| 16 | 177 requests, 27 min | 56 / 22, 0 | 96.1 s | 1.83 s | 69–91.5% |
+| 32 | 354 requests, 31 min | 157 / 43, 0 | 21.5 s | 2.15 s | 93–99.4% |
+| 48 | 531 requests, 59 min | 140 / 57, 0 | 42.5 s | 2.45 s | 84–99% |
+
+- **Concurrency 8 is not a valid run.** aiperf passes a run only when its last first token or its last
+  completed response lands in the final 5% of the window (`ttft_ratio >= 0.95` or `itl_ratio >= 0.95`). At 8
+  lanes, requests took 465 s at p50 and up to 2852 s, and nothing completed in the last 194 s: the last response
+  came at 3406 s of 3600 (94.6%). The client exits with `ProfileMetricCoverageError`. Its numbers are recorded
+  here, but it is not a valid submission.
+- TTFT p50 is highest at the lowest concurrency: 192 s at 8, 21.5 s at 32. Not investigated.
+- Warm-up time grows with concurrency. At 48 it took 59 min. 16 of those minutes went by before the last cold
+  primer returned (one long prefill per lane, up to ~400k tokens); the rest of the warm-up waits for it.
+- No stall at any concurrency; tokens kept flowing at 99% KV.
+
+### ⚠️ A hang in the DP LM head's custom all-gather
+
+Seen once, on 2026-10-11, during a full GSM8K on the server of the sweep above. The LM head was Config A's:
+`ATOM_DP_LM_HEAD_MODE=allgather`, `ATOM_USE_CUSTOM_ALL_GATHER=1`, `AITER_CUSTOM_AR_USE_SYMM_MEM=1`. Three
+minutes in, at 180 of 1319 questions, all eight engines stopped, with no error:
+
+- `Engine 007` logged last, and the other seven went quiet within seconds.
+- Thirty minutes later the seven logged `_sync_dp_state failed: ... Timed out waiting 1800000ms for recv` and
+  `PrefillDelayer all_reduce failed (peer down?)`.
+- dmesg showed no GPU fault. lm_eval only retried, with `TimeoutError`.
+
+**Take stacks before killing anything.**
+
+- `py-spy dump` on rank 7's ModelRunner: `postprocess -> prepare_sampled_ids -> recv_async_output ->
+  synchronize`. It was waiting for its own GPU.
+- On the others: the next step's `prepare_model -> sync_dp_metadata -> all_gather`. They were waiting for rank 7.
+
+Then rocgdb names the kernel each GPU is running. It attaches, lists and detaches; the process keeps running:
+
+```bash
+# in the container, for every ATOM::DP<r>TP0 process (ps -eo pid,args)
+cd /tmp && timeout 200 /opt/rocm/bin/rocgdb -q -p <pid> -batch \
+  -ex "info dispatches" -ex "info queues" -ex detach
+```
+
+| ranks | kernel in flight | packets queued behind it |
+|---|---|---|
+| 7 | `aiter::ag_gfx1250_lastdim<bf16, 8>` | 2290 |
+| 0–6 | `tdm_compact_plan`, the next step's first MoE dispatch | 2240 on every rank |
+
+2240 packets is one forward pass:
+
+- Ranks 0–6 had finished the step, including its LM-head all-gather. They were waiting for rank 7 in the next
+  step's first dispatch.
+- Rank 7 never left that all-gather. Behind it were the next forward and the last 50 packets of its own step.
+
+So the hang is in the all-gather of the logits along the vocab dimension (`ParallelLMHead._dp_sharded_logits`,
+`embed_head.py`), not in the MoE dispatch or combine. This head runs only on decode-only steps, when no rank is
+prefilling. GSM8K is almost all decode-only steps, so it runs this all-gather far more often than an agentic
+trace does.
+
+The same head ran without a hang in every other run on this stack:
+
+- the full GSM8K at the top of this section;
+- the 200-question runs;
+- the 14k/500 benchmarks;
+- the con32 AgentX run;
+- the four 3600 s runs above.
+
+**Workaround:** the replicated head, which uses no custom collective:
+`ATOM_DP_LM_HEAD_MODE=default ATOM_USE_CUSTOM_ALL_GATHER=0`, without `AITER_CUSTOM_AR_USE_SYMM_MEM`. Its
+throughput cost was not measured.
+
+**Lead, not verified.** The barrier (`start_sync`/`end_sync` in `csrc/include/custom_all_reduce_gfx1250.cuh`)
+spins on flags that peers write, with relaxed device-scope loads:
+
+- aiter's IPC transport allocates that Signal buffer uncached (`hipDeviceMallocUncached`, "suitable for
+  cross-GPU synchronization metadata and signal buffers").
+- [aiter #5431](https://github.com/ROCm/aiter/pull/5431)'s symm_mem transport allocates it with `symm_mem.empty`
+  (mori's allocator).
+
+Nobody has checked whether that memory is uncached. A spin that keeps reading a stale cached flag would fit
+what was seen: seven ranks completed the all-gather, and one kept waiting for a flag.
+
+### dp16ep16 on this stack: prepared, not run
+
+Set up on CT2, CT3, CT12 and CT15 on 2026-10-11, then dropped. Preparing it showed two changes from the dp8
+launch. Neither was run:
+
+- **The replicated LM head.** The DP LM head's custom all-gather runs on aiter's gfx1250 custom all-reduce,
+  which takes world sizes 2, 4, 6 and 8 only: `_SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]` in
+  `custom_all_reduce.py`, and `DISPATCH_NGPUS_1250` in the kernel. At DP 16 it is disabled, and the allgather
+  head would hit `assert not ca_comm.disabled` (see [Known issues](#known-issues)). Use
+  `ATOM_DP_LM_HEAD_MODE=default ATOM_USE_CUSTOM_ALL_GATHER=0`. Config A and B ran at DP 16 on the 0918-ep8
+  image's aiter, which is a different build.
+- **Lower memory utilization at 16384.** The grouped GEMM's per-route `grouped_out` transient is sized by the
+  tokens a rank can receive: EP × batched tokens × top-k rows. That is 14 GiB at EP 8 (see above) and an
+  estimated 28 GiB at EP 16. The plan was to start at 0.85.
 
 ### Other things this run showed
 
@@ -2652,6 +2814,9 @@ A correct run logs lines of this shape:
   [Throughput](#throughput) for why it is the first thing to try.
 - The [optimized source stack](#optimized-source-stack--pending-verification)
   as a whole: boot, accuracy and AgentX are all pending.
-- The [newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) beyond accuracy: throughput,
-  AgentX, dp16ep16 on four nodes, and A/Bs of `ATOM_UNFUSED_GATHER_KV_B_PROJ=0` (Triton 3.9's fused
-  gather) and of the new gfx1250 asm MLA decode (`ATOM_USE_TRITON_MLA` unset).
+- The [newer stack](#newer-stack-atom-dev-image-dp8ep8-on-two-nodes) beyond dp8ep8. Not yet measured:
+  - dp16ep16 on four nodes ([prepared, not run](#dp16ep16-on-this-stack-prepared-not-run));
+  - a valid AgentX run at concurrency 8 (the 3600 s run failed aiperf's coverage rule);
+  - the replicated LM head's throughput cost;
+  - A/Bs of `ATOM_UNFUSED_GATHER_KV_B_PROJ=0` (Triton 3.9's fused gather);
+  - A/Bs of the new gfx1250 asm MLA decode (`ATOM_USE_TRITON_MLA` unset).
