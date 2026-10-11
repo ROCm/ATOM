@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -22,6 +23,58 @@ static const size_t thp_size = 2UL * 1024 * 1024;
 #define MADV_COLLAPSE 25
 #endif
 
+/* Temporary, opt-in failure-boundary evidence. Read while the VMA still exists. */
+static void memory_snapshot(void *address, size_t length, const char *phase) {
+    const char *enabled = getenv("ATOMESH_THP_DIAGNOSTICS");
+    if (!enabled || strcmp(enabled, "1") != 0)
+        return;
+    fprintf(stderr, "[DEBUG-mooncake-memory] pid=%ld phase=%s range=%p-%p\n",
+            (long)getpid(), phase, address, (char *)address + length);
+    const char *paths[] = {
+        "/proc/self/status", "/proc/self/numa_maps", "/proc/self/smaps",
+        "/proc/meminfo", "/proc/buddyinfo", "/proc/vmstat",
+        "/sys/devices/system/node/node0/meminfo",
+        "/sys/devices/system/node/node1/meminfo",
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset.mems.effective",
+        "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory.events"
+    };
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+        FILE *file = fopen(paths[i], "r");
+        if (!file) {
+            fprintf(stderr, "[DEBUG-mooncake-memory] path=%s errno=%d\n", paths[i], errno);
+            continue;
+        }
+        char line[2048];
+        int in_range = 0;
+        while (fgets(line, sizeof(line), file)) {
+            unsigned long start, end;
+            int selected = 1;
+            if (i == 0)
+                selected = strncmp(line, "Cpus_allowed", 12) == 0 ||
+                           strncmp(line, "Mems_allowed", 12) == 0;
+            else if (i == 1)
+                selected = sscanf(line, "%lx", &start) == 1 &&
+                           start >= (uintptr_t)address &&
+                           start < (uintptr_t)address + length;
+            else if (i == 2) {
+                if (sscanf(line, "%lx-%lx", &start, &end) == 2)
+                    in_range = start < (uintptr_t)address + length &&
+                               end > (uintptr_t)address;
+                selected = in_range;
+            } else if (i == 5)
+                selected = strncmp(line, "compact_", 8) == 0 ||
+                           strncmp(line, "thp_", 4) == 0 ||
+                           strncmp(line, "pgscan_", 7) == 0 ||
+                           strncmp(line, "pgsteal_", 8) == 0;
+            if (selected)
+                fprintf(stderr, "[DEBUG-mooncake-memory] %s %s", paths[i], line);
+        }
+        fclose(file);
+    }
+}
+
 static int populate_thp(void *address, size_t length, const char *kind) {
     /* Avoid synchronous huge-page compaction on every first-touch fault.
      * Populate movable base pages before requesting the final THP backing. */
@@ -29,6 +82,8 @@ static int populate_thp(void *address, size_t length, const char *kind) {
                           MADV_HUGEPAGE, MADV_COLLAPSE};
     const char *phases[] = {"base-pages", "populate", "huge-pages", "collapse"};
     for (size_t i = 0; i < sizeof(advice) / sizeof(advice[0]); ++i) {
+        if (advice[i] == MADV_COLLAPSE)
+            memory_snapshot(address, length, "before-collapse");
         for (int attempt = 1; ; ++attempt) {
             struct timespec start, end;
             clock_gettime(CLOCK_MONOTONIC, &start);
@@ -61,6 +116,7 @@ static int populate_thp(void *address, size_t length, const char *kind) {
                 usleep(100000);
                 continue;
             }
+            memory_snapshot(address, length, "failed-collapse");
             errno = error;
             return rc;
         }
