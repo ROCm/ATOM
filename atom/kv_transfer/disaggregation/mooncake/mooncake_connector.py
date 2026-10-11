@@ -1220,7 +1220,9 @@ class MooncakeConnector(KVConnectorBase):
             recv_deadline_s=PD_RECV_DEADLINE_S,
         )
         logger.info(
-            "PD MLA landing: %d slots x %.1f MiB for %d MLA regions",
+            "PD MLA landing: %d slots x %.1f MiB for %d MLA regions, held back "
+            "from the KV cache. Only non-DCP MLA prefills with MLA staging on "
+            "land; set ATOM_PD_MLA_LANDING=0 if none does",
             slots,
             MLA_LANDING_SLOT_BYTES / (1 << 20),
             len(mla_regions),
@@ -1271,7 +1273,9 @@ class MooncakeConnector(KVConnectorBase):
         self._mla_token_views = token_views
         logger.info(
             "PD MLA staging: %d slots x %.1f MiB for %d MLA regions, "
-            "%d send workers",
+            "%d send workers, held back from the KV cache. Only transfers to "
+            "DCP decode ranks use it; set ATOM_PD_MLA_STAGING=0 if no decode "
+            "runs DCP",
             pool_size,
             slot_bytes / (1 << 20),
             len(token_views),
@@ -3033,11 +3037,13 @@ class MooncakeConnector(KVConnectorBase):
             self.pp_rank,
             request_data.get("write_nonce", 0),
             success=success,
-            # None unless the consumer offered landing slots, so it can tell
-            # "landed none" from "producer does not land".
+            # None unless the consumer offered landing slots and this stage
+            # can land (it has an MLA staging pool), so the consumer can tell
+            # "landed none" from "cannot land" and take a partition back.
             landed_slots=(
                 request_data.get("_mla_landed", [])
                 if request_data.get("mla_landing") is not None
+                and self._mla_staging is not None
                 else None
             ),
         )

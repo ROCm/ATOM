@@ -15,10 +15,12 @@ Protocol, per decode rank (every rank has its own pool and connector):
 
 1. On first contact the rank gives a prefill stage endpoint a partition of
    ``pool_slots // pp_size`` slots (``pp_size`` is the prefill's), first
-   come, first served, and never takes it back while the decode runs. With
-   several prefill instances per decode rank, a later one may get fewer
-   slots, or none and keep the staged path. The rank advertises the stage's
-   partition in every ``write_request``
+   come, first served, and takes it back only from a stage that reports it
+   cannot land (no MLA staging pool: a DCP prefill, ``ATOM_PD_MLA_STAGING=0``
+   or a build without landing); such an endpoint is not offered slots
+   again. With several landing prefill instances per decode rank, a later
+   one may get fewer slots, or none and keep the staged path. The rank
+   advertises the stage's partition in every ``write_request``
    (``mla_landing = {epoch, base, slot_bytes, slots}``).
 2. The stage keeps the partition as credits (``LandingCredits``), shared by
    all its requests to that rank. A send worker takes a credit, gathers rows
@@ -27,7 +29,7 @@ Protocol, per decode rank (every rank has its own pool and connector):
    no credit within ``MLA_LANDING_CREDIT_WAIT_S`` it sends the rest
    of the transfer through the staged path. Write-done then lists the slot of
    every READY it sent (``landed_slots``), so a lost READY is detected and its
-   slot still returned.
+   slot still returned; a stage that cannot land sends ``None`` instead.
 3. The rank (``LandingReceiver``) scatters READY slots on its own stream and
    returns their credits (``MSG_LANDING_CREDIT``) once the scatter finished.
 4. A request completes when every stage's write-done arrived, every landed
@@ -47,9 +49,9 @@ Protocol, per decode rank (every rank has its own pool and connector):
    counts no READY lost, so a READY that arrives after its request retired
    leaves its slot in flight on the stage.
 
-Credits never move between stages or ranks, so no slot is reused while a
-stage may still write it, and no side waits on another stage's or rank's
-progress.
+Credits never move between stages or ranks (a partition taken back comes
+from a stage that never takes a credit), so no slot is reused while a stage
+may still write it, and no side waits on another stage's or rank's progress.
 """
 
 from __future__ import annotations
@@ -324,6 +326,8 @@ class LandingReceiver:
         self._lock = threading.Lock()
         self._partitions: dict[str, list[int]] = {}
         self._unassigned = list(range(pool_slots))
+        # Stage endpoints that reported they cannot land.
+        self._cannot_land: set[str] = set()
         self._warned_spent = False
         self._requests: dict[str, _Request] = {}
         self._tombstones: dict[tuple[str, int], float] = {}
@@ -375,11 +379,12 @@ class LandingReceiver:
         """The ``mla_landing`` field for a write request to ``stage_addr``.
 
         The first request to a stage endpoint assigns it a partition of
-        ``pool_slots // num_stages`` slots; None once the pool is spent or
-        landing is disabled (a scatter error).
+        ``pool_slots // num_stages`` slots; None once the pool is spent, for
+        an endpoint that cannot land, or when landing is disabled (a scatter
+        error).
         """
         with self._lock:
-            if self._disabled:
+            if self._disabled or stage_addr in self._cannot_land:
                 return None
             slots = self._partitions.get(stage_addr)
             if slots is None:
@@ -549,14 +554,17 @@ class LandingReceiver:
         """Record a stage's write-done; False if this request is not tracked.
 
         ``landed_slots`` lists the slot of every READY the stage sent, by
-        ``seq`` (None from a producer that does not land). A READY that never
-        arrived fails the request, and its slot goes back to the stage: the
-        RDMA write finished before the write-done was sent. A list that names
-        a slot outside the stage's partition, or that disagrees with the
-        READYs that arrived, fails the request and returns nothing.
+        ``seq``. A READY that never arrived fails the request, and its slot
+        goes back to the stage: the RDMA write finished before the write-done
+        was sent. A list that names a slot outside the stage's partition, or
+        that disagrees with the READYs that arrived, fails the request and
+        returns nothing. ``None`` comes from a stage that cannot land, which
+        never takes a credit, so its partition goes back to the pool.
         """
         outcome = None
         lost: dict[int, int] = {}
+        reclaimed = 0
+        cannot_land = landed_slots is None
         with self._lock:
             request = self._requests.get(req_id)
             if request is None:
@@ -610,6 +618,8 @@ class LandingReceiver:
             # Returned here: a lost READY that a reconnect reordered behind
             # this write-done is then a duplicate.
             stage.seen.update(lost)
+            if cannot_land and stage.slots and not stage.seen:
+                reclaimed = self._reclaim_locked(stage.stage_addr)
             if not success:
                 self._fail_locked(request)
             elif lost:
@@ -623,6 +633,14 @@ class LandingReceiver:
                 )
                 self._fail_locked(request)
             outcome = self._settle_locked(req_id, request)
+        if reclaimed:
+            logger.warning(
+                "[PD-LANDING] stage %s cannot land (a DCP prefill, "
+                "ATOM_PD_MLA_STAGING=0 or a build without landing); its %d "
+                "slots go back to the pool and it keeps staged per-page writes",
+                stage.stage_addr,
+                reclaimed,
+            )
         if lost:
             self._send_credits(stage.stage_addr, list(lost.values()))
         if outcome is not None:
@@ -870,6 +888,19 @@ class LandingReceiver:
                 logger.exception("[PD-LANDING] reporting req %s failed", req_id)
 
     # -- helpers (lock held) -------------------------------------------------
+
+    def _reclaim_locked(self, stage_addr: str) -> int:
+        """Return a stage endpoint's partition to the pool; slots moved.
+
+        Only for an endpoint that cannot land: it never acquires a credit,
+        so none of its slots can be in flight.
+        """
+        if stage_addr in self._cannot_land:
+            return 0
+        self._cannot_land.add(stage_addr)
+        slots = self._partitions.pop(stage_addr, [])
+        self._unassigned.extend(slots)
+        return len(slots)
 
     def _fail_locked(self, request: _Request) -> None:
         request.failed = True

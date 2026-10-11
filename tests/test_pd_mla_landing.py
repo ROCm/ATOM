@@ -1029,6 +1029,7 @@ def test_write_done_reports_landed_slots_only_when_offered():
     conn = object.__new__(mc.MooncakeConnector)
     conn.pp_rank = 2
     conn.tp_rank = 0
+    conn._mla_staging = torch.empty(0, dtype=torch.uint8)
     sent = []
     conn._send_on_socket = lambda path, parts, repeat=1: sent.append(parts)
     base = {"notify_host": "h", "notify_port": 1, "request_id": "r"}
@@ -1036,12 +1037,32 @@ def test_write_done_reports_landed_slots_only_when_offered():
     conn._notify_transfer_result(
         {**base, "mla_landing": {}, "_mla_landed": [4, 4, 5]}, success=True
     )
+    conn._notify_transfer_result({**base, "mla_landing": {}}, success=True)
     # A None offer is no offer, as for the write listener and the transfer.
     conn._notify_transfer_result({**base, "mla_landing": None}, success=True)
-    first, second, third = (msgpack.loads(p[1]) for p in sent)
-    assert first["landed_slots"] is None
-    assert second["landed_slots"] == [4, 4, 5]
-    assert third["landed_slots"] is None
+    # A stage without an MLA staging pool cannot land, offer or not.
+    conn._mla_staging = None
+    conn._notify_transfer_result({**base, "mla_landing": {}}, success=True)
+    landed = [msgpack.loads(p[1])["landed_slots"] for p in sent]
+    assert landed == [None, [4, 4, 5], [], None, None]
+
+
+def test_a_stage_that_cannot_land_gives_its_partition_back():
+    # A DCP prefill, or one with ATOM_PD_MLA_STAGING=0, used to keep the
+    # whole pool for the decode's lifetime, leaving none for the prefills
+    # that could land.
+    dest = _Dest(pool_slots=8)
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    assert dest.recv.advertise("other", 1) is None  # pool spent
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    dest.recv.stage_done("r", 0, 5, True, None)
+    assert dest.finished == [("r", False)]
+    assert dest.recv.advertise("stage0", 1) is None  # not offered again
+    assert sorted(dest.recv.advertise("other", 1)["slots"]) == sorted(s0)
+    # A stage that landed nothing, but could have, keeps its partition.
+    dest.recv.begin("r2", 5, [1], {0: "other"})
+    dest.recv.stage_done("r2", 0, 5, True, [])
+    assert sorted(dest.recv.advertise("other", 1)["slots"]) == sorted(s0)
 
 
 def test_landing_requests_complete_through_the_receiver():
