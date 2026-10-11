@@ -32,34 +32,34 @@ consume it. BF16 rounding at projection and scaled-activation boundaries is
 preserved. Each CTA owns its output; there is no persistent scratch or
 cross-CTA synchronization, so changed-input CUDA Graph replay is safe.
 
-`python tools/bench_qwen38_hc.py --repeats 5` benchmarks an
+`python tools/bench_qwen38_hc.py --repeats 3` benchmarks an
 actual ATOM `Qwen4ExpHyperConnection` with synthetic BF16 weights on one idle
 MI355X. Times are median graph GPU microseconds for one standalone
 mix+combine pair, which the served decoder does not call:
 
 | Decode tokens | Native | FlyDSL | Speedup |
 | ---: | ---: | ---: | ---: |
-| 1 | 33.58 | 12.98 | 2.59× |
-| 2 | 35.44 | 13.90 | 2.55× |
-| 4 | 36.10 | 16.44 | 2.20× |
-| 8 | 36.31 | 20.53 | 1.77× |
-| 16 | 36.31 | 28.52 | 1.27× |
+| 1 | 33.45 | 13.81 | 2.42× |
+| 2 | 35.37 | 14.19 | 2.49× |
+| 4 | 36.00 | 16.33 | 2.20× |
+| 8 | 36.25 | 20.69 | 1.75× |
+| 16 | 36.78 | 28.88 | 1.27× |
 
 For the served `mix_fused` call with a deferred block output and injection
 logits, the same benchmark measured:
 
 | Decode tokens | Native | FlyDSL | Speedup | Production dispatch |
 | ---: | ---: | ---: | ---: | :--- |
-| 1 | 8.74 | 10.44 | 0.84× | Native |
-| 2 | 10.73 | 12.50 | 0.86× | Native |
-| 4 | 26.45 | 14.67 | 1.80× | FlyDSL |
-| 8 | 26.31 | 18.94 | 1.39× | FlyDSL |
-| 16 | 26.29 | 20.97 | 1.25× | FlyDSL norm/down/mean, CK MFMA up |
+| 1 | 8.89 | 11.26 | 0.79× | Native |
+| 2 | 10.87 | 12.35 | 0.88× | Native |
+| 4 | 26.73 | 14.57 | 1.84× | FlyDSL |
+| 8 | 26.72 | 19.18 | 1.39× | FlyDSL |
+| 16 | 26.72 | 21.28 | 1.26× | FlyDSL norm/down/mean, CK MFMA up |
 
 These are HC component times with synthetic weights. The production path's
-three launches at 4–8 tokens and four at 16 are part of a decoder layer with separate
-attention, MoE, communication, state update, and QSA launches; the table does
-not measure whole-layer latency or model throughput.
+three launches at 4–8 tokens and four at 16 are part of a decoder layer with
+separate attention, MoE, communication, state update, and QSA launches. The
+table does not measure whole-layer latency or model throughput.
 
 A one-launch resident FlyDSL HC experiment for 1–2 rows matched the native
 outputs and graph replay, but took 15.8/20.6 µs versus the native two-launch
@@ -67,68 +67,45 @@ path's 8.5/10.6 µs. Its cross-CTA norm/down/up handoffs cost more than the
 saved launch, even with zero ISA spills. That experiment is not dispatched or
 included in this PR; 1–2 row HC remains native.
 
-The 16-token standalone FlyDSL stage times were 2.69 µs norm, 7.08 µs down,
-13.27 µs up, and 3.18 µs combine. The up projection is the larger-batch
-bottleneck.
+The 16-token standalone FlyDSL stage times in the review rerun were 2.82 µs
+norm, 7.22 µs down, 13.31 µs up, and 3.46 µs combine. The up projection is
+the larger-batch bottleneck.
 For 16/32/64/128 tokens, the combine stage alone measured 3.34/3.39/3.48/
 3.95 µs versus 9.92/9.93/10.15/10.08 µs native, or 2.98/2.93/2.92/2.55×.
 The 32–128-token mix remains native.
 
 ### Generated gfx950 ISA
 
-The benchmark's `--dump-ir-dir` option saves the final AMDGCN assembly. The
-one-token build at `/tmp/qwen38-atom-internal-isa` yielded:
+During review, the packed BF16 dot helper was changed to FlyDSL vector casts
+and `fma` arithmetic, removing its direct ROCDL operation. The final gfx950
+assembly from `tools/bench_qwen38_hc.py --dump-ir-dir` contains no `v_dot2`
+or MFMA in these HC stages. It uses FP32 fused multiply/add instructions;
+measured HC latency stayed within run-to-run variation at four and sixteen rows.
 
-| Stage | VGPR | LDS bytes | `v_dot2c_f32_bf16` | DPP moves | Buffer loads | Barriers | Scratch ops |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Norm | 21 | 16 | 0 | 6 | 15 | 1 | 0 |
-| Down + SiLU | 45 | 16 | 20 | 6 | 40 | 1 | 0 |
-| Up + gated mean | 13 | 0 | 12 | 24 | 19 | 0 | 0 |
-| Injection + combine | 49 | 16 | 20 | 6 | 50 | 2 | 0 |
+| Rows | Stage | VGPR | LDS bytes | VALU instructions | Buffer loads | Scratch ops |
+| ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| 1 | Norm | 21 | 16 | 135 | 15 | 0 |
+| 1 | Down + SiLU | 32 | 16 | 228 | 40 | 0 |
+| 1 | Up + gated mean | 14 | 0 | 205 | 19 | 0 |
+| 1 | Injection + combine | 37 | 16 | 274 | 50 | 0 |
+| 4 | Down + injection | 71 | 32 | 372 | 60 | 0 |
+| 4 | Up + gated mean | 26 | 0 | 344 | 26 | 0 |
+| 16 | Down + injection | 109 | 64 | 666 | 100 | 0 |
+| 16 | Up + gated mean | 26 | 0 | 344 | 26 | 0 |
 
-The four-token served variant with a pending combine and next injection has
-three compiled stages:
-
-| Stage | VGPR | LDS bytes | Packed BF16 dot2 | Barriers | Scratch ops |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| Combine + norm | 26 | 32 | 0 | 1 | 0 |
-| Down + injection | 65 | 32 | 40 | 1 | 0 |
-| Up + gated mean | 15 | 0 | 24 | 0 | 0 |
-
-At 4–8 rows, the down and up stages retain `v_dot2c_f32_bf16`; none of the
-served FlyDSL stages spill. The norm stage recomputes the rounded combined values after its
-reduction, avoiding a read of data it has just written through a buffer
-resource. That read produced incorrect normalized values during bring-up.
-
-The BF16 GEMVs use packed `v_dot2c_f32_bf16` through an ATOM-side typed helper;
-the Qwen HC kernel contains no inline assembly or raw LLVM operations.
-There is no MFMA at one token.
-No stage spills. The up stage's four gate reductions account for its 24 DPP
-moves and four exponentials/reciprocals; it is compute and reduction heavy as
-batch size rises. Down and combine use one wave reduction plus a CTA barrier
-to join partials. The combine grid grows with rows, which keeps it effective
-through 128 tokens.
-The separately dumped 128-token combine build still has 49 VGPR, 20 dot2
-instructions, 32 bytes LDS, and no scratch operations.
-At 16 tokens, the grouped down CTA uses 96 VGPR, 80 packed dot2 instructions,
-100 buffer loads, and no scratch spills. The standalone `mix` up CTA uses 15 VGPR, 24 dot2
-instructions, 26 buffer loads, eight exponentials and eight reciprocals, with
-no LDS or spills. It takes 13.27 µs of the 28.52 µs pair; giving each up CTA
-four rows raised VGPR to 25 and made the up stage slower (13.61 µs), so the
-two-row schedule is retained for standalone `mix`. The served 16-row path
-instead uses CK's existing MFMA up GEMM and a FlyDSL gated mean. The latter's
-gfx950 ISA has 14 VGPR, zero LDS or scratch, eight buffer loads, four
-exponentials and four reciprocals. That changed the isolated served HC from
-26.29 to 20.97 µs and the complete 128k/16 QSA layer from about 276 to
-265 µs. Direct FlyDSL mix probes at 32/64/128 rows took
-38.0/67.8/142.9 µs versus 25.3/27.5/30.1 µs native; mix therefore falls
-back above 16 rows while the fused combine remains enabled through 128.
+The norm stage recomputes rounded combined values after reduction, avoiding a
+read of data it has just written through a buffer resource. The up stage has
+four gate reductions and is the standalone `mix` bottleneck at sixteen rows:
+13.31 µs of its 28.88 µs pair. The served sixteen-row path uses CK's existing
+MFMA up GEMM and a FlyDSL gated mean, reaching 21.28 µs versus 26.72 µs for
+the native HC call. The direct FlyDSL mix is retained only through sixteen
+rows; the fused combine remains enabled through 128.
 
 ## QSA when the context fits the sparse budget
 
 Set `ATOM_QWEN38_QSA_SHORT=1` to use a one-launch FlyDSL selection for gfx950
 decode when `max_seq_len <= indexer_budget` (2,048 tokens in this checkpoint).
-The flag defaults off until full-model validation is available. Every visible
+The flag defaults off; the TP1 GSM8K run below exercised it. Every visible
 complete group wins top-k in this case, and stable top-k returns them in group
 order. The kernel directly writes logical token IDs through the query position
 and `-1` padding. The indexer's cache update still runs, so later long-context
@@ -236,6 +213,10 @@ padded and all-zero tie cases were also exact at 128k/256k on TP2 and TP4.
 The QSA CP path is separate from full PCP/DCP, whose Qwen backend guard
 remains because those modes require partitioned cache, page metadata and
 recurrent-state contracts.
+When the scored width cannot be split into equal, whole-page shards, or a
+shard cannot retain the global top-k, selection uses the ordinary local path.
+The native TP exchange is disabled in plugin mode, whose QSA graph metadata
+has a different owner. Both guards were added during review.
 
 ## GDN recurrent decode on gfx950
 
@@ -292,6 +273,9 @@ update remains in place. The two projection outputs matched the unfused
 outputs bit for bit in every complete-layer run. A separate graph microbench
 measured 32.9 → 20.4 µs at 4 rows and 35.6 → 21.5 µs at 16 rows.
 
+Initial synthetic-weight, complete decoder-layer graphs before the final HC
+helper cleanup (100 replays) measured:
+
 | Layer | Context | Rows | Baseline → tuned | Gain |
 | :--- | ---: | ---: | ---: | ---: |
 | QSA | 2k | 4 | 213.35 → 181.69 µs | 1.17× |
@@ -305,6 +289,23 @@ measured 32.9 → 20.4 µs at 4 rows and 35.6 → 21.5 µs at 16 rows.
 | GDN, FP32 state | — | 4 | 165.51 → 142.86 µs | 1.16× |
 | GDN, FP32 state | — | 8 | 174.13 → 157.90 µs | 1.10× |
 | GDN, FP32 state | — | 16 | 202.94 → 180.97 µs | 1.12× |
+
+A review rerun of the final high-level HC helper on the same four MI355X GPUs
+used 100 graph replays per case. Both sides used a temporary AITER BF16
+GEMM table with its incompatible FlyDSL A16W16 entries removed; neither AITER
+nor FlyDSL source was changed. These are still synthetic-weight layer times:
+
+| Layer | Context | Rows | Baseline → tuned | Gain |
+| :--- | ---: | ---: | ---: | ---: |
+| QSA | 128k | 4 | 262.24 → 220.14 µs | 1.19× |
+| QSA | 128k | 16 | 306.31 → 267.37 µs | 1.15× |
+| QSA | 256k | 4 | 285.75 → 238.63 µs | 1.20× |
+| QSA | 256k | 16 | 371.02 → 280.79 µs | 1.32× |
+| GDN, FP32 state | — | 16 | 203.12 → 181.39 µs | 1.12× |
+
+One initial 128k/four-row baseline capture took 325 µs while its tuned side
+stayed near 220 µs; an idle-GPU rerun measured 262.24 → 220.14 µs and is
+reported above. Selected QSA IDs matched the unsplit path in every final rerun.
 
 The QSA scorer now uses 256 rather than 64 column programs on gfx950 for
 4/8-row, four-head, 128-dimension decode when a rank scores at least 16,384
@@ -332,14 +333,14 @@ inputs.
 
 QSA selected token IDs were identical for the measured TP4 CP cases at
 128k/16 and 256k/4/8/16, and merged projection outputs were exact. Complete QSA
-layer stream/pending output NRMSE was at most 0.0028 on these synthetic
+layer stream/pending output NRMSE was at most 0.0031 on these synthetic
 weights. GDN/4's recurrent state NRMSE was 0.00004 and attention output NRMSE
 was 0.00148, but its deferred MoE output NRMSE was 0.032. The top-10 routed
 experts were identical before and after tuning; the synthetic constant FP8
 expert weights amplify small changes in the MoE input. At GDN/16, one row
 had 9/10 routing overlap and the deferred MoE output NRMSE was 0.0048.
-Checkpoint-weight
-full-layer accuracy and generation remain unverified.
+Checkpoint-weight GSM8K and short-context TP4 serving results appear below;
+checkpoint-weight 128k/256k generation remains unmeasured.
 
 Direct GEMM replacement was rejected: for the QSA `(M,N,K)=(4/8,3584,2560)`
 projection the existing CK path took about 14–15 µs, ASM 20–25 µs, and CK-Tile
@@ -437,10 +438,57 @@ the same QSA component with local sparse attention. Trained HC weights from
 the official checkpoint were separately parity checked.
 `tests/test_aiter_flydsl_gdn.py` checks gfx950 recurrent GDN dispatch, state
 writeback, padded decode, and graph replay.
-The full checkpoint is incomplete locally. Synthetic full-layer timing
-and numerical comparisons are reported above; checkpoint-weight full-layer
-accuracy, generation accuracy, and InferenceMAX throughput remain unmeasured.
 M3's one-launch sparse layer also includes index selection, attention, both TP
 reductions and MoE; this PR does not yet implement that layer-level fusion for
 Qwen's GDN/QSA and block-FP8 MoE. The 2–3× figures above are QSA component
 measurements, not full-model speedups.
+
+## Checkpoint-weight accuracy and API performance
+
+The complete local FP8 checkpoint (131 shards) served through native ATOM on
+MI355X without downloading model or evaluation data. A paired GSM8K run used
+all 1,319 test questions, 5-shot multiturn chat, greedy generation and a
+4,096-token output limit. The pre-PR ATOM checkout and this PR each used one
+GPU, eight concurrent requests, an 8,192-token context and CUDA graphs.
+Document and prompt hashes matched for every paired question; neither run
+reported API errors.
+
+| GSM8K exact match | Pre-PR ATOM | This PR |
+| :--- | ---: | ---: |
+| Flexible extraction | 1,289/1,319 (97.73%) | 1,288/1,319 (97.65%) |
+| Strict extraction | 1,287/1,319 (97.57%) | 1,286/1,319 (97.50%) |
+
+Flexible extraction had six questions correct only on the pre-PR checkout and
+five correct only on this PR. Strict extraction had eight and seven,
+respectively. The net change is one question (0.08 percentage points) under
+each filter; it does not establish a systematic accuracy loss or bitwise
+generation parity. The request phase took 14:01 on the pre-PR checkout and
+12:53 on the final PR code (1.09× in questions per second).
+TP1 exercises HC, short-context QSA and gfx950 GDN decode, but not the TP4
+merged projection or index CP.
+
+A separate local API probe used 78-token prompts and generated exactly 96
+tokens per request. With seven steady runs per batch, median completion
+throughput was:
+
+| TP1 concurrent requests | Pre-PR ATOM | This PR | Gain |
+| ---: | ---: | ---: | ---: |
+| 1 | 98.62 tokens/s | 100.68 tokens/s | 1.02× |
+| 4 | 318.82 tokens/s | 333.19 tokens/s | 1.05× |
+| 8 | 610.42 tokens/s | 640.87 tokens/s | 1.05× |
+
+For a checkpoint-weight TP4+EP4 check, 16 concurrent deterministic math
+prompts produced the same correct final answer with all Qwen optimization
+flags on and off. The flags-off comparison used this PR's model loader because
+the older checkout does not recognize `qwen4_exp_text` at TP4. A steady
+96-token, 16-request API probe measured median 849.96 → 891.30 completion
+tokens/s over five runs (1.05×); individual batches varied with scheduling.
+This probe used a short context, so it did not exercise long-context index CP.
+
+The local AITER/FlyDSL build could not compile some AITER GDN prefill and BF16
+GEMM kernels. Both sides used the existing Triton GDN prefill and the same
+temporary AITER BF16 table with incompatible FlyDSL A16W16 entries removed;
+no dependency source was changed. These paired results characterize that
+specific local setup. The 128k/256k tests above establish synthetic selection
+and layer behavior; checkpoint-weight long-context generation and
+InferenceMAX throughput remain unmeasured.

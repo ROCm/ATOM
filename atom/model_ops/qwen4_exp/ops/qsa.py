@@ -1232,15 +1232,13 @@ def qsa_select_paged_tokens(
     if index_cp is not None:
         rank, world, _ = index_cp
         groups_per_page = compressed_k_cache.shape[1]
-        if (
-            world < 2
-            or not 0 <= rank < world
-            or columns % (world * groups_per_page)
-            or columns // world < block_topk
-        ):
-            raise ValueError(
-                "QSA index CP needs equal page shards with local top-k capacity"
-            )
+        if world < 2 or not 0 <= rank < world:
+            raise ValueError("QSA index CP has an invalid TP rank or group size")
+        # An engine can reserve an arbitrary number of KV pages. Only use CP
+        # when the scored bucket divides into equal, page-aligned shards and
+        # each shard can retain the global top-k. Otherwise score locally.
+        if columns % (world * groups_per_page) or columns // world < block_topk:
+            index_cp = None
     output_width = block_topk * compress_ratio + compress_ratio - 1
 
     if out is None:

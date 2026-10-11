@@ -79,17 +79,13 @@ def rsrc(addr, nbytes=None):
 
 
 def dot2_bf16(a, b, acc):
-    """Accumulate two packed BF16 products using FlyDSL's ROCDL intrinsic."""
+    """Accumulate a packed BF16 pair with the public FlyDSL math API."""
     lhs = fx.Vector.from_elements([fx.Int32(a)], fx.Int32).bitcast(fx.BFloat16)
     rhs = fx.Vector.from_elements([fx.Int32(b)], fx.Int32).bitcast(fx.BFloat16)
-    return fx.Float32(
-        rocdl.fdot2_f32_bf16(
-            T.f32,
-            as_ir_value(lhs),
-            as_ir_value(rhs),
-            as_ir_value(fx.Float32(acc)),
-            clamp=False,
-        ).result
+    return fmath.fma(
+        fx.Float32(lhs[1]),
+        fx.Float32(rhs[1]),
+        fmath.fma(fx.Float32(lhs[0]), fx.Float32(rhs[0]), fx.Float32(acc)),
     )
 
 

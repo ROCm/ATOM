@@ -15,6 +15,7 @@ inputs because the two choices are different collectives on the same TP group.
 import torch
 import torch.distributed as dist
 
+from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 
 # Graph measurements on MI355X: TP4 custom gather still saves 12-22 us at
@@ -23,8 +24,8 @@ _CUSTOM_GATHER_MAX_PAYLOAD_BYTES = {2: 512 * 1024, 4: 1024 * 1024}
 
 
 def qsa_cp_enabled() -> bool:
-    """Whether QSA index-only context partitioning was requested."""
-    return envs.ATOM_QWEN38_QSA_CP
+    """Only native ATOM owns the TP exchange and QSA graph metadata here."""
+    return envs.ATOM_QWEN38_QSA_CP and not is_plugin_mode()
 
 
 def get_qsa_cp_group():
