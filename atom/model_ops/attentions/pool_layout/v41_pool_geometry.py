@@ -36,7 +36,13 @@ from dataclasses import dataclass
 
 import torch
 
-from .entry_arena import EntryField, entry_bytes_for, field_extents, plan_regions
+from .entry_arena import (
+    EntryField,
+    checkpoint_ranges_for,
+    entry_bytes_for,
+    field_extents,
+    plan_regions,
+)
 from .v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
     fp8_indexer_block_fields,
@@ -308,6 +314,8 @@ class V41PoolGeometry:
         # `K_pool` raw projections per owner, so a pool window reaching back
         # before this forward reads them from here instead of the caller
         # carrying an incomplete group across the boundary.
+        # Not checkpointed: CSA2 pools without overlap and a checkpoint sits on a
+        # PAGE boundary (a multiple of every ratio), so a resumer reads none.
         rings = [
             EntryField(
                 name,
@@ -315,6 +323,7 @@ class V41PoolGeometry:
                 (self.compress_ring_slots, self.head_dim),
                 torch.float32,
                 align=self.alignment,
+                in_checkpoint=False,
             )
             for name in ("compress_kv", "compress_score")
         ]
@@ -334,6 +343,15 @@ class V41PoolGeometry:
     @property
     def state_bytes(self):
         return self._aligned_bytes(self.state_fields)
+
+    @property
+    def checkpoint_image_ranges(self):
+        """`(offset, num_bytes)` of a STATE entry a checkpoint image holds."""
+        return checkpoint_ranges_for(self.state_fields)
+
+    @property
+    def checkpoint_image_bytes(self):
+        return sum(nbytes for _, nbytes in self.checkpoint_image_ranges)
 
     def main_offset(self, owner):
         return next(
@@ -372,6 +390,9 @@ class V41PoolGeometry:
             # Every other term below was already the same in v1, so without the
             # bump a v1 image would read as compatible and restore into fields
             # that no longer mean what it holds.
+            # v3: the image no longer carries the compressor tails, so it is
+            # no longer the whole entry; a v2 image would restore its tail
+            # bytes over the cursor.
             #
             # The index plane's format is here even though no STATE field holds
             # an index row: this string is what a resumed prefix is matched on,
@@ -380,7 +401,7 @@ class V41PoolGeometry:
             # than read off a field because FP8 is the only plane the scorer
             # takes -- an image from a build that had another must not match.
             f"dsv41-{'packed' if self.packed else 'bf16'}-index-fp8"
-            f"-state-v2:layers={self.layers}:owners={self.owners}"
+            f"-state-v3:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"
         )

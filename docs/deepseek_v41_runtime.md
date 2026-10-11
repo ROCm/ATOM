@@ -38,15 +38,19 @@ of the historical main KV.
 
 Allocation and checkpoints use the same `V41PoolGeometry` declarations.
 Positions and Engram history advance after the model forward; checkpoints
-carry every state field and padding byte. Images are versioned by geometry,
-including the index plane format. See
+carry the SWA rings and the cursor (position and Engram history), but not the
+FP32 compressor tails: CSA2 pools without overlap and a checkpoint sits on a
+PAGE boundary, a multiple of every ratio, so the first group a resumer reads is
+one its own forward writes (as DeepSeek-V4 leaves out its HCA tails). Images
+are versioned by geometry, including the index plane format. See
 [cache format and graph execution](deepseek_v41_performance.md#cache-format-and-attention-boundary)
 for the storage formats.
 
 An exact prefix hit restores the entire state before preparing Engram inputs.
 Without a matching image, the generic scheduler replays from a recoverable
 boundary. Checkpoint relocation/fork and restored tentative suffixes cannot
-retain stale compressor tails, window rows or Engram history.
+retain stale window rows or Engram history; a restore leaves the slot's own
+compressor tails, which the resumed forward overwrites before reading.
 
 ## Scheduler acceptance
 

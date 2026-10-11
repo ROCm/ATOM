@@ -3,19 +3,29 @@
 """K1 ``attn_pre``: one V4.1 layer from the attention seam to the rotated query.
 
 One launch a layer and rank, ``BLOCKS`` CTAs x ``THREADS`` threads, S = ``tokens``
-rows (a DSpark verify step). Stages, each a task table placed round the CTAs and
-handed off through the tagged mailbox (device scope; nothing crosses GPUs here):
+rows (a decode step). Stages, each a task table placed round the CTAs and
+handed off through the tagged mailbox (device scope; across GPUs only in a
+token-parallel build, below):
 
     slice   (160, 32 hidden columns x 4 streams each): the owed post folded into
             the residual (R_new, bf16 out), the collapsed layer input (mailbox
             LIN) and the partial mix projection / sum of squares (mailbox PMIX)
-    gate    (S): the 160 partials -> post / comb (Sinkhorn) and the next pre
-    norm    (S): attn_norm -> bf16, then quantize_fp8 of it (mailbox X8)
+    norm    (S): attn_norm of LIN -> bf16, then quantize_fp8 of it (mailbox X8)
     wqkv_a  (112, 16 rows): FP8 GEMV -> the q latent | kv row (mailbox QKV)
+    gate    (S): the 160 partials -> post / comb (Sinkhorn) and the next pre:
+            the next seam's, so after the stages a CTA may hold with it
     qkv     (S): q_norm -> MXFP8 (mailbox QX8); kv_norm -> RoPE -> FP8 QAT ->
             the window ring row
     wq_b    (the rank's heads x 512 / 16, 16 rows: 512 at TP4): FP8 GEMV -> bf16
             -> RoPE on each head's tail -> q out
+
+Token parallel (``tok_par``, S a multiple of TP; the owed post arrives
+reduce-scattered): slice .. qkv run on this rank's tokens (``own_view``), qkv
+pushes each token's q latent to every rank's QG / QGS (wq_b reads every
+token's from there) and its window row to every other rank's KG, which the
+launch's last stage writes into the ring; an indexer layer's iw runs on this
+rank's tokens too (head weights to every rank's IWG) and its normed rows reach
+every rank's ``normed`` through NBG, for the compressor.
 
 Every elementwise step follows the original seam's rounding (aiter's
 ``mhc_fused_post_pre_delayed_rmsnorm``, then ATOM's ``quantize_fp8``); the mix
@@ -34,8 +44,16 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
+from atom.models.deepseek_v41.mono.config import MAX_ROWS
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
-from atom.models.deepseek_v41.mono.kernels.dims import HEAD_DIM, Dims
+from atom.models.deepseek_v41.mono.kernels.dims import (
+    HC,
+    HEAD_DIM,
+    HIDDEN,
+    KV_DIM,
+    Q_RANK,
+    Dims,
+)
 from atom.models.deepseek_v41.mono.kernels.index_query import (
     IDX_ROPE,
     IDX_ROWS,
@@ -48,6 +66,8 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
     scratch_pairs as indexer_pairs,
 )
 from atom.models.deepseek_v41.mono.kernels.mx import code_round, fp8_value
+from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_offsets
+from atom.models.deepseek_v41.mono.kernels.token_par import own_view
 from atom.models.deepseek_v41.mono.sources import SOURCES
 from atom.mono.device.mx import (
     FP8_MAX,
@@ -65,32 +85,30 @@ from atom.mono.device.ops import (
     bf_lo,
     butterfly,
     div_rn,
+    first_rounds,
     fp8_pack4,
     fresh,
     hw_exp2,
     hw_rcp,
     hw_rsq,
     kernel_symbol,
-    lane_gather,
     launcher,
     ld_i32,
     row_sum,
     rsrc,
     traced,
 )
+from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
-from atom.mono.device.sync import POLL_MAX, sreg
+from atom.mono.device.sync import POLL_MAX, preg, sreg
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES, first_task
 from atom.mono.plan.layout import pair_layout
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.abi import KernelAbi
 
-HC = 4
-HIDDEN = 5120
 K_MIX = HC * HIDDEN
 MIX = HC * (HC + 2)  # 24 projections: pre 4 | post 4 | comb 16
-Q_RANK, KV_DIM = 1280, 512
 QKV_ROWS = Q_RANK + KV_DIM  # 1792
 ROPE = 64
 HALF = ROPE // 2
@@ -105,15 +123,18 @@ LOG2E = 1.0 / math.log(2.0)
 COLS = 32  # hidden columns a slice task
 SLICES = HIDDEN // COLS  # 160
 KT = HC * COLS  # projection columns a slice task
+# a slice's mix weights are whole rounds of the CTA (``slice_fn_loads``)
+assert MIX * KT % THREADS == 0
 PART = MIX + 1  # a slice's partials a token: the mixes, then the sum of squares
 ROWS = 16  # GEMV rows a task
 TILE = 16  # an MFMA's N: the tokens a GEMV pass takes (``token_tiles``)
-MAX_TOKENS = 48  # a step's rows at most
+MAX_TOKENS = MAX_ROWS  # a step's rows at most (``config``)
 WQKV_TASKS = QKV_ROWS // ROWS  # 112
 X8_WORDS = HIDDEN // 4  # fp8 words of a normed row
 QX8_WORDS = Q_RANK // 4
 
-# every stage's first CTA; a CTA runs its tasks of each stage in this order
+# every stage's first CTA; the norm's have no slice, so its weights go out at
+# launch
 GATE0 = SLICES
 NORM0 = GATE0 + 8
 WQKV0 = NORM0 + 8
@@ -148,10 +169,23 @@ class AttnPreBuild:
     # ``ATOM_MONO_DEBUG``: bounded mailbox waits recording at this scratch
     # offset (``debug``); -1 is the normal build
     diag_off: int = -1
+    # token parallel: the owed post arrives reduce-scattered (each rank its own
+    # tokens' rows), slice .. qkv run on this rank's tokens, and their q latent
+    # (QG) and window rows (KG) are gathered from every rank
+    tok_par: bool = False
 
 
 # ``timeline`` stamps: kernel start, then the end of each stage's task loop
-TL_STAGES = ("slice", "gate", "norm", "wqkv_a", "qkv", "wq_b", "index")
+TL_STAGES = ("slice", "norm", "wqkv_a", "gate", "qkv", "wq_b", "index")
+
+
+# the per-token arguments slice .. qkv read and write (``own_view``)
+K1_OWN = (
+    "res_in", "pend", "post_in", "comb_in", "pre_in", "res_out", "post_out",
+    "comb_out", "pre_out", "pos", "ring_rows", "normed", "aux", "qr_out", "qrs_out",
+)  # fmt: skip
+
+
 TL_POINTS = 1 + len(TL_STAGES)
 
 
@@ -162,7 +196,7 @@ ABI = KernelAbi(
         "wqb", "wqb_s", "cos", "sin", "pos", "ring", "ring_rows", "ring_off",
         "res_out", "post_out", "comb_out", "pre_out", "q_out", "normed", "qr_out",
         "qrs_out", "aux", "iq_w", "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out",
-        "scratch", "layer", "tl",
+        "scratch", "sym", "peers", "rank", "layer", "tl",
     )
 )  # fmt: skip
 
@@ -203,10 +237,6 @@ def ld_bf(ptr, i):
     return fx.Float32(
         fx.BFloat16(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.bf16))
     )
-
-
-def lane_f32(v, src):
-    return lane_gather(v.bitcast(fx.Int32), src).bitcast(fx.Float32)
 
 
 def nth_task(first, i):
@@ -345,28 +375,62 @@ def slice_row(c, c0, e, got):
     fx.ptr_store(v, c["rl"] + (t * KT + o * COLS + e % COLS))
 
 
-@traced
-def stage_slice(c, task):
-    """R_new, the layer input and the partial projections of hidden columns
-    32 task .. +32, all four streams, every token."""
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
-    rl, fl = c["rl"], c["fl"]
+def slice_fn_loads(c, task):
+    """``task``'s columns of the mix projection's weights, a thread's
+    ``MIX KT / THREADS``: no wait decides them, so they go out first."""
     a = c["args"]
     c0 = task * COLS
+    fns = []
+    for i in range_constexpr(MIX * KT // THREADS):
+        e = c["tid"] + THREADS * i
+        j = e // KT
+        o = (e % KT) // COLS
+        fns.append(ld_f32(a["hc_fn"], j * K_MIX + o * HIDDEN + c0 + e % COLS))
+    return fns
+
+
+# a slice of at most this many rows holds its weights through K2a's wait as
+# well; wider, those registers spill
+SLICE_FN_EARLY_MAX = 24
+
+
+def slice_issued(c, task, pre):
+    """``stage_slice``'s (weights, first rows' loads) issued ahead of its rows:
+    what the caller issued (``pre``; weights None: loaded after the rows), or
+    else the weights now."""
+    return (slice_fn_loads(c, task), None) if pre is None else pre
+
+
+def slice_prefetch(c, task):
+    """``stage_slice``'s first residual / gate loads for ``task`` and, up to
+    ``SLICE_FN_EARLY_MAX`` rows, its weights, issued before a wait they do not
+    depend on (K2a's: the attention partials)."""
+    c0 = task * COLS
+    rows = first_rounds(c["tid"], c["S"] * KT, lambda e: slice_loads(c, c0, e))
+    fns = slice_fn_loads(c, task) if c["S"] <= SLICE_FN_EARLY_MAX else None
+    return fns, rows
+
+
+@traced
+def stage_slice(c, task, pre=None):
+    """R_new, the layer input and the partial projections of hidden columns
+    32 task .. +32, all four streams, every token. ``pre``: its weights and
+    first loads, already issued (``slice_prefetch``)."""
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    rl, fl = c["rl"], c["fl"]
+    c0 = task * COLS
+    fns, rows = slice_issued(c, task, pre)
     batched_rounds(
         tid, s * KT, lambda e: slice_loads(c, c0, e),
-        lambda e, got: slice_row(c, c0, e, got),
+        lambda e, got: slice_row(c, c0, e, got), first=rows,
     )  # fmt: skip
-    for i in range_constexpr((MIX * KT + THREADS - 1) // THREADS):
-        e = tid + THREADS * i
-        if e < MIX * KT:
-            j = e // KT
-            o = (e % KT) // COLS
-            # the original's two bf16 MFMAs take fn as hi = bf16(fn) and lo =
-            # bf16(fn - hi): their sum, exact in fp32, is the weight it applies
-            f = ld_f32(a["hc_fn"], j * K_MIX + o * HIDDEN + c0 + e % COLS)
-            hi = bf16_round(f)
-            fx.ptr_store(hi + bf16_round(f - hi), fl + e)
+    if const_expr(fns is None):
+        fns = slice_fn_loads(c, task)
+    for i in range_constexpr(MIX * KT // THREADS):
+        # the original's two bf16 MFMAs take fn as hi = bf16(fn) and lo =
+        # bf16(fn - hi): their sum, exact in fp32, is the weight it applies
+        hi = bf16_round(fns[i])
+        fx.ptr_store(hi + bf16_round(fns[i] - hi), fl + (tid + THREADS * i))
     gpu.barrier()
     # the layer input: bf16 R_new of the four streams by the incoming pre-mix,
     # products rounded, summed in order (the Triton collapse, no contraction);
@@ -422,15 +486,18 @@ def slice_mix(c, task, t0, n):
 
 # ---------------------------------------------------------------- gate
 GATE_BLOCK = 8  # slices a gate thread sums
+# comb[r][c] at lane COMB0 + 4 r + c: one DPP row of 16 lanes, a row's sum
+# lanes xor 1, 2 and a column's xor 4, 8. Both add (e0 + e1) + (e2 + e3), the
+# reference's order
+COMB0 = 16
 
 
-def _row(v, lane, q):
-    """comb lanes 8..23 hold comb[r][c] at lane 8 + 4 r + c: element q of the row."""
-    return lane_f32(v, (lane - 8) // 4 * 4 + 8 + q)
+def _row_sum(v):
+    return butterfly(v, (1, 2))
 
 
-def _col(v, lane, q):
-    return lane_f32(v, 8 + 4 * q + (lane - 8) % 4)
+def _col_sum(v):
+    return butterfly(v, (4, 8))
 
 
 @traced
@@ -455,7 +522,10 @@ def stage_gate(c, t):
         fx.ptr_store(acc, red + (g * PART + j))
     gpu.barrier()
     if wave == 0:
-        j = fx.min(lane, MIX - 1)
+        # lane -> its mix: pre / post on lanes 0 .. 7, comb from lane COMB0
+        j = (lane < COMB0).select(
+            lane % (2 * HC), fx.min(lane - COMB0 + 2 * HC, MIX - 1)
+        )
         mix = fx.ptr_load(red + j)
         sq = fx.ptr_load(red + MIX)
         for g in range_constexpr(1, groups):
@@ -475,26 +545,17 @@ def stage_gate(c, t):
                 post * fx.Float32(POST_MULT), rsrc(a["post_out"]), t * HC + lane - HC
             )
         cv = fma(v, sc[2], base)
-        row = [_row(cv, lane, q) for q in range(4)]
         # Triton's exp: exp2 of (x - max) log2(e)
-        m = fx.max(fx.max(row[0], row[1]), fx.max(row[2], row[3]))
+        m = butterfly(cv, (1, 2), fx.max)
         cv = hw_exp2((cv - m) * fx.Float32(LOG2E))
         # fast_dividef is x rcp(y); its first "+ eps" contracts into the fma
-        row = [_row(cv, lane, q) for q in range(4)]
-        cv = fma(cv, hw_rcp((row[0] + row[1]) + (row[2] + row[3])), fx.Float32(HC_EPS))
-        col = [_col(cv, lane, q) for q in range(4)]
-        cv = cv * hw_rcp(((col[0] + col[1]) + (col[2] + col[3])) + fx.Float32(HC_EPS))
+        cv = fma(cv, hw_rcp(_row_sum(cv)), fx.Float32(HC_EPS))
+        cv = cv * hw_rcp(_col_sum(cv) + fx.Float32(HC_EPS))
         for _ in range_constexpr(SINKHORN - 1):
-            row = [_row(cv, lane, q) for q in range(4)]
-            cv = cv * hw_rcp(
-                ((row[0] + row[1]) + (row[2] + row[3])) + fx.Float32(HC_EPS)
-            )
-            col = [_col(cv, lane, q) for q in range(4)]
-            cv = cv * hw_rcp(
-                ((col[0] + col[1]) + (col[2] + col[3])) + fx.Float32(HC_EPS)
-            )
-        if (lane >= 2 * HC) & (lane < MIX):
-            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - 2 * HC)
+            cv = cv * hw_rcp(_row_sum(cv) + fx.Float32(HC_EPS))
+            cv = cv * hw_rcp(_col_sum(cv) + fx.Float32(HC_EPS))
+        if (lane >= COMB0) & (lane < COMB0 + HC * HC):
+            bo.buffer_store(cv, rsrc(a["comb_out"]), t * HC * HC + lane - COMB0)
     gpu.barrier()
 
 
@@ -515,13 +576,20 @@ def stage_norm(c, t):
     tt = fx.min(tid, 255)
     mine = tid < 256
     cols = [tt * 8 + 2048 * ch for ch in range(3)]
+    # the norm weights, which the row does not decide: loaded before its wait
+    wts = [
+        [ld_bf(a["attn_w"], fx.min(cols[ch], HIDDEN - 8) + j) for j in range(8)]
+        for ch in range(3)
+    ]
+    bases = [t * HIDDEN + fx.min(cols[ch], HIDDEN - 8) for ch in range(3)]
+    words = c["poll"](
+        [(c["lin"], bases[ch] // 2 + k, 1) for ch in range(3) for k in range(4)]
+    )
     xs = []
     for ch in range_constexpr(3):
-        base = t * HIDDEN + fx.min(cols[ch], HIDDEN - 8)
-        words = c["poll"]([(c["lin"], base // 2 + k, 1) for k in range(4)])
         v = []
         for k in range_constexpr(4):
-            v += [bf_lo(words[k][0]), bf_hi(words[k][0])]
+            v += [bf_lo(words[4 * ch + k][0]), bf_hi(words[4 * ch + k][0])]
         xs.append([(cols[ch] < HIDDEN).select(x, fx.Float32(0.0)) for x in v])
     acc = fx.Float32(0.0)
     for ch in range_constexpr(3):
@@ -535,9 +603,7 @@ def stage_norm(c, t):
     r = hw_rsq(fma(tot, fx.Float32(1.0 / HIDDEN), fx.Float32(EPS)))
     for ch in range_constexpr(3):
         col = fx.min(cols[ch], HIDDEN - 8)
-        ys = [
-            bf16_round((xs[ch][j] * r) * ld_bf(a["attn_w"], col + j)) for j in range(8)
-        ]
+        ys = [bf16_round((xs[ch][j] * r) * wts[ch][j]) for j in range(8)]
         amax = fx.Float32(0.0)
         for y in ys:
             amax = fx.max(amax, abs(y))
@@ -557,6 +623,14 @@ def stage_norm(c, t):
                 # the indexer's weights_proj reads the bf16 row
                 c["put_bf"](c["nb"], t * HIDDEN + col, ys[0:4])
                 c["put_bf"](c["nb"], t * HIDDEN + col + 4, ys[4:8])
+                if const_expr(c["tok_par"]):
+                    # token parallel: the row for every other rank's compressor
+                    tg = c["t0"] + t
+                    for p in range_constexpr(c["d"].tp):
+                        if c["rank"] != p:
+                            dst = c["nb_dsts"][p]
+                            c["put_bf"](dst, tg * HIDDEN + col, ys[0:4])
+                            c["put_bf"](dst, tg * HIDDEN + col + 4, ys[4:8])
             if const_expr(not c["ffn"]):
                 w0 = fp8_pack4(*[clamp_fp8(ys[i] / step) for i in range(4)])
                 w1 = fp8_pack4(*[clamp_fp8(ys[4 + i] / step) for i in range(4)])
@@ -816,14 +890,26 @@ def stage_qkv(c, t):
     tt = fx.min(tid, 255)
     mine = tid < 256
     qc = [fx.min(tt * 8 + j, Q_RANK - 1) for j in range(8)]
-    qv = c["poll"]([(c["qkv"], t * QKV_ROWS + qc[j], 1) for j in range(8)])
+    # every weight and table value the token's rows do not decide, loaded
+    # before their wait
+    qnw = [ld_bf(a["qn_w"], qc[j]) for j in range(8)]
+    kvnw = [ld_bf(a["kvn_w"], tt * 2 + j) for j in range(2)]
+    pos = ld_i32(a["pos"], 2 * t)
+    jr = tt - (KV_DIM - ROPE) // 2
+    live = jr >= 0
+    jj = fx.max(jr, 0)
+    cs = live.select(ld_bf(a["cos"], pos * HALF + jj), fx.Float32(1.0))
+    sn = live.select(ld_bf(a["sin"], pos * HALF + jj), fx.Float32(0.0))
+    rel = ld_i32(a["ring_rows"], t)
+    got = c["poll"](
+        [(c["qkv"], t * QKV_ROWS + qc[j], 1) for j in range(8)]
+        + [(c["qkv"], t * QKV_ROWS + Q_RANK + tt * 2 + j, 1) for j in range(2)]
+    )
+    qv, kvv = got[:8], got[8:]
     xq = [
         ((tt * 8 + j) < Q_RANK).select(qv[j][0].bitcast(fx.Float32), fx.Float32(0.0))
         for j in range(8)
     ]
-    kvv = c["poll"](
-        [(c["qkv"], t * QKV_ROWS + Q_RANK + tt * 2 + j, 1) for j in range(2)]
-    )
     xk = [kvv[j][0].bitcast(fx.Float32) for j in range(2)]
     ssq = xq[0] * xq[0]
     for j in range_constexpr(1, 8):
@@ -845,7 +931,7 @@ def stage_qkv(c, t):
         + fx.Float32(EPS)
     )
     # q: MXFP8 by _mxfp8_quant_op, a group of 32 = 4 threads
-    ys = [(xq[j] * nq) * ld_bf(a["qn_w"], qc[j]) for j in range(8)]
+    ys = [(xq[j] * nq) * qnw[j] for j in range(8)]
     amax = fx.Float32(0.0)
     for y in ys:
         amax = fx.max(amax, abs(y))
@@ -854,9 +940,18 @@ def stage_qkv(c, t):
     if mine & (tt * 8 < Q_RANK):
         w0 = fp8_pack4(*[ys[i] * mul for i in range(4)])
         w1 = fp8_pack4(*[ys[4 + i] * mul for i in range(4)])
-        c["put_words"](c["qx8"], t * QX8_WORDS + 2 * tt, [w0, w1])
-        if tt % 4 == 0:
-            c["put"](c["qx8s"], t * (Q_RANK // 32) + tt // 4, code)
+        if const_expr(c["tok_par"]):
+            # token parallel: to every rank, at the token's row of the step
+            tg = c["t0"] + t
+            for p in range_constexpr(c["d"].tp):
+                qw, qs = c["q_dsts"][p]
+                c["put_words"](qw, tg * QX8_WORDS + 2 * tt, [w0, w1])
+                if tt % 4 == 0:
+                    c["put"](qs, tg * (Q_RANK // 32) + tt // 4, code)
+        else:
+            c["put_words"](c["qx8"], t * QX8_WORDS + 2 * tt, [w0, w1])
+            if tt % 4 == 0:
+                c["put"](c["qx8s"], t * (Q_RANK // 32) + tt // 4, code)
         if const_expr(c["index"]):
             # the (qr, qr_scale) pair the original indexer reads
             bo.buffer_store(
@@ -869,13 +964,7 @@ def stage_qkv(c, t):
                     fx.Int8(code), rsrc(a["qrs_out"]), t * (Q_RANK // 32) + tt // 4
                 )
     # kv: this thread's pair (2 tt, 2 tt + 1), RoPE on the last 64 columns
-    kn = [bf16_round((xk[j] * nk) * ld_bf(a["kvn_w"], tt * 2 + j)) for j in range(2)]
-    pos = ld_i32(a["pos"], 2 * t)
-    jr = tt - (KV_DIM - ROPE) // 2
-    live = jr >= 0
-    jj = fx.max(jr, 0)
-    cs = live.select(ld_bf(a["cos"], pos * HALF + jj), fx.Float32(1.0))
-    sn = live.select(ld_bf(a["sin"], pos * HALF + jj), fx.Float32(0.0))
+    kn = [bf16_round((xk[j] * nk) * kvnw[j]) for j in range(2)]
     e0 = bf16_round(kn[0] * cs - kn[1] * sn)
     e1 = bf16_round(kn[0] * sn + kn[1] * cs)
     amax = butterfly(fx.max(abs(e0), abs(e1)), (1, 2, 4, 8), fx.max)
@@ -883,22 +972,85 @@ def stage_qkv(c, t):
     qat = [fp8_value(clamp_fp8(v / step)) * step for v in (e0, e1)]
     # the ring row of a [rows, 512] bf16 pool: the step's row of this token (int32,
     # -1: none) past the layer's ring start
-    rel = ld_i32(a["ring_rows"], t)
     row = rel + a["ring_off"]
     if mine & (rel >= 0):
         dst = rsrc(a["ring"] + fx.Int64(row) * (KV_DIM * 2))
         for j in range_constexpr(2):
             bo.buffer_store(qat[j].to(fx.BFloat16), dst, tt * 2 + j)
+    if const_expr(c["tok_par"]):  # noqa: SIM102
+        # token parallel: the row to every other rank (``ring_row_from``)
+        if mine:
+            tg = c["t0"] + t
+            for p in range_constexpr(c["d"].tp):
+                if c["rank"] != p:
+                    c["put_bf"](c["kv_dsts"][p], tg * KV_DIM + 2 * tt, qat)
     gpu.barrier()
+
+
+@traced
+def normed_row_from(c, nbg, t, n):
+    """Token t, when another rank owns it: its normed row from NBG -> ``normed``
+    (``stage_norm``'s store)."""
+    tid = c["tid"]
+    a = c["args"]
+    if t // n != c["rank"]:
+        for k in range_constexpr(-(-(HIDDEN // 4) // THREADS)):
+            q = tid + THREADS * k
+            if q < HIDDEN // 4:
+                (w,) = c["poll"]([(nbg, t * (HIDDEN // 2) + 2 * q, 2)])
+                bo.buffer_store(
+                    fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                    rsrc(a["normed"]),
+                    t * (HIDDEN // 2) + 2 * q,
+                )
+
+
+@traced
+def ring_row_from(c, kg, t, n):
+    """Token t, when another rank owns it: its window row from KG -> the ring
+    row (``stage_qkv``'s store)."""
+    tid = c["tid"]
+    a = c["args"]
+    if t // n != c["rank"]:
+        rel = ld_i32(a["ring_rows"], t)
+        row = rel + a["ring_off"]
+        if tid < KV_DIM // 2:
+            (w,) = c["poll"]([(kg, t * (KV_DIM // 2) + tid, 1)])
+            if rel >= 0:
+                bo.buffer_store(
+                    w[0],
+                    rsrc(a["ring"] + fx.Int64(row) * (KV_DIM * 2)),
+                    tid,
+                )
 
 
 # ---------------------------------------------------------------- wq_b
 @traced
-def stage_wqb(c, task, ops, t0=0, n=None):
+def rope_pair(c, t0, n, dim0):
+    """This thread's (cos, sin) for its token of the tile from ``t0`` (``n``
+    rows, the index clamped into them) at pair dim0 // 2 of a head's rotated
+    tail -- the thread map of ``stage_wqb`` / ``stage_iq``'s epilogue; loaded
+    before the GEMV waits for its x, used after it."""
+    a = c["args"]
+    tl = c["tid"] // (ROWS // 2)
+    pos = ld_i32(a["pos"], 2 * plus(t0, fx.min(tl, n - 1)))
+    jj = fx.max(dim0, 0) // 2
+    return ld_bf(a["cos"], pos * HALF + jj), ld_bf(a["sin"], pos * HALF + jj)
+
+
+@traced
+def wqb_rope(c, task, t0, n):
+    """``rope_pair`` for row task 16 + 2 (tid % 8) of wq_b."""
+    d = (task * ROWS + 2 * (c["tid"] % (ROWS // 2))) % HEAD_DIM
+    return rope_pair(c, t0, n, d - (HEAD_DIM - ROPE))
+
+
+@traced
+def stage_wqb(c, task, ops, t0, n, rope):
     """Rows 16 task .. +16 of the rank's heads x 512: FP8 GEMV -> bf16 -> the
     GPT-J RoPE of a head's last 64 dims (the Triton seam: bf16 products are exact,
     so its contraction does not show) -> q out; the token tile from ``t0`` (its
-    x in LDS)."""
+    x in LDS), ``rope`` its tables (``wqb_rope``, loaded before x's wait)."""
     tid, red = c["tid"], c["red"]
     n = c["S"] if n is None else n
     a = c["args"]
@@ -912,12 +1064,8 @@ def stage_wqb(c, task, ops, t0=0, n=None):
         v0 = bf16_round(row_sum(red, 2 * rp, tl))
         v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
         d = r0 % HEAD_DIM
-        jr = (d - (HEAD_DIM - ROPE)) // 2
         live = d >= HEAD_DIM - ROPE
-        pos = ld_i32(a["pos"], 2 * t)
-        jj = fx.max(jr, 0)
-        cs = ld_bf(a["cos"], pos * HALF + jj)
-        sn = ld_bf(a["sin"], pos * HALF + jj)
+        cs, sn = rope
         e0 = fx.Float32(live.select(v0 * cs - v1 * sn, v0))
         e1 = fx.Float32(live.select(v0 * sn + v1 * cs, v1))
         out = t * c["d"].heads * HEAD_DIM + r0
@@ -927,13 +1075,19 @@ def stage_wqb(c, task, ops, t0=0, n=None):
 
 
 @traced
-def stage_iq(c, task, ops, t0=0, n=None):
+def iq_rope(c, task, t0, n):
+    """``rope_pair`` for row task 16 + 2 (tid % 8) of the index query."""
+    d = (task * ROWS + 2 * (c["tid"] % (ROWS // 2))) % ip.DIM
+    return rope_pair(c, t0, n, d - (ip.DIM - IDX_ROPE))
+
+
+@traced
+def stage_iq(c, task, ops, t0, n, rope):
     """Rows 16 task .. of the indexer's wq_b [4096, 1280]: FP8 GEMV of the q
     latent -> bf16 -> the GPT-J RoPE of a head's dims 64..127 -> IQ; the token
-    tile from ``t0`` (its x in LDS)."""
+    tile from ``t0`` (its x in LDS), ``rope`` its tables (``iq_rope``)."""
     tid, red = c["tid"], c["red"]
     n = c["S"] if n is None else n
-    a = c["args"]
     gemv_fp8_mfmas(c, Q_RANK, c["qxl"], c["qxsl"], red, ops, rows=n)
     gpu.barrier()
     if tid < ROWS * n // 2:
@@ -945,10 +1099,7 @@ def stage_iq(c, task, ops, t0=0, n=None):
         v1 = bf16_round(row_sum(red, 2 * rp + 1, tl))
         d = r0 % ip.DIM
         live = d >= ip.DIM - IDX_ROPE
-        jj = fx.max((d - (ip.DIM - IDX_ROPE)) // 2, 0)
-        pos = ld_i32(a["pos"], 2 * t)
-        cs = ld_bf(a["cos"], pos * HALF + jj)
-        sn = ld_bf(a["sin"], pos * HALF + jj)
+        cs, sn = rope
         # bf16 x bf16 products are exact: the original's contraction cannot show
         e0 = fx.Float32(live.select(v0 * cs - v1 * sn, v0))
         e1 = fx.Float32(live.select(v0 * sn + v1 * cs, v1))
@@ -964,6 +1115,10 @@ def build_attn_pre(key: AttnPreBuild):
     keyed = key_tuple(key, SOURCES)
     dims = Dims(key.tp)
     assert dims.wqb_tasks % BLOCKS == 0
+    if key.tok_par:
+        assert s % key.tp == 0, f"{s} rows do not split over {key.tp} ranks"
+    own_n = s // key.tp if key.tok_par else s
+    own_tiles, own_rows_lds = token_tiles(own_n), tile_rows(own_n)
     wqb_per_cta = dims.wqb_tasks // BLOCKS
 
     # LDS: what several stages read, then one union of what only one stage
@@ -1006,6 +1161,7 @@ def build_attn_pre(key: AttnPreBuild):
         i4=int(key.index_fp4),
         a=int(key.aux),
         tl=int(key.timeline),
+        tpar=int(key.tok_par),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1017,7 +1173,8 @@ def build_attn_pre(key: AttnPreBuild):
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
-        iw_out: Int64, scratch: Int64, layer: Int32, tl: Int64,
+        iw_out: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, tl: Int64,
     ):  # fmt: skip
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1044,59 +1201,83 @@ def build_attn_pre(key: AttnPreBuild):
                 "iq_out": iq_out, "iqs_out": iqs_out, "iw_out": iw_out,
             },
             "fold": key.fold, "index": key.feeds_index, "aux": key.aux, "ffn": False,
-            "d": dims,
+            "d": dims, "tok_par": False,
         }  # fmt: skip
         for region, (off, _) in layout.items():
             c[region] = sreg(scratch, off, region)
+        c["rank"] = rank
+        if const_expr(key.tok_par):
+            bases = peer_bases(peers, key.tp)
+            c["peer_addr"] = lambda p: bases[p]
+            pl = peer_offsets(s, key.tp)
+            co = own_view(c, K1_OWN)
+            co["tok_par"] = True
+            # qkv pushes its token's q latent to every rank's QG / QGS and its
+            # window row to every other rank's KG
+            co["q_dsts"] = [
+                (preg(bases[p], pl["qg"], "qg"), preg(bases[p], pl["qgs"], "qgs"))
+                for p in range(key.tp)
+            ]
+            co["kv_dsts"] = [preg(bases[p], pl["kg"], "kg") for p in range(key.tp)]
+            co["nb_dsts"] = [preg(bases[p], pl["nbg"], "nbg") for p in range(key.tp)]
+            co["iw_dsts"] = [preg(bases[p], pl["iwg"], "iwg") for p in range(key.tp)]
+        else:
+            co = c
         timeline = key.timeline
         tls = lds.tls.ptr
         stamp_begin(timeline, tls, tid, TL_POINTS)
         enter_stage("k1.slice")
         for task in range(first_task(bid, 0), SLICES, BLOCKS):
-            stage_slice(c, task)
+            stage_slice(co, task)
         stamp(timeline, tls, tid, 1)
-        enter_stage("k1.gate")
-        for t in range(first_task(bid, GATE0), s, BLOCKS):
-            stage_gate(c, t)
-        stamp(timeline, tls, tid, 2)
+        # the gate's outputs are the next seam's: it runs after the stages
+        # this launch waits on that its CTAs may also hold (norm, wqkv_a)
         enter_stage("k1.norm")
-        for t in range(first_task(bid, NORM0), s, BLOCKS):
-            stage_norm(c, t)
-        stamp(timeline, tls, tid, 3)
+        for t in range(first_task(bid, NORM0), own_n, BLOCKS):
+            stage_norm(co, t)
+        stamp(timeline, tls, tid, 2)
         enter_stage("k1.wqkv_a")
         # a CTA's wqkv task (at most one): its weights in flight before the
         # normed row's wait
         assert WQKV_TASKS <= BLOCKS
-        if const_expr(len(tiles) == 1):
+        if const_expr(len(own_tiles) == 1):
             wqkv_task = first_task(bid, WQKV0)
             if wqkv_task < WQKV_TASKS:
-                wqkv_ops = gemv_fp8_loads(c, wqkv, wqkv_s, HIDDEN, wqkv_task)
+                wqkv_ops = gemv_fp8_loads(co, wqkv, wqkv_s, HIDDEN, wqkv_task)
                 load_x8(
-                    c, c["x8"], c["x8s"], X8_WORDS, HIDDEN // 32, c["xl"], c["xsl"],
-                    0, rows,
+                    co, co["x8"], co["x8s"], X8_WORDS, HIDDEN // 32, co["xl"],
+                    co["xsl"], 0, own_rows_lds,
                 )  # fmt: skip
-                stage_wqkv(c, wqkv_task, wqkv_ops, 0, s)
+                stage_wqkv(co, wqkv_task, wqkv_ops, 0, own_n)
         else:
             # a task's tiles in series on one CTA left more than half the CTAs
             # idle through it (the weights read again a tile: L2 hits)
-            tile, wqkv_tasks = tile_tasks(bid, WQKV0, len(tiles), WQKV_TASKS)
+            tile, wqkv_tasks = tile_tasks(bid, WQKV0, len(own_tiles), WQKV_TASKS)
             wqkv_ops = [
-                gemv_fp8_loads(c, wqkv, wqkv_s, HIDDEN, fx.min(t, WQKV_TASKS - 1))
+                gemv_fp8_loads(co, wqkv, wqkv_s, HIDDEN, fx.min(t, WQKV_TASKS - 1))
                 for t in wqkv_tasks
             ]
             t0 = tile * TILE
-            n = fx.min(fx.Int32(TILE), s - t0)
+            n = fx.min(fx.Int32(TILE), own_n - t0)
             load_x8(
-                c, c["x8"], c["x8s"], X8_WORDS, HIDDEN // 32, c["xl"], c["xsl"],
+                co, co["x8"], co["x8s"], X8_WORDS, HIDDEN // 32, co["xl"], co["xsl"],
                 t0, n,
             )  # fmt: skip
             for k in range_constexpr(len(wqkv_tasks)):
                 if wqkv_tasks[k] < WQKV_TASKS:
-                    stage_wqkv(c, wqkv_tasks[k], wqkv_ops[k], t0, n)
+                    stage_wqkv(co, wqkv_tasks[k], wqkv_ops[k], t0, n)
+        stamp(timeline, tls, tid, 3)
+        enter_stage("k1.gate")
+        for t in range(first_task(bid, GATE0), own_n, BLOCKS):
+            stage_gate(co, t)
         stamp(timeline, tls, tid, 4)
         enter_stage("k1.qkv")
-        for t in range(first_task(bid, QKV0), s, BLOCKS):
-            stage_qkv(c, t)
+        for t in range(first_task(bid, QKV0), own_n, BLOCKS):
+            stage_qkv(co, t)
+        if const_expr(key.tok_par):
+            # wq_b reads every token's q latent where qkv pushed it
+            c["qx8"] = preg(sym, pl["qg"], "qg")
+            c["qx8s"] = preg(sym, pl["qgs"], "qgs")
         stamp(timeline, tls, tid, 5)
         enter_stage("k1.wq_b")
         # every CTA's wq_b tasks (and an indexer layer's wq task), two at a
@@ -1114,6 +1295,12 @@ def build_attn_pre(key: AttnPreBuild):
             iq_ops = gemv_fp8_loads(c, iq_w, iq_ws, Q_RANK, iq_task)
         wqb_all = list(wqb_ops)
         for t0, n in tiles:
+            # the epilogues' RoPE tables, loaded before the q latent's wait
+            ropes = [
+                wqb_rope(c, nth_task(wqb_task, b), t0, n) for b in range(wqb_per_cta)
+            ]
+            if const_expr(key.feeds_index):
+                iq_ropes = iq_rope(c, iq_task, t0, n)
             load_x8(
                 c, c["qx8"], c["qx8s"], QX8_WORDS, Q_RANK // 32, c["qxl"], c["qxsl"],
                 t0, n,
@@ -1125,23 +1312,30 @@ def build_attn_pre(key: AttnPreBuild):
                         for i in range(min(2, wqb_per_cta - b))
                     ]
                 for i in range_constexpr(min(2, wqb_per_cta - b)):
-                    stage_wqb(c, nth_task(wqb_task, b + i), wqb_all[b + i], t0, n)
+                    stage_wqb(
+                        c, nth_task(wqb_task, b + i), wqb_all[b + i], t0, n,
+                        ropes[b + i],
+                    )  # fmt: skip
             if const_expr(key.feeds_index):
-                stage_iq(c, iq_task, iq_ops, t0, n)
+                stage_iq(c, iq_task, iq_ops, t0, n, iq_ropes)
         stamp(timeline, tls, tid, 6)
         if const_expr(key.feeds_index):
             enter_stage("k1.index_w")
 
             def load_group(g, n):
                 poll_copy(
-                    c, tid, THREADS,
-                    [(c["nb"], lambda u: plus(g * HIDDEN // 2, u), n * HIDDEN // 2,
+                    co, tid, THREADS,
+                    [(co["nb"], lambda u: plus(g * HIDDEN // 2, u), n * HIDDEN // 2,
                       il.nbl.ptr, None)],
                 )  # fmt: skip
                 gpu.barrier()
 
             for task in range(first_task(bid, IW0), IW_TASKS, BLOCKS):
-                stage_iw(c, task, HIDDEN, il.nbl.ptr, load_group)
+                stage_iw(co, task, HIDDEN, il.nbl.ptr, load_group)
+            if const_expr(key.tok_par):
+                # the quantization reads every token's head weights where iw
+                # pushed them
+                c["iw"] = preg(sym, pl["iwg"], "iwg")
             enter_stage("k1.index_quant")
             for task in range(first_task(bid, IQUANT0), s * ip.HEADS, BLOCKS):
                 if const_expr(key.index_fp4):
@@ -1149,6 +1343,15 @@ def build_attn_pre(key: AttnPreBuild):
                 else:
                     stage_iquant(c, task)
         stamp(timeline, tls, tid, TL_POINTS - 1)
+        if const_expr(key.tok_par):
+            kg = preg(sym, pl["kg"], "kg")
+            for t in range(first_task(bid, QKV0), s, BLOCKS):
+                ring_row_from(c, kg, t, own_n)
+            if const_expr(key.feeds_index):
+                # the compressor reads every token's normed row
+                nbg = preg(sym, pl["nbg"], "nbg")
+                for t in range(first_task(bid, NORM0), s, BLOCKS):
+                    normed_row_from(c, nbg, t, own_n)
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 
@@ -1161,15 +1364,16 @@ def build_attn_pre(key: AttnPreBuild):
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
-        iw_out: Int64, scratch: Int64, layer: Int32, tl: Int64,
-        stream: fx.Stream = _CURRENT_STREAM,
+        iw_out: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32,
+        layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
         _ = keyed
         attn_pre(
             res_in, pend, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, attn_w,
             wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_rows, ring_off,
             res_out, post_out, comb_out, pre_out, q_out, normed, qr_out, qrs_out, aux,
-            iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, scratch, layer, tl,
+            iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, scratch, sym, peers, rank,
+            layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 
     ABI.check(attn_pre, launch)

@@ -316,7 +316,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return StateTransfer.copy(self.geometry.layout_id)
 
     def checkpoint_image_bytes(self):
-        return self.geometry.state_bytes
+        return self.geometry.checkpoint_image_bytes
 
     def allocate_kv_cache_tensors(self, *, blocks, buf):
         self.num_blocks = blocks
