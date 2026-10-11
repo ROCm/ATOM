@@ -1095,8 +1095,9 @@ mooncake_owner_devices_csv() {
 
 # kv_transfer_offload_connector <kv-transfer-config JSON>: prints the first
 # offload connector the config names, matched by name or alias as ATOM matches
-# them (atom/model_engine/arg_utils.py, _OFFLOAD_CONNECTORS: any case, outer
-# whitespace ignored); fails when it names none.
+# them (KVConnectorFactory: every name and alias of a backend registered with
+# offload=True, in any case, outer whitespace ignored); fails when it names
+# none. A test keeps this list equal to the factory's.
 kv_transfer_offload_connector() {
   local config="${1,,}" name
   config="${config//[[:space:]]/}"

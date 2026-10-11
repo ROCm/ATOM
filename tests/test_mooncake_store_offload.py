@@ -3269,6 +3269,62 @@ def test_kv_offload_mode_selects_the_store_connector():
         )
 
 
+@pytest.mark.parametrize(
+    ("transfer", "offload_already"),
+    [
+        # Any name or alias the factory registered as an offload tier, as it
+        # resolves them: any case, outer whitespace ignored.
+        ({"kv_connector": " LMCacheMPConnector "}, True),
+        ({"kv_connector": "LMCACHECONNECTORV1"}, True),
+        ({"kv_connector": "Mooncake_Store"}, True),
+        # A P/D transport, or a name the factory does not know, is not one.
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, False),
+        ({"kv_connector": "not_registered"}, False),
+    ],
+)
+def test_kv_offload_refuses_a_second_offload_tier_the_factory_names(
+    transfer, offload_already
+):
+    offload = kv_offload_connector_config("mooncake_store", "")
+    if offload_already:
+        with pytest.raises(ValueError, match="conflicts with an offload connector"):
+            compose_kv_offload_config(json.dumps(transfer), offload)
+    else:
+        assert json.loads(compose_kv_offload_config(json.dumps(transfer), offload))[
+            "connectors"
+        ] == [transfer, offload]
+
+
+def test_kv_offload_knows_every_offload_tier_the_factory_registers(monkeypatch):
+    # One registered later is an offload tier as soon as the factory says so.
+    entry = dict(KVConnectorFactory._registry["mooncake_store"])
+    monkeypatch.setitem(KVConnectorFactory._registry, "new_tier", entry)
+    monkeypatch.setitem(KVConnectorFactory._aliases, "new_tier", "new_tier")
+    monkeypatch.setitem(KVConnectorFactory._offload, "new_tier", True)
+    with pytest.raises(ValueError, match="conflicts with an offload connector"):
+        compose_kv_offload_config(
+            json.dumps({"kv_connector": "New_Tier"}),
+            kv_offload_connector_config("mooncake_store", ""),
+        )
+
+
+def test_the_launcher_names_the_offload_tiers_the_factory_registers():
+    # The launcher refuses an offload connector in its P/D config before
+    # anything starts, without ATOM; its list is the factory's.
+    script = (
+        Path(__file__).resolve().parents[1]
+        / ".github/scripts/atomesh/pd_server_atom.sh"
+    ).read_text()
+    body = script[script.index("kv_transfer_offload_connector() {") :]
+    listed = body[body.index("for name in") + len("for name in") : body.index("; do")]
+    names = set(listed.replace("\\\n", " ").split())
+    assert names == {
+        alias
+        for alias, name in KVConnectorFactory._aliases.items()
+        if KVConnectorFactory.is_offload_backend(name)
+    }
+
+
 # --- in-place copies -----------------------------------------------------------
 
 # A chunk that fills its slot exactly, so a window of slots is one buffer.
