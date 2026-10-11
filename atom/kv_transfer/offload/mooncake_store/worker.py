@@ -28,6 +28,9 @@ Completion protocol, per worker and operation:
 * A slot returns to the pool only once no GPU or NIC access can still reach
   it. One a Store transfer or a GPU copy may still reach is quarantined for
   good, and the pool's memory then outlives the worker (``pool.close``).
+* A put that leaves its slot quarantined may also still write the owner
+  memory the Store took back, inside another key's object: from then on the
+  worker loads nothing from the Store (``_distrust_store``).
 """
 
 from __future__ import annotations
@@ -155,6 +158,9 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._next_stats_log_at = 0.0
         self._next_warning_at: dict[str, float] = {}
         self._suppressed_warnings: Counter = Counter()
+        # Why this worker loads nothing from the Store any more, once it does
+        # not; see `_distrust_store`.
+        self._store_distrusted: str | None = None
         timeout = self._store_cfg.save_abandon_timeout_s
         self._source_read_window_s = timeout - min(
             _MAX_SOURCE_READ_MARGIN_S, timeout / 5
@@ -527,10 +533,17 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 )
             except Exception as exc:  # noqa: BLE001  # reported below
                 pool.quarantine(slots, reason="a put raised")
+                self._distrust_store(f"a put raised {exc!r}")
                 failure, detail = "put_raised", repr(exc)
                 break
             put_ms += (time.perf_counter() - t_put0) * 1000
-            self._settle(pool, slots, codes, clock.seconds())
+            call_seconds = clock.seconds()
+            unsettled = self._settle(pool, slots, codes, call_seconds)
+            if unsettled:
+                self._distrust_store(
+                    f"a put gave up on {unsettled} of {len(slots)} chunks after "
+                    f"{call_seconds:.0f}s"
+                )
             bad = [code for code in codes if code != 0]
             if bad:
                 failure = "put_failed"
@@ -644,6 +657,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         windows_run = loaded_chunks = in_place_windows = 0
         get_ms = unpack_ms = 0.0
         for window in windows:
+            # Checked before every get: a save thread may give up a put
+            # while this load runs.
+            if self._store_distrusted is not None:
+                failure, detail = "store_distrusted", self._store_distrusted
+                break
             try:
                 slots = pool.acquire("load", len(window))
             except SlotPoolExhausted as exc:
@@ -795,11 +813,12 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         slots: list[Slot],
         codes: list[int],
         call_seconds: float,
-    ) -> None:
+    ) -> int:
         """Release each slot whose Store transfer is over; quarantine the rest.
 
         ``call_seconds`` is how long the call that returned ``codes`` took: a
-        failure is unsettled only after Mooncake's batch wait ran out.
+        failure is unsettled only after Mooncake's batch wait ran out. Returns
+        how many slots were quarantined.
         """
         settled: list[Slot] = []
         unsettled: list[Slot] = []
@@ -817,6 +836,34 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     "its RDMA work possibly still posted"
                 ),
             )
+        return len(unsettled)
+
+    def _distrust_store(self, why: str) -> None:
+        """Load nothing more from the Store: a put may still write memory it lost.
+
+        Mooncake revokes a put whose transfer it gave up on before the call
+        returns, and the master frees the owner memory it had given the put
+        at once, for the next put that needs as much (``FinalizeBatchPut``,
+        ``PutRevoke``). The abandoned RDMA write can still land there later,
+        with this put's bytes, inside another key's object of the same size,
+        and nothing in a load would tell. Quarantining the slot keeps this
+        worker's memory out of that write's reach; the owners' memory is out
+        of this worker's, so it stops loading instead, for good. That fails
+        every load of the engine, since a load needs every rank's chunks: the
+        requests prefill instead. Saves go on.
+        """
+        with self._stats_lock:
+            if self._store_distrusted is not None:
+                return
+            self._store_distrusted = why
+        logger.error(
+            "Mooncake Store offload: %s, and its RDMA writes may still land in "
+            "owner memory the Store has since given to other objects. This "
+            "worker loads nothing more from the Store, so every load of this "
+            "engine prefills instead; restart the engine and the Store to load "
+            "from it again",
+            why,
+        )
 
     def _release_once_device_idle(
         self, pool: TransferSlotPool, slots: list[Slot]

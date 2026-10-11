@@ -454,6 +454,20 @@ a copy into each slot (and the reverse).
   `close()` for the life of the process, while the Store client's teardown
   ends its RDMA work. Re-creating the client after repeated stalls, which
   would let the slots return, is a follow-up.
+- A put that quarantines its slot may also still write the owner memory it
+  was given, and that memory is no longer the put's. Mooncake revokes a put
+  it gave up on before the call returns (`FinalizeBatchPut` sends
+  `BatchPutRevoke`), and the master frees the memory at once for the next put
+  that needs as much (`PutRevoke`). A late write would land inside another
+  key's object of the same size, which a load's size check accepts. After
+  such a put the worker loads nothing more from the Store (logged once as an
+  error). A load needs every rank's chunks, so every load of the engine then
+  fails and its request prefills, until the engine and its Store restart.
+  Saves go on.
+  A per-chunk digest checked before the unpack would keep loads going, but
+  Mooncake's own (`MOONCAKE_STORE_CHECKSUM=1`) runs a byte-wise CRC64 on
+  the CPU after copying each object off the GPU, far below the in-place
+  load rate.
 - The engine reclaims a save's source blocks `save_abandon_timeout_s` after
   dispatch. A worker therefore stops starting GPU reads for a save that is
   still queued `timeout - min(60 s, timeout / 5)` after the scheduler

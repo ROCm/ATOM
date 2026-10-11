@@ -1937,6 +1937,57 @@ def test_a_put_that_raises_quarantines_its_window(cluster, make_worker):
     assert _store(later.save_operation) in worker.get_finished().connector_completions
 
 
+@pytest.mark.parametrize(
+    ("put", "distrusted"),
+    [
+        # Mooncake gave up after its batch wait, with the write still posted.
+        ("batch_wait", True),
+        ("raised", True),
+        # A dead owner failed it within a second: nothing is left posted.
+        ("settled", False),
+    ],
+)
+def test_a_put_that_may_still_write_stops_every_later_load(
+    cluster, make_worker, monkeypatch, caplog, put, distrusted
+):
+    worker, _ = make_worker()
+    stored = _save_req(50, 16)
+    worker._do_save_req(stored)
+    store = worker._client._store
+    failing = [_save_req(51, 16, offset=100), _save_req(52, 16, offset=200)]
+    if put == "raised":
+        store.raise_on = "put"
+    for request in failing:
+        store.put_codes[_key(request.chunk_hashes, 1)] = store_client.TRANSFER_FAIL
+    if put == "batch_wait":
+        monkeypatch.setattr(
+            store_client.CallClock, "seconds", lambda _self: store_client.BATCH_WAIT_S
+        )
+    with caplog.at_level(logging.ERROR, logger="atom"):
+        for request in failing:
+            worker._do_save_req(request)
+    store.raise_on = None
+    worker.get_finished()
+    # Saves go on either way.
+    later = _save_req(53, 16, offset=300)
+    worker._do_save_req(later)
+    assert _store(later.save_operation) in worker.get_finished().connector_completions
+
+    gets = [call for call in store.calls if call[0] == "get"]
+    load = _load_req(50, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    worker._do_load_req(load)
+    output = worker.get_finished()
+    if distrusted:
+        # The revoked memory may hold a late write: no get, the request prefills.
+        assert output.failed_loading == {load.load_operation}
+        assert [call for call in store.calls if call[0] == "get"] == gets
+        [error] = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert "loads nothing more from the Store" in error.getMessage()
+    else:
+        assert output.finished_loading == {load.load_operation}
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
 def test_a_region_with_no_usable_slot_fails_saves_at_once(cluster, make_worker):
     worker, gpu = make_worker(save_slots=2)
     worker._pool.quarantine(worker._pool.acquire("save", 2))
