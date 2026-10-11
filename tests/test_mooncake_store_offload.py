@@ -2312,6 +2312,38 @@ def test_a_failing_save_is_retried_after_a_pause_that_grows(
     assert step() == 1
 
 
+@pytest.mark.parametrize("stored_last", [True, False])
+def test_a_save_stored_after_another_failed_ends_the_pause(
+    cluster, make_worker, scheduler_clock, stored_last
+):
+    config = _config()
+    scheduler = MooncakeStoreOffloadScheduler(config)
+    worker, _ = make_worker(
+        config=config, namespace=keys.store_namespace(config, CHUNK)
+    )
+    for seq in (_seq(45, 16), _seq(46, 16, offset=100)):
+        scheduler.update_state_after_alloc(seq)
+        seq.num_cached_tokens = 16
+    # Both saves are in flight at once, and the Store refuses one of them.
+    requests = {r.req_id: r for r in scheduler.build_connector_meta().requests}
+    assert sorted(requests) == [45, 46]
+    worker._client._store.put_codes[
+        _key(requests[45].chunk_hashes, 1, namespace=worker._namespace)
+    ] = store_client.NO_AVAILABLE_HANDLE
+    for req_id in [45, 46] if stored_last else [46, 45]:
+        worker._do_save_req(requests[req_id])
+        scheduler.process_completions(worker.get_finished())
+    retried = [r.req_id for r in scheduler.build_connector_meta().requests]
+    if stored_last:
+        # Stored after the failure paused saves: the retry goes out at once.
+        assert retried == [45]
+    else:
+        # The failure reported last, so its pause holds.
+        assert retried == []
+        scheduler_clock.now += 1.0
+        assert [r.req_id for r in scheduler.build_connector_meta().requests] == [45]
+
+
 def test_a_stage_that_stops_early_still_completes_every_quorum(cluster, make_worker):
     stages = [make_worker(rank=rank, world=2, save_slots=8)[0] for rank in range(2)]
     request = _save_req(42, 40)

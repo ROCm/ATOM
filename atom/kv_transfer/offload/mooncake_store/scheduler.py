@@ -64,7 +64,8 @@ _LOOKUP_STATS_INTERVAL_S = 60.0
 # from eviction, and a request can wait far longer than that for KV blocks.
 _LOOKUP_REUSE_S = 1.0
 # After a failed save, no save is emitted for this long, doubled for each
-# further failure in a row up to `_SAVE_RETRY_MAX_S`; a stored save resets it.
+# further failure in a row up to `_SAVE_RETRY_MAX_S`. A stored save ends the
+# pause and starts the doubling over, whenever it reports.
 # The base retries a failed save on the next step, and a failure that repeats
 # -- a full Store, a master that is down, a stage whose save slots are all
 # quarantined -- would otherwise re-pack the request's unsaved range on every
@@ -421,7 +422,10 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
 
     def _store_finished(self, operation: SaveOperationId, *, succeeded: bool) -> None:
         if succeeded:
+            # Saves run concurrently, so this one may report after another
+            # failed and paused them: the Store takes saves again.
             self._failed_saves_in_a_row = 0
+            self._saves_paused_until = 0.0
         super()._store_finished(operation, succeeded=succeeded)
 
     def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> None:
