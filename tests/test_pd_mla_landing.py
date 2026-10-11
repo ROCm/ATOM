@@ -1332,14 +1332,14 @@ def test_gpu_scatter_matches_rows_across_allocations_and_slot_reuse():
 # ---------------------------------------------------------------------------
 
 
-def _config(transfer, dcp=4, kv_lora_rank=512, block_size=1):
+def _config(transfer, dcp=4, kv_lora_rank=512, block_size=1, **hf):
     from types import SimpleNamespace
 
     return SimpleNamespace(
         kv_transfer_config=transfer,
         decode_context_parallel_size=dcp,
         kv_cache_block_size=block_size,
-        hf_config=SimpleNamespace(kv_lora_rank=kv_lora_rank),
+        hf_config=SimpleNamespace(kv_lora_rank=kv_lora_rank, **hf),
     )
 
 
@@ -1365,6 +1365,13 @@ def test_landing_reserve_matches_the_pool_and_its_gates(monkeypatch, transfer):
     assert mla_landing_reserve_bytes(_config(transfer)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, dcp=1)) == 0
     assert mla_landing_reserve_bytes(_config(consumer, kv_lora_rank=None)) == 0
+    # A latent rank alone is not plain MLA: DeepSeek-V4 (V3 schema) and the
+    # Kimi hybrid never land, so they reserve nothing.
+    v4 = _config(
+        consumer, model_type="deepseek_v3", architectures=["DeepseekV4ForCausalLM"]
+    )
+    assert mla_landing_reserve_bytes(v4) == 0
+    assert mla_landing_reserve_bytes(_config(consumer, model_type="kimi_linear")) == 0
     monkeypatch.setenv("ATOM_PD_MLA_LANDING", "0")
     assert mla_landing_reserve_bytes(_config(consumer)) == 0
 

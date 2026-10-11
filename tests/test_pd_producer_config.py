@@ -172,6 +172,22 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
     "overrides, env",
     [
         ({"hf_config": SimpleNamespace()}, {}),
+        # DeepSeek-V4 loads through the V3 schema, which defaults kv_lora_rank,
+        # and Kimi's MLA hybrid has slot regions: neither stages MLA rows.
+        (
+            {
+                "hf_config": SimpleNamespace(
+                    model_type="deepseek_v3",
+                    architectures=["DeepseekV4ForCausalLM"],
+                    kv_lora_rank=512,
+                )
+            },
+            {},
+        ),
+        (
+            {"hf_config": SimpleNamespace(model_type="kimi_linear", kv_lora_rank=512)},
+            {},
+        ),
         ({"decode_context_parallel_size": 4}, {}),
         (
             {

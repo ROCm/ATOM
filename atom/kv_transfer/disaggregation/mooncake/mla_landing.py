@@ -75,8 +75,9 @@ from atom.kv_transfer.disaggregation.landing_scatter import (
     segment_table,
     segment_table_capacity,
 )
+from atom.kv_transfer.disaggregation.pd_producer import plain_mla_model
 from atom.kv_transfer.disaggregation.types import KVTransferRegion
-from atom.utils import envs
+from atom.utils import envs, get_hf_text_config
 
 logger = logging.getLogger("atom")
 
@@ -184,15 +185,16 @@ def mla_landing_configured(config) -> bool:
 
     ``config`` holds one Mooncake connector's ``kv_transfer_config`` (see
     ``KVConnectorFactory.kv_budget_reserve_bytes``). Only a ``kv_consumer``
-    running DCP on an MLA model lands. The reserve and the allocation in
-    ``register_kv_caches`` both ask this, so no pool goes unreserved.
+    running DCP on a plain MLA model (``plain_mla_model``) lands. The reserve
+    and the allocation in ``register_kv_caches`` both ask this, so no pool
+    goes unreserved.
     """
 
     return bool(
         envs.ATOM_PD_MLA_LANDING
         and getattr(config, "decode_context_parallel_size", 1) > 1
-        and getattr(getattr(config, "hf_config", None), "kv_lora_rank", None)
         and config.kv_transfer_config.get("kv_role") == "kv_consumer"
+        and plain_mla_model(config)
     )
 
 
@@ -205,7 +207,8 @@ def mla_landing_table_segments(config) -> int:
     copied in several chunks.
     """
 
-    page_bytes = config.kv_cache_block_size * config.hf_config.kv_lora_rank
+    kv_lora_rank = get_hf_text_config(config.hf_config).kv_lora_rank
+    page_bytes = config.kv_cache_block_size * kv_lora_rank
     pages_per_slot = MLA_LANDING_SLOT_BYTES // page_bytes
     return segment_table_capacity(MLA_LANDING_POOL_SLOTS * (pages_per_slot + 64))
 
