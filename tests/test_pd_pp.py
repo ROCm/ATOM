@@ -1406,6 +1406,7 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
     connector._index_staging_pool_size = 1
     connector._cuda_device = 3
     connector._kv_cache_ready_events = {}
+    connector._kv_cache_ready_batches = deque()
     connector._completed_prefills_lock = threading.Lock()
     ready_event = MagicMock()
     producer_stream = object()
@@ -1420,6 +1421,37 @@ def test_mooncake_records_one_ready_event_for_a_prefill_batch(monkeypatch):
 
     ready_event.record.assert_called_once_with(producer_stream)
     assert connector._kv_cache_ready_events == {11: ready_event, 12: ready_event}
+
+
+def test_ready_events_no_transfer_takes_are_dropped_after_their_ttl(monkeypatch):
+    """Without the TTL, every final prefill with no finished transfer leaked
+    its event: requests without P/D, aborts, unpulled requests, failures."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    connector = object.__new__(mc.MooncakeConnector)
+    connector.is_producer = True
+    connector._index_staging_pool_size = 1
+    connector._cuda_device = 0
+    connector._kv_cache_ready_events = {}
+    connector._kv_cache_ready_batches = deque()
+    connector._completed_prefills_lock = threading.Lock()
+    events = iter([MagicMock(), MagicMock(), MagicMock()])
+    monkeypatch.setattr(mc.torch.cuda, "Event", lambda: next(events))
+    monkeypatch.setattr(mc.torch.cuda, "current_stream", lambda _d: None)
+    clock = [1000.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: clock[0])
+
+    connector.record_kv_cache_ready(["a", "b"])
+    first = connector._kv_cache_ready_events["a"]
+    clock[0] += 10
+    connector.record_kv_cache_ready(["b"])  # recorded again, by a later batch
+    clock[0] += mc.KV_CACHE_READY_EVENT_TTL_S - 5
+    connector.record_kv_cache_ready(["c"])
+    # The first batch expired; "b" keeps its later event.
+    assert set(connector._kv_cache_ready_events) == {"b", "c"}
+    assert connector._kv_cache_ready_events["b"] is not first
+    assert len(connector._kv_cache_ready_batches) == 2
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
@@ -116,6 +117,9 @@ PD_TRANSFER_DEADLINE_S = 120.0
 # by default, plus about 1 s per GB), so a stage still running has stopped
 # writing by then, and one that has not answered is presumed dead.
 PD_RECV_DEADLINE_S = 300.0
+# A final prefill's KV-ready event is dropped this long after it was recorded
+# if no finished transfer dropped it first (see _drop_stale_kv_ready_events).
+KV_CACHE_READY_EVENT_TTL_S = 600.0
 _IB_SYSFS_ROOT = Path("/sys/class/infiniband")
 
 
@@ -827,6 +831,10 @@ class MooncakeConnector(KVConnectorBase):
         # The write listener looks up block_ids here when consumer requests a write.
         self._completed_prefills: dict[ReqId, dict] = {}
         self._kv_cache_ready_events: dict[ReqId, torch.cuda.Event] = {}
+        # (recorded at, event, req_ids) per prefill batch, oldest first.
+        self._kv_cache_ready_batches: deque[
+            tuple[float, torch.cuda.Event, list[ReqId]]
+        ] = deque()
         self._completed_prefills_lock = threading.Lock()
         self._completed_prefills_cv = threading.Condition(self._completed_prefills_lock)
         self._transfer_refcount: dict[ReqId, int] = {}
@@ -1321,9 +1329,29 @@ class MooncakeConnector(KVConnectorBase):
             return
         ready_event = torch.cuda.Event()
         ready_event.record(torch.cuda.current_stream(self._cuda_device))
+        now = time.monotonic()
         with self._completed_prefills_lock:
             for req_id in req_ids:
                 self._kv_cache_ready_events[req_id] = ready_event
+            self._kv_cache_ready_batches.append((now, ready_event, list(req_ids)))
+            self._drop_stale_kv_ready_events(now)
+
+    def _drop_stale_kv_ready_events(self, now: float) -> None:
+        """Forget ready events older than ``KV_CACHE_READY_EVENT_TTL_S``.
+
+        A finished transfer drops its event, but the runner reports every
+        final prefill chunk, and some never get one: requests without P/D,
+        aborted requests, requests no decode pulls and failed transfers. A
+        transfer that still comes later has no event, so its MLA rows go
+        per token and a DSA index transfer fails. Caller holds
+        ``_completed_prefills_lock``.
+        """
+        batches = self._kv_cache_ready_batches
+        while batches and now - batches[0][0] > KV_CACHE_READY_EVENT_TTL_S:
+            _, event, req_ids = batches.popleft()
+            for req_id in req_ids:
+                if self._kv_cache_ready_events.get(req_id) is event:
+                    del self._kv_cache_ready_events[req_id]
 
     def _get_kv_cache_ready_event(self, req_id: ReqId) -> torch.cuda.Event | None:
         with self._completed_prefills_lock:
