@@ -22,8 +22,8 @@ grep -Eq '(^|[[:space:]])JobState=PENDING([[:space:]]|$)' "${output}/job-before.
 grep -Eq '(^|[[:space:]])NumNodes=1([[:space:]]|$)' "${output}/job-before.txt"
 grep -Eq '(^|[[:space:]])Account=amd-frameworks([[:space:]]|$)' "${output}/job-before.txt"
 grep -Eq '(^|[[:space:]])QOS=amd-frameworks-qos([[:space:]]|$)' "${output}/job-before.txt"
-printf '%s\n' "scontrol update JobId=${job_id} ReqNodeList=${node}" > "${output}/command.txt"
-timeout 15s scontrol update "JobId=${job_id}" "ReqNodeList=${node}" \
+printf '%s\n' "scontrol update JobId=${job_id} NodeList=${node}" > "${output}/command.txt"
+timeout 15s scontrol update "JobId=${job_id}" "NodeList=${node}" \
   > "${output}/update.log" 2>&1
 timeout 15s scontrol show job "${job_id}" > "${output}/job-after.txt"
 grep -Eq "(^|[[:space:]])ReqNodeList=${node}([[:space:]]|$)" "${output}/job-after.txt"
