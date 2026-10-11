@@ -469,26 +469,34 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
-        if (
-            model_arch in _DEEPSEEK_V41_ARCHES
-            and getattr(vllm_config, "speculative_config", None) is not None
-            and getattr(self.atom_config, "enable_decoder_swa_bounded_replay", False)
+        if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
+            self.atom_config, "enable_decoder_swa_bounded_replay", False
         ):
-            # Decoder SWA bounded replay splits the forward into two compiled
-            # stages whose layer loop is `_Stage.run`, not the one in
-            # `model.py` that collects the draft's aux hidden states -- and it
-            # runs the late stage on a tail of the rows, which only the native
-            # drafter's hook path knows how to map back. On this path the
-            # speculator reads the aux states off the forward's return value,
-            # so the single-graph forward is the one that can produce them.
-            # Decided here rather than left to the user: the alternative is a
-            # boot that fails with a flag to pass, and the flag costs prefill
-            # throughput, not correctness.
+            # Bounded replay re-enters the model with a tail of the rows,
+            # and on this path the step those rows belong to was already
+            # staged -- outside the forward, once, against the full padded
+            # width (`atom_deepseek_v41_forward_context`). The staged step
+            # does not describe the tail, so the two disagree on how many
+            # rows there are:
+            #
+            #     RuntimeError: shape '[1389, -1, 512]' is invalid for input
+            #     of size 1048576        (cache.rope_quant_window)
+            #
+            # measured on the default plugin configuration, no speculation
+            # involved. It also bypasses the layer loop in `model.py` -- its
+            # stages run their own (`_Stage.run`) -- so a draft's aux hidden
+            # states would come back silently empty.
+            #
+            # Native keeps both: its drafter taps the layers with forward
+            # hooks and maps the tail's captures back itself
+            # (`_late_on_tail`). The plugin has neither half, so it does not
+            # get the optimization. Decided here rather than left to the
+            # operator: the alternative is a crash with a flag to pass.
             self.atom_config.enable_decoder_swa_bounded_replay = False
             logger.info(
-                "ATOM plugin: decoder SWA bounded replay is off because "
-                "DeepSeek-V4.1 is speculating; the draft's aux hidden states "
-                "come from the single-graph forward."
+                "ATOM plugin: decoder SWA bounded replay is off for "
+                "DeepSeek-V4.1; this path stages a step outside the forward, "
+                "which a replayed tail of rows no longer describes."
             )
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "

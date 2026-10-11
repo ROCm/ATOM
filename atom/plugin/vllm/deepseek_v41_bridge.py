@@ -298,7 +298,7 @@ def _v41_staged_running_tokens() -> int:
     return int(getattr(batch, "num_tokens", 0) or 0)
 
 
-def _v41_capture_batch(snapshot, vllm_config):
+def _v41_capture_batch(snapshot, vllm_config, builder=None):
     """The synthetic batch vLLM is about to capture, declared for what it is.
 
     Two things it is not, and both have to be said or the step is refused:
@@ -317,16 +317,73 @@ def _v41_capture_batch(snapshot, vllm_config):
     """
     query_lens = np.asarray(snapshot.query_lens, dtype=np.int32)
     num_reqs = int(snapshot.num_reqs)
+    context_lens = query_lens.astype(np.int64)
+    block_tables = snapshot.block_rows
+    slots = v41_capture_state_slots(num_reqs, vllm_config)
+    if _v41_capture_is_a_verify_step(query_lens, vllm_config):
+        # A verify bucket, and it has to be captured as one. Rows at position
+        # 0 record the compressor's cold branch and the prefill FFN, while a
+        # replayed verify step runs the warm branch and `decode_ffn` -- ATOM's
+        # own capture entry says as much and starts its rows a full window in
+        # (`backend.build_for_cudagraph_capture`). Mirror it: one window of
+        # history, and one page id repeated to cover it, because naming
+        # distinct pages makes the capture write to the ones the block pool
+        # hands out first.
+        start = int(builder.cache.geometry.window_size)
+        context_lens = (start + query_lens).astype(np.int64)
+        pages = -(-(start + int(query_lens.max())) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
+        block_tables = tuple(
+            np.zeros(pages, dtype=np.int32) for _ in range(num_reqs)
+        )
+        _v41_prime_capture_cursors(builder, slots, start)
     return SimpleNamespace(
         is_dummy_run=False,
         req_ids=snapshot.req_ids,
         num_scheduled_tokens=query_lens,
-        context_lens=query_lens.astype(np.int64),
-        state_slots_committed=v41_capture_state_slots(num_reqs, vllm_config),
-        block_tables=snapshot.block_rows,
+        context_lens=context_lens,
+        state_slots_committed=slots,
+        block_tables=block_tables,
         total_seqs_num=num_reqs,
         total_tokens_num=int(query_lens.sum()),
     )
+
+
+def _v41_prime_capture_cursors(builder, slots, start) -> None:
+    """Put the capture slots' cursors where the capture says its rows are.
+
+    A row at position 0 is *fresh*: `prepare_state` resets its slot and the
+    stale-state judge exempts it by that position. A verify capture cannot be
+    at position 0 -- the tentative step refuses it, and the compressor would
+    record its cold branch -- so its rows are judged like any decode's, and
+    the slot still holds whatever the previous capture left in it:
+
+        Request 0 needs state at 128, found 6
+
+    These slots are the capture half of the slot space, which the allocator
+    never hands out, so nothing else reads what is written here and no request
+    in flight can be looking at it. Setting the frontier is what declaring the
+    rows fresh does for a position-0 capture; the history columns are left as
+    they are, because a capture's values are read and thrown away.
+    """
+    import torch
+
+    cursor = builder.cache.cursor
+    index = torch.as_tensor(np.asarray(slots), dtype=torch.long, device=cursor.device)
+    cursor[index, 0] = int(start)
+
+
+def _v41_capture_is_a_verify_step(query_lens, vllm_config) -> bool:
+    """Whether this capture records a draft block's verification.
+
+    Only a uniform multi-token bucket is one: that is the shape vLLM captures
+    a FULL decode graph in when it speculates, and the only shape whose rows
+    all fit the tentative staging.
+    """
+    speculative = v41_speculative_tokens(vllm_config)
+    if not speculative or not query_lens.size:
+        return False
+    width = int(query_lens.max())
+    return 1 < width <= speculative + 1 and int(query_lens.min()) == width
 
 
 def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturing):
@@ -376,7 +433,7 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     #                      twice in one step.
     synthetic = capturing or in_dummy_run() or _v41_request_ids_are_synthetic(snapshot)
     if synthetic:
-        batch = _v41_capture_batch(snapshot, vllm_config)
+        batch = _v41_capture_batch(snapshot, vllm_config, builder)
     else:
         batch = _v41_scheduled_batch(snapshot, slot_allocator, None)
     running_bs = num_reqs
@@ -443,7 +500,15 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
         if join is not None:
             join()
     metadata.staged_outside_forward = True
-    if getattr(metadata.step, "tentative", False):
+    if synthetic and getattr(metadata.step, "tentative", False):
+        # A capture is staged tentatively so it records the verify branch, but
+        # nothing will ever sample it, so nothing will commit its prefix --
+        # and the cache refuses the next step while one is outstanding
+        # ("Commit the accepted prefix before reusing or checkpointing
+        # state"). Drop it here: a synthetic step's accepted prefix is not a
+        # quantity that exists.
+        builder.cache.pending = None
+    elif getattr(metadata.step, "tentative", False):
         # Held until the sampler says how much of the draft block survived.
         # Set after staging, not at `_prepare`: a step that raised on the way
         # here never reached the cache, and leaving a stale handle behind
@@ -502,6 +567,26 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
     """
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
+        """`UNIFORM_BATCH` once a draft widens the decode step.
+
+        vLLM reads this before any step runs and, when it speculates, refuses
+        a FULL decode graph from a backend that claims only single-token
+        decode -- and because this plugin is not fx-split, there is no
+        PIECEWISE to fall back to, so the whole deployment drops to eager.
+        What the wider claim asserts is still the same thing the narrow one
+        did: the host-side state is staged outside the forward, once per step.
+        A verify bucket is uniform by construction (vLLM captures one shape
+        per `uniform_decode_query_len`), and a step that is not uniform --
+        a batch mixing widths, or one whose drafts were dropped so a prefill
+        could run -- is routed by vLLM to the non-uniform path rather than to
+        this graph.
+        """
+        if v41_speculative_tokens(vllm_config):
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -1352,8 +1437,20 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
     them, so a tentative step there would be left uncommitted forever.
     """
     speculative_tokens = builder.geometry.speculative_tokens
-    if synthetic or not speculative_tokens:
+    if not speculative_tokens:
         return {}
+    if synthetic:
+        # A capture is staged as whatever it records. A verify bucket has to
+        # be recorded as one -- `tentative` is what selects the decode FFN and
+        # the compressor's warm branch, so a capture without it records a
+        # different model than every replay runs.
+        lengths = [int(n) for n in batch.num_scheduled_tokens]
+        if not lengths:
+            return {}
+        width = max(lengths)
+        if not (1 < width <= speculative_tokens + 1 and min(lengths) == width):
+            return {}
+        return {"tentative": True, "max_q_len": width}
     lengths = [int(n) for n in batch.num_scheduled_tokens]
     ends = [int(n) for n in batch.context_lens]
     rows = [(end - length, length) for end, length in zip(ends, lengths) if length]
