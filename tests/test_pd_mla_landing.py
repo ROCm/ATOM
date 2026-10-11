@@ -210,7 +210,14 @@ def test_credit_wait_wakes_on_release():
 class _Dest:
     """Consumer MLA regions plus a CPU receiver whose scatter is a memmove."""
 
-    def __init__(self, num_regions=2, num_blocks=48, pool_slots=8, slot_rows=64):
+    def __init__(
+        self,
+        num_regions=2,
+        num_blocks=48,
+        pool_slots=8,
+        slot_rows=64,
+        recv_deadline_s=300.0,
+    ):
         gen = torch.Generator().manual_seed(11)
         self.regions = [
             torch.randint(0, 256, (num_blocks, PAGE_BYTES), generator=gen).to(
@@ -231,6 +238,7 @@ class _Dest:
             mla_regions=list(range(num_regions)),
             send=lambda addr, parts: self.sent.append((addr, parts)),
             finish=lambda req, failed: self.finished.append((req, failed)),
+            recv_deadline_s=recv_deadline_s,
         )
         pool = self.recv.pool
 
@@ -585,13 +593,70 @@ def test_sweep_never_reports_a_failure_while_a_stage_still_runs():
     dest.recv.advertise("stage1", 2)
     dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
     dest.recv.stage_done("r", 1, 5, False, [])
-    dest.recv._requests["r"].failed_at -= 3600
+    dest.recv._requests["r"].started_at -= 299
     dest.recv.sweep()
     dest.recv.sweep()
     assert dest.finished == []
     assert dest.recv._requests["r"].stall_logged
     dest.recv.stage_done("r", 0, 5, True, [])
     assert dest.finished == [("r", True)]
+
+
+@pytest.mark.parametrize("first", ["failure", "success", "none"])
+def test_stages_silent_past_the_deadline_fail_the_request(first):
+    # A stage still running stops writing at its transfer deadline, before
+    # the receive deadline, so one silent past it is presumed dead: without
+    # this its request, pages and credits waited forever.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 2)["slots"]
+    dest.recv.advertise("stage1", 2)
+    dest.recv.begin("r", 5, [1], {0: "stage0", 1: "stage1"})
+    if first != "none":
+        dest.recv.stage_done("r", 1, 5, first == "success", [])
+    dest.recv.sweep()
+    assert dest.finished == []
+    dest.recv._requests["r"].started_at -= 301
+    dest.recv.sweep()
+    assert dest.finished == [("r", True)]
+    assert "r" not in dest.recv._requests
+    # The silent stage's late messages change nothing.
+    dest.recv.on_ready(_ready("r", s0[0], 0, [[0, 0, 1, 0]]))
+    assert dest.recv.stage_done("r", 0, 5, True, [s0[0]])
+    assert dest.recv._queue.empty()
+    assert dest.credits() == []
+    assert dest.finished == [("r", True)]
+
+
+def test_an_expired_request_settles_after_its_queued_scatter():
+    # The scatter writes the request's pages, so the failure waits for it.
+    dest = _Dest()
+    s0 = dest.recv.advertise("stage0", 1)["slots"]
+    dest.recv.begin("r", 5, [1], {0: "stage0"})
+    before = dest.regions[0].clone()
+    rows = torch.ones((4, TOKEN_BYTES), dtype=torch.uint8)
+    dest.recv.on_ready(_ready("r", s0[0], 0, _land(dest, s0[0], 0, 0, rows)))
+    dest.recv._requests["r"].started_at -= 301
+    dest.recv.sweep()
+    dest.recv.sweep()
+    assert dest.finished == []
+    dest.pump()
+    assert torch.equal(dest.regions[0], before)  # the failed request is skipped
+    assert dest.finished == [("r", True)]
+    assert dest.credits() == [("stage0", [s0[0]])]
+
+
+def test_tombstones_expire_oldest_first():
+    dest = _Dest()
+    dest.recv.advertise("stage0", 1)
+    for i in range(3):
+        dest.recv.begin(f"r{i}", 5, [1], {0: "stage0"})
+        dest.recv.stage_done(f"r{i}", 0, 5, True, [])
+    stones = dest.recv._tombstones
+    first, second, _ = list(stones)
+    stones[first] -= 601
+    stones[second] -= 601
+    dest.recv.sweep()
+    assert list(stones) == [("r2", 5)]
 
 
 def test_scatter_errors_fail_the_slots_and_disable_landing():
@@ -653,7 +718,9 @@ class _Nic:
     def __init__(self):
         self.labels = []
 
-    def write(self, _target, src, dst, sizes, _req, label, *, engine=None):
+    def write(
+        self, _target, src, dst, sizes, _req, label, *, engine=None, deadline=None
+    ):
         for s, d, n in zip(src, dst, sizes):
             ctypes.memmove(d, s, n)
         self.labels.append((label, len(src)))
@@ -862,9 +929,10 @@ def test_small_transfers_keep_the_staged_path(monkeypatch):
 
 def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     # Stage 1 finds no landing credit and writes the final KV page through
-    # the staged path while stage 0 fails. However long that write takes, the
-    # failure is reported only after stage 1's write-done, so the scheduler
-    # never recomputes into a page stage 1 may still overwrite.
+    # the staged path while stage 0 fails. Short of the receive deadline,
+    # which a live stage cannot outlast, the failure is reported only after
+    # stage 1's write-done, so the scheduler never recomputes into a page
+    # stage 1 may still overwrite.
     mc = _mooncake()
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
@@ -900,7 +968,7 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
     writer.start()
     assert started.wait(timeout=10)
     dest.recv.stage_done("req", 0, 5, False, [])
-    dest.recv._requests["req"].failed_at -= 3600
+    dest.recv._requests["req"].started_at -= 299
     dest.recv.sweep()
     assert dest.finished == []  # stage 1 is still writing page 3
     resume.set()
@@ -987,10 +1055,12 @@ def test_landing_requests_complete_through_the_receiver():
     conn._pending_recv = {"r"}
     conn._pending_recv_blocks = {"r": [1]}
     conn._pending_recv_slots = {}
-    conn._pending_recv_expected = {"r": 1}
+    # A landing request is not in the write-done tables: the receiver has it.
+    conn._pending_recv_expected = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
-    conn._pending_recv_nonce = {"r": 5}
+    conn._pending_recv_nonce = {}
+    conn._pending_recv_started = {}
     conn._release_targets = {}
     conn.done_recving = set()
     conn.failed_recving = set()
@@ -1003,8 +1073,48 @@ def test_landing_requests_complete_through_the_receiver():
     assert conn.done_recving == set()  # scatter still queued
     dest.pump()
     assert conn.done_recving == {"r"}
-    assert conn._pending_recv_expected == {}
     assert conn._pending_recv == set()
+    assert conn._pending_recv_stages == {}
+
+
+def test_a_socket_whose_send_raised_is_not_reused():
+    # A failed READY used to leave the cached socket in place, so the failure
+    # write-done that follows it was sent on the same broken socket.
+    mc = _mooncake()
+    conn = object.__new__(mc.MooncakeConnector)
+    conn._notify_sockets_lock = threading.Lock()
+    conn._notify_sockets = {}
+    sockets = []
+
+    class _Socket:
+        def __init__(self):
+            self.sent, self.closed = [], False
+
+        def setsockopt(self, *_args):
+            pass
+
+        def connect(self, _addr):
+            pass
+
+        def send_multipart(self, parts):
+            if self is sockets[0]:
+                raise RuntimeError("socket gone")
+            self.sent.append(parts)
+
+        def close(self):
+            self.closed = True
+
+    class _Context:
+        def socket(self, _kind):
+            sockets.append(_Socket())
+            return sockets[-1]
+
+    conn.zmq_context = _Context()
+    with pytest.raises(RuntimeError):
+        conn._send_on_socket("tcp://decode:1", [b"ready"])
+    conn._send_on_socket("tcp://decode:1", [b"write-done"], repeat=2)
+    assert sockets[0].closed
+    assert sockets[1].sent == [[b"write-done"], [b"write-done"]]
 
 
 def _listen(monkeypatch, mc, listener, messages):
@@ -1127,8 +1237,11 @@ def test_unreadable_landing_fields_do_not_stop_the_write_listener(monkeypatch):
             (MSG_LANDING_CREDIT, msgpack.dumps(credit)),
         ],
     )
-    # The transfer still reaches a send worker, which reports its outcome.
-    assert submitted == [request]
+    # The transfer still reaches a send worker, which reports its outcome
+    # before its transfer deadline.
+    [sent] = submitted
+    assert sent.pop("_deadline") > time.monotonic()
+    assert sent == request
     assert conn._landing_credits.acquire("d0", 1, 0) == 0
 
 

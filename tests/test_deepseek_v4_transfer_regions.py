@@ -825,7 +825,17 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
 
     selected_engine = object()
 
-    def write(target, sources, destinations, sizes, request_id, kind, *, engine=None):
+    def write(
+        target,
+        sources,
+        destinations,
+        sizes,
+        request_id,
+        kind,
+        *,
+        engine=None,
+        deadline=None,
+    ):
         assert engine is selected_engine
         calls.append(kind)
         for s, d, size in zip(sources, destinations, sizes, strict=True):

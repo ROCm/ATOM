@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import types
 from collections import deque
 from types import SimpleNamespace
@@ -771,6 +772,7 @@ def _make_connector(**overrides):
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
+    conn._pending_recv_started = {}
     conn._pending_recv = set()
     conn._pending_recv_blocks = {}
     conn._pending_recv_slots = {}
@@ -957,6 +959,56 @@ def test_failed_write_done_waits_for_every_producer_rank():
     assert conn.failed_recving == {"r1"} and conn.done_recving == set()
     assert sent == [("stage0", mc.MSG_RELEASE)]
     assert not conn._pending_recv_failed
+
+
+def test_silent_producer_ranks_fail_the_receive_at_the_deadline():
+    """A rank silent past PD_RECV_DEADLINE_S is dead or past its own deadline.
+
+    Without a bound, one failed stage plus one dead stage kept the request,
+    its decode blocks and stage-0's page table forever.
+    """
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    sent = []
+    conn = _make_connector(
+        _release_targets={"old": ("stage0", "t1", 1)},
+        _send_on_socket=lambda addr, parts, repeat=1: sent.append((addr, parts[0])),
+    )
+    now = time.monotonic()
+    for req_id, started in (("old", now - mc.PD_RECV_DEADLINE_S - 1), ("new", now)):
+        conn._pending_recv_expected[req_id] = 2
+        conn._pending_recv_started[req_id] = started
+        conn._pending_recv.add(req_id)
+    assert not conn._record_write_done("old", 1, 0, 0, success=False)
+    conn._expire_pending_recvs()
+    assert conn.failed_recving == {"old"} and conn.done_recving == set()
+    assert sent == [("stage0", mc.MSG_RELEASE)]
+    assert list(conn._pending_recv_started) == ["new"]
+    assert conn._pending_recv == {"new"}
+    assert not conn._pending_recv_failed and "old" not in conn._pending_recv_stages
+    # The dead stage's write-done, should it ever come, changes nothing.
+    assert not conn._record_write_done("old", 0, 0, 0)
+    assert conn.done_recving == set()
+
+
+def test_no_rdma_attempt_starts_past_the_transfer_deadline():
+    """A stage stops writing at its deadline, before the consumer gives up."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    engine = MagicMock()
+    engine.batch_transfer_sync_write.return_value = 0
+    args = ("consumer:1", [1], [2], [3], "r", "block")
+    assert conn._rdma_write_with_retry(
+        *args, engine=engine, deadline=time.monotonic() + 60
+    )
+    assert not conn._rdma_write_with_retry(
+        *args, engine=engine, deadline=time.monotonic() - 1
+    )
+    assert engine.batch_transfer_sync_write.call_count == 1
+    assert mc.PD_RECV_DEADLINE_S > mc.PD_TRANSFER_DEADLINE_S + 60
 
 
 def test_write_done_pp_only_dedup():
@@ -1197,7 +1249,15 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
     transferred_bytes = 0
 
     def record_batch(
-        _target, src_addrs, dst_addrs, sizes, _req_id, _label, *, engine=None
+        _target,
+        src_addrs,
+        dst_addrs,
+        sizes,
+        _req_id,
+        _label,
+        *,
+        engine=None,
+        deadline=None,
     ):
         assert engine is None
         nonlocal transferred_bytes
@@ -1289,6 +1349,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
         "req-1",
         gather_indices,
         engine=ready_event,
+        deadline=None,
     )
     assert all(
         call.kwargs["engine"] is ready_event
@@ -1677,6 +1738,7 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
         "request",
         "staged-index",
         engine=selected,
+        deadline=None,
     )
     staging_stream.synchronize.assert_called_once()
     conn._release_index_staging_slot.assert_called_once_with(3)

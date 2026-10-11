@@ -177,7 +177,9 @@ class _Nic:
         self.labels = []
         self.dst_spans = []
 
-    def write(self, _target, src, dst, sizes, _req, label, *, engine=None):
+    def write(
+        self, _target, src, dst, sizes, _req, label, *, engine=None, deadline=None
+    ):
         assert len(src) == len(dst) == len(sizes)
         for s, d, n in zip(src, dst, sizes):
             ctypes.memmove(d, s, n)
@@ -580,7 +582,9 @@ class _DeviceNic:
                 return flat[addr - base : addr - base + n]
         raise AssertionError(f"address {addr:#x}+{n} outside every buffer")
 
-    def write(self, _target, src, dst, sizes, _req, label, *, engine=None):
+    def write(
+        self, _target, src, dst, sizes, _req, label, *, engine=None, deadline=None
+    ):
         for s, d, n in zip(src, dst, sizes):
             self._at(d, n).copy_(self._at(s, n))
         self.labels.append(label)

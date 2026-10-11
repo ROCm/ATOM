@@ -32,11 +32,13 @@ Protocol, per decode rank (every rank has its own pool and connector):
    returns their credits (``MSG_LANDING_CREDIT``) once the scatter finished.
 4. A request completes when every stage's write-done arrived, every landed
    slot it announced was received, and every scatter finished. A failed
-   request is reported only after all its stages ended, never on a timer: a
-   stage still running may yet write the final KV pages directly (staged
-   path, index regions), and reporting the failure lets the scheduler reuse
-   them. READY slots that arrive after the request failed or their stage
-   ended are dropped, so they never reach the KV cache. Each slot goes back
+   request is reported only after all its stages ended: a stage still
+   running may yet write the final KV pages directly (staged path, index
+   regions), and reporting the failure lets the scheduler reuse them. Stages
+   silent for the receive deadline (``PD_RECV_DEADLINE_S``) fail the request
+   anyway: a live stage has passed its own transfer deadline by then. READY
+   slots that arrive after the request failed or their stage ended are
+   dropped, so they never reach the KV cache. Each slot goes back
    once: after its scatter, with its READY if that is dropped, or with the
    write-done if its READY had not arrived by then. ZMQ keeps order only
    within one connection, so a READY can still trail its write-done after a
@@ -91,7 +93,7 @@ MLA_LANDING_SLOT_BYTES = 8 << 20
 MLA_LANDING_POOL_BYTES = 256 << 20
 
 _STATS_INTERVAL_S = 30.0
-# A failed request still waiting on a stage this long is logged once.
+# A request still waiting on a stage this long is logged once.
 _STALL_LOG_S = 30.0
 # A finished request is remembered this long so READY slots that arrive after
 # it finished are dropped quietly; on_ready says why they return no credit.
@@ -212,9 +214,12 @@ class _Request:
     stages: dict[int, _StageTransfer]
     # None once a scatter has waited on it.
     compute_event: torch.cuda.Event | None
+    # When its write requests went out (time.monotonic()).
+    started_at: float
     pending: int = 0
     failed: bool = False
-    failed_at: float = 0.0
+    # Failed at the receive deadline: settles without its silent stages.
+    expired: bool = False
     stall_logged: bool = False
 
 
@@ -273,6 +278,7 @@ class LandingReceiver:
         mla_regions: list[int],
         send: Callable[[str, list], None],
         finish: Callable[[str, bool], None],
+        recv_deadline_s: float,
     ) -> None:
         if not mla_regions:
             raise ValueError("MLA landing needs at least one MLA region")
@@ -286,6 +292,7 @@ class LandingReceiver:
         self.epoch = int.from_bytes(os.urandom(7), "big")
         self._send = send
         self._finish = finish
+        self._recv_deadline_s = recv_deadline_s
         self._region_bases = np.asarray(region_bases, dtype=np.int64)
         self._region_block_bytes = np.asarray(region_block_bytes, dtype=np.int64)
         self._is_mla = np.zeros(len(region_bases), dtype=bool)
@@ -426,11 +433,13 @@ class LandingReceiver:
             for pp, addr in stage_addrs.items()
         }
         with self._lock:
+            # Insertion order is start order: sweep walks the oldest first.
             self._requests[req_id] = _Request(
                 nonce=nonce,
                 dst_block_ids=np.asarray(dst_block_ids, dtype=np.int64),
                 stages=stages,
                 compute_event=event,
+                started_at=time.monotonic(),
             )
 
     # -- notifications (listener thread) ---------------------------------------
@@ -623,26 +632,44 @@ class LandingReceiver:
     # -- sweep (main thread) ----------------------------------------------------
 
     def sweep(self) -> None:
-        """Log failed requests still waiting on a stage; log stats.
+        """Fail requests past the receive deadline; log stalls and stats.
 
-        Such a request is never reported early: only a stage's write-done
-        proves its writes into the request's KV pages have ended.
+        A failed request is otherwise never reported early: only a stage's
+        write-done proves its writes into the request's KV pages have ended.
+        Requests and tombstones are walked oldest first, and only as far as
+        one is old enough to act on.
         """
         now = time.monotonic()
         stalled: list[tuple[str, float, list[int]]] = []
+        expired: list[tuple[str, list[int]]] = []
+        outcomes: list[tuple[str, bool]] = []
         with self._lock:
+            old: list[tuple[str, _Request]] = []
             for req_id, request in self._requests.items():
-                if (
-                    request.failed
-                    and not request.stall_logged
-                    and now - request.failed_at > _STALL_LOG_S
-                ):
+                if now - request.started_at <= _STALL_LOG_S:
+                    break
+                old.append((req_id, request))
+            for req_id, request in old:
+                running = [pp for pp, s in request.stages.items() if not s.done]
+                if now - request.started_at > self._recv_deadline_s:
+                    if request.expired:
+                        continue  # a scatter still runs; _complete settles it
+                    request.expired = True
+                    self._fail_locked(request)
+                    expired.append((req_id, running))
+                    outcome = self._settle_locked(req_id, request)
+                    if outcome is not None:
+                        outcomes.append((req_id, outcome))
+                elif not request.stall_logged:
                     request.stall_logged = True
-                    running = [pp for pp, s in request.stages.items() if not s.done]
-                    stalled.append((req_id, now - request.failed_at, running))
-            for key, at in list(self._tombstones.items()):
-                if now - at > _TOMBSTONE_TTL_S:
-                    del self._tombstones[key]
+                    stalled.append((req_id, now - request.started_at, running))
+            stale = []
+            for key, at in self._tombstones.items():
+                if now - at <= _TOMBSTONE_TTL_S:
+                    break
+                stale.append(key)
+            for key in stale:
+                del self._tombstones[key]
             stats = None
             if now - self._stats_at >= _STATS_INTERVAL_S:
                 stats, self._stats = self._stats, {
@@ -653,13 +680,22 @@ class LandingReceiver:
                 }
                 elapsed, self._stats_at = now - self._stats_at, now
         for req_id, waited, running in stalled:
-            logger.error(
-                "[PD-LANDING] req %s failed %.0fs ago and still waits for "
-                "stage(s) %s; it is reported once they end",
+            logger.warning(
+                "[PD-LANDING] req %s has waited %.0fs for stage(s) %s",
                 req_id,
                 waited,
                 running,
             )
+        for req_id, running in expired:
+            logger.error(
+                "[PD-LANDING] req %s: stage(s) %s sent no write-done within "
+                "%.0fs; failing it. Slots those stages still hold stay in flight.",
+                req_id,
+                running,
+                self._recv_deadline_s,
+            )
+        for req_id, failed in outcomes:
+            self._finish(req_id, failed)
         if stats is not None and stats["slots"]:
             logger.info(
                 "[PD-LANDING] %.1fs: %d slots, %.2f GB landed (%.2f GB/s), "
@@ -836,24 +872,24 @@ class LandingReceiver:
     # -- helpers (lock held) -------------------------------------------------
 
     def _fail_locked(self, request: _Request) -> None:
-        if not request.failed:
-            request.failed = True
-            request.failed_at = time.monotonic()
+        request.failed = True
 
     def _settle_locked(self, req_id: str, request: _Request) -> bool | None:
         """Retire the request once nothing is pending and every stage ended.
 
-        Returns whether it failed, or None if it is still open.
+        An expired request does not wait for its silent stages. Returns
+        whether it failed, or None if it is still open.
         """
         if request.pending:
             return None
-        if not all(s.done for s in request.stages.values()):
+        if not request.expired and not all(s.done for s in request.stages.values()):
             return None
         self._retire_locked(req_id, request)
         return request.failed
 
     def _retire_locked(self, req_id: str, request: _Request) -> None:
         del self._requests[req_id]
+        # Insertion order is expiry order: sweep drops the oldest first.
         self._tombstones[(req_id, request.nonce)] = time.monotonic()
 
     def _send_credits(self, addr: str, slots: list[int]) -> None:
