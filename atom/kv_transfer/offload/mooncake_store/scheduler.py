@@ -83,13 +83,34 @@ def monotonic_clock_id() -> str | None:
 
     Every process of one boot of a host reads the same CLOCK_MONOTONIC, which no
     wall-clock step moves; another host's counts from another origin. None when
-    the kernel does not say, which no worker takes for its own clock.
+    the kernel does not say (`require_monotonic_clock_id`).
     """
     try:
         with open(_BOOT_ID_PATH) as boot_id:
             return boot_id.read().strip() or None
     except OSError:
         return None
+
+
+def require_monotonic_clock_id() -> str:
+    """`monotonic_clock_id`, or a refusal to start without one.
+
+    A worker reads a save's dispatch stamp only on the clock the stamp names,
+    and treats any other as one it cannot place (the save then reads nothing):
+    without a boot ID every save would fail on its deadline, with no other sign
+    than a rate-limited warning.
+
+    Raises:
+        RuntimeError: The kernel does not name this boot.
+    """
+    clock = monotonic_clock_id()
+    if clock is None:
+        raise RuntimeError(
+            f"the Mooncake Store offload cannot read the boot ID in {_BOOT_ID_PATH}, "
+            "which names the clock its saves are timed on; without it every save "
+            "would store nothing"
+        )
+    return clock
 
 
 def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
@@ -345,6 +366,7 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         validated_kv_role(kvc)
         cfg = parse_mooncake_store_config(kvc)
         check_engine_compatibility(cfg, config)
+        require_monotonic_clock_id()
         world = offcfg.lmcache_replica_world_size(config)
         namespace = store_namespace(config, cfg.chunk_tokens)
         self._store_cfg = cfg
@@ -519,4 +541,5 @@ __all__ = [
     "MooncakeStoreOffloadScheduler",
     "monotonic_clock_id",
     "prompt_chunk_hashes",
+    "require_monotonic_clock_id",
 ]

@@ -477,7 +477,10 @@ a copy into each slot (and the reverse).
   stamped on the scheduler's CLOCK_MONOTONIC, the clock the reclaim runs on,
   which every process of an engine shares (they run on one host) and no
   wall-clock step moves. A stamp from another host's clock, told apart by its
-  boot ID, gives an age the worker cannot read: that save reads nothing.
+  boot ID, gives an age the worker cannot read: that save reads nothing. The
+  scheduler and the workers refuse to start where the kernel's boot ID
+  (`/proc/sys/kernel/random/boot_id`) cannot be read, since every save would
+  then read nothing.
 - A put of a key that already exists succeeds (Mooncake reports 0).
 - After a failed save no save is emitted for 1 s, doubled for each further
   failure in a row up to 30 s. A stored save ends the pause and starts the

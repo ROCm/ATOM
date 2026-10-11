@@ -70,7 +70,10 @@ from atom.kv_transfer.offload.mooncake_store.pool import (
     SlotPoolExhausted,
     TransferSlotPool,
 )
-from atom.kv_transfer.offload.mooncake_store.scheduler import monotonic_clock_id
+from atom.kv_transfer.offload.mooncake_store.scheduler import (
+    monotonic_clock_id,
+    require_monotonic_clock_id,
+)
 
 logger = logging.getLogger("atom")
 
@@ -143,6 +146,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         self._store_cfg = parse_mooncake_store_config(kvc)
         check_engine_compatibility(self._store_cfg, config)
+        require_monotonic_clock_id()
         self.chunk_size = self._store_cfg.chunk_tokens
         self._client: store_client.MooncakeStoreClient | None = None
         self._pool: TransferSlotPool | None = None
@@ -395,12 +399,14 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         this worker can read, and one counted too short would let the save
         read blocks the scheduler already handed to other requests: the save
         is placed a whole read window before its receipt, so it reads nothing.
-        A save without a stamp counts from its receipt.
+        A save without a stamp counts from its receipt. Both sides refuse to
+        start where the kernel does not name the boot
+        (`require_monotonic_clock_id`), so the clock here is always named.
         """
         if req.dispatched_at is None:
             return received_at
         clock = monotonic_clock_id()
-        if clock is None or req.dispatch_clock != clock:
+        if req.dispatch_clock != clock:
             self._warn_rate_limited(
                 "save:foreign_clock",
                 "Mooncake Store offload: req=%s was dispatched on another clock "

@@ -2152,7 +2152,7 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     ("dispatch_clock", "own_clock"),
     [
         ("another-host", "this-host"),  # another host's CLOCK_MONOTONIC
-        (None, None),  # neither side could name its clock
+        (None, "this-host"),  # a stamp that names no clock
     ],
 )
 def test_a_save_stamped_on_a_clock_the_worker_cannot_place_reads_nothing(
@@ -2177,6 +2177,28 @@ def test_a_save_stamped_on_a_clock_the_worker_cannot_place_reads_nothing(
         _quiescent(operation),
         *(_safe(operation, index) for index in range(3)),
     }
+
+
+@pytest.mark.parametrize("side", ["scheduler", "worker"])
+def test_neither_side_starts_where_the_boot_is_unnamed(
+    cluster, monkeypatch, tmp_path, side
+):
+    # A save's stamp is read on the clock it names: without a boot ID every
+    # save would read nothing, so neither half starts.
+    monkeypatch.setattr(scheduler_mod, "_BOOT_ID_PATH", str(tmp_path / "missing"))
+    scheduler_mod.monotonic_clock_id.cache_clear()
+    try:
+        build = (
+            MooncakeStoreOffloadScheduler
+            if side == "scheduler"
+            else MooncakeStoreOffloadConnector
+        )
+        with pytest.raises(RuntimeError, match="cannot read the boot ID"):
+            build(_config())
+    finally:
+        monkeypatch.undo()
+        scheduler_mod.monotonic_clock_id.cache_clear()
+    assert scheduler_mod.monotonic_clock_id() is not None
 
 
 def test_a_late_exception_still_leaves_exactly_one_terminal(
