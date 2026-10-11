@@ -244,3 +244,9 @@ def chunk_group_ids(namespace: str, hashes: bytes, start: int, end: int) -> list
 def probe_key(namespace: str, rank: int, nonce: str) -> str:
     """A key outside every chunk key, for the worker's startup round trip."""
     return f"{namespace}/probe/w{int(rank)}/{nonce}"
+
+
+# Present in a Store that a put Mooncake gave up on may still write (see
+# `taint`). Outside every namespace: the late write can land in an object of
+# any namespace.
+STORE_TAINT_KEY = "atomkv/store-tainted"

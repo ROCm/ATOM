@@ -61,6 +61,7 @@ from atom.kv_transfer.offload.mooncake_store import client as store_client
 from atom.kv_transfer.offload.mooncake_store import keys, nic
 from atom.kv_transfer.offload.mooncake_store import pool as pool_mod
 from atom.kv_transfer.offload.mooncake_store import scheduler as scheduler_mod
+from atom.kv_transfer.offload.mooncake_store import taint as taint_mod
 from atom.kv_transfer.offload.mooncake_store import worker as worker_mod
 from atom.kv_transfer.offload.mooncake_store.config import (
     StorePool,
@@ -106,6 +107,8 @@ class FakeCluster:
         self.objects: dict[str, dict[str, bytes]] = {}
         # Per master: the Mooncake group each grouped key was put in.
         self.groups: dict[str, dict[str, str]] = {}
+        # Per master: the ReplicateConfig each put-session object was made with.
+        self.markers: dict[str, dict[str, object]] = {}
         self.stores: list[FakeStore] = []
         self.setup_rc = 0
         # Per master: a setup result other than `setup_rc`.
@@ -116,6 +119,8 @@ class FakeCluster:
         self.put_code: int | None = None
         # A call every store raises from, as `FakeStore.raise_on`.
         self.raise_on: str | None = None
+        # Lookup results every store answers, as `FakeStore.exist_codes`.
+        self.exist_codes: dict[str, int] = {}
 
     def new_store(self) -> FakeStore:
         store = FakeStore(self)
@@ -143,6 +148,9 @@ class FakeStore:
         self.put_codes: dict[str, int] = {}
         self.get_codes: dict[str, int] = {}
         self.exist_codes: dict[str, int] = {}
+        # Put sessions this client started: key -> (size, config).
+        self.sessions: dict[str, tuple] = {}
+        self.session_codes: dict[str, int] = {}
         self.register_rc = 0
         self.raise_on: str | None = None
         self.closed = False
@@ -154,6 +162,7 @@ class FakeStore:
             return rc
         self.objects = self.cluster.objects.setdefault(args[6], {})
         self.groups = self.cluster.groups.setdefault(args[6], {})
+        self.markers = self.cluster.markers.setdefault(args[6], {})
         return 0
 
     def register_buffer(self, ptr, size):
@@ -180,7 +189,12 @@ class FakeStore:
     def batch_is_exist(self, keys):
         self.calls.append(("exists", list(keys)))
         self._maybe_raise("exists")
-        return [self.exist_codes.get(k, int(k in self.objects)) for k in keys]
+        return [
+            self.exist_codes.get(
+                k, self.cluster.exist_codes.get(k, int(k in self.objects))
+            )
+            for k in keys
+        ]
 
     def batch_put_from(self, keys, ptrs, sizes, config=None):
         self.calls.append(("put", list(keys)))
@@ -225,6 +239,48 @@ class FakeStore:
                     code = len(data)
             codes.append(code)
         return codes
+
+    def batch_put_session_start(self, keys, sizes, config=None):
+        self.calls.append(("session_start", list(keys)))
+        self._maybe_raise("session_start")
+        codes = []
+        for key, size in zip(keys, sizes, strict=True):
+            code = self.session_codes.get(key)
+            if code is None:
+                if key in self.sessions:
+                    code = store_client.INVALID_PARAMS
+                elif key in self.objects:
+                    code = store_client.OBJECT_ALREADY_EXISTS
+                else:
+                    self.sessions[key] = (size, config)
+                    code = 0
+            codes.append(code)
+        return codes
+
+    def batch_put_session_end(self, keys):
+        # The object is committed as the master reserved it: nothing written.
+        self.calls.append(("session_end", list(keys)))
+        codes = []
+        for key in keys:
+            if key not in self.sessions:
+                codes.append(store_client.INVALID_PARAMS)
+                continue
+            size, config = self.sessions.pop(key)
+            self.objects[key] = bytes(size)
+            self.markers[key] = config
+            codes.append(0)
+        return codes
+
+    def batch_put_session_revoke(self, keys):
+        self.calls.append(("session_revoke", list(keys)))
+        return [
+            (
+                0
+                if self.sessions.pop(key, None) is not None
+                else store_client.INVALID_PARAMS
+            )
+            for key in keys
+        ]
 
     def remove(self, key, force=False):
         self.calls.append(("remove", key, force))
@@ -344,6 +400,11 @@ def cluster(monkeypatch):
         store_client,
         "_new_replicate_config",
         lambda group_ids: SimpleNamespace(group_ids=list(group_ids)),
+    )
+    monkeypatch.setattr(
+        store_client,
+        "_new_marker_config",
+        lambda replicas: SimpleNamespace(replica_num=replicas, with_hard_pin=True),
     )
     # What closed pools kept for the life of the process, per test.
     monkeypatch.setattr(pool_mod, "_UNSETTLED_ALLOCATIONS", [])
@@ -479,6 +540,7 @@ def make_worker(cluster):
             client=client,
         )
         worker._gpu_connector, worker._client, worker._pool = gpu, client, pool
+        worker._taint_marker = taint_mod.TaintMarker(client)
         worker._namespace = namespace or NAMESPACE
         worker._rank, worker._world = rank, world
         worker._chunk_bytes = CHUNK_BYTES
@@ -1281,9 +1343,11 @@ def test_lookup_is_the_prefix_every_rank_holds(cluster):
     assert lookup.lookup(_seq(0, 52)) == 6 * CHUNK  # partial tail not asked
     assert lookup.lookup(_seq(0, 7)) == 0  # shorter than a chunk
     [store] = cluster.stores
-    # One RPC per lookup, rank-major, the partial chunk never asked about.
+    # One RPC per lookup: the taint marker, then every rank's chunks
+    # rank-major, the partial chunk never asked about.
     asked = [call[1] for call in store.calls if call[0] == "exists"]
-    assert [len(batch) for batch in asked] == [12, 12, 12]
+    assert [len(batch) for batch in asked] == [13, 13, 13]
+    assert {batch[0] for batch in asked} == {keys.STORE_TAINT_KEY}
 
 
 def test_lookup_counts_rank_objects_past_the_shared_prefix(
@@ -1346,7 +1410,8 @@ def test_lookup_splits_large_prompts_into_batches(cluster, monkeypatch):
         _store_chunks(cluster, hashes, range(5), rank=rank, world=2)
     assert scheduler._lookup_client.lookup(_seq(0, 40)) == 40
     [store] = cluster.stores
-    assert [len(c[1]) for c in store.calls if c[0] == "exists"] == [4, 4, 2]
+    # The taint marker and ten chunk keys.
+    assert [len(c[1]) for c in store.calls if c[0] == "exists"] == [4, 4, 3]
 
 
 def test_lookup_with_per_nic_pools_asks_every_pool(cluster):
@@ -1426,6 +1491,60 @@ def test_a_pool_that_cannot_connect_leaves_the_others_open(cluster, scheduler_cl
     scheduler_clock.now += 2.0
     assert lookup.lookup(_seq(0, 32)) == 32
     assert len(cluster.stores) == 3 and not up.closed
+
+
+def test_lookups_count_nothing_a_marked_pool_holds(cluster, caplog):
+    scheduler = MooncakeStoreOffloadScheduler(_config())
+    scheduler._min_load_tokens = 0
+    lookup = scheduler._lookup_client
+    hashes = _hashes(40)
+    _store_chunks(cluster, hashes, range(5))
+    assert lookup.lookup(_seq(0, 41)) == 40
+    cluster.objects[MASTER][keys.STORE_TAINT_KEY] = b""
+    with caplog.at_level(logging.ERROR, logger="atom"):
+        assert scheduler.get_num_new_matched_tokens(_seq(1, 41)) == (0, False)
+    assert f"carries the taint marker {keys.STORE_TAINT_KEY}" in caplog.text
+    [store] = cluster.stores
+    asked = len(store.calls)
+    # For good, and without asking it again: the marker goes only with the
+    # Store, and the Store's memory does not come back with a removed key.
+    del cluster.objects[MASTER][keys.STORE_TAINT_KEY]
+    assert lookup.lookup(_seq(2, 41)) == 0
+    assert len(store.calls) == asked
+
+
+def test_a_marked_pool_holds_nothing_beside_pools_that_are_not(cluster):
+    lookup = _two_pools()._lookup_client
+    hashes = _hashes(32)
+    for rank in range(2):
+        _store_chunks(cluster, hashes, range(4), rank=rank, world=2)
+        _store_chunks(
+            cluster, hashes, range(4), rank=rank, world=2, master="10.0.0.1:26151"
+        )
+    assert lookup.lookup(_seq(0, 32)) == 32
+    cluster.objects[MASTER][keys.STORE_TAINT_KEY] = b""
+    # The other pool still holds the prefix.
+    assert lookup.lookup(_seq(0, 32)) == 32
+    assert [pool.tainted for pool in lookup._pools] == [True, False]
+    # What only the marked pool holds is absent.
+    cluster.objects["10.0.0.1:26151"].clear()
+    assert lookup.lookup(_seq(0, 32)) == 0
+
+
+@pytest.mark.parametrize("code", [store_client.RPC_FAIL, "raise"])
+def test_a_pool_that_cannot_say_whether_it_is_marked_answers_nothing(
+    cluster, scheduler_clock, code
+):
+    lookup = MooncakeStoreOffloadScheduler(_config())._lookup_client
+    _store_chunks(cluster, _hashes(40), range(5))
+    assert lookup.lookup(_seq(0, 41)) == 40
+    [store] = cluster.stores
+    if code == "raise":
+        store.raise_on = "exists"
+    else:
+        store.exist_codes[keys.STORE_TAINT_KEY] = code
+    assert lookup.lookup(_seq(0, 41)) is None
+    assert lookup._pools[0].paused_until > scheduler_clock.now
 
 
 def test_a_lookup_answers_what_unanswered_keys_cannot_change(cluster):
@@ -2126,6 +2245,100 @@ def test_a_get_refused_before_mooncake_has_it_frees_its_slots(
     assert [call for call in store.calls if call[0] == "get"] == []
     assert worker._pool.quarantined("load") == 0
     assert worker.get_finished().failed_loading == {request.load_operation}
+
+
+@pytest.mark.parametrize("put", ["batch_wait", "raised"])
+def test_a_put_that_may_still_write_marks_the_store_for_every_client(
+    cluster, make_worker, monkeypatch, caplog, put
+):
+    # Another engine's worker on the same Store, which stored a prefix.
+    other, _ = make_worker()
+    other._do_save_req(_save_req(60, 16))
+    other.get_finished()
+    worker, _ = make_worker()
+    store = worker._client._store
+    failing = _save_req(61, 16, offset=100)
+    if put == "raised":
+        store.raise_on = "put"
+    else:
+        store.put_codes[_key(failing.chunk_hashes, 1)] = store_client.TRANSFER_FAIL
+        monkeypatch.setattr(
+            store_client.CallClock, "seconds", lambda _self: store_client.BATCH_WAIT_S
+        )
+    worker._do_save_req(failing)
+    store.raise_on = None
+    # The marker: hard-pinned, a replica asked on every segment, and made by
+    # the master alone, with no transfer the stalled fabric would carry.
+    marker = cluster.markers[MASTER][keys.STORE_TAINT_KEY]
+    assert marker.with_hard_pin and marker.replica_num == taint_mod.MARKER_REPLICAS
+    assert worker._taint_marker.placed
+    assert not any(
+        call[0] == "put" and keys.STORE_TAINT_KEY in call[1] for call in store.calls
+    )
+    # The other worker finds it before its next get, and loads nothing.
+    other_store = other._client._store
+    gets = [call for call in other_store.calls if call[0] == "get"]
+    load = _load_req(60, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    with caplog.at_level(logging.ERROR, logger="atom"):
+        other._do_load_req(load)
+    assert other.get_finished().failed_loading == {load.load_operation}
+    assert [call for call in other_store.calls if call[0] == "get"] == gets
+    assert f"carries the taint marker {keys.STORE_TAINT_KEY}" in caplog.text
+    # For good: the marker going does not bring the Store's memory back.
+    del cluster.objects[MASTER][keys.STORE_TAINT_KEY]
+    again = _load_req(60, hbm=0, lmc=16, block_ids=[8, 9, 10, 11], generation=1)
+    other._do_load_req(again)
+    assert other.get_finished().failed_loading == {again.load_operation}
+
+
+def test_a_marker_the_store_refuses_is_placed_again_until_it_lands(
+    cluster, make_worker, monkeypatch, slow_calls
+):
+    monkeypatch.setattr(taint_mod, "_RETRY_BASE_S", 0.01)
+    worker, _ = make_worker()
+    store = worker._client._store
+    store.session_codes[keys.STORE_TAINT_KEY] = store_client.NO_AVAILABLE_HANDLE
+    failing = _save_req(62, 16)
+    store.put_codes[_key(failing.chunk_hashes, 1)] = store_client.TRANSFER_FAIL
+    worker._do_save_req(failing)
+    assert keys.STORE_TAINT_KEY not in cluster.objects[MASTER]
+    # This worker loads nothing meanwhile.
+    worker._do_save_req(_save_req(63, 16, offset=100))
+    load = _load_req(63, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    worker._do_load_req(load)
+    assert load.load_operation in worker.get_finished().failed_loading
+    # It keeps trying until the Store takes the marker.
+    del store.session_codes[keys.STORE_TAINT_KEY]
+    deadline = time.monotonic() + 30
+    while not worker._taint_marker.placed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert keys.STORE_TAINT_KEY in cluster.objects[MASTER]
+    assert worker._taint_marker.placed
+
+
+def test_a_load_that_cannot_look_for_the_marker_gets_nothing(cluster, make_worker):
+    worker, _ = make_worker()
+    worker._do_save_req(_save_req(64, 16))
+    worker.get_finished()
+    store = worker._client._store
+    store.exist_codes[keys.STORE_TAINT_KEY] = store_client.RPC_FAIL
+    load = _load_req(64, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    worker._do_load_req(load)
+    assert worker.get_finished().failed_loading == {load.load_operation}
+    assert not any(call[0] == "get" for call in store.calls)
+    # That refuses the one load: the next look is answered, and its answer
+    # serves the loads that follow for a while.
+    del store.exist_codes[keys.STORE_TAINT_KEY]
+    for generation in (1, 2):
+        again = _load_req(
+            64, hbm=0, lmc=16, block_ids=[8, 9, 10, 11], generation=generation
+        )
+        worker._do_load_req(again)
+        assert worker.get_finished().finished_loading == {again.load_operation}
+    looks = [
+        c for c in store.calls if c[0] == "exists" and c[1] == [keys.STORE_TAINT_KEY]
+    ]
+    assert len(looks) == 2
 
 
 def test_a_region_with_no_usable_slot_fails_saves_at_once(cluster, make_worker):
@@ -2893,6 +3106,40 @@ def test_a_probe_transfer_left_unsettled_keeps_the_pool(
         assert store.closed and len(store.registered) == 1
         assert len(pool_mod._UNSETTLED_ALLOCATIONS) == 1
         assert worker._pool is None
+        # The put may still write: the Store is marked before startup gives up.
+        assert keys.STORE_TAINT_KEY in cluster.objects[MASTER]
+    finally:
+        worker.close()
+
+
+def test_a_worker_started_on_a_marked_store_loads_nothing(cluster, one_rank, caplog):
+    cluster.objects[MASTER] = {keys.STORE_TAINT_KEY: b""}
+    worker = MooncakeStoreOffloadConnector(_registering_config())
+    try:
+        with caplog.at_level(logging.ERROR, logger="atom"):
+            worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        assert f"carries the taint marker {keys.STORE_TAINT_KEY}" in caplog.text
+        [store] = cluster.stores
+        gets = [call for call in store.calls if call[0] == "get"]  # the probe's
+        request = _load_req(70, hbm=0, lmc=16, block_ids=list(range(4)))
+        worker._do_load_req(request)
+        assert worker.get_finished().failed_loading == {request.load_operation}
+        assert [call for call in store.calls if call[0] == "get"] == gets
+    finally:
+        worker.close()
+
+
+def test_startup_stops_where_the_store_cannot_say_whether_it_is_marked(
+    cluster, one_rank
+):
+    cluster.exist_codes[keys.STORE_TAINT_KEY] = store_client.RPC_FAIL
+    worker = MooncakeStoreOffloadConnector(_registering_config())
+    try:
+        with pytest.raises(RuntimeError, match="carries the taint marker"):
+            worker.register_kv_caches(_kv_caches(), num_blocks=8)
+        [store] = cluster.stores
+        assert store.closed and store.registered == {}
+        assert worker._pool is None and worker._taint_marker is None
     finally:
         worker.close()
 

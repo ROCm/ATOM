@@ -36,6 +36,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
+    STORE_TAINT_KEY,
     chain_seed,
     chunk_digest,
     chunk_hash_chain,
@@ -141,15 +142,17 @@ class _PoolLookups:
     Its client is opened on the first lookup that asks it. A pool that cannot
     be reached, or fails a lookup, is not asked until ``paused_until``: every
     call to it blocks the scheduler thread, and the other pools answer
-    meanwhile.
+    meanwhile. A pool found to carry the taint marker is ``tainted`` for good
+    and holds nothing for the lookups from then on.
     """
 
-    __slots__ = ("client", "paused_until", "pool")
+    __slots__ = ("client", "paused_until", "pool", "tainted")
 
     def __init__(self, pool: StorePool) -> None:
         self.pool = pool
         self.client: store_client.MooncakeStoreClient | None = None
         self.paused_until = 0.0
+        self.tainted = False
 
 
 class _StoreLookup:
@@ -169,6 +172,10 @@ class _StoreLookup:
     pool that fails is absent for every key another pool answers. A lookup
     answers only what the unanswered keys cannot change, so a pool that fails
     never makes a hit longer.
+
+    Each call also asks for the Store's taint marker (:mod:`.taint`). A pool
+    that carries it holds nothing from then on, for this scheduler's life, and
+    is not asked again; one that cannot say whether it does answers nothing.
 
     A pool's Store client is opened on the first lookup that asks it, not at
     construction: every PP stage builds a scheduler, and only the head ever
@@ -272,12 +279,16 @@ class _StoreLookup:
         """Per key: 1 if a pool holds it, 0 if a pool answered and none holds
         it, None if no pool answered. None when no pool answered any key.
         """
+        answers: list[list[int]] = []
+        if any(pool.tainted for pool in self._pools):
+            answers.append([0] * len(keys))
         pools = self._pools_to_ask()
-        if not pools:
+        if pools:
+            answers += [
+                answer for answer in self._exists_on(pools, keys) if answer is not None
+            ]
+        if not answers:
             return None
-        answers = [
-            answer for answer in self._exists_on(pools, keys) if answer is not None
-        ]
         merged: list[int | None] = []
         for codes in zip(*answers):
             if 1 in codes:
@@ -291,35 +302,40 @@ class _StoreLookup:
         return merged
 
     def _pools_to_ask(self) -> list[_PoolLookups]:
-        """The pools not paused, each connected, connecting those not yet."""
+        """The pools neither tainted nor paused, each connected, connecting
+        those not yet."""
         now = time.monotonic()
         return [
             pool
             for pool in self._pools
-            if now >= pool.paused_until
+            if not pool.tainted
+            and now >= pool.paused_until
             and (pool.client is not None or self._connect(pool))
         ]
 
     def _exists_on(
         self, pools: list[_PoolLookups], keys: list[str]
     ) -> list[list[int] | None]:
-        """Each pool's codes for ``keys``, concurrently; None for one that raised.
+        """Each pool's codes for ``keys``, concurrently.
 
-        A pool that raised or answered an error is paused (`_pause`).
+        None for a pool that raised or could not say whether it carries the
+        taint marker, and all 0 for one that does. A pool that raised or
+        answered an error is paused (`_pause`).
         """
+        asked = [STORE_TAINT_KEY, *keys]
         asked_at = time.monotonic()
         futures = (
-            [self._executor.submit(pool.client.exists, keys) for pool in pools]
+            [self._executor.submit(pool.client.exists, asked) for pool in pools]
             if self._executor is not None
             else None
         )
         answers: list[list[int] | None] = []
         for index, pool in enumerate(pools):
             try:
-                codes = (
+                taint, *codes = (
                     futures[index].result()
                     if futures is not None
-                    else pool.client.exists(keys)
+                    else pool.client.exists(asked)
                 )
             except Exception as exc:  # noqa: BLE001  # the pool is not asked a while
                 self._warn(
@@ -333,7 +349,20 @@ class _StoreLookup:
                 )
                 answers.append(None)
                 continue
-            errors = [code for code in codes if code < 0]
+            if taint == 1:
+                pool.tainted = True
+                logger.error(
+                    "Mooncake Store offload: the Store pool at %s carries the "
+                    "taint marker %s: a put a worker gave up on may still write "
+                    "memory the Store has since given to other objects. Lookups "
+                    "count nothing it holds from now on, so no load reads it; "
+                    "restart the Store, then this engine, to load from it again",
+                    pool.pool.master,
+                    STORE_TAINT_KEY,
+                )
+                answers.append([0] * len(keys))
+                continue
+            errors = [code for code in (taint, *codes) if code < 0]
             if errors:
                 self._warn(
                     pool,
@@ -341,11 +370,13 @@ class _StoreLookup:
                     "it is not asked for %.0fs",
                     pool.pool.master,
                     len(errors),
-                    len(keys),
+                    len(asked),
                     store_client.describe(errors[0]),
                     self._pause(pool, _LOOKUP_BACKOFF_S, asked_at),
                 )
-            answers.append(codes)
+            # A pool that cannot say whether it carries the marker answers
+            # nothing: what it holds may be what a late write reached.
+            answers.append(None if taint < 0 else codes)
         return answers
 
     @staticmethod

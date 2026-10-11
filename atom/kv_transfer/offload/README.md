@@ -117,6 +117,7 @@ Four rules carry the module:
 | `mooncake_store/nic.py` | One PCI-local RDMA device per worker. |
 | `mooncake_store/client.py` | Pure zero-copy `MooncakeDistributedStore` client, result codes, per-call counters. |
 | `mooncake_store/pool.py` | `TransferSlotPool`: the registered save/load slots in HBM, with quarantine. |
+| `mooncake_store/taint.py` | The Store's taint marker, placed after a put Mooncake gave up on, which every client of the Store checks before it loads. |
 | `mooncake_store/scheduler.py`, `mooncake_store/worker.py` | `mooncake_store` scheduler (Store lookups, digest-carrying requests) and worker (windowed put/get, startup probe). |
 
 The engine-side counterpart of the state tier lives outside this directory:
@@ -394,18 +395,20 @@ a copy into each slot (and the reverse).
   others are in while any of them lives.
 - Lookup runs in the scheduler process over its own tcp Store client per
   pool, each opened on the first lookup that asks it (every PP stage builds a
-  scheduler; only the head asks): one `batch_is_exist` for every rank x chunk
-  key (split into calls of at most 8192 keys). The hit is the shortest run of
-  present chunks from chunk 0 over all ranks, because a load is
-  all-or-nothing across stages. A key no pool answered (an error code, or a
-  pool that raised or is paused) leaves the lookup `None` -- "no answer",
-  retried later, never a remembered miss -- where it could change the hit; an
-  error past the hit cannot lengthen it, and the hit stands. A lookup blocks
-  the scheduler thread, and a master that is down holds each call for
-  seconds, so a pool that failed a lookup is not asked for 10 s, or ten times
-  as long as the failed call blocked if that is longer, and one the scheduler
-  could not reach for 30 s; with one pool, lookups meanwhile answer `None`
-  without asking.
+  scheduler; only the head asks): one `batch_is_exist` for the Store's taint
+  marker and every rank x chunk key (split into calls of at most 8192 keys).
+  The hit is the shortest run of present chunks from chunk 0 over all ranks,
+  because a load is all-or-nothing across stages. A key no pool answered (an
+  error code, or a pool that raised, is paused or cannot say whether it
+  carries the taint marker) leaves the lookup `None` -- "no answer", retried
+  later, never a remembered miss -- where it could change the hit; an error
+  past the hit cannot lengthen it, and the hit stands. A pool that carries
+  the marker holds nothing for the lookups from then on and is not asked
+  again. A lookup blocks the scheduler thread, and a master that is down
+  holds each call for seconds, so a pool that failed a lookup is not asked
+  for 10 s, or ten times as long as the failed call blocked if that is
+  longer, and one the scheduler could not reach for 30 s; with one pool,
+  lookups meanwhile answer `None` without asking.
 - With per-NIC pools the scheduler cannot tell which pool a rank writes to, so
   it asks every pool for every key, concurrently: a key is present if any pool
   holds it, and absent if a pool answered and none holds it, so a pool that
@@ -464,12 +467,36 @@ a copy into each slot (and the reverse).
   it gave up on before the call returns (`FinalizeBatchPut` sends
   `BatchPutRevoke`), and the master frees the memory at once for the next put
   that needs as much (`PutRevoke`). A late write would land inside another
-  key's object of the same size, which a load's size check accepts. After
-  such a put the worker loads nothing more from the Store (logged once as an
-  error). A load needs every rank's chunks, so every load of the engine then
-  fails and its request prefills, until the engine and its Store restart.
-  Saves go on.
-  A per-chunk digest checked before the unpack would keep loads going, but
+  key's object of the same size, of any namespace, which a load's size check
+  accepts. After such a put (or a startup probe put that raised or gave up)
+  the worker loads nothing more from the Store, logged once as an error, and
+  marks the Store tainted, so no client of it loads from it again: not the
+  engine's other workers, not other engines on the same Store, and not an
+  engine restarted against it. A put refused before Mooncake was called
+  (duplicate keys, a `ReplicateConfig` the binding refuses) posts nothing
+  and fails only its save.
+- The mark is one object, `atomkv/store-tainted`, outside every namespace.
+  The master creates it on its own, through Mooncake's put session (no
+  transfer, so it gets there while the fabric is stalled), hard-pinned
+  (`ReplicateConfig.with_hard_pin`: eviction never takes it) and with a
+  replica on every segment it can (`replica_num=100`; a segment that
+  unmounts takes its own objects, late write included, and the mark lives on
+  in the others). The worker retries a mark the Store does not take, with
+  backoff up to 30 s, logging each failure as an error, while its own loads
+  stay off. Every worker looks for the mark at startup and before it loads
+  (at most once a second), and every scheduler lookup asks for it with the
+  chunks; a process that has seen it loads nothing from that Store for the
+  rest of its life, and a look that gets no answer refuses that load or
+  lookup. A worker that cannot tell at startup refuses to start. A load needs
+  every rank's chunks, so every load of an engine on a tainted Store fails
+  and its request prefills. Saves go on.
+- A taint clears only when the Store restarts: its master and owners, which
+  frees the memory the late write may reach. Restart the engines that saw
+  it too: they keep refusing that Store. Removing the key, or every object
+  (`remove_all`), drops the mark but not the late write: restart a tainted
+  Store, never just empty it. The mark is also lost if every segment holding
+  a replica of it unmounts while the Store goes on.
+- A per-chunk digest checked before the unpack would keep loads going, but
   Mooncake's own (`MOONCAKE_STORE_CHECKSUM=1`) runs a byte-wise CRC64 on
   the CPU after copying each object off the GPU, far below the in-place
   load rate.
@@ -576,7 +603,8 @@ this worker config.
   the revision an HF config names, not the bytes of local weights: restart
   the Store (or `remove_all`) after changing weights under the same model
   path, or any other setting that rearranges the KV bytes without being named
-  above.
+  above. A Store whose log or workers report the taint marker needs a
+  restart, not `remove_all` (see above).
 - **Logs.** `OFFLOAD_PROFILE=1` emits `[OFFLOAD-SAVE-PROF]` (`pack_ms`, `put_ms`)
   and `[OFFLOAD-LOAD-PROF]` (`get_ms`, `unpack_ms`, `retrieve_ms`,
   `effective_gbps`) per operation, with `status=ok` or the failure that ended

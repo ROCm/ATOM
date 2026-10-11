@@ -153,6 +153,16 @@ def _new_replicate_config(group_ids: list[str]) -> Any:
     return config
 
 
+def _new_marker_config(replicas: int) -> Any:
+    """A ``ReplicateConfig`` for a marker: hard-pinned, up to ``replicas`` copies."""
+    from mooncake.store import ReplicateConfig
+
+    config = ReplicateConfig()
+    config.replica_num = int(replicas)
+    config.with_hard_pin = True
+    return config
+
+
 class MooncakeStoreClient:
     """One ``MooncakeDistributedStore`` set up as a pure, zero-copy client."""
 
@@ -289,6 +299,26 @@ class MooncakeStoreClient:
         read = sum(code for code in codes if code > 0)
         self._count("get", keys, read, codes, failed=lambda code: code < 0)
         return codes
+
+    def put_marker(self, key: str, nbytes: int, *, replicas: int) -> int:
+        """Create ``key`` as a hard-pinned object nothing writes; 0 or a negative code.
+
+        Metadata only, through Mooncake's put session: the master reserves
+        ``nbytes`` on up to ``replicas`` segments, one each (fewer when there
+        are fewer), and commits the object as it is, with no transfer, so this
+        works where the fabric does not. Eviction never takes a hard-pinned
+        object; a remove does, and so does the loss of every segment holding a
+        replica of it. A key that exists returns OBJECT_ALREADY_EXISTS.
+        """
+        config = _new_marker_config(replicas)
+        [code] = self._store.batch_put_session_start([key], [int(nbytes)], config)
+        if code == 0:
+            [code] = self._store.batch_put_session_end([key])
+        if code != 0:
+            # Drops a session that could not end, here or in an earlier call,
+            # which would refuse the next start (no RPC without one).
+            self._store.batch_put_session_revoke([key])
+        return int(code)
 
     def remove(self, key: str, *, force: bool = False) -> int:
         """Remove one object; ``force`` ignores the read leases lookups grant."""

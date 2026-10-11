@@ -903,8 +903,10 @@ purge_lmcache_disk() {
 # conflicting setting, or an image without the Store, before the node starts
 # anything. Master and owners start before the workers, which connect (and
 # round-trip a probe chunk) while they build their engines and never retry,
-# and stop after them. A Store lives as long as this shell: its objects
-# outlive a worker restart, not the job.
+# and stop after them. A Store lives as long as this shell, which starts each
+# worker once and restarts none: the Store and its objects end with the job,
+# so one a worker marked tainted (a put it gave up on may still write the
+# owners' memory) is never loaded from again.
 mooncake_store_pids=()
 mooncake_store_logs=()
 mooncake_store_names=()

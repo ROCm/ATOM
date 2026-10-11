@@ -30,7 +30,9 @@ Completion protocol, per worker and operation:
   good, and the pool's memory then outlives the worker (``pool.close``).
 * A put that leaves its slot quarantined may also still write the owner
   memory the Store took back, inside another key's object: from then on the
-  worker loads nothing from the Store (``_distrust_store``).
+  worker loads nothing from the Store, and marks it tainted so that no client
+  of it does (``_distrust_store``, :mod:`.taint`). Before every load it looks
+  for that mark (``_load_refusal``).
 """
 
 from __future__ import annotations
@@ -59,6 +61,7 @@ from atom.kv_transfer.offload.mooncake_store.config import (
 )
 from atom.kv_transfer.offload.mooncake_store.keys import (
     DIGEST_BYTES,
+    STORE_TAINT_KEY,
     chunk_group_ids,
     chunk_keys,
     probe_key,
@@ -74,6 +77,7 @@ from atom.kv_transfer.offload.mooncake_store.scheduler import (
     monotonic_clock_id,
     require_monotonic_clock_id,
 )
+from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
 
 logger = logging.getLogger("atom")
 
@@ -86,6 +90,10 @@ _WARNING_INTERVAL_S = 30.0
 # A save stops reading its source blocks this long (at most) before the
 # scheduler may reclaim them; see `_source_read_deadline`.
 _MAX_SOURCE_READ_MARGIN_S = 60.0
+# Seconds a load trusts the last look for the Store's taint marker
+# (`_load_refusal`): a worker stops loading from a Store another client marked
+# within this.
+_TAINT_RECHECK_S = 1.0
 
 
 def _tp_group():
@@ -163,8 +171,12 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         self._next_warning_at: dict[str, float] = {}
         self._suppressed_warnings: Counter = Counter()
         # Why this worker loads nothing from the Store any more, once it does
-        # not; see `_distrust_store`.
+        # not: its own put (`_distrust_store`) or the Store's taint marker.
         self._store_distrusted: str | None = None
+        # Places the taint marker in this worker's Store; and when a load
+        # next looks for one there (`_load_refusal`).
+        self._taint_marker: TaintMarker | None = None
+        self._taint_checked_until = 0.0
         timeout = self._store_cfg.save_abandon_timeout_s
         self._source_read_window_s = timeout - min(
             _MAX_SOURCE_READ_MARGIN_S, timeout / 5
@@ -173,6 +185,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
     def close(self) -> None:
         """Join the executors, then release the GPU connector, pool and client."""
         super().close()
+        marker, self._taint_marker = self._taint_marker, None
+        # A retry of the taint marker still inside a Store call keeps the
+        # client open: closing it would pull it from under the call.
+        client_idle = marker is None or marker.close()
         gpu_connector, self._gpu_connector = self._gpu_connector, None
         if gpu_connector is not None:
             gpu_connector.close()
@@ -180,8 +196,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         if pool is not None:
             pool.close()
         client, self._client = self._client, None
-        if client is not None:
+        if client is not None and client_idle:
             client.close()
+        elif client is not None:
+            logger.warning(
+                "Mooncake Store offload: the taint marker is still being placed; "
+                "the Store client stays open"
+            )
 
     # -- lifecycle --------------------------------------------------------
     def register_kv_caches(
@@ -221,6 +242,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 protocol=cfg.protocol,
                 rdma_devices=nic or "",
             )
+            # Before the probe, whose put may leave a write behind.
+            self._taint_marker = TaintMarker(client)
             pool = TransferSlotPool(
                 device=device,
                 chunk_bytes=gpu_connector.gpu_staging_chunk_bytes,
@@ -229,13 +252,26 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 client=client,
             )
             self._probe_store(client, pool, namespace, rank)
+            checked_at = time.monotonic()
+            tainted, detail = self._look_for_taint(client)
+            if tainted is None:
+                raise RuntimeError(
+                    "Mooncake Store startup: cannot tell whether the Store at "
+                    f"{store_pool.master} carries the taint marker {STORE_TAINT_KEY} "
+                    f"({detail})"
+                )
         except BaseException:
+            marker, self._taint_marker = self._taint_marker, None
+            client_idle = marker is None or marker.close()
             if pool is not None:
                 pool.close()
-            if client is not None:
+            if client is not None and client_idle:
                 client.close()
             gpu_connector.close()
             raise
+        self._taint_checked_until = checked_at + _TAINT_RECHECK_S
+        if tainted:
+            self._refuse_loads_from_marked_store(store_pool.master)
         self._gpu_connector = gpu_connector
         self._client = client
         self._pool = pool
@@ -300,7 +336,13 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             target.tensor.zero_()
             _synchronize(pool.device)
             put_rc = self._probe_transfer(
-                pool, leased, source, lambda: client.put([key], [source.ptr], [nbytes])
+                pool,
+                leased,
+                source,
+                lambda: client.put([key], [source.ptr], [nbytes]),
+                # A put that may still write marks the Store before startup
+                # gives up.
+                on_unsettled=self._distrust_store,
             )
             if put_rc != 0:
                 raise RuntimeError(
@@ -349,28 +391,38 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
 
     @staticmethod
     def _probe_transfer(
-        pool: TransferSlotPool, leased: list[Slot], slot: Slot, call: Any
+        pool: TransferSlotPool,
+        leased: list[Slot],
+        slot: Slot,
+        call: Any,
+        *,
+        on_unsettled: Any = None,
     ) -> int:
         """Run the probe's put or get on ``slot``, quarantining it if unsettled.
 
-        A quarantined slot leaves ``leased``, the probe's slots still to release.
+        A quarantined slot leaves ``leased``, the probe's slots still to release,
+        and is reported to ``on_unsettled``, with why, when one is given.
         """
         clock = store_client.CallClock()
         try:
             [code] = call()
-        except BaseException:
+        except store_client.CallRefused:
+            raise  # nothing was posted: the slot is released with the rest
+        except BaseException as exc:
             leased.remove(slot)
             pool.quarantine([slot], reason="a startup probe transfer raised")
+            if on_unsettled is not None:
+                on_unsettled(f"the startup probe's transfer raised {exc!r}")
             raise
         if not store_client.buffer_settled(code, clock.seconds()):
-            leased.remove(slot)
-            pool.quarantine(
-                [slot],
-                reason=(
-                    f"a startup probe transfer gave up after {clock.seconds():.0f}s "
-                    "with its RDMA work possibly still posted"
-                ),
+            why = (
+                f"a startup probe transfer gave up after {clock.seconds():.0f}s "
+                "with its RDMA work possibly still posted"
             )
+            leased.remove(slot)
+            pool.quarantine([slot], reason=why)
+            if on_unsettled is not None:
+                on_unsettled(why)
         return code
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
@@ -669,9 +721,10 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         get_ms = unpack_ms = 0.0
         for window in windows:
             # Checked before every get: a save thread may give up a put
-            # while this load runs.
-            if self._store_distrusted is not None:
-                failure, detail = "store_distrusted", self._store_distrusted
+            # while this load runs, and another client may mark the Store.
+            refusal = self._load_refusal(client)
+            if refusal is not None:
+                failure, detail = "store_distrusted", refusal
                 break
             try:
                 slots = pool.acquire("load", len(window))
@@ -857,31 +910,87 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         return len(unsettled)
 
     def _distrust_store(self, why: str) -> None:
-        """Load nothing more from the Store: a put may still write memory it lost.
+        """Load nothing more from the Store, and mark it so no client does.
 
-        Mooncake revokes a put whose transfer it gave up on before the call
-        returns, and the master frees the owner memory it had given the put
-        at once, for the next put that needs as much (``FinalizeBatchPut``,
-        ``PutRevoke``). The abandoned RDMA write can still land there later,
-        with this put's bytes, inside another key's object of the same size,
-        and nothing in a load would tell. Quarantining the slot keeps this
-        worker's memory out of that write's reach; the owners' memory is out
-        of this worker's, so it stops loading instead, for good. That fails
-        every load of the engine, since a load needs every rank's chunks: the
-        requests prefill instead. Saves go on.
+        ``why`` is a put that may still write owner memory the Store has since
+        given to other objects (see :mod:`.taint`). Quarantining the slot keeps
+        this worker's memory out of that write's reach; the owners' memory is
+        out of every client's, so this worker stops loading, for good, and
+        places the Store's taint marker, which every other client of it checks.
+        A load needs every rank's chunks, so every load of the engine fails and
+        its request prefills. Saves go on.
         """
+        if self._refuse_loads(why):
+            logger.error(
+                "Mooncake Store offload: %s, and its RDMA writes may still land "
+                "in owner memory the Store has since given to other objects. "
+                "This worker loads nothing more from the Store and marks it "
+                "tainted (%s), so no client of it loads from it until it "
+                "restarts; every load of this engine prefills instead",
+                why,
+                STORE_TAINT_KEY,
+            )
+        marker = self._taint_marker
+        if marker is not None:
+            marker.place()
+
+    def _refuse_loads_from_marked_store(self, master: str) -> str:
+        """Load nothing more from a Store that carries the taint marker."""
+        why = f"the Store carries the taint marker {STORE_TAINT_KEY}"
+        if self._refuse_loads(why):
+            logger.error(
+                "Mooncake Store offload: the Store at %s carries the taint "
+                "marker %s: a put another client gave up on may still write "
+                "memory the Store has since given to other objects. This worker "
+                "loads nothing more from it, and every load of this engine "
+                "prefills instead; restart the Store, then this engine, to load "
+                "from it again",
+                master,
+                STORE_TAINT_KEY,
+            )
+        return self._store_distrusted or why
+
+    def _refuse_loads(self, why: str) -> bool:
+        """Load nothing more from the Store; True the first time only."""
         with self._stats_lock:
             if self._store_distrusted is not None:
-                return
+                return False
             self._store_distrusted = why
-        logger.error(
-            "Mooncake Store offload: %s, and its RDMA writes may still land in "
-            "owner memory the Store has since given to other objects. This "
-            "worker loads nothing more from the Store, so every load of this "
-            "engine prefills instead; restart the engine and the Store to load "
-            "from it again",
-            why,
-        )
+        return True
+
+    def _load_refusal(self, client: store_client.MooncakeStoreClient) -> str | None:
+        """Why this worker may not load from its Store now; None when it may.
+
+        Its own verdict holds for good (`_distrust_store`). The Store's taint
+        marker is looked for at most every `_TAINT_RECHECK_S`; once seen it
+        holds for good too, and a look that gets no answer refuses this load
+        only.
+        """
+        if self._store_distrusted is not None:
+            return self._store_distrusted
+        checked_at = time.monotonic()
+        if checked_at < self._taint_checked_until:
+            return None
+        tainted, detail = self._look_for_taint(client)
+        if tainted is None:
+            return f"cannot tell whether the Store carries the taint marker ({detail})"
+        if tainted:
+            return self._refuse_loads_from_marked_store(client.master_server_addr)
+        self._taint_checked_until = checked_at + _TAINT_RECHECK_S
+        return None
+
+    @staticmethod
+    def _look_for_taint(
+        client: store_client.MooncakeStoreClient,
+    ) -> tuple[bool | None, str]:
+        """Whether the Store carries the taint marker; None, and why, if unsaid."""
+        try:
+            [code] = client.exists([STORE_TAINT_KEY])
+        except Exception as exc:  # noqa: BLE001  # an unanswered look refuses
+            return None, repr(exc)
+        if code < 0:
+            return None, store_client.describe(code)
+        return code == 1, ""
 
     def _release_once_device_idle(
         self, pool: TransferSlotPool, slots: list[Slot]
