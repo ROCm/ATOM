@@ -498,18 +498,14 @@ def slow_calls(monkeypatch):
 def scheduler_clock(monkeypatch):
     """The scheduler module's monotonic clock, advanced by hand.
 
-    Its wall clock, which only stamps a save's dispatch time for the workers,
-    stays the real one the workers read.
+    It starts at the real clock's reading: the workers compare a save's
+    dispatch stamp with their own ``time.monotonic()``.
     """
-    clock = SimpleNamespace(now=1000.0)
+    clock = SimpleNamespace(now=time.monotonic())
     monkeypatch.setattr(
         scheduler_mod,
         "time",
-        SimpleNamespace(
-            monotonic=lambda: clock.now,
-            perf_counter=time.perf_counter,
-            time=time.time,
-        ),
+        SimpleNamespace(monotonic=lambda: clock.now, perf_counter=time.perf_counter),
     )
     return clock
 
@@ -1494,17 +1490,22 @@ def _arm_load(scheduler, seq, *, hbm, lmc, end=None):
         scheduler._looked_up_at[sid] = scheduler_mod.time.monotonic()
 
 
-def test_save_requests_carry_digests_not_tokens(cluster):
+def test_save_requests_carry_digests_not_tokens(cluster, make_worker):
     scheduler = MooncakeStoreOffloadScheduler(_config("kv_producer"))
     seq = _seq(6, 30)
     scheduler.update_state_after_alloc(seq)
     seq.num_cached_tokens = 16
-    before = time.time()
+    before = time.monotonic()
     [first] = scheduler.build_connector_meta().requests
     assert first.token_ids == [] and first.save_spec.skip_leading_tokens == 0
     assert first.chunk_hashes == _hashes(16)
-    # Where the reclaim clock starts, for the workers' source read deadline.
-    assert before <= first.dispatched_at <= time.time()
+    # Where the reclaim clock starts, for the workers' source read deadline,
+    # on the clock the reclaim runs on, which this boot's workers share.
+    assert before <= first.dispatched_at <= time.monotonic()
+    clock = scheduler_mod.monotonic_clock_id()
+    assert clock is not None and first.dispatch_clock == clock
+    worker, _ = make_worker()
+    assert worker._dispatch_time(first, time.monotonic()) == first.dispatched_at
     scheduler.save_finished(first.save_operation)
     seq.num_cached_tokens = 30
     [second] = scheduler.build_connector_meta().requests
@@ -2000,14 +2001,13 @@ def test_a_save_queued_past_its_deadline_reads_nothing(cluster, make_worker):
 def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     cluster, make_worker, monkeypatch, runs_after_s, stored
 ):
-    clock = SimpleNamespace(monotonic=5000.0, wall=1.75e9)
+    clock = SimpleNamespace(monotonic=5000.0)
+    # No wall clock: the worker reads none, so no step of it moves a deadline.
     monkeypatch.setattr(
         worker_mod,
         "time",
         SimpleNamespace(
-            monotonic=lambda: clock.monotonic,
-            time=lambda: clock.wall,
-            perf_counter=time.perf_counter,
+            monotonic=lambda: clock.monotonic, perf_counter=time.perf_counter
         ),
     )
     # Enqueue nothing: the test runs the save when its thread would get to it.
@@ -2016,11 +2016,12 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
     # The scheduler may reclaim the source 10 s after the dispatch.
     assert worker._source_read_window_s == 8.0
     request = _save_req(26, 24)
-    request.dispatched_at = clock.wall
+    # Stamped by the scheduler on the CLOCK_MONOTONIC this boot shares.
+    request.dispatched_at = clock.monotonic
+    request.dispatch_clock = scheduler_mod.monotonic_clock_id()
     # A downstream PP stage receives it 3 s later, after the forwards queued
     # ahead of it.
     clock.monotonic += 3.0
-    clock.wall += 3.0
     metadata = LMCacheOffloadMetadata()
     metadata.add_request(request)
     worker.start_load_kv(metadata)
@@ -2040,6 +2041,37 @@ def test_a_saves_deadline_counts_from_its_dispatch_not_its_receipt(
             _quiescent(operation),
             *(_safe(operation, index) for index in range(3)),
         }
+
+
+@pytest.mark.parametrize(
+    ("dispatch_clock", "own_clock"),
+    [
+        ("another-host", "this-host"),  # another host's CLOCK_MONOTONIC
+        (None, None),  # neither side could name its clock
+    ],
+)
+def test_a_save_stamped_on_a_clock_the_worker_cannot_place_reads_nothing(
+    cluster, make_worker, monkeypatch, dispatch_clock, own_clock
+):
+    monkeypatch.setattr(worker_mod, "monotonic_clock_id", lambda: own_clock)
+    # Enqueue nothing: the test runs the save when its thread would get to it.
+    monkeypatch.setattr(DenseOffloadConnector, "start_load_kv", lambda *_: None)
+    worker, gpu = make_worker()
+    request = _save_req(27, 24)
+    # Read off another clock, a stamp can look as young as it likes.
+    request.dispatched_at = time.monotonic() + 1e6
+    request.dispatch_clock = dispatch_clock
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(request)
+    worker.start_load_kv(metadata)
+    worker._do_save_req(request)
+    assert gpu.calls == [] and cluster.objects.get(MASTER, {}) == {}
+    operation = request.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation, False),
+        _quiescent(operation),
+        *(_safe(operation, index) for index in range(3)),
+    }
 
 
 def test_a_late_exception_still_leaves_exactly_one_terminal(

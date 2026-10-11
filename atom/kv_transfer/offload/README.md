@@ -457,9 +457,13 @@ a copy into each slot (and the reverse).
 - The engine reclaims a save's source blocks `save_abandon_timeout_s` after
   dispatch. A worker therefore stops starting GPU reads for a save that is
   still queued `timeout - min(60 s, timeout / 5)` after the scheduler
-  dispatched it (the request carries the dispatch time; a downstream PP stage
-  receives a save only after the forwards queued ahead of it): it would
-  otherwise pack another request's KV into this prompt's keys.
+  dispatched it: it would otherwise pack another request's KV into this
+  prompt's keys. The request carries the dispatch time, since a downstream PP
+  stage receives a save only after the forwards queued ahead of it. It is
+  stamped on the scheduler's CLOCK_MONOTONIC, the clock the reclaim runs on,
+  which every process of an engine shares (they run on one host) and no
+  wall-clock step moves. A stamp from another host's clock, told apart by its
+  boot ID, gives an age the worker cannot read: that save reads nothing.
 - A put of a key that already exists succeeds (Mooncake reports 0).
 - After a failed save no save is emitted for 1 s, doubled for each further
   failure in a row up to 30 s. A stored save ends the pause and starts the

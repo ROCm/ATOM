@@ -13,6 +13,7 @@ Store objects, instead of the prompt's token ids.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -72,6 +73,23 @@ _LOOKUP_REUSE_S = 1.0
 # PP stage every step.
 _SAVE_RETRY_BASE_S = 1.0
 _SAVE_RETRY_MAX_S = 30.0
+# Names the boot a CLOCK_MONOTONIC reading is from; see `monotonic_clock_id`.
+_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+
+@functools.cache
+def monotonic_clock_id() -> str | None:
+    """Which CLOCK_MONOTONIC ``time.monotonic()`` reads here: this boot's ID.
+
+    Every process of one boot of a host reads the same CLOCK_MONOTONIC, which no
+    wall-clock step moves; another host's counts from another origin. None when
+    the kernel does not say, which no worker takes for its own clock.
+    """
+    try:
+        with open(_BOOT_ID_PATH) as boot_id:
+            return boot_id.read().strip() or None
+    except OSError:
+        return None
 
 
 def prompt_chunk_hashes(seq: Any, chunk_tokens: int) -> bytes:
@@ -453,7 +471,8 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
 
         No token ids: every PP stage receives each request, and the digests
         are all the worker needs to name its objects. The dispatch time starts
-        the workers' source read deadline where the reclaim clock starts.
+        the workers' source read deadline where the reclaim clock starts, on
+        the same CLOCK_MONOTONIC (the reclaim stamps the save just after).
         """
         hashes = prompt_chunk_hashes(seq, self.chunk_size)
         return LMCacheReqMeta(
@@ -464,7 +483,8 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             is_last_prefill=is_last_prefill,
             save_operation=operation,
             chunk_hashes=hashes[: (aligned // self.chunk_size) * DIGEST_BYTES],
-            dispatched_at=time.time(),
+            dispatched_at=time.monotonic(),
+            dispatch_clock=monotonic_clock_id(),
         )
 
     def _build_load_request(
@@ -495,4 +515,8 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         return self._store_cfg.save_abandon_timeout_s
 
 
-__all__ = ["MooncakeStoreOffloadScheduler", "prompt_chunk_hashes"]
+__all__ = [
+    "MooncakeStoreOffloadScheduler",
+    "monotonic_clock_id",
+    "prompt_chunk_hashes",
+]

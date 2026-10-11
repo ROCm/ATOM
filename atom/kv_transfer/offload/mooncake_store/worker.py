@@ -67,6 +67,7 @@ from atom.kv_transfer.offload.mooncake_store.pool import (
     SlotPoolExhausted,
     TransferSlotPool,
 )
+from atom.kv_transfer.offload.mooncake_store.scheduler import monotonic_clock_id
 
 logger = logging.getLogger("atom")
 
@@ -367,19 +368,44 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         if isinstance(metadata, LMCacheOffloadMetadata):
             # The source read deadline of a save counts from its dispatch, not
             # from whenever a save thread gets to it; see
-            # `_source_read_deadline`. Placed on this worker's monotonic clock
-            # here, once: the wall clock is read only to learn how long ago the
-            # scheduler dispatched it.
+            # `_source_read_deadline`. Placed here, once per save.
             received_at = time.monotonic()
-            received_wall = time.time()
             for req in metadata.requests:
-                if req.save_spec is None:
-                    continue
-                in_transit = 0.0
-                if req.dispatched_at is not None:
-                    in_transit = max(0.0, received_wall - float(req.dispatched_at))
-                req._mooncake_store_dispatched_at = received_at - in_transit
+                if req.save_spec is not None:
+                    req._mooncake_store_dispatched_at = self._dispatch_time(
+                        req, received_at
+                    )
         super().start_load_kv(metadata)
+
+    def _dispatch_time(self, req: LMCacheReqMeta, received_at: float) -> float:
+        """When the scheduler dispatched ``req``, on this worker's monotonic clock.
+
+        The scheduler stamps it on its CLOCK_MONOTONIC, the clock its reclaim
+        deadline runs on. Every process of an engine runs on one host -- the PP
+        stages pass metadata over ipc:// sockets, the TP workers their calls
+        over shared memory -- where that is one clock, shared by all and moved
+        by no wall-clock step: a save's age read off it is the age the
+        scheduler counts, never less. A stamp from another clock has no age
+        this worker can read, and one counted too short would let the save
+        read blocks the scheduler already handed to other requests: the save
+        is placed a whole read window before its receipt, so it reads nothing.
+        A save without a stamp counts from its receipt.
+        """
+        if req.dispatched_at is None:
+            return received_at
+        clock = monotonic_clock_id()
+        if clock is None or req.dispatch_clock != clock:
+            self._warn_rate_limited(
+                "save:foreign_clock",
+                "Mooncake Store offload: req=%s was dispatched on another clock "
+                "(boot %s; this worker's is %s); its save reads nothing",
+                req.req_id,
+                req.dispatch_clock,
+                clock,
+            )
+            return received_at - self._source_read_window_s
+        # On one clock a dispatch never comes after its receipt.
+        return min(float(req.dispatched_at), received_at)
 
     def _source_read_deadline(self, req: LMCacheReqMeta) -> float | None:
         """When a save must stop starting GPU reads of its source blocks.
@@ -391,9 +417,8 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         reach a window past the deadline stop instead. The window counts from
         the dispatch too, not from when this worker received the save: a
         downstream PP stage receives it only after the forwards queued ahead
-        of it, seconds later. The margin covers the copy in flight, which
-        finishes within milliseconds. A save without a dispatch time counts
-        from its receipt.
+        of it, seconds later (`_dispatch_time`). The margin covers the copy in
+        flight, which finishes within milliseconds.
         """
         dispatched_at = getattr(req, "_mooncake_store_dispatched_at", None)
         if dispatched_at is None:
