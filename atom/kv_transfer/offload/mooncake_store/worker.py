@@ -531,6 +531,11 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     [self._chunk_bytes] * len(slots),
                     group_ids=group_ids,
                 )
+            except store_client.CallRefused as exc:
+                # Refused before Mooncake had the call: nothing was posted.
+                pool.release(slots)
+                failure, detail = "put_refused", str(exc)
+                break
             except Exception as exc:  # noqa: BLE001  # reported below
                 pool.quarantine(slots, reason="a put raised")
                 self._distrust_store(f"a put raised {exc!r}")
@@ -677,7 +682,14 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     [slot.ptr for slot in slots],
                     [self._chunk_bytes] * len(slots),
                 )
+            except store_client.CallRefused as exc:
+                pool.release(slots)
+                failure, detail = "get_refused", str(exc)
+                break
             except Exception as exc:  # noqa: BLE001  # reported below
+                # A get's late RDMA writes only these slots: it reads the
+                # owners' memory and writes none of it, so quarantining them
+                # is all it takes, unlike a put's (`_distrust_store`).
                 pool.quarantine(slots, reason="a get raised")
                 failure, detail = "get_raised", repr(exc)
                 break

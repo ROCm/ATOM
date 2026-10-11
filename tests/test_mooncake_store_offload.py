@@ -925,10 +925,11 @@ def test_client_lookups_are_batched_in_order(cluster, monkeypatch):
 
 def test_client_refuses_duplicate_keys_and_short_answers(cluster):
     client = _client()
-    with pytest.raises(ValueError, match="unique"):
+    with pytest.raises(store_client.CallRefused, match="unique"):
         client.put(["a", "a"], [1, 2], [8, 8])
-    with pytest.raises(ValueError, match="unique"):
+    with pytest.raises(store_client.CallRefused, match="unique"):
         client.get(["a", "a"], [1, 2], [8, 8])
+    assert [call[0] for call in cluster.stores[0].calls] == []  # never called
     client._store.batch_get_into = lambda *args: []
     with pytest.raises(RuntimeError, match="0 results for 1 keys"):
         client.get(["a"], [1], [8])
@@ -1986,6 +1987,58 @@ def test_a_put_that_may_still_write_stops_every_later_load(
     else:
         assert output.finished_loading == {load.load_operation}
         assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_a_put_refused_before_mooncake_has_it_fails_only_its_save(
+    cluster, make_worker, monkeypatch, caplog
+):
+    worker, _ = make_worker(save_slots=8)
+    stored = _save_req(54, 16)
+    worker._do_save_req(stored)
+    worker.get_finished()
+
+    def no_group_ids(group_ids):
+        raise AttributeError("ReplicateConfig has no attribute 'group_ids'")
+
+    # A binding that cannot group keys refuses the put before posting it.
+    monkeypatch.setattr(store_client, "_new_replicate_config", no_group_ids)
+    refused = _save_req(55, 16, offset=100)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        worker._do_save_req(refused)
+    assert "put_refused" in caplog.text
+    # Its slots go back and the Store stays trusted: nothing was posted.
+    assert worker._pool.quarantined("save") == 0
+    assert worker._store_distrusted is None
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    operation = refused.save_operation
+    assert worker.get_finished().connector_completions == {
+        _store(operation, False),
+        _quiescent(operation),
+        _safe(operation, 0),
+        _safe(operation, 1),
+    }
+    load = _load_req(54, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    worker._do_load_req(load)
+    assert worker.get_finished().finished_loading == {load.load_operation}
+
+
+def test_a_get_refused_before_mooncake_has_it_frees_its_slots(
+    cluster, make_worker, monkeypatch
+):
+    worker, _ = make_worker(load_slots=8)
+    worker._do_save_req(_save_req(56, 16))
+    worker.get_finished()
+    store = worker._client._store
+
+    def refused(keys):
+        raise store_client.CallRefused("Mooncake Store batch keys must be unique")
+
+    monkeypatch.setattr(worker._client, "_check_unique", refused)
+    request = _load_req(56, hbm=0, lmc=16, block_ids=list(range(4)))
+    worker._do_load_req(request)
+    assert [call for call in store.calls if call[0] == "get"] == []
+    assert worker._pool.quarantined("load") == 0
+    assert worker.get_finished().failed_loading == {request.load_operation}
 
 
 def test_a_region_with_no_usable_slot_fails_saves_at_once(cluster, make_worker):

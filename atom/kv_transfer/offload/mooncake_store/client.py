@@ -129,6 +129,14 @@ class CallClock:
         return max(time.monotonic() - self._monotonic, time.time() - self._wall)
 
 
+class CallRefused(RuntimeError):
+    """This client refused a call before handing it to Mooncake.
+
+    Nothing was posted, so no transfer can reach the call's buffers or the
+    Store's memory.
+    """
+
+
 def _new_distributed_store() -> Any:
     """A fresh ``MooncakeDistributedStore``; imported here, never at load time."""
     from mooncake.store import MooncakeDistributedStore
@@ -239,11 +247,22 @@ class MooncakeStoreClient:
 
         ``group_ids`` puts each key in that Mooncake group, which the master
         evicts whole. A key that already exists keeps the group it was put in.
+
+        Raises:
+            CallRefused: Before ``batch_put_from`` was called (duplicate keys,
+                a ``ReplicateConfig`` the binding refuses): nothing is posted.
+            Whatever ``batch_put_from`` raises, after which a transfer may
+                still be.
         """
         self._check_unique(keys)
         args: list[Any] = [list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]]
         if group_ids is not None:
-            args.append(_new_replicate_config(group_ids))
+            try:
+                args.append(_new_replicate_config(group_ids))
+            except Exception as exc:
+                raise CallRefused(
+                    f"Mooncake Store could not group a put's keys: {exc!r}"
+                ) from exc
         codes = [int(code) for code in self._store.batch_put_from(*args)]
         self._check_length("batch_put_from", codes, keys)
         stored = sum(int(s) for s, code in zip(sizes, codes) if code == 0)
@@ -251,7 +270,14 @@ class MooncakeStoreClient:
         return codes
 
     def get(self, keys: list[str], ptrs: list[int], sizes: list[int]) -> list[int]:
-        """Read each object into its buffer; per key its size or a negative code."""
+        """Read each object into its buffer; per key its size or a negative code.
+
+        Raises:
+            CallRefused: Before ``batch_get_into`` was called (duplicate
+                keys): nothing is posted.
+            Whatever ``batch_get_into`` raises, after which a transfer may
+                still be.
+        """
         self._check_unique(keys)
         codes = [
             int(code)
@@ -296,7 +322,7 @@ class MooncakeStoreClient:
     @staticmethod
     def _check_unique(keys: list[str]) -> None:
         if len(set(keys)) != len(keys):
-            raise ValueError(
+            raise CallRefused(
                 "Mooncake Store batch keys must be unique; a duplicate collapses "
                 "onto one buffer while both report success"
             )
