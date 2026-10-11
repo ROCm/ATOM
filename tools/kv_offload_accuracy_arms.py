@@ -159,6 +159,7 @@ def run(name, sectors, *, with_doc, unique=False):
     after = tier()
     supply = ""
     share = None
+    raw = (0.0, 0.0)
     if before and after:
         dq = after["external_prefix_cache_queries_total"] - before[
             "external_prefix_cache_queries_total"
@@ -169,12 +170,13 @@ def run(name, sectors, *, with_doc, unique=False):
         lq = after["prefix_cache_queries_total"] - before["prefix_cache_queries_total"]
         lh = after["prefix_cache_hits_total"] - before["prefix_cache_hits_total"]
         share = 100 * dh / dq if dq else 0.0
+        raw = (dh, dq)
         supply = (
             f" tier={dh:.0f}/{dq:.0f} ({share:.1f}%)"
             f" hbm={lh:.0f}/{lq:.0f} ({100 * lh / lq if lq else 0:.1f}%)"
         )
     print(f"ARM {name} correct {right}/{len(sectors)} prompt_tokens={ntok}{supply}")
-    return right, share
+    return right, share, raw
 
 
 pool = rng.sample(range(NFACTS), 3 * NQ)
@@ -183,8 +185,9 @@ blind, cold, warm = pool[:NQ], pool[NQ : 2 * NQ], pool[2 * NQ :]
 print(f"document facts={NFACTS} questions_per_arm={NQ} max_tokens={MAXTOK}")
 # The shared document is primed once, outside every arm, so the warm arm is
 # measured on a tier that is already full rather than on one it is filling.
+PRIMED_TOKENS = 0
 try:
-    ask(pool[0], with_doc=True)
+    _, PRIMED_TOKENS = ask(pool[0], with_doc=True)
 except Exception as exc:
     print(f"INVALID: priming request failed {type(exc).__name__}: {exc}")
     sys.exit(1)
@@ -197,7 +200,7 @@ print("--- verdict ---")
 if None in (b, c, w):
     print("INVALID: an arm failed to complete")
     sys.exit(1)
-(b, _), (c, c_share), (w, w_share) = b, c, w
+(b, _, _), (c, c_share, (c_hits, c_queries)), (w, w_share, (w_hits, w_queries)) = b, c, w
 if b > NQ // 4:
     print(f"INVALID: blind scored {b}/{NQ}; the questions do not need the prefix,")
     print("         so neither of the other arms is about the prefix either")
@@ -207,12 +210,25 @@ if c < NQ * 3 // 4:
     print("         warm score would be read as corruption when it is not")
     sys.exit(1)
 if c_share is not None and c_share > 5:
-    print(f"INVALID: cold arm took {c_share:.1f}% of its prompt from the tier;")
-    print("         it is a second copy of the measurement, not a control")
+    print(f"INVALID: cold arm took {c_share:.1f}% of its prompt from the tier")
+    print(f"         = {c_hits:.0f} hits / {c_queries:.0f} queries over {NQ} requests")
+    print(f"         = {c_hits / NQ:.0f} tokens per request served from the tier,")
+    print(f"           against {c_queries / NQ:.0f} asked for")
+    print("         A control takes ~0. Two ways it stops being one: the nonce")
+    print("         is not at the document HEAD (the tier then serves")
+    print("         everything up to it), or the nonce repeats across runs")
+    print("         (the previous run stored it). Both have happened here.")
     sys.exit(1)
 if w_share is not None and w_share < 50:
-    print(f"INVALID: warm arm took only {w_share:.1f}% of its prompt from the")
-    print("         tier; the experiment did not happen, whatever it scored")
+    print(f"INVALID: warm arm took only {w_share:.1f}% of its prompt from the tier")
+    print(f"         = {w_hits:.0f} hits / {w_queries:.0f} queries over {NQ} requests")
+    print(f"         = {w_hits / NQ:.0f} tokens per request served from the tier,")
+    print(f"           against {w_queries / NQ:.0f} asked for and ~{PRIMED_TOKENS} stored")
+    print("         Compare those three. Hits far below queries means the tier")
+    print("         was asked and could not answer -- eviction, or a store that")
+    print("         declined. Queries far below the prompt means it was not")
+    print("         asked, which is a local-hit or admission question, not a")
+    print("         tier one.")
     sys.exit(1)
 print(
     f"VALID test. blind={b}/{NQ} cold={c}/{NQ} warm={w}/{NQ} "
