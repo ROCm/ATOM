@@ -400,6 +400,8 @@ class LandingReceiver:
         self._disabled = False
         self._stats = {"slots": 0, "bytes": 0, "scatter_s": 0.0, "batches": 0}
         self._stats_at = time.monotonic()
+        # Credits whose send raised, by stage endpoint; sweep sends them again.
+        self._unsent_credits: dict[str, list[int]] = {}
 
     # -- setup ---------------------------------------------------------------
 
@@ -819,6 +821,10 @@ class LandingReceiver:
             except Exception:
                 # The other requests still have to be reported.
                 logger.exception("[PD-LANDING] reporting req %s failed", req_id)
+        with self._lock:
+            unsent, self._unsent_credits = self._unsent_credits, {}
+        for addr, slots in unsent.items():
+            self._send_credits(addr, slots)  # queued again if it raises
         if stats is not None and stats["slots"]:
             logger.info(
                 "[PD-LANDING] %.1fs: %d slots, %.2f GB landed (%.2f GB/s), "
@@ -1052,6 +1058,13 @@ class LandingReceiver:
         try:
             self._send(addr, [MSG_LANDING_CREDIT, payload])
         except Exception:
-            # Not raised: callers send after their bookkeeping is done. The
-            # stage holds these slots in flight until this rank restarts.
-            logger.exception("[PD-LANDING] returning slots to %s failed", addr)
+            # Not raised: callers send after their bookkeeping is done. A send
+            # that raised queued nothing, so sweep sends these slots again;
+            # until then the stage holds them in flight.
+            with self._lock:
+                first = addr not in self._unsent_credits
+                self._unsent_credits.setdefault(addr, []).extend(slots)
+            if first:
+                logger.exception(
+                    "[PD-LANDING] returning slots to %s failed; retrying", addr
+                )

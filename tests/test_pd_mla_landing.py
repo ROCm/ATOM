@@ -778,6 +778,14 @@ def test_a_failed_credit_send_still_reports_the_request():
     dest.pump()  # slot 0 is returned once its task completes
     dest.recv.stage_done("r", 0, 5, True, s0[:3])  # seq 2 lost: returned now
     assert dest.finished == [("r", True)]
+    # None of them is lost: sweep sends them again once the socket works.
+    dest.recv.sweep()
+    assert dest.sent == []
+    dest.recv._send = lambda addr, parts: dest.sent.append((addr, parts))
+    dest.recv.sweep()
+    assert sorted(s for _addr, slots in dest.credits() for s in slots) == sorted(s0[:3])
+    dest.recv.sweep()
+    assert dest.credits() == []  # sent once
 
 
 # ---------------------------------------------------------------------------
