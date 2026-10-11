@@ -258,7 +258,7 @@ EOF
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
-  if [[ "${rank}" -eq 0 ]]; then
+  if [[ "${rank}" -eq 0 && "${ATOMESH_PD_WORKER_LAYOUT:-}" != "standalone" ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
   fi
@@ -673,7 +673,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
       mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
-      if [[ "${rank}" -eq 0 ]]; then
+      if [[ "${rank}" -eq 0 && "${ATOMESH_PD_WORKER_LAYOUT:-}" != "standalone" ]]; then
         mesh_binary="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/setup_mesh.sh" \
           "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
       fi

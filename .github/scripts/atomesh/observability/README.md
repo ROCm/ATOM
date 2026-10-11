@@ -4,6 +4,15 @@ Agentic PD benchmarks (`benchmark.kind: aiperf_agentic`) automatically collect
 metrics and generate an offline HTML report for each concurrency setting. No
 additional workflow input or long-running monitoring server is required.
 
+Cases with `pd_worker_layout: standalone` run one combined ATOM server using
+its `prefill` service settings. The benchmark connects directly to ATOM on the
+configured frontend port. Mesh setup, routing, and Mesh metric collection are
+skipped; the report uses the standalone ATOM panels and one metrics target.
+
+The migrated Kimi-K3 C48 recipe is in `models_atomesh.yaml`. Select `nightly`
+and case `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48`
+in **Atomesh Benchmark** to run TP8/DCP8 with LMCache and state checkpoints.
+
 GPU event timing is disabled by default in ATOM. Agentic CI sets
 `ATOM_ENABLE_METRICS_DEVICE_TIMER=1` on the prefill and decode services so their
 GPU panels have data. Set `env.common.ATOM_ENABLE_METRICS_DEVICE_TIMER: "0"` in the job
@@ -91,7 +100,7 @@ reference and how to add a new metric.
 
 ## Collection lifecycle
 
-The workflow explicitly enables `ATOMESH_BUILD_MESH=true` for agentic cells.
+The workflow explicitly enables `ATOMESH_BUILD_MESH=true` for P/D agentic cells.
 Before launching the rank-0 service container, `../setup_mesh.sh` runs a separate
 build container using `../build_mesh.sh`. It builds the reviewed source with
 `ATOMESH_MESH_BUILD_PROFILE=release` (or an explicitly selected `ci` profile).

@@ -262,6 +262,7 @@ def empty_report(start, end, model, notes, *, window=60, deployment="pd"):
     return {
         "meta": {
             "title": report_title(deployment),
+            "deployment": deployment,
             "model": model,
             "start": start,
             "end": max(end, start + 1),
@@ -553,10 +554,10 @@ def main():
     args.prefill = args.prefill or []
     args.decode = args.decode or []
     args.standalone = args.standalone or []
-    if args.standalone and (args.prefill or args.decode):
+    if args.standalone and (args.prefill or args.decode or args.mesh):
         parser.error(
             "--standalone names the single server answering both roles and "
-            "cannot be combined with --prefill or --decode"
+            "cannot be combined with --prefill, --decode or --mesh"
         )
     if not args.standalone and not (args.prefill and args.decode):
         parser.error("--prefill and --decode are required without --standalone")

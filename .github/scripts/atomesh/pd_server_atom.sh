@@ -39,11 +39,15 @@ BACKEND="${BACKEND:-atom}"
 TOPOLOGY="${TOPOLOGY:-unknown}"
 DISPLAY_TOPOLOGY="${DISPLAY_TOPOLOGY:-${TOPOLOGY}}"
 ATOMESH_PD_WORKER_LAYOUT="${ATOMESH_PD_WORKER_LAYOUT:-multi_node}"
+STANDALONE=0
 SINGLE_NODE_PD=0
 PREFILL_SINGLE_NODE_PD=0
 DECODE_SINGLE_NODE_PD=0
 PACKED_NODES_PD=0
 case "${ATOMESH_PD_WORKER_LAYOUT}" in
+  standalone)
+    STANDALONE=1
+    ;;
   single_node)
     SINGLE_NODE_PD=1
     ;;
@@ -373,6 +377,14 @@ if [[ "${AGGREGATED}" == "1" ]]; then
   prefill_ports+=("${ROUTER_PORT}")
   decode_ips+=("${IP_ARRAY[0]}")
   decode_ports+=("${ROUTER_PORT}")
+elif [[ "${STANDALONE}" == "1" ]]; then
+  if [[ "${NODE_RANK}" != "0" || "${#IP_ARRAY[@]}" != "1" || "${xP}" != "1" || "${yD}" != "0" ]]; then
+    echo "ERROR: standalone requires one node, one combined server and no decode workers" >&2
+    exit 2
+  fi
+  # Keep the benchmark URL stable; ATOM itself listens on the frontend port.
+  prefill_ips+=("${IP_ARRAY[0]}")
+  prefill_ports+=("${ROUTER_PORT}")
 elif [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   if [[ "${xP}" != "1" || "${yD}" != "1" ]]; then
     echo "ERROR: single_node PD worker layout currently supports only 1 prefill and 1 decode worker" >&2
@@ -871,6 +883,30 @@ build_torch_profiler_args() {
   local dir="${RUN_DIR}/torch_traces/${log_name}"
   mkdir -p "${dir}"
   out_args=(--torch-profiler-dir "${dir}")
+}
+
+start_standalone() {
+  apply_role_env "ATOMESH_PREFILL_ENV_" "${host_ip}"
+  reset_lmcache_disk
+  local -a cache_env=() kv_args=() profiler_args=()
+  build_torch_profiler_args "standalone-rank-0" profiler_args
+  build_server_cache_env "standalone" "${ROUTER_PORT}" cache_env
+  if [[ -n "${ATOMESH_STANDALONE_KV_TRANSFER_CONFIG:-}" ]]; then
+    kv_args=(--kv-transfer-config "${ATOMESH_STANDALONE_KV_TRANSFER_CONFIG}")
+  fi
+  local -a cmd=(
+    python3 -m atom.entrypoints.openai_server
+    "${server_common[@]}"
+    --server-port "${ROUTER_PORT}"
+    "${prefill_parallel[@]}"
+    --max-num-seqs "${MAX_NUM_SEQS}"
+    "${kv_args[@]}"
+    "${prefill_cudagraph_args[@]}"
+    "${profiler_args[@]}"
+    ${PREFILL_SERVER_ARGS}
+  )
+  dump_launch_info "STANDALONE" "${cmd[@]}"
+  start_logged_process server_pid "${RUNTIME_LOG_DIR}/standalone-rank-0.log" env "${ATOM_SOURCE_ENV[@]}" "${cache_env[@]}" "${cmd[@]}"
 }
 
 start_prefill() {
@@ -1381,6 +1417,7 @@ run_aiperf_agentic_benchmark() {
   local safe_model="${MODEL_NAME//\//-}"
   local -a server_metrics_args=(--server-metrics)
   local -a report_args=(--model "${MODEL_NAME} · ${DISPLAY_TOPOLOGY}")
+  local warmup_grace_flag=--warmup-grace-period
   local idx
   if [[ "${AGGREGATED}" == "1" ]]; then
     # Both endpoint lists name the same server, so scrape it once: naming it
@@ -1388,6 +1425,11 @@ run_aiperf_agentic_benchmark() {
     # since this layout starts no router to answer on the Prometheus port.
     server_metrics_args+=("http://${decode_ips[0]}:${decode_ports[0]}/metrics")
     report_args+=(--standalone "${decode_ips[0]}:${decode_ports[0]}")
+  elif [[ "${STANDALONE}" == "1" ]]; then
+    server_metrics_args+=("http://${prefill_ips[0]}:${prefill_ports[0]}/metrics")
+    report_args+=(--standalone "${prefill_ips[0]}:${prefill_ports[0]}")
+    # Preserve the single-node agentic recipe's effective warmup timeout.
+    warmup_grace_flag=--agentic-warmup-grace-period
   else
     report_args+=(--mesh "127.0.0.1:${PROMETHEUS_PORT}")
     for idx in "${!prefill_ips[@]}"; do
@@ -1461,7 +1503,7 @@ run_aiperf_agentic_benchmark() {
       --trajectory-start-max-ratio "${AIPERF_TRAJECTORY_START_MAX_RATIO}" \
       --warmup-requests-per-lane "${AIPERF_WARMUP_REQUESTS_PER_LANE}" \
       --trace-idle-gap-cap-seconds "${AIPERF_TRACE_IDLE_GAP_CAP_SECONDS}" \
-      --warmup-grace-period "${AIPERF_WARMUP_GRACE_PERIOD}" \
+      "${warmup_grace_flag}" "${AIPERF_WARMUP_GRACE_PERIOD}" \
       --use-server-token-count \
       --no-gpu-telemetry \
       --tokenizer "${MODEL_PATH}" \
@@ -1732,6 +1774,12 @@ if [[ "${AGGREGATED}" == "1" ]]; then
   wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
   run_benchmark_and_eval
   cleanup_processes "${aggregated_pid}"
+elif [[ "${STANDALONE}" == "1" ]]; then
+  trap 'cleanup_processes ${server_pid:-}' EXIT
+  start_standalone
+  wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "standalone" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
+  run_benchmark_and_eval
+  cleanup_processes "${server_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   start_prefill "prefill-rank-0"
   prefill_pid="${server_pid}"

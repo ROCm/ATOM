@@ -660,65 +660,9 @@ def test_agentic_custom_image_digest_resolution(monkeypatch):
     )
 
 
-def test_agentic_kimi_k3_c48_has_non_speculative_state_checkpoints():
-    import json
-    import shlex
-
+def test_agentic_kimi_k3_moved_to_atomesh_standalone():
     from build_agentic_benchmark_matrix import build_configs
 
-    defaults = build_configs()
-    assert {c["prefix"] for c in defaults} == {"deepseek-v41-flash", "kimi-k3"}
-    (config,) = build_configs(inputs={"models": "kimi-k3"})
-    assert config["bench_kind"] == "aiperf_agentic"
-    assert json.loads(config["concurrency"]) == [48]
-    assert config["suffix"] == "-agentic-tp8-dcp8-lmcache-state"
-    assert "dspark" not in config["display"].lower()
-    args = shlex.split(config["server_args"])
-    expected = {
-        "-tp": "8",
-        "--decode-context-parallel-size": "8",
-        "--data-parallel-size": "1",
-        "--max-num-seqs": "96",
-        "--max-num-batched-tokens": "8192",
-        "--state-checkpoint-interval-tokens": "-1",
-        "--kv_cache_dtype": "fp8",
-    }
-    for flag, value in expected.items():
-        assert args.count(flag) == 1 and args[args.index(flag) + 1] == value
-    # Match the observed baseline's speculative_config=None, including real
-    # output text instead of forced-acceptance synthetic text.
-    assert not {
-        "--method",
-        "--draft-model",
-        "--num-speculative-tokens",
-        "--speculative-config",
-        "--spec-decode-acceptance-length",
-        "--spec-decode-acceptance-rate",
-    }.intersection(args)
-    assert "--enable_prefix_caching" in args
-    assert (
-        "--enable-expert-parallel" not in args and "--enable-dp-attention" not in args
-    )
-    assert json.loads(args[args.index("--kv-transfer-config") + 1]) == {
-        "kv_connector": "lmcache_offload",
-        "kv_role": "offload",
-    }
-    assert json.loads(args[args.index("--cudagraph-capture-sizes") + 1]) == list(
-        range(1, 97)
-    )
-    env = dict(line.split("=", 1) for line in config["env_vars"].splitlines())
-    assert env["ATOM_KDA_SPARE_STATE_CHECKPOINTS"] == "1"
-    assert env["ATOM_KDA_SPARE_STATE_RESERVE"] == "8"
-    assert env["ATOM_ENABLE_REPLAYSSM"] == "0"
-    assert env["ATOM_STATE_CHECKPOINT_DEMAND"] == "0"
-    assert env["ATOM_GDN_SSM_DTYPE"] == "fp16"
-    assert env["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "128"
-    assert env["LMCACHE_LOCAL_CPU"] == "True"
-    assert env["LMCACHE_CHUNK_SIZE"] == "1024"
-    assert env["BENCHMARK_PRECISION"] == "fp4"
-    assert env["BENCHMARK_MODEL_KEY"] == "kimik3"
-    assert env["AIPERF_BENCHMARK_DURATION"] == "3600"
-    assert env["AIPERF_MAX_CONTEXT_LENGTH"] == "1048576"
-    assert not any(
-        k.startswith("DYN_") or k in ("ETCD_ENDPOINTS", "HEAD_NODE_IP") for k in env
-    )
+    assert {c["prefix"] for c in build_configs()} == {"deepseek-v41-flash"}
+    with pytest.raises(ValueError, match="Unknown agentic models"):
+        build_configs(inputs={"models": "kimi-k3"})

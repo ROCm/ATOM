@@ -68,6 +68,52 @@ def test_aggregated_server_is_scraped_once_and_needs_no_router(collector):
     ]
 
 
+def test_standalone_metrics_have_no_mesh_targets_or_panels(collector):
+    config = collector.scrape_config([], [], None, standalone=["127.0.0.1:8000"])
+    assert config["scrape_configs"] == [
+        {
+            "job_name": "atom",
+            "static_configs": [
+                {
+                    "targets": ["127.0.0.1:8000"],
+                    "labels": {"observer": "api", "role": "standalone"},
+                }
+            ],
+        }
+    ]
+    report = collector.empty_report(1, 2, "Kimi-K3", [], deployment="standalone")
+    assert report["meta"]["deployment"] == "standalone"
+    assert "mesh_ttft" not in {panel["id"] for panel in report["panels"]}
+
+
+def test_standalone_metrics_cli(collector, monkeypatch, tmp_path):
+    run = Mock(return_value=0)
+    monkeypatch.setattr(collector, "run", run)
+    argv = [
+        "collect_metrics",
+        "--output",
+        str(tmp_path),
+        "--model",
+        "Kimi-K3",
+        "--standalone",
+        "127.0.0.1:8000",
+        "--",
+        "aiperf",
+        "profile",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert collector.main() == 0
+    args = run.call_args.args[0]
+    assert args.standalone == ["127.0.0.1:8000"]
+    assert args.mesh is None and args.prefill == [] and args.decode == []
+    assert args.command == ["aiperf", "profile"]
+    monkeypatch.setattr(
+        sys, "argv", argv[:-3] + ["--mesh", "localhost:29100", "--", "aiperf"]
+    )
+    with pytest.raises(SystemExit):
+        collector.main()
+
+
 @pytest.mark.parametrize(
     "interval,duration,timeout",
     [

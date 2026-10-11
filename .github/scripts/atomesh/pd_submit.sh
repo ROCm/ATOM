@@ -218,6 +218,7 @@ exports = {
         "decode_max_num_batched_tokens", ""
     ),
     "ONLINE_QUANT_CONFIG": server_args.get("online_quant_config", ""),
+    "ATOMESH_STANDALONE_KV_TRANSFER_CONFIG": server_args.get("kv_transfer_config", ""),
     "HF_OVERRIDES": server_args.get("hf_overrides", ""),
     "SPEC_METHOD": server_args.get("method", ""),
     "DRAFT_MODEL_PATH": server_args.get("draft_model", ""),

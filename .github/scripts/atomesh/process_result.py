@@ -349,6 +349,8 @@ def topology_resources(
     num_decode_gpu = int_value(payload.get("num_decode_gpu"))
     if num_prefill_gpu is None and prefill_workers and prefill_tp:
         num_prefill_gpu = prefill_workers * prefill_tp * prefill_pp
+    if num_decode_gpu is None and decode_workers == 0:
+        num_decode_gpu = 0
     if num_decode_gpu is None and decode_workers and decode_tp:
         num_decode_gpu = decode_workers * decode_tp
     total_gpu = int_value(payload.get("total_gpu"))

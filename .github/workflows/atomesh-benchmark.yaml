@@ -94,7 +94,8 @@ on:
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16,
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24
 
-          Kimi-K3:
+          Kimi-K3 (standalone case connects directly to ATOM without Mesh):
+            kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,
@@ -1672,7 +1673,7 @@ jobs:
         env:
           # Build the reviewed source in a separate setup container. Use the
           # existing release profile for both benchmark and eval services.
-          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && matrix.pd_worker_layout != 'standalone' && 'true' || 'false' }}
           ATOMESH_MESH_BUILD_PROFILE: release
           ATOMESH_ATOM_SOURCE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_source || 'mounted' }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}

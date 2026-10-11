@@ -173,7 +173,7 @@ def required_node_count(
     prefill_cfg: dict[str, Any],
     decode_cfg: dict[str, Any],
 ) -> int:
-    if pd_worker_layout == "single_node":
+    if pd_worker_layout in {"single_node", "standalone"}:
         return 1
     if pd_worker_layout == "packed_nodes":
         return packed_node_count(prefill_cfg, decode_cfg)
@@ -293,7 +293,15 @@ def build_cell(
         suite_cfg.get("router", {}),
     )
     pd_worker_layout = str(suite_cfg.get("pd_worker_layout", "multi_node"))
-    single_node_pd = pd_worker_layout == "single_node"
+    # Standalone uses the prefill settings for one combined ATOM server.
+    if pd_worker_layout == "standalone":
+        if int(prefill_cfg.get("workers", 1)) != 1:
+            raise ValueError("standalone requires exactly one ATOM server")
+        if worker_gpu_count(prefill_cfg) > GPUS_PER_NODE:
+            raise ValueError("standalone server must fit on one 8-GPU node")
+        decode_cfg = {"workers": 0}
+        router_cfg = {"port": router_cfg.get("port", 8000)}
+    single_node_pd = pd_worker_layout in {"single_node", "standalone"}
     prefill_single_node_pd = pd_worker_layout == "prefill_single_node"
     runner_cfg = resolve_runner(
         deep_merge(defaults.get("runner", {}), suite_cfg.get("runner", {}))
