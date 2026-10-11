@@ -800,6 +800,7 @@ def resolve_target_verify_lens(
     draft_token_num: int,
     *,
     use_positions: bool = False,
+    in_capture: bool = False,
 ):
     """Return committed prefix lengths and total KV lengths for target_verify."""
     position_rows = positions.detach().cpu().numpy().astype(np.int32)
@@ -813,18 +814,22 @@ def resolve_target_verify_lens(
     prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
     if use_positions:
         context_lens = prefix_lens + np.int32(draft_token_num)
-        # Capture rewrites every row to GLM52_GRAPH_SEQ_LEN_CAPACITY so the
-        # graph buffers are wide enough. A live verify must not keep that
-        # fill: the paged indexer and hd256 FMHA both walk it. Prefer the
-        # CPU seq_lens mirror when it is a real length, and drop rows that
-        # are still the fill on both sides.
-        try:
-            capturing = bool(torch.cuda.is_current_stream_capturing())
-        except Exception:  # noqa: BLE001 - HIP compatibility fallback
-            capturing = False
+        # Graph warmup builds these buffers before the stream is capturing,
+        # and that allocation is what replay copies into. Size it to the
+        # context capacity. A draft-width buffer (num-draft-tokens) cannot
+        # hold a real verify context.
+        if in_capture:
+            context_lens = np.full(
+                bs, np.int32(GLM52_GRAPH_SEQ_LEN_CAPACITY), dtype=np.int32
+            )
+            prefix_lens = np.maximum(context_lens - np.int32(draft_token_num), 0)
+            return prefix_lens, context_lens
+        # A live verify must not keep the capture fill: the paged indexer
+        # and hd256 FMHA both walk it. Prefer the CPU seq_lens mirror when
+        # it is a real length, and drop rows that are still the fill.
         seq_lens = get_seq_lens_cpu(forward_batch, bs)
         sentinel = np.int32(GLM52_GRAPH_SEQ_LEN_CAPACITY)
-        if not capturing and seq_lens.shape[0] == bs:
+        if seq_lens.shape[0] == bs:
             real = seq_lens.astype(np.int32)
             context_lens = np.where(
                 real >= sentinel, context_lens, np.minimum(context_lens, real)
@@ -851,6 +856,7 @@ def build_mtp_verify_decode_metadata(
     req_to_token_pool,
     atom_config,
     use_positions: bool = False,
+    in_capture: bool = False,
 ):
     """Build ATOM-native decode-style metadata for SGLang target_verify."""
     draft_token_num = int(
@@ -866,6 +872,7 @@ def build_mtp_verify_decode_metadata(
             batch_size,
             num_draft_tokens,
             use_positions=use_positions,
+            in_capture=in_capture,
         )
 
     return build_mtp_multi_token_decode_metadata(

@@ -88,6 +88,7 @@ def install_upstream_glm52_graph_metadata_adapter() -> None:
             req_to_token_pool=self.req_to_token_pool,
             atom_config=atom_config,
             use_positions=True,
+            in_capture=in_capture,
         )
         batch_size = int(forward_batch.batch_size)
         fixed_by_bs = getattr(
@@ -215,6 +216,8 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
         self,
         forward_batch,
         positions,
+        *,
+        in_capture: bool = False,
     ):
         from atom.config import get_current_atom_config
         from atom.plugin.sglang.glm52_dsa_bridge import (
@@ -228,6 +231,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             req_to_token_pool=self.req_to_token_pool,
             atom_config=get_current_atom_config(),
             use_positions=True,
+            in_capture=in_capture,
         )
 
     def _publish_target_verify_graph_metadata(self, forward_batch, metadata):
@@ -327,7 +331,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                     spec_info=SimpleNamespace(draft_token_num=draft_token_num),
                 )
                 fixed = self._build_target_verify_graph_metadata(
-                    metadata_batch, positions
+                    metadata_batch, positions, in_capture=True
                 )
                 self._target_verify_graph_metadata[bs] = fixed
                 return self._publish_target_verify_graph_metadata(metadata_batch, fixed)
@@ -418,7 +422,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                 spec_info=SimpleNamespace(draft_token_num=draft_token_num),
             )
             metadata = self._build_target_verify_graph_metadata(
-                forward_batch, positions
+                forward_batch, positions, in_capture=True
             )
             self._target_verify_graph_metadata[int(bs)] = metadata
             return self._publish_target_verify_graph_metadata(forward_batch, metadata)
