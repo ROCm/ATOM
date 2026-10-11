@@ -379,6 +379,25 @@ jobs:
           name: benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
 
+      # Models whose env_vars set ATOM_COMPASS_DIR=/workspace/compass write
+      # per-rank forward/op records there (atom/metrics/compass.py). The idle
+      # engine closes any open op window and flushes within ~2s; wait for it
+      # instead of depending on a graceful server stop.
+      - name: Wait for Compass records to settle
+        if: always() && hashFiles('compass/**') != ''
+        run: |
+          sleep 10
+          du -sh compass/* || true
+
+      - name: Upload Compass records
+        if: always() && hashFiles('compass/**') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: compass-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
+          path: compass/
+          if-no-files-found: ignore
+          retention-days: 15
+
       # The container binds the checkout at /workspace. Upload before cleanup,
       # even after benchmark/validation failure. Each completed cell is usable
       # immediately; the optional run index is not a prerequisite.

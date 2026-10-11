@@ -238,7 +238,7 @@
       "path": "moonshotai/Kimi-K3",
       "prefix": "kimi-k3",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
+      "env_vars": "ATOM_COMPASS_DIR=/workspace/compass\nATOM_COMPASS_OP_STEPS=6\nATOM_COMPASS_OP_EVERY=500\nATOM_COMPASS_OP_MAX_WINDOWS=10",
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",

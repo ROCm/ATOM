@@ -527,6 +527,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # ATOM Compass data collection (atom/metrics/compass.py): per-rank forward
+    # rows always, per-op rows in profiler windows of OP_STEPS forwards started
+    # every OP_EVERY forwards (OP_STEPS=0 disables ops, OP_MAX_WINDOWS=0 is
+    # unlimited).
+    "ATOM_COMPASS_DIR": lambda: os.getenv("ATOM_COMPASS_DIR", None),
+    "ATOM_COMPASS_OP_STEPS": lambda: _nonnegative_int_env("ATOM_COMPASS_OP_STEPS", 20),
+    "ATOM_COMPASS_OP_EVERY": lambda: max(1, _int_env("ATOM_COMPASS_OP_EVERY", 200)),
+    "ATOM_COMPASS_OP_MAX_WINDOWS": lambda: _nonnegative_int_env(
+        "ATOM_COMPASS_OP_MAX_WINDOWS", 0
+    ),
+    "ATOM_COMPASS_ANCHOR_S": lambda: _positive_float_env("ATOM_COMPASS_ANCHOR_S", "10"),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.

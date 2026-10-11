@@ -2644,6 +2644,46 @@ async def metrics():
     )
 
 
+def _compass_root() -> str:
+    root = envs.ATOM_COMPASS_DIR
+    if not root:
+        raise HTTPException(status_code=404, detail="ATOM_COMPASS_DIR is not set")
+    return root
+
+
+@app.get("/compass/files", include_in_schema=False)
+async def compass_files():
+    """List this node's Compass spool files and their current sizes."""
+    from atom.metrics import compass_spool
+
+    return {"files": await asyncio.to_thread(compass_spool.list_files, _compass_root())}
+
+
+@app.get("/compass/records", include_in_schema=False)
+async def compass_records(file: str, offset: int = 0, max_bytes: int = 16 << 20):
+    """Whole JSONL lines of one spool file from ``offset``.
+
+    ``X-Compass-Next-Offset`` is where the next pull starts; a collector that
+    always passes it back reads every record exactly once.
+    """
+    from atom.metrics import compass_spool
+
+    try:
+        path = compass_spool.resolve(_compass_root(), file)
+        data, next_offset = await asyncio.to_thread(
+            compass_spool.read_lines, path, max(0, offset), max(1, max_bytes)
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=f"no such file: {file}") from e
+    return Response(
+        content=data,
+        media_type="application/x-ndjson",
+        headers={"X-Compass-Next-Offset": str(next_offset)},
+    )
+
+
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""

@@ -42,6 +42,7 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.metrics.compass import CompassRecorder, record_compass
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -933,9 +934,33 @@ class ModelRunner:
                 ),
             )
 
+        self.compass_recorder = None
+        if envs.ATOM_COMPASS_DIR:
+            self.compass_recorder = CompassRecorder(
+                envs.ATOM_COMPASS_DIR,
+                dp_rank=config.parallel_config.data_parallel_rank,
+                pp_rank=config.parallel_config.pipeline_parallel_rank,
+                tp_rank=self.rank,
+                engine_role=(
+                    ("decode" if config.disagg_is_decode else "prefill")
+                    if config.enable_rapidserve
+                    else "default"
+                ),
+                is_profiler_busy=lambda: self.profiler is not None,
+            )
+
+    def _compass_phase(self, batch, phase):
+        # Drafter passes are timed here, at the call site, rather than inside
+        # the drafters' traced code.
+        # Warmup drafts before the recorder exists.
+        recorder = getattr(self, "compass_recorder", None)
+        return nullcontext() if recorder is None else recorder.measure(batch, phase)
+
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
             self.gpu_forward_metrics.poll()
+        if self.compass_recorder is not None:
+            self.compass_recorder.poll()
 
     def _build_and_load_model(self, model_class):
         """Construct the model and load its weights from disk.
@@ -1106,6 +1131,13 @@ class ModelRunner:
             return
         self.still_running = False
         self.vision_embeddings.clear()
+        recorder = getattr(self, "compass_recorder", None)
+        if recorder is not None:
+            self.compass_recorder = None
+            try:
+                recorder.close()
+            except Exception:
+                logger.exception("Compass recorder close failed")
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -2955,6 +2987,7 @@ class ModelRunner:
 
     @_profile_runner_stage
     @record_gpu_forward
+    @record_compass
     def run_model(
         self,
         input_ids: torch.Tensor,
@@ -3430,11 +3463,12 @@ class ModelRunner:
             and not (will_align_draft and drafter.draft_kv_duplicates_propose)
         )
         if run_compute_draft_kv:
-            drafter.compute_draft_kv(
-                get_forward_context().context.positions,
-                hidden_states,
-                batch.next_token_ids,
-            )
+            with self._compass_phase(batch, "draft_kv"):
+                drafter.compute_draft_kv(
+                    get_forward_context().context.positions,
+                    hidden_states,
+                    batch.next_token_ids,
+                )
         if pp_non_last or self._is_pure_middle_chunk(batch):
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.
@@ -3604,14 +3638,15 @@ class ModelRunner:
             forward_context.attn_metadata, last_token_indices
         )
 
-        draft_token = self.drafter.propose(
-            target_token_ids=input_ids,
-            target_positions=positions,
-            target_hidden_states=hidden_states,
-            num_reject_tokens=num_reject_tokens,
-            next_token_ids=next_token_ids,
-            last_token_indices=last_token_indices,
-        )
+        with self._compass_phase(batch, "draft"):
+            draft_token = self.drafter.propose(
+                target_token_ids=input_ids,
+                target_positions=positions,
+                target_hidden_states=hidden_states,
+                num_reject_tokens=num_reject_tokens,
+                next_token_ids=next_token_ids,
+                last_token_indices=last_token_indices,
+            )
         # PCP runs the drafter on every rank and the ids come out different.
         # Align them before verification consumes them, so all ranks accept the
         # same count.

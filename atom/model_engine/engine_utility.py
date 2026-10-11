@@ -339,7 +339,9 @@ class EngineUtilityHandler:
         """
         # Poll ready device events even after the final forward. Workers write
         # native metrics directly; this RPC has no response payload.
-        if envs.ATOM_ENABLE_METRICS_DEVICE_TIMER and self.runner_mgr is not None:
+        if (
+            envs.ATOM_ENABLE_METRICS_DEVICE_TIMER or envs.ATOM_COMPASS_DIR
+        ) and self.runner_mgr is not None:
             self.runner_mgr.call_func("poll_forward_metrics")
         if scheduler_metrics:
             self.output_queue.put_nowait(("METRICS", self.collect_metrics()))

@@ -370,7 +370,11 @@ jobs:
 
   # ---------- Generate regression matrix (lightweight, ubuntu) ----------
   generate-regression-matrix:
-    if: always() && needs.summarize-benchmark-result.outputs.has_regression == 'true'
+    # Scheduled runs only: a manual run (e.g. with Compass recording on) must
+    # not start GPU reruns or open regression issues.
+    if: >-
+      always() && github.event_name == 'schedule'
+      && needs.summarize-benchmark-result.outputs.has_regression == 'true'
     name: Generate regression rerun matrix
     needs: [summarize-benchmark-result]
     runs-on: ubuntu-latest
@@ -704,7 +708,9 @@ jobs:
         continue-on-error: true
 
       - name: Create GitHub Issue for regression
-        if: needs.summarize-benchmark-result.outputs.has_regression == 'true'
+        if: >-
+          github.event_name == 'schedule'
+          && needs.summarize-benchmark-result.outputs.has_regression == 'true'
         uses: actions/github-script@v7
         with:
           script: |
