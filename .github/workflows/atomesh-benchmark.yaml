@@ -67,6 +67,14 @@ on:
         required: false
         default: ''
         type: string
+      store_smoke_plan:
+        description: 'CPU Store control; both plans keep the direct engine on RDMA'
+        required: false
+        default: thp-store
+        type: choice
+        options:
+          - thp-store
+          - tcp-store
       rdma_smoke_node_count:
         description: 'Number of Slurm nodes for the Mooncake RDMA smoke test'
         required: false
@@ -658,10 +666,11 @@ jobs:
         env:
           STORE_SMOKE_NODES: ${{ inputs.rdma_smoke_nodes }}
           STORE_SMOKE_IMAGE: ${{ needs.load-config.outputs.image }}
+          STORE_SMOKE_PLAN: ${{ inputs.store_smoke_plan || 'thp-store' }}
         run: |
           bash .github/scripts/atomesh/pd_mooncake_store_smoke.sh \
             "${STORE_SMOKE_NODES}" "${STORE_SMOKE_IMAGE}" \
-            "${GITHUB_WORKSPACE}/store-smoke-results"
+            "${GITHUB_WORKSPACE}/store-smoke-results" "${STORE_SMOKE_PLAN}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -24,13 +24,16 @@ if [[ "${1:-}" == --container ]]; then
     ibv_devinfo -v || true
     rdma resource show || true
   } > /results/registration-environment.txt 2>&1
-  cc -shared -fPIC -O2 -Wall -Wextra -Werror \
-    /scripts/diagnostics/mooncake_thp_alloc.c -ldl -o /results/mooncake_thp_alloc.so
-  export ATOMESH_THP_ALLOCATOR_LIBRARY=/results/mooncake_thp_alloc.so
-  sha256sum /scripts/diagnostics/mooncake_thp_alloc.c \
-    /results/mooncake_thp_alloc.so > /results/allocator-sha256.txt
+  if [[ "${ATOMESH_STORE_SMOKE_PLAN:-thp-store}" == thp-store ]]; then
+    cc -shared -fPIC -O2 -Wall -Wextra -Werror \
+      /scripts/diagnostics/mooncake_thp_alloc.c -ldl -o /results/mooncake_thp_alloc.so
+    export ATOMESH_THP_ALLOCATOR_LIBRARY=/results/mooncake_thp_alloc.so
+    sha256sum /scripts/diagnostics/mooncake_thp_alloc.c \
+      /results/mooncake_thp_alloc.so > /results/allocator-sha256.txt
+  fi
   /tmp/mooncake-store-smoke-venv/bin/python \
-    /scripts/pd_mooncake_store_smoke.py --output /results/cases --plan thp-store
+    /scripts/pd_mooncake_store_smoke.py --output /results/cases \
+    --plan "${ATOMESH_STORE_SMOKE_PLAN:-thp-store}"
   cat /proc/meminfo > /results/meminfo-after.txt
   if [[ -r /sys/fs/cgroup/memory.events ]]; then
     cat /sys/fs/cgroup/memory.events > /results/memory-events-after.txt
@@ -41,6 +44,7 @@ fi
 if [[ "${1:-}" == --worker ]]; then
   image="$2"
   output="$3"
+  plan="${4:-thp-store}"
   job_id="${SLURM_JOB_ID:-${SPUR_JOB_ID}}"
   run_token="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   hostname > "${output}/node.txt"
@@ -61,6 +65,7 @@ if [[ "${1:-}" == --worker ]]; then
   docker pull "${image}"
   docker run --name "${container}" --user "$(id -u):$(id -g)" \
     -e STORE_SMOKE_OUTER_HOST_IP="$(hostname -I | awk '{print $1}')" \
+    -e ATOMESH_STORE_SMOKE_PLAN="${plan}" \
     --group-add video --group-add "$(stat -c %g /dev/dri/renderD128)" \
     --network host --ipc host \
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
@@ -74,6 +79,8 @@ fi
 nodes="${1:?candidate nodes required}"
 image="${2:?image required}"
 output="${3:?output directory required}"
+plan="${4:-thp-store}"
+[[ "${plan}" == thp-store || "${plan}" == tcp-store ]]
 IFS=',' read -r -a candidates <<< "${nodes}"
 (( ${#candidates[@]} >= 1 && ${#candidates[@]} <= 4 ))
 for node in "${candidates[@]}"; do
@@ -96,7 +103,7 @@ timeout --kill-after=20s 21000s srun --job-name "${name}" \
   --account amd-frameworks --partition amd-spur --qos amd-frameworks-qos \
   --exclusive --nodes 1 --ntasks 1 --cpus-per-task 16 --gpus 8 \
   --time 00:20:00 --nodelist "${nodes}" \
-  bash "${script_dir}/pd_mooncake_store_smoke.sh" --worker "${image}" "${output}" \
+  bash "${script_dir}/pd_mooncake_store_smoke.sh" --worker "${image}" "${output}" "${plan}" \
   > "${output}/slurm.log" 2>&1 || run_rc=$?
 printf '%s\n' "${run_rc}" > "${output}/srun.rc"
 if [[ -f "${output}/job.txt" ]] &&

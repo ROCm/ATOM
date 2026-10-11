@@ -61,6 +61,46 @@ def select_host(root):
     os.environ["STORE_SMOKE_HOST_IP"] = host
 
 
+def gpu_store_roundtrip(store, buffer, rank):
+    """Use the connector's scatter/gather API, then verify overwritten data."""
+    import torch
+
+    part = 16 * 1024**2
+    offsets = [0, buffer.numel() // 2, buffer.numel() - part]
+    if offsets[1] < part or offsets[2] < offsets[1] + part:
+        raise ValueError("GPU roundtrip needs at least 64 MiB")
+    views = [buffer[offset : offset + part] for offset in offsets]
+    pattern = torch.arange(256, dtype=torch.uint8, device=buffer.device).repeat(
+        part // 256
+    )
+    expected = [pattern ^ ((rank * 23 + index * 53) % 256) for index in range(3)]
+    for view, data in zip(views, expected, strict=True):
+        view.copy_(data)
+    if buffer.is_cuda:
+        torch.cuda.synchronize(buffer.device)
+    keys = [f"store-gpu-scatter-rank-{rank}"]
+    addresses = [[view.data_ptr() for view in views]]
+    sizes = [[part] * len(views)]
+    put = store.batch_put_from_multi_buffers(keys, addresses, sizes)
+    # A read must replace zeros with the saved pattern to pass.
+    for view in views:
+        view.zero_()
+    if buffer.is_cuda:
+        torch.cuda.synchronize(buffer.device)
+    get = store.batch_get_into_multi_buffers(keys, addresses, sizes)
+    if buffer.is_cuda:
+        torch.cuda.synchronize(buffer.device)
+    return {
+        "gpu_roundtrip_bytes": part * len(views),
+        "gpu_roundtrip_offsets": offsets,
+        "gpu_put_rcs": put,
+        "gpu_get_bytes": get,
+        "gpu_roundtrip": put == [0]
+        and get == [part * len(views)]
+        and all(torch.equal(view, data) for view, data in zip(views, expected)),
+    }
+
+
 def worker(args):
     import torch
     from mooncake.engine import TransferEngine
@@ -73,6 +113,8 @@ def worker(args):
         "segment": args.segment,
         "local_buffer": args.local_buffer,
         "glibc_tunables": os.environ.get("GLIBC_TUNABLES", ""),
+        "direct_protocol": "rdma",
+        "store_protocol": args.store_protocol,
     }
     direct = None
     store = None
@@ -93,7 +135,7 @@ def worker(args):
             "P2PHANDSHAKE",
             args.segment,
             args.local_buffer,
-            "rdma",
+            args.store_protocol,
             args.device,
             f"127.0.0.1:{args.port}",
         )
@@ -122,6 +164,13 @@ def worker(args):
                 result["store_gpu_register_rc"] = store.register_buffer(
                     gpu_buffer.data_ptr(), args.gpu_bytes
                 )
+                if args.gpu_roundtrip:
+                    if (
+                        result["direct_gpu_register_rc"] != 0
+                        or result["store_gpu_register_rc"] != 0
+                    ):
+                        raise RuntimeError("GPU registration failed before roundtrip")
+                    result.update(gpu_store_roundtrip(store, gpu_buffer, args.rank))
     except (RuntimeError, ValueError, TypeError, OSError) as exc:
         traceback.print_exc()
         result["error"] = repr(exc)
@@ -146,6 +195,8 @@ def run_case(
     local_buffer=1024**3,
     env_overrides=None,
     gpu_bytes=0,
+    store_protocol="rdma",
+    gpu_roundtrip=False,
 ):
     import mooncake
 
@@ -197,6 +248,9 @@ def run_case(
                         str(local_buffer),
                         "--gpu-bytes",
                         str(gpu_bytes),
+                        "--store-protocol",
+                        store_protocol,
+                        *(["--gpu-roundtrip"] if gpu_roundtrip else []),
                         "--port",
                         str(port),
                         "--output",
@@ -287,6 +341,8 @@ def run_case(
         "name": name,
         "ranks": reports,
         "serialized_setup": serialized,
+        "store_protocol": store_protocol,
+        "gpu_roundtrip_required": gpu_roundtrip,
         "timed_out": timed_out,
         "registration_passed": setup_completed
         and len(reports) == ranks
@@ -298,6 +354,7 @@ def run_case(
             and r.get("setup_rc") == 0
             and r.get("put_rc") == 0
             and r.get("roundtrip") is True
+            and (not gpu_roundtrip or r.get("gpu_roundtrip") is True)
             and "error" not in r
             and (
                 not gpu_bytes
@@ -421,6 +478,32 @@ def thp_store_cases(root):
             break
 
 
+def tcp_store_cases(root):
+    """Native TCP Store and RDMA direct engine; no allocator override."""
+    if os.environ.get("LD_PRELOAD"):
+        raise RuntimeError("TCP Store control requires no LD_PRELOAD override")
+    results = []
+    for name, segment, gpu_bytes in (
+        ("eight-tcp-small", 64 * 1024**2, 64 * 1024**2),
+        ("eight-tcp-full", int(224.875 * 1024**3), 20 * 1024**3),
+    ):
+        result = run_case(
+            root,
+            name,
+            8,
+            [""] * 8,
+            segment,
+            store_protocol="tcp",
+            gpu_bytes=gpu_bytes,
+            gpu_roundtrip=True,
+            timeout=420,
+        )
+        results.append(result)
+        (root / "result.json").write_text(json.dumps(results, indent=2))
+        if not result["passed"]:
+            break
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
@@ -429,9 +512,11 @@ def main():
     parser.add_argument("--segment", type=int, default=64 * 1024**2)
     parser.add_argument("--local-buffer", type=int, default=1024**3)
     parser.add_argument("--gpu-bytes", type=int, default=0)
+    parser.add_argument("--store-protocol", choices=["rdma", "tcp"], default="rdma")
+    parser.add_argument("--gpu-roundtrip", action="store_true")
     parser.add_argument(
         "--plan",
-        choices=["registration", "capacity", "thp-store"],
+        choices=["registration", "capacity", "thp-store", "tcp-store"],
         default="registration",
     )
     parser.add_argument("--port", type=int)
@@ -452,6 +537,9 @@ def main():
         return
     if args.plan == "thp-store":
         thp_store_cases(root)
+        return
+    if args.plan == "tcp-store":
+        tcp_store_cases(root)
         return
     small = 64 * 1024**2
     results = [run_case(root, "single-all", 1, [""], small)]
