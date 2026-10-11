@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from atom.kv_transfer.disaggregation.types import ConnectorCompletion
 from atom.kv_transfer.offload._offload_common import offload_save_abandon_timeout_s
 from atom.plugin.vllm.kv_transfer.kda_state import (
+    NULL_BLOCK_ID,
     KdaBoundaryPlanner,
     KdaPageViews,
     KdaStateTier,
@@ -1192,7 +1193,17 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if tier is None:
             return
         for load in getattr(metadata, "kda_loads", None) or ():
-            if self._is_deepseek_v41:
+            already_refused = bool(load.block_ids) and all(
+                int(b) <= NULL_BLOCK_ID for b in load.block_ids
+            )
+            if already_refused:
+                # A refusal the scheduler half already decided (see
+                # `refuse_admission`). Reserving a slot for it would bind one
+                # to a request that is about to be told to recompute, and
+                # `replace` below would overwrite the very marker that says
+                # "fail this without touching the device".
+                pass
+            elif self._is_deepseek_v41:
                 # The destination is a state slot, and a parked request has no
                 # batch row yet -- `assign` has never seen it. Reserving binds
                 # one now and, critically, keeps the following `assign` from
@@ -1836,13 +1847,31 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 int(num_external_tokens),
                 int(self._config.kv_cache_block_size),
             )
-        if self._v41_planner is not None and num_external_tokens > 0:
+        if self._v41_planner is not None and num_total_computed > 0:
             # The attention blocks the dense load is filling: if the state
             # half misses, they are what has to be invalidated, or vLLM caches
             # a prefix whose window ring never existed.
-            self._v41_planner.resolve_load(
+            #
+            # Gated on the FRONTIER, not on `num_external_tokens`. vLLM calls
+            # this again for a request whose dense load failed, with the
+            # external half gone and the frontier rewound to the local prefix
+            # -- traced as `cached=7936 ext=256 total=8192` followed by
+            # `cached=7936 ext=0 total=7936` for one request. Gating on the
+            # external half let that second call through untouched, and 7936
+            # is a position nobody stored state for. What matters is where the
+            # request will sit, not who supplied it.
+            #
+            # The return value is load-bearing and used to be dropped. False
+            # means no load was queued -- the index no longer claims the
+            # boundary, or this request already has one in flight -- while the
+            # admission goes ahead regardless. That leaves PAGE restored at a
+            # boundary with nothing on its way to put STATE there, which the
+            # forward meets as a stale cursor and the engine does not survive.
+            # Refusing turns it into the miss it actually is.
+            if not self._v41_planner.resolve_load(
                 request, num_total_computed, tuple(attention_blocks)
-            )
+            ):
+                self._v41_planner.refuse_admission(request, attention_blocks)
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         """Snapshot this step's transfers.

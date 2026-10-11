@@ -49,14 +49,18 @@ import torch
 
 from atom.model_engine.state_offload import StateOffloadIndex
 
-from .kda_state import KdaLoad, KdaStore, boundary_prefix_hash
+from .kda_state import NULL_BLOCK_ID, KdaLoad, KdaStore, boundary_prefix_hash
 
 logger = logging.getLogger("atom")
 
 
 #: Serve vLLM's own prefix-cache hits by capping them to one block below a
-#: claimed CSA2 boundary and letting the tier supply that block. Off until
-#: the race in the paragraph in `cap_local_hit` is closed.
+#: claimed CSA2 boundary and letting the tier supply that block. Off, and the
+#: long comment in `cap_local_hit` says why it is not a flag waiting to be
+#: turned on: the position it invents is one no request may legally sit at.
+#: Kept because the measurements it enables are the case for doing this
+#: properly -- local hits 0 -> 74% of queries, tier traffic down to one block
+#: per request -- not because it is nearly ready.
 _LOCAL_PREFIX_HITS_ENABLED = os.environ.get("ATOM_V41_LOCAL_PREFIX_HITS") in (
     "1",
     "true",
@@ -424,6 +428,7 @@ class V41BoundaryPlanner:
             "local_cap_declined": 0,
             "local_cap_kept": 0,
             "local_cap_withdrawn": 0,
+            "admission_refused": 0,
         }
         # One warning per planner, not per hit: an unarmed cap fires once
         # per request on whatever path is missing its arming.
@@ -602,14 +607,33 @@ class V41BoundaryPlanner:
         if hit <= 0:
             return hit
         if not _LOCAL_PREFIX_HITS_ENABLED:
-            # Off by default: measured, this path still loses a race under
-            # concurrency. With 24 lanes it produced `needs state at 7936,
-            # found 5` -- a request admitted at a boundary whose slot held
-            # another tenant's five tokens -- on the second round of a run
-            # whose first eight rounds had been clean. Eight clean rounds are
-            # not proof when the failure is a race; the cursor check is, and
-            # it says this is not ready. Declining costs the HBM-speed path
-            # and keeps the tier serving the whole prefix, which is correct.
+            # Off, and the reason is structural rather than a race that is
+            # waiting to be found. Traced, for one request:
+            #
+            #   cap_local  hit=9472 claimed=8192 capped=7936
+            #   alloc      cached=7936 ext=256 total=8192  -> load at 8192
+            #   alloc      cached=7936 ext=0   total=7936
+            #
+            # The second line is vLLM re-admitting the request after its
+            # dense load failed, with the external half gone and the frontier
+            # rewound to the local prefix. That prefix is 7936 -- the point
+            # this cap invents, one block below a boundary -- and by
+            # construction nobody ever stored state there. The engine then
+            # dies on `needs state at 7936`, and it died there in every run,
+            # under eager and under FULL_AND_PIECEWISE alike, with only the
+            # `found` value differing.
+            #
+            # It cannot be rescued by refusing afterwards: the request is no
+            # longer parked, so a load-failure report arrives after its
+            # forward has already run. Nor by storing a boundary at B - one
+            # block, because with 8192-token prefill chunks that position is
+            # never a frontier anyone can snapshot. The capped point has to be
+            # one the request may legally sit at, and the only such points are
+            # stored boundaries and zero -- which is what declining gives.
+            #
+            # Declining costs the HBM-speed path and keeps the tier serving
+            # the whole prefix, with its state. That is correct and is what
+            # every default run measures.
             self._counters["local_cap_declined"] += 1
             return 0
         if req_id in self._local_cap_withdrawn:
@@ -846,6 +870,33 @@ class V41BoundaryPlanner:
             )
         )
         return True
+
+    def refuse_admission(self, request, error_block_ids=()) -> None:
+        """Fail a request whose prefix was admitted with no load behind it.
+
+        `resolve_load` returning False used to be discarded by its caller, and
+        that is the whole of the race: the admission goes ahead, PAGE is in
+        place at the boundary, and nothing is queued to put STATE there. The
+        forward then finds whatever the slot held -- measured as `needs state
+        at 7936, found 9657` (the request's own later state, from before it
+        was preempted) and `found 5` (another tenant's).
+
+        Refusing cannot undo the allocation; what it can do is make the
+        request take the path a missing load already takes. An unresolvable
+        destination is failed by the tier without touching the device, which
+        reports through `_join_kda`, invalidates these blocks and recomputes.
+        So the two halves live or die together, which is the invariant the
+        boundary design rests on and had never been enforced.
+        """
+        self._counters["admission_refused"] += 1
+        self._loads.append(
+            KdaLoad(
+                str(request.request_id),
+                0,
+                (NULL_BLOCK_ID,),
+                tuple(error_block_ids),
+            )
+        )
 
     def take_loads(self) -> list[KdaLoad]:
         loads, self._loads = self._loads, []
