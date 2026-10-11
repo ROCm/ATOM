@@ -19,7 +19,14 @@ import triton.testing
 
 from atom.model_ops import linear
 from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
-from atom.model_ops.qwen4_exp.ops.hc_flydsl import build_hyperconnection, combine, mix
+from atom.model_ops.qwen4_exp.ops.hc_flydsl import (
+    build_hyperconnection,
+    combine,
+    mix,
+)
+from atom.model_ops.qwen4_exp.ops.hc_flydsl import (
+    mix_fused as flydsl_mix_fused,
+)
 
 
 def measure(fn, repeats):
@@ -62,11 +69,15 @@ def benchmark_batch(hc, samples, repeats):
             x.data_ptr(),
             hc.hc_norm.weight.data_ptr(),
             normed.data_ptr(),
+            x.data_ptr(),
+            x.data_ptr(),
+            x.data_ptr(),
             stream=torch.cuda.current_stream(),
         ),
         "down_silu": lambda: down(
             normed.data_ptr(),
             hc.input_mix_weight_down.weight.data_ptr(),
+            low.data_ptr(),
             low.data_ptr(),
             stream=torch.cuda.current_stream(),
         ),
@@ -95,6 +106,44 @@ def benchmark_batch(hc, samples, repeats):
         "mix_nrmse": round(mix_nrmse, 7),
         "combine_nrmse": round(combine_nrmse, 7),
         "stage_us": {name: measure(fn, repeats) for name, fn in stages.items()},
+    }
+
+
+def benchmark_served(hc, samples, repeats):
+    """Measure the actual decoder's deferred-combine HC path."""
+    x = (
+        torch.randn(samples, 10240, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).contiguous()
+    block = (
+        torch.randn(samples, 2560, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).contiguous()
+    raw = (
+        torch.randn(samples, 4, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).contiguous()
+    pending = (block, raw)
+    expected, (expected_streams, expected_raw) = hc.mix_fused(x, pending)
+    actual, (streams, injected) = flydsl_mix_fused(hc, x, pending)
+    nrmse = float(
+        torch.linalg.norm((actual - expected).float())
+        / torch.linalg.norm(expected.float())
+    )
+    stream_nrmse = float(
+        torch.linalg.norm((streams - expected_streams).float())
+        / torch.linalg.norm(expected_streams.float())
+    )
+    raw_nrmse = float(
+        torch.linalg.norm((injected - expected_raw).float())
+        / torch.linalg.norm(expected_raw.float())
+    )
+    native_us = measure(lambda: hc.mix_fused(x, pending), repeats)
+    flydsl_us = measure(lambda: flydsl_mix_fused(hc, x, pending), repeats)
+    return {
+        "native_us": native_us,
+        "flydsl_us": flydsl_us,
+        "speedup": round(native_us / flydsl_us, 3),
+        "mixed_nrmse": round(nrmse, 7),
+        "streams_nrmse": round(stream_nrmse, 7),
+        "inject_nrmse": round(raw_nrmse, 7),
     }
 
 
@@ -162,6 +211,7 @@ def main():
     with torch.no_grad():
         for weight in hc.parameters():
             weight.normal_(0, 0.02)
+    hc.process_weights_after_loading()
     report = {
         "gpu": torch.cuda.get_device_name(0),
         "checkpoint": "synthetic",
@@ -171,6 +221,9 @@ def main():
         report["batches"][str(samples)] = benchmark_batch(hc, samples, args.repeats)
         if args.dump_ir_dir:
             report["batches"][str(samples)]["isa"] = isa_summary(args.dump_ir_dir)
+        report["batches"][str(samples)]["served_fused"] = benchmark_served(
+            hc, samples, args.repeats
+        )
     print(json.dumps(report, indent=2))
 
 

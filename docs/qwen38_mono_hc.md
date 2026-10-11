@@ -2,8 +2,9 @@
 
 This work adds gfx950 FlyDSL kernels for the repeated hyper-connection (HC)
 path and an opt-in indexer-only context partition for long QSA decode. These
-are component specializations, not a single-launch decoder layer. No Qwen
-Triton HC variant is retained. QSA still uses ATOM's existing paged scorer,
+are component specializations, not a single-launch decoder layer. This PR
+adds no Triton HC kernel; the existing Triton HC path remains the fallback.
+QSA still uses ATOM's existing paged scorer,
 AITER stable top-k, and sparse attention; index CP partitions that scorer's
 work over the TP group without partitioning the KV cache or GDN/PLE state.
 
@@ -11,11 +12,16 @@ work over the TP group without partitioning the KV cache or GDN/PLE state.
 
 Set `ATOM_QWEN38_MONO_HC=1` before starting ATOM. The default is off. Dispatch
 requires gfx950, contiguous BF16 data and weights, FP32 norm weights, and the
-Flash-Next geometry: HC=4, hidden=2560, low rank=320. Mix uses three FlyDSL
-launches at 1–16 tokens; combine uses one launch at 1–128 tokens. Larger and
-unsupported shapes use the native operators. The kernel and its packed BF16
-dot helper live in ATOM and use the FlyDSL build already used by ATOM's mono
-kernels. No FlyDSL source change or companion PR is required.
+Flash-Next geometry: HC=4, hidden=2560, low rank=320. The served decoder calls
+`mix_fused`, which uses three FlyDSL launches at exactly 4 or 8 decode tokens:
+deferred combine plus grouped norm, fused down and injection projection, then
+up projection plus gated mean. It keeps the existing two-launch path at 1–2
+tokens and native GEMMs at 16 or more tokens, where the FlyDSL path did not
+improve latency. The standalone `mix` and `combine` calls used by the MTP
+drafter use three launches at 1–16 tokens and one launch at 1–128 tokens,
+respectively. Unsupported shapes use the native operators. The kernel and its
+packed BF16 dot helper live in ATOM and use the FlyDSL build already used by
+ATOM's mono kernels. No FlyDSL source change or companion PR is required.
 
 The four stages are grouped Gemma RMSNorm, down projection with scaled SiLU,
 up projection with gated mean, and injection with residual update. The
@@ -26,18 +32,36 @@ cross-CTA synchronization, so changed-input CUDA Graph replay is safe.
 
 `python tools/bench_qwen38_hc.py --repeats 5` benchmarks an
 actual ATOM `Qwen4ExpHyperConnection` with synthetic BF16 weights on one idle
-MI355X. Times are median graph GPU microseconds for one mix+combine pair:
+MI355X. Times are median graph GPU microseconds for one standalone
+mix+combine pair, which the served decoder does not call:
 
 | Decode tokens | Native | FlyDSL | Speedup |
 | ---: | ---: | ---: | ---: |
-| 1 | 33.41 | 13.08 | 2.56× |
-| 2 | 35.58 | 13.87 | 2.57× |
-| 4 | 36.44 | 16.27 | 2.24× |
-| 8 | 36.65 | 20.43 | 1.79× |
-| 16 | 36.58 | 28.41 | 1.29× |
+| 1 | 33.58 | 12.98 | 2.59× |
+| 2 | 35.44 | 13.90 | 2.55× |
+| 4 | 36.10 | 16.44 | 2.20× |
+| 8 | 36.31 | 20.53 | 1.77× |
+| 16 | 36.31 | 28.52 | 1.27× |
 
-The 16-token FlyDSL stage times were 2.61 µs norm, 7.19 µs down, 13.25 µs
-up, and 3.21 µs combine. The up projection is the larger-batch bottleneck.
+For the served `mix_fused` call with a deferred block output and injection
+logits, the same benchmark measured:
+
+| Decode tokens | Native | FlyDSL | Speedup | Production dispatch |
+| ---: | ---: | ---: | ---: | :--- |
+| 1 | 8.74 | 10.44 | 0.84× | Native |
+| 2 | 10.73 | 12.50 | 0.86× | Native |
+| 4 | 26.45 | 14.67 | 1.80× | FlyDSL |
+| 8 | 26.31 | 18.94 | 1.39× | FlyDSL |
+| 16 | 26.37 | 27.00 | 0.98× | Native |
+
+These are HC component times with synthetic weights. The production path's
+three launches at 4–8 tokens are part of a decoder layer with separate
+attention, MoE, communication, state update, and QSA launches; the table does
+not measure whole-layer latency or model throughput.
+
+The 16-token standalone FlyDSL stage times were 2.69 µs norm, 7.08 µs down,
+13.27 µs up, and 3.18 µs combine. The up projection is the larger-batch
+bottleneck.
 For 16/32/64/128 tokens, the combine stage alone measured 3.34/3.39/3.48/
 3.95 µs versus 9.92/9.93/10.15/10.08 µs native, or 2.98/2.93/2.92/2.55×.
 The 32–128-token mix remains native.
@@ -54,6 +78,20 @@ one-token build at `/tmp/qwen38-atom-internal-isa` yielded:
 | Up + gated mean | 13 | 0 | 12 | 24 | 19 | 0 | 0 |
 | Injection + combine | 49 | 16 | 20 | 6 | 50 | 2 | 0 |
 
+The four-token served variant with a pending combine and next injection has
+three compiled stages:
+
+| Stage | VGPR | LDS bytes | Packed BF16 dot2 | Barriers | Scratch ops |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Combine + norm | 26 | 32 | 0 | 1 | 0 |
+| Down + injection | 65 | 32 | 40 | 1 | 0 |
+| Up + gated mean | 15 | 0 | 24 | 0 | 0 |
+
+The down and up stages retain `v_dot2c_f32_bf16`; none of the served stages
+spill. The norm stage recomputes the rounded combined values after its
+reduction, avoiding a read of data it has just written through a buffer
+resource. That read produced incorrect normalized values during bring-up.
+
 The BF16 GEMVs use packed `v_dot2c_f32_bf16` through an ATOM-side typed helper;
 the Qwen HC kernel contains no inline assembly or raw LLVM operations.
 There is no MFMA at one token.
@@ -67,7 +105,7 @@ instructions, 32 bytes LDS, and no scratch operations.
 At 16 tokens, the grouped down CTA uses 96 VGPR, 80 packed dot2 instructions,
 100 buffer loads, and no scratch spills. The up CTA uses 15 VGPR, 24 dot2
 instructions, 26 buffer loads, eight exponentials and eight reciprocals, with
-no LDS or spills. It takes 13.25 µs of the 28.41 µs pair; giving each up CTA
+no LDS or spills. It takes 13.27 µs of the 28.52 µs pair; giving each up CTA
 four rows raised VGPR to 25 and made the up stage slower (13.61 µs), so the
 two-row schedule is retained. Direct FlyDSL mix probes at 32/64/128 rows took
 38.0/67.8/142.9 µs versus 25.3/27.5/30.1 µs native; mix therefore falls
@@ -125,7 +163,9 @@ partitioned cache/page metadata, recurrent state and attention contracts.
 ## Validation scope
 
 `tests/model_ops/test_qwen38_mono_hyperconnection.py` checks 1/2/4/8/16-token
-mix+combine parity, 32/64/128-token combine parity, fallback, and graph replay.
+mix+combine parity, 32/64/128-token combine parity, served `mix_fused` parity
+at 4/8 tokens including the final mixer without injection, fallback, and
+changed-input graph replay.
 `tools/bench_qwen38_qsa_cp.py` checks exact selection and changed-input graph
 replay on two or four GPUs. No local Flash-Next checkpoint was available, so
 whole-layer accuracy, real-checkpoint generation, and InferenceMAX throughput

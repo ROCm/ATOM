@@ -214,6 +214,39 @@ class Qwen4ExpHyperConnection(nn.Module):
         hyper-connection. Returns the mixed activation and `(streams,
         inject_logits)`; the logits are None when there is no block injection.
         """
+        # The served decoder uses mix_fused, not mix/combine. At four and
+        # eight rows the FlyDSL path folds deferred combine into norm and the
+        # next injection projection into the down GEMV (three launches).
+        # The existing two-launch path wins at one/two rows; native GEMMs catch
+        # up by sixteen rows.
+        if hyper_input.shape[0] in (4, 8) and self._mono_supported(hyper_input, 8):
+            fused_weight = getattr(self, "fused_w_cat", None)
+            fused_rows = getattr(self, "fused_rank", 0) + (
+                self.hc_count if self.block_inject_weight is not None else 0
+            )
+            valid_pending = pending is None or (
+                len(pending) == 2
+                and all(isinstance(tensor, torch.Tensor) for tensor in pending)
+                and pending[0].shape == (hyper_input.shape[0], self.hidden_size)
+                and pending[1].shape == (hyper_input.shape[0], self.hc_count)
+                and all(
+                    tensor.dtype == torch.bfloat16
+                    and tensor.device == hyper_input.device
+                    and tensor.is_contiguous()
+                    for tensor in pending
+                )
+            )
+            if (
+                isinstance(fused_weight, torch.Tensor)
+                and fused_weight.shape == (fused_rows, self.hc_dim)
+                and fused_weight.dtype == torch.bfloat16
+                and fused_weight.device == hyper_input.device
+                and fused_weight.is_contiguous()
+                and valid_pending
+            ):
+                from atom.model_ops.qwen4_exp.ops.hc_flydsl import mix_fused
+
+                return mix_fused(self, hyper_input, pending)
         block_out, raw_prev = pending if pending is not None else (None, None)
         has_inject = self.block_inject_weight is not None
         w_up = self.input_mix_weight_up.weight

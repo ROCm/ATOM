@@ -115,3 +115,77 @@ def test_large_batch_combine_graph_replay(hc, monkeypatch):
         reference = hc.combine(block, (x, normed))
         monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
         torch.testing.assert_close(actual, reference, atol=0.004, rtol=0.02)
+
+
+@pytest.mark.parametrize("rows", [4, 8])
+@pytest.mark.parametrize("has_pending", [False, True])
+def test_served_mix_fused_matches_native(hc, monkeypatch, rows, has_pending):
+    hc.process_weights_after_loading()
+    x = (
+        torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).contiguous()
+    pending = None
+    if has_pending:
+        pending = (
+            (
+                torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16) * 0.5
+            ).contiguous(),
+            (
+                torch.randn(rows, 4, device="cuda", dtype=torch.bfloat16) * 0.5
+            ).contiguous(),
+        )
+    monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "0")
+    expected, (expected_streams, expected_raw) = hc.mix_fused(x, pending)
+    monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
+    actual, (actual_streams, actual_raw) = hc.mix_fused(x, pending)
+    torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
+    torch.testing.assert_close(actual_streams, expected_streams, atol=1e-5, rtol=0)
+    torch.testing.assert_close(actual_raw, expected_raw, atol=0.004, rtol=0.02)
+
+
+def test_served_mix_fused_graph_replay(hc, monkeypatch):
+    hc.process_weights_after_loading()
+    rows = 8
+    x = torch.zeros(rows, 10240, device="cuda", dtype=torch.bfloat16)
+    block = torch.zeros(rows, 2560, device="cuda", dtype=torch.bfloat16)
+    raw = torch.zeros(rows, 4, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
+    hc.mix_fused(x, (block, raw))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, (streams, inject) = hc.mix_fused(x, (block, raw))
+    for seed in (11, 17):
+        torch.manual_seed(seed)
+        x.copy_(torch.randn_like(x) * 0.5)
+        block.copy_(torch.randn_like(block) * 0.5)
+        raw.copy_(torch.randn_like(raw) * 0.5)
+        graph.replay()
+        torch.cuda.synchronize()
+        monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "0")
+        expected, (expected_streams, expected_inject) = hc.mix_fused(x, (block, raw))
+        monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
+        torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
+        torch.testing.assert_close(streams, expected_streams, atol=1e-5, rtol=0)
+        torch.testing.assert_close(inject, expected_inject, atol=0.004, rtol=0.02)
+
+
+def test_final_mixer_without_injection(hc, monkeypatch):
+    hc.block_inject_weight = None
+    hc.process_weights_after_loading()
+    rows = 4
+    x = (
+        torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16) * 0.5
+    ).contiguous()
+    pending = (
+        (
+            torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16) * 0.5
+        ).contiguous(),
+        (torch.randn(rows, 4, device="cuda", dtype=torch.bfloat16) * 0.5).contiguous(),
+    )
+    monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "0")
+    expected, (expected_streams, expected_raw) = hc.mix_fused(x, pending)
+    monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
+    actual, (actual_streams, actual_raw) = hc.mix_fused(x, pending)
+    assert expected_raw is None and actual_raw is None
+    torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
+    torch.testing.assert_close(actual_streams, expected_streams, atol=1e-5, rtol=0)
