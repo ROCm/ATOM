@@ -237,6 +237,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dynamic CPP follows SGLang's quadratic chunk-size predictor. This factor
     # interpolates between the configured initial chunk size (0) and the fitted
     # equal-latency size (1). Values around 0.6-0.85 are typically most stable.
+    # Read by Config only when dynamic chunking is on and no explicit factor
+    # was given.
     "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR": lambda: float(
         os.getenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "0.75")
     ),

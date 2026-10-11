@@ -47,7 +47,7 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
-from atom.model_engine.dynamic_chunking import DynamicChunkingWorker
+from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -1314,23 +1314,23 @@ class ModelRunner:
         )
         return True
 
+    def warmup_max_tokens(self) -> int:
+        """Tokens one warmup forward carries: the activation peak KV sizing allows."""
+        max_tokens = self.config.max_num_batched_tokens
+        if not self.config.enable_dp_attention:
+            max_tokens //= get_dp_group().world_size
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            max_tokens = max(1, max_tokens // pcp_size)
+        return max_tokens
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
+        max_model_len = self.config.max_model_len
         dp_size = get_dp_group().world_size
-        if self.config.enable_dp_attention:
-            warmup_max_tokens = max_num_batched_tokens
-        else:
-            warmup_max_tokens = max_num_batched_tokens // dp_size
-
-        pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
-            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+        warmup_max_tokens = self.warmup_max_tokens()
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 

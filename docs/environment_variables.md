@@ -81,9 +81,10 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 ## Dynamic chunking
 
 Interpolates pipeline-parallel chunk sizes between the configured batch budget
-and the equal-latency size solved from the calibrated chunk model. Read as the
-default of `--dynamic-chunking-smooth-factor`. Only consulted when
-`--enable-dynamic-chunking` is set.
+and the equal-latency size solved from the calibrated chunk model. Used when
+neither `--dynamic-chunking-smooth-factor` nor `Config.dynamic_chunking_smooth_factor`
+is given, and read only when dynamic chunking is enabled, so a malformed value
+cannot affect a server that does not use the feature.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|

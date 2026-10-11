@@ -2,7 +2,7 @@
 
 Dynamic Chunked Pipeline Parallel (Dynamic CPP) reduces Time to First Token (TTFT) for long prompts on pipeline-parallel prefill workers. It changes the prefill chunk size as the cached prefix grows so that consecutive pipeline microbatches take similar time, reducing pipeline fill, drain, and stage-misalignment bubbles.
 
-Dynamic CPP is intended for latency-bound, low-concurrency long-context prefill. In a Prefill-Decode (PD) disaggregated deployment, enable it only on the prefill worker.
+Dynamic CPP is intended for latency-bound, low-concurrency long-context prefill. In a Prefill-Decode (PD) disaggregated deployment, enable it only on the prefill worker; ATOM turns it off with a warning on a decode instance (`kv_role: kv_consumer`) and under RapidServe, neither of which runs the prefills it would size.
 
 ## How it works
 
@@ -23,10 +23,10 @@ The scheduler solves for the next `x` whose latency matches the initial chunk, t
 
 ATOM calibrates the model automatically:
 
-1. At startup, 24 attention-free dummy forwards fit the per-token and fixed overheads (`b` and `c`).
-2. During the first few single-prefill requests, the scheduler alternates between `--max-num-batched-tokens` and one quarter of that size. Real forward timings fit the attention-area, cached-prefix, and serving overhead terms.
+1. At startup, attention-free dummy forwards over up to 24 chunk sizes fit the per-token and fixed overheads (`b` and `c`): one warmup forward, then the best of two per size, so at most 49 forwards. The largest size is the token count warmup already sized activations for. Each forward is timed around the model call only, the same window runtime samples use, so input staging and PP transfers stay out of both.
+2. During the first few single-prefill requests, the scheduler alternates between `--max-num-batched-tokens` and one quarter of that size (but never below `--dynamic-chunking-min-chunk-size`). Real forward timings fit the attention-area, cached-prefix, and serving overhead terms.
 3. Samples use non-blocking GPU events, are reduced by median per `(chunk, prefix)` shape, and must pass residual, matrix-conditioning, and prediction-uncertainty checks.
-4. The accepted model is installed once and timing stops. If calibration is unusable or predicts no useful shrink, ATOM keeps fixed chunking.
+4. The accepted model is installed once and timing stops. If startup profiling has no room to run or its fit fails, calibration is unusable, or the model predicts no useful shrink, ATOM logs why and keeps fixed chunking. A dummy forward that raises during the startup sweep fails startup, as a failed warmup forward does: the other PP stages are already waiting on it, so carrying on would leave them blocked.
 
 No offline coefficients or calibration flags are required.
 
@@ -50,14 +50,18 @@ python3 -m atom.entrypoints.openai_server \
 The main controls are:
 
 - `--max-num-batched-tokens`: global scheduling token budget and the reference/maximum chunk size for Dynamic CPP. Start with 2-3x the best fixed chunk size, and consider 4x for very long prompts; benchmark the target workload because the optimum is model- and topology-dependent.
-- `--dynamic-chunking-smooth-factor`: interpolation between the initial chunk (`0`) and the fitted equal-latency chunk (`1`). The default is `0.75`; `0.6-0.85` is a practical tuning range.
-- `--dynamic-chunking-min-chunk-size`: lower bound for solved chunks, default `4096`.
+- `--dynamic-chunking-smooth-factor`: interpolation between the initial chunk (`0`) and the fitted equal-latency chunk (`1`). When the flag is omitted it comes from `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`, default `0.75`; `0.6-0.85` is a practical tuning range.
+- `--dynamic-chunking-min-chunk-size`: lower bound for solved chunks, default `4096`. It must be below `--max-num-batched-tokens`, or the two calibration chunk sizes collapse into one and ATOM keeps fixed chunking with a warning. With a small test budget (for example 512), lower it as well (for example to 128).
 
 Use single-request warmup traffic so automatic calibration completes before measurement or production traffic.
 
+To check that the feature acted on a run, look for `Dynamic chunking latency model installed` once calibration ends, and for the periodic `Dynamic chunking since last report` line next to the engine-status line. It counts the chunks sized from the model and by the calibration sweep, and the chunks that kept the fixed budget because no equal-latency chunk was reachable or because other prefills were present.
+
 ## Runtime behavior and limits
 
-- Dynamic sizing is used only while one request is the pipeline's sole recent prefill source. With concurrent prefills, ATOM keeps the configured fixed chunk size because other requests already fill pipeline bubbles and extra chunks only add forward and cached-prefix overhead.
+- Dynamic sizing is used only while one request is the pipeline's sole prefill source over the last 16 scheduler steps. With concurrent prefills, ATOM keeps the configured fixed chunk size because other requests already fill pipeline bubbles and extra chunks only add forward and cached-prefix overhead. Waiting requests that cannot prefill yet (aborted, waiting for remote KV, or permanently unschedulable) do not count as other prefills.
+- A prefill that must go in one forward, such as a multimodal prompt without embedding spans, keeps the fixed budget.
+- While dynamic chunking is calibrating or has a model installed, the PP head waits for the last stage to acknowledge each middle prefill chunk instead of retiring it locally. The flag travels with each batch, so every stage agrees on it; once the feature turns itself off, middle chunks retire locally again.
 - The optimization targets long-prefill TTFT, not decode performance.
 - The best initial chunk and smoothing factor remain model-, hardware-, prompt-, and PP-topology-dependent.
 - Uneven PP layer partitions can perform better with the larger partition on a later stage, for example `15,15,15,16`.
@@ -83,13 +87,13 @@ Overall, Dynamic CPP primarily reduces the sensitivity of a large initial chunk 
 
 ## Accuracy and correctness
 
-The same PR evaluates GSM8K 3-shot accuracy over 1319 samples with a 512-token budget that forces multi-chunk prefill:
+GSM8K 3-shot on Llama-3.3-70B-Instruct-MXFP4 with PP2, an fp8 KV cache, `--max-num-batched-tokens 512` and `--dynamic-chunking-min-chunk-size 128`:
 
-- 1107 requests exercised the multi-chunk path.
-- Fixed and dynamic chunking both completed `1319/1319` requests without timeouts, crashes, or KV handoff failures.
-- Flexible exact match changed from `92.72%` to `93.56%`, and strict exact match changed from `92.57%` to `93.48%`.
+- GSM8K prompts alone are too short at this budget for calibration to measure attention growth, so it gives up and chunking stays fixed. To exercise model-sized chunks, the server first served two long prompts (5k and 8k tokens), which installed the latency model.
+- Over all 1319 samples at concurrency 65, two runs with model-sized chunks (575 and 618 chunks from the latency model) scored 0.910 and 0.915 flexible exact match, against 0.915 and 0.916 for two fixed-chunking runs.
+- At concurrency 1, fixed chunking is bit-reproducible. A run whose model picked the same boundaries as fixed chunking produced identical generations. A run whose model shrank first chunks moved accuracy about as much as changing the fixed budget from 512 to 384 or 256 does. Over the first 200 samples, these runs span 0.905–0.925 flexible and 0.630–0.675 strict, and the questions that flip go both ways. With an fp8 KV cache, where a prefill splits changes which tokens attend through quantized KV.
 
-The small accuracy difference is within run-to-run noise, showing no accuracy regression from Dynamic CPP.
+To check that a run exercised dynamic sizing, its log should show the calibration sweep and model-sized chunks in the `Dynamic chunking since last report` line.
 
 ## References
 

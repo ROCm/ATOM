@@ -1,23 +1,26 @@
 # SPDX-License-Identifier: MIT
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
+import torch
 
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     MAX_CALIBRATION_FIT_FAILURES,
-    MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES,
-    MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY,
     MAX_PREFIX_OVERHEAD_FRACTION,
     ChunkLatencyCalibrator,
     ChunkSizePredictor,
-    DynamicChunkingWorker,
     fit_chunk_overhead,
     has_sole_prefill,
 )
-from atom.utils import pack_rows
+from atom.model_engine.dynamic_chunking_worker import (
+    MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES,
+    MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY,
+    ChunkTimingSample,
+    DynamicChunkingWorker,
+)
 
 A, B, C, GAMMA = 2.5e-5, 0.015, 3.0, 0.002
 
@@ -305,6 +308,24 @@ def test_min_chunk_size_floors_the_prediction():
     )
 
 
+def test_an_unaligned_min_chunk_size_still_floors_the_prediction():
+    # The floor is aligned up, not down: a min chunk off the block grid must not
+    # let the chunk drop a whole alignment unit below it.
+    predictor = ChunkSizePredictor(1.0, 0.0, 0.0)
+
+    assert (
+        predictor.predict(
+            history_len=131072,
+            base_chunk_size=8192,
+            smooth_factor=1.0,
+            alignment=128,
+            max_chunk_size=8192,
+            min_chunk_size=4000,
+        )
+        == 4096
+    )
+
+
 def test_prefix_rebuild_is_charged_against_the_equal_latency_budget():
     # gamma * L is a floor the chunk pays before its own tokens are attended to,
     # so it comes out of the budget the chunk has to match the first one.
@@ -426,16 +447,18 @@ def test_invalid_smoothing_factor_is_rejected(smooth_factor):
 
 
 def test_sole_prefill_requires_no_other_prefill_work():
-    assert has_sole_prefill(1)
-    assert has_sole_prefill(0)
-    assert not has_sole_prefill(2)
+    assert has_sole_prefill([1])
+    assert has_sole_prefill([0])
+    assert not has_sole_prefill([2])
+    # No census yet is no evidence of a sole prefill.
+    assert not has_sole_prefill([])
 
 
 def test_sole_prefill_ignores_a_momentary_lull():
     # One request finished just before the next was admitted. Sizing chunks for
     # an empty pipeline in that gap commits them to run alongside the arrivals.
-    assert not has_sole_prefill(1, [1, 5, 3, 1])
-    assert has_sole_prefill(1, [1, 1, 0, 1])
+    assert not has_sole_prefill([1, 2, 2, 1])
+    assert has_sole_prefill([1, 1, 0, 1])
 
 
 @pytest.mark.parametrize(
@@ -451,19 +474,150 @@ def test_coefficients_are_validated(coefficients, match):
         ChunkSizePredictor.from_coefficients(coefficients)
 
 
-def _profiling_worker(block_size=64, vocab_size=1024):
-    """A worker over the only runner attributes `_dummy_batch` reads."""
-    runner = SimpleNamespace(
-        block_size=block_size,
-        hf_text_config=SimpleNamespace(vocab_size=vocab_size),
-        config=SimpleNamespace(hf_config=SimpleNamespace(vocab_size=vocab_size)),
+class _FakeEvent:
+    """A CUDA timing event on a manual clock, already complete when recorded."""
+
+    clock = 0.0
+
+    def __init__(self, enable_timing=False):
+        self.t = None
+
+    def record(self):
+        self.t = _FakeEvent.clock
+
+    def synchronize(self):
+        pass
+
+    def query(self):
+        return True
+
+    def elapsed_time(self, end):
+        return end.t - self.t
+
+
+@pytest.fixture
+def fake_events(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    _FakeEvent.clock = 0.0
+
+
+def _runner(rank=0, pp_rank=0, enabled=True, warmup_max_tokens=1024):
+    return SimpleNamespace(
+        rank=rank,
+        label=f"pp{pp_rank}",
+        block_size=64,
+        hf_text_config=SimpleNamespace(vocab_size=1024),
+        config=SimpleNamespace(
+            enable_dynamic_chunking=enabled,
+            pipeline_parallel_size=2,
+            max_model_len=131072,
+            parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank),
+        ),
+        warmup_max_tokens=lambda: warmup_max_tokens,
+        flush_pp_send=MagicMock(),
     )
-    return DynamicChunkingWorker(runner)
+
+
+def _bracketed_forward(worker, cost_ms):
+    """Mimic `ModelRunner.run_model`: only the model call sits in the bracket."""
+
+    def forward(batch):
+        _FakeEvent.clock += 100.0  # input staging and the PP receive
+        sample = worker.start_sample(batch)
+        _FakeEvent.clock += cost_ms(batch.total_tokens_num)
+        worker.finish_sample(sample)
+        _FakeEvent.clock += 100.0  # the PP send
+
+    return forward
+
+
+def _profiling_worker(**runner_kwargs):
+    runner = _runner(**runner_kwargs)
+    worker = DynamicChunkingWorker(runner)
+    runner.forward = _bracketed_forward(worker, lambda chunk: C + B * chunk)
+    return worker
+
+
+def test_startup_sweep_times_the_window_runtime_calibration_times(fake_events):
+    # The constant fitted at startup is reused at runtime, so both must measure
+    # the same window: the model call, without staging or PP transfers.
+    worker = _profiling_worker()
+
+    latencies = worker._sweep([256, 128, 64], vocab_size=1024)
+
+    assert latencies == pytest.approx([C + B * 256, C + B * 128, C + B * 64])
+    worker._runner.flush_pp_send.assert_called()
+    assert worker._sweep_samples is None
+
+
+def test_startup_profiling_fits_the_overhead_within_the_warmup_bound(fake_events):
+    worker = _profiling_worker(warmup_max_tokens=1000)
+    grids = []
+    sweep = worker._sweep
+    worker._sweep = lambda grid, vocab: grids.append(grid) or sweep(grid, vocab)
+
+    result = worker.profile()
+
+    assert result["linear_coeff"] == pytest.approx(B)
+    assert result["constant_coeff"] == pytest.approx(C)
+    # Aligned down from what warmup sized activations for, never above it.
+    assert max(grids[0]) == 960
+    assert worker._calibrator is not None
+
+
+@pytest.mark.parametrize(
+    "rank,expected",
+    [(0, {"error": "profiling needs hf_text_config.vocab_size; got None"}), (1, None)],
+)
+def test_a_sweep_that_cannot_run_answers_from_rank_zero_before_any_forward(
+    fake_events, rank, expected
+):
+    # `call_func(wait_out=True)` waits on rank 0 with no timeout, and every
+    # stage has to skip the sweep before a forward crosses stages.
+    worker = _profiling_worker(rank=rank)
+    worker._runner.hf_text_config = SimpleNamespace(vocab_size=None)
+    worker._runner.forward = MagicMock()
+
+    assert worker.profile() == expected
+    worker._runner.forward.assert_not_called()
+    assert worker._calibrator is None
+
+
+def test_a_failing_sweep_forward_takes_the_worker_down(fake_events):
+    # Answering it as an error would let this stage start serving while its
+    # neighbours stay blocked in the PP send/recv. Escaping fails startup, as
+    # a failed warmup forward does.
+    worker = _profiling_worker()
+    worker._runner.forward = MagicMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        worker.profile()
+    assert worker._calibrator is None
+
+
+def test_profiling_answers_when_the_feature_is_off():
+    assert "error" in DynamicChunkingWorker(_runner(enabled=False)).profile()
+
+
+def test_only_the_head_stage_calibrates_from_real_prefills(fake_events):
+    worker = _profiling_worker(pp_rank=1)
+
+    assert "linear_coeff" in worker.profile()
+    assert worker._calibrator is None
+
+
+def test_a_calibration_error_gives_up_instead_of_raising():
+    worker = DynamicChunkingWorker(_runner())
+    worker._calibrator = ChunkLatencyCalibrator(B, C)
+    worker._take_fit = MagicMock(side_effect=RuntimeError("boom"))
+
+    assert worker.take_fit() == {"coefficients": None, "gave_up": True}
+    assert worker._calibrator is None
 
 
 def test_worker_gives_up_when_calibration_never_sees_two_chunk_sizes():
-    runner = SimpleNamespace(rank=0, label="pp0")
-    worker = DynamicChunkingWorker(runner)
+    worker = DynamicChunkingWorker(_runner())
     worker._calibrator = ChunkLatencyCalibrator(B, C)
     worker._requests_seen = MAX_CALIBRATION_REQUESTS_WITHOUT_DIVERSITY
 
@@ -475,8 +629,7 @@ def test_worker_gives_up_when_calibration_never_sees_two_chunk_sizes():
 
 
 def test_worker_gives_up_when_polls_see_no_samples():
-    runner = SimpleNamespace(rank=0, label="pp0")
-    worker = DynamicChunkingWorker(runner)
+    worker = DynamicChunkingWorker(_runner())
     worker._calibrator = ChunkLatencyCalibrator(B, C)
 
     for _ in range(MAX_CALIBRATION_POLLS_WITHOUT_SAMPLES - 1):
@@ -487,32 +640,48 @@ def test_worker_gives_up_when_polls_see_no_samples():
     assert worker._calibrator is None
 
 
-def test_startup_profiling_batch_block_table_is_marshallable():
-    """The startup sweep's dummy batch has to survive `pack_rows`.
+def test_a_cache_hit_follow_up_counts_as_a_new_request(fake_events):
+    # A multi-turn follow-up can start on a cache hit deeper than where the
+    # previous turn's last chunk began; only the request id tells them apart.
+    worker = DynamicChunkingWorker(_runner())
+    worker._calibrator = ChunkLatencyCalibrator(B, C)
+    for req_id, prefix in ((1, 0), (1, 2048), (2, 4096)):
+        start, end = _FakeEvent(), _FakeEvent()
+        start.record()
+        _FakeEvent.clock += TRUTH.predicted_latency(prefix, 2048)
+        end.record()
+        worker._pending.append(ChunkTimingSample(start, end, req_id, prefix, 2048))
 
-    Every forward marshals `block_tables` into the int32 `block_tables` buffer
-    through a `memoryview` cast, which raises TypeError on a plain list. A list
-    here would take down the worker on the first profiling forward -- on every
-    PP stage, before the engine's ready signal -- and warmup cannot catch it
-    because it leaves `block_table` empty.
-    """
-    batch = _profiling_worker(block_size=64)._dummy_batch(256)
+    worker._drain()
 
-    assert len(batch.block_tables) == 1
-    dst = np.zeros((1, 8), dtype=np.int32)
-    pack_rows(dst, batch.block_tables)
-    assert dst[0].tolist() == [0, 1, 2, 3, 0, 0, 0, 0]
+    assert worker._requests_seen == 2
+    # The first request's timings carry kernel warmup and are discarded.
+    assert worker._calibrator.num_shapes == 1
+
+
+def test_startup_profiling_batch_carries_no_block_table():
+    # As in warmup: a dummy forward writes no KV, and fabricated block ids would
+    # have to fit every stage's own pool.
+    batch = DynamicChunkingWorker(_runner())._dummy_batch(256, vocab_size=1024)
+
+    assert batch.block_tables == []
 
 
 def test_startup_profiling_batch_covers_the_chunk_it_times():
     """One prefill sequence, no cached prefix: the shape the sweep fits on."""
     chunk_size = 192
-    batch = _profiling_worker(block_size=64)._dummy_batch(chunk_size)
+    batch = DynamicChunkingWorker(_runner())._dummy_batch(chunk_size, vocab_size=1024)
 
     assert batch.is_dummy_run
     assert batch.total_seqs_num == batch.total_seqs_num_prefill == 1
     assert batch.total_tokens_num == batch.total_tokens_num_prefill == chunk_size
     assert list(batch.num_scheduled_tokens) == [chunk_size]
     assert list(batch.num_cached_tokens) == [0]
-    # Enough blocks for the whole chunk: attention reads its own tokens back.
-    assert len(batch.block_tables[0]) == chunk_size // 64
+
+
+def test_a_served_prefill_is_not_timed_without_a_calibrator(fake_events):
+    worker = DynamicChunkingWorker(_runner())
+    batch = worker._dummy_batch(64, vocab_size=1024)
+    batch.is_dummy_run = False
+
+    assert worker.start_sample(batch) is None

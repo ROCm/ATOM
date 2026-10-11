@@ -2025,7 +2025,9 @@ class Config:
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
-    dynamic_chunking_smooth_factor: float = 0.75
+    # None reads ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR once the feature is on; see
+    # `_resolve_dynamic_chunking`.
+    dynamic_chunking_smooth_factor: float | None = None
     # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
     # rebuild, so the floor is what bounds that amplification.
     dynamic_chunking_min_chunk_size: int = 4096
@@ -2317,26 +2319,6 @@ class Config:
                 )
                 self.dcp_config.enable_query_replication = False
         assert 1 <= self.pipeline_parallel_size
-        if self.enable_dynamic_chunking:
-            # Checked only when the feature is on. A stale
-            # ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
-            # must not stop a server that never asked for dynamic chunking.
-            if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
-                raise ValueError("dynamic_chunking_smooth_factor must be in [0, 1]")
-            if self.dynamic_chunking_min_chunk_size <= 0:
-                raise ValueError("dynamic_chunking_min_chunk_size must be positive")
-            if self.pipeline_parallel_size <= 1 or not self.enable_chunked_prefill:
-                # Same degrade-to-fixed path as a failed profile or a rejected
-                # fit. Raising here would make `--enable-dynamic-chunking` on a
-                # TP-only server a hard failure, unlike every other miss.
-                logger.warning(
-                    "Dynamic chunking needs pipeline_parallel_size > 1 and "
-                    "enable_chunked_prefill=True (got pp=%d, chunked_prefill=%s); "
-                    "leaving chunking fixed",
-                    self.pipeline_parallel_size,
-                    self.enable_chunked_prefill,
-                )
-                self.enable_dynamic_chunking = False
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
         )
@@ -2475,6 +2457,7 @@ class Config:
             # llama.py adds a key to the live `rope_parameters` while a worker
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_dynamic_chunking()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2685,6 +2668,48 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_dynamic_chunking(self) -> None:
+        """Validate dynamic chunking, or turn it off where it cannot size a chunk.
+
+        Everything here, the env read included, runs only when the feature is
+        on: a stale ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+        must not stop a server that never asked for dynamic chunking.
+        """
+        if not self.enable_dynamic_chunking:
+            return
+        if self.dynamic_chunking_smooth_factor is None:
+            try:
+                self.dynamic_chunking_smooth_factor = (
+                    envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR must be a number: {exc}"
+                ) from None
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError(
+                "dynamic_chunking_smooth_factor must be in [0, 1], got "
+                f"{self.dynamic_chunking_smooth_factor}"
+            )
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.pipeline_parallel_size <= 1:
+            reason = "pipeline_parallel_size is 1"
+        elif not self.enable_chunked_prefill:
+            reason = "chunked prefill is off"
+        elif self.enable_rapidserve:
+            reason = "the RapidServe prefill scheduler never chunks"
+        elif (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer":
+            reason = "a P/D decode instance does not run the prefills it would size"
+        else:
+            return
+        # Same degrade-to-fixed path as a failed profile or a rejected fit.
+        # Raising would make the flag a hard failure in a shared launch script.
+        logger.warning(
+            "Dynamic chunking disabled because %s; chunking stays fixed", reason
+        )
+        self.enable_dynamic_chunking = False
 
     def compute_hash(self) -> str:
         """

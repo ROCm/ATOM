@@ -87,10 +87,6 @@ class EngineCore:
         self._rl_weights_inconsistent = False
         self.input_address = input_address
         self.output_address = output_address
-        # Overridden once KV is allocated, if this process was asked for
-        # dynamic chunking on a real pipeline. Default keeps the historical
-        # PP path: middle chunks retire locally, with no completion ack.
-        self._pp_chunk_completion = False
         # Control traffic arrives on its own socket so CoreManager can keep the
         # request socket single-writer; see CoreManager._send_request.
         self.control_address = config.parallel_config.control_address
@@ -153,16 +149,10 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
-            # Sticky for the process. Downstream stages clear
-            # `enable_dynamic_chunking` below because they never size chunks,
-            # and the head clears `_dynamic_chunking_enabled` once calibration
-            # ends. Both ends of the PP completion ack have to keep agreeing
-            # after that, and a server that did not ask for the feature must
-            # not pay the ack on its default chunked-prefill path.
-            self._pp_chunk_completion = (
-                config.enable_dynamic_chunking and config.pipeline_parallel_size > 1
-            )
-            if self._pp_chunk_completion:
+            # Config has already turned the feature off wherever it cannot act,
+            # so every stage of a pipeline takes this branch or none does: the
+            # sweep's dummy forwards cross stages and must run in lockstep.
+            if config.enable_dynamic_chunking:
                 # Startup profiling only measures the chunk cost that carries no
                 # attention; the attention terms are calibrated from real
                 # prefills while serving, so no chunk is rebalanced until then.
@@ -670,9 +660,17 @@ class EngineCore:
         # there is never a second one to collect - whether the scheduler takes
         # this model or rejects it as not worth acting on.
         self._dynamic_chunking_enabled = False
-        self.scheduler.install_chunk_latency_model(
-            ChunkSizePredictor.from_coefficients(coefficients)
-        )
+        try:
+            predictor = ChunkSizePredictor.from_coefficients(coefficients)
+        except (TypeError, ValueError):
+            logger.exception(
+                "%s: rejecting dynamic chunking coefficients %r",
+                self.label,
+                coefficients,
+            )
+            self.scheduler.abandon_chunk_latency_calibration()
+            return
+        self.scheduler.install_chunk_latency_model(predictor)
 
     def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         if not self.kv_transfer_enabled:

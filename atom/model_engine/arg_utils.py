@@ -147,7 +147,9 @@ class EngineArgs:
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
-    dynamic_chunking_smooth_factor: float = 0.75
+    # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
+    # feature is on (see Config._resolve_dynamic_chunking).
+    dynamic_chunking_smooth_factor: float | None = None
     dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
@@ -611,11 +613,12 @@ class EngineArgs:
         parser.add_argument(
             "--dynamic-chunking-smooth-factor",
             type=float,
-            default=envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR,
+            default=None,
             help=(
                 "Interpolation between the initial chunk size (0) and the "
                 "equal-latency prediction (1). Defaults to "
-                "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75."
+                "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR or 0.75, read only when "
+                "--enable-dynamic-chunking is set."
             ),
         )
         parser.add_argument(

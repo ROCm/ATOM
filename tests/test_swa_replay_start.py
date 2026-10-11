@@ -137,9 +137,11 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
         max_num_batched_tokens=16384,
         block_manager=SimpleNamespace(block_size=128),
         _tick_cost_limit=math.inf,  # no DP prefill cost balancing
+        _dynamic_chunk_limit=lambda history_len, kind: None,
     )
-    scheduler._chunked_prefill_size = lambda *a: Scheduler._chunked_prefill_size(
-        scheduler, *a
+    scheduler._chunk_alignment = lambda: Scheduler._chunk_alignment(scheduler)
+    scheduler._chunked_prefill_size = lambda *a, **kw: Scheduler._chunked_prefill_size(
+        scheduler, *a, **kw
     )
     scheduler._prefill_room = lambda *a: Scheduler._prefill_room(scheduler, *a)
     seq = SimpleNamespace(num_tokens=16484)

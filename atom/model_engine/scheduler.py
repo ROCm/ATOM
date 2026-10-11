@@ -19,13 +19,14 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 
 from __future__ import annotations
 
+import enum
 import itertools
 import logging
 import math
 import struct
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -37,7 +38,9 @@ from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
+    USEFUL_SHRINK_REFERENCE_CHUNKS,
     ChunkSizePredictor,
+    chunk_alignment,
     has_sole_prefill,
 )
 from atom.model_engine.engine_stats import EngineStats
@@ -64,6 +67,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom")
 
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
+
+
+class ChunkKind(enum.Enum):
+    """Which prefill chunk a sizing call is for, as dynamic chunking sees it.
+
+    Required at every sizing call rather than defaulted, so a new call site has
+    to say which one it is.
+    """
+
+    # A new request's first chunk: takes the next calibration sweep arm.
+    FIRST = enum.auto()
+    # A later chunk of a request already admitted: keeps the current arm.
+    NEXT = enum.auto()
+    # A prefill that must go whole (`_requires_atomic_prefill`): never limited.
+    WHOLE = enum.auto()
 
 
 # How often the stalled-save reconciler actually scans deferred_free_blocks. The
@@ -381,6 +399,10 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+        # Set by the PP head on a batch whose completion it waits for although
+        # the batch produces no output. It travels with the metadata, so the
+        # last stage acks exactly the batches the head waits on.
+        self.pp_completion_ack = False
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
@@ -689,15 +711,18 @@ class Scheduler:
         # Installed after runtime calibration; None keeps fixed/sweep chunking.
         self.dynamic_chunk_predictor: ChunkSizePredictor | None = None
         self._calibrating = self.enable_dynamic_chunking
-        # Alternate calibration base size per request. The arm flips when a new
-        # request is sized, and stays there until that request is actually
-        # admitted — a requeue must not burn the other arm.
-        self._calibration_sweep_alternate = False
+        # Sweep arm of the request admitted last; a new request takes the other.
+        self._calibration_small_arm = False
+        # Whether the latest first-chunk sizing drew a sweep arm, so that
+        # admitting that request moves the sweep on (see _commit_calibration_arm).
         self._calibration_arm_drawn = False
-        # Suppress dynamic sizing after recent multi-prefill supply.
+        # Per-step prefill census (`_record_prefill_supply`); dynamic sizing
+        # needs at most one prefill source over the whole window.
         self._recent_prefill_supply: deque[int] = deque(
             maxlen=_DYNAMIC_CHUNKING_SUPPLY_WINDOW
         )
+        # Sizing decisions by outcome, reported beside the engine-status line.
+        self._dynamic_chunking_counts: Counter[str] = Counter()
         if self._calibrating and self._calibration_arms_collapsed():
             # The two sweep arms are the same aligned size, so the fit can
             # never see MIN_CALIBRATION_CHUNK_SIZES distinct chunks. Give up
@@ -705,14 +730,15 @@ class Scheduler:
             logger.warning(
                 "Dynamic chunking calibration sweep has only one chunk size "
                 "at max_num_batched_tokens=%d, min_chunk_size=%d; chunking "
-                "stays fixed",
+                "stays fixed. Set --dynamic-chunking-min-chunk-size below "
+                "--max-num-batched-tokens to enable it",
                 self.max_num_batched_tokens,
                 self.dynamic_chunking_min_chunk_size,
             )
             self._calibrating = False
         # Running seqs currently mid-prefill. Excludes `waiting`. The counter
         # lets schedule() skip the running-queue scan on pure-decode steps, and
-        # `_dynamic_chunk_limit` adds `len(self.waiting)` on top of it.
+        # `_record_prefill_supply` adds the admittable waiting seqs to it.
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
@@ -888,6 +914,15 @@ class Scheduler:
 
     def _local_prefill_pending_work(self) -> tuple[bool, int]:
         """Count probed work; a bounded scan never invents fill for unseen work."""
+        # The probe sizes the chunks admission is about to size; only
+        # admission's outcomes belong in the sizing report.
+        counts = self._dynamic_chunking_counts.copy()
+        try:
+            return self._probe_local_prefill_work()
+        finally:
+            self._dynamic_chunking_counts = counts
+
+    def _probe_local_prefill_work(self) -> tuple[bool, int]:
         budget = self.max_num_batched_tokens
         pending = 0
         if self._partial_prefill_count:
@@ -941,10 +976,17 @@ class Scheduler:
                 if offload_resume
                 else self._new_prefill_tokens(seq, cached, resume)
             )
-            chunk = self._prefill_chunk_for_budget(remaining, budget - pending, pending)
+            atomic = self._requires_atomic_prefill(seq)
+            if atomic:
+                kind = ChunkKind.WHOLE
+            else:
+                kind = ChunkKind.NEXT if offload_resume else ChunkKind.FIRST
+            chunk = self._prefill_chunk_for_budget(
+                remaining, budget - pending, pending, history_len=cached, kind=kind
+            )
             if (
                 chunk is None
-                or (self._requires_atomic_prefill(seq) and chunk < remaining)
+                or (atomic and chunk < remaining)
                 or self._waits_below_resume(seq, cached, chunk, resume)
             ):
                 break
@@ -1150,7 +1192,7 @@ class Scheduler:
             self._prefill_room(batched_tokens, start),
             batched_tokens,
             history_len=start,
-            already_prefilling=True,
+            kind=ChunkKind.NEXT,
         )
         return chunk if start + chunk > resume else 0
 
@@ -1250,6 +1292,8 @@ class Scheduler:
             num_waiting_reqs=num_waiting_reqs,
             kv_usage=self._kv_usage(),
         )
+        if self._dynamic_chunking_counts:
+            self._log_dynamic_chunking_counts()
 
     def heartbeat_throughput(self, now: float) -> None:
         """Close the throughput window on time while the engine sits idle."""
@@ -1825,12 +1869,6 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
-        if self.enable_dynamic_chunking:
-            # Sampled before the queues move, so `_dynamic_chunk_limit` sees how
-            # much prefill work the pipeline has had, not just what is left now.
-            self._recent_prefill_supply.append(
-                self._partial_prefill_count + len(self.waiting)
-            )
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1851,6 +1889,8 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
+        if self.enable_dynamic_chunking:
+            self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
             prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
             if prefetch is not None:
@@ -2079,8 +2119,12 @@ class Scheduler:
                     budget_remaining,
                     num_batched_tokens,
                     history_len=start,
-                    # The tier already ran earlier chunks of this request.
-                    already_prefilling=True,
+                    # Admitted (and sized as FIRST) before it parked for the load.
+                    kind=(
+                        ChunkKind.WHOLE
+                        if self._requires_atomic_prefill(seq)
+                        else ChunkKind.NEXT
+                    ),
                 )
                 if chunk is None or start + chunk <= seq.num_cached_tokens:
                     self.waiting.appendleft(seq)
@@ -2171,7 +2215,7 @@ class Scheduler:
                 budget_remaining,
                 num_batched_tokens,
                 history_len=start,
-                draw_calibration=True,
+                kind=ChunkKind.WHOLE if atomic_prefill else ChunkKind.FIRST,
             )
             if (
                 chunk is None
@@ -2320,8 +2364,8 @@ class Scheduler:
                 num_seqs_prefill,
                 num_batched_tokens,
             )
-            # The arm was drawn for this admission. Commit only once the request
-            # is on the batch, so a requeue above leaves the sweep on this arm.
+            # Commit only once the request is on the batch, so a requeue above
+            # leaves the next sizing drawing the same arm.
             self._commit_calibration_arm()
             self._inflight_prefix_wait.pop(seq.id, None)
 
@@ -2917,9 +2961,7 @@ class Scheduler:
         the workers stop timing once they have answered with a fit.
         """
         self._calibrating = False
-        # One base chunk is too shallow: a quadratic that only pays off deeper
-        # in the prompt would be rejected, and the feature would never turn on.
-        reference_len = self.max_num_batched_tokens * 4
+        reference_len = self.max_num_batched_tokens * USEFUL_SHRINK_REFERENCE_CHUNKS
         if self.max_model_len:
             reference_len = min(self.max_model_len, reference_len)
         if not predictor.predicts_useful_shrink(
@@ -2954,45 +2996,78 @@ class Scheduler:
             self.max_num_batched_tokens,
         )
 
-    def _dynamic_chunk_limit(
-        self,
-        history_len: int,
-        *,
-        already_prefilling: bool = False,
-        draw_calibration: bool = False,
-    ) -> int | None:
+    @property
+    def dynamic_chunking_active(self) -> bool:
+        """Whether chunk sizes can still differ from the fixed budget."""
+        return self.enable_dynamic_chunking and (
+            self._calibrating or self.dynamic_chunk_predictor is not None
+        )
+
+    def _record_prefill_supply(self) -> None:
+        """Sample this step's prefill sources into the sole-prefill window.
+
+        Counts the requests mid-prefill plus the waiting ones admission could
+        take, before this step admits any. Capped at 2: only "at most one"
+        matters, and the cap keeps a long queue from costing a full scan.
+        """
+        sources = self._partial_prefill_count
+        if sources < 2:
+            waiting = itertools.islice(self._waiting_prefills(), 2 - sources)
+            sources += sum(1 for _ in waiting)
+        self._recent_prefill_supply.append(min(sources, 2))
+
+    def _dynamic_chunk_limit(self, history_len: int, kind: ChunkKind) -> int | None:
         """Return the dynamic chunk ceiling, or None for fixed chunking.
 
-        Dynamic sizing requires sole-prefill supply. Before calibration completes,
-        it returns the sweep size; ``already_prefilling`` avoids double-counting
-        the current request.
+        Dynamic sizing requires a single prefill source over the whole census
+        window. Before calibration completes, it returns the sweep size.
         """
-        if not self.enable_dynamic_chunking:
+        if kind is not ChunkKind.NEXT:
+            # A new request is being sized: forget any arm an earlier query drew.
+            self._calibration_arm_drawn = False
+        if kind is ChunkKind.WHOLE or not self.dynamic_chunking_active:
             return None
-        prefill_sources = (
-            self._partial_prefill_count
-            + len(self.waiting)
-            + (0 if already_prefilling else 1)
-        )
-        if not has_sole_prefill(prefill_sources, self._recent_prefill_supply):
+        if not has_sole_prefill(self._recent_prefill_supply):
+            self._dynamic_chunking_counts["multi_prefill"] += 1
             return None
         if self.dynamic_chunk_predictor is None:
-            if not self._calibrating:
-                return None
-            return self._calibration_sweep_chunk(
-                already_prefilling, draw_calibration=draw_calibration
+            self._dynamic_chunking_counts["sweep"] += 1
+            return self._calibration_sweep_chunk(kind)
+        try:
+            limit = self.dynamic_chunk_predictor.predict(
+                history_len=history_len,
+                base_chunk_size=self.max_num_batched_tokens,
+                smooth_factor=self.dynamic_chunking_smooth_factor,
+                alignment=self._chunk_alignment(),
+                max_chunk_size=self.max_num_batched_tokens,
+                min_chunk_size=self.dynamic_chunking_min_chunk_size,
             )
-        return self.dynamic_chunk_predictor.predict(
-            history_len=history_len,
-            base_chunk_size=self.max_num_batched_tokens,
-            smooth_factor=self.dynamic_chunking_smooth_factor,
-            alignment=max(self.block_manager.block_size, 64),
-            max_chunk_size=self.max_num_batched_tokens,
-            min_chunk_size=self.dynamic_chunking_min_chunk_size,
+        except ValueError:
+            logger.exception(
+                "Dynamic chunking prediction failed; chunking stays fixed at %d tokens",
+                self.max_num_batched_tokens,
+            )
+            self.dynamic_chunk_predictor = None
+            return None
+        outcome = "unreachable" if limit is None else "solved"
+        self._dynamic_chunking_counts[outcome] += 1
+        return limit
+
+    def _log_dynamic_chunking_counts(self) -> None:
+        counts = self._dynamic_chunking_counts
+        logger.info(
+            "Dynamic chunking since last report: %d chunk(s) from the latency "
+            "model, %d calibration-sweep chunk(s); fixed budget kept for %d "
+            "unreachable, %d alongside other prefills",
+            counts["solved"],
+            counts["sweep"],
+            counts["unreachable"],
+            counts["multi_prefill"],
         )
+        counts.clear()
 
     def _chunk_alignment(self) -> int:
-        return max(self.block_manager.block_size, 64)
+        return chunk_alignment(self.block_manager.block_size)
 
     def _align_chunk_down(self, chunk: int) -> int:
         alignment = self._chunk_alignment()
@@ -3011,29 +3086,28 @@ class Scheduler:
         return small >= full
 
     def _commit_calibration_arm(self) -> None:
-        """A drawn calibration arm was admitted; the next new request flips."""
-        self._calibration_arm_drawn = False
+        """The request just admitted is the one last sized; its arm is now current."""
+        if self._calibration_arm_drawn:
+            self._calibration_small_arm = not self._calibration_small_arm
+            self._calibration_arm_drawn = False
 
-    def _calibration_sweep_chunk(
-        self, already_prefilling: bool, *, draw_calibration: bool = False
-    ) -> int | None:
+    def _calibration_sweep_chunk(self, kind: ChunkKind) -> int | None:
         """Select one of two per-request chunk sizes for an identifiable fit.
 
         Requests alternate between the full budget (None) and its
         ``CALIBRATION_SWEEP_RATIO`` fraction, aligned down the same way the
-        full arm is. The arm is drawn once per new request and committed only
-        when that request is admitted, so a sizing query that is later
-        requeued does not burn the other arm. Later chunks of the same request
-        (``already_prefilling``) keep the arm the request started on.
+        full arm is. A first chunk takes the arm the last admitted request did
+        not; sizing only reads that state, and `_commit_calibration_arm` moves
+        it when the request is admitted. So a requeued request, or a fit
+        probe, draws the same arm again rather than burning the other one.
+        Later chunks keep the current arm, which is their own: the sole-prefill
+        gate keeps a second request from being swept while one is mid-prefill.
         """
-        if (
-            draw_calibration
-            and not already_prefilling
-            and not self._calibration_arm_drawn
-        ):
-            self._calibration_sweep_alternate = not self._calibration_sweep_alternate
+        small = self._calibration_small_arm
+        if kind is ChunkKind.FIRST:
+            small = not small
             self._calibration_arm_drawn = True
-        if not self._calibration_sweep_alternate:
+        if not small:
             return None
         return self._align_chunk_down(
             max(
@@ -3048,9 +3122,8 @@ class Scheduler:
         budget_remaining: int,
         num_batched_tokens: int,
         *,
-        history_len: int = 0,
-        already_prefilling: bool = False,
-        draw_calibration: bool = False,
+        history_len: int,
+        kind: ChunkKind,
     ) -> int:
         """Tokens to forward this step, or 0 to leave the request for the next.
 
@@ -3065,11 +3138,7 @@ class Scheduler:
         Never 0 for an empty batch: something has to go out each step, or a
         `max_num_batched_tokens` below the alignment would stall forever.
         """
-        dynamic_limit = self._dynamic_chunk_limit(
-            history_len,
-            already_prefilling=already_prefilling,
-            draw_calibration=draw_calibration,
-        )
+        dynamic_limit = self._dynamic_chunk_limit(history_len, kind)
         # None means the equal-latency chunk is unreachable for this prefix, so
         # the fixed budget stands. A reachable limit is the equal-latency or
         # sweep chunk size; the feature-off path is also None.
@@ -3080,7 +3149,7 @@ class Scheduler:
         )
         if chunk >= num_new_tokens:
             return chunk
-        aligned = chunk - chunk % max(self.block_manager.block_size, 64)
+        aligned = chunk - chunk % self._chunk_alignment()
         return aligned or (0 if num_batched_tokens else chunk)
 
     def _prefill_chunk_for_budget(
@@ -3089,9 +3158,8 @@ class Scheduler:
         budget_remaining: int,
         num_batched_tokens: int,
         *,
-        history_len: int = 0,
-        already_prefilling: bool = False,
-        draw_calibration: bool = False,
+        history_len: int,
+        kind: ChunkKind,
     ) -> int | None:
         if self.enable_chunked_prefill:
             return (
@@ -3100,8 +3168,7 @@ class Scheduler:
                     budget_remaining,
                     num_batched_tokens,
                     history_len=history_len,
-                    already_prefilling=already_prefilling,
-                    draw_calibration=draw_calibration,
+                    kind=kind,
                 )
                 or None
             )
