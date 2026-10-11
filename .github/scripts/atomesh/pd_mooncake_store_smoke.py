@@ -392,6 +392,7 @@ def thp_store_cases(root):
                 "ATOMESH_THP_LOCAL_BUFFER_BYTES": str(1024**3),
                 "ATOMESH_THP_GLOBAL_SEGMENT_BYTES": str(segment),
                 "ATOMESH_THP_NUMA_REGION_BYTES": str(segment // 2),
+                "ATOMESH_THP_NUMA_FALLBACK": "1",
             },
             timeout=600 if count == 8 and segment > 1024**3 else 180,
             gpu_bytes=20 * 1024**3 if segment > 1024**3 else 0,

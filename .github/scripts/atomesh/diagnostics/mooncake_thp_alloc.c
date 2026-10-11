@@ -71,9 +71,17 @@ void *aligned_alloc(size_t alignment, size_t size) {
 long mbind(void *address, unsigned long length, int mode,
            const unsigned long *nodes, unsigned long maxnode,
            unsigned int flags) {
-    long rc = syscall(SYS_mbind, address, length, mode, nodes, maxnode, flags);
-    if (rc == 0 && mode == MPOL_BIND && (uintptr_t)address % thp_size == 0 &&
-        matches_size("ATOMESH_THP_NUMA_REGION_BYTES", length))
+    int selected = mode == MPOL_BIND && (uintptr_t)address % thp_size == 0 &&
+                   matches_size("ATOMESH_THP_NUMA_REGION_BYTES", length);
+    const char *fallback = getenv("ATOMESH_THP_NUMA_FALLBACK");
+    int effective_mode = selected && fallback && fallback[0] == '1' &&
+                         fallback[1] == '\0' ? MPOL_PREFERRED_MANY : mode;
+    long rc = syscall(SYS_mbind, address, length, effective_mode, nodes,
+                      maxnode, flags);
+    if (selected)
+        fprintf(stderr, "[DEBUG-mooncake-thp] numa-policy=%d requested=%d bytes=%lu rc=%ld\n",
+                effective_mode, mode, length, rc);
+    if (rc == 0 && selected)
         rc = populate_thp(address, length, "numa-region");
     return rc;
 }
