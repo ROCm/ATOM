@@ -219,32 +219,32 @@ def _dspark_markov_argmax_stage2(
 
 
 @triton.jit
-def _dspark_markov_pick_rank(
-    gathered_ptr,
+def _argmax_gather_kernel(
+    pairs_ptr,
     out_ptr,
     num_rows,
     stride_out,
-    WORLD: tl.constexpr,
+    NUM_J: tl.constexpr,
     BLOCK_ROW: tl.constexpr,
 ):
-    """Each row's id from every rank's ``(max, id)``, into ``out``.
+    """``out[i] = ids[argmax_j vals[j, i], i]`` over ``pairs`` ``[J, N, 2]``
+    fp32 ``(val, id)``: ``torch.argmax`` over ``j``, the gather of the ids at
+    the winner and the copy into a strided, integer ``out`` in one launch.
 
-    ``torch.argmax`` over the ranks' maxima, then their ids gathered at the
-    winner, then the copy into the strided destination -- three launches --
-    as one. The same pick: the lowest rank among equal maxima, and the first
-    NaN if any rank published one (``torch.argmax`` takes NaN as the max).
+    The same pick as ``torch.argmax``: the lowest ``j`` among equal values,
+    and the first NaN if any (``torch.argmax`` takes NaN as the max).
     """
     rows = tl.program_id(0) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
     mask = rows < num_rows
-    best = tl.load(gathered_ptr + rows * 2, mask=mask, other=0.0)
-    best_id = tl.load(gathered_ptr + rows * 2 + 1, mask=mask, other=0.0)
+    best = tl.load(pairs_ptr + rows * 2, mask=mask, other=0.0)
+    best_id = tl.load(pairs_ptr + rows * 2 + 1, mask=mask, other=0.0)
     best_nan = best != best  # noqa: PLR0124 -- NaN test in Triton
-    for r in tl.static_range(1, WORLD):
-        base = gathered_ptr + (r * num_rows + rows) * 2
+    for j in tl.static_range(1, NUM_J):
+        base = pairs_ptr + (j * num_rows + rows) * 2
         val = tl.load(base, mask=mask, other=0.0)
         idx = tl.load(base + 1, mask=mask, other=0.0)
         val_nan = val != val  # noqa: PLR0124
-        # strict `>`: an equal max keeps the lower rank
+        # strict `>`: an equal value keeps the lower j
         take = (~best_nan) & (val_nan | (val > best))
         best = tl.where(take, val, best)
         best_id = tl.where(take, idx, best_id)
@@ -254,6 +254,32 @@ def _dspark_markov_pick_rank(
         best_id.to(out_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+def argmax_gather(pairs: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``out[i] = pairs[argmax_j pairs[j, i, 0], i, 1]`` for fp32 ``pairs``
+    ``[J, N, 2]`` of ``(value, id)``, written into integer ``out`` ``[N]``
+    (strided is fine); see ``_argmax_gather_kernel``."""
+    num_j, num_rows = pairs.shape[0], pairs.shape[1]
+    if pairs.shape != (num_j, num_rows, 2) or pairs.dtype != torch.float32:
+        raise ValueError(
+            f"pairs {tuple(pairs.shape)} {pairs.dtype} is not [J, N, 2] fp32"
+        )
+    if out.shape != (num_rows,):
+        raise ValueError(f"out {tuple(out.shape)} is not [{num_rows}]")
+    if num_rows:
+        pairs = pairs if pairs.is_contiguous() else pairs.contiguous()
+        block_row = min(1024, triton.next_power_of_2(num_rows))
+        _argmax_gather_kernel[(triton.cdiv(num_rows, block_row),)](
+            pairs,
+            out,
+            num_rows,
+            out.stride(0),
+            NUM_J=num_j,
+            BLOCK_ROW=block_row,
+            num_warps=1 if block_row <= 64 else 4,
+        )
+    return out
 
 
 def _dspark_markov_argmax_fake(
@@ -500,85 +526,6 @@ def dspark_markov_argmax_tp(
         embed_out,
     )
     gathered = tp_group.all_gather(packed, dim=0, use_custom=use_custom)
-    block_row = min(1024, triton.next_power_of_2(num_rows))
-    _dspark_markov_pick_rank[(triton.cdiv(num_rows, block_row),)](
-        gathered,
-        out,
-        num_rows,
-        out.stride(0),
-        WORLD=tp_group.world_size,
-        BLOCK_ROW=block_row,
-        num_warps=1 if block_row <= 64 else 4,
-    )
+    # each rank's (max, id) -> the id of the largest max
+    argmax_gather(gathered.view(tp_group.world_size, num_rows, 2), out)
     return markov_embed
-
-
-@triton.jit
-def _dspark_confidence_kernel(
-    hidden_ptr,
-    embed_ptr,
-    weight_ptr,
-    out_ptr,
-    hidden_size,
-    rank,
-    stride_hidden,
-    stride_embed,
-    BLOCK: tl.constexpr,
-):
-    """One row: ``sigmoid(w . [h ; e])`` in fp32."""
-    row = tl.program_id(0)
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    for k in range(0, hidden_size, BLOCK):
-        offs = k + tl.arange(0, BLOCK)
-        mask = offs < hidden_size
-        h = tl.load(hidden_ptr + row * stride_hidden + offs, mask=mask, other=0.0)
-        w = tl.load(weight_ptr + offs, mask=mask, other=0.0)
-        acc += h.to(tl.float32) * w.to(tl.float32)
-    for k in range(0, rank, BLOCK):
-        offs = k + tl.arange(0, BLOCK)
-        mask = offs < rank
-        e = tl.load(embed_ptr + row * stride_embed + offs, mask=mask, other=0.0)
-        w = tl.load(weight_ptr + hidden_size + offs, mask=mask, other=0.0)
-        acc += e.to(tl.float32) * w.to(tl.float32)
-    tl.store(out_ptr + row, tl.sigmoid(tl.sum(acc, axis=0)))
-
-
-def dspark_confidence(
-    hidden: torch.Tensor, embeds: torch.Tensor, weight: torch.Tensor
-) -> torch.Tensor:
-    """``sigmoid(linear(cat([hidden, embeds], -1).float(), weight.float()))``
-    as one launch: no concatenated copy, no casts, no split GEMV.
-
-    ``hidden`` ``[*, H]``, ``embeds`` ``[*, r]``, ``weight`` ``[1, H + r]``;
-    returns fp32 ``[*]``. The fp32 sum runs in a different order from the
-    GEMM's, so the result agrees to fp32 rounding, not bit for bit.
-    """
-    lead = hidden.shape[:-1]
-    hidden_size, rank = hidden.shape[-1], embeds.shape[-1]
-    if embeds.shape[:-1] != lead or weight.shape != (1, hidden_size + rank):
-        raise ValueError(
-            f"confidence shapes disagree: hidden {tuple(hidden.shape)}, "
-            f"embeds {tuple(embeds.shape)}, weight {tuple(weight.shape)}"
-        )
-    h = hidden.reshape(-1, hidden_size)
-    e = embeds.reshape(-1, rank)
-    if h.stride(-1) != 1:
-        h = h.contiguous()
-    if e.stride(-1) != 1:
-        e = e.contiguous()
-    w = weight if weight.is_contiguous() else weight.contiguous()
-    out = torch.empty(h.shape[0], dtype=torch.float32, device=hidden.device)
-    if h.shape[0]:
-        _dspark_confidence_kernel[(h.shape[0],)](
-            h,
-            e,
-            w,
-            out,
-            hidden_size,
-            rank,
-            h.stride(0),
-            e.stride(0),
-            BLOCK=1024,
-            num_warps=4,
-        )
-    return out.view(lead)

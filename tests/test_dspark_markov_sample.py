@@ -14,7 +14,6 @@ hand back then is a copy, so a returned id tensor could not be trusted.
 
 import pytest
 import torch
-import triton
 
 pytest.importorskip("aiter", reason="the Markov sampler is a Triton/AITER op")
 
@@ -193,58 +192,52 @@ def test_sharded_sampling_matches_the_whole_vocab(tp, rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("num_j", [2, 4, 8])
 @pytest.mark.parametrize("rows", [1, 32, 160, 2048])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_rank_pick_is_the_argmax_gather_it_replaces(tp, rows, dtype):
-    """The fused cross-rank pick against the three ops it replaces --
-    `argmax` over the ranks' maxima, the id gather and the copy -- with ties
-    between ranks and NaN maxima, written into a strided id column."""
-    from atom.model_ops.dspark_markov_sample import _dspark_markov_pick_rank
+def test_argmax_gather_is_the_three_ops_it_replaces(num_j, rows, dtype):
+    """`argmax_gather` against `argmax` over j, the id gather at the winner
+    and the copy -- with ties across j and NaN values, written into a strided
+    integer column."""
+    from atom.model_ops.dspark_markov_sample import argmax_gather
 
-    g = torch.Generator(device="cuda").manual_seed(rows * tp)
-    vals = torch.randint(0, 4, (tp, rows), device="cuda", generator=g).float()
-    ids = torch.randint(0, 129280, (tp, rows), device="cuda", generator=g).float()
-    nan = torch.rand(tp, rows, device="cuda", generator=g) < 0.1
-    vals[nan] = float("nan")
-    gathered = torch.stack((vals, ids), dim=-1).contiguous()
-    winner = gathered[:, :, 0].argmax(dim=0)
-    ref = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0).to(dtype)
+    g = torch.Generator(device="cuda").manual_seed(rows * num_j)
+    vals = torch.randint(0, 4, (num_j, rows), device="cuda", generator=g).float()
+    ids = torch.randint(0, 129280, (num_j, rows), device="cuda", generator=g).float()
+    vals[torch.rand(num_j, rows, device="cuda", generator=g) < 0.1] = float("nan")
+    pairs = torch.stack((vals, ids), dim=-1).contiguous()
+    winner = pairs[:, :, 0].argmax(dim=0)
+    ref = pairs[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0).to(dtype)
 
     block = torch.full((rows, 3), -1, dtype=dtype, device="cuda")
-    out = block[:, 1]
-    block_row = min(1024, triton.next_power_of_2(rows))
-    _dspark_markov_pick_rank[(triton.cdiv(rows, block_row),)](
-        gathered, out, rows, out.stride(0), WORLD=tp, BLOCK_ROW=block_row
-    )
-    assert torch.equal(out, ref)
+    argmax_gather(pairs, block[:, 1])
+    assert torch.equal(block[:, 1], ref)
     # the neighbouring columns are untouched
     assert torch.all(block[:, 0] == -1) and torch.all(block[:, 2] == -1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("rows", [1, 5, 160])
-@pytest.mark.parametrize("wdtype", [torch.float32, torch.bfloat16])
-def test_fused_confidence_matches_concat_linear_sigmoid(rows, wdtype):
-    """The one-launch confidence head against concat -> fp32 linear ->
-    sigmoid, over a strided hidden view like the draft's [B, T, H]."""
-    from atom.model_ops.dspark_markov_sample import dspark_confidence
+def test_confidence_head_matches_the_fp32_reference(rows):
+    """The head's GPU path (concat, BF16 GEMV with FP32 output, sigmoid)
+    against the FP32 reference it replaces, on a [B, T, H] strided hidden."""
+    from atom.models.deepseek_v4_dspark import DSparkConfidenceHead
 
-    hidden_size, rank = 5120, 2560
+    hidden_size, rank = 5120, 256
+    head = DSparkConfidenceHead(hidden_size, rank).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        head.proj.weight.normal_(std=0.02)
     g = torch.Generator(device="cuda").manual_seed(rows)
-    big = torch.randn(rows, 2, hidden_size, device="cuda", generator=g)
-    hidden = big.to(torch.bfloat16)[:, 1]  # rows strided by 2 * H
-    embeds = torch.randn(rows, rank, device="cuda", generator=g).to(torch.bfloat16)
-    weight = (torch.randn(1, hidden_size + rank, device="cuda", generator=g) * 0.02).to(
-        wdtype
-    )
+    big = torch.randn(rows, 5, 2, hidden_size, device="cuda", generator=g)
+    hidden = big.to(torch.bfloat16)[:, :, 1]
+    embeds = torch.randn(rows, 5, rank, device="cuda", generator=g).bfloat16()
     ref = torch.sigmoid(
         torch.nn.functional.linear(
-            torch.cat([hidden, embeds], dim=-1).float(), weight.float()
+            torch.cat([hidden, embeds], dim=-1).float(), head.proj.weight.float()
         ).squeeze(-1)
     )
-    out = dspark_confidence(hidden, embeds, weight)
-    assert out.dtype == torch.float32 and out.shape == (rows,)
+    out = head(hidden, embeds)
+    assert out.dtype == torch.float32 and out.shape == (rows, 5)
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
 
 
