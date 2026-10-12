@@ -220,3 +220,66 @@ def test_rank_pick_is_the_argmax_gather_it_replaces(tp, rows, dtype):
     assert torch.equal(out, ref)
     # the neighbouring columns are untouched
     assert torch.all(block[:, 0] == -1) and torch.all(block[:, 2] == -1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rows", [1, 5, 160])
+@pytest.mark.parametrize("wdtype", [torch.float32, torch.bfloat16])
+def test_fused_confidence_matches_concat_linear_sigmoid(rows, wdtype):
+    """The one-launch confidence head against concat -> fp32 linear ->
+    sigmoid, over a strided hidden view like the draft's [B, T, H]."""
+    from atom.model_ops.dspark_markov_sample import dspark_confidence
+
+    hidden_size, rank = 5120, 2560
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    big = torch.randn(rows, 2, hidden_size, device="cuda", generator=g)
+    hidden = big.to(torch.bfloat16)[:, 1]  # rows strided by 2 * H
+    embeds = torch.randn(rows, rank, device="cuda", generator=g).to(torch.bfloat16)
+    weight = (torch.randn(1, hidden_size + rank, device="cuda", generator=g) * 0.02).to(
+        wdtype
+    )
+    ref = torch.sigmoid(
+        torch.nn.functional.linear(
+            torch.cat([hidden, embeds], dim=-1).float(), weight.float()
+        ).squeeze(-1)
+    )
+    out = dspark_confidence(hidden, embeds, weight)
+    assert out.dtype == torch.float32 and out.shape == (rows,)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_sharded_step_writes_its_embed_column_in_place():
+    """`embed_out` receives the step's W1[x] rows: a [B, T, r] block filled
+    column by column equals the stack of fresh results."""
+    from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
+
+    rows, steps, vocab, rank, tp = 32, 5, 129280, 256, 2
+    base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
+    shard = vocab // tp
+    block = w1.new_empty(rows, steps, rank)
+    fresh = []
+    for k in range(steps):
+        packed = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
+        from atom.model_ops.dspark_markov_sample import _launch
+
+        _launch(
+            base[:, :shard], prev, w1, w2, _ids(rows, "cuda", torch.int32), 0, packed
+        )
+        group = _TpGroup([packed, packed])
+        fresh.append(
+            dspark_markov_argmax_tp(
+                base[:, :shard], prev, w1, w2, _ids(rows, "cuda", torch.int32), 0, group
+            )
+        )
+        dspark_markov_argmax_tp(
+            base[:, :shard],
+            prev,
+            w1,
+            w2,
+            _ids(rows, "cuda", torch.int32),
+            0,
+            group,
+            embed_out=block[:, k],
+        )
+    assert torch.equal(block, torch.stack(fresh, dim=1))

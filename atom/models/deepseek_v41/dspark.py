@@ -599,7 +599,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
         # Position k's id lands in column k and is position k + 1's previous
         # id; position 0 reads the anchors where they are, not a copy of them.
         out_ids = anchor_ids.new_empty(B, T)
-        markov_embeds = [
+        # Each step writes its W1[x] rows into its column of this block, so
+        # the confidence head reads them without a stack.
+        markov_w1 = last.markov_head.markov_w1.weight
+        markov_embeds = markov_w1.new_empty(B, T, markov_w1.shape[1])
+        for k in range(T):
             dspark_markov_argmax_tp(
                 base_logits[:, k],
                 anchor_ids if k == 0 else out_ids[:, k - 1],
@@ -609,8 +613,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
                 head.vocab_start_idx,
                 tp_group,
                 use_custom=use_custom,
+                embed_out=markov_embeds[:, k],
             )
-            for k in range(T)
-        ]
-        confidence = last.confidence_head(hc_hidden, torch.stack(markov_embeds, dim=1))
+        confidence = last.confidence_head(hc_hidden, markov_embeds)
         return out_ids, confidence

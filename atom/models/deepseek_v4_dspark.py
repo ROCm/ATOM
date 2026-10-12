@@ -229,6 +229,11 @@ class DSparkConfidenceHead(nn.Module):
         """
         # Confidence is computed in fp32 (the checkpoint head is fp32 and the
         # downstream scheduler needs calibrated absolute probabilities).
+        if hidden_states.is_cuda:
+            # one launch for the concat, both casts, the GEMV and the sigmoid
+            from atom.model_ops.dspark_markov_sample import dspark_confidence
+
+            return dspark_confidence(hidden_states, markov_embeds, self.proj.weight)
         x = torch.cat([hidden_states, markov_embeds], dim=-1).float()
         logit = torch.nn.functional.linear(x, self.proj.weight.float()).squeeze(-1)
         return torch.sigmoid(logit)

@@ -384,13 +384,25 @@ def dspark_markov_argmax(
     return _launch(base_logits, prev_ids, markov_w1, markov_w2, out, 0, None)
 
 
-def _launch(base_logits, prev_ids, markov_w1, markov_w2, out, vocab_offset, packed):
+def _launch(
+    base_logits,
+    prev_ids,
+    markov_w1,
+    markov_w2,
+    out,
+    vocab_offset,
+    packed,
+    embed_out=None,
+):
     """Both stages over ``base_logits``' columns, which are vocab ids
-    ``vocab_offset ..``; ids to ``out``, or ``(max, id)`` to ``packed``."""
+    ``vocab_offset ..``; ids to ``out``, or ``(max, id)`` to ``packed``.
+    ``W1[prev_ids]`` goes to ``embed_out`` (rows may be strided) when given."""
     num_rows, vocab_size = base_logits.shape
     rank = markov_w2.shape[1]
-    markov_embed = torch.empty(
-        num_rows, rank, dtype=markov_w1.dtype, device=base_logits.device
+    markov_embed = (
+        torch.empty(num_rows, rank, dtype=markov_w1.dtype, device=base_logits.device)
+        if embed_out is None
+        else embed_out
     )
     num_tiles = triton.cdiv(vocab_size, _BLOCK_V)
     block_row = min(
@@ -456,8 +468,13 @@ def dspark_markov_argmax_tp(
     vocab_start: int,
     tp_group,
     use_custom: bool = True,
+    embed_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``dspark_markov_argmax`` over a TP-sharded vocab.
+
+    ``embed_out``, ``[B, r]`` with unit stride along ``r``, receives the
+    gathered ``W1[prev_ids]`` rows instead of a fresh tensor: a caller that
+    stacks the steps hands in its block's column and skips the stack.
 
     ``base_logits`` is this rank's ``[B, V / tp]`` slice of the LM head, ids
     ``vocab_start ..``; the Markov tables are whole. Each rank reduces its
@@ -473,7 +490,14 @@ def dspark_markov_argmax_tp(
         return markov_w1.new_empty(0, markov_w1.shape[1])
     packed = torch.empty((num_rows, 2), dtype=torch.float32, device=base_logits.device)
     markov_embed = _launch(
-        base_logits, prev_ids, markov_w1, markov_w2, out, vocab_start, packed
+        base_logits,
+        prev_ids,
+        markov_w1,
+        markov_w2,
+        out,
+        vocab_start,
+        packed,
+        embed_out,
     )
     gathered = tp_group.all_gather(packed, dim=0, use_custom=use_custom)
     block_row = min(1024, triton.next_power_of_2(num_rows))
@@ -487,3 +511,74 @@ def dspark_markov_argmax_tp(
         num_warps=1 if block_row <= 64 else 4,
     )
     return markov_embed
+
+
+@triton.jit
+def _dspark_confidence_kernel(
+    hidden_ptr,
+    embed_ptr,
+    weight_ptr,
+    out_ptr,
+    hidden_size,
+    rank,
+    stride_hidden,
+    stride_embed,
+    BLOCK: tl.constexpr,
+):
+    """One row: ``sigmoid(w . [h ; e])`` in fp32."""
+    row = tl.program_id(0)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in range(0, hidden_size, BLOCK):
+        offs = k + tl.arange(0, BLOCK)
+        mask = offs < hidden_size
+        h = tl.load(hidden_ptr + row * stride_hidden + offs, mask=mask, other=0.0)
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0)
+        acc += h.to(tl.float32) * w.to(tl.float32)
+    for k in range(0, rank, BLOCK):
+        offs = k + tl.arange(0, BLOCK)
+        mask = offs < rank
+        e = tl.load(embed_ptr + row * stride_embed + offs, mask=mask, other=0.0)
+        w = tl.load(weight_ptr + hidden_size + offs, mask=mask, other=0.0)
+        acc += e.to(tl.float32) * w.to(tl.float32)
+    tl.store(out_ptr + row, tl.sigmoid(tl.sum(acc, axis=0)))
+
+
+def dspark_confidence(
+    hidden: torch.Tensor, embeds: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """``sigmoid(linear(cat([hidden, embeds], -1).float(), weight.float()))``
+    as one launch: no concatenated copy, no casts, no split GEMV.
+
+    ``hidden`` ``[*, H]``, ``embeds`` ``[*, r]``, ``weight`` ``[1, H + r]``;
+    returns fp32 ``[*]``. The fp32 sum runs in a different order from the
+    GEMM's, so the result agrees to fp32 rounding, not bit for bit.
+    """
+    lead = hidden.shape[:-1]
+    hidden_size, rank = hidden.shape[-1], embeds.shape[-1]
+    if embeds.shape[:-1] != lead or weight.shape != (1, hidden_size + rank):
+        raise ValueError(
+            f"confidence shapes disagree: hidden {tuple(hidden.shape)}, "
+            f"embeds {tuple(embeds.shape)}, weight {tuple(weight.shape)}"
+        )
+    h = hidden.reshape(-1, hidden_size)
+    e = embeds.reshape(-1, rank)
+    if h.stride(-1) != 1:
+        h = h.contiguous()
+    if e.stride(-1) != 1:
+        e = e.contiguous()
+    w = weight if weight.is_contiguous() else weight.contiguous()
+    out = torch.empty(h.shape[0], dtype=torch.float32, device=hidden.device)
+    if h.shape[0]:
+        _dspark_confidence_kernel[(h.shape[0],)](
+            h,
+            e,
+            w,
+            out,
+            hidden_size,
+            rank,
+            h.stride(0),
+            e.stride(0),
+            BLOCK=1024,
+            num_warps=4,
+        )
+    return out.view(lead)
