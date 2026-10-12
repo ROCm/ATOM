@@ -16,6 +16,14 @@ from .backends import AttentionBackend
 
 logger = logging.getLogger("atom")
 
+# The dense decode table holds token-level KV row ids (page_size 1). aiter's
+# Triton decode multiplies each id it loads by the row stride (576 for MLA) in
+# the id's own type. With int32 ids the offset wraps once a pool passes
+# 2**31 / 576 = 3,728,270 rows, which is 233,016 blocks of 16. The kernel then
+# reads outside the layer's KV and gets garbage, NaN, or a memory fault. int64
+# ids keep the whole offset in 64 bits, although every id fits in int32.
+TRITON_BLOCK_TABLE_DTYPE = torch.int64
+
 
 class TritonMLABackend(AttentionBackend):
     @staticmethod
@@ -43,7 +51,7 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
             "triton_block_table": torch.zeros(
                 self.max_bs,
                 self.max_num_blocks_per_seq,
-                dtype=torch.int32,
+                dtype=TRITON_BLOCK_TABLE_DTYPE,
                 device=self.device,
             ),
             "triton_attn_logits": torch.empty(
