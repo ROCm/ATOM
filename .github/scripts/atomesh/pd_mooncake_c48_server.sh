@@ -2,6 +2,12 @@
 # One archived C48 configuration; only the PD/offload stack changes.
 
 prepare_mooncake_c48_runtime() {
+  {
+    hostname
+    lscpu
+    timeout 20s rocm-smi --showproductname --showclocks --showpower --showmaxpower || true
+    timeout 20s ibv_devinfo -l || true
+  } > "${RUNTIME_LOG_DIR}/hardware-rank-${NODE_RANK}.txt" 2>&1
   local wheel="${ATOMESH_SCRIPT_DIR}/mooncake-dist/mooncake_transfer_engine_rocm-0.3.13-cp312-cp312-manylinux_2_35_x86_64.whl"
   printf '%s  %s\n' 7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6 "${wheel}" | sha256sum -c -
   uv venv --system-site-packages --python "$(command -v python3)" /tmp/mooncake-c48-venv
