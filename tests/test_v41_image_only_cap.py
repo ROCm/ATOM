@@ -10,12 +10,28 @@ hung off the connector's planner.
 from atom.plugin.vllm import scheduler as sched
 
 
-def test_the_hit_is_capped_to_the_checkpoint_when_images_are_wired(monkeypatch):
+def test_a_hit_that_is_not_the_checkpoint_is_refused(monkeypatch):
+    """vLLM writes one image per prefill, at that prompt's own last block
+    boundary. A shared-prefix hit lands elsewhere: measured without a tier,
+    a 1362-token prompt's image sat at 1280 while the hit arrived at 1024,
+    and the engine died rather than reusing nothing."""
     monkeypatch.setattr(
         "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
     )
-    assert sched._image_only_cap(6912, 256) == 6656
-    assert sched._image_only_cap(9472, 256) == 9216
+    assert sched._image_only_cap(6912, 256) == 0
+    assert sched._image_only_cap(1024, 256) == 0
+
+
+def test_a_hit_that_is_a_checkpoint_is_kept(monkeypatch):
+    """`get_mamba_prefill_checkpoint_position` is the identity exactly on
+    the positions an image can sit at."""
+    monkeypatch.setattr(
+        "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
+    )
+    from vllm.v1.kv_cache_interface import get_mamba_prefill_checkpoint_position
+
+    for hit in (1024, 6656, 9216):
+        assert get_mamba_prefill_checkpoint_position(hit + 1, 256, False) == hit
 
 
 def test_vllms_answer_is_left_alone_without_images(monkeypatch):

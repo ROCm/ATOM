@@ -491,3 +491,35 @@ Two configuration facts worth keeping:
 * The image group must be invisible to the offload connector in BOTH
   directions. As a recurrent group it produces `KdaStore`s the V4.1 leg
   cannot read; as an attention group it trips the one-geometry check.
+
+### Can the images carry a hit on their own? Measured: no
+
+Every arm above had a tier, and the tier reached the boundary first -- 11
+state loads completed, 0 images restored -- so the restore direction had
+never run. The arm that forces it is `LMCACHE=off` with the images on,
+where a local hit can only be backed by an image.
+
+    ARM blind correct 0/16  hbm 0.0%
+    ARM cold  correct 16/16 hbm 0.0%
+    ARM warm  correct 16/16 hbm 0.0%
+    stale-cursor refusals 0, images 33 stored, 0 restored
+
+It cannot, and the reason is structural rather than a bug to find. vLLM
+writes exactly ONE image per prefill, at that prompt's own last block
+boundary (`(seq_len - 1) // block * block`). A shared-prefix hit has no
+reason to land there: in the first run of this arm a 1362-token prompt put
+its image at 1280 while the hit arrived at 1024, and the engine died on
+`needs state at 1024, found 3` with `image_restore_no_block=1`.
+
+The two positions coincide only when the whole prompt repeats, which is the
+6912 -> 6656 case the tier arm measured -- and there the TIER supplies the
+state, not the image.
+
+So without a tier the hit is now refused rather than taken: reuse drops to
+zero and the answers stay right, instead of the server dying. Taking an
+unbacked hit costs the server; giving it up costs a recompute.
+
+Making the images carry hits in general needs a checkpoint at every reusable
+boundary, not one per prefill -- vLLM's `compute_mamba_prefill_checkpoints`
+returns a single position per row, so that is an upstream change, not a
+configuration.
