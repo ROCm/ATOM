@@ -693,7 +693,7 @@ models:
               kv_transfer_config: '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
               extra_args: --tool-call-parser kimi_k3 --data-parallel-size 1
           env:
-            common:
+            common: &kimi_k3_standalone_state_env
               HIP_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
               AITER_FLYDSL_STAGE2_FP8: '1'
               AITER_LOG_LEVEL: WARNING
@@ -719,6 +719,7 @@ models:
               OFFLOAD_GPU_STAGING_CHUNKS: '32'
               OFFLOAD_KV_FOR_HYBRID: '1'
               OFFLOAD_PROFILE: '1'
+              OFFLOAD_STATE_CPU_SIZE: '128'
               PYTHONHASHSEED: '0'
               PYTHONNOUSERSITE: '1'
               HTTPS_PROXY: ''
@@ -750,6 +751,16 @@ models:
             common_args:
               <<: *kimi_k3_standalone_state_args
               max_num_seqs: 144
+
+        # C48 control: keep PAGE checkpoints and LMCache STATE offload;
+        # disable only checkpoints stored in spare STATE pool slots.
+        - <<: *kimi_k3_standalone_state
+          name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48
+          display_topology: STANDALONE-TP8-DCP8-NO-SPARE-STATE
+          env:
+            common:
+              <<: *kimi_k3_standalone_state_env
+              ATOM_KDA_SPARE_STATE_CHECKPOINTS: '0'
 
         # One concurrency per job keeps the prefix/state caches independent.
         - <<: &kimi_k3_agentic_tp8
