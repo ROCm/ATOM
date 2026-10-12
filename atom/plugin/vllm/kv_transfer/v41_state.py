@@ -68,6 +68,18 @@ _LOCAL_PREFIX_HITS_ENABLED = os.environ.get("ATOM_V41_LOCAL_PREFIX_HITS") in (
 )
 
 
+#: Whether an image may back a LOCAL prefix hit. Separate from whether
+#: images are wired, so the two halves can be measured apart: storing and
+#: restoring images is testable without opening the gate that lets vLLM
+#: serve a hit which -- if no image happens to sit at that exact position --
+#: is a dead engine rather than a slow one.
+_IMAGE_LOCAL_HITS_ENABLED = os.environ.get("ATOM_V41_IMAGE_LOCAL_HITS") in (
+    "1",
+    "true",
+    "True",
+)
+
+
 def _images_can_serve() -> bool:
     """True when the state-image mechanism is wired and may back a local hit.
 
@@ -624,7 +636,7 @@ class V41BoundaryPlanner:
         self._local_caps.pop(req_id, None)
         if hit <= 0:
             return hit
-        if _images_can_serve():
+        if _images_can_serve() and _IMAGE_LOCAL_HITS_ENABLED:
             # With checkpoint images the refusal below loses its premise.
             # That refusal exists because the only positions a request may
             # legally resume from were stored boundaries, and the capped

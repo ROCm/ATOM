@@ -379,8 +379,17 @@ def _maybe_register_v41_state_images(vllm_config) -> None:
 
     geometry = v41_proxy_geometry(vllm_config)
     sizing = sizing_from_geometry(geometry)
+    # The grid vLLM's own validity test measures against, not the tier's
+    # state interval. `is_mamba_prefill_checkpoint_valid` requires
+    # `(checkpoint_position - query_start) % alignment == 0`, and the
+    # position it checks is `(seq_len - 1) // hash_block_size *
+    # hash_block_size` -- a multiple of the block size, almost never of
+    # 4096. With 4096 the test failed on every step of every run: measured
+    # as `image_write_col_calls=4, image_write_col_null=4`, no image ever
+    # written, and restores reading blocks nothing had filled.
     alignment = int(
-        os.environ.get("ATOM_V41_STATE_INTERVAL_FOR_IMAGES", "4096") or 4096
+        os.environ.get("ATOM_V41_IMAGE_ALIGNMENT", "")
+        or ATOM_DEEPSEEK_V41_BLOCK_SIZE
     )
     register_image_layers(
         vllm_config, sizing, ATOM_DEEPSEEK_V41_BLOCK_SIZE, alignment

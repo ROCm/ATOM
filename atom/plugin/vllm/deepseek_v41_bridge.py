@@ -714,14 +714,22 @@ def v41_store_images_after_forward(prepared) -> int:
     which is a real image of the wrong boundary, and nothing downstream could
     tell.
     """
-    from atom.plugin.vllm.v41_state_image import runtime, take_store_marks
+    from atom.plugin.vllm.v41_state_image import (
+        note_store_decline,
+        runtime,
+        take_store_marks,
+    )
 
     rt = runtime()
     if rt is None or prepared is None:
         return 0
     slots = getattr(prepared, "image_slots", None)
     marks = take_store_marks()
-    if not slots or not marks:
+    if not slots:
+        note_store_decline("slots")
+        return 0
+    if not marks:
+        note_store_decline("marks")
         return 0
     n = min(len(slots), len(marks))
     return rt.store_for([(int(slots[i]), int(marks[i])) for i in range(n)])

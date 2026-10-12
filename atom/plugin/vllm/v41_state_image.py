@@ -1041,6 +1041,11 @@ def image_read_column(position: int, block_size: int) -> int:
 #: first cost a run: every write column raised `'InputBatch' object has no
 #: attribute 'block_table'`, counted as `image_mark_failures=4`.
 _RUNNER = None
+_WRITE_COL_CALLS: list = []
+_WRITE_COL_NULL: list = []
+_WRITE_COL_EMPTY: list = []
+_STORE_NO_SLOTS: list = []
+_STORE_NO_MARKS: list = []
 _RESTORE_NO_BATCH: list = []
 _RESTORE_NO_BLOCK: list = []
 _RESTORE_OUT_OF_TABLE: list = []
@@ -1143,6 +1148,7 @@ def publish_image_halves(vllm_config, common_attn_metadata, num_reqs: int) -> bo
     differently here than the one the scheduler filled is a checkpoint
     written where nobody will look for it.
     """
+    _WRITE_COL_CALLS.append(1)
     _LAST_STORE_MARKS.clear()
     try:
         table = image_block_table()
@@ -1159,8 +1165,15 @@ def publish_image_halves(vllm_config, common_attn_metadata, num_reqs: int) -> bo
         shim.block_table_tensor = table[:num_reqs]
         builder = _checkpoint_builder(vllm_config, image_spec(vllm_config))
         meta = builder.build(shim, list(range(int(num_reqs))))
-        if meta is not None:
-            _LAST_STORE_MARKS.extend(int(b) for b in meta.state_indices.tolist())
+        if meta is None:
+            # vLLM says no checkpoint is written this step. Counted,
+            # because "no marks" and "never asked" produce the same
+            # `image_stored=0` and nothing else distinguishes them.
+            _WRITE_COL_NULL.append(1)
+            return True
+        _LAST_STORE_MARKS.extend(int(b) for b in meta.state_indices.tolist())
+        if not _LAST_STORE_MARKS:
+            _WRITE_COL_EMPTY.append(1)
         return True
     except Exception:
         logger.warning("V4.1 image write column failed", exc_info=True)
@@ -1168,8 +1181,17 @@ def publish_image_halves(vllm_config, common_attn_metadata, num_reqs: int) -> bo
         return False
 
 
+def note_store_decline(reason: str) -> None:
+    {"slots": _STORE_NO_SLOTS, "marks": _STORE_NO_MARKS}[reason].append(1)
+
+
 def restore_declines() -> dict:
     return {
+        "image_write_col_calls": len(_WRITE_COL_CALLS),
+        "image_write_col_null": len(_WRITE_COL_NULL),
+        "image_write_col_empty": len(_WRITE_COL_EMPTY),
+        "image_store_no_slots": len(_STORE_NO_SLOTS),
+        "image_store_no_marks": len(_STORE_NO_MARKS),
         "image_restore_no_table": len(_RESTORE_NO_BATCH),
         "image_restore_no_block": len(_RESTORE_NO_BLOCK),
         "image_restore_off_table": len(_RESTORE_OUT_OF_TABLE),
