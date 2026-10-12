@@ -44,7 +44,7 @@ class Rows(dict):
 
 
 class Attention(nn.Module):
-    def forward(self, hidden, hidden_scale, cache, step, rope):
+    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
         assert not step.selected
         return hidden + step.shift
 
@@ -164,7 +164,11 @@ def test_runtime_guard_with_live_steps_and_aux_hooks(
                     if rows == 4:
                         mask.fill_(True)
             metadata = SimpleNamespace(
-                step=step, cache=None, engram_embeddings=embeddings, image_mask=mask
+                step=step,
+                cache=None,
+                engram_embeddings=embeddings,
+                image_mask=mask,
+                queries=None,
             )
             monkeypatch.setattr(
                 forward_context,

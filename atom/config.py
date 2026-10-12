@@ -1959,6 +1959,19 @@ class Config:
     # (models/deepseek_v41/bounded_replay.py). On by default;
     # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
     enable_decoder_swa_bounded_replay: bool = True
+    # The fewest rows the forward that finishes a prompt runs: one that resumes
+    # closer to the prompt's end starts that much earlier, recomputing rows
+    # the cache already holds (`BlockManager.replay_start`). Set by the model,
+    # not a flag: V4.1's decoder bounded replay reads the last `window` rows.
+    min_final_prefill_rows: int = 0
+    # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
+    # Set by the model: V4.1's Engram n-gram lookback.
+    replay_history_tokens: int = 0
+    # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
+    # checkpoint and rebuilds it by recomputing the window rows below the hit
+    # (`--encoder-swa-bounded-replay`). On by default;
+    # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
+    enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -2612,13 +2625,18 @@ class Config:
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
             # tiles -- and its ratio-2 owners halve the PAGE before that count
-            # is taken, which makes the floor twice the tile. 256 rather than
-            # that floor, and for the reason DeepSeek-V4 takes it: the block
-            # table is `[max_num_seqs, max_model_len / block_size]` int32 held
-            # twice and copied to the device every forward, 8 MB here against
-            # 134 MB at the 16 this field defaults to. What it costs is prefix
-            # reuse shorter than a PAGE, which stops matching at all.
-            self.kv_cache_block_size = 256
+            # is taken, which makes the floor twice the tile. 128 rather than
+            # that floor: the block table is `[max_num_seqs, max_model_len /
+            # block_size]` int32 held twice and copied to the device every
+            # forward, 17 MB here against 134 MB at the 16 this field defaults
+            # to. Not the 256 DeepSeek-V4 takes: a PAGE is also the prefix
+            # cache's hash block, so it is the granularity of prefix reuse and
+            # of the rows encoder bounded replay recomputes below a hit: one
+            # PAGE, which must cover the window - 1 rows a row at the hit reads.
+            self.kv_cache_block_size = 128
+            if self.enable_decoder_swa_bounded_replay:
+                self.min_final_prefill_rows = self.hf_config.sliding_window
+            self.replay_history_tokens = self.hf_config.engram_max_ngram_size - 1
 
             from atom.models.deepseek_v41.config import validate_runtime_config
 

@@ -450,6 +450,60 @@ class TestSchedule:
         assert seq._awaiting_aborted_load_cleanup
         assert sched._rejected == [seq]
 
+    @staticmethod
+    def _parked_pd_receive(seq_factory, max_num_seqs=4):
+        """A decode with a P/D request whose blocks are allocated and parked."""
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_producer=False,
+            is_offload=False,
+            build_connector_meta=lambda: None,
+        )
+        free_before = sched.block_manager.pool_occupancy()["free"]
+        seq = seq_factory(list(range(8)))
+        sched.add(seq)
+        bm = sched.block_manager
+        assert bm.allocate(seq, bm.can_allocate(seq))
+        seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+        sched._count_inflight_load(seq)
+        return sched, seq, free_before
+
+    def test_a_failed_pd_receive_aborts_the_request(self, seq_factory):
+        """The decode does not prefill it, so its blocks go back at once."""
+        sched, seq, free_before = self._parked_pd_receive(seq_factory, 1)
+        sched.running.append(SimpleNamespace(id=-1))  # no free seq slot
+
+        sched._update_from_kv_xfer_finished(
+            KVConnectorOutput(failed_recving={str(seq.id)})
+        )
+
+        assert seq.status == SequenceStatus.FINISHED
+        assert seq.leave_reason == "aborted"
+        assert sched.take_rejected() == [seq]
+        assert seq not in sched.waiting
+        assert sched.failed_recving_kv_req_ids == []
+        assert sched._num_parked_remote_kv == 0
+        assert sched.deferred_free_blocks == {}
+        assert sched.block_manager.pool_occupancy()["free"] == free_before
+
+    def test_a_client_abort_frees_a_pd_receive_only_at_its_failure(self, seq_factory):
+        """The connector reports the failure once no late write can land."""
+        sched, seq, free_before = self._parked_pd_receive(seq_factory)
+        assert sched.abort_request(seq.id)
+        assert sched.block_manager.pool_occupancy()["free"] < free_before
+
+        sched._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
+
+        assert sched.take_rejected() == [seq]
+        assert sched._num_parked_remote_kv == 0
+        assert sched.block_manager.pool_occupancy()["free"] == free_before
+
     @pytest.mark.parametrize("producer", [False, True])
     @pytest.mark.parametrize("load_outcome", ["finished_loading", "failed_loading"])
     @pytest.mark.parametrize("first_terminal", ["load", "save"])

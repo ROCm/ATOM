@@ -20,13 +20,14 @@ through end-to-end `lm_eval` evaluation.
 - `model_ops/engram/` prepares Engram rows after final GPU token IDs and restored
   state are available. There is no separate committed history map. Its host half
   (`mapping`, `tables`, `host`) imports without Triton; `device/` does not.
-- `runtime.py` compiles the forward as one graph (`_Backbone`), or as two split
-  after the last KV-source layer (`_EarlyLayers`, `_LateLayers`) under decoder
-  SWA bounded replay; `bounded_replay.py` builds the late layers' tail step
-  (below).
-- Scheduler consumes the existing generic `StateTransfer.copy` capability.
-  The only scheduling change fixes cancellation of requests with no sampled
-  output, including a middle prefill chunk and the first deferred step.
+- `runtime.py` compiles the forward as one graph (`_Backbone`), or as two
+  around the last KV-source layer (`_EarlyLayers`, `_LateLayers`) under decoder
+  SWA bounded replay; `bounded_replay.py` lays out the rows each layer from 20
+  on runs (below).
+- Scheduler consumes the existing generic `StateTransfer.copy` capability, or `StateTransfer.replay` under `--encoder-swa-bounded-replay` (the default).
+  Bounded replay adds where a prefill forward starts (`BlockManager.replay_start`,
+  below); cancellation of requests with no sampled output is fixed too,
+  including a middle prefill chunk and the first deferred step.
 
 Only Full owners 2, 8, 14 and 20 allocate global main/index storage. Reuse and
 Reindex layers read those owner regions. Every request has all 40 SWA rings,
@@ -38,15 +39,19 @@ of the historical main KV.
 
 Allocation and checkpoints use the same `V41PoolGeometry` declarations.
 Positions and Engram history advance after the model forward; checkpoints
-carry every state field and padding byte. Images are versioned by geometry,
-including the index plane format. See
+carry the SWA rings and the cursor (position and Engram history), but not the
+FP32 compressor tails: CSA2 pools without overlap and a checkpoint sits on a
+PAGE boundary, a multiple of every ratio, so the first group a resumer reads is
+one its own forward writes (as DeepSeek-V4 leaves out its HCA tails). Images
+are versioned by geometry, including the index plane format. See
 [cache format and graph execution](deepseek_v41_performance.md#cache-format-and-attention-boundary)
 for the storage formats.
 
 An exact prefix hit restores the entire state before preparing Engram inputs.
 Without a matching image, the generic scheduler replays from a recoverable
 boundary. Checkpoint relocation/fork and restored tentative suffixes cannot
-retain stale compressor tails, window rows or Engram history.
+retain stale window rows or Engram history; a restore leaves the slot's own
+compressor tails, which the resumed forward overwrites before reading.
 
 ## Scheduler acceptance
 
@@ -91,7 +96,9 @@ decode and speculative verification.
 
 Because a block id names 16 index rows and a ratio-2 owner halves the PAGE
 before that count is taken, the PAGE token count has a floor of 32; production
-rounds it to 256 for block-table reasons.
+uses 128, coarse enough to keep the block table small and no coarser than the
+window, since a PAGE is also the prefix cache's hash block (the granularity of
+prefix reuse and of what encoder bounded replay recomputes below a hit).
 
 The index query is left on the grid its reader rounds it to: the paged scorer
 quantizes the query itself. The published model instead FP4-rounds query and
@@ -144,33 +151,81 @@ the CPU; moving the lookup to HBM and fusing it further is future work.
 ## Decoder SWA bounded replay
 
 Decoder SWA bounded replay is on by default; `--no-decoder-swa-bounded-replay`
-turns it off. It is SGLang's `--enable-decoder-swa-bounded-replay` and vLLM's
-`--swa-bounded-replay` (also on by default there). Layers 21..39 own no global KV,
-only their sliding-window rings, so after a prefill only each request's last
-ring of rows in them is ever read.
+turns it off. It follows the V4.1 report's SWA Bounded Replay (section 3.2.2).
+V4.1 is a causal encoder (layers 0..19) and a decoder (layers 20..39) whose
+global KV layer 20 projects from the encoder's output; past that, the decoder
+layers own only their sliding-window rings, so a prefill computes only what
+anything after it reads (`models/deepseek_v41/bounded_replay.py`). With `W`
+the window (128), the forward that finishes a prompt runs, per request:
+
+- every row: the encoder, and layer 20's compressed KV and index keys;
+- its last `W` rows, the tail: layers 20..38, and layer 39's KV;
+- its last row: layer 39's query, attention and FFN, the row the LM head reads.
+
+Every decoder layer's window starts at the tail (`swa_replay_start`): a tail
+row at position `i` reads `[max(s, i - W + 1), i]`, `s` the tail's first
+position. A forward that does not finish its prompt
+(`ScheduledBatch.is_final_chunk`) runs nothing past the encoder but layer 20's
+compression: no kernel of the decoder's attention or FFN. Layer 39's queries
+are fewer than its KV rows (`QueryRows`): the rows are gathered in one launch
+(`token_layout.gather_rows`), the index lists built over all KV rows with every
+other row's batch id -1, so the queries' lists come out adjacent, and attention
+runs on the queries alone. The DSpark draft's window is built from layers
+37..39, so it follows the decoder: a replayed forward leaves its plan on the
+step (`BatchStep.replay`), and the draft writes its context on the tail through
+the tail's step, and nothing in a forward that ran no decoder.
+
+The forward finishing a prompt has to hold its last `W` rows. One that resumes
+closer to the end -- a short last chunk, or a prefix hit with a short suffix --
+starts a whole hash block earlier (`BlockManager.replay_start`,
+`Config.min_final_prefill_rows`), recomputing rows the cache holds without
+changing them: their global KV is not written again
+(`make_compress_plans(write_from=...)`), the encoder's rings keep the rows they
+hold (`swa_write(cached_until=...)`), and the rows from where the forward
+resumed read those rings below that point (`swa_cached_until`), as a forward
+resuming there would. The slot's state stays; its cursor steps back to the
+forward's start. Only what the recomputed rows feed the decoder is new. The
+forward starts on the hash-block grid, however its resume was cut. Its
+long-prefill cap counts from where it resumed, and one the budget cannot carry
+past that point waits for a step that can: a chunk ending there would recompute
+cached rows alone and hand the next pass the same back-off.
 
 With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
-as one graph (`runtime._Backbone`), as before. Otherwise the forward is two graphs split
-after the last KV-source layer (`_EarlyLayers`, `_LateLayers`, each with its
-own compile-cache key). A prefill runs the early graph on every row and the
-late graph on each request's last `ring_slots` rows (window + speculative
-tokens, 133 with five DSpark tokens), with a tail `BatchStep` whose
-`swa_replay_start` keeps the index build from reading window rows the late
-layers never wrote. Decode, warmup, draft, TBO, image and padded steps run
-both graphs on every row. After a replay only each request's last row of the
-model output is defined; the LM head reads only those.
+as one graph (`runtime._Backbone`), as before. Otherwise layers 0..19 and
+21..38 are two graphs (`_EarlyLayers`, `_LateLayers`, each with its own
+compile-cache key) and layers 20 and 39 run between and after them, where a
+replay cuts their rows. Decode, warmup, draft, TBO and padded steps run every
+layer on every row. After a replay only each finishing request's last row of
+the model output is defined; the LM head reads only those.
 
-Accuracy: this is not a full prefill. In layer 21 the tail's rows see a
-window truncated at the tail start. The tail is only a few rows longer than
-the window, so from layer 22 on even the last token's window is made of rows
-computed from truncated windows, and the last token's logits and every ring
-row decode reads differ from a full prefill's in all 19 late layers. The
-global path (the KV-source layers' compressed KV and the top-k selections the
-late layers reuse) is exact. Measured on V4.1-Flash (TP2): GSM8K 3-shot
-92.2 with the flag vs 92.1 without (mean of three runs each on the two-graph
-build: 91.2 / 92.8 / 92.7 vs 92.5 / 91.4 / 92.3; run-to-run noise about 1 point); 40/40 on a 4K-60K-token long-context retrieval set either way.
-SGLang and vLLM make the same approximation.
+Accuracy: this is not a full prefill. In every decoder layer the tail's rows
+see a window truncated at the tail start, so from layer 21 on even the last
+token's window is made of rows computed from truncated windows, and the last
+token's logits and every ring row decode reads differ from a full prefill's.
+The encoder and the global path (the compressed KV and the top-k selections
+the decoder reuses) are exact. DeepSeek post-trains on this truncation.
 
-Cost: the early graph's every-row output is a graph input of the late one,
-so it lives until the late graph returns. On V4.1-Flash TP2 the profiled peak
-rises by about 0.8 GB (160.06 vs 159.28 GB), about 1% fewer KV entries.
+## Encoder SWA bounded replay
+
+`--encoder-swa-bounded-replay` (on by default; `--no-encoder-swa-bounded-replay`
+keeps state checkpoints instead) resumes a prefix hit without a
+state checkpoint. The backend declares a `replay` state transfer
+(`StateTransfer.replay()`): the engine keeps no checkpoint (so no prefill chunk
+is cut for one, and no PAGE unit holds a STATE image), accepts a hit at any
+hash-block boundary, and starts the hit's forward a whole hash block below it
+(`BlockManager.replay_start`; 128 rows at V4.1's block size, the report's
+`n_win`, which also leaves the decoder its `W` rows however short the suffix).
+That forward rebuilds the sliding-window state in a fresh slot: it recomputes
+the rows below the hit without writing what the prefix cache holds
+(`make_compress_plans(write_from=...)` drops every compressed group ending
+below the hit), its windows start at its first row (`swa_replay_start`), and
+its Engram history is the compressed tokens before that row, an image position
+DEAD (`Sequence.replay`, `Replay.history_ids`; `Config.replay_history_tokens`
+of them). The hit stays the reported hit. `validate_runtime_config` refuses a
+PAGE shorter than the window - 1, which one PAGE of rebuild would not cover.
+TorchSpec hidden-state export reads every prefill row, so it needs
+`--no-decoder-swa-bounded-replay` at launch.
+
+Accuracy: the encoder's rebuilt rows see windows truncated at the replay
+start, so a resumed request's logits differ from a cold prefill's the way decoder replay's
+do; the cached global KV it reads is exact.
