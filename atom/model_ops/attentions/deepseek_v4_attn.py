@@ -1031,9 +1031,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         if host is None:
             return None
+        # Two address spaces, crossed exactly once each: the slot copy takes
+        # pool slots (`_slot_views` maps them), while every ring kernel the
+        # replay calls addresses plane positions -- the same translation
+        # `_populate_state_slot_mappings` applies to `state_slot_out`. Handing a
+        # kernel a pool slot writes some other request's state.
         self.relocate_state_slots(
             list(zip(host.src_slots.tolist(), host.dst_slots.tolist()))
         )
+        host.dst_slots = self._physical_slots(host.dst_slots).astype(np.int32)
         return to_device(host, self.device)
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:

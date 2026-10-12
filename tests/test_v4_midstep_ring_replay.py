@@ -189,3 +189,36 @@ def test_compressor_replay_matches_a_cut_forward(monkeypatch, ratio, overlap):
         )
         assert torch.equal(ckv[SLOTS[i]], kv_s[g]), (i, p)
         assert torch.equal(csc[SLOTS[i]], sc_s[g]), (i, p)
+
+
+def test_builder_hands_kernels_plane_positions_and_the_copy_pool_slots():
+    """The replay kernels address plane positions; the slot copy, pool slots.
+
+    `_attach_midstep` crosses between the two exactly like
+    `_populate_state_slot_mappings` does for `state_slot_out`. Passing a pool
+    slot to a ring kernel writes another request's state -- the bug this pins.
+    """
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+
+    copies = []
+    stub = SimpleNamespace(
+        _unique_compress_ratios_overlap=[(4, True)],
+        device=DEV,
+        relocate_state_slots=lambda pairs: copies.extend(pairs),
+        _physical_slots=lambda s: np.int32(99) - s,
+    )
+    batch = SimpleNamespace(
+        state_save_all=[[(5, 300)], []],
+        state_slots_committed=[2, 3],
+        state_fork_srcs=[-1, -1],
+        num_cached_tokens=[256, 0],
+    )
+    plan = DeepseekV4AttentionMetadataBuilder._attach_midstep(
+        stub, batch, 2, np.array([0, 100, 140])
+    )
+    assert copies == [(2, 5)]  # pool slots: request's slot -> scratch
+    assert plan.dst_slots.tolist() == [99 - 5]  # plane position for kernels
