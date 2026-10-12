@@ -653,40 +653,20 @@ class V41BoundaryPlanner:
         if hit <= 0:
             return hit
         if _images_can_serve() and _IMAGE_LOCAL_HITS_ENABLED:
-            # With checkpoint images the refusal below loses its premise.
-            # That refusal exists because the only positions a request may
-            # legally resume from were stored boundaries, and the capped
-            # point is never one of them. An image is written at every block
-            # boundary vLLM checkpoints, so the hit IS such a position: the
-            # state is restored from the image in the same block vLLM served
-            # the pages from -- whichever level holds the hit restores it.
+            # Left alone. vLLM has already reduced this hit to a boundary
+            # the state group can serve: its coordinator takes the minimum
+            # across groups, and the image group only offers boundaries it
+            # has a cached checkpoint block for (measured: the group
+            # answered 1280 for a 1345-token prompt whose checkpoint is at
+            # 1280).
             #
-            # Capped to the checkpoint, not kept whole. vLLM writes one
-            # image per prefill, at `(seq_len - 1) // hash * hash` -- for a
-            # 6912-token prompt, 6656, column `cdiv(6912, 256) - 2 = 25`.
-            # It then offers a later request the whole 6912, which is one
-            # block PAST the only state that exists: measured as
-            # `needs state at 6912, found 0` with
-            # `image_restore_no_block=2` and exactly one image ever stored.
-            #
-            # At the capped position the read column is
-            # `(6656 - 1) // 256 = 25` -- the column the writer used, and
-            # the same physical block, since prefix-cached blocks are
-            # shared by column.
-            from vllm.v1.kv_cache_interface import (
-                get_mamba_prefill_checkpoint_position,
-            )
-
-            position = int(
-                get_mamba_prefill_checkpoint_position(
-                    hit, self.hash_block_size, drop_eagle_block=False
-                )
-            )
-            if position <= 0:
-                self._counters["local_cap_declined"] += 1
-                return 0
+            # Capping it here manufactured the very mismatch this branch
+            # was written to avoid. `get_mamba_prefill_checkpoint_position`
+            # is a rule about a raw prefix length; applied to an
+            # already-snapped hit it returns one block lower, which is a
+            # position nothing wrote -- `needs state at 1024, found 3`.
             self._counters["local_cap_image"] += 1
-            return min(hit, position)
+            return hit
         if not _LOCAL_PREFIX_HITS_ENABLED:
             # Off, and the reason is structural rather than a race that is
             # waiting to be found. Traced, for one request:

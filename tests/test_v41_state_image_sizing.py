@@ -149,13 +149,18 @@ def test_the_spec_holds_exactly_one_unit():
     assert spec.page_size_bytes == UNIT
 
 
-def test_the_spec_declares_itself_checkpointable():
+def test_the_spec_promises_no_checkpoint_it_cannot_export():
     """Without this the scheduler does not know these blocks can be
     checkpointed at a prefill boundary, and nothing is ever stored."""
     from atom.plugin.vllm.v41_state_image import image_kv_cache_spec
 
     spec = image_kv_cache_spec(sizing_from_geometry(geometry()), 256, 4096)
-    assert spec.num_prefill_checkpoint_blocks == 1
+    # Zero, and deliberately: a non-zero value is a PROMISE to vLLM that
+    # the backend exports state at that boundary. Nothing here can --
+    # vLLM asks for an interior offset of the query and the store runs
+    # after the forward -- and the unkept promise is an engine death
+    # (`needs state at 1280, found 3`) rather than a missed reuse.
+    assert spec.num_prefill_checkpoint_blocks == 0
     assert spec.prefill_checkpoint_alignment == 4096
 
 
@@ -282,6 +287,27 @@ def test_the_layer_class_can_actually_be_built():
     layer = cls("atom.dsv41.state_image.0", 0, UNIT, 256, 4096)
     spec = layer.get_kv_cache_spec(None)
     assert spec.page_size_bytes == UNIT
-    assert spec.num_prefill_checkpoint_blocks == 1
+    assert spec.num_prefill_checkpoint_blocks == 0
     assert layer.get_attn_backend().is_ssm() is True
     assert layer.get_attn_backend().get_builder_cls() is not None
+
+
+def test_the_layer_and_the_helper_build_the_same_spec():
+    """One construction, not two. These were separate and disagreed on the
+    checkpoint count the moment one was changed -- a promise to vLLM in one
+    place and not the other, which is an engine death rather than a
+    mismatch anything reports."""
+    from atom.plugin.vllm.v41_state_image import (
+        image_kv_cache_spec,
+        image_layer_class,
+    )
+
+    sizing = sizing_from_geometry(geometry())
+    cls = image_layer_class()
+    layer = cls("atom.v41.image.0", 0, sizing.unit_bytes, 256, 4096)
+    direct = image_kv_cache_spec(sizing, 256, 4096)
+    built = layer.get_kv_cache_spec(None)
+    assert built.num_prefill_checkpoint_blocks == direct.num_prefill_checkpoint_blocks
+    assert built.prefill_checkpoint_alignment == direct.prefill_checkpoint_alignment
+    assert built.block_size == direct.block_size
+    assert built.page_size_bytes == direct.page_size_bytes

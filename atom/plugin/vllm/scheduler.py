@@ -292,37 +292,7 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
 _CAP_LOG = [0]
 
 
-def _image_only_cap(num_local: int, block_size: int) -> int:
-    """Cap to the checkpoint position when images are the only state source.
-
-    Returns the hit unchanged when images are not wired, which leaves
-    vLLM's answer alone for every model that has none.
-    """
-    try:
-        from atom.plugin.vllm.v41_state_image import images_can_serve
-    except Exception:
-        return num_local
-    if not images_can_serve():
-        return num_local
-    from vllm.v1.kv_cache_interface import get_mamba_prefill_checkpoint_position
-
-    position = int(
-        get_mamba_prefill_checkpoint_position(
-            num_local, block_size, drop_eagle_block=False
-        )
-    )
-    # Given up rather than taken when it is not itself a checkpoint.
-    # Accepting block-aligned hits was tried on the grounds that the store
-    # writes one at every step end that lands on a boundary -- but a step
-    # end almost never does: measured, `image_boundary_unaligned=2087` and
-    # `image_boundary_marks=0`, and the engine died on the same hit again. There is nothing behind
-    # an unbacked hit but a dead engine: measured, a 1362-token prompt put
-    # its image at 1280 while the hit arrived at 1024, and the server went
-    # down on `needs state at 1024, found 3`. Giving it up costs a
-    # recompute; taking it costs the server.
-    if position != num_local:
-        return 0
-    return position
+_CAP_LOG = [0]
 
 
 def _log_cap_decision(num_local, planner, capped=None) -> None:
@@ -338,6 +308,31 @@ def _log_cap_decision(num_local, planner, capped=None) -> None:
         "present" if planner is not None else "ABSENT",
         "not reached" if capped is None else capped,
     )
+
+
+def _image_only_cap(num_local: int, block_size: int) -> int:
+    """Leave vLLM's answer alone when the state images are wired.
+
+    vLLM has ALREADY reduced the hit to a position the state group can
+    serve. Its coordinator reconciles every group to a common length by
+    taking the minimum, and the image group -- a `MambaSpec`, so
+    `MambaManager` -- only ever offers a boundary it has a cached
+    checkpoint block for. Measured directly:
+
+        MambaManager(MambaSpec) groups=[1] max=1280 -> hit=1280
+
+    So "PAGE tokens == STATE tokens" is a guarantee vLLM already makes, and
+    anything done here can only break it.
+
+    It did. This used to apply `get_mamba_prefill_checkpoint_position` to
+    the hit, which is a rule about a raw prefix length, not about a hit
+    vLLM has already snapped to a boundary: handed 1280 it returned 1024,
+    one block below, a position nothing had ever written. That is where
+    `needs state at 1024, found 3` came from -- the mismatch was
+    manufactured here, not found. Refusing instead of capping then threw
+    away a correct, backed hit and reuse read 0.0%.
+    """
+    return num_local
 
 
 def apply_vllm_v41_local_hit_cap_patch() -> None:

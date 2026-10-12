@@ -439,6 +439,17 @@ def register_model() -> None:
     )
 
     apply_vllm_v41_local_hit_cap_patch()
+    # Diagnostic, env-gated and log-only: which kv-cache group offers what
+    # as a prefix hit, and what the coordinator reconciles them to.
+    #
+    # Installed HERE and not from the model wrapper, which runs in the
+    # workers: the coordinator lives in the EngineCore process, and from
+    # there the probe printed "installed" four times and not one hit line.
+    # Same shape as the planner counters I tried to read from a worker's
+    # refusal dump, which printed nothing at all.
+    from atom.plugin.vllm.v41_hit_probe import install as _install_hit_probe
+
+    _install_hit_probe()
     apply_vllm_v41_prefill_alignment_patch()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend

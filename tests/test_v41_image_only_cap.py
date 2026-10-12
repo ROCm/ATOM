@@ -10,40 +10,31 @@ hung off the connector's planner.
 from atom.plugin.vllm import scheduler as sched
 
 
-def test_a_hit_that_is_not_the_checkpoint_is_refused(monkeypatch):
-    """vLLM writes one image per prefill, at that prompt's own last block
-    boundary. A shared-prefix hit lands elsewhere: measured without a tier,
-    a 1362-token prompt's image sat at 1280 while the hit arrived at 1024,
-    and the engine died rather than reusing nothing."""
+def test_vllms_answer_is_left_alone_when_images_are_wired(monkeypatch):
+    """vLLM has already reduced the hit to a boundary the state group can
+    serve -- its coordinator takes the minimum across groups, and the image
+    group only offers boundaries it holds a cached checkpoint block for.
+    Measured: `MambaManager(MambaSpec) groups=[1] max=1280 -> hit=1280`."""
     monkeypatch.setattr(
         "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
     )
-    # Not block-aligned, so nothing was written there.
-    assert sched._image_only_cap(6900, 256) == 0
-    assert sched._image_only_cap(1000, 256) == 0
+    for hit in (1280, 1024, 6912, 6900, 1):
+        assert sched._image_only_cap(hit, 256) == hit
 
 
-def test_a_block_aligned_hit_is_not_kept_on_that_ground(monkeypatch):
-    """Accepting these was tried, on the grounds that the store writes an
-    image at every step end landing on a boundary. A step end almost never
-    does: `image_boundary_unaligned=2087`, `image_boundary_marks=0`, and
-    the engine died on the same hit again."""
-    monkeypatch.setattr(
-        "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
-    )
-    assert sched._image_only_cap(1024, 256) == 0
+def test_the_checkpoint_rule_is_not_applied_to_an_already_snapped_hit():
+    """The regression this replaces, stated as arithmetic.
 
-
-def test_a_hit_that_is_a_checkpoint_is_kept(monkeypatch):
-    """`get_mamba_prefill_checkpoint_position` is the identity exactly on
-    the positions an image can sit at."""
-    monkeypatch.setattr(
-        "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
-    )
+    `get_mamba_prefill_checkpoint_position` is a rule about a RAW prefix
+    length. Applied to a hit vLLM has already snapped to a boundary it
+    returns one block lower -- a position nothing ever wrote, which is
+    where `needs state at 1024, found 3` came from. The mismatch was
+    manufactured by that call, not found in the data.
+    """
     from vllm.v1.kv_cache_interface import get_mamba_prefill_checkpoint_position
 
-    for hit in (1024, 6656, 9216):
-        assert get_mamba_prefill_checkpoint_position(hit + 1, 256, False) == hit
+    assert get_mamba_prefill_checkpoint_position(1280, 256, False) == 1024
+    assert sched._image_only_cap(1280, 256) == 1280
 
 
 def test_vllms_answer_is_left_alone_without_images(monkeypatch):

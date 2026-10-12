@@ -59,6 +59,17 @@ def test_the_restore_hook_the_cache_installs_is_this_function():
     assert "install_image_restore_hook(restore_stale_rows)" in src
 
 
+def test_the_prefix_cache_gate_stays_shut_while_the_export_is_unimplemented():
+    """`images_can_serve()` is what opens prefix caching for V4.1 without a
+    tier. It must stay shut: vLLM's align-mode mamba prefix caching assumes
+    the backend leaves state recoverable at every full block boundary, and
+    V4.1 does not -- measured, the group offered 1280 and the engine died
+    on `needs state at 1280, found 3`. Registering the layers is not the
+    same claim as being able to serve from them."""
+    assert mod._RESTORE_IMPLEMENTED is False
+    assert mod.images_can_serve() is False
+
+
 def test_the_whole_batch_restore_is_gone_and_stays_gone():
     """It restored every row of every step from blocks nothing had written,
     erasing state a prefill had just built. Reconnecting it looks like a

@@ -66,7 +66,29 @@ _IMAGES_WIRED = False
 #: The counter that settled it is `image_builds`, and it exists because no
 #: other counter separates "the group was built and declined" from "the
 #: group is never built at all". Both read as zero stores.
-_RESTORE_IMPLEMENTED = True
+#: False, and now for a reason that no switch can route around.
+#:
+#: vLLM's align-mode prefix caching for a mamba group assumes the backend
+#: leaves the state recoverable AT EVERY FULL BLOCK BOUNDARY -- upstream
+#: mamba backends write it block by block as they go. `MambaManager` caches
+#: the block at the last full boundary and then offers later requests a hit
+#: there. Measured: for a 1362-token prompt the group answered
+#: `max=1280 -> hit=1280`, and it kept answering 1280 with
+#: `num_prefill_checkpoint_blocks=0`, so the checkpoint promise is not what
+#: drives it.
+#:
+#: V4.1 does not materialise state that way: a store running after the
+#: forward has only the state at the END of the query, and vLLM's own
+#: `checkpoint_offsets` asks for an INTERIOR offset. So any configuration
+#: that lets the image group take part in prefix caching is a configuration
+#: where vLLM will offer a boundary nothing wrote -- measured as
+#: `needs state at 1280, found 3`, engine down, on the first repeat.
+#:
+#: Honouring it means exporting during the forward through
+#: `MambaPrefillCheckpointExporter`, which for V4.1 means splitting the
+#: `engram_compress` plan at that offset. A model-op change, and the thing
+#: this flag is waiting for.
+_RESTORE_IMPLEMENTED = False
 
 
 def images_registered() -> bool:
@@ -241,9 +263,13 @@ def image_kv_cache_spec(sizing: V41ImageSizing, block_size: int, alignment: int)
         shapes=((sizing.unit_bytes,),),
         dtypes=(torch.uint8,),
         block_size=block_size,
-        # One checkpoint block per request: an image is written at a boundary
-        # and read at a hit, never accumulated.
-        num_prefill_checkpoint_blocks=1,
+        # A PROMISE to vLLM, not a request: non-zero makes `MambaManager`
+        # offer later requests a prefix hit at that boundary, on the
+        # understanding that the backend exported state there. Nothing here
+        # can -- vLLM asks for an interior offset of the query and the
+        # store runs after the forward -- and the unkept promise is an
+        # engine death, `needs state at 1280, found 3`, not a missed reuse.
+        num_prefill_checkpoint_blocks=_CHECKPOINT_BLOCKS,
         prefill_checkpoint_alignment=alignment,
         # The slot is per rank, not replicated: each TP rank holds its own
         # ring and its own compressor tails, and an image is that rank's.
@@ -509,6 +535,13 @@ class V41ImageExporter:
 
 
 _IMAGE_LAYER_CLS = None
+#: How many prefill checkpoint blocks the image group promises vLLM. Zero
+#: because nothing here can export at the interior offset vLLM asks for;
+#: `ATOM_V41_IMAGE_CHECKPOINT_BLOCKS=1` re-arms it for whoever implements
+#: that export, and the failure it brings back is loud.
+_CHECKPOINT_BLOCKS = int(
+    __import__("os").environ.get("ATOM_V41_IMAGE_CHECKPOINT_BLOCKS", "0") or 0
+)
 
 
 def image_layer_class():
@@ -684,13 +717,19 @@ def image_layer_class():
             return _V41ImageBackend
 
         def get_kv_cache_spec(self, vllm_config):
-            return MambaSpec(
-                shapes=((self.unit_bytes,),),
-                dtypes=(torch.uint8,),
-                block_size=self.image_block_size,
-                num_prefill_checkpoint_blocks=1,
-                prefill_checkpoint_alignment=self.alignment,
-                tp_replicated=False,
+            # One construction, not two: this used to build its own
+            # `MambaSpec` beside `image_kv_cache_spec`, and the two
+            # disagreed on the checkpoint count the moment one was changed.
+            return image_kv_cache_spec(
+                V41ImageSizing(
+                    unit_bytes=self.unit_bytes,
+                    image_bytes=self.unit_bytes,
+                    slot_bytes=self.unit_bytes,
+                    units=1,
+                    layout_id="",
+                ),
+                self.image_block_size,
+                self.alignment,
             )
 
         def bind_kv_cache(self, kv_cache) -> None:

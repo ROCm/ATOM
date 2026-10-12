@@ -524,49 +524,47 @@ boundary, not one per prefill -- vLLM's `compute_mamba_prefill_checkpoints`
 returns a single position per row, so that is an upstream change, not a
 configuration.
 
-### Why the images stay inert: vLLM's checkpoint is interior
+### Why the images stay inert, corrected
 
-`MambaPrefillCheckpointMetadata.checkpoint_offsets` says where INSIDE the
-query the state must be captured -- vLLM's own words are "mid-prefill
-checkpoint". A store that runs after the forward holds the state at the END
-of the query. The two coincide only when the offset equals the query
-length.
+An earlier version of this section said the images could not carry a hit
+because vLLM's checkpoint position, the hit position and the position a
+post-forward store can capture are three independent numbers that never
+coincide. Two of those three were manufactured here, and the real reason is
+simpler and harder.
 
-Anywhere else, writing it labels the state at 1362 tokens as the state at
-1280, and nothing downstream can tell: the cursor contract compares the
-position a request WANTS against the one the slot reports, and a restore
-sets both. This is the only defect in this mechanism that produces a wrong
-answer rather than a dead engine. The store now declines those columns --
-17 of 17 on the measured run -- so what it writes is position-correct, and
-what it writes is only the end-of-query case.
+**vLLM already enforces the rule.** `MambaManager` only offers a prefix hit
+at a boundary it holds a cached state block for, and the coordinator
+reconciles every group to the minimum. Measured directly, with a probe on
+the finder:
 
-Filling vLLM's column properly means exporting during the forward at that
-offset, through `MambaPrefillCheckpointExporter`. V4.1 advances its state
-through `engram_compress` over pre-built compression plans, so that means
-splitting the plan at the checkpoint offset and exporting between the
-halves -- a model-op change, not a bridge one.
+    MambaManager(MambaSpec) groups=[1] max=1280 -> hit=1280
 
-The cheaper route is the one the error message already names: reuse the
-compressed prefix up to a PAGE boundary and replay the last <=128 tokens to
-rebuild STATE, paying one window per hit instead. Either way the tier
-already covers this workload (warm 16/16, 79.8% supplied), so the images
-are not on the critical path for offload.
+So "PAGE tokens == STATE tokens" is a guarantee vLLM makes, not one this
+code has to build.
 
-### Known collision: state images and the DSpark draft group
+**The 1024 in the old story was ours.** `cap_local_hit` applied
+`get_mamba_prefill_checkpoint_position` to the hit. That is a rule about a
+raw prefix length; applied to a hit vLLM had already snapped to a boundary
+it returns one block lower -- 1280 became 1024, a position nothing wrote,
+and the engine died on `needs state at 1024, found 3`. Removing the cap
+moved the death to `needs state at 1280`, which is the real one.
 
-`ATOM_V41_STATE_IMAGES=1` registers a `MambaSpec` group, and #2494's
-`_build_v41_proxy_draft_groups` (`atom/plugin/vllm/spec_decode_patch.py`)
-splits kv-cache groups into exactly two -- the proxy, and everything else --
-then calls `rest_specs[0].merge(rest_specs)`, which asserts all specs are
-the same type. With images on AND DSpark on, "everything else" holds a
-`MambaSpec` and a `SlidingWindowMLASpec`, and that assert fires.
+**What vLLM's guarantee rests on is an export this backend cannot do.**
+Registering a cached block at a boundary is bookkeeping; vLLM trusts the
+backend to have left the state there. Upstream mamba backends do, block by
+block as they go. V4.1 does not: a store after the forward holds only the
+state at the END of the query, and `checkpoint_offsets` asks for an
+INTERIOR offset. Setting `num_prefill_checkpoint_blocks=0` does not avoid
+it -- the group still answered 1280 -- because align mode caches the last
+full block's state regardless.
 
-Reachable today: the images need no connector, so `LMCACHE=off` + images +
-DSpark is a legal combination. The connector's own refusal of speculation
-alongside offload does not cover it. Nobody hits it only because
-`ATOM_V41_STATE_IMAGES` defaults off.
+So `images_can_serve()` is False and prefix caching stays refused without a
+tier. Honouring the contract means exporting during the forward through
+`MambaPrefillCheckpointExporter`, which for V4.1 means splitting the
+`engram_compress` plan at that offset: a model-op change, and what this
+flag waits for.
 
-Sharing a page does not avoid it: the image unit is 739,840 B, byte-for-byte
-the proxy's page, but `merge` asserts on spec TYPE and the images must be a
-`MambaSpec` for vLLM to allocate and hash them. The fix is to split those
-groups by spec type rather than proxy-vs-rest, which lives in that file.
+Measured end state: the gate refuses at startup (no tier + images +
+prefix caching never boots, with the right message), and the tier arm is
+unaffected -- blind 0/16, cold 16/16, warm 16/16, 95.2% of prompt tokens
+supplied, zero stale-cursor refusals.
