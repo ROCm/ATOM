@@ -348,7 +348,12 @@ class MooncakeStoreClient:
             return {"counts": dict(self._counts), "failures": dict(self._failures)}
 
     def _count(self, op, keys, nbytes, codes, *, failed) -> None:
-        """Tally one call; ``nbytes`` is what it moved, None for a lookup."""
+        """Tally one call; ``nbytes`` is what it moved, None for a lookup.
+
+        For a put that is the chunks the Store holds once it returns: Mooncake
+        answers 0 for a key it already had, without moving its bytes, and the
+        answer does not tell the two apart.
+        """
         bad = [code for code in codes if failed(int(code))]
         with self._stats_lock:
             self._counts[f"{op}_calls"] += 1

@@ -502,12 +502,14 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
             ),
         )
         extra = kvc.get("kv_connector_extra_config", kvc) or {}
-        # Unbounded unless asked for, like the dense offload: one save per
-        # request is in flight at most either way.
+        # Unbounded unless asked for, in the connector config or through
+        # OFFLOAD_MAX_PENDING_SAVES: one save per request is in flight at most
+        # either way.
+        asked = (
+            "max_pending_saves" in extra or envs.OFFLOAD_MAX_PENDING_SAVES is not None
+        )
         self._max_pending_saves = (
-            max_pending_saves(kvc, envs.OFFLOAD_COPY_WORKERS)
-            if "max_pending_saves" in extra
-            else None
+            max_pending_saves(kvc, envs.OFFLOAD_COPY_WORKERS) if asked else None
         )
         logger.info(
             "Mooncake Store offload scheduler: namespace=%s world=%d chunk=%d "

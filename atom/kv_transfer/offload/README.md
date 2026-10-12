@@ -621,7 +621,9 @@ this worker config.
   `effective_gbps`) per operation, with `status=ok` or the failure that ended
   it, whose rate-limited warning names the first Mooncake result code.
   Every worker logs `[OFFLOAD-STORE-STATS]` (calls, keys, bytes, failures by
-  code, quarantined slots) at most once a minute while it transfers. The
+  code, quarantined slots) at most once a minute while it transfers;
+  `put_bytes` counts every chunk a put left in the Store, those it already
+  held included, since Mooncake answers both alike. The
   scheduler logs `[OFFLOAD-LOOKUP-STATS]` once a minute: answered lookups,
   those whose ranks held prefixes of different lengths (`uneven_lookups`),
   and the rank objects they found past the shared prefix

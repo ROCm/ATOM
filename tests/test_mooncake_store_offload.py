@@ -2016,13 +2016,21 @@ def test_dense_scheduler_load_request_is_unchanged(monkeypatch):
     assert request.block_ids == seq.block_table
 
 
-def test_scheduler_settings(cluster):
+def test_scheduler_settings(cluster, monkeypatch):
+    monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES", raising=False)
     scheduler = MooncakeStoreOffloadScheduler(
         _config(extra=_extra(save_abandon_timeout_s=120))
     )
     assert scheduler.save_abandon_timeout_s() == 120.0
     assert scheduler._early_release and scheduler.chunk_size == CHUNK
     assert scheduler.max_pending_saves is None and scheduler._may_emit_save()
+    # The environment bounds it too, as it does the other connectors; the
+    # connector config still takes precedence.
+    monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "3")
+    assert MooncakeStoreOffloadScheduler(_config()).max_pending_saves == 3
+    extra = _extra()
+    extra["max_pending_saves"] = 5
+    assert MooncakeStoreOffloadScheduler(_config(extra=extra)).max_pending_saves == 5
 
 
 def test_max_pending_saves_bounds_saves_in_flight(cluster):
