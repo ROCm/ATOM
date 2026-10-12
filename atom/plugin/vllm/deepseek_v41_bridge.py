@@ -339,6 +339,16 @@ def _v41_capture_batch(snapshot, vllm_config, builder=None):
         req_ids=snapshot.req_ids,
         num_scheduled_tokens=query_lens,
         context_lens=context_lens,
+        # Neither is tracked on this path, and neither has a reader here.
+        # `is_final_chunk` feeds `step.request_finals`, whose only consumer is
+        # `bounded_replay`, which the model wrapper forces off for V4.1 on the
+        # plugin. `replaying` names the seqs whose forward starts below where
+        # they resumed, which needs restored state -- and prefix caching, KV
+        # connectors and bounded replay are all refused here, so nothing
+        # resumes. None and {} are what core reads as "this frontend does not
+        # track it", not placeholders.
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=slots,
         block_tables=block_tables,
         total_seqs_num=num_reqs,
@@ -1230,6 +1240,16 @@ def _v41_scheduled_batch(snapshot, slot_allocator, slots=None):
         req_ids=snapshot.req_ids,
         num_scheduled_tokens=snapshot.query_lens,
         context_lens=snapshot.ends,
+        # Neither is tracked on this path, and neither has a reader here.
+        # `is_final_chunk` feeds `step.request_finals`, whose only consumer is
+        # `bounded_replay`, which the model wrapper forces off for V4.1 on the
+        # plugin. `replaying` names the seqs whose forward starts below where
+        # they resumed, which needs restored state -- and prefix caching, KV
+        # connectors and bounded replay are all refused here, so nothing
+        # resumes. None and {} are what core reads as "this frontend does not
+        # track it", not placeholders.
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=slots,
         block_tables=snapshot.block_rows,
         total_seqs_num=len(slots),
@@ -1268,6 +1288,10 @@ def _v41_dummy_batch(running_tokens, *, max_req_tokens, max_reqs):
         req_ids=tuple(range(num_reqs)),
         num_scheduled_tokens=lengths,
         context_lens=lengths,
+        # `_prepare` reads both before it reads `is_dummy_run`, so a dummy
+        # batch needs them present even though it uses neither.
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=(),
         block_tables=(),
         total_seqs_num=num_reqs,
