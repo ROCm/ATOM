@@ -1506,6 +1506,19 @@ models:
               <<: *dsv4_0813_agentic_ep8_mega_mp_ix_prefill
               OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT: "1"
 
+        # Skip the useless LMCache lookup, and take prompt state checkpoints
+        # midstep instead of cutting prefill chunks onto them (anchor kept, so
+        # the same checkpoints exist as on the cut path).
+        - <<: *dsv4_0813_agentic_ep8_mega_mp_ix
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-ix-skiplookup-midstep-c256
+          display_topology: 1P1D-DPA-TP8-EP8P-MEGA-EPLB-MP-DSPARK3-IX-SKIPLOOKUP-MIDSTEP
+          env:
+            common: {}
+            prefill:
+              <<: *dsv4_0813_agentic_ep8_mega_mp_ix_prefill
+              OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT: "1"
+              ATOM_V4_MIDSTEP_CHECKPOINT: "1"
+
         - <<: *dsv4_0813_agentic_ep8_mega_mp_ix
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-ix-skiplookup-noanchor-c256
           display_topology: 1P1D-DPA-TP8-EP8P-MEGA-EPLB-MP-DSPARK3-IX-SKIPLOOKUP-NOANCHOR
