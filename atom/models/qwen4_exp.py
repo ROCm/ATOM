@@ -128,6 +128,31 @@ class Qwen4ExpRMSNormGated(nn.Module):
         return sigmoid_rmsnorm(x, z, self.weight, self.eps)
 
 
+def routed_expert_slice(expert_map: torch.Tensor | None, num_routed: int) -> slice:
+    """Global-id slice of the routed experts this rank loads from a stacked tensor.
+
+    Expert parallelism stores a contiguous run of routed ids and -1 everywhere
+    else. Fused shared experts are appended after that run, so their local slot
+    ids sit past the -1 holes. The stacked checkpoint only has the routed rows;
+    scanning the whole map treats those holes as a gap and refuses to load.
+    """
+
+    if expert_map is None:
+        return slice(0, num_routed)
+    routed = expert_map[:num_routed]
+    local = torch.nonzero(routed >= 0).flatten()
+    if local.numel() == 0:
+        raise NotImplementedError(
+            "Qwen3.8-Flash-Next expert loading needs a contiguous expert-parallel range"
+        )
+    first, last = int(local[0]), int(local[-1])
+    if last - first + 1 != int(local.numel()):
+        raise NotImplementedError(
+            "Qwen3.8-Flash-Next expert loading needs a contiguous expert-parallel range"
+        )
+    return slice(first, last + 1)
+
+
 def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     """Let `FusedMoE` accept whole-layer `[E, ...]` expert tensors as well.
 
@@ -155,18 +180,10 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     """
     moe_parallel = experts.moe_parallel_config
     tp_rank = moe_parallel.tp_rank
-    expert_map = getattr(experts, "expert_map", None)
-    if expert_map is None:
-        # A fused shared expert occupies slots past the routed ones.
-        expert_slice = slice(0, experts.expert_layout.num_routed)
-    else:
-        local = torch.nonzero(expert_map >= 0).flatten()
-        first, last = int(local[0]), int(local[-1])
-        if last - first + 1 != local.numel():
-            raise NotImplementedError(
-                "Qwen3.8-Flash-Next expert loading needs a contiguous expert-parallel range"
-            )
-        expert_slice = slice(first, last + 1)
+    expert_slice = routed_expert_slice(
+        getattr(experts, "expert_map", None),
+        int(experts.expert_layout.num_routed),
+    )
 
     def stacked_w13(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         intermediate = param.data.shape[1] // 2
