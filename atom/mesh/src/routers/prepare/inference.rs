@@ -156,12 +156,19 @@ impl ParsedInference {
             || body
                 .get("input")
                 .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("type").and_then(serde_json::Value::as_str)
-                            == Some("item_reference")
-                    })
-                })
+                .is_some_and(|items| items.iter().any(Self::is_item_reference))
+    }
+
+    /// `item_reference` items may omit `type`; an untyped item with an `id` and
+    /// no message `role` refers to stored state.
+    fn is_item_reference(item: &serde_json::Value) -> bool {
+        use serde_json::Value;
+        match item.get("type").and_then(Value::as_str) {
+            Some(kind) => kind == "item_reference",
+            None => {
+                item.get("id").is_some_and(Self::is_nonempty_string) && item.get("role").is_none()
+            }
+        }
     }
 
     fn validate_api_body(body: &serde_json::Value, messages: bool) -> Result<(), String> {
@@ -335,6 +342,9 @@ impl ParsedInference {
 
     fn is_response_item(value: &serde_json::Value) -> bool {
         use serde_json::Value;
+        if Self::is_item_reference(value) {
+            return true;
+        }
         match value.get("type").and_then(Value::as_str) {
             None | Some("message") => {
                 matches!(

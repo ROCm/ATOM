@@ -282,6 +282,7 @@ impl Session {
                     // acknowledging Envoy's local response.
                     dispatch = None;
                     self.request = None;
+                    let mut event_stream = None;
                     for header in headers.headers.unwrap_or_default().headers {
                         let bytes = RequestEnvelope::header_bytes(&header);
                         if header.key == ":status" {
@@ -289,12 +290,13 @@ impl Session {
                                 std::str::from_utf8(bytes).ok().and_then(|v| v.parse().ok());
                         }
                         if header.key.eq_ignore_ascii_case("content-type") {
-                            self.lifecycle.streaming = bytes.starts_with(b"text/event-stream");
+                            event_stream = Some(bytes.starts_with(b"text/event-stream"));
                         }
                     }
                     if self.lifecycle.status.is_none() {
                         return Err(ProcessingError::protocol("response is missing :status"));
                     }
+                    self.lifecycle.resolve_streaming(event_stream);
                     self.respond(
                         self.output
                             .send(Mutation::response_headers(self.request_id.as_deref())),

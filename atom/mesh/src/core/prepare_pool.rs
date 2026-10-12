@@ -132,7 +132,7 @@ impl PoolControl {
                 let _execution = job._execution.take();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     if self.force_cancel.load(Ordering::Acquire) {
-                        job.reject(PrepareError::Cancelled);
+                        job.reject(self.forced_rejection());
                     } else {
                         job.execute();
                     }
@@ -150,6 +150,15 @@ impl PoolControl {
         }
         self.live_workers.fetch_sub(1, Ordering::AcqRel);
         metrics::gauge!("mesh_prepare_live_workers").decrement(1.0);
+    }
+
+    /// Jobs rejected by a forced cancel report why the pool stopped them.
+    fn forced_rejection(&self) -> PrepareError {
+        if self.failed.load(Ordering::Acquire) {
+            PrepareError::WorkerFailed
+        } else {
+            PrepareError::Cancelled
+        }
     }
 
     fn mark_failed(&self) {
@@ -184,8 +193,8 @@ impl PoolControl {
                 if let Some(receiver) = receiver.upgrade() {
                     while let Ok(job) = receiver.try_recv() {
                         // A panicking destructor must not prevent later cleanup.
-                        let _ =
-                            catch_unwind(AssertUnwindSafe(|| job.reject(PrepareError::Cancelled)));
+                        let error = self.forced_rejection();
+                        let _ = catch_unwind(AssertUnwindSafe(|| job.reject(error)));
                     }
                 }
                 // Detach remaining synchronous work; live_workers still counts it.
@@ -350,6 +359,7 @@ impl PrepareHandle {
         let control = Arc::new(JobControl {
             state: AtomicU8::new(QUEUED),
             cancelled: AtomicBool::new(false),
+            counted: AtomicBool::new(false),
             pool: state.control.clone(),
         });
         let (sender, receiver) = oneshot::channel();
@@ -359,19 +369,22 @@ impl PrepareHandle {
             enqueued,
             queue_deadline,
             deadline,
-            work: Box::new(move |context| match context {
+            work: Box::new(move |context, control| match context {
                 Ok(context) => {
                     let result = catch_unwind(AssertUnwindSafe(|| work(context)))
-                        .map_err(|_| PrepareError::Panicked.count())
+                        .map_err(|_| control.count(PrepareError::Panicked))
                         .and_then(|value| {
-                            context.check().map(|()| value).map_err(PrepareError::count)
+                            context
+                                .check()
+                                .map(|()| value)
+                                .map_err(|error| control.count(error))
                         });
                     context.control.state.store(FINISHED, Ordering::Release);
                     // Failed sends dispose of returned input on this worker.
                     let _ = sender.send(result);
                 }
                 Err(error) => {
-                    let _ = sender.send(Err(error.count()));
+                    let _ = sender.send(Err(error));
                     drop(work);
                 }
             }),
@@ -530,10 +543,21 @@ impl Drop for ExecutionCharge {
 struct JobControl {
     state: AtomicU8,
     cancelled: AtomicBool,
+    /// Set once the job's outcome has been counted, so a ticket timeout and the
+    /// worker's resulting cancellation record one error rather than two.
+    counted: AtomicBool,
     pool: Arc<PoolControl>,
 }
 
 impl JobControl {
+    /// Count `error` unless this job's outcome was already counted.
+    fn count(&self, error: PrepareError) -> PrepareError {
+        if !self.counted.swap(true, Ordering::AcqRel) {
+            error.count();
+        }
+        error
+    }
+
     fn cancel_queued(&self) -> bool {
         // Account before CAS so a worker cannot decrement before this increment.
         self.pool.cancelled_queued.fetch_add(1, Ordering::AcqRel);
@@ -600,19 +624,22 @@ impl<T> PrepareTicket<T> {
             tokio::select! {
                 biased;
                 result = &mut self.receiver => {
-                    break result.unwrap_or(Err(PrepareError::WorkerFailed));
+                    break result
+                        .unwrap_or_else(|_| Err(self.control.count(PrepareError::WorkerFailed)));
                 }
                 _ = &mut queue, if queue_pending => {
                     if self.control.cancel_queued() {
                         self.control.cancelled.store(true, Ordering::Release);
-                        break Err(PrepareError::QueueTimeout.count());
+                        break Err(self.control.count(PrepareError::QueueTimeout));
                     }
                     // Once running, only the overall preparation deadline applies.
                     queue_pending = false;
                 }
                 _ = &mut overall => {
+                    // Count before cancelling so the worker cannot count first.
+                    let error = self.control.count(PrepareError::Timeout);
                     self.control.cancel();
-                    break Err(PrepareError::Timeout.count());
+                    break Err(error);
                 }
             }
         };
@@ -624,6 +651,7 @@ impl<T> PrepareTicket<T> {
 impl<T> Drop for PrepareTicket<T> {
     fn drop(&mut self) {
         if !self.completed {
+            self.control.count(PrepareError::Cancelled);
             self.control.cancel();
         }
     }
@@ -635,19 +663,26 @@ struct Job {
     enqueued: Instant,
     queue_deadline: Instant,
     deadline: Instant,
-    work: Box<dyn FnOnce(Result<&JobContext, PrepareError>) + Send>,
+    work: Box<dyn FnOnce(Result<&JobContext, PrepareError>, &JobControl) + Send>,
     // Last: even a panicking input destructor runs before capacity is released.
     _execution: Option<ExecutionCharge>,
 }
 
 impl Job {
-    fn reject(mut self, error: PrepareError) {
+    fn reject(self, error: PrepareError) {
+        self.control.count(error);
+        self.dispose(error);
+    }
+
+    /// Fail the job without counting: the ticket that cancelled it counts its
+    /// own timeout or cancellation.
+    fn dispose(mut self, error: PrepareError) {
         let previous = self.control.state.swap(FINISHED, Ordering::AcqRel);
         if previous == CANCELLED_QUEUED {
             self.control.pool.release_cancelled_queued();
         }
         drop(self.queued.take());
-        (self.work)(Err(error));
+        (self.work)(Err(error), &self.control);
     }
 
     fn execute(mut self) {
@@ -657,7 +692,7 @@ impl Job {
             .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            self.reject(PrepareError::Cancelled);
+            self.dispose(PrepareError::Cancelled);
             return;
         }
         drop(self.queued.take());
@@ -677,7 +712,7 @@ impl Job {
             self.reject(error);
             return;
         }
-        (self.work)(Ok(&context));
+        (self.work)(Ok(&context), &self.control);
         metrics::histogram!("mesh_prepare_run_seconds").record(now.elapsed().as_secs_f64());
     }
 }
@@ -1536,12 +1571,39 @@ mod tests {
     }
 
     #[test]
+    fn each_job_outcome_is_counted_once() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let runtime = PreparePoolRuntime::new(config()).unwrap();
+        let control = JobControl {
+            state: AtomicU8::new(QUEUED),
+            cancelled: AtomicBool::new(false),
+            counted: AtomicBool::new(false),
+            pool: runtime.state.control.clone(),
+        };
+        // A ticket timeout, then the worker observing the resulting cancellation.
+        assert_eq!(control.count(PrepareError::Timeout), PrepareError::Timeout);
+        assert_eq!(
+            control.count(PrepareError::Cancelled),
+            PrepareError::Cancelled
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("mesh_prepare_errors_total{reason=\"prepare_timeout\"} 1"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("prepare_cancelled"), "{rendered}");
+    }
+
+    #[test]
     fn queue_cancel_and_worker_claim_have_exactly_one_winner() {
         let runtime = PreparePoolRuntime::new(config()).unwrap();
         for _ in 0..32 {
             let control = Arc::new(JobControl {
                 state: AtomicU8::new(QUEUED),
                 cancelled: AtomicBool::new(false),
+                counted: AtomicBool::new(false),
                 pool: runtime.state.control.clone(),
             });
             let start = Arc::new(std::sync::Barrier::new(2));

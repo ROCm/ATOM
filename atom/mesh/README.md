@@ -42,8 +42,10 @@ Backends without a worker key receive the client's `authorization` and
 inference.
 Workers sharing one backend address must have matching credential configuration.
 The first successful probe is returned immediately. If all probes fail, non-404
-client errors take precedence over server or connection errors; 404 is the
-fallback. Errors with equal priority are selected by backend address order.
+client errors take precedence over server errors and unreachable backends
+(`502 backend_unreachable`), which outrank 404 because such a backend may own the
+resource. 405 and 501 from backends without these routes rank last. Errors with
+equal priority are selected by backend address order.
 
 DP-aware forwarding writes the selected worker's rank to `data_parallel_rank` in
 the request body for Chat Completions, Completions and Generate, overriding any

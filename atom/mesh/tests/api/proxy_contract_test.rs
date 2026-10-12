@@ -562,3 +562,79 @@ async fn response_resources_preserve_methods_queries_credentials_and_streaming()
     assert!(captured.try_recv().is_err());
     server.abort();
 }
+
+#[tokio::test]
+async fn response_resource_errors_prefer_possible_owners_over_unsupported_routes() {
+    use axum::{http::Method, Router};
+    use mesh::{
+        app_context::AppContext, config::RouterConfig, core::prepare_pool::PreparePoolRuntime,
+        core::BasicWorkerBuilder,
+    };
+    use std::sync::Arc;
+
+    async fn serve(status: StatusCode) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move || async move { status }),
+            )
+            .await
+            .unwrap();
+        });
+        url
+    }
+    let unsupported = serve(StatusCode::METHOD_NOT_ALLOWED).await;
+    let missing = serve(StatusCode::NOT_FOUND).await;
+    // Release a bound port so connections to it are refused.
+    let unreachable = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    for (urls, status, code) in [
+        // A backend without the routes says nothing about the resource.
+        (vec![&unsupported, &missing], StatusCode::NOT_FOUND, None),
+        // An unreachable backend may own the resource, so 404 is not certain.
+        (
+            vec![&missing, &unreachable],
+            StatusCode::BAD_GATEWAY,
+            Some("backend_unreachable"),
+        ),
+    ] {
+        let config = RouterConfig {
+            disable_retries: true,
+            ..Default::default()
+        };
+        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let context = Arc::new(
+            AppContext::from_config(config, 5, prepare_runtime.handle())
+                .await
+                .unwrap(),
+        );
+        for url in urls {
+            context
+                .worker_registry
+                .register(Arc::new(BasicWorkerBuilder::new(url.as_str()).build()));
+        }
+        let response = multi_api::http_app(context)
+            .await
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/responses/resp-x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        if let Some(code) = code {
+            assert_eq!(response.headers()["x-mesh-error-code"], code);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains(&unreachable));
+        }
+    }
+}

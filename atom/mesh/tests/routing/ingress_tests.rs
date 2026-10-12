@@ -322,8 +322,10 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
                 }
             );
         }
+        // Preparation finished before the deadline passed, so the request is
+        // still forwarded rather than discarded.
         let response = router.route_inference(expired, &app).await;
-        assert_eq!(response.headers()["x-mesh-error-code"], "prepare_timeout");
+        assert_eq!(response.headers()["x-mesh-error-code"], "model_not_found");
         let response = router.route_inference(invalid, &app).await;
         assert_eq!(response.headers()["x-mesh-error-code"], "invalid_request");
     }
@@ -650,7 +652,7 @@ async fn universal_parse_keeps_native_router_preparation_contract() {
 }
 
 #[tokio::test]
-async fn native_handoff_releases_raw_input_and_checks_preparation_deadline() {
+async fn native_handoff_releases_raw_input_even_after_the_preparation_deadline() {
     use crate::routers::RouterTrait;
 
     for expired in [false, true] {
@@ -680,12 +682,9 @@ async fn native_handoff_releases_raw_input_and_checks_preparation_deadline() {
             pool: pool.handle(),
             raw_dropped: Some(dropped.clone()),
         };
+        // A deadline passing after preparation must not discard the request.
         let response = router.route_inference(request, &app).await;
-        if expired {
-            assert_eq!(response.headers()["x-mesh-error-code"], "prepare_timeout");
-        } else {
-            assert_eq!(response.status(), http::StatusCode::OK);
-        }
+        assert_eq!(response.status(), http::StatusCode::OK);
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(pool.handle().stats().retained_input_bytes, 0);
     }
@@ -992,4 +991,24 @@ async fn http_ingress_prepares_routing_tokens_in_the_parse_job() {
     let (_, (metadata, tokens)) = request.prepare_routing(&closed, &routing).await.unwrap();
     assert_eq!(metadata.text, "hello world");
     assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
+}
+
+#[test]
+fn untyped_item_references_are_accepted_as_state_references() {
+    for (input, state) in [
+        (json!([{"id": "msg_1"}]), true),
+        (json!([{"type": "item_reference", "id": "msg_1"}]), true),
+        (json!([{"role": "user", "content": "hi"}]), false),
+        (
+            json!([{"type": "message", "role": "user", "content": "hi"}]),
+            false,
+        ),
+    ] {
+        let body = serde_json::to_vec(&json!({"model": "m", "input": input})).unwrap();
+        let parsed = ParsedInference::parse("/v1/responses", &body).unwrap();
+        assert_eq!(parsed.requires_state_domain(), state, "{input}");
+    }
+    // An untyped item with neither an id nor a message shape is still invalid.
+    let body = serde_json::to_vec(&json!({"model": "m", "input": [{"content": "hi"}]})).unwrap();
+    assert!(ParsedInference::parse("/v1/responses", &body).is_err());
 }

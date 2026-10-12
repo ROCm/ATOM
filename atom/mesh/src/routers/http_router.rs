@@ -456,7 +456,15 @@ impl Router {
             .into_iter()
             .enumerate()
             .map(|(index, request)| async move {
-                (index, request.send().await.map_err(convert_reqwest_error))
+                // A transport failure means this backend could not answer; keep
+                // its internal URL out of the client-visible error.
+                let result = request.send().await.map_err(|_| {
+                    error::bad_gateway(
+                        "backend_unreachable",
+                        "a backend that may own this response could not be reached",
+                    )
+                });
+                (index, result)
             });
         let mut stream = stream::iter(futures).buffer_unordered(32);
         let mut best_error: Option<((u8, usize), Response)> = None;
@@ -477,7 +485,12 @@ impl Router {
                 Err(response) => response,
             };
             let status = response.status();
-            let priority = if status.is_client_error() && status != StatusCode::NOT_FOUND {
+            // A backend without these routes says nothing about the resource.
+            let route_unsupported =
+                status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::NOT_IMPLEMENTED;
+            let priority = if route_unsupported {
+                4
+            } else if status.is_client_error() && status != StatusCode::NOT_FOUND {
                 0
             } else if status.is_server_error() {
                 1
@@ -487,7 +500,8 @@ impl Router {
                 2
             };
             // Preserve actionable client errors over failures at other backends.
-            // A missing resource is the fallback; ties follow URL order.
+            // An unreachable or failing backend may own the resource, so its
+            // error outranks 404; ties follow URL order.
             let rank = (priority, index);
             if best_error
                 .as_ref()
@@ -653,6 +667,30 @@ impl Router {
     }
 }
 
+const CONNECTION_FAILED_CODE: &str = "call_upstream_connection_failed";
+
+/// Mesh-local errors caused by configuration or the request itself; retrying
+/// another worker cannot change the outcome.
+const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
+    "invalid_backend_credentials",
+    "worker_request_preparation_failed",
+    "invalid_request",
+];
+
+/// Decide whether an inference attempt should be retried on another worker.
+pub(super) fn should_retry_inference(route: &str, response: &Response) -> bool {
+    let code = extract_error_code_from_response(response);
+    if NON_RETRYABLE_ERROR_CODES.contains(&code) {
+        return false;
+    }
+    // A Responses submission that reached a backend may already have created
+    // stored work, so only fail over when the connection was never made.
+    if route == "/v1/responses" {
+        return code == CONNECTION_FAILED_CODE;
+    }
+    is_retryable_status(response.status())
+}
+
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let url = e
         .url()
@@ -661,8 +699,12 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let message = format!("{}. URL: {}", e, url);
 
     // TODO improve error status code
+    // Connection failures are also request errors; classify them first so
+    // callers can tell that nothing reached the backend.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
+    } else if e.is_connect() {
+        (StatusCode::INTERNAL_SERVER_ERROR, CONNECTION_FAILED_CODE)
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -690,11 +732,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         )
     } else if e.is_timeout() {
         (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
-    } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
-        )
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -777,10 +814,7 @@ impl RouterTrait for Router {
                 );
                 response
             },
-            // A failed Responses submission may already have created stored work.
-            |response, _| {
-                metadata.route != "/v1/responses" && is_retryable_status(response.status())
-            },
+            |response, _| should_retry_inference(metadata.route, response),
             |delay, attempt| {
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
                 MeshMetrics::record_worker_retry_backoff(attempt, delay);
@@ -896,6 +930,28 @@ mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
     use crate::policies::PolicyRegistry;
+
+    #[test]
+    fn retries_skip_configuration_errors_and_responses_only_fail_over_unsent() {
+        let mesh_error =
+            |status, code: &str| error::create_error(status, code.to_owned(), "message");
+        for &code in NON_RETRYABLE_ERROR_CODES {
+            let response = mesh_error(StatusCode::SERVICE_UNAVAILABLE, code);
+            assert!(
+                !should_retry_inference("/v1/chat/completions", &response),
+                "{code}"
+            );
+        }
+        let unsent = mesh_error(StatusCode::INTERNAL_SERVER_ERROR, CONNECTION_FAILED_CODE);
+        let backend_failure = mesh_error(StatusCode::BAD_GATEWAY, "call_upstream_status_error");
+        assert!(should_retry_inference("/v1/chat/completions", &unsent));
+        assert!(should_retry_inference(
+            "/v1/chat/completions",
+            &backend_failure
+        ));
+        assert!(should_retry_inference("/v1/responses", &unsent));
+        assert!(!should_retry_inference("/v1/responses", &backend_failure));
+    }
 
     fn create_test_regular_router() -> Router {
         use crate::core::WorkerType;

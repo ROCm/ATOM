@@ -28,7 +28,6 @@ use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest};
 use crate::{
     config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig},
     core::{
-        is_retryable_status,
         placement::{
             backend::{
                 atom::{AtomAdapter, AtomPrefillInfo},
@@ -756,7 +755,7 @@ impl PDRouter {
                         .await
                 }
             },
-            |response, _| is_retryable_status(response.status()),
+            |response, _| super::http_router::should_retry_inference(context.route, response),
             |delay, attempt| {
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
