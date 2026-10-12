@@ -86,7 +86,23 @@ _STEP_PROBE_ON = __import__("os").environ.get("ATOM_MP_STEP_PROBE") == "1"
 # against ~20 us to re-record a pooled one, once per step.
 # ATOM_MP_EVENT_POOL=1 takes it back for a configuration that has measured
 # the pair itself.
-_EVENT_POOL_ON = __import__("os").environ.get("ATOM_MP_EVENT_POOL", "0") == "1"
+def event_pool_enabled(env=None) -> bool:
+    """Whether the interprocess step-event pool is on. Opt-in, exactly "1".
+
+    A function rather than a bare expression so a test can ask the question
+    without reloading this module. Reloading it left a second copy of
+    `LMCacheMPConnector` alive -- `native_state_worker` had already imported
+    the first -- which makes `is` and `==` disagree for every test that runs
+    afterwards, and the repo's own conftest guard caught it.
+    """
+    import os
+
+    return (env if env is not None else os.environ).get(
+        "ATOM_MP_EVENT_POOL", "0"
+    ) == "1"
+
+
+_EVENT_POOL_ON = event_pool_enabled()
 
 # tag -> [calls, total_s, max_s, [samples since the last report]]. A mean alone
 # cannot tell a uniformly expensive call from a cheap one with a rare stall, and
