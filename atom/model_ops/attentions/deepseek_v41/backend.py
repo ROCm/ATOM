@@ -26,26 +26,14 @@ from atom.model_ops.engram.device.hashing import (
 from atom.model_ops.engram.device.runtime import EngramInputPreparer
 from atom.model_ops.engram.device.staging import EngramStep
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
+from atom.model_ops.execution_policy import (
+    breakable_capture_enabled,
+    state_probe_blocking,
+)
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
-
-
-def _breakable_cudagraph_enabled() -> bool:
-    """Whether this run may capture graphs around this model's step work.
-
-    Routed through the plugin: the answer is one frontend's, and this file is
-    not that frontend's. Native ATOM owns its own capture loop and never asks
-    vLLM anything, so it takes the False below without importing it.
-    """
-    from atom.plugin import is_vllm
-
-    if not is_vllm():
-        return False
-    from atom.plugin.vllm.breakable_capture import breakable_capture_enabled
-
-    return breakable_capture_enabled()
 
 
 from .checkpoints import StateCopies
@@ -56,40 +44,6 @@ logger = logging.getLogger("atom")
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
-
-
-def _blocking_state_probe() -> bool:
-    """Whether to render the stale-slot verdict in the step that asks for it.
-
-    `prepare_state` can ship the cursor rows asynchronously and judge them a
-    step later, which takes one blocking D2H (~58 us) off each decode step.
-    The deferred path is wrong under concurrency, and wrong in the direction
-    that costs most: it refuses correct state and takes the engine down.
-
-    Measured on the plugin path, FULL_AND_PIECEWISE, 64 concurrent GSM8K
-    requests, no KV connector of any kind:
-
-        needs state at 952, found 951
-
-    while the state-row dump for that same request, printed beside it, reads
-    `computed 953, cursor 953` -- self-consistent. The verdict is rendered
-    against a claim from one step and a `_probe` buffer that later steps have
-    already reused, so the two describe different moments.
-
-    Default on for the plugin path and off for the native one: that is where
-    the fault is observed, and the native engine drives its own scheduler.
-    `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
-
-    This is a guard, not a fix. The register slip in the deferred probe is
-    still not understood, and a check that fails closed on correct state is
-    worse than the microsecond it saves.
-    """
-    override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
-    if override is not None and override != "":
-        return override not in ("0", "false", "False")
-    from atom.plugin import is_plugin_mode
-
-    return bool(is_plugin_mode())
 
 
 def _staging_advances(embeddings, step) -> bool:
@@ -533,7 +487,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         without the per-bucket cost of a cache each (the STATE side alone is
         ~5 MiB per slot).
         """
-        if not _breakable_cudagraph_enabled():
+        if not breakable_capture_enabled():
             return PagedAttentionCache(
                 self.geometry,
                 pages,
@@ -827,7 +781,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
             else cache.prepare_state(
-                step, histories=not on_device or _blocking_state_probe()
+                step, histories=not on_device or state_probe_blocking()
             )
         )
         if self.engram is not None:

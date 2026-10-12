@@ -43,3 +43,25 @@ def breakable_capture_enabled() -> bool:
     except ImportError:
         return False
     return bool(is_breakable_cudagraph_enabled())
+
+
+def install_execution_policy() -> None:
+    """Tell ATOM core what this frontend does, instead of core asking.
+
+    Pushed from the V4.1 model wrapper's constructor, which runs in every
+    worker before the model is ever called, so there is no window in which the
+    model runs against core's native defaults. Idempotent, and cheap enough to
+    repeat: it stores two callables and a flag.
+
+    `state_probe_blocking=True` is this path's answer and not core's default,
+    because the deferred verdict is wrong under concurrency here -- see
+    `atom.model_ops.execution_policy.state_probe_blocking` for the measurement
+    it comes from.
+    """
+    from atom.model_ops.execution_policy import set_execution_policy
+
+    set_execution_policy(
+        capture_breaks_mid_forward=capture_breaks_mid_forward,
+        breakable_capture_enabled=breakable_capture_enabled,
+        state_probe_blocking=True,
+    )

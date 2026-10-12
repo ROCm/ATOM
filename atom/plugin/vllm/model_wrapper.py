@@ -469,6 +469,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
+        if model_arch in _DEEPSEEK_V41_ARCHES:
+            # Core asks neither of these of the plugin any more; the plugin
+            # states them. Here rather than at registration because this runs
+            # in every worker, and it runs before the model it configures can
+            # be called -- the object does not exist until this returns.
+            from atom.plugin.vllm.breakable_capture import install_execution_policy
+
+            install_execution_policy()
         if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
             self.atom_config, "enable_decoder_swa_bounded_replay", False
         ):
