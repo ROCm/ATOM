@@ -27,6 +27,11 @@ on:
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
+      c48_pending_job:
+        description: 'Adjust one unstarted job from C48 run 38218421252 to g12/g24; requires inspect_run_id=38218421252'
+        required: false
+        default: ''
+        type: string
       inspect_run_id:
         description: 'Collect existing Slurm logs for this GitHub run ID without allocating GPUs'
         required: false
@@ -227,6 +232,23 @@ permissions:
   contents: write
 
 jobs:
+  c48-adjust-pending:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_run_id == '38218421252' && inputs.c48_pending_job != '' }}
+    runs-on: atomesh-cicd
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Adjust only the specified pending C48 job
+        env:
+          C48_JOB: ${{ inputs.c48_pending_job }}
+        run: |
+          python3 .github/scripts/atomesh/pd_c48_adjust_pending.py --job "$C48_JOB" --out c48-node-adjustment
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: c48-node-adjustment-${{ inputs.c48_pending_job }}-${{ github.run_id }}
+          path: c48-node-adjustment/
+          retention-days: 14
   inspect-run:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_run_id != '' }}
     name: Inspect existing Slurm logs
