@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+import torch
+
+logger = logging.getLogger("atom.plugin.sglang.models.glm52_dsa")
+_indexer_run_logged = False
 
 from atom.plugin.sglang.models.deepseek_mla import (
     _align_qknorm_fusion_for_sglang,
@@ -56,10 +62,19 @@ def _install_short_verify_indexer_skip(module: Any) -> None:
 
     def _sparse_attn_indexer(*args: Any, **kwargs: Any):
         from atom.distributed.dcp_utils import get_dcp_world_size
+        from atom.plugin.sglang.glm52_dsa_bridge import (
+            clamp_published_indexer_context,
+            mask_oob_indexer_pages,
+        )
+        from atom.plugin.sglang.runtime.attention_backend_resolver import (
+            resolve_sglang_runtime,
+        )
+        from atom.plugin.sglang.runtime.context import get_current_forward_batch
         from atom.utils.forward_context import get_forward_context
 
         context = get_forward_context()
         metadata = getattr(context, "attn_metadata", None)
+        forward_batch = get_current_forward_batch()
         is_prefill = bool(
             getattr(getattr(context, "context", None), "is_prefill", False)
         )
@@ -70,6 +85,47 @@ def _install_short_verify_indexer_skip(module: Any) -> None:
             topk_tokens=int(getattr(indexer, "topk_tokens", 0) or 0),
         ):
             return None
+        if metadata is not None and forward_batch is not None:
+            runtime = resolve_sglang_runtime(forward_batch)
+            clamp_published_indexer_context(
+                metadata, forward_batch, runtime.req_to_token_pool
+            )
+            mask_oob_indexer_pages(metadata, runtime.token_to_kv_pool)
+        global _indexer_run_logged
+        if not _indexer_run_logged:
+            _indexer_run_logged = True
+            context_lens = getattr(metadata, "context_lens", None)
+            block_tables = getattr(metadata, "block_tables", None)
+            slot_mapping = getattr(metadata, "slot_mapping", None)
+            claimed_max = (
+                int(context_lens.max().item())
+                if torch.is_tensor(context_lens) and int(context_lens.numel())
+                else -1
+            )
+            page_max = (
+                int(block_tables.max().item())
+                if torch.is_tensor(block_tables) and int(block_tables.numel())
+                else -1
+            )
+            slot_max = (
+                int(slot_mapping.max().item())
+                if torch.is_tensor(slot_mapping) and int(slot_mapping.numel())
+                else -1
+            )
+            mode = getattr(getattr(forward_batch, "forward_mode", None), "name", "?")
+            logger.warning(
+                "GLM indexer run mode=%s prefill=%s q=%s k=%s claimed_max=%s rows=%s "
+                "pages=%s page_max=%s slot_max=%s",
+                mode,
+                is_prefill,
+                int(getattr(metadata, "max_seqlen_q", -1) or -1),
+                int(getattr(metadata, "max_seqlen_k", -1) or -1),
+                claimed_max,
+                int(context_lens.numel()) if torch.is_tensor(context_lens) else 0,
+                tuple(block_tables.shape) if torch.is_tensor(block_tables) else None,
+                page_max,
+                slot_max,
+            )
         return original(*args, **kwargs)
 
     indexer.sparse_attn_indexer_impl = _sparse_attn_indexer

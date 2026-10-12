@@ -67,6 +67,9 @@ def widen_verify_storage(real_metadata, forward_batch, real_positions, **build_k
     )
     capacity_batch = copy.copy(forward_batch)
     capacity_batch.positions = capacity_positions
+    # This build only sizes the captured buffers. The rows are still empty,
+    # so a written-prefix cap would collapse the allocation to one token.
+    capacity_batch._atom_glm52_keep_graph_fill = True
     wide = build_mtp_verify_decode_metadata(
         capacity_batch,
         capacity_positions,
@@ -430,6 +433,8 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                 req_pool_indices=forward_batch.req_pool_indices[:bs],
                 seq_lens=forward_batch.seq_lens[:bs],
                 seq_lens_cpu=forward_batch.seq_lens_cpu[:bs],
+                seq_lens_sum=getattr(forward_batch, "seq_lens_sum", None),
+                num_padding=int(getattr(forward_batch, "num_padding", 0) or 0),
                 out_cache_loc=forward_batch.out_cache_loc[:total_tokens],
                 positions=positions,
                 spec_info=SimpleNamespace(draft_token_num=draft_token_num),
@@ -508,6 +513,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens.detach().cpu(),
             out_cache_loc=None,
+            _atom_glm52_keep_graph_fill=True,
         )
         self._build_decode_graph_metadata(forward_batch, max_bs=int(bs))
 
@@ -562,6 +568,8 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
+                seq_lens_sum=getattr(replay_batch, "seq_lens_sum", None),
+                num_padding=int(getattr(replay_batch, "num_padding", 0) or 0),
                 out_cache_loc=graph_buffers.out_cache_loc[:total_tokens],
                 positions=positions,
                 spec_info=SimpleNamespace(draft_token_num=draft_token_num),
@@ -622,6 +630,7 @@ class ATOMGLM52DSABackendForSgl(AttentionBackend):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens.detach().cpu(),
             out_cache_loc=None,
+            _atom_glm52_keep_graph_fill=True,
         )
         self._build_decode_graph_metadata(
             forward_batch,

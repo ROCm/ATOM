@@ -7,8 +7,12 @@ from __future__ import annotations
 
 # --- common.py ---
 # Shared GLM-5.2 DSA bridge helpers (all MTP phases).
+import logging
+
 import numpy as np
 import torch
+
+logger = logging.getLogger("atom.plugin.sglang.glm52_dsa_bridge")
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 
@@ -83,6 +87,191 @@ def _prefer_real_length(primary: int, alternate: int) -> int:
     return max(int(primary), int(alternate))
 
 
+def _drop_unconfirmed_graph_fill(lengths: np.ndarray, forward_batch) -> np.ndarray:
+    """Drop a CUDA-graph capacity sentinel the host sum does not confirm.
+
+    Capture fills ``seq_lens`` with ``GLM52_GRAPH_SEQ_LEN_CAPACITY``. Replay
+    padding keeps that sentinel, and a live row can keep it too while
+    ``seq_lens_sum`` still counts the tokens prefill wrote. The verify indexer
+    then loads ``req_to_token`` past the KV cache and the GPU faults. A real
+    context at the capacity has a matching host sum and is preserved. No host
+    sum means this is the capture allocation, which must stay wide.
+    """
+
+    out = np.asarray(lengths, dtype=np.int32).copy()
+    if out.size == 0 or not np.any(out >= int(GLM52_GRAPH_SEQ_LEN_CAPACITY)):
+        return out
+    seq_lens_sum = getattr(forward_batch, "seq_lens_sum", None)
+    if seq_lens_sum is None:
+        return out
+
+    fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+    num_padding = max(0, min(num_padding, int(out.size)))
+    raw_bs = int(out.size) - num_padding
+    host_sum = int(seq_lens_sum)
+    if num_padding and host_sum >= num_padding * fill:
+        host_sum -= num_padding * fill
+    if num_padding:
+        out[raw_bs:] = 1
+    if raw_bs <= 0 or not np.any(out[:raw_bs] >= fill):
+        return out
+    raw = out[:raw_bs]
+    if int(raw.sum()) == host_sum or host_sum >= fill * raw_bs:
+        return out
+    if raw_bs == 1 and host_sum > 0:
+        raw[0] = np.int32(host_sum)
+    else:
+        raw[raw >= fill] = 1
+    logger.warning(
+        "GLM graph-fill context %s does not match host sum %s; walking %s",
+        np.asarray(lengths, dtype=np.int32).tolist(),
+        int(seq_lens_sum),
+        out.tolist(),
+    )
+    return out
+
+
+def _cap_context_to_written_tokens(
+    context_lens: np.ndarray,
+    forward_batch,
+    req_to_token_pool,
+) -> np.ndarray:
+    """Do not walk ``req_to_token`` past the tokens this request has stored.
+
+    Slot 0 is the dummy pad. A live row is a packed prefix of real cache
+    locations followed by zeros. A CUDA-graph fill of 10240 keeps reading
+    that tail, and those page ids are what the verify indexer faults on.
+    """
+
+    context = np.asarray(context_lens, dtype=np.int32).copy()
+    if (
+        context.size == 0
+        or req_to_token_pool is None
+        or getattr(forward_batch, "_atom_glm52_keep_graph_fill", False)
+    ):
+        return context
+    table = getattr(req_to_token_pool, "req_to_token", None)
+    indices = getattr(forward_batch, "req_pool_indices", None)
+    if not torch.is_tensor(table) or not torch.is_tensor(indices):
+        return context
+    bs = int(context.size)
+    if int(indices.numel()) < bs:
+        return context
+    limit = int(context.max(initial=0))
+    if limit <= 0:
+        return context
+    limit = min(limit, int(table.shape[1]))
+    rows = table[indices[:bs].to(device=table.device, dtype=torch.long), :limit]
+    filled = rows != 0
+    first_zero = filled.to(torch.int32).argmin(dim=1)
+    counts = torch.where(
+        filled.all(dim=1),
+        torch.full_like(first_zero, limit),
+        first_zero,
+    )
+    counts_np = counts.detach().cpu().numpy().astype(np.int32)
+    # A claim at the graph fill is not a context. A written prefix is the
+    # tokens prefill stored; an empty row has no such tokens (capture keeps
+    # the fill only when ``_atom_glm52_keep_graph_fill`` is set). Walking the
+    # fill on either row is the verify/draft indexer fault.
+    capped = context.copy()
+    fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    # A positive written prefix is the KV this row actually holds, even when
+    # the claim is shorter than the graph fill. An empty row is only shortened
+    # at the fill: capture stages a 4-token verify on a still-empty row.
+    shrink = (counts_np < context) & ((counts_np > 0) | (context >= fill))
+    capped[shrink] = np.maximum(counts_np[shrink], 1)
+    if np.any(shrink):
+        logger.warning(
+            "GLM capped %d rows from max claimed %d to max written %d",
+            int(np.sum(shrink)),
+            int(context.max()),
+            int(capped.max()),
+        )
+    return capped.astype(np.int32)
+
+
+def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) -> None:
+    """Shrink a published decode context that still carries the graph fill.
+
+    Replay can hand the indexer the capture buffer after the host length was
+    already copied in. The kernel reads this tensor, not the numpy that built
+    it, so the clamp has to land here.
+    """
+
+    context = getattr(metadata, "context_lens", None)
+    if not torch.is_tensor(context) or int(context.numel()) == 0:
+        return
+    if getattr(forward_batch, "_atom_glm52_keep_graph_fill", False):
+        return
+    claimed = context.detach().to(dtype=torch.int32, device="cpu").reshape(-1).numpy()
+    capped = _cap_context_to_written_tokens(claimed, forward_batch, req_to_token_pool)
+    fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    if int(capped.max(initial=0)) >= fill and not getattr(
+        clamp_published_indexer_context, "_logged_fill", False
+    ):
+        clamp_published_indexer_context._logged_fill = True
+        logger.warning(
+            "GLM indexer context still at the graph fill: claimed_max=%s capped_max=%s rows=%s",
+            int(claimed.max(initial=0)),
+            int(capped.max(initial=0)),
+            int(capped.size),
+        )
+    if np.array_equal(capped, claimed):
+        return
+    context.copy_(
+        torch.from_numpy(capped).to(device=context.device, dtype=context.dtype).reshape(
+            context.shape
+        )
+    )
+    if hasattr(metadata, "max_seqlen_k"):
+        metadata.max_seqlen_k = int(max(int(capped.max(initial=1)), 1))
+
+
+def mask_oob_indexer_pages(metadata, token_to_kv_pool) -> None:
+    """Drop page ids and slots that are outside this rank's KV allocation.
+
+    The verify indexer faults when a block-table entry is a token slot used as
+    a page id, or a slot past ``token_to_kv_pool.size``. In-range ids are left
+    alone.
+    """
+
+    if token_to_kv_pool is None:
+        return
+    n_slots = int(getattr(token_to_kv_pool, "size", 0) or 0)
+    if n_slots <= 0:
+        return
+    page = max(1, int(getattr(token_to_kv_pool, "page_size", 1) or 1))
+    n_pages = (n_slots + page - 1) // page
+    block_tables = getattr(metadata, "block_tables", None)
+    if torch.is_tensor(block_tables) and int(block_tables.numel()):
+        oob = block_tables >= n_pages
+        # A negative page is not a cache line either.
+        oob = oob | (block_tables < 0)
+        if bool(oob.any().item()):
+            if not getattr(mask_oob_indexer_pages, "_logged", False):
+                mask_oob_indexer_pages._logged = True
+                logger.warning(
+                    "GLM indexer masked %d block-table entries at or past %d pages",
+                    int(oob.sum().item()),
+                    n_pages,
+                )
+            block_tables.masked_fill_(oob, 0)
+    slot_mapping = getattr(metadata, "slot_mapping", None)
+    if torch.is_tensor(slot_mapping) and int(slot_mapping.numel()):
+        bad_slot = slot_mapping >= n_slots
+        if bool(bad_slot.any().item()):
+            if not getattr(mask_oob_indexer_pages, "_logged_slot", False):
+                mask_oob_indexer_pages._logged_slot = True
+                logger.warning(
+                    "GLM indexer masked %d slots at or past kv size %d",
+                    int(bad_slot.sum().item()),
+                    n_slots,
+                )
+            slot_mapping.masked_fill_(bad_slot, -1)
+
+
 def resolve_draft_decode_context_lens(
     forward_batch,
     positions: torch.Tensor | None,
@@ -99,7 +288,9 @@ def resolve_draft_decode_context_lens(
     if bs <= 0:
         bs = int(forward_batch.batch_size)
 
-    committed = get_seq_lens_cpu(forward_batch, bs)
+    committed = _drop_unconfirmed_graph_fill(
+        get_seq_lens_cpu(forward_batch, bs), forward_batch
+    )
     effective = (committed + int(sub_step) + 1).astype(np.int32)
 
     if torch.is_tensor(positions) and int(positions.numel()) > 0:
@@ -704,6 +895,13 @@ def build_mtp_multi_token_decode_metadata(
     prefix_lens_np, context_lens_np = resolve_lens_fn(
         forward_batch, positions, bs, draft_token_num
     )
+    capped_context = _cap_context_to_written_tokens(
+        context_lens_np, forward_batch, req_to_token_pool
+    )
+    prefix_lens_np = np.maximum(
+        prefix_lens_np - (context_lens_np - capped_context), 0
+    ).astype(np.int32)
+    context_lens_np = capped_context
     extend_lens = np.full(bs, draft_token_num, dtype=np.int32)
     sum_scheduled_tokens = bs * max_seqlen_q
 
@@ -836,7 +1034,9 @@ def resolve_target_verify_lens(
             f"bs={bs}, draft_token_num={draft_token_num}"
         )
     prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
-    seq_lens = get_seq_lens_cpu(forward_batch, bs)
+    seq_lens = _drop_unconfirmed_graph_fill(
+        get_seq_lens_cpu(forward_batch, bs), forward_batch
+    )
     if use_positions:
         # Capture leaves positions at ``capacity - draft``. A shorter committed
         # seq_lens is the context prefill actually wrote.
@@ -969,7 +1169,14 @@ def _build_mtp_draft_decode_metadata(
     num_heads = local_num_attention_heads(atom_config)
 
     context_lens_np = resolve_draft_decode_lens(forward_batch, positions, bs, sub_step)
-    committed_np = get_seq_lens_cpu(forward_batch, bs)
+    context_lens_np = _cap_context_to_written_tokens(
+        context_lens_np, forward_batch, req_to_token_pool
+    )
+    # The table gather adds ``sub_step + 1`` itself. Feed it the same committed
+    # length the resolver just published, not the raw graph-fill seq_lens.
+    committed_np = np.maximum(
+        context_lens_np - int(sub_step) - 1, 0
+    ).astype(np.int32)
     num_steps = resolve_speculative_num_steps(
         forward_batch, default=max(sub_step + 1, 1)
     )
@@ -1104,20 +1311,28 @@ def build_decode_metadata(
     page_size = validate_page_size(token_to_kv_pool, atom_config)
 
     spec_kv = resolve_spec_decode_kv(forward_batch)
+    seq_lens = None
     if spec_kv is not None:
         kv_indptr, kv_indices, bs = spec_kv
-        seq_lens = (
+        raw_seq_lens = (
             (kv_indptr[1:] - kv_indptr[:-1]).detach().cpu().numpy().astype(np.int32)
         )
-        block_tables = build_token_table(
-            forward_batch,
-            req_to_token_pool,
-            seq_lens=seq_lens,
-            extend_lens=None,
-            page_size=page_size,
+        seq_lens = _drop_unconfirmed_graph_fill(raw_seq_lens, forward_batch)
+        seq_lens = _cap_context_to_written_tokens(
+            seq_lens, forward_batch, req_to_token_pool
         )
-    else:
-        seq_lens = get_seq_lens_cpu(forward_batch, bs)
+        if not np.array_equal(seq_lens, raw_seq_lens):
+            # The spec table still describes the graph fill. Rebuild from the
+            # confirmed length so the indexer and the indptr agree.
+            spec_kv = None
+    if spec_kv is None:
+        if seq_lens is None:
+            seq_lens = _drop_unconfirmed_graph_fill(
+                get_seq_lens_cpu(forward_batch, bs), forward_batch
+            )
+            seq_lens = _cap_context_to_written_tokens(
+                seq_lens, forward_batch, req_to_token_pool
+            )
         block_tables = build_token_table(
             forward_batch,
             req_to_token_pool,
@@ -1134,6 +1349,14 @@ def build_decode_metadata(
         )
         kv_indptr = counts_to_indptr(seq_lens, device)
         kv_indices = flatten_kv_indices(token_table, seq_lens)
+    else:
+        block_tables = build_token_table(
+            forward_batch,
+            req_to_token_pool,
+            seq_lens=seq_lens,
+            extend_lens=None,
+            page_size=page_size,
+        )
 
     cu_q = torch.arange(bs + 1, dtype=torch.int32, device=device)
     kv_last_page_lens = torch.ones(bs, dtype=torch.int32, device=device)
@@ -1197,7 +1420,9 @@ def resolve_draft_extend_lens(
 ):
     """Return prefix and total KV lengths for DRAFT_EXTEND_V2."""
     draft_token_num = int(draft_token_num)
-    seq_lens = get_seq_lens_cpu(forward_batch, bs)
+    seq_lens = _drop_unconfirmed_graph_fill(
+        get_seq_lens_cpu(forward_batch, bs), forward_batch
+    )
     position_rows = positions.detach().cpu().numpy().astype(np.int32)
     required = bs * draft_token_num
     if position_rows.size >= required:
@@ -1684,10 +1909,24 @@ def build_atom_glm52_decode_graph_metadata_from_sglang(
 ):
     from atom.utils.forward_context import AttentionMetaData, AttnState
 
-    del positions
     device = forward_batch.seq_lens.device
     bs = int(forward_batch.batch_size)
-    seq_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
+    seq_lens_np = _drop_unconfirmed_graph_fill(
+        get_seq_lens_cpu(forward_batch, bs), forward_batch
+    )
+    if torch.is_tensor(positions) and int(positions.numel()) > 0:
+        pos_rows = positions.detach().cpu().numpy().astype(np.int32).reshape(-1)
+        for row in range(int(seq_lens_np.size)):
+            if row < int(pos_rows.size):
+                seq_lens_np[row] = _prefer_real_length(
+                    int(seq_lens_np[row]), int(pos_rows[row]) + 1
+                )
+    seq_lens_np = _cap_context_to_written_tokens(
+        seq_lens_np, forward_batch, req_to_token_pool
+    )
+    seq_lens = torch.from_numpy(np.ascontiguousarray(seq_lens_np)).to(
+        device=device, dtype=torch.int32
+    )
     if max_context_len is None:
         req_to_token = req_to_token_pool.req_to_token
         max_context_len = int(req_to_token.shape[1])

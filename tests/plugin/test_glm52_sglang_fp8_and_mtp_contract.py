@@ -7,8 +7,11 @@ import torch
 from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
     verify_kernel_positions,
 )
+import numpy as np
+
 from atom.plugin.sglang.glm52_dsa_bridge import (
     GLM52_GRAPH_SEQ_LEN_CAPACITY,
+    _cap_context_to_written_tokens,
     resolve_draft_decode_context_lens,
     resolve_target_verify_lens,
 )
@@ -109,6 +112,66 @@ def test_graph_fill_does_not_override_a_real_mtp_context():
         use_positions=True,
     )
     assert capture_context.tolist() == [4]
+
+    # Live replay: seq_lens is still the fill, but the host sum is the prompt.
+    # Positions derived from the fill are not a second source. Walk the sum.
+    stale = SimpleNamespace(
+        batch_size=1,
+        seq_lens_cpu=torch.tensor([sentinel], dtype=torch.int32),
+        seq_lens_sum=8,
+    )
+    _, stale_context = resolve_target_verify_lens(
+        stale,
+        torch.arange(sentinel - 4, sentinel, dtype=torch.int64),
+        1,
+        4,
+        use_positions=True,
+    )
+    assert stale_context.tolist() == [8]
+
+    # A real context that lands on the capacity still matches its host sum.
+    confirmed = SimpleNamespace(
+        batch_size=1,
+        seq_lens_cpu=torch.tensor([sentinel], dtype=torch.int32),
+        seq_lens_sum=sentinel,
+    )
+    _, confirmed_context = resolve_target_verify_lens(
+        confirmed,
+        torch.arange(sentinel - 4, sentinel, dtype=torch.int64),
+        1,
+        4,
+        use_positions=True,
+    )
+    assert confirmed_context.tolist() == [sentinel]
+
+    padded = SimpleNamespace(
+        batch_size=4,
+        seq_lens_cpu=torch.tensor([12, sentinel, sentinel, sentinel], dtype=torch.int32),
+        seq_lens_sum=12 + 3 * sentinel,
+        num_padding=3,
+    )
+    padded_lens = resolve_draft_decode_context_lens(
+        padded, torch.tensor([11, 0, 0, 0], dtype=torch.int64), 4, 0
+    )
+    assert padded_lens.tolist() == [13, 2, 2, 2]
+
+
+def test_context_stops_at_the_written_req_to_token_prefix():
+    pool = SimpleNamespace(
+        req_to_token=torch.tensor(
+            [
+                [4, 5, 6, 0, 0, 9],
+                [0, 0, 0, 0, 0, 0],
+                [7, 8, 9, 10, 11, 12],
+            ],
+            dtype=torch.int32,
+        )
+    )
+    batch = SimpleNamespace(req_pool_indices=torch.tensor([0, 1, 2]))
+    capped = _cap_context_to_written_tokens(
+        np.array([10240, 10240, 4], dtype=np.int32), batch, pool
+    )
+    assert capped.tolist() == [3, 1, 4]
 
 
 def test_head_chunk_keeps_the_padded_flash_stride():
