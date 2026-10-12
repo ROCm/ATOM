@@ -948,7 +948,9 @@ def bind_deepseek_v41_proxy_cache(
     if getattr(model, "_atom_v41_proxy_cache_ptr", None) == ptr:
         return True
 
-    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.plugin.vllm.v41_external_cache import (
+        VllmBackedPagedAttentionCache,
+    )
 
     # vLLM hands this back in one of two ranks, and the difference is which
     # side applied `get_kv_cache_stride_order`. Through 0.28 the tensor keeps
@@ -1026,7 +1028,7 @@ def bind_deepseek_v41_proxy_cache(
         )
 
     builder.num_blocks = pages
-    builder.cache = PagedAttentionCache(
+    builder.cache = VllmBackedPagedAttentionCache(
         geometry,
         pages,
         num_slots,

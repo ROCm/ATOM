@@ -750,8 +750,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         """One CSA2 step's host-side work: Engram rows, state, cursor.
 
         Called by the metadata builder, before the forward and outside any
-        capture, which is what lets this model be captured at all. None of this can be replayed from a graph --
-        the Engram row staging hashes token ids, `prepare_state` resets the
+        capture, which is what lets this model be captured at all. None of
+        this can be replayed from a graph -- the Engram row staging hashes
+        token ids, `prepare_state` resets the
         slots this batch recycled, and `advance_cursor` writes the committed
         position -- and it has to happen once, in order, per step.
 
