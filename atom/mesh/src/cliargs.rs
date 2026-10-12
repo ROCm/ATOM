@@ -721,6 +721,7 @@ impl CliArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::runtime::default_prepare_workers;
 
     #[test]
     fn cli_prepare_options_map_to_router_config() {
@@ -768,7 +769,7 @@ mod tests {
                 .to_router_config(Vec::new())
                 .unwrap()
                 .resolved_prepare_workers(),
-            10
+            default_prepare_workers()
         );
         assert_eq!(config.resolved_prepare_pool().queue_capacity, 6);
         assert_eq!(
@@ -777,7 +778,7 @@ mod tests {
                 .unwrap()
                 .resolved_prepare_pool()
                 .queue_capacity,
-            100
+            default_prepare_workers() * 10
         );
     }
 
@@ -815,13 +816,16 @@ mod tests {
     #[test]
     fn cli_prepare_and_legacy_ext_proc_options_have_independent_ids() {
         let defaults = CliArgs::try_parse_from(["atomesh", "--ext-proc"]).unwrap();
-        assert_eq!(defaults.ext_proc.parser_concurrency, 10);
+        assert_eq!(
+            defaults.ext_proc.parser_concurrency,
+            default_prepare_workers()
+        );
         assert_eq!(
             defaults
                 .to_router_config(Vec::new())
                 .unwrap()
                 .resolved_prepare_workers(),
-            10
+            default_prepare_workers().min(defaults.ext_proc.max_streams)
         );
         let legacy = CliArgs::try_parse_from([
             "atomesh",

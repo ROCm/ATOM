@@ -9,6 +9,7 @@ use crate::{
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
     },
     config::RoutingMode,
+    core::runtime::build_runtime,
     routers::atom_standalone::AtomStandaloneRuntime,
     server::{self, ServerConfig},
     version,
@@ -76,7 +77,7 @@ pub fn launch_mesh(
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
-    let tokio_runtime = tokio::runtime::Runtime::new()
+    let tokio_runtime = build_runtime()
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
     tokio_runtime
         .block_on(async move { server::startup(server_config).await })
@@ -397,7 +398,7 @@ mod tests {
                     .unwrap()
                     .router_config
                     .resolved_prepare_workers(),
-                10
+                crate::core::runtime::default_prepare_workers().min(ext_proc.max_streams)
             );
         });
     }

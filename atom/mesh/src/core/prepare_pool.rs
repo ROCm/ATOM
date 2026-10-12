@@ -19,12 +19,12 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+use super::runtime::default_prepare_workers;
+
 const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
 const CANCELLED_QUEUED: u8 = 2;
 const FINISHED: u8 = 3;
-
-pub const DEFAULT_PREPARE_WORKERS: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -39,9 +39,10 @@ pub struct PoolConfig {
 
 impl Default for PoolConfig {
     fn default() -> Self {
+        let workers = default_prepare_workers();
         Self {
-            workers: DEFAULT_PREPARE_WORKERS,
-            queue_capacity: DEFAULT_PREPARE_WORKERS * 10,
+            workers,
+            queue_capacity: workers * 10,
             max_retained_input_bytes: 32 * 1024 * 1024,
             queue_timeout: Duration::from_millis(250),
             prepare_timeout: Duration::from_secs(5),
@@ -959,6 +960,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn ten_execution_slots_and_one_hundred_waiters_accept_a_burst() {
         let mut settings = PoolConfig::default();
+        settings.workers = 10;
+        settings.queue_capacity = 100;
         settings.queue_timeout = Duration::from_secs(10);
         settings.prepare_timeout = Duration::from_secs(20);
         let mut runtime = PreparePoolRuntime::new(settings).unwrap();

@@ -241,13 +241,20 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
 
 ## Reliability
 
-- **Request preparation**: Parsing and tokenization use `--prepare-workers` threads
-  (default: 10). The waiting queue defaults to 10 jobs per resolved preparation
-  thread: 100 jobs by default, or 20 with `--prepare-workers 2`.
+- **Request preparation**: Parsing, template rendering and tokenization use a fixed
+  thread pool. By default, Mesh splits Rust's `available_parallelism()` count
+  between preparation and Tokio: 224 available CPUs give 112 preparation threads
+  and 112 Tokio workers. An odd spare CPU goes to Tokio; with one available CPU,
+  each pool still has one worker. `--prepare-workers` and `TOKIO_WORKER_THREADS`
+  independently override their respective defaults. The OS chooses CPU placement,
+  and auxiliary threads may also exist.
+  The waiting queue defaults to 10 jobs per resolved preparation thread: 1120 jobs
+  with 112 threads, or 20 with `--prepare-workers 2`.
   `--prepare-queue-capacity` overrides that limit. Queued jobs still have a
   `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
-  their slot immediately. An enabled ext-proc parser-concurrency setting determines
-  the thread count when `--prepare-workers` is omitted.
+  their slot immediately. When ext-proc is enabled and `--prepare-workers` is
+  omitted, `--ext-proc-parser-concurrency` determines the preparation count,
+  capped by `--ext-proc-max-streams`; its default is the same detected half.
   `--prepare-max-retained-input-bytes` (default: 32 MiB) caps the raw input bytes
   held during preparation, including queueing and result handoff. The charge is
   released before upstream dispatch; forwarding and retries do not hold it.

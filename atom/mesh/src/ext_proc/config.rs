@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{ConfigError, ConfigResult, RouterConfig},
-    core::{prepare_pool::DEFAULT_PREPARE_WORKERS, ConnectionMode},
+    core::{runtime::default_prepare_workers, ConnectionMode},
 };
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
@@ -39,10 +39,10 @@ pub struct ExtProcConfig {
         help_heading = "External Processing"
     )]
     pub max_buffered_bytes: usize,
-    /// Preparation threads when --prepare-workers is unset.
+    /// Preparation threads when --prepare-workers is unset (default: half the available CPUs).
     #[arg(
         long = "ext-proc-parser-concurrency",
-        default_value_t = DEFAULT_PREPARE_WORKERS,
+        default_value_t = default_prepare_workers(),
         help_heading = "External Processing"
     )]
     pub parser_concurrency: usize,
@@ -133,7 +133,7 @@ impl Default for ExtProcConfig {
             max_body_bytes: 8_388_608,
             max_streams: 256,
             max_buffered_bytes: 268_435_456,
-            parser_concurrency: DEFAULT_PREPARE_WORKERS,
+            parser_concurrency: default_prepare_workers(),
             max_tokenize_bytes: 1_048_576,
             reservation_timeout_secs: 10,
             body_timeout_secs: 30,
