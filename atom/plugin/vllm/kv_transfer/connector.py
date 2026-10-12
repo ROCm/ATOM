@@ -80,6 +80,40 @@ logger = logging.getLogger("atom")
 _SAVE_RECONCILE_INTERVAL_S = 5.0
 
 
+
+def _without_v41_image_groups(groups, kv_cache_config):
+    """Drop DeepSeek-V4.1's checkpoint-image group from the recurrent leg.
+
+    The image layers are declared as a `MambaSpec` so vLLM allocates and
+    prefix-caches blocks for them, which makes `find_mamba_groups` pick them
+    up -- but they are ATOM's own state checkpoints, written and read inside
+    the worker, not a recurrent cache to hand to the tier.
+
+    Left in, the recurrent leg produced `KdaStore`s for them and fed them to
+    the V4.1 leg, which expects its own shape: measured as
+    `AttributeError: 'KdaStore' object has no attribute 'req_id'` on the
+    first request, every rank, with the engine down.
+    """
+    from atom.plugin.vllm.v41_state_image import is_image_layer
+
+    cfg_groups = list(getattr(kv_cache_config, "kv_cache_groups", None) or ())
+    kept = []
+    for group_id, spec in groups or ():
+        names = []
+        if 0 <= int(group_id) < len(cfg_groups):
+            names = list(getattr(cfg_groups[int(group_id)], "layer_names", []) or [])
+        if names and all(is_image_layer(n) for n in names):
+            logger.info(
+                "ATOM LMCache offload: kv cache group %s is DeepSeek-V4.1's "
+                "state-image group (%d layers); not offloading it",
+                group_id,
+                len(names),
+            )
+            continue
+        kept.append((group_id, spec))
+    return kept
+
+
 class AtomOffloadMetadata(KVConnectorMetadata):
     """Carries ATOM's offload metadata through vLLM's connector plumbing.
 
@@ -323,8 +357,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Resolved once here so both halves agree on which group is which. A
         # model with no mamba group leaves every field below inert and takes
         # exactly the code path it takes today.
-        self._mamba_groups = find_mamba_groups(
-            getattr(kv_cache_config, "kv_cache_groups", None) or ()
+        self._mamba_groups = _without_v41_image_groups(
+            find_mamba_groups(
+                getattr(kv_cache_config, "kv_cache_groups", None) or ()
+            ),
+            kv_cache_config,
         )
         self._attn_group_id = self._resolve_attention_group(kv_cache_config)
         # DeepSeek-V4.1 registers one proxy layer whose tensor is an opaque
