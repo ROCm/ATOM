@@ -795,7 +795,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
-        """Build or refresh aiter #5546's work plan for this forward.
+        """Build or refresh aiter's FlyDSL work plan for this forward.
 
         Depends only on context_lens, which every layer of one forward shares,
         so it is built here rather than per pa_decode call. Decode replays a

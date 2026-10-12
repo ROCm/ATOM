@@ -190,6 +190,37 @@ def _flydsl_arch_supported() -> bool:
     return get_gfx_runtime() in _FLYDSL_PA_ARCHS
 
 
+@functools.lru_cache(maxsize=1)
+def _flydsl_explicit_plan_api() -> bool:
+    """Whether aiter has #5809's FlyDSL decode API (a required work plan).
+
+    An older aiter would raise on the first call; probing once lets the gate
+    fall back to gluon instead.
+    """
+    import inspect
+
+    try:
+        from aiter.ops.flydsl import pa_decode as mod
+    except ImportError:
+        ok = False
+    else:
+        params = inspect.signature(mod.pa_decode).parameters
+        plan = params.get("work_plan")
+        ok = (
+            hasattr(mod, "plan_pa_decode")
+            and plan is not None
+            and plan.kind is inspect.Parameter.KEYWORD_ONLY
+            and plan.default is inspect.Parameter.empty
+            and "max_context_length" in params
+        )
+    if not ok:
+        logger.warning(
+            "ATOM_PA_FLYDSL=1 but this aiter predates the #5809 FlyDSL paged "
+            "decode API; using gluon."
+        )
+    return ok
+
+
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -241,6 +272,8 @@ def _flydsl_pa_decode_num_seqs(
     if k_cache.shape[-2] not in _FLYDSL_PA_BLOCK_SIZES:
         return None
     if not _flydsl_arch_supported():
+        return None
+    if not _flydsl_explicit_plan_api():
         return None
     if context_partition_size != _FLYDSL_PA_TILE:
         return None
@@ -375,7 +408,6 @@ def _flydsl_prepare_explicit_plan(
     num_seqs,
     query_length,
     plan_partition_cap,
-    sliding_window,
     context_bound,
     existing_plan,
     plan_step_owner=None,
@@ -385,12 +417,12 @@ def _flydsl_prepare_explicit_plan(
     ``plan_partition_cap``: None takes aiter's default partition ceiling.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
+    Plans are window-free: the gate rejects sliding windows.
     """
     from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
     device = q.device
     num_kv_heads = int(k_cache.shape[1])
-    window = max(int(sliding_window), 0)
     if existing_plan is not None:
         max_partitions = int(existing_plan.max_partitions)
     elif plan_partition_cap is not None:
@@ -398,25 +430,25 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = None
 
-    if (
-        existing_plan is not None
-        and flydsl_plan_matches(existing_plan, num_seqs, num_kv_heads)
-        and int(existing_plan.sliding_window) == window
-        and (window == 0 or int(existing_plan.query_length) == query_length)
+    if existing_plan is not None and flydsl_plan_matches(
+        existing_plan, num_seqs, num_kv_heads
     ):
         return existing_plan
 
-    # Keyed by stream (TBO ubatches must not share a plan), never by tensor
-    # address. Step-scoped and per-call plans are kept apart so a per-call
-    # caller cannot leave the step's remaining calls on its lengths.
+    from atom.utils.tbo.ubatching import tbo_current_ubatch_id
+
+    # Never keyed by tensor address. TBO ubatches share one compute stream, so
+    # the ubatch id keeps their plans (and lengths) apart. Step-scoped and
+    # per-call plans are kept apart so a per-call caller cannot leave the
+    # step's remaining calls on its lengths.
     stream_id = int(torch.cuda.current_stream(device=device).cuda_stream)
     plan_key = (
         stream_id,
+        tbo_current_ubatch_id(),
         num_seqs,
         num_kv_heads,
         query_length,
         max_partitions,
-        window,
         device.index,
         plan_step_owner is not None,
     )
@@ -435,7 +467,6 @@ def _flydsl_prepare_explicit_plan(
             lengths,
             num_kv_heads,
             max_partitions=max_partitions,
-            sliding_window=window,
             query_length=query_length,
         )
         _FLYDSL_RUNTIME_PLANS[plan_key] = plan
@@ -453,7 +484,6 @@ def _flydsl_prepare_explicit_plan(
         plan_pa_decode(
             lengths,
             num_kv_heads,
-            sliding_window=window,
             query_length=query_length,
             plan=plan,
         )
@@ -516,7 +546,7 @@ def run_pa_decode(
         sliding_window=sliding_window,
         ps=ps,
     )
-    # aiter's planner rejects more than _FLYDSL_PLAN_MAX_BATCH rows.
+    # aiter's planner rejects more than _FLYDSL_PLAN_MAX_BATCH sequences.
     if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
         flydsl_seqs = None
     # Only on the FlyDSL path; a bound below the query window goes to gluon.
@@ -563,8 +593,8 @@ def run_pa_decode(
         # re-read from the thread-local one: under TBO a worker thread that
         # never installed its own context would read whatever the other ubatch
         # wrote last, and the shape guard below compares only batch and kv-head
-        # count -- two equal-sized ubatches pass. Which call sites pass a plan
-        # is the boundary: the sparse sites and the vLLM/SGLang bridges do not.
+        # count -- two equal-sized ubatches pass. Only the native dense sites
+        # pass a capture-owned plan; the others get a runtime plan below.
         if work_plan is not None and not flydsl_plan_matches(
             work_plan, flydsl_seqs, k_cache.shape[1]
         ):
@@ -592,7 +622,6 @@ def run_pa_decode(
             num_seqs=n,
             query_length=max_seqlen_q,
             plan_partition_cap=plan_partition_cap,
-            sliding_window=sliding_window,
             context_bound=context_bound,
             existing_plan=work_plan,
             plan_step_owner=plan_step_owner,

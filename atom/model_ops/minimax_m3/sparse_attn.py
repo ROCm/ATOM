@@ -1339,9 +1339,10 @@ def minimax_m3_sparse_attn_decode_asm(
             topk_idx, block_table, seq_lens, block_page_stride=block_page_stride
         )
 
-    # All sparse layers of a step share per-row lengths (the tail block is
-    # always selected, so a length depends only on seq_len, given one
-    # topk/init/local config), so the FlyDSL plan is refreshed once per step.
+    # With sparse_local_block >= 1 the tail block is always selected, so every
+    # sparse layer of a step (sharing one topk/init/local config) has the same
+    # per-row lengths and the FlyDSL plan is refreshed once per step. Callers
+    # pass no plan_step_owner otherwise.
     _sparse_pa_per_row(
         q,
         k_cache,

@@ -988,7 +988,6 @@ class TestExplicitPlan:
             num_seqs=n,
             query_length=1,
             plan_partition_cap=cap,
-            sliding_window=0,
             context_bound=2048,
             existing_plan=existing_plan,
             plan_step_owner=owner,
@@ -1104,14 +1103,61 @@ class TestExplicitPlan:
         ``AiterAttentionMetadataBuilder.prepare_decode`` (native) and
         ``MinimaxM3SparseAttentionMetadataBuilder.build`` (vLLM).
         """
+        import ast
+
         for relpath in (
             "model_ops/attention_mha.py",
             "plugin/vllm/attention/minimax_m3_attnetion.py",
         ):
             for kw in self._call_kwargs(relpath, "minimax_m3_sparse_attn_decode_asm"):
-                assert getattr(kw.get("plan_step_owner"), "id", None) == (
-                    "decode_md"
-                ), f"{relpath}: sparse decode does not pass its step metadata"
+                owner = kw.get("plan_step_owner")
+                # `decode_md if self.local_blocks >= 1 else None`: once per
+                # step only while the tail block is forced.
+                assert isinstance(owner, ast.IfExp), f"{relpath}: {owner}"
+                assert getattr(owner.body, "id", None) == "decode_md", relpath
+                assert getattr(owner.orelse, "value", 0) is None, relpath
+                assert "local_blocks" in ast.unparse(owner.test), relpath
+
+    def test_tbo_ubatches_do_not_share_a_step_plan(self, monkeypatch):
+        """TBO ubatches share one compute stream; each needs its own plan."""
+        from atom.utils.tbo import ubatching
+
+        ba, _ = self._setup(monkeypatch)
+        ubatch = [0]
+        monkeypatch.setattr(ubatching, "tbo_current_ubatch_id", lambda: ubatch[0])
+        ub0 = self._call(ba, owner=SimpleNamespace())
+        ubatch[0] = 1
+        ub1 = self._call(ba, owner=SimpleNamespace())
+        assert ub1 is not ub0, "ub1 would overwrite ub0's lengths mid-step"
+        ubatch[0] = 0
+        assert self._call(ba, owner=SimpleNamespace()) is ub0
+
+    def test_old_aiter_api_takes_gluon(self, monkeypatch):
+        """An aiter without #5809's required work plan must not be routed."""
+        from atom.model_ops import base_attention as ba
+
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+
+        def optional_plan(output, *a, work_plan=None, max_context_length=None):
+            raise AssertionError("not called")
+
+        def no_bound(output, *a, work_plan, sinks=None):
+            raise AssertionError("not called")
+
+        try:
+            for old in (optional_plan, no_bound):
+                monkeypatch.setattr(mod, "pa_decode", old)
+                ba._flydsl_explicit_plan_api.cache_clear()
+                assert ba._flydsl_explicit_plan_api() is False, old.__name__
+        finally:
+            monkeypatch.undo()
+            ba._flydsl_explicit_plan_api.cache_clear()
+        assert ba._flydsl_explicit_plan_api() is True
+
+    def test_dense_site_leaves_the_bound_to_the_block_table(self):
+        """max_seqlen_k differs between graph and eager and picks the kernel."""
+        for kw in self._call_kwargs("model_ops/attention_mha.py", "run_pa_decode"):
+            assert "max_context_length" not in kw
 
     def test_step_scoped_and_per_call_plans_do_not_share(self, monkeypatch):
         """A per-call caller of the same shape must not touch the step's plan."""
