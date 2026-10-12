@@ -3531,8 +3531,8 @@ class MooncakeConnector(KVConnectorBase):
         A failure is reported only ``ATOM_PD_FAILED_WRITE_HOLD_S`` later
         (``_report_held_failures``): Mooncake gives up on a sync write without
         cancelling the work it posted, so a failed write may still land in
-        the request's pages, which the scheduler reuses or recomputes into
-        once it hears of the failure. The staging row and stage-0's page
+        the request's pages, which the scheduler frees once it hears of the
+        failure (it aborts the request). The staging row and stage-0's page
         table stay held as long.
         """
         if failed:

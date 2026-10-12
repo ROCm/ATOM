@@ -419,11 +419,9 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     scheduler._count_inflight_load(seq)
     scheduler._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
-    assert scheduler.engine_stats.total_requests == 0
-    # At the failure/success branch, choose fallback without counting a PD hit.
-    # Local prefill admission is covered separately; block recovery is not part
-    # of this metrics change.
-    assert scheduler._resolve_waiting_remote_kv(seq, deque()) is False
+    # The request is aborted, not prefilled here, and counts no PD hit.
+    assert seq.leave_reason == "aborted"
+    assert scheduler.take_rejected() == [seq]
     assert scheduler.engine_stats.total_requests == 0
     assert scheduler.engine_stats.total_full_tokens == 0
     assert scheduler.engine_stats.total_cached_tokens == 0
