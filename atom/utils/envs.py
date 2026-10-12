@@ -1022,6 +1022,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_END_ANCHOR": lambda: _flag_env(
         "ATOM_STATE_CHECKPOINT_END_ANCHOR", "1"
     ),
+    # DeepSeek-V4: take prompt state checkpoints (ladder rungs, demand rungs,
+    # the prompt-end anchor) inside an uncut prefill forward instead of cutting
+    # the chunk onto each one. Same checkpoints, one fewer lockstep step each.
+    "ATOM_V4_MIDSTEP_CHECKPOINT": lambda: _flag_env("ATOM_V4_MIDSTEP_CHECKPOINT"),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.

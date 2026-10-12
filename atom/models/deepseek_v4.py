@@ -127,6 +127,10 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.attn_ffn_piecewise import decode_bucket_key, piecewise_core
 from atom.utils.cuda_graph import CudagraphCaptureRunner
 from atom.utils.custom_register import direct_register_custom_op
+from atom.model_ops.v4_kernels.midstep import (
+    midstep_compressor_write,
+    midstep_swa_write,
+)
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import AttnState, get_forward_context
 
@@ -1432,6 +1436,19 @@ class Compressor(nn.Module):
             self.score_state,
             write_plan=plan.write_plan_gpu,
             state_slot_mapping=state_slot_out,
+            ratio=ratio,
+            overlap=overlap,
+            prefix=f"{self.prefix}.update_compressor_states",
+        )
+        # Midstep checkpoints: the same ring write, truncated at each reserved
+        # prompt position, into that checkpoint's scratch slot. No-op unless
+        # the prefill carries a plan (see v4_kernels/midstep.py).
+        midstep_compressor_write(
+            kv,
+            score,
+            self.ape,
+            self.kv_state,
+            self.score_state,
             ratio=ratio,
             overlap=overlap,
             prefix=f"{self.prefix}.update_compressor_states",
@@ -3467,6 +3484,19 @@ class DeepseekV4Attention(nn.Module):
                 # overwrite what this same call just wrote.
                 # K source is the PCP all-gathered full extend K (k_*_full); off
                 # PCP it falls back to qkn.k_packed/k_rope (single-rank identical).
+                min(self.window_size, attn_md.max_seqlen_q),
+                k_packed=k_packed_full,
+                k_rope=k_rope_full,
+                pool_rope=self.swa_plane_rope,
+                prefix=f"{self.layer_name}.swa_write",
+            )
+            # Midstep checkpoints: replay this window write into each reserved
+            # checkpoint's scratch slot, truncated at its prompt position.
+            midstep_swa_write(
+                kv_full,
+                positions_full,
+                self.swa_plane,
+                self.swa_window,
                 min(self.window_size, attn_md.max_seqlen_q),
                 k_packed=k_packed_full,
                 k_rope=k_rope_full,

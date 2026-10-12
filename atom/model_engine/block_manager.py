@@ -244,6 +244,7 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
+                readable_midstep=state_runtime.transfer.readable_midstep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -261,6 +262,10 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        if self.paged_state_checkpoints is not None:
+            # Midstep checkpoints of a PAGE class are written into scratch
+            # Active Slots before their image is stored.
+            self.paged_state_checkpoints.bind_slot_pool(self.state)
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
         # up — the ladder would checkpoint into a void. The interval defaults to
@@ -1973,7 +1978,8 @@ class BlockManager:
         blocks the forward just finished, and this would be a hash pass over the
         whole prompt on every admission, spent on nothing.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        ckpt = self._state_checkpoint_cache
+        if not ckpt.readable_midstep or not ckpt.applies(seq):
             seq.block_hashes = []
             return
         # The continuation itself -- resume from the last APPENDED hash (on a
@@ -2018,7 +2024,8 @@ class BlockManager:
         one nobody dared remove. `test_interval_zero_reserves_nothing` pins the
         behavior end to end rather than the check.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        ckpt = self._state_checkpoint_cache
+        if not ckpt.readable_midstep or not ckpt.applies(seq):
             return []
         interval = self.state_checkpoint_interval_tokens
         hbs = self.hash_block_size
@@ -2054,11 +2061,12 @@ class BlockManager:
         one forward, so a second plan for the same seq means the first forward
         never ran — hand its slots back rather than leak them.
         """
-        if not self.state.readable_midstep:
+        ckpt = self._state_checkpoint_cache
+        if not ckpt.readable_midstep:
             return
         if seq.midstep_reservations:
             self.cancel_midstep(seq)
-        seq.midstep_reservations = self.state.reserve_midstep(
+        seq.midstep_reservations = ckpt.reserve_midstep(
             seq, self.midstep_positions(seq, start, end)
         )
 
@@ -2071,7 +2079,7 @@ class BlockManager:
         """
         if not seq.midstep_reservations:
             return
-        self.state.publish_midstep(seq.midstep_reservations, seq)
+        self._state_checkpoint_cache.publish_midstep(seq.midstep_reservations, seq)
         # The rightmost published position, for the decode-side spacing rule in
         # `checkpointers_at`. Generation is never midstep-readable — its
         # forwards end where acceptance puts them — so it still measures from
@@ -2086,7 +2094,7 @@ class BlockManager:
         """Hand back reservations whose forward is not going to run."""
         if not seq.midstep_reservations:
             return
-        self.state.cancel_midstep(seq.midstep_reservations)
+        self._state_checkpoint_cache.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
 
     def checkpoint_cut(

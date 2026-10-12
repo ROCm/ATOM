@@ -218,6 +218,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
       index_topk = self.index_topk         (1024 for V4-Pro)
     """
 
+    v4_midstep: Any | None = None
+    """`v4_kernels.midstep.MidstepPlan` for a prefill that carries midstep
+    checkpoints; None everywhere else, which makes every replay write a no-op."""
+
     # ----- CPU mirrors (avoid GPU→CPU `.item()` / `.tolist()` syncs) -----
     state_slot_out_cpu: Any | None = None
     """[bs] np.int32 — per-seq state cache slot id (host copy)."""
@@ -959,7 +963,28 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             f":nocopy={nocopy}"
             ":entry=packed"
         )
-        return StateTransfer.copy(layout_id)
+        return StateTransfer.copy(
+            layout_id, readable_midstep=self._midstep_checkpoints_supported()
+        )
+
+    def _midstep_checkpoints_supported(self) -> bool:
+        """Whether prefill can snapshot state at interior positions.
+
+        Opt-in (`ATOM_V4_MIDSTEP_CHECKPOINT`), and only on the paths whose ring
+        writes `v4_kernels.midstep` replays: no PCP (the replay indexes the
+        unsharded token axis) and no TBO (micro-batches split the metadata the
+        plan lives on). Decided once, because the scheduler plans against it.
+        """
+        if not envs.ATOM_V4_MIDSTEP_CHECKPOINT:
+            return False
+        runner = getattr(self, "model_runner", None)
+        cfg = getattr(runner, "config", None)
+        if cfg is None:
+            return False
+        return (
+            getattr(cfg, "prefill_context_parallel_size", 1) <= 1
+            and not getattr(cfg, "enable_tbo", False)
+        )
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per plane: a V4 slot is one row per plane."""
@@ -972,6 +997,44 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if slot < 0:
             raise IndexError(f"state_entry_views: invalid negative slot {slot}")
         return self._slot_views()[slot]
+
+    def _attach_midstep(self, batch, scheduled_bs: int, cu_seqlens_q_np):
+        """Plan this prefill's midstep checkpoints and seed their slots.
+
+        Each reserved scratch slot first takes a copy of its request's incoming
+        slot -- the ring rows before the chunk, which a forward cut at the
+        checkpoint would have inherited too -- and the forward then replays the
+        chunk's ring writes up to the checkpoint into it. Runs after this
+        batch's state maintenance (restores land first) and before the forward,
+        on the same stream as both.
+        """
+        saves = getattr(batch, "state_save_all", None)
+        if not saves or not any(saves):
+            return None
+        from atom.model_ops.v4_kernels.midstep import build_midstep_plan, to_device
+
+        if len(saves) != scheduled_bs:
+            raise RuntimeError(
+                f"midstep checkpoints need one save list per prefill row: "
+                f"{len(saves)} lists for {scheduled_bs} rows"
+            )
+        committed = batch.state_slots_committed[:scheduled_bs]
+        forks = getattr(batch, "state_fork_srcs", None) or [-1] * scheduled_bs
+        src = [int(f) if int(f) >= 0 else int(c) for f, c in zip(forks, committed)]
+        host = build_midstep_plan(
+            saves,
+            batch.num_cached_tokens[:scheduled_bs],
+            cu_seqlens_q_np,
+            src,
+            self._unique_compress_ratios_overlap,
+            extra_write=0,
+        )
+        if host is None:
+            return None
+        self.relocate_state_slots(
+            list(zip(host.src_slots.tolist(), host.dst_slots.tolist()))
+        )
+        return to_device(host, self.device)
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a request's whole Active Slot."""
@@ -3010,6 +3073,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             extend_lens_np,
             context_lens_np,
             extra_write=0,
+        )
+        attn_metadata.v4_midstep = self._attach_midstep(
+            batch, scheduled_bs, cu_seqlens_q_np
         )
         # Prefill is eager (no CG), so it runs exactly what it scheduled and
         # omits `running_tokens` to say so. Must still run BEFORE

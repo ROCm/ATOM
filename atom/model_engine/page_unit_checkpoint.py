@@ -876,24 +876,81 @@ class PagedStateCheckpointCoordinator:
 
     successor_room = 0.0
     # A PAGE image is written by a copy the runner issues after the forward that
-    # produced the state, out of the slot that forward left behind. There are no
-    # interior positions to slice: unlike a chunk kernel's `h`, the compressor
-    # ring is not materialized at boundaries inside a step. So the engine keeps
-    # cutting prefill chunks onto rungs for this class, and the three methods
-    # below are the no-ops `StateCache` documents for a class that is not
-    # readable midstep — present because `BlockManager` calls them across every
-    # member of `state_caches` without asking which kind it holds.
+    # produced the state, out of the slot that forward left behind.
+    #
+    # Without midstep support that slot only ever holds the state as of a
+    # forward's LAST token, so the engine cuts prefill chunks onto rungs for this
+    # class and the three methods below stay no-ops. With it (`readable_midstep`
+    # from the backend's `StateTransfer`), each interior checkpoint gets a
+    # scratch Active Slot of its own: the runner seeds it from the request's
+    # incoming slot and replays the forward's ring writes up to the checkpoint
+    # position into it (DeepSeek-V4: `v4_kernels/midstep.py`), and the image is
+    # then stored out of the scratch slot exactly as it would be out of a cut
+    # forward's slot. The scratch slot is pinned until that store's batch is
+    # out, then goes back to the pool.
     readable_midstep = False
 
+    def bind_slot_pool(self, slot_pool) -> None:
+        """The Active Slot pool scratch slots for midstep checkpoints come from."""
+        self._slot_pool = slot_pool
+
     def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
-        del seq, positions
-        return []
+        """A scratch slot per `(position, hash)` worth storing, in order.
+
+        Skips a hash already stored or about to be. Best-effort like every
+        checkpoint: stops at the first position the slot pool cannot cover,
+        counting it dropped, so the earliest positions are the ones kept.
+        """
+        pool = self._slot_pool
+        if not self.readable_midstep or pool is None or not self.applies(seq):
+            return []
+        out = []
+        queued = {h for h, _slot in self._midstep_pending}
+        for pos, h in positions:
+            if h in queued or self.store.contains_or_pending(h):
+                continue
+            if not pool.has_free():
+                self.checkpoints_dropped += 1
+                break
+            out.append((pool.pop(), pos, h))
+            queued.add(h)
+        return out
 
     def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
-        del reservations, seq
+        """Queue each scratch slot's image for storing, now that its bytes exist."""
+        del seq
+        for slot, _pos, h in reservations:
+            self._midstep_pending.append((h, slot))
 
     def cancel_midstep(self, reservations: list[tuple]) -> None:
-        del reservations
+        """Hand back scratch slots whose forward never ran (preempt, abort)."""
+        if self._slot_pool is None:
+            return
+        for slot, _pos, _h in reservations:
+            self._slot_pool.release(slot)
+
+    def _take_midstep_stores(self) -> None:
+        """Turn published midstep checkpoints into store ops for this batch.
+
+        The scratch slot is read by the store this batch issues, so it is
+        pinned for exactly that batch (`StateSlotPool.release_pins` returns it
+        a pass later). A checkpoint that cannot be stored gives its slot back
+        at once: nothing will read it.
+        """
+        pending, self._midstep_pending = self._midstep_pending, []
+        pool = self._slot_pool
+        for h, slot in pending:
+            op = None
+            if not self.store.contains_or_pending(h):
+                op = self.store.begin_store(h, slot)
+            if op is None:
+                if not self.store.contains_or_pending(h):
+                    self.checkpoints_dropped += 1
+                pool.release(slot)
+                continue
+            self._store_ops.append(op)
+            self.checkpoints_kept += 1
+            pool.pin(slot)
 
     def __init__(
         self,
@@ -901,8 +958,14 @@ class PagedStateCheckpointCoordinator:
         spec: PagedStateCheckpointSpec,
         enabled: bool,
         offload=None,
+        *,
+        readable_midstep: bool = False,
     ) -> None:
         self.enabled = enabled
+        self.readable_midstep = bool(readable_midstep)
+        self._slot_pool = None
+        # Published midstep checkpoints awaiting their store, `(hash, slot)`.
+        self._midstep_pending: list[tuple[int, int]] = []
         # The CPU tier beneath this one, or None. Not a member of
         # `BlockManager.state_caches`: every one of those is a veto over where a
         # prefix may resume, and this does the opposite -- it makes MORE
@@ -1042,6 +1105,8 @@ class PagedStateCheckpointCoordinator:
     def take_checkpoint_ops(
         self,
     ) -> tuple[tuple[CheckpointStoreOp, ...], tuple[CheckpointRestoreOp, ...]]:
+        if self._midstep_pending:
+            self._take_midstep_stores()
         pending, self._pending = self._pending, {}
         for seq, h in pending.values():
             # Safe to read now because `checkpoint` keeps at most one pending

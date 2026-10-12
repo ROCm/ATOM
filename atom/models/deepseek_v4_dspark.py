@@ -517,6 +517,7 @@ try:
     from atom.model_ops.layernorm import RMSNorm
     from atom.model_ops.linear import ReplicatedLinear
     from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
+    from atom.model_ops.v4_kernels.midstep import midstep_swa_write
     from atom.model_ops.v4_kernels.paged_decode import sparse_attn_v4_paged_decode
     from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import (
         qk_norm_rope_maybe_quant,
@@ -756,6 +757,17 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 pool_rope=a.swa_plane_rope,  # [plane_rows, 64] bf16
                 prefix=f"{a.layer_name}.dspark_swa_write_2buff",
             )
+            midstep_swa_write(
+                None,
+                positions,
+                a.swa_plane,
+                a.swa_window,
+                self.write_per_batch,
+                k_packed=k_packed.view(-1, 1, V4_DIM_QK_PACKED),
+                k_rope=k_rope.view(-1, 1, V4_DIM_ROPE),
+                pool_rope=a.swa_plane_rope,
+                prefix=f"{a.layer_name}.dspark_swa_write_2buff",
+            )
             return
         # The window was reserved at the dtype this layer declared in
         # `window_kv_dtype`, while main_kv carries whatever the projections
@@ -776,6 +788,13 @@ class DSparkLayer(Block):  # type: ignore[misc]
             cu_seqlens_q,  # [B+1] int32, per-req spans
             attn_md.state_slot_out[:B],  # [B] ring slot per request
             a.swa_plane,  # [plane_rows, head_dim]
+            a.swa_window,
+            self.write_per_batch,
+        )
+        midstep_swa_write(
+            main_kv,
+            positions,
+            a.swa_plane,
             a.swa_window,
             self.write_per_batch,
         )
