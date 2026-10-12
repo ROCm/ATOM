@@ -836,9 +836,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
         elif (
-            not metadata.dummy
-            and not step.tentative
-            and not _staging_advances(staged)
+            not metadata.dummy and not step.tentative and not _staging_advances(staged)
         ):
             # Owed to `EngramStaging.start` only when there is a staging to do
             # it. The condition used to be `staged is None`, which assumed the

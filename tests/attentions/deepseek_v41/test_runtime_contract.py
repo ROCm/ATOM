@@ -487,7 +487,7 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
 
     pytest.importorskip("aiter", reason="the attention module reaches AITER")
     from atom.models.deepseek_v41.attention import Attention
-    from atom.plugin.vllm.v41_eager_break import _attn_out_buffer
+    from atom.plugin.vllm.v41_core_overrides import _attn_out_buffer
 
     heads, head_dim = 16, 512
     stub = SimpleNamespace(heads=heads, head_dim=head_dim)

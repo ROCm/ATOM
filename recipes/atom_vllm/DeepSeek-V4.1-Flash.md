@@ -6,9 +6,11 @@ vLLM plugin backend. For background on the plugin backend, see
 model itself and its native ATOM path, see the
 [DeepSeek-V4.1-Flash recipe](../DeepSeek-V4.1-Flash.md).
 
-The plugin path serves the **text backbone only**. Vision, DSpark speculative
-decoding and prefix caching are refused at startup rather than silently
-degraded — run the native ATOM engine for those. The reasons are in
+The plugin path serves the **text backbone only**. Vision, prefix caching and
+KV-transfer connectors are refused at startup rather than silently degraded —
+run the native ATOM engine for those. DSpark speculation and CUDA graphs are
+supported, both behind an explicit flag. The reasons, and what each refusal
+costs, are in
 [What the plugin path does not do](#what-the-plugin-path-does-not-do).
 
 ## Step 1: Launch vLLM Server
@@ -48,9 +50,12 @@ Notes:
 - `--block-size` is negotiated to `256` whatever you pass. V4.1's PAGE is 256
   tokens, and the bridge relies on a vLLM block id being the same id as a V4.1
   page id.
-- CUDA graphs are forced off (`cudagraph_mode=NONE`), so `--enforce-eager` and
-  any `--compilation-config` cudagraph setting are redundant. The server logs
-  the override at startup.
+- CUDA graphs are **off unless you ask for them**, with
+  `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` *and* `VLLM_USE_BREAKABLE_CUDAGRAPH=1`.
+  Both are required: vLLM auto-enables its own flag for some architectures, and
+  the second condition keeps a vLLM upgrade that adds V4.1 to that list from
+  changing this path's behaviour with nothing in the log. See
+  [CUDA graphs](#cuda-graphs).
 - `--max-num-seqs` is what the per-request state region is sized for, and that
   region comes out of the same pool as cached history — see
   [How the KV pool is sized](#how-the-kv-pool-is-sized). Raise it only
@@ -149,113 +154,94 @@ naming both numbers — raise `--gpu-memory-utilization`, or lower
 | Text generation, chat, tools, reasoning effort | Supported |
 | BF16 and packed FP4 main pool | Supported (`--kv-cache-dtype auto` / `nvfp4`) |
 | Image requests | Refused — text only |
-| DSpark speculative decoding | Refused — needs ATOM's tentative staging, which the proxy bridge does not drive |
+| DSpark speculative decoding | Supported — 5 draft tokens, fixed by the model's own config gate; the draft is the target checkpoint's `mtp.*` stages, so there is no separate draft model to pass |
 | Prefix caching | Refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
 | KV transfer / offload connectors | Refused — V4.1's cached prefix is PAGE bytes *and* a per-request STATE image, and no connector on this path carries the second; a PAGE prefix restored without its STATE is a dead engine, not a degraded answer |
-| CUDA graphs | Forced off — a V4.1 step does host-side Engram staging, state reset and cursor advance every forward that no captured graph replays. See [CUDA graphs: what blocks them](#cuda-graphs-what-blocks-them) |
+| CUDA graphs | Supported behind `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` — the host-side step work and attention each run in an eager break, so the rest of the forward is captured. See [CUDA graphs](#cuda-graphs) |
 
-Each of these is refused by `enforce_deepseek_v41_constraints` -- which the
+Each refusal above is made by `enforce_deepseek_v41_constraints` -- which the
 worker applies to the config it is about to run, ahead of cudagraph capture and
 the first forward -- or by
 `atom.models.deepseek_v41.config.validate_runtime_config`, with a message
 naming the flag to drop. Use the
 [native ATOM engine](../DeepSeek-V4.1-Flash.md) for any of them.
 
-## CUDA graphs: what blocks them
+## CUDA graphs
 
-Graphs were attempted, measured and stood down. The record, so the next
-attempt does not start from the beginning:
+Graphs are off by default and enabled by two flags together:
 
-**What was removed.** The stated reason V4.1 ran eager was that ATOM's plugin
-models are not fx-split, so vLLM's PIECEWISE mode had nothing to split on and
-would swallow the backbone whole. `VLLM_USE_BREAKABLE_CUDAGRAPH=1` ends the
-stream capture at runtime instead of splitting an fx graph, so that reason
-does not survive it. With it:
+```bash
+export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+export ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1
+```
 
-- `v41_stage_step` (`deepseek_v41_bridge.py`) carries the break around the
-  step's host work -- `_prepare` *and* `prepare_model_inputs` in one break,
-  because `_prepare` stages the step's index/indptr/slot tensors with kernels
-  of its own.
-- `cudagraph_mode` must be **PIECEWISE exactly**, not merely non-NONE:
-  `eager_break_during_capture` *skips the break* when the forward context
-  reports a FULL runtime mode. Under FULL the step work is recorded into the
-  graph and never runs again -- a frozen cursor, every replayed step
-  re-answering the first, with nothing raised.
-- The proxy builder's `AttentionCGSupport.NEVER` needs no change: vLLM's three
-  NEVER gates in `resolve_cudagraph_mode_and_sizes` all test FULL
-  (`mixed_mode`, `decode_mode`, `has_full_cudagraphs`), so PIECEWISE passes
-  them untouched and the honest declaration stays.
-- The dummy-batch cache must be reused, not rebuilt per call. `_prepare`'s
-  dummy branch allocated a scratch `PagedAttentionCache` each time; captured
-  kernels hold its addresses, it is freed when the capture returns, and the
-  first replay reads freed memory. Symptom: `illegal memory access`, reported
-  asynchronously inside an unrelated `copy_to_gpu`. Fixed by `_dummy_cache`.
+Both are required. vLLM auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH` for some
+architectures; without ATOM's own second condition, a vLLM upgrade that adds
+V4.1 to that list would change this path's behaviour with nothing in the log.
+`tests/plugin/test_vllm_deepseek_v41_cudagraph_mode.py` holds that shut.
 
-**What still blocks it, on vLLM 0.28.** With all of the above, V4.1 captures
-and serves without raising, and the answers degenerate into noise after the
-first few tokens (measured: 8/8 prompts, greedy, against an eager arm that
-answers all 8 correctly). The attention is what stays behind: its kernels are
-launched with per-step host values -- the batch's longest KV extent among
-them -- which a capture freezes at whatever length it recorded while every
-decode step grows past it.
+Measured on TP4, GSM8K 20-shot, the full 1319 questions:
 
-**What blocks it on 0.31 is different and earlier: capture does not finish.**
-The attention was given a caller-owned output buffer and its own eager break,
-which is what the decorator requires. With that break in place the capture
-dies; without it the capture completes and the answers are noise again, which
-is how we know the break is necessary rather than optional:
+| Arm | Accuracy |
+|---|---|
+| Graphs off, no speculation | 0.9280 |
+| Graphs on (FULL + PIECEWISE), no speculation | 0.9280 FULL / 0.9325 PIECEWISE |
+| Graphs on, DSpark 5 tokens | 0.9295 ± 0.0071, mean acceptance 3.55–3.58 |
 
-    capture_end() -> HIP error: attempt to terminate a thread-local capture
-                     sequence from another thread  (hipErrorStreamCaptureWrongThread)
+A V4.1 serving run captures a mix: 47 FULL graphs and 110 PIECEWISE in the
+DSpark configuration above, with no capture failures.
 
-The message names a thread and the thread is not the problem. Measured at the
-segment boundary: `_begin_segment` and `_end_segment` run on the same thread
-and the same stream every time, and the capture object has one instance per
-rank, so no nesting. What the paired trace does show is the first
-`_end_segment` raising inside `capture_end()` -- it never reaches
-`self._capturing = False`, so the context manager's `__exit__` ends an
-already-dead graph and reports *that*, hiding the first failure.
+### How a V4.1 forward gets captured at all
 
-Eight explanations were tested and refuted, each by measurement, so that
-nobody re-walks them: the compressor/indexer side streams (off by default,
-`ATOM_DSV41_SIDE_STREAMS=0`); `in_hipgraph` opening ATOM's fork gate under a
+A V4.1 step does host-side work every forward that no captured graph can
+replay -- Engram staging, state reset, cursor advance -- and its attention
+kernels are launched with per-step host values, including the batch's longest
+KV extent, which a capture would freeze at whatever length it recorded. Three
+things make it work, and each is load-bearing:
+
+- **The step work moved out of the forward.** The metadata builder stages the
+  step before the model is called (`_v41_stage_outside_forward` in
+  `deepseek_v41_bridge.py`), so nothing that must run per step is inside a
+  region a graph records.
+- **Attention runs in an eager break** (`v41_core_overrides.py`).
+  `eager_break_during_capture` ends the capture segment at the decorated call,
+  runs it eagerly and starts a fresh one, which is what keeps the per-step
+  launch bounds live. The decorator requires the broken-out region to write
+  through a caller-owned buffer -- a fresh tensor would change address on each
+  replay while the captured segments after it still point at the first -- so
+  `_attn_out_buffer` allocates that buffer in what stays inside the graph.
+- **Engram's prefetch keeps its side stream, with the orderings in breaks.**
+  A fork held open across a segment boundary is refused
+  (`hipErrorStreamCaptureUnjoined`), and a captured stream waiting on an event
+  recorded off-capture is too (`hipErrorStreamCaptureIsolation`). Decorating
+  `_prefetch`, `_await_layer` and `_await_fork` issues each where no segment
+  owns it, which is what upstream's own V4.1 does for `_start_prefetch` and
+  `_finish_prefetch`. Standing the fork down instead also works and costs the
+  overlap between a largely-UVA gather and the layers consuming it.
+
+Under FULL the picture differs in one way worth knowing: `eager_break_during_capture`
+returns the function unwrapped, so there is no break. The Engram fork is
+therefore joined immediately on that path rather than left open across layers
+(`_v41_join_covers_the_layers`), which keeps FULL correct at the cost of that
+overlap.
+
+### Dead ends, so they are not re-walked
+
+Each of these was measured, and none of them is the explanation for a capture
+that will not finish: the compressor/indexer side streams
+(`ATOM_DSV41_SIDE_STREAMS=0`); `in_hipgraph` opening ATOM's fork gate under a
 foreign capture; the MoE's dual-stream overlap
-(`ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0`, verified to take effect, still
-crashes); an exception inside either eager-break body (both wrapped whole,
-neither raises); unsynchronised staging left on another stream (device-wide
-`torch.cuda.synchronize()` at the end of the eager body, still crashes); the
-cudagraph mode and the path that sets it (explicit
-`--compilation-config '{"cudagraph_mode":"PIECEWISE"}'`, still crashes); and
-0.31's new wrapper nesting sharing one `_capturing` flag (one instance per
-rank, so not that).
+(`ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0`, verified to take effect); an
+exception inside an eager-break body; unsynchronised staging left on another
+stream; the cudagraph mode and the path that sets it; and 0.31's wrapper
+nesting sharing one `_capturing` flag.
 
-What is left is inside vLLM's own capture bookkeeping: why the first
-`capture_end()` fails. That is the question to hand upstream, and it is the
-reason the gate below stays shut on 0.31 -- not caution, a crash.
-
-The ordinary remedy, an eager break on the attention op the way vLLM does for
-`unified_attention_with_output`, **does not apply as a decoration**: the
-decorator requires an in-place output buffer ("a fresh tensor returned by `fn`
-would change address each replay"), and V4.1's `Attention.forward` returns a
-fresh tensor. Applied anyway, it faults *inside capture*, not at replay.
-
-So capturing V4.1 is attention-level work -- a persistent per-layer output
-buffer plus a device-side length bound -- not configuration. Two routes, both
-real:
-
-1. V4's road: hoist every per-step host value into fixed-address buffers and
-   declare `UNIFORM_BATCH` (see `deepseek_v4_bridge.py`). Large, and V4.1's
-   step work is the thing its own builder docstring says must run inside the
-   forward.
-2. Give attention a persistent output buffer so it can legally carry the
-   break, and move the KV length bound to device memory. Costs one buffer per
-   layer at the captured width.
-
-**The gate is closed by default and deliberately.** `_breakable_cudagraph_available`
-returns False unless `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` is set, *in addition*
-to vLLM's own flag. vLLM auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH` for some
-architectures; without the second condition, a vLLM upgrade that adds V4.1 to
-that list would turn correct answers into noise with nothing in the log.
-`tests/plugin/test_vllm_deepseek_v41_cudagraph_mode.py` holds that shut. The
-numbers in this recipe are therefore all eager, and must not be extrapolated
-to a graph deployment.
+Two notes on reading a failure here. `capture_end()` reporting
+`hipErrorStreamCaptureWrongThread` names a thread that is not the problem: the
+first `_end_segment` raises inside `capture_end()` before it reaches
+`self._capturing = False`, so the context manager's `__exit__` ends an
+already-dead graph and reports *that*, hiding the first failure. And a capture
+that completes is not a capture that is correct -- an early arm captured and
+served without raising while the answers degenerated into noise after the
+first few tokens (8/8 prompts, greedy, against an eager arm answering all 8).
+Check accuracy, not the absence of an exception.

@@ -332,9 +332,7 @@ def _v41_capture_batch(snapshot, vllm_config, builder=None):
         start = int(builder.cache.geometry.window_size)
         context_lens = (start + query_lens).astype(np.int64)
         pages = -(-(start + int(query_lens.max())) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
-        block_tables = tuple(
-            np.zeros(pages, dtype=np.int32) for _ in range(num_reqs)
-        )
+        block_tables = tuple(np.zeros(pages, dtype=np.int32) for _ in range(num_reqs))
         _v41_prime_capture_cursors(builder, slots, start)
     return SimpleNamespace(
         is_dummy_run=False,
@@ -410,7 +408,7 @@ def _v41_join_covers_the_layers() -> bool:
     Getting this backwards is loud rather than silent: the capture refuses at
     startup instead of serving a wrong answer.
     """
-    from atom.plugin.vllm.breakable_capture import breakable_capture_enabled
+    from atom.plugin.vllm.vllm_runtime import breakable_capture_enabled
 
     if not breakable_capture_enabled():
         return False
@@ -459,7 +457,7 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     if snapshot is None or snapshot.num_reqs == 0:
         return None
     slot_allocator = getattr(model, "_atom_v41_slot_allocator", None)
-    from atom.plugin.vllm.dummy_run import in_dummy_run as _in_dummy_run
+    from atom.plugin.vllm.vllm_runtime import in_dummy_run as _in_dummy_run
 
     if slot_allocator is None and not (
         capturing or _in_dummy_run() or _v41_request_ids_are_synthetic(snapshot)
@@ -474,7 +472,7 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     # other step, so the batch has to be recognised rather than announced --
     # by the repeated placeholder request id, which real traffic cannot
     # produce because vLLM never schedules one request twice in a step.
-    from atom.plugin.vllm.dummy_run import in_dummy_run
+    from atom.plugin.vllm.vllm_runtime import in_dummy_run
 
     # Three signals, union, because no one of them covers every synthetic
     # batch and each was measured to miss a different kind:
@@ -945,7 +943,7 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
     ``prepare_batch_step`` takes the dtype of its request-start array from it;
     int64 matches what native ATOM allocates.
     """
-    from atom.plugin.vllm.v41_metadata_builder import (
+    from atom.plugin.vllm.v41_core_overrides import (
         VllmDeepseekV41MetadataBuilder,
     )
     from atom.utils import CpuGpuBuffer
@@ -1008,7 +1006,7 @@ def bind_deepseek_v41_proxy_cache(
     if getattr(model, "_atom_v41_proxy_cache_ptr", None) == ptr:
         return True
 
-    from atom.plugin.vllm.v41_external_cache import (
+    from atom.plugin.vllm.v41_core_overrides import (
         VllmBackedPagedAttentionCache,
     )
 
@@ -1518,6 +1516,7 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
     rows = [(end - length, length) for end, length in zip(ends, lengths) if length]
     if not rows:
         return {}
+
     # A tentative step is a verification step: every row is a draft block on
     # top of an existing prefix. A prefill row is neither -- it starts at
     # position 0 and is longer than a block -- and the cache refuses the mix.

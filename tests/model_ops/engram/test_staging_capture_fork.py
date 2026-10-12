@@ -103,7 +103,7 @@ def test_the_vllm_staging_keeps_the_fork_and_moves_the_waits():
     subclass ever went back to answering `_forks` False, the gather would
     serialize against the layers again with nothing to say so.
     """
-    from atom.plugin.vllm.v41_engram_staging import VllmEngramStaging
+    from atom.plugin.vllm.v41_core_overrides import VllmEngramStaging
 
     assert VllmEngramStaging._forks(object()) is True
     assert issubclass(VllmEngramStaging, staging_mod.EngramStaging)

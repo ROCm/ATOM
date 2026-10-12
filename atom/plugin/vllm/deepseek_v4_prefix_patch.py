@@ -141,7 +141,7 @@ def apply_vllm_v4_profile_cache_patch() -> None:
     must therefore stay on its existing dummy-attention path until vLLM
     installs the real cache.
     """
-    from atom.plugin.vllm.gpu_model_runner_targets import gpu_model_runner_classes
+    from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
     # Both runner classes, because `GPUWorker` picks between two unrelated ones
     # and this patch read only the older name. On 0.31 with the V2 runner

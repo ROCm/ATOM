@@ -474,8 +474,8 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # registration, because this runs in every worker and it returns
             # before the model it configures can be called -- the object does
             # not exist until it does.
-            from atom.plugin.vllm.v41_eager_break import apply_v41_eager_break
-            from atom.plugin.vllm.v41_engram_staging import (
+            from atom.plugin.vllm.v41_core_overrides import (
+                apply_v41_eager_break,
                 install_vllm_engram_staging,
             )
 
@@ -1005,7 +1005,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # A DSpark draft has no output projection of its own and expects
             # the target's under the name vLLM uses. Nothing fails without it:
             # the draft keeps an unfilled head and drafts noise.
-            from atom.plugin.vllm.v41_draft_lm_head import attach_v41_target_lm_head
+            from atom.plugin.vllm.v41_speculative import attach_v41_target_lm_head
 
             attach_v41_target_lm_head(self, model)
 

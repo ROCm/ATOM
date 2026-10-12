@@ -33,6 +33,7 @@ from atom.utils.forward_context import side_stream
 from .config import AttentionMode
 from .layers import native_quant_config
 
+
 class Indexer(nn.Module):
     def __init__(self, config, spec):
         super().__init__()
@@ -388,7 +389,7 @@ class Attention(nn.Module):
         """Everything from the compressor fork to the attention rows.
 
         Takes the cache, not the step. A frontend that breaks a capture here
-        (`atom.plugin.vllm.v41_eager_break`) binds the break's arguments at
+        (`atom.plugin.vllm.v41_core_overrides`) binds the break's arguments at
         capture time and reruns no host code to rebind them, so a `step`
         parameter would hold the step the graph was recorded with on every
         later replay -- the warmup batch's lengths and
@@ -422,9 +423,7 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        return self._attend(
-            attn_out, query, kv_normed, selecting, cache, step, rope
-        )
+        return self._attend(attn_out, query, kv_normed, selecting, cache, step, rope)
 
     def _attend(self, attn_out, query, kv_normed, selecting, cache, step, rope):
         """The sparse indexer's join and the MLA attention, into `attn_out`.
