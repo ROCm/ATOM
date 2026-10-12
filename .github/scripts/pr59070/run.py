@@ -182,9 +182,13 @@ try:
             save(directory / "execution-info.json", info)
             ranks = info["results"]
             assert {r["rank"] for r in ranks} == set(range(8))
-            expected = "MLACommonImpl" if mode == "fallback" else "AiterMLAImpl"
+            expected = "MLACommonBaseImpl" if mode == "fallback" else "AiterMLAImpl"
             assert all(r["mode"] == mode and r["layers"] for r in ranks)
-            assert all(r["context_implementation"].startswith(expected) for r in ranks)
+            assert all(
+                r["context_implementation"]
+                == expected + "._context_parallel_compute_prefill_context"
+                for r in ranks
+            )
             gpu_snapshot(directory / "gpu-loaded.json")
             metrics(directory / "gsm8k-before.metrics")
             command = [
