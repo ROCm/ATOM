@@ -233,11 +233,17 @@ class DSparkConfidenceHead(nn.Module):
         # casting both operands to FP32 first would compute, minus the casts.
         # aiter is imported here, not at module load: this module (the heads'
         # shapes and the draft's plain-torch pieces) imports without it.
+        x = torch.cat([hidden_states, markov_embeds], dim=-1)
+        weight = self.proj.weight
+        if not x.is_cuda:
+            logit = torch.nn.functional.linear(
+                x.float(), weight.float()
+            ).squeeze(-1)
+            return torch.sigmoid(logit)
+
         import aiter
         from aiter.tuned_gemm import tgemm
 
-        x = torch.cat([hidden_states, markov_embeds], dim=-1)
-        weight = self.proj.weight
         if weight.dtype != x.dtype:
             weight = weight.to(x.dtype)
         logit = tgemm.mm(x.reshape(-1, x.shape[-1]), weight, otype=torch.float32)
