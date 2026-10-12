@@ -21,6 +21,7 @@ import textwrap
 import threading
 import types
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from import_guard import skip_if_dependency_missing
@@ -386,6 +387,184 @@ class TestAnthropicSamplingParams:
         assert captured["temperature"] == 0.0
         assert captured["top_p"] == 0.95
         assert captured["top_k"] == -1
+
+
+class TestStartProfile:
+    """What the endpoint accepts, and what it answers.
+
+    The window may come in the request, and a request without one has to
+    behave exactly as before. Coming back, a conflict is the one failure the
+    caller can act on: no engine started, so a `/stop_profile` and a retry
+    will work. Anything else is ours.
+    """
+
+    # What `benchmark_serving.py --profile` sends: it reaches this endpoint
+    # through `async_request_openai_completions`, which posts its usual
+    # completion payload either way.
+    BENCHMARK_CLIENT_PAYLOAD: ClassVar[dict] = {
+        "model": "test",
+        "prompt": "hi",
+        "temperature": 0.0,
+        "best_of": 1,
+        "max_tokens": 128,
+        "logprobs": None,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    @staticmethod
+    def _client(monkeypatch, recorded=None, answer=None):
+        """The real route, over HTTP, with only the engine replaced.
+
+        Driven through the app because the parse and the status code both
+        belong to FastAPI. Not used as a context manager: entering one runs
+        the app's lifespan, which builds a real engine.
+
+        *answer* is what the engines hand back, or an exception the engine
+        raises; the default is a single core reporting success.
+        """
+        pytest.importorskip("httpx")
+        from fastapi.testclient import TestClient
+
+        def start_profile(**kwargs):
+            if recorded is not None:
+                recorded.append(kwargs)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer or [{"message": "Profiling started"}]
+
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(start_profile=start_profile)
+        )
+        # A raise out of the engine is under test, so it has to come back as
+        # a response rather than into the test.
+        return TestClient(api_server.app, raise_server_exceptions=False)
+
+    def test_a_bodyless_post_overrides_nothing(self, monkeypatch):
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post("/start_profile")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "success"
+        assert recorded == [{"delay_iters": None, "max_iters": None}]
+
+        # An empty object is the same request with a body attached.
+        assert client.post("/start_profile", json={}).status_code == 200
+        assert recorded[-1] == {"delay_iters": None, "max_iters": None}
+
+    def test_the_body_window_reaches_the_engine(self, monkeypatch):
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post(
+            "/start_profile", json={"delay_iters": 100, "max_iters": 200}
+        )
+
+        assert response.status_code == 200
+        assert recorded == [{"delay_iters": 100, "max_iters": 200}]
+
+    @pytest.mark.parametrize("field", ["delay_iters", "max_iters"])
+    @pytest.mark.parametrize("value", [-1, "abc"])
+    def test_a_bad_window_is_refused_before_the_engine(self, monkeypatch, field, value):
+        """422 from body validation, and the engine is never told to start."""
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post("/start_profile", json={field: value})
+
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["loc"] == ["body", field]
+        assert recorded == []
+
+    def test_the_benchmark_clients_completion_payload_is_still_accepted(
+        self, monkeypatch
+    ):
+        """Extra fields are ignored rather than forbidden, or --profile 422s."""
+        recorded: list[dict] = []
+        client = self._client(monkeypatch, recorded)
+
+        response = client.post("/start_profile", json=self.BENCHMARK_CLIENT_PAYLOAD)
+
+        assert response.status_code == 200
+        assert recorded == [{"delay_iters": None, "max_iters": None}]
+
+    def test_a_busy_engine_is_a_409_carrying_its_own_words(self, monkeypatch):
+        busy = {"error": "Profiling is already in progress.", "conflict": True}
+        client = self._client(monkeypatch, answer=[busy, dict(busy)])
+
+        response = client.post("/start_profile")
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Profiling is already in progress."
+
+    def test_a_partial_refusal_says_that_none_were_started(self, monkeypatch):
+        """The disagg case: a client told otherwise would send a
+        `/stop_profile` to collect a trace that does not exist.
+        """
+        client = self._client(
+            monkeypatch,
+            answer=[
+                {"reserved": True},
+                {"error": "Profiling is already in progress.", "conflict": True},
+            ],
+        )
+
+        response = client.post("/start_profile")
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "1 of 2 engines refused" in detail
+        assert "none were started" in detail
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            # A reservation released or overwritten between the rounds.
+            [{"error": "No profiling reservation to commit."}],
+            # A reserve round that never came back.
+            TimeoutError("engine never answered"),
+        ],
+        ids=["no-reservation", "reserve-timed-out"],
+    )
+    def test_anything_other_than_a_conflict_is_a_500(self, monkeypatch, answer):
+        client = self._client(monkeypatch, answer=answer)
+
+        assert client.post("/start_profile").status_code == 500
+
+
+class TestStopProfile:
+    """Where an engine reports the auto-start that failed after it armed."""
+
+    @staticmethod
+    def _client(monkeypatch, traces):
+        pytest.importorskip("httpx")
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setattr(
+            api_server, "engine", SimpleNamespace(stop_profile=lambda: traces)
+        )
+        return TestClient(api_server.app)
+
+    def test_an_engine_error_is_reported_instead_of_a_trace(self, monkeypatch):
+        failed = {"trace_dir": "/traces", "error": "profiler auto-start failed: boom"}
+        client = self._client(monkeypatch, [{"trace_dir": "/traces"}, failed])
+
+        body = client.post("/stop_profile").json()
+
+        assert body["status"] == "error"
+        assert (
+            "auto-start failed" in body["message"]
+        ), "the only place left to tell the caller, so it cannot stay in the list"
+
+    def test_a_clean_stop_still_reports_success(self, monkeypatch):
+        client = self._client(monkeypatch, [{"trace_dir": "/traces", "elapsed": 1.3}])
+
+        body = client.post("/stop_profile").json()
+
+        assert body["status"] == "success"
+        assert body["traces"] == [{"trace_dir": "/traces", "elapsed": 1.3}]
 
 
 class TestValidateContextLength:
