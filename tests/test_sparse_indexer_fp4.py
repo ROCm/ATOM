@@ -489,6 +489,116 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
     assert (got[len(picks) :] == -1).all()
 
 
+@pytest.mark.parametrize("capture_core", [False, True], ids=["piecewise", "af_piecewise"])
+def test_v4_fp4_graphs_distinguish_equal_token_sequence_shapes(
+    on_gfx950, monkeypatch, capture_core
+):
+    """Replay 8x1, 1x8 and ragged batches over the same eight query rows.
+
+    Only the active prefix of the shared sequence-boundary buffer is refreshed,
+    as in serving. A token-count-only graph reuses the captured sequence count
+    and reads stale boundaries. Check the actual row-group scorer against the
+    dequantized reference, including the stable output consumed downstream.
+    """
+    from atom.config import CUDAGraphMode
+    from atom.models import deepseek_v4
+    from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
+    from atom.utils.forward_context import AttnState
+
+    rows, width, topk = 8, 768, 512
+    table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(
+        rows, 1, width, seed=17
+    )
+    weights = weights.bfloat16()
+    cu = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
+    ends = torch.empty(rows, dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(state=AttnState.DECODE)
+    fc = SimpleNamespace(
+        attn_metadata=metadata,
+        context=SimpleNamespace(is_dummy_run=False),
+        in_hipgraph=True,
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+    )
+    monkeypatch.setattr(deepseek_v4, "get_forward_context", lambda: fc)
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer.kv_cache, indexer.kv_scale = kv, ks
+    indexer._max_model_len_idx, indexer._weights_scale = width, WEIGHTS_SCALE
+
+    def score(q, w, qs):
+        return indexer._score_topk_decode_fp4_flydsl(
+            q, qs, metadata.block_tables, w, topk
+        )
+
+    layer = SimpleNamespace(
+        layer_name="fp4_graph_test",
+        attn_ffn_piecewise=capture_core,
+        indexer=SimpleNamespace(score_topk_from=score),
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={layer.layer_name: layer}
+        )
+    )
+    monkeypatch.setattr(deepseek_v4, "get_current_atom_config", lambda: config)
+    runner, outputs = CudagraphCaptureRunner(), StableOutputs()
+    monkeypatch.setattr(deepseek_v4, "v4_indexer_runner", runner)
+    monkeypatch.setattr(deepseek_v4, "v4_indexer_outputs", outputs)
+    # The opaque outer attention op must not capture this scorer into a
+    # token-count-only dense graph again.
+    assert torch.ops.aiter.v4_indexer_topk.spliting_op
+
+    def publish(counts):
+        bs = len(counts)
+        starts = [0, *np.cumsum(counts).tolist()]
+        cu[: bs + 1].copy_(torch.tensor(starts, dtype=torch.int32, device="cuda"))
+        bounds = [width - c + i + 1 for c in counts for i in range(c)]
+        ends.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
+        metadata.cu_seqlens_q = cu[: bs + 1]
+        metadata.csa_n_committed_per_token = ends
+        metadata.max_seqlen_q = max(counts)
+        metadata.block_tables = table[:bs]
+        fc.context.scheduled_bs = bs
+        fc.context.forward_mode = SimpleNamespace(running_bs=bs)
+        return bounds
+
+    def run():
+        return deepseek_v4.v4_indexer_topk(q, weights, qs, layer.layer_name, topk)
+
+    shapes = [[1] * rows, [rows], [3, 1, 4], [4, 4]]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for counts in shapes:
+            publish(counts)
+            run()
+        torch.cuda.synchronize()
+        fc.in_hipgraph = False
+        output_ptr = None
+        for counts in shapes[::-1] + shapes:
+            bounds = publish(counts)
+            got = run()
+            if output_ptr is None:
+                output_ptr = got.data_ptr()
+            assert got.data_ptr() == output_ptr
+            seq = [b for b, count in enumerate(counts) for _ in range(count)]
+            want = _oracle(
+                q, qs, kv, ks, table[: len(counts)], width, weights,
+                lambda keys: keys[seq],
+            )  # fmt: skip
+            for row, end in enumerate(bounds):
+                chosen = set(got[row][got[row] >= 0].tolist())
+                best = set(want[row, :end].topk(topk).indices.tolist())
+                assert len(chosen) == topk and max(chosen) < end
+                assert len(chosen & best) / topk > 0.99
+        # A dummy step must not access the KV cache or invoke the row-group
+        # scorer, but must overwrite the same output consumed by the dense graph.
+        fc.context.is_dummy_run = True
+        got = run()
+        assert got.data_ptr() == output_ptr and (got == -1).all()
+        torch.cuda.synchronize()
+    runner.release_graphs()
+
+
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
     """The geometry `dcp_decode_candidate_exchange_fused` hands the scorer: one
     row per query token over this rank's shard, each its own sequence, so the
