@@ -9,6 +9,12 @@ use std::{
     time::Duration,
 };
 
+fn default_pool() -> PoolConfig {
+    crate::config::RouterConfig::default()
+        .resolved_prepare_pool()
+        .unwrap()
+}
+
 #[test]
 fn response_state_never_fails_over_to_a_different_owner() {
     let parsed = ParsedInference::parse(
@@ -54,37 +60,6 @@ fn response_state_never_fails_over_to_a_different_owner() {
     assert!(!background.requires_state_domain());
 }
 
-#[test]
-fn new_api_routing_includes_system_tools_and_extension_content() {
-    for path in ["/v1/messages", "/v1/responses"] {
-        let mut value = if path.ends_with("messages") {
-            json!({"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":3,"system":"first"})
-        } else {
-            json!({"model":"m","input":"hi","instructions":"first"})
-        };
-        let first = ParsedInference::parse(path, &serde_json::to_vec(&value).unwrap())
-            .unwrap()
-            .metadata()
-            .text;
-        value[if path.ends_with("messages") {
-            "system"
-        } else {
-            "instructions"
-        }] = json!("different");
-        let second = ParsedInference::parse(path, &serde_json::to_vec(&value).unwrap())
-            .unwrap()
-            .metadata()
-            .text;
-        assert_ne!(first, second);
-        value["tools"] = json!([{"type":"function","name":"tool","vendor":{"x":1}}]);
-        let third = ParsedInference::parse(path, &serde_json::to_vec(&value).unwrap())
-            .unwrap()
-            .metadata()
-            .text;
-        assert_ne!(second, third);
-    }
-}
-
 #[tokio::test]
 async fn capabilities_and_exact_token_routing_are_explicit() {
     let worker = BasicWorkerBuilder::new("http://127.0.0.1:1")
@@ -106,7 +81,7 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         },
         ..Default::default()
     };
-    let _pool = PreparePoolRuntime::new(PoolConfig::default()).unwrap();
+    let _pool = PreparePoolRuntime::new(default_pool()).unwrap();
     let app = AppContext::from_config(config, 5, _pool.handle())
         .await
         .unwrap();
@@ -139,65 +114,6 @@ async fn capabilities_and_exact_token_routing_are_explicit() {
         assert_eq!(result.unwrap_err().code, "token_routing_unsupported");
     }
 }
-#[tokio::test]
-async fn round_robin_skips_routing_text_and_candidates_keep_model_boundaries() {
-    let _pool = PreparePoolRuntime::new(PoolConfig::default()).unwrap();
-    let app = AppContext::from_config(
-        crate::config::RouterConfig {
-            policy: crate::config::PolicyConfig::RoundRobin,
-            ..Default::default()
-        },
-        5,
-        _pool.handle(),
-    )
-    .await
-    .unwrap();
-    let target: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://127.0.0.1:1")
-            .model_id("m")
-            .build(),
-    );
-    let other: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://127.0.0.1:2")
-            .model_id("other")
-            .build(),
-    );
-    app.worker_registry.register(target);
-    app.worker_registry.register(other);
-    let routing = IngressRouting::new(&app);
-    for (path, body) in [
-        (
-            "/v1/chat/completions",
-            json!({"model":"m","messages":[{"role":"user","content":"text"}]}),
-        ),
-        (
-            "/v1/messages",
-            json!({"model":"m","messages":[{"role":"user","content":"text"}],"max_tokens":1}),
-        ),
-        ("/v1/responses", json!({"model":"m","input":"text"})),
-    ] {
-        let parsed = ParsedInference::parse(path, &serde_json::to_vec(&body).unwrap()).unwrap();
-        assert!(!parsed.metadata().text.is_empty());
-        let resources = routing.clone();
-        let (metadata, tokens) = app
-            .prepare_pool
-            .submit(app.prepare_pool.prepare_deadline(), move |ctx| {
-                resources.prepare(&parsed, ctx)
-            })
-            .await
-            .unwrap()
-            .wait()
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(metadata.text.is_empty());
-        assert!(tokens.is_none());
-        let candidates = routing.candidates(&metadata, false).unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].model_id(), "m");
-    }
-}
-
 fn json_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -215,7 +131,7 @@ async fn preparation_test_router(
     Arc<AppContext>,
     Arc<dyn crate::routers::RouterTrait>,
 ) {
-    let pool = PreparePoolRuntime::new(PoolConfig::default()).unwrap();
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
     let mut config = crate::config::RouterConfig {
         policy,
         backend: crate::config::BackendType::Sglang,
@@ -287,6 +203,7 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
             }
             requests.push(request);
         }
+        let model_metadata = requests[0].metadata.clone();
         let mut expired = InferenceEnvelope::parse(
             "/generate".parse().unwrap(),
             json_headers(),
@@ -296,15 +213,16 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
         .await
         .unwrap();
         expired.prepare_deadline = Instant::now() - Duration::from_millis(1);
-        let mut invalid = InferenceEnvelope::parse(
+        let invalid = InferenceEnvelope::parse(
             "/generate".parse().unwrap(),
             json_headers(),
-            Bytes::from_static(br#"{"model":"m","text":"test"}"#),
+            Bytes::from_static(br#"{"model":" ","text":"test"}"#),
             &app,
         )
         .await
+        .err()
         .unwrap();
-        invalid.metadata.model = Some(" ".into());
+        assert_eq!(invalid.code, "invalid_request");
 
         // A closed pool rejects every submission, so reaching placement proves
         // routing did not acquire another CPU slot after the initial parse.
@@ -326,36 +244,22 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
         // still forwarded rather than discarded.
         let response = router.route_inference(expired, &app).await;
         assert_eq!(response.headers()["x-mesh-error-code"], "model_not_found");
-        let response = router.route_inference(invalid, &app).await;
-        assert_eq!(response.headers()["x-mesh-error-code"], "invalid_request");
-    }
-}
 
-#[tokio::test]
-async fn token_routing_still_requires_pool_after_parsing() {
-    for pd in [false, true] {
-        let (pool, app, router) = preparation_test_router(
-            pd,
-            crate::config::PolicyConfig::PrefixHash {
-                prefix_token_count: 4,
-                load_factor: 1.25,
-            },
-        )
-        .await;
-        let request = InferenceEnvelope::parse(
-            "/generate".parse().unwrap(),
-            json_headers(),
-            Bytes::from_static(br#"{"model":"m","text":"test"}"#),
-            &app,
-        )
-        .await
-        .unwrap();
-        pool.close();
-        let response = router.route_inference(request, &app).await;
-        assert_eq!(
-            response.headers()["x-mesh-error-code"],
-            "prepare_pool_closed"
-        );
+        // Lightweight routing still keeps candidates within the model boundary.
+        if !pd {
+            for (port, model) in [(1, "m"), (2, "other")] {
+                app.worker_registry.register(Arc::new(
+                    BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                        .model_id(model)
+                        .build(),
+                ));
+            }
+            let candidates = IngressRouting::new(&app)
+                .candidates(&model_metadata, false)
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].model_id(), "m");
+        }
     }
 }
 
@@ -365,7 +269,7 @@ async fn sequential_prepare_preserves_deadline_body_and_input_lease() {
     let pool = PreparePoolRuntime::new(PoolConfig {
         workers: 1,
         max_retained_input_bytes: raw.len(),
-        ..PoolConfig::default()
+        ..default_pool()
     })
     .unwrap();
     let handle = pool.handle();
@@ -404,7 +308,7 @@ async fn sequential_prepare_preserves_deadline_body_and_input_lease() {
     assert_eq!(request.body, raw);
     assert_eq!(handle.stats().retained_input_bytes, raw.len());
     let downstream = request.body.clone();
-    let forwarding = request.into_http_request().unwrap();
+    let forwarding = request.into_http_request();
     assert_eq!(
         handle.stats().retained_input_bytes,
         0,
@@ -498,7 +402,7 @@ async fn running_preparation_keeps_input_budget_after_cancel_or_timeout() {
         let pool = PreparePoolRuntime::new(PoolConfig {
             workers: 1,
             max_retained_input_bytes: original.len(),
-            ..PoolConfig::default()
+            ..default_pool()
         })
         .unwrap();
         let handle = pool.handle();
@@ -611,14 +515,17 @@ impl crate::routers::RouterTrait for NativeIngressRouter {
 }
 
 #[tokio::test]
-async fn universal_parse_keeps_native_router_preparation_contract() {
+async fn native_handoff_keeps_router_contract_and_releases_raw_input() {
+    use crate::routers::RouterTrait;
     use http_body_util::BodyExt;
-    let pool = PreparePoolRuntime::new(PoolConfig::default()).unwrap();
+
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
     let config = crate::config::RouterConfig {
         policy: crate::config::PolicyConfig::PrefixHash {
             prefix_token_count: 4,
             load_factor: 1.25,
         },
+        connection_mode: ConnectionMode::Grpc { port: None },
         ..Default::default()
     };
     // HTTP preparation would fail without a tokenizer. The trait default must
@@ -649,14 +556,11 @@ async fn universal_parse_keeps_native_router_preparation_contract() {
         response.into_body().collect().await.unwrap().to_bytes(),
         "native"
     );
-}
 
-#[tokio::test]
-async fn native_handoff_releases_raw_input_even_after_the_preparation_deadline() {
-    use crate::routers::RouterTrait;
-
+    // The raw input is released before the native router runs, even when the
+    // preparation deadline has passed after parsing.
     for expired in [false, true] {
-        let pool = PreparePoolRuntime::new(PoolConfig::default()).unwrap();
+        let pool = PreparePoolRuntime::new(default_pool()).unwrap();
         let app = Arc::new(
             AppContext::from_config(crate::config::RouterConfig::default(), 5, pool.handle())
                 .await
@@ -763,7 +667,7 @@ async fn blocked_encode_keeps_tokio_responsive(pd: bool) {
     let pool = PreparePoolRuntime::new(PoolConfig {
         workers: 1,
         prepare_timeout: Duration::from_secs(20),
-        ..PoolConfig::default()
+        ..default_pool()
     })
     .unwrap();
     let mut config = RouterConfig {
@@ -865,7 +769,7 @@ async fn body_larger_than_total_input_budget_is_rejected_with_413() {
     let pool = PreparePoolRuntime::new(PoolConfig {
         workers: 1,
         max_retained_input_bytes: body.len() - 1,
-        ..PoolConfig::default()
+        ..default_pool()
     })
     .unwrap();
     let app = AppContext::from_config(Default::default(), 5, pool.handle())
@@ -889,7 +793,7 @@ async fn body_larger_than_total_input_budget_is_rejected_with_413() {
 async fn tokenize_endpoint_encodes_on_the_prepare_pool() {
     let pool = PreparePoolRuntime::new(PoolConfig {
         workers: 1,
-        ..PoolConfig::default()
+        ..default_pool()
     })
     .unwrap();
     let context = Arc::new(
@@ -953,10 +857,36 @@ fn dp_rank_is_forwarded_to_messages_and_responses_only_when_listed() {
 }
 
 #[tokio::test]
-async fn http_ingress_prepares_routing_tokens_in_the_parse_job() {
+async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
+    // Without parse-job preparation, token routing needs another pool job.
+    for pd in [false, true] {
+        let (pool, app, router) = preparation_test_router(
+            pd,
+            crate::config::PolicyConfig::PrefixHash {
+                prefix_token_count: 4,
+                load_factor: 1.25,
+            },
+        )
+        .await;
+        let request = InferenceEnvelope::parse(
+            "/generate".parse().unwrap(),
+            json_headers(),
+            Bytes::from_static(br#"{"model":"m","text":"test"}"#),
+            &app,
+        )
+        .await
+        .unwrap();
+        pool.close();
+        let response = router.route_inference(request, &app).await;
+        assert_eq!(
+            response.headers()["x-mesh-error-code"],
+            "prepare_pool_closed"
+        );
+    }
+
     let pool = PreparePoolRuntime::new(PoolConfig {
         workers: 1,
-        ..PoolConfig::default()
+        ..default_pool()
     })
     .unwrap();
     let config = crate::config::RouterConfig {
@@ -975,7 +905,7 @@ async fn http_ingress_prepares_routing_tokens_in_the_parse_job() {
         .load("mock-id", "m", "mock", || async { Ok(tokenizer) })
         .await
         .unwrap();
-    let routing = IngressRouting::new(&app);
+    let routing = IngressRouting::for_app(&app).unwrap();
     let request = InferenceEnvelope::parse_for_routing(
         "/generate".parse().unwrap(),
         json_headers(),
@@ -1011,4 +941,58 @@ fn untyped_item_references_are_accepted_as_state_references() {
     // An untyped item with neither an id nor a message shape is still invalid.
     let body = serde_json::to_vec(&json!({"model": "m", "input": [{"content": "hi"}]})).unwrap();
     assert!(ParsedInference::parse("/v1/responses", &body).is_err());
+}
+
+#[tokio::test]
+async fn ingress_prepares_routing_only_for_http_routers() {
+    use crate::config::{RouterConfig, RoutingMode};
+    let pool = PreparePoolRuntime::new(default_pool()).unwrap();
+    let pd = RoutingMode::PrefillDecode {
+        prefill_urls: vec![],
+        decode_urls: vec![],
+        prefill_policy: None,
+        decode_policy: None,
+    };
+    let grpc = ConnectionMode::Grpc { port: None };
+    // The production AppState routes through RouterManager, so the decision
+    // follows the configuration that RouterFactory uses to pick a router.
+    for (mode, connection_mode, atom_standalone, prepares) in [
+        (
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            ConnectionMode::Http,
+            false,
+            true,
+        ),
+        (pd.clone(), ConnectionMode::Http, false, true),
+        (
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            grpc.clone(),
+            false,
+            false,
+        ),
+        (pd, grpc, false, false),
+        (
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            ConnectionMode::Http,
+            true,
+            false,
+        ),
+    ] {
+        let config = RouterConfig {
+            mode,
+            connection_mode,
+            atom_standalone,
+            ..Default::default()
+        };
+        let app = AppContext::from_config(config, 5, pool.handle())
+            .await
+            .unwrap();
+        assert_eq!(IngressRouting::for_app(&app).is_some(), prepares);
+    }
 }

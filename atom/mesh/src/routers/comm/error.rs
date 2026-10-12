@@ -189,6 +189,13 @@ impl IngressError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
     }
+    pub fn body_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "request body limit exceeded",
+        )
+    }
     pub fn response(&self, path: &str) -> Response {
         MeshLocalError::response(path, self.status, self.code, &self.message)
     }

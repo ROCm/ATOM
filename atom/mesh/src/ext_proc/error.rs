@@ -111,9 +111,8 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
             serde_json::from_slice::<serde_json::Value>(&http).unwrap()
         );
-    }
-    #[test]
-    fn messages_size_error_has_its_protocol_type() {
+
+        // Messages size errors use their protocol-specific type.
         let response =
             ProcessingError::new(413, "body_too_large", "too large").response(None, "/v1/messages");
         let Some(pb::processing_response::Response::ImmediateResponse(response)) =

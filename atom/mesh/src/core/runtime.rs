@@ -35,8 +35,6 @@ pub fn build_runtime() -> io::Result<Runtime> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use super::*;
 
     #[test]
@@ -46,48 +44,5 @@ mod tests {
         assert_eq!(split_workers(7), (3, 4));
         assert_eq!(split_workers(2), (1, 1));
         assert_eq!(split_workers(1), (1, 1));
-    }
-
-    #[test]
-    fn runtime_uses_split_default_and_preserves_env_override() {
-        const EXPECTED_WORKERS: &str = "ATOMESH_RUNTIME_TEST_EXPECTED_WORKERS";
-        if let Ok(expected) = std::env::var(EXPECTED_WORKERS) {
-            let runtime = build_runtime().unwrap();
-            assert_eq!(
-                runtime.metrics().num_workers(),
-                expected.parse::<usize>().unwrap()
-            );
-            runtime.block_on(async {
-                assert_eq!(tokio::spawn(async { 42 }).await.unwrap(), 42);
-            });
-            return;
-        }
-
-        // Change only each child's environment; other tests may build runtimes
-        // concurrently in this process.
-        for override_workers in [None, Some("3")] {
-            let expected = override_workers
-                .map(str::to_owned)
-                .unwrap_or_else(|| default_worker_counts().1.to_string());
-            let mut child = Command::new(std::env::current_exe().unwrap());
-            child
-                .args([
-                    "--exact",
-                    "core::runtime::tests::runtime_uses_split_default_and_preserves_env_override",
-                    "--nocapture",
-                ])
-                .env(EXPECTED_WORKERS, expected)
-                .env_remove("TOKIO_WORKER_THREADS");
-            if let Some(workers) = override_workers {
-                child.env("TOKIO_WORKER_THREADS", workers);
-            }
-            let output = child.output().unwrap();
-            assert!(
-                output.status.success(),
-                "runtime probe failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
     }
 }

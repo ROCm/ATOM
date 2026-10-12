@@ -259,9 +259,13 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
   with 112 threads, or 20 with `--prepare-workers 2`.
   `--prepare-queue-capacity` overrides that limit. Queued jobs still have a
   `--prepare-queue-timeout-ms` deadline (default: 250 ms); canceled waiters release
-  their slot immediately. When ext-proc is enabled and `--prepare-workers` is
-  omitted, `--ext-proc-parser-concurrency` determines the preparation count,
-  capped by `--ext-proc-max-streams`; its default is the same detected half.
+  their slot immediately. All request parsing runs on this pool. Each request's
+  preparation shares one `--prepare-timeout-ms` deadline (default: 5000 ms), and
+  tokenization input is limited by `--prepare-max-tokenize-bytes` (default: 1 MiB).
+  When ext-proc is enabled, the legacy `--ext-proc-parser-concurrency` and
+  `--ext-proc-max-tokenize-bytes` options apply only if the corresponding
+  `--prepare-*` option is unset; neither has a default of its own. On shutdown,
+  Mesh waits up to 5 seconds for preparation threads after transport draining.
   `--prepare-max-retained-input-bytes` (default: 32 MiB) caps the raw input bytes
   held during preparation, including queueing and result handoff. The charge is
   released before upstream dispatch; forwarding and retries do not hold it.

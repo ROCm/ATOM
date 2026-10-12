@@ -37,7 +37,8 @@ impl Fixture {
     async fn new(mut config: RouterConfig) -> Self {
         config.ext_proc.enabled = true;
         config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
-        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let prepare_runtime =
+            PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
         let app = Arc::new(
             AppContext::from_config(config, 5, prepare_runtime.handle())
                 .await
@@ -1416,7 +1417,7 @@ async fn pd_execution_lease_pins_pair_rejects_replay_and_expires_on_disconnect()
     config.max_concurrent_requests = 1;
     config.ext_proc.listen = "127.0.0.1:0".parse().unwrap();
     config.ext_proc.executor_listen = "127.0.0.1:0".parse().unwrap();
-    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
     let app = Arc::new(
         AppContext::from_config(config, 5, prepare_runtime.handle())
             .await

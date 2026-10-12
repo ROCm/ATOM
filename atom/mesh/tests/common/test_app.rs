@@ -23,7 +23,8 @@ pub fn create_test_app(
     client: Client,
     router_config: &RouterConfig,
 ) -> (Router, PreparePoolRuntime) {
-    let prepare_runtime = PreparePoolRuntime::new(router_config.resolved_prepare_pool()).unwrap();
+    let prepare_runtime =
+        PreparePoolRuntime::new(router_config.resolved_prepare_pool().unwrap()).unwrap();
     // Initialize rate limiter
     let rate_limiter = match router_config.max_concurrent_requests {
         n if n <= 0 => None,
@@ -148,7 +149,8 @@ pub fn create_test_app_with_context(
 #[allow(dead_code)]
 pub async fn create_test_app_context() -> (Arc<AppContext>, PreparePoolRuntime) {
     let router_config = RouterConfig::default();
-    let prepare_runtime = PreparePoolRuntime::new(router_config.resolved_prepare_pool()).unwrap();
+    let prepare_runtime =
+        PreparePoolRuntime::new(router_config.resolved_prepare_pool().unwrap()).unwrap();
     let client = Client::new();
 
     // Initialize empty OnceLocks

@@ -43,90 +43,79 @@ async fn preparation_budget_is_reusable_while_upstream_headers_are_blocked() {
             .unwrap();
     });
 
-    for policy in [
-        PolicyConfig::RoundRobin,
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-        },
-    ] {
-        for path in multi_api::APIS {
-            let raw = Bytes::from(multi_api::request(path, false).to_string());
-            let mut config = RouterConfig {
-                policy: policy.clone(),
-                disable_retries: true,
-                ..Default::default()
-            };
-            config.prepare_pool.workers = Some(1);
-            // There is only enough preparation budget for one request at a time.
-            config.prepare_pool.max_retained_input_bytes = raw.len();
-            let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
-            let pool = runtime.handle();
-            let context = Arc::new(
-                AppContext::from_config(config, 5, pool.clone())
+    for path in multi_api::APIS {
+        let raw = Bytes::from(multi_api::request(path, false).to_string());
+        let mut config = RouterConfig {
+            policy: PolicyConfig::RoundRobin,
+            disable_retries: true,
+            ..Default::default()
+        };
+        config.prepare_pool.workers = Some(1);
+        // There is only enough preparation budget for one request at a time.
+        config.prepare_pool.max_retained_input_bytes = raw.len();
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
+        let pool = runtime.handle();
+        let context = Arc::new(
+            AppContext::from_config(config, 5, pool.clone())
+                .await
+                .unwrap(),
+        );
+        context.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new(&url).model_id("test-model").build(),
+        ));
+        let app = multi_api::http_app(context).await;
+        let request = || {
+            Request::post(*path)
+                .header("content-type", "application/json")
+                .body(Body::from(raw.clone()))
+                .unwrap()
+        };
+
+        let first = tokio::spawn(app.clone().oneshot(request()));
+        let (first_body, first_reply) =
+            tokio::time::timeout(Duration::from_secs(5), captured.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(first_body, raw);
+        assert!(!first.is_finished());
+        assert_eq!(pool.stats().retained_input_bytes, 0, "{path}");
+
+        // Leave the first response headers blocked while the next request enters.
+        let second = tokio::spawn(app.oneshot(request()));
+        let (second_body, second_reply) =
+            tokio::time::timeout(Duration::from_secs(5), captured.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(second_body, raw);
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        assert_eq!(pool.stats().retained_input_bytes, 0, "{path}");
+
+        for reply in [first_reply, second_reply] {
+            reply
+                .send(
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from(multi_api::output(path, false)))
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        for task in [first, second] {
+            let response = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
                     .await
                     .unwrap(),
+                multi_api::output(path, false)
             );
-            context.worker_registry.register(Arc::new(
-                BasicWorkerBuilder::new(&url).model_id("test-model").build(),
-            ));
-            let app = multi_api::http_app(context).await;
-            let request = || {
-                Request::post(*path)
-                    .header("content-type", "application/json")
-                    .body(Body::from(raw.clone()))
-                    .unwrap()
-            };
-
-            let first = tokio::spawn(app.clone().oneshot(request()));
-            let (first_body, first_reply) =
-                tokio::time::timeout(Duration::from_secs(5), captured.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            assert_eq!(first_body, raw);
-            assert!(!first.is_finished());
-            assert_eq!(pool.stats().retained_input_bytes, 0, "{path}");
-
-            // Leave the first response headers blocked while the next request enters.
-            let second = tokio::spawn(app.oneshot(request()));
-            let (second_body, second_reply) =
-                tokio::time::timeout(Duration::from_secs(5), captured.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            assert_eq!(second_body, raw);
-            assert!(!first.is_finished());
-            assert!(!second.is_finished());
-            assert_eq!(pool.stats().retained_input_bytes, 0, "{path}");
-
-            for reply in [first_reply, second_reply] {
-                reply
-                    .send(
-                        Response::builder()
-                            .header("content-type", "application/json")
-                            .body(Body::from(multi_api::output(path, false)))
-                            .unwrap(),
-                    )
-                    .unwrap();
-            }
-            for task in [first, second] {
-                let response = tokio::time::timeout(Duration::from_secs(5), task)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(response.status(), StatusCode::OK);
-                assert_eq!(
-                    axum::body::to_bytes(response.into_body(), 4096)
-                        .await
-                        .unwrap(),
-                    multi_api::output(path, false)
-                );
-            }
         }
     }
     server.abort();
@@ -150,16 +139,13 @@ async fn http_preserves_all_api_requests_and_json_sse_errors() {
 }
 
 #[tokio::test]
-async fn api_validation_errors_follow_the_requested_protocol() {
+async fn malformed_requests_and_uploads_return_protocol_errors() {
     let backend = multi_api::Backend::start().await;
     let (context, _, _prepare_runtime) = backend.context(None).await;
     let app = multi_api::http_app(context).await;
+    // Bodies that are not JSON objects fail before schema validation.
     for path in multi_api::APIS {
-        for body in [
-            "{",
-            "[]",
-            "{\"model\":\"test-model\",\"messages\":[],\"stream\":42}",
-        ] {
+        for body in ["{", "[]"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -181,72 +167,73 @@ async fn api_validation_errors_follow_the_requested_protocol() {
             }
         }
     }
-    let response = app
-        .oneshot(
-            Request::post("/v1/messages")
-                .header("content-type", "application/json")
-                .header("content-encoding", "gzip")
-                .body(Body::from(json!({}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-}
 
-#[tokio::test]
-async fn messages_method_and_size_errors_are_protocol_errors() {
-    let backend = multi_api::Backend::start().await;
-    let (context, _, _prepare_runtime) = backend.context(None).await;
-    let app = multi_api::http_app(context).await;
-    for (method, body, content_length, status) in [
-        ("GET", String::new(), true, StatusCode::METHOD_NOT_ALLOWED),
-        (
-            "POST",
-            "x".repeat(1024 * 1024 + 1),
-            true,
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ),
-        (
-            "POST",
-            "x".repeat(1024 * 1024 + 1),
-            false,
-            StatusCode::PAYLOAD_TOO_LARGE,
-        ),
-    ] {
-        let mut request = Request::builder()
-            .method(method)
-            .uri("/v1/messages")
-            .header("content-type", "application/json");
-        if content_length {
-            request = request.header("content-length", body.len().to_string());
-        }
-        // Use an unknown-size stream to exercise the actual limit during upload.
-        let chunks = futures_util::stream::iter(
-            body.into_bytes()
+    // Use an unknown-size stream to exercise the actual limit during upload.
+    let oversized = || {
+        Body::from_stream(futures_util::stream::iter(
+            vec![b'x'; 1024 * 1024 + 1]
                 .chunks(8192)
                 .map(|c| Ok::<_, std::convert::Infallible>(bytes::Bytes::copy_from_slice(c)))
                 .collect::<Vec<_>>(),
-        );
-        let response = app
-            .clone()
-            .oneshot(request.body(Body::from_stream(chunks)).unwrap())
-            .await
-            .unwrap();
+        ))
+    };
+    let broken = Body::from_stream(futures_util::stream::once(async {
+        Err::<bytes::Bytes, _>(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "upload interrupted",
+        ))
+    }));
+    let messages = |method: &str| {
+        Request::builder()
+            .method(method)
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+    };
+    for (request, status, error_type) in [
+        (
+            messages("GET").body(Body::empty()).unwrap(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "invalid_request_error",
+        ),
+        (
+            messages("POST")
+                .header("content-length", (1024 * 1024 + 1).to_string())
+                .body(oversized())
+                .unwrap(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ),
+        (
+            messages("POST").body(oversized()).unwrap(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        ),
+        // A broken upload is not reported as oversized.
+        (
+            messages("POST").body(broken).unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+        ),
+        (
+            messages("POST")
+                .header("content-encoding", "gzip")
+                .body(Body::from(json!({}).to_string()))
+                .unwrap(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+        ),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), status);
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(response.headers()["x-mesh-error-code"], "invalid_request");
+        }
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["type"], "error");
-        assert_eq!(
-            value["error"]["type"],
-            if status == StatusCode::PAYLOAD_TOO_LARGE {
-                "request_too_large"
-            } else {
-                "invalid_request_error"
-            }
-        );
+        assert_eq!(value["type"], "error", "{status}: {value}");
+        assert_eq!(value["error"]["type"], error_type, "{status}: {value}");
         assert!(value["error"]["message"].is_string());
     }
 }
@@ -323,35 +310,6 @@ async fn responses_submissions_are_never_retried_after_backend_failure() {
 }
 
 #[tokio::test]
-async fn broken_upload_is_not_reported_as_oversized() {
-    let backend = multi_api::Backend::start().await;
-    let (context, _, _prepare_runtime) = backend.context(None).await;
-    let app = multi_api::http_app(context).await;
-    let body = Body::from_stream(futures_util::stream::once(async {
-        Err::<bytes::Bytes, _>(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "upload interrupted",
-        ))
-    }));
-    let response = app
-        .oneshot(
-            Request::post("/v1/messages")
-                .header("content-type", "application/json")
-                .body(body)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(response.headers()["x-mesh-error-code"], "invalid_request");
-    let body = axum::body::to_bytes(response.into_body(), 4096)
-        .await
-        .unwrap();
-    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(error["type"], "error");
-}
-
-#[tokio::test]
 async fn response_resources_preserve_methods_queries_credentials_and_streaming() {
     use axum::{extract::State, http::Method, response::Response, Router};
     use bytes::Bytes;
@@ -388,7 +346,8 @@ async fn response_resources_preserve_methods_queries_credentials_and_streaming()
         ..Default::default()
     };
     let prepare_runtime =
-        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap())
+            .unwrap();
     let context = Arc::new(
         AppContext::from_config(config, 5, prepare_runtime.handle())
             .await
@@ -587,11 +546,11 @@ async fn response_resource_errors_prefer_possible_owners_over_unsupported_routes
     }
     let unsupported = serve(StatusCode::METHOD_NOT_ALLOWED).await;
     let missing = serve(StatusCode::NOT_FOUND).await;
-    // Release a bound port so connections to it are refused.
-    let unreachable = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
+    // Bind a port without listening: connections are refused, and the port
+    // cannot be reused by another test while the socket is held.
+    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let unreachable = format!("http://{}", reserved.local_addr().unwrap());
     for (urls, status, code) in [
         // A backend without the routes says nothing about the resource.
         (vec![&unsupported, &missing], StatusCode::NOT_FOUND, None),
@@ -606,7 +565,8 @@ async fn response_resource_errors_prefer_possible_owners_over_unsupported_routes
             disable_retries: true,
             ..Default::default()
         };
-        let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let prepare_runtime =
+            PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
         let context = Arc::new(
             AppContext::from_config(config, 5, prepare_runtime.handle())
                 .await

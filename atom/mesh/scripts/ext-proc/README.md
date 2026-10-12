@@ -51,6 +51,12 @@ For other options:
 bash atom/mesh/scripts/ext-proc/test_envoy_atom.sh --help
 ```
 
+Ext-proc parsing and tokenization use the shared request preparation pool,
+configured with the Mesh `--prepare-*` options (see the Mesh README). The legacy
+`--ext-proc-parser-concurrency` and `--ext-proc-max-tokenize-bytes` options are
+still accepted; each applies only when `--prepare-workers` or
+`--prepare-max-tokenize-bytes`, respectively, is unset.
+
 The Envoy template disables automatic request ID generation and preserves client
 request IDs. Keep `generate_request_id: false` and
 `preserve_external_request_id: true` when adapting the configuration so Mesh can

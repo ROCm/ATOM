@@ -37,14 +37,14 @@ impl MetricsRouteFactory {
 /// A failed preparation pool never recovers, so report the process as not
 /// live and let the orchestrator restart it rather than only draining traffic.
 async fn liveness(State(state): State<Arc<AppState>>) -> Response {
-    if state.context.prepare_pool.stats().failed {
+    if state.context.prepare_pool.is_failed() {
         return prepare_pool_unavailable();
     }
     (StatusCode::OK, "OK").into_response()
 }
 
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
-    if state.context.prepare_pool.stats().failed {
+    if state.context.prepare_pool.is_failed() {
         return prepare_pool_unavailable();
     }
     let workers = state.context.worker_registry.get_all();
@@ -90,7 +90,7 @@ async fn health(state: State<Arc<AppState>>) -> Response {
 }
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    if state.context.prepare_pool.stats().failed {
+    if state.context.prepare_pool.is_failed() {
         return prepare_pool_unavailable();
     }
     state.router.health_generate(req).await
@@ -136,7 +136,9 @@ mod tests {
         }
         let mut pool = PreparePoolRuntime::new(PoolConfig {
             workers: 1,
-            ..PoolConfig::default()
+            ..crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap()
         })
         .unwrap();
         let context = Arc::new(
@@ -187,7 +189,7 @@ mod tests {
         drop(ticket);
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !handle.stats().failed {
+            while !handle.is_failed() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

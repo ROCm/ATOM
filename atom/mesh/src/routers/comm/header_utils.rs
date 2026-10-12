@@ -85,7 +85,16 @@ pub fn inference_request_headers(
     original: &HeaderMap,
     path: &str,
     api_key: Option<&str>,
-) -> Result<HeaderMap, http::header::InvalidHeaderValue> {
+) -> Result<HeaderMap, super::error::IngressError> {
+    let credential = |value: &str| {
+        http::HeaderValue::from_str(value).map_err(|_| {
+            super::error::IngressError::new(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "invalid_backend_credentials",
+                "configured worker credential is not a valid HTTP header",
+            )
+        })
+    };
     let mut result = HeaderMap::new();
     for (name, value) in original {
         if should_forward_request_header(name.as_str())
@@ -95,14 +104,11 @@ pub fn inference_request_headers(
         }
     }
     if let Some(key) = api_key {
-        result.insert(
-            "authorization",
-            http::HeaderValue::from_str(&format!("Bearer {key}"))?,
-        );
+        result.insert("authorization", credential(&format!("Bearer {key}"))?);
         // Anthropic clients authenticate Messages with x-api-key, while
         // OpenAI-compatible backends serving the same route check the bearer.
         if path.split('?').next() == Some("/v1/messages") {
-            result.insert("x-api-key", http::HeaderValue::from_str(key)?);
+            result.insert("x-api-key", credential(key)?);
         }
     }
     Ok(result)

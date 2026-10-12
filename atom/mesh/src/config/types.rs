@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +111,17 @@ pub struct RouterConfig {
     pub tokenizer_cache: TokenizerCacheConfig,
 }
 
+/// Default `--prepare-max-retained-input-bytes`.
+pub const DEFAULT_MAX_RETAINED_INPUT_BYTES: usize = 32 * 1024 * 1024;
+/// Default `--prepare-queue-timeout-ms`.
+pub const DEFAULT_PREPARE_QUEUE_TIMEOUT_MS: u64 = 250;
+/// Default `--prepare-timeout-ms`.
+pub const DEFAULT_PREPARE_TIMEOUT_MS: u64 = 5000;
+/// Default `--prepare-max-tokenize-bytes`.
+pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 1024 * 1024;
+/// Waiting jobs per preparation thread when `--prepare-queue-capacity` is unset.
+pub const PREPARE_QUEUE_SLOTS_PER_WORKER: usize = 10;
+
 /// Shared CPU preparation limits for HTTP, PD and external processing.
 #[derive(Debug, Clone, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
 #[command(next_help_heading = "Request Preparation")]
@@ -127,137 +138,38 @@ pub struct PreparePoolConfig {
     #[arg(
         id = "prepare_max_retained_input_bytes",
         long = "prepare-max-retained-input-bytes",
-        default_value_t = 33554432
+        default_value_t = DEFAULT_MAX_RETAINED_INPUT_BYTES
     )]
     pub max_retained_input_bytes: usize,
     /// Queue wait limit.
     #[arg(
         id = "prepare_queue_timeout_ms",
         long = "prepare-queue-timeout-ms",
-        default_value_t = 250
+        default_value_t = DEFAULT_PREPARE_QUEUE_TIMEOUT_MS
     )]
     pub queue_timeout_ms: u64,
     /// Deadline shared by parsing and tokenization.
     #[arg(
         id = "prepare_timeout_ms",
         long = "prepare-timeout-ms",
-        default_value_t = 5000
+        default_value_t = DEFAULT_PREPARE_TIMEOUT_MS
     )]
     pub prepare_timeout_ms: u64,
-    /// Pool shutdown wait after transport draining.
-    #[arg(
-        id = "prepare_shutdown_grace_ms",
-        long = "prepare-shutdown-grace-ms",
-        default_value_t = 5000
-    )]
-    pub shutdown_grace_ms: u64,
-    /// Tokenization byte limit; overrides --ext-proc-max-tokenize-bytes.
+    /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
     #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
     pub max_tokenize_bytes: Option<usize>,
-    /// Parse bodies up to this size on Tokio (at most 64 KiB); 0 sends all
-    /// parsing to the pool.
-    #[arg(
-        id = "prepare_parse_inline_max_bytes",
-        long = "prepare-parse-inline-max-bytes",
-        default_value_t = 0
-    )]
-    pub parse_inline_max_bytes: usize,
 }
-
-/// Upper bound for `--prepare-parse-inline-max-bytes`.
-pub const MAX_PARSE_INLINE_BYTES: usize = 64 * 1024;
 
 impl Default for PreparePoolConfig {
     fn default() -> Self {
         Self {
             workers: None,
             queue_capacity: None,
-            max_retained_input_bytes: 32 * 1024 * 1024,
-            queue_timeout_ms: 250,
-            prepare_timeout_ms: 5000,
-            shutdown_grace_ms: 5000,
+            max_retained_input_bytes: DEFAULT_MAX_RETAINED_INPUT_BYTES,
+            queue_timeout_ms: DEFAULT_PREPARE_QUEUE_TIMEOUT_MS,
+            prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
             max_tokenize_bytes: None,
-            parse_inline_max_bytes: 0,
         }
-    }
-}
-
-impl PreparePoolConfig {
-    pub fn validate(&self) -> ConfigResult<()> {
-        self.validate_with_workers(self.workers.unwrap_or_else(default_prepare_workers))
-    }
-
-    pub(crate) fn resolved_queue_capacity(&self, workers: usize) -> ConfigResult<usize> {
-        let capacity = match self.queue_capacity {
-            Some(capacity) => capacity,
-            None => workers
-                .checked_mul(10)
-                .ok_or_else(|| ConfigError::InvalidValue {
-                    field: "prepare_pool.queue_capacity".to_string(),
-                    value: format!("10 * {workers}"),
-                    reason: "Automatic queue capacity exceeds the platform limit".to_string(),
-                })?,
-        };
-        if capacity == 0 || capacity > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(ConfigError::InvalidValue {
-                field: "prepare_pool.queue_capacity".to_string(),
-                value: capacity.to_string(),
-                reason: "Queue capacity must be positive and fit the semaphore permit limit"
-                    .to_string(),
-            });
-        }
-        Ok(capacity)
-    }
-
-    pub(crate) fn validate_with_workers(&self, workers: usize) -> ConfigResult<()> {
-        if workers > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(ConfigError::InvalidValue {
-                field: "prepare_pool.workers".to_string(),
-                value: workers.to_string(),
-                reason: "Worker count exceeds the semaphore permit limit".to_string(),
-            });
-        }
-        for (field, value) in [
-            ("workers", workers),
-            ("max_retained_input_bytes", self.max_retained_input_bytes),
-            ("max_tokenize_bytes", self.max_tokenize_bytes.unwrap_or(1)),
-        ] {
-            if value == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: format!("prepare_pool.{field}"),
-                    value: value.to_string(),
-                    reason: "Must be greater than zero".to_string(),
-                });
-            }
-        }
-        self.resolved_queue_capacity(workers)?;
-        // Inline parsing runs on Tokio workers without a concurrency limit, so
-        // keep it to small bodies whose parse cost is negligible.
-        if self.parse_inline_max_bytes > MAX_PARSE_INLINE_BYTES {
-            return Err(ConfigError::InvalidValue {
-                field: "prepare_pool.parse_inline_max_bytes".to_string(),
-                value: self.parse_inline_max_bytes.to_string(),
-                reason: format!("Must not exceed {MAX_PARSE_INLINE_BYTES} bytes"),
-            });
-        }
-        for (field, value) in [
-            ("queue_timeout_ms", self.queue_timeout_ms),
-            ("prepare_timeout_ms", self.prepare_timeout_ms),
-            ("shutdown_grace_ms", self.shutdown_grace_ms),
-        ] {
-            if value == 0
-                || Instant::now()
-                    .checked_add(Duration::from_millis(value))
-                    .is_none()
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: format!("prepare_pool.{field}"),
-                    value: value.to_string(),
-                    reason: "Must be a positive, representable duration".to_string(),
-                });
-            }
-        }
-        Ok(())
     }
 }
 
@@ -571,56 +483,57 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
-    pub fn resolved_prepare_pool(&self) -> PoolConfig {
-        let config = &self.prepare_pool;
-        let workers = self.resolved_prepare_workers();
-        PoolConfig {
+    /// Preparation settings, with the legacy ext-proc options filling unset
+    /// values when the external-processing transport is enabled.
+    fn effective_prepare_pool(&self) -> PreparePoolConfig {
+        let config = self.prepare_pool.clone();
+        #[cfg(feature = "ext-proc")]
+        if self.ext_proc.enabled {
+            return PreparePoolConfig {
+                workers: config.workers.or(self.ext_proc.parser_concurrency),
+                max_tokenize_bytes: config
+                    .max_tokenize_bytes
+                    .or(self.ext_proc.max_tokenize_bytes),
+                ..config
+            };
+        }
+        config
+    }
+
+    pub fn resolved_prepare_pool(&self) -> ConfigResult<PoolConfig> {
+        let config = self.effective_prepare_pool();
+        let workers = config.workers.unwrap_or_else(default_prepare_workers);
+        let queue_capacity = match config.queue_capacity {
+            Some(capacity) => capacity,
+            None => workers
+                .checked_mul(PREPARE_QUEUE_SLOTS_PER_WORKER)
+                .ok_or_else(|| ConfigError::InvalidValue {
+                    field: "prepare_pool.queue_capacity".to_string(),
+                    value: format!("{PREPARE_QUEUE_SLOTS_PER_WORKER} * {workers}"),
+                    reason: "Automatic queue capacity exceeds the platform limit".to_string(),
+                })?,
+        };
+        let pool = PoolConfig {
             workers,
-            queue_capacity: config
-                .resolved_queue_capacity(workers)
-                .expect("preparation queue capacity must be validated before resolution"),
+            queue_capacity,
             max_retained_input_bytes: config.max_retained_input_bytes,
             queue_timeout: Duration::from_millis(config.queue_timeout_ms),
             prepare_timeout: Duration::from_millis(config.prepare_timeout_ms),
-            shutdown_grace: Duration::from_millis(config.shutdown_grace_ms),
-        }
+        };
+        pool.validate()?;
+        Ok(pool)
     }
 
-    /// Resolve legacy options only when the external-processing transport is enabled.
     pub fn resolved_prepare_workers(&self) -> usize {
-        if let Some(workers) = self.prepare_pool.workers {
-            return workers;
-        }
-        #[cfg(feature = "ext-proc")]
-        if self.ext_proc.enabled {
-            return self
-                .ext_proc
-                .parser_concurrency
-                .min(self.ext_proc.max_streams);
-        }
-        default_prepare_workers()
-    }
-
-    pub fn prepare_workers_source(&self) -> &'static str {
-        if self.prepare_pool.workers.is_some() {
-            return "common";
-        }
-        #[cfg(feature = "ext-proc")]
-        if self.ext_proc.enabled {
-            return "ext_proc";
-        }
-        "default"
+        self.effective_prepare_pool()
+            .workers
+            .unwrap_or_else(default_prepare_workers)
     }
 
     pub fn resolved_max_tokenize_bytes(&self) -> usize {
-        if let Some(limit) = self.prepare_pool.max_tokenize_bytes {
-            return limit;
-        }
-        #[cfg(feature = "ext-proc")]
-        if self.ext_proc.enabled {
-            return self.ext_proc.max_tokenize_bytes;
-        }
-        1024 * 1024
+        self.effective_prepare_pool()
+            .max_tokenize_bytes
+            .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
     }
 
     /// Create a new configuration with mode and policy
@@ -674,21 +587,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_pool_defaults_and_legacy_config_deserialization() {
+    fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
         let config = RouterConfig::default();
         let workers = default_prepare_workers();
         assert_eq!(config.resolved_prepare_workers(), workers);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, workers * 10);
+        let pool = config.resolved_prepare_pool().unwrap();
+        assert_eq!(pool.queue_capacity, workers * 10);
+        assert_eq!(pool.max_retained_input_bytes, 32 * 1024 * 1024);
+        assert_eq!(pool.queue_timeout, Duration::from_millis(250));
+        assert_eq!(pool.prepare_timeout, Duration::from_secs(5));
         assert_eq!(config.prepare_pool.queue_capacity, None);
-        assert_eq!(config.prepare_workers_source(), "default");
         assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
-        assert_eq!(config.prepare_pool.parse_inline_max_bytes, 0);
         let mut legacy = serde_json::to_value(&config).unwrap();
         legacy.as_object_mut().unwrap().remove("prepare_pool");
         let restored: RouterConfig = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.prepare_pool, PreparePoolConfig::default());
 
-        let partial: PreparePoolConfig = serde_json::from_str(r#"{"workers":2}"#).unwrap();
+        // Removed options in saved configs are ignored.
+        let partial: PreparePoolConfig = serde_json::from_str(
+            r#"{"workers":2,"shutdown_grace_ms":3000,"parse_inline_max_bytes":1024}"#,
+        )
+        .unwrap();
         assert_eq!(partial.workers, Some(2));
         assert_eq!(partial.queue_capacity, None);
         assert_eq!(partial.max_retained_input_bytes, 32 * 1024 * 1024);
@@ -696,42 +615,16 @@ mod tests {
             prepare_pool: partial,
             ..Default::default()
         };
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 20);
-    }
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 20);
 
-    #[test]
-    fn prepare_pool_explicit_queue_capacity_overrides_thread_multiplier() {
+        // An explicit queue capacity overrides the per-worker multiplier.
         let prepare_pool = serde_json::from_str(r#"{"workers":2,"queue_capacity":6}"#).unwrap();
         let config = RouterConfig {
             prepare_pool,
             ..Default::default()
         };
         config.validate().unwrap();
-        assert_eq!(config.prepare_pool.queue_capacity, Some(6));
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 6);
-
-        let prepare_pool = serde_json::from_str(r#"{"workers":2,"queue_capacity":null}"#).unwrap();
-        let config = RouterConfig {
-            prepare_pool,
-            ..Default::default()
-        };
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 20);
-    }
-
-    #[test]
-    fn prepare_pool_defaults_to_half_available_cpus_in_pd_mode() {
-        let config = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: Vec::new(),
-                decode_urls: Vec::new(),
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
-        let workers = default_prepare_workers();
-        assert_eq!(config.resolved_prepare_pool().workers, workers);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, workers * 10);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);
     }
 
     #[cfg(feature = "ext-proc")]
@@ -740,28 +633,40 @@ mod tests {
         let mut config = RouterConfig::default();
         config.ext_proc.enabled = true;
         let workers = default_prepare_workers();
-        assert_eq!(
-            config.resolved_prepare_workers(),
-            workers.min(config.ext_proc.max_streams)
-        );
+        assert_eq!(config.resolved_prepare_workers(), workers);
         config.ext_proc.enabled = false;
-        config.ext_proc.parser_concurrency = 8;
-        config.ext_proc.max_streams = 3;
-        config.ext_proc.max_tokenize_bytes = 4096;
+        config.ext_proc.parser_concurrency = Some(3);
+        config.ext_proc.max_tokenize_bytes = Some(4096);
         // Merely compiling ext-proc must not change the ordinary HTTP limits.
         assert_eq!(config.resolved_prepare_workers(), workers);
         assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
         config.ext_proc.enabled = true;
         assert_eq!(config.resolved_prepare_workers(), 3);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 30);
-        assert_eq!(config.prepare_workers_source(), "ext_proc");
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
         assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
         config.prepare_pool.workers = Some(1);
         config.prepare_pool.max_tokenize_bytes = Some(8192);
         assert_eq!(config.resolved_prepare_workers(), 1);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 10);
-        assert_eq!(config.prepare_workers_source(), "common");
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
         assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+    }
+
+    #[cfg(feature = "ext-proc")]
+    #[test]
+    fn legacy_ext_proc_config_file_still_sets_preparation_limits() {
+        let mut legacy = serde_json::to_value(RouterConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("prepare_pool");
+        legacy["ext_proc"] = serde_json::json!({
+            "enabled": true,
+            "parser_concurrency": 3,
+            "max_tokenize_bytes": 4096,
+        });
+        let config: RouterConfig = serde_json::from_value(legacy).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.ext_proc.parser_concurrency, Some(3));
+        assert_eq!(config.resolved_prepare_workers(), 3);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
     }
 
     #[test]

@@ -266,7 +266,7 @@ impl AppTestContext {
 
 /// Helper function to create AppContext for tests
 pub async fn create_test_context(config: RouterConfig) -> (Arc<AppContext>, PreparePoolRuntime) {
-    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
     let client = reqwest::Client::new();
 
     // Initialize rate limiter
@@ -349,7 +349,7 @@ pub async fn create_test_context(config: RouterConfig) -> (Arc<AppContext>, Prep
 pub async fn create_test_context_with_parsers(
     config: RouterConfig,
 ) -> (Arc<AppContext>, PreparePoolRuntime) {
-    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
     let client = reqwest::Client::new();
 
     // Initialize rate limiter

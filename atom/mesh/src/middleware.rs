@@ -223,12 +223,8 @@ pub async fn payload_limit_middleware(
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|n| n > limit as u64)
     {
-        return crate::routers::comm::error::IngressError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-            "request body limit exceeded",
-        )
-        .response(request.uri().path());
+        return crate::routers::comm::error::IngressError::body_too_large()
+            .response(request.uri().path());
     }
     // Raw handlers also need a stream limit for chunked uploads.
     let request = request.map(|body| Body::new(http_body_util::Limited::new(body, limit)));

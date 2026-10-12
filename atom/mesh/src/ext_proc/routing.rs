@@ -4,14 +4,14 @@ use crate::{
     app_context::AppContext,
     core::{
         placement::{
-            planner::DefaultPlanner,
-            registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            registry_adapters::PolicyRegistryAdapter,
             traits::{PdPlanner, PolicySource},
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
         Worker, WorkerLoadGuard,
     },
     policies::LoadBalancingPolicy,
+    routers::ingress::{dp_rank_body, IngressRouting},
 };
 
 use super::{
@@ -65,6 +65,7 @@ impl ExecutionTarget {
 pub(super) struct EndpointRouter {
     app: Arc<AppContext>,
     executor: Option<Arc<PdExecutor>>,
+    routing: IngressRouting,
     policies: Arc<PolicyRegistryAdapter>,
 }
 
@@ -72,6 +73,7 @@ impl EndpointRouter {
     pub fn new(app: Arc<AppContext>, executor: Option<Arc<PdExecutor>>) -> Self {
         let policies = Arc::new(PolicyRegistryAdapter::new(app.policy_registry.clone()));
         Self {
+            routing: IngressRouting::new(&app),
             app,
             executor,
             policies,
@@ -84,7 +86,8 @@ impl EndpointRouter {
         input: &RoutingInput,
     ) -> Result<RoutingDecision, ProcessingError> {
         let model = input.model.as_deref();
-        let mut workers = crate::routers::ingress::IngressRouting::new(&self.app)
+        let mut workers = self
+            .routing
             .candidates(&input.metadata, input.state_reference)
             .map_err(ProcessingError::from)?;
         let mut resolved = HashMap::new();
@@ -110,11 +113,7 @@ impl EndpointRouter {
             }
             workers = candidates;
         }
-        let source = Arc::new(WorkerRegistryAdapter::with_candidates(
-            self.app.worker_registry.clone(),
-            workers,
-        ));
-        let planner = DefaultPlanner::new(source, self.policies.clone());
+        let planner = self.routing.planner(workers, self.policies.clone());
         let descriptor = RequestDescriptor {
             model_id: model,
             protocol: Some(Protocol::Http),
@@ -154,14 +153,9 @@ impl EndpointRouter {
             Some(address) => *address,
             None => Self::address(worker.as_ref()).await?,
         };
-        let forwards_dp_rank = worker.is_dp_aware()
-            && crate::routers::ingress::EndpointSpec::find(input.metadata.route)
-                .is_some_and(|endpoint| endpoint.forwards_dp_rank(worker.as_ref()));
-        if forwards_dp_rank {
-            let body = serde_json::from_slice(&request.raw)?;
-            let body = worker.prepare_request(body).await.map_err(|e| {
-                ProcessingError::new(500, "worker_request_preparation_failed", e.to_string())
-            })?;
+        if let Some(body) =
+            dp_rank_body(worker.as_ref(), input.metadata.route, &request.raw).await?
+        {
             request.replace_body(
                 serde_json::to_vec(&body)?,
                 self.app.router_config.ext_proc.max_body_bytes,
