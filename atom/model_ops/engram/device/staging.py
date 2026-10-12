@@ -22,7 +22,6 @@ from atom.model_ops.engram.device.hashing import (
     engram_snapshot_indices,
 )
 from atom.model_ops.engram.device.uva import uva_gather_into
-from atom.plugin import is_vllm
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +47,23 @@ class EngramStep:
     candidates: torch.Tensor | None
 
 
-def _capture_breaks_mid_forward() -> bool:
-    """Ask the active frontend whether it may break a capture mid-forward.
+_staging_cls = None
 
-    Routed through the plugin because the answer is one frontend's internals
-    and this file is not; native ATOM records one graph per forward and never
-    breaks, so the question only has a non-trivial answer under vLLM.
+
+def set_engram_staging_cls(cls) -> None:
+    """Pick the `EngramStaging` the Engram runtime builds. Idempotent.
+
+    A frontend with its own answer to `_forks` states it here rather than
+    having this file ask after it, so `model_ops` names no frontend.
     """
-    if not is_vllm():
-        return False
-    from atom.plugin.vllm.breakable_capture import capture_breaks_mid_forward
+    global _staging_cls
 
-    return capture_breaks_mid_forward()
+    _staging_cls = cls
+
+
+def engram_staging_cls():
+    """The class to build; `EngramStaging` unless a frontend replaced it."""
+    return _staging_cls or EngramStaging
 
 
 class EngramStaging:
@@ -191,33 +195,66 @@ class EngramStaging:
                 live=step.live,
             )
 
+    def _forks(self) -> bool:
+        """Whether to prefetch on a side stream.
+
+        True, and a frontend that breaks captures keeps it true: the overlap
+        between the gather and the layers consuming it is the whole point of
+        the fork, and giving it up is not the price of a breakable capture.
+        What that costs instead is that the two orderings below have to be
+        issued outside the captured segment -- see `_await_layer`.
+
+        The hook stays because a frontend that can do neither has somewhere to
+        say so, and because `consume` and `join` must not order against a
+        stream that was never forked.
+        """
+        return True
+
+    def _await_layer(self, event) -> None:
+        """Order the compute stream behind one layer's prefetch.
+
+        Issued where the layer needs its rows, so later layers' lookups keep
+        running. A frontend whose capture segments end mid-forward overrides
+        this to issue the wait outside the segment: the event was recorded on
+        a stream the capture does not own, and a captured stream waiting on it
+        is refused with `hipErrorStreamCaptureIsolation` ("dependency created
+        on uncaptured work in another stream").
+        """
+        torch.cuda.current_stream(self.host.device).wait_event(event)
+
+    def _await_fork(self) -> None:
+        """Order the compute stream behind every outstanding lookup.
+
+        The same boundary question as `_await_layer`, for the whole stream
+        rather than one layer's event.
+        """
+        torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
+
     def start(self, width):
-        host = self.host
         self._snapshot(width)
-        compute = torch.cuda.current_stream(host.device)
-        # The join is per layer and lazy -- `consume` waits on that layer's
-        # event where the layer needs its rows -- so the fork stays open
-        # across the whole forward. A frontend that ends a capture segment
-        # inside that span (vLLM's breakable graph breaks at every attention)
-        # would be ending it with work still on this stream, which
-        # `capture_end()` refuses as `hipErrorStreamCaptureUnjoined`. Issue on
-        # the compute stream instead: same work in the same order, with the
-        # prefetch no longer overlapping the layers that consume it.
-        forking = not _capture_breaks_mid_forward()
         # Remembered for `consume` and `join`, which otherwise order against a
-        # stream that was never forked. Under a breakable capture that is not
-        # merely redundant: this function runs in an eager break, so its
-        # events are recorded off-capture, and a captured layer waiting on one
-        # is refused -- `hipErrorStreamCaptureIsolation`, "dependency created
-        # on uncaptured work in another stream".
-        self.forked = forking
+        # stream that was never forked.
+        self.forked = self._forks()
+        # past the fork: the side stream reads the snapshot, not the cursor
+        self._advance_cursor(width)
+        self._prefetch(width)
+
+    def _prefetch(self, width):
+        """Fork, and issue every layer's lookup on the stream that results.
+
+        Split from `start` so a frontend can wrap exactly this in a capture
+        break. It has to be exactly this: the fork and the lookups belong to
+        the same segment, and `_snapshot` and `_advance_cursor` write state the
+        break would otherwise re-run on every replay.
+        """
+        host = self.host
+        compute = torch.cuda.current_stream(host.device)
+        forking = self.forked
         issuing = self.stream if forking else compute
         if forking:
             # Get the parent BEFORE entering the guard: waiting on ourselves
             # would neither order the inputs nor join the graph capture.
             self.stream.wait_stream(compute)
-        # past the fork: the side stream reads the snapshot, not the cursor
-        self._advance_cursor(width)
         with torch.cuda.stream(issuing):
             for layer in host.layer_ids:
                 ids = engram_snapshot_indices(
@@ -257,8 +294,8 @@ class EngramStaging:
 
     def consume(self, layer, width):
         host = self.host
-        if getattr(self, "forked", True):
-            torch.cuda.current_stream(host.device).wait_event(self.done[layer])
+        if self.forked:
+            self._await_layer(self.done[layer])
         if host._tp_group is not None and self.collective is None:
             out = self.flat[layer][:width]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
@@ -267,10 +304,8 @@ class EngramStaging:
 
     def join(self):
         # Close the fork even if a partial forward did not consume every layer.
-        # Nothing to close when there was no fork, and saying so matters: the
-        # wait would otherwise cross the capture boundary this step runs on.
-        if getattr(self, "forked", True):
-            torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
+        if self.forked:
+            self._await_fork()
 
 
 class EngramStagedRows(dict):

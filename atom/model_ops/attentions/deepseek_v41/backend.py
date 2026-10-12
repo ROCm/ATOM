@@ -30,24 +30,6 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
-
-
-def _breakable_cudagraph_enabled() -> bool:
-    """Whether this run may capture graphs around this model's step work.
-
-    Routed through the plugin: the answer is one frontend's, and this file is
-    not that frontend's. Native ATOM owns its own capture loop and never asks
-    vLLM anything, so it takes the False below without importing it.
-    """
-    from atom.plugin import is_vllm
-
-    if not is_vllm():
-        return False
-    from atom.plugin.vllm.breakable_capture import breakable_capture_enabled
-
-    return breakable_capture_enabled()
-
-
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
 from .score_planner import ScorePlanner
@@ -58,55 +40,26 @@ logger = logging.getLogger("atom")
 ENGRAM_ROWS = "v41_engram_rows"
 
 
-def _blocking_state_probe() -> bool:
-    """Whether to render the stale-slot verdict in the step that asks for it.
+def _staging_advances(staged) -> bool:
+    """Whether this step's Engram staging will advance the cursor itself.
 
-    `prepare_state` can ship the cursor rows asynchronously and judge them a
-    step later, which takes one blocking D2H (~58 us) off each decode step.
-    The deferred path is wrong under concurrency, and wrong in the direction
-    that costs most: it refuses correct state and takes the engine down.
+    The advance has to happen exactly once, down one path or the other.
+    `EngramStaging._advance_cursor` does it on the way past, and stands down on
+    a step carrying candidate cursors -- a verify step's cursor is the accepted
+    prefix's, which only the sampler knows.
 
-    Measured on the plugin path, FULL_AND_PIECEWISE, 64 concurrent GSM8K
-    requests, no KV connector of any kind:
-
-        needs state at 952, found 951
-
-    while the state-row dump for that same request, printed beside it, reads
-    `computed 953, cursor 953` -- self-consistent. The verdict is rendered
-    against a claim from one step and a `_probe` buffer that later steps have
-    already reused, so the two describe different moments.
-
-    Default on for the plugin path and off for the native one: that is where
-    the fault is observed, and the native engine drives its own scheduler.
-    `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
-
-    This is a guard, not a fix. The register slip in the deferred probe is
-    still not understood, and a check that fails closed on correct state is
-    worse than the microsecond it saves.
+    Takes the `EngramStep`, which is the object that answers both halves. An
+    earlier version of this took the batch step instead and asked it for
+    `candidates`: both types carry that name, but the batch step's is the
+    indexer's per-layer block ids, a `dict` with a `default_factory`, so
+    `is None` was false for every step ever built. The gate was a constant,
+    and what it silently dropped was the `staged is None` test it had
+    replaced -- leaving the caller to advance a cursor the staging was about
+    to advance too.
     """
-    override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
-    if override is not None and override != "":
-        return override not in ("0", "false", "False")
-    from atom.plugin import is_plugin_mode
-
-    return bool(is_plugin_mode())
-
-
-def _staging_advances(embeddings, step) -> bool:
-    """Whether this step's Engram rows carry a staging that advances the cursor.
-
-    `EngramStaging.start` does it on the way past; a plain mapping of rows has
-    no `stage` and does nothing. The caller needs the difference because the
-    advance has to happen exactly once, down one path or the other.
-    """
-    if getattr(embeddings, "stage", None) is None:
+    if staged is None:
         return False
-    # `EngramStaging._advance_cursor` stands down on a step that carries
-    # candidates -- a verify step's cursor belongs to the sampler. Asking only
-    # whether a `stage` exists left the same hole twice over: staging skipped
-    # the advance, the caller saw a `stage` and skipped it too, and neither
-    # thought it owed one.
-    return getattr(step, "candidates", None) is None
+    return staged.candidates is None
 
 
 def build_v41_pool_geometry(
@@ -514,49 +467,63 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
+    # Whether to render the stale-slot verdict in the step that asks for it.
+    # False is ATOM's own answer; a frontend that needs the other overrides
+    # the attribute rather than the method, so the env override below stays
+    # written once. See `_state_probe_blocking`.
+    _state_probe_blocking_default = False
+
+    def _state_probe_blocking(self) -> bool:
+        """Whether this step's stale-state verdict is rendered now or later.
+
+        `prepare_state` can ship the cursor rows asynchronously and judge them
+        a step later, which takes one blocking D2H (~58 us) off each decode
+        step. That deferred path is wrong under concurrency, and wrong in the
+        direction that costs most: it refuses correct state and takes the
+        engine down with it. Measured on the vLLM plugin, FULL_AND_PIECEWISE,
+        64 concurrent GSM8K requests, no KV connector of any kind:
+
+            needs state at 952, found 951
+
+        while the state-row dump for that same request, printed beside it,
+        reads `computed 953, cursor 953` -- self-consistent. The verdict is
+        rendered against a claim from one step and a `_probe` buffer that
+        later steps have already reused, so the two describe different
+        moments.
+
+        A guard, not a fix: the register slip in the deferred probe is still
+        not understood, and a check that fails closed on correct state is
+        worse than the microseconds it saves.
+
+        `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
+        """
+        override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+        if override is not None and override != "":
+            return override not in ("0", "false", "False")
+        return self._state_probe_blocking_default
+
     def _dummy_cache(self, pages, slots, running_tokens):
-        """Scratch for a dummy batch: per call, except under graph capture.
+        """Scratch for a dummy batch, allocated per call.
 
         A dummy run must never touch a live PAGE or STATE slot, so it gets its
-        own cache. Allocating a fresh one per call is right while nothing is
-        being captured -- it is freed again immediately, and the eager path
-        pays nothing for it.
+        own cache, and allocating a fresh one each time is right here: it is
+        freed again immediately and nothing outlives the call that asked for
+        it. ATOM's own capture entry fabricates its batch with
+        ``is_dummy_run=False`` against the serving cache, so no graph ever
+        records an address of one of these.
 
-        Under a breakable capture it is fatal, and loudly so. The kernels
-        recorded during capture hold this cache's addresses; the object dies
-        when the capture returns, and the first replay reads freed memory as an
-        illegal access, reported asynchronously somewhere else entirely. So
-        while capture is possible, hand out one cache, allocated once at the
-        capture ceiling and kept alive on the builder. Every bucket's dummy
-        batch fits inside it -- its page, slot and token counts are caps, and
-        the batch indexes from zero -- so one allocation serves them all
-        without the per-bucket cost of a cache each (the STATE side alone is
-        ~5 MiB per slot).
+        A frontend whose captures do run dummy batches overrides this -- a
+        cache freed while a recorded kernel still holds its addresses is read
+        back as an illegal access on the first replay.
         """
-        if not _breakable_cudagraph_enabled():
-            return PagedAttentionCache(
-                self.geometry,
-                pages,
-                slots,
-                self.device,
-                max_tokens=running_tokens,
-                workspace=self.score_workspace,
-            )
-        cached = getattr(self, "_capture_dummy_cache", None)
-        if cached is None:
-            ceiling_pages = max(
-                pages, -(-self.max_num_batched_tokens // self.block_size)
-            )
-            cached = PagedAttentionCache(
-                self.geometry,
-                ceiling_pages,
-                max(slots, self.max_bs),
-                self.device,
-                max_tokens=max(running_tokens, self.max_num_batched_tokens),
-                workspace=self.score_workspace,
-            )
-            self._capture_dummy_cache = cached
-        return cached
+        return PagedAttentionCache(
+            self.geometry,
+            pages,
+            slots,
+            self.device,
+            max_tokens=running_tokens,
+            workspace=self.score_workspace,
+        )
 
     def _prepare(
         self,
@@ -796,8 +763,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         """One CSA2 step's host-side work: Engram rows, state, cursor.
 
         Called by the metadata builder, before the forward and outside any
-        capture, which is what lets this model be captured at all. None of this can be replayed from a graph --
-        the Engram row staging hashes token ids, `prepare_state` resets the
+        capture, which is what lets this model be captured at all. None of
+        this can be replayed from a graph -- the Engram row staging hashes
+        token ids, `prepare_state` resets the
         slots this batch recycled, and `advance_cursor` writes the committed
         position -- and it has to happen once, in order, per step.
 
@@ -827,7 +795,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
             else cache.prepare_state(
-                step, histories=not on_device or _blocking_state_probe()
+                step, histories=not on_device or self._state_probe_blocking()
             )
         )
         if self.engram is not None:
@@ -866,9 +834,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
         elif (
-            not metadata.dummy
-            and not step.tentative
-            and not _staging_advances(embeddings, step)
+            not metadata.dummy and not step.tentative and not _staging_advances(staged)
         ):
             # Owed to `EngramStaging.start` only when there is a staging to do
             # it. The condition used to be `staged is None`, which assumed the

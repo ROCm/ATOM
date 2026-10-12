@@ -491,7 +491,7 @@ def test_the_profile_cache_patch_reaches_the_runner_the_worker_builds():
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
         apply_vllm_v4_profile_cache_patch,
     )
-    from atom.plugin.vllm.gpu_model_runner_targets import gpu_model_runner_classes
+    from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
     classes = gpu_model_runner_classes()
     assert classes, "no vLLM GPUModelRunner class resolved"

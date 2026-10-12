@@ -366,6 +366,8 @@ def validate_runtime_config(config):
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
     plugin = config.plugin_config
     # The vLLM plugin path is text-only and runs the backbone alone: vLLM owns
     # scheduling and block allocation, and the bridge in
@@ -411,6 +413,10 @@ def validate_runtime_config(config):
             # transport is not an ATOM connector at all -- it is vLLM's own
             # `kv_connector`, and feeding that string to ATOM's factory is a
             # category error -- so it is named against its own allow-list.
+            # `lmcache_mp` (native) and AtomLMCacheOffloadConnector
+            # (vLLM plugin) are the transports admitted: both checkpoint
+            # STATE. P/D and in-process offload read SLOT regions and codecs
+            # this runtime does not publish.
             (
                 "KV transfer other than lmcache_mp (native) or "
                 "AtomLMCacheOffloadConnector (vLLM plugin)"
@@ -430,12 +436,21 @@ def validate_runtime_config(config):
             and config.speculative_config is not None
             and getattr(config.speculative_config, "method", None) != "dspark",
         ),
-        # CSA2 blocks are reusable only at whole-PAGE boundaries after the
-        # compressor has run, and the STATE side is not replayed by a
-        # block-table hit. The offload connector is what makes reuse
-        # admissible: it stores the STATE at those boundaries and caps every
-        # hit -- vLLM's own included, through the scheduler mixin -- to one it
-        # holds. Without it there is nothing to cap against.
+        # Not a TODO, and not a flag. vLLM's prefix cache requires the
+        # backend to have left recoverable state at each complete block
+        # boundary -- registering a cached block IS that claim -- and a V4.1
+        # forward leaves state only at the end of the query, never at an
+        # interior boundary. Zeroing `num_prefill_checkpoint_blocks` does not
+        # opt out of the claim: align mode caches the last full block anyway
+        # and the group still answers that boundary (measured).
+        #
+        # The offload connector is what makes reuse admissible instead: it
+        # stores STATE at whole-PAGE boundaries and caps every hit -- vLLM's
+        # own included, through the scheduler mixin -- to one it holds.
+        # Without it there is nothing to cap against. Reviving a block-table
+        # hit on its own means exporting state at a given offset
+        # (`MambaPrefillCheckpointExporter`), which for V4.1 means splitting
+        # `engram_compress`'s plan there.
         (
             (
                 "prefix caching on the vLLM plugin without "

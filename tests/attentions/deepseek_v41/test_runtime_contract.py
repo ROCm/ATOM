@@ -535,13 +535,19 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
 
     pytest.importorskip("aiter", reason="the attention module reaches AITER")
     from atom.models.deepseek_v41.attention import Attention
+    from atom.plugin.vllm.v41_core_overrides import _attn_out_buffer
 
     heads, head_dim = 16, 512
     stub = SimpleNamespace(heads=heads, head_dim=head_dim)
 
+    # Core allocates nothing: the rows come back by return value, which is
+    # what keeps the native path free of this buffer and of the copy that
+    # landing in it would need.
+    assert Attention._attn_out_buffer(stub, None) is None
+
     for shape, tokens in (((8192, 7168), 8192), ((1, 8192, 7168), 8192)):
         hidden = torch.empty(shape, dtype=torch.bfloat16, device="cpu")
-        out = Attention._alloc_attn_out(stub, hidden)
+        out = _attn_out_buffer(stub, hidden)
         assert out.shape[-2:] == (heads, head_dim)
         # The leading dims are whatever `hidden` had, so the flatten this
         # path performs next yields one row per token under either layout.

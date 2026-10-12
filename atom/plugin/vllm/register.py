@@ -243,7 +243,7 @@ def register_platform() -> str | None:
     apply_vllm_v4_profile_cache_patch()
 
     # Which forwards are vLLM's own, for a model that keeps per-request state.
-    from atom.plugin.vllm.dummy_run import apply_vllm_dummy_run_patch
+    from atom.plugin.vllm.vllm_runtime import apply_vllm_dummy_run_patch
 
     covered = apply_vllm_dummy_run_patch()
     logger.info("ATOM plugin: dummy-run marking covers %d runner class(es)", covered)
@@ -397,7 +397,7 @@ def register_model() -> None:
     # can be swallowed whole, and the first run proved it -- the coverage line
     # this logs never appeared, so the marking covered nothing and the
     # synthetic batches went on taking real STATE slots.
-    from atom.plugin.vllm.dummy_run import apply_vllm_dummy_run_patch
+    from atom.plugin.vllm.vllm_runtime import apply_vllm_dummy_run_patch
 
     covered = apply_vllm_dummy_run_patch()
     logger.info("ATOM plugin: dummy-run marking covers %d runner class(es)", covered)
@@ -538,14 +538,13 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
-    # The other half of V4.1's tentative speculative step: the builder stages
-    # it, this commits the accepted prefix once the sampler has judged it.
-    from atom.plugin.vllm.v41_speculative_commit import patch_v41_speculative_commit
-
-    patch_v41_speculative_commit()
-    # Runs in the EngineCore process, which is where the scheduler lives.
-    from atom.plugin.vllm.v41_speculative_scheduling_patch import (
+    from atom.plugin.vllm.v41_speculative import (
+        patch_v41_speculative_commit,
         patch_v41_speculative_scheduling,
     )
 
+    # The other half of V4.1's tentative speculative step: the builder stages
+    # it, this commits the accepted prefix once the sampler has judged it.
+    patch_v41_speculative_commit()
+    # Runs in the EngineCore process, which is where the scheduler lives.
     patch_v41_speculative_scheduling()

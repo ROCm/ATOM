@@ -332,9 +332,7 @@ def _v41_capture_batch(snapshot, vllm_config, builder=None):
         start = int(builder.cache.geometry.window_size)
         context_lens = (start + query_lens).astype(np.int64)
         pages = -(-(start + int(query_lens.max())) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
-        block_tables = tuple(
-            np.zeros(pages, dtype=np.int32) for _ in range(num_reqs)
-        )
+        block_tables = tuple(np.zeros(pages, dtype=np.int32) for _ in range(num_reqs))
         _v41_prime_capture_cursors(builder, slots, start)
     return SimpleNamespace(
         is_dummy_run=False,
@@ -386,6 +384,60 @@ def _v41_capture_is_a_verify_step(query_lens, vllm_config) -> bool:
     return 1 < width <= speculative + 1 and int(query_lens.min()) == width
 
 
+# The previous step's Engram fork, when it was left open for the layers to
+# join themselves.
+_V41_OPEN_ENGRAM_FORK = None
+
+
+def _v41_join_covers_the_layers() -> bool:
+    """Whether a layer may wait on the prefetch from inside the forward.
+
+    `stage()` runs before the forward and outside any capture, so the events
+    it records belong to no segment, and a captured stream waiting on one is
+    refused -- `hipErrorStreamCaptureIsolation`. Under PIECEWISE the wait is
+    covered: `VllmEngramStaging._await_layer` is an eager break, which ends
+    the segment, issues the wait where none owns it, and starts a fresh one.
+
+    Under FULL the decorator stands down -- it hands the function back
+    unwrapped when `cudagraph_runtime_mode` is FULL -- so the wait would land
+    inside the single graph recording the whole forward. There the fork has to
+    be closed before the forward starts. That costs the overlap, and costs it
+    where it is cheapest: FULL is the uniform decode path, a few hundred rows
+    of gather against a prefill's thousands.
+
+    Getting this backwards is loud rather than silent: the capture refuses at
+    startup instead of serving a wrong answer.
+    """
+    from atom.plugin.vllm.vllm_runtime import breakable_capture_enabled
+
+    if not breakable_capture_enabled():
+        return False
+    try:
+        from vllm.config import CUDAGraphMode
+    except ImportError:
+        return False
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_cudagraph_mode
+
+    mode = get_current_cudagraph_mode()
+    return mode is not None and mode != CUDAGraphMode.FULL
+
+
+def _v41_close_previous_engram_fork() -> None:
+    """Join a fork the last step left to its layers.
+
+    Every layer that ran has waited on its own event, but a forward that
+    consumed only some of them leaves the rest outstanding. Closed at the top
+    of the next step's staging, the first place after that forward that is
+    outside any capture.
+    """
+    global _V41_OPEN_ENGRAM_FORK
+
+    rows, _V41_OPEN_ENGRAM_FORK = _V41_OPEN_ENGRAM_FORK, None
+    join = None if rows is None else getattr(rows, "join", None)
+    if join is not None:
+        join()
+
+
 def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturing):
     """One CSA2 step, staged where no graph can capture it.
 
@@ -405,19 +457,22 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     if snapshot is None or snapshot.num_reqs == 0:
         return None
     slot_allocator = getattr(model, "_atom_v41_slot_allocator", None)
-    from atom.plugin.vllm.dummy_run import in_dummy_run as _in_dummy_run
+    from atom.plugin.vllm.vllm_runtime import in_dummy_run as _in_dummy_run
 
     if slot_allocator is None and not (
         capturing or _in_dummy_run() or _v41_request_ids_are_synthetic(snapshot)
     ):
         return None
+    # Before anything of this step is staged: the last one may have left its
+    # Engram fork for its layers, and they write the same staging buffers.
+    _v41_close_previous_engram_fork()
     num_reqs = int(snapshot.num_reqs)
     # `capturing` is vLLM calling `build_for_cudagraph_capture`, which it only
     # does for a FULL graph. A PIECEWISE capture comes through `build` like any
     # other step, so the batch has to be recognised rather than announced --
     # by the repeated placeholder request id, which real traffic cannot
     # produce because vLLM never schedules one request twice in a step.
-    from atom.plugin.vllm.dummy_run import in_dummy_run
+    from atom.plugin.vllm.vllm_runtime import in_dummy_run
 
     # Three signals, union, because no one of them covers every synthetic
     # batch and each was measured to miss a different kind:
@@ -485,20 +540,23 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
     stage = getattr(rows, "stage", None)
     if stage is not None:
         stage()
-        # Closed here, not left for the forward to close. The staging may fork
-        # a prefetch stream, and this runs before the forward -- so the event
-        # it records is outside whatever capture the forward is under, and a
-        # captured layer waiting on it is refused:
-        #
-        #     hipErrorStreamCaptureIsolation: dependency created on uncaptured
-        #     work in another stream
-        #
-        # Joining inside this window costs the overlap with the layers that
-        # consume the rows, which this step never had: the whole of it happens
-        # before the first layer runs.
-        join = getattr(rows, "join", None)
-        if join is not None:
-            join()
+        # Left open when the layers can join it themselves, which is what buys
+        # the overlap: each waits on its own event where it needs the rows, so
+        # the gather runs under the layers ahead of it rather than finishing
+        # before the first one starts.
+        if _v41_join_covers_the_layers():
+            global _V41_OPEN_ENGRAM_FORK
+            _V41_OPEN_ENGRAM_FORK = rows
+        else:
+            # Nothing covers a wait issued from inside this forward, so close
+            # it here. A captured layer waiting on an event recorded outside
+            # the capture is refused:
+            #
+            #     hipErrorStreamCaptureIsolation: dependency created on
+            #     uncaptured work in another stream
+            join = getattr(rows, "join", None)
+            if join is not None:
+                join()
     metadata.staged_outside_forward = True
     if synthetic and getattr(metadata.step, "tentative", False):
         # A capture is staged tentatively so it records the verify branch, but
@@ -1040,8 +1098,8 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
     ``prepare_batch_step`` takes the dtype of its request-start array from it;
     int64 matches what native ATOM allocates.
     """
-    from atom.model_ops.attentions.deepseek_v41.backend import (
-        DeepseekV41MetadataBuilder,
+    from atom.plugin.vllm.v41_core_overrides import (
+        VllmDeepseekV41MetadataBuilder,
     )
     from atom.utils import CpuGpuBuffer
 
@@ -1061,7 +1119,7 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
             )
         },
     )
-    return DeepseekV41MetadataBuilder(runner)
+    return VllmDeepseekV41MetadataBuilder(runner)
 
 
 def bind_deepseek_v41_proxy_cache(
@@ -1103,7 +1161,9 @@ def bind_deepseek_v41_proxy_cache(
     if getattr(model, "_atom_v41_proxy_cache_ptr", None) == ptr:
         return True
 
-    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.plugin.vllm.v41_core_overrides import (
+        VllmBackedPagedAttentionCache,
+    )
 
     # vLLM hands this back in one of two ranks, and the difference is which
     # side applied `get_kv_cache_stride_order`. Through 0.28 the tensor keeps
@@ -1181,7 +1241,7 @@ def bind_deepseek_v41_proxy_cache(
         )
 
     builder.num_blocks = pages
-    builder.cache = PagedAttentionCache(
+    builder.cache = VllmBackedPagedAttentionCache(
         geometry,
         pages,
         num_slots,
@@ -1809,6 +1869,7 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
     rows = [(end - length, length) for end, length in zip(ends, lengths) if length]
     if not rows:
         return {}
+
     # A tentative step is a verification step: every row is a draft block on
     # top of an existing prefix. A prefill row is neither -- it starts at
     # position 0 and is longer than a block -- and the cache refuses the mix.

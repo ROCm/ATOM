@@ -49,48 +49,24 @@ from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    @staticmethod
-    def _adopt_backing(backing, size, device):
-        """Take an externally owned uint8 arena as this cache's whole pool.
+    def _allocate_backing(self, size, device):
+        """This cache's whole pool, as one flat uint8 arena.
 
-        The vLLM plugin path pages out of the slab vLLM's KVCacheManager
-        allocated for ATOM's proxy attention layer, so that the pool is not
-        allocated a second time beside vLLM's own accounting. The hand-over is
-        all or nothing: PAGE and STATE share one address space because
+        The one seam a caller that already owns the bytes overrides. PAGE and
+        STATE share a single address space here because
         :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
-        the paged region, and the index builder emits page rows and window rows
-        into a single array that is dereferenced against a single base. A
-        caller that owns only the block pool must therefore hand over a slab
-        wide enough for STATE behind it as well.
+        the absolute end of the paged region, and the ``_indices`` kernels
+        dereference page rows and window rows against one base -- so the pool
+        is handed over whole or not at all, and an override returns the whole
+        arena rather than the paged part of it.
 
-        The arena has to behave exactly like the ``torch.zeros`` it replaces:
-        flat uint8, contiguous, on this cache's device, and at least ``size``
-        bytes. It is trimmed to exactly ``size`` because the regions carved out
-        of it are reshaped to their own strides, which a longer tail would not
-        divide.
+        What an override has to return is what this returns: zeroed, flat
+        uint8, contiguous, on ``device``, and exactly ``size`` elements. Every
+        region below is a `view` of it with its own strides, which neither a
+        short arena nor a longer tail would divide, and the cursor reset plus
+        every cold read assume the zeros.
         """
-        if not isinstance(backing, torch.Tensor):
-            raise TypeError("An external CSA2 backing must be a tensor")
-        if backing.dtype != torch.uint8 or backing.dim() != 1:
-            raise ValueError("An external CSA2 backing must be flat uint8")
-        if not backing.is_contiguous():
-            raise ValueError("An external CSA2 backing must be contiguous")
-        # Where ``torch.zeros(device=device)`` would have put it -- an
-        # index-less ``cuda`` means the current device, which is what vLLM
-        # hands down in ``device_config.device``, and comparing that to a
-        # tensor's always-indexed ``.device`` would never match.
-        resolved = torch.empty(0, device=device).device
-        if backing.device != resolved:
-            raise ValueError(
-                f"An external CSA2 backing on {backing.device} cannot back a "
-                f"cache on {resolved}"
-            )
-        if backing.numel() < size:
-            raise ValueError(
-                f"An external CSA2 backing of {backing.numel()} bytes is short "
-                f"of the {size} this geometry needs"
-            )
-        return backing[:size]
+        return torch.zeros(size, dtype=torch.uint8, device=device)
 
     def __init__(
         self,
@@ -100,8 +76,6 @@ class PagedAttentionCache:
         device,
         max_tokens=0,
         workspace=None,
-        *,
-        backing=None,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
@@ -113,13 +87,7 @@ class PagedAttentionCache:
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
         size = boundary + slots * geometry.state_bytes
-        if backing is None:
-            self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
-        else:
-            self.backing = self._adopt_backing(backing, size, device)
-            # What the `torch.zeros` above already guarantees, and what the
-            # cursor reset below and every cold read assume.
-            self.backing.zero_()
+        self.backing = self._allocate_backing(size, device)
         main_bytes = self.num_pages * geometry.page_bytes
         self.pages = EntryMajorArena(
             geometry.page_fields,

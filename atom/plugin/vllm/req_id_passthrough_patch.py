@@ -124,7 +124,10 @@ def _wrap_with_req_id_snapshot(cls, method_name: str, batch_from_arg=False) -> b
             # which reuses this same ordering. A copy keeps it stable even if the
             # batch mutates later in the step.
             _req_id_local.req_ids = list(batch.req_ids)
-        except Exception:
+        except Exception:  # noqa: BLE001 - best effort; None is a valid answer
+            # Deliberately blind. This is an optimisation -- callers read None
+            # as "fall back to the device-side tensors" -- so no shape a future
+            # vLLM gives `req_ids` should be able to take the engine down here.
             _req_id_local.req_ids = None
         try:
             return original(self, *args, **kwargs)

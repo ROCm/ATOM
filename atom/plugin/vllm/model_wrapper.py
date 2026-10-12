@@ -515,6 +515,22 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
+        if model_arch in _DEEPSEEK_V41_ARCHES:
+            # Every one of these is installed on a class, here rather than at
+            # registration, because this runs in every worker and it returns
+            # before the model it configures can be called -- the object does
+            # not exist until it does.
+            from atom.plugin.vllm.v41_core_overrides import (
+                apply_v41_eager_break,
+                install_vllm_engram_staging,
+            )
+
+            # Engram's prefetch must not hold a fork open across a capture
+            # break; picked before the Engram runtime is built below.
+            install_vllm_engram_staging()
+            # The attention break this frontend needs, applied to the class
+            # before the model below is built out of it.
+            apply_v41_eager_break()
         if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
             self.atom_config, "enable_decoder_swa_bounded_replay", False
         ):
@@ -1043,7 +1059,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # A DSpark draft has no output projection of its own and expects
             # the target's under the name vLLM uses. Nothing fails without it:
             # the draft keeps an unfilled head and drafts noise.
-            from atom.plugin.vllm.v41_draft_lm_head import attach_v41_target_lm_head
+            from atom.plugin.vllm.v41_speculative import attach_v41_target_lm_head
 
             attach_v41_target_lm_head(self, model)
 

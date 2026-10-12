@@ -324,7 +324,7 @@ def test_unknown_lmcache_override_is_rejected():
         )
 
 
-def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
+def _install_metadata_modules(monkeypatch):
     @dataclass
     class _Metadata:
         model_name: str
@@ -346,6 +346,11 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     monkeypatch.setitem(sys.modules, "lmcache", types.ModuleType("lmcache"))
     monkeypatch.setitem(sys.modules, "lmcache.v1", types.ModuleType("lmcache.v1"))
     monkeypatch.setitem(sys.modules, "lmcache.v1.metadata", metadata_module)
+    return _Metadata
+
+
+def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
+    _install_metadata_modules(monkeypatch)
 
     scheduler = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 0)
     worker = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 3)
@@ -353,6 +358,78 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     assert scheduler.model_name == worker.model_name
     assert scheduler.worker_id == 0
     assert worker.worker_id == 3
+
+
+@pytest.mark.parametrize(
+    ("world_size", "worker_ids"),
+    [(1, [1]), (1, [0, 1]), (4, [4])],
+)
+def test_lmcache_metadata_rejects_lookup_scope_outside_replica_world(
+    monkeypatch,
+    world_size,
+    worker_ids,
+):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    with pytest.raises(ValueError) as exc_info:
+        offcfg.build_lmcache_metadata(_config(), cfg, world_size, 0)
+    expected = (
+        "lookup_server_worker_ids must be within the replica-local world "
+        f"[0, {world_size})"
+    )
+    assert expected in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "worker_ids"),
+    [(1, []), (1, [0]), (4, [0, 3])],
+)
+def test_lmcache_metadata_accepts_lookup_scope_within_replica_world(
+    monkeypatch,
+    world_size,
+    worker_ids,
+):
+    metadata_type = _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    metadata = offcfg.build_lmcache_metadata(_config(), cfg, world_size, 0)
+
+    assert isinstance(metadata, metadata_type)
+    assert metadata.world_size == world_size
+    assert metadata.worker_id == 0
+
+
+@pytest.mark.parametrize("worker_ids", [0, 3])
+def test_lmcache_metadata_rejects_scalar_lookup_scope(monkeypatch, worker_ids):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    with pytest.raises(ValueError, match="must be a list or tuple"):
+        offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+
+def test_lmcache_metadata_rejects_duplicate_lookup_scope(monkeypatch):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = [0, 0]
+
+    with pytest.raises(ValueError, match="must not contain duplicate"):
+        offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+
+def test_lmcache_metadata_accepts_tuple_lookup_scope(monkeypatch):
+    metadata_type = _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = (0, 3)
+
+    metadata = offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+    assert isinstance(metadata, metadata_type)
+    assert metadata.world_size == 4
 
 
 def test_page_namespace_survives_a_worker_normalising_hf_config():

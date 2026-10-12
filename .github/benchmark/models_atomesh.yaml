@@ -640,6 +640,8 @@ models:
         # move the published numbers.
         ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: "1"
         ATOM_STATE_CHECKPOINT_DEMAND: "0"
+        # AgentX runs FlyDSL FP8 prefill attention on every band.
+        ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: "1"
         # AgentX band default: ReplaySSM off on CONC 1/2/4, on for the mid band
         # (CONC 8-16), off again from CONC 32. Cases that declare their own env
         # block must restate the key, because a YAML merge key loses to an
@@ -687,7 +689,7 @@ models:
               workers: 1
               tp: 8
               # AgentX pins the compile path and captures the dense query-token
-              # range 2..2*CONC*(1+spec) that `auto` derives per concurrency.
+              # range 1..2*CONC*(1+spec) that `auto` derives per concurrency.
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
@@ -773,14 +775,6 @@ models:
             prefill: *kimi_k3_agentic_lmcache128_env
 
         - <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c40
-          concurrency: [40]
-          server:
-            common_args:
-              <<: *kimi_k3_agentic_no_dspark_args
-              max_num_seqs: 80
-
-        - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48
           concurrency: [48]
           server:
@@ -822,6 +816,121 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 144
           env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+          env: *kimi_k3_agentic_lmcache192_env
+
+        # Non-disaggregated counterpart to the C72 cell above: one server does
+        # prefill and decode on a single node, same workload and same server
+        # knobs, so the pair isolates what the P/D split itself is worth.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72
+          topology: agg
+          display_topology: AGG-TP8-DCP8
+          # Placement only; `topology: agg` above is what says there is no
+          # prefill/decode split to place. The other single_node cells halve the
+          # node between two services, so this one keeps all 8 GPUs at TP8.
+          pd_worker_layout: single_node
+          concurrency: [72]
+          # Unused here; the aggregated server is configured by the decode block.
+          prefill: {}
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            # The aggregated server reads env.decode. These are the C72 prefill's
+            # LMCache settings, spelled out rather than merged from its anchor:
+            # that anchor also carries the mooncake half of the `multi`
+            # connector, which has no peer to stream KV to here. What is left is
+            # the same 192 GiB CPU tier behind a standalone offload connector.
+            decode:
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              LMCACHE_CHUNK_SIZE: "1024"
+              LMCACHE_NUMA_MODE: auto
+              ATOM_NUMA_BIND: "1"
+              ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
+              ATOM_AUTO_NUMA_BIND: "0"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              # AgentX throughput band (CONC 16 up): with prefill and decode on
+              # one server, a ready prefill waits four decode passes, and the
+              # PrefillDelayer coalesces queued prefill for up to 5 s.
+              ATOM_PREFILL_DECODE_INTERVAL: "4"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        - &kimi_k3_agentic_2p1d
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
+          topology: 2p1d
+          display_topology: 2P1D-TP8-DCP8
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [72]
+          prefill:
+            workers: 2
+            tp: 8
+            dcp: 8
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_lmcache192_env
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 256
+
+        - <<: *kimi_k3_agentic_2p1d
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
+          concurrency: [256]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 512
+
+      # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
+      # the published dashboard. The stop_profile export stalls both engines,
+      # which makes this cell's aiperf numbers incomparable with its C72 twin.
+      profile:
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              # 30 s starting 900 s into the aiperf Profiling phase, on every
+              # prefill and decode server; traces land under ${RUN_DIR}/torch_traces/<worker>/rank_<tp>/.
+              ATOMESH_TORCH_PROFILE_START: "900"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              # Kernel names and durations only; shapes/stacks on a TP8 window
+              # risk OOMing the ranks during export.
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
     accuracy:
       task: gsm8k

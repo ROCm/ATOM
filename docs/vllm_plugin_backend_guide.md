@@ -199,11 +199,13 @@ DeepSeek-V4.1 pages out of a proxy KV cache: ATOM declares one fake attention
 layer whose block is exactly one 256-token CSA2 PAGE, lets vLLM size and
 allocate the arena, and carves its own planes -- main latent, index plane, and
 a per-request state region -- out of that storage. The plugin path serves the
-text backbone only; image requests, DSpark speculation and prefix caching are
-refused at startup. See the
+text backbone only; image requests, prefix caching and KV-transfer connectors
+are refused at startup. DSpark speculation and CUDA graphs are supported, each
+behind an explicit flag. See the
 [DeepSeek-V4.1-Flash vLLM recipe](../recipes/atom_vllm/DeepSeek-V4.1-Flash.md)
-for its TP4 launch, its `--tokenizer-mode deepseek_v4` requirement and how the
-state region is bought out of vLLM's block pool.
+for its TP4 launch, its `--tokenizer-mode deepseek_v4` requirement, how the
+state region is bought out of vLLM's block pool, and the two flags that turn
+graphs on.
 
 ## Installation and quick start
 
