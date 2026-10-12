@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import numpy as np
 import torch
 from aiter.dist.parallel_state import (
@@ -6,46 +8,41 @@ from aiter.dist.parallel_state import (
 )
 from torch import nn
 
-
-from atom.config import QuantizationConfig, Config
-
-from atom.model_ops.utils import atom_parameter
-from atom.utils.decorators import support_torch_compile
-
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
+from atom.config import Config, QuantizationConfig
 from atom.model_config.qwen3_5 import (
     Qwen3_5Config,  # noqa: F401
     Qwen3_5TextConfig,
 )
-
 from atom.model_config.qwen3_5_moe import (
     Qwen3_5MoeConfig,  # noqa: F401
     Qwen3_5MoeTextConfig,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
 )
-from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import (
     ENABLE_ALLREDUCE_RMSNORM_FUSION,
     Qwen3NextAttention,
+    Qwen3NextDecoderLayer,
     Qwen3NextGatedDeltaNet,
+    Qwen3NextMLP,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
-    Qwen3NextMLP,
-    Qwen3NextDecoderLayer,
 )
-
-from atom.plugin.prepare import is_plugin_mode
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    extract_layer_index,
 )
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils.decorators import support_torch_compile
 
 
 def allreduce_norm_fusion_enabled() -> bool:
@@ -783,14 +780,14 @@ class _Qwen3_5MultimodalBase(nn.Module):
     )
 
     # Weight name mapping: checkpoint -> native ATOM module names.
-    hf_to_atom_mapper = {
+    hf_to_atom_mapper: ClassVar[dict[str, str]] = {
         "model.visual.": "visual.",
         "lm_head.": "language_model.lm_head.",
         "model.language_model.": "language_model.model.",
     }
 
     # Remap quant exclude layer names from checkpoint format to native names.
-    quant_exclude_name_mapping = {
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
         "model.visual.": "visual.",
         "lm_head.": "language_model.lm_head.",
         "model.language_model.": "language_model.model.",
