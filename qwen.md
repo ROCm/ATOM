@@ -132,7 +132,9 @@ The subsequent flags-on run returned correct lists and 16/16 arithmetic
 answers, but four other GPU processes entered on ranks 0–3 before its probe,
 each allocating about 43 GB and occupying up to 100% GPU time. Its raw data
 is at `/tmp/qwen38-tp8-mtp2-on-completed.jsonl`; it cannot be compared with
-the idle-GPU baseline as a speedup. The current QSA index CP path explicitly
+the idle-GPU baseline as a speedup. A second flags-on launch was stopped before
+probing when the same four processes and another 28 GB process on GPU 6
+returned. The current QSA index CP path explicitly
 accepts only TP2/TP4; enabling its flag at TP8 raises a configuration error.
 The merged QKV/index projection has exact TP4 weight-shape gates, so the TP4
 projection result cannot be projected onto TP8. No 128k/256k checkpoint
