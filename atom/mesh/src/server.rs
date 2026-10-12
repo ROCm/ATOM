@@ -293,14 +293,14 @@ async fn v1_tokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TokenizeRequest>,
 ) -> Response {
-    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+    tokenize::tokenize(&state.context, request).await
 }
 
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DetokenizeRequest>,
 ) -> Response {
-    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+    tokenize::detokenize(&state.context, request).await
 }
 
 async fn v1_tokenizers_add(
@@ -524,6 +524,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         max_tokenize_bytes = config.router_config.resolved_max_tokenize_bytes(),
         "Request preparation pool started"
     );
+    let max_retained_input_bytes = config.router_config.prepare_pool.max_retained_input_bytes;
+    if max_retained_input_bytes < config.router_config.max_payload_size {
+        warn!(
+            max_retained_input_bytes,
+            max_payload_size = config.router_config.max_payload_size,
+            "Inference bodies larger than --prepare-max-retained-input-bytes are rejected \
+             with 413 even though they are within --max-payload-size"
+        );
+    }
     #[cfg(feature = "ext-proc")]
     if config.router_config.ext_proc.enabled
         && config

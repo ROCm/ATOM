@@ -25,6 +25,8 @@ use crate::{
     tokenizer::TokenizerRegistry,
 };
 
+const MAX_RESPONSE_ID_BYTES: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Api {
     Chat,
@@ -140,11 +142,18 @@ impl EndpointSpec {
                     return IngressError::invalid("failed to read request body").response(&path);
                 }
             };
-        let envelope =
-            match InferenceEnvelope::parse(parts.uri, parts.headers, body, &state.context).await {
-                Ok(envelope) => envelope,
-                Err(error) => return error.response(&path),
-            };
+        let envelope = match InferenceEnvelope::parse_for_routing(
+            parts.uri,
+            parts.headers,
+            body,
+            &state.context,
+            state.router.ingress_routing(&state.context),
+        )
+        .await
+        {
+            Ok(envelope) => envelope,
+            Err(error) => return error.response(&path),
+        };
         MeshLocalError::format_response(
             &path,
             state.router.route_inference(envelope, &state.context).await,
@@ -157,6 +166,9 @@ impl EndpointSpec {
         headers: HeaderMap,
         RawQuery(query): RawQuery,
     ) -> Response {
+        if let Err(error) = Self::validate_response_id(&response_id) {
+            return error.response("/v1/responses");
+        }
         state
             .router
             .get_response(Some(&headers), &response_id, query.as_deref())
@@ -168,6 +180,9 @@ impl EndpointSpec {
         Path(response_id): Path<String>,
         headers: HeaderMap,
     ) -> Response {
+        if let Err(error) = Self::validate_response_id(&response_id) {
+            return error.response("/v1/responses");
+        }
         state
             .router
             .cancel_response(Some(&headers), &response_id)
@@ -179,6 +194,9 @@ impl EndpointSpec {
         Path(response_id): Path<String>,
         headers: HeaderMap,
     ) -> Response {
+        if let Err(error) = Self::validate_response_id(&response_id) {
+            return error.response("/v1/responses");
+        }
         state
             .router
             .delete_response(Some(&headers), &response_id)
@@ -191,10 +209,31 @@ impl EndpointSpec {
         headers: HeaderMap,
         RawQuery(query): RawQuery,
     ) -> Response {
+        if let Err(error) = Self::validate_response_id(&response_id) {
+            return error.response("/v1/responses");
+        }
         state
             .router
             .list_response_input_items(Some(&headers), &response_id, query.as_deref())
             .await
+    }
+
+    /// Resource IDs arrive percent-decoded and become one backend path segment, so
+    /// reject anything that could change the forwarded path or query.
+    fn validate_response_id(response_id: &str) -> Result<(), IngressError> {
+        let valid = !response_id.is_empty()
+            && response_id.len() <= MAX_RESPONSE_ID_BYTES
+            && response_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if valid {
+            return Ok(());
+        }
+        Err(IngressError::new(
+            http::StatusCode::BAD_REQUEST,
+            "invalid_response_id",
+            "response_id may contain only ASCII letters, digits, '_' and '-'",
+        ))
     }
 
     fn validate_topology(&self, pd: bool) -> Result<(), IngressError> {
@@ -209,11 +248,26 @@ impl EndpointSpec {
     }
 
     pub(crate) fn supports(&self, worker: &dyn Worker) -> bool {
+        self.listed_in_apis_label(worker).unwrap_or(true)
+    }
+
+    /// Whether a DP-aware worker receives `data_parallel_rank` for this API.
+    /// Chat, Completions and Generate carry the rank on supported backends.
+    /// Messages and Responses only do so when the worker's `mesh.apis` label
+    /// lists them, which declares that the backend honors the field.
+    pub(crate) fn forwards_dp_rank(&self, worker: &dyn Worker) -> bool {
+        match self.api {
+            Api::Chat | Api::Completions | Api::Generate => true,
+            Api::Messages | Api::Responses => self.listed_in_apis_label(worker).unwrap_or(false),
+        }
+    }
+
+    fn listed_in_apis_label(&self, worker: &dyn Worker) -> Option<bool> {
         worker
             .metadata()
             .labels
             .get("mesh.apis")
-            .is_none_or(|apis| apis.split(',').any(|api| api.trim() == self.path))
+            .map(|apis| apis.split(',').any(|api| api.trim() == self.path))
     }
 }
 
@@ -235,15 +289,33 @@ pub struct InferenceEnvelope {
     pd_body: Option<serde_json::Value>,
     /// Shared by JSON parsing and every subsequent prepare submission.
     pub(crate) prepare_deadline: Instant,
+    /// Routing text and tokens computed in the parse job, so the request does
+    /// not queue for the preparation pool a second time.
+    routed: Option<RoutingPreparation>,
     // Remains with the envelope through queued/running jobs and returned results.
     _input_lease: InputLease,
 }
+
+/// Execution metadata and, when the policy needs them, routing tokens.
+pub(crate) type RoutingPreparation = (InferenceMetadata, Option<Vec<u32>>);
 impl InferenceEnvelope {
     pub async fn parse(
         uri: Uri,
         headers: HeaderMap,
         body: Bytes,
         app: &AppContext,
+    ) -> Result<Self, IngressError> {
+        Self::parse_for_routing(uri, headers, body, app, None).await
+    }
+
+    /// Parse, and when `routing` is given and its policy needs request text or
+    /// tokens, prepare them in the same pool job.
+    pub(crate) async fn parse_for_routing(
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        app: &AppContext,
+        routing: Option<IngressRouting>,
     ) -> Result<Self, IngressError> {
         Self::validate_headers(&headers)?;
         let deadline = app.prepare_pool.prepare_deadline();
@@ -284,6 +356,7 @@ impl InferenceEnvelope {
                 metadata,
                 pd_body,
                 prepare_deadline: deadline,
+                routed: None,
                 _input_lease: lease,
             })
         };
@@ -297,8 +370,16 @@ impl InferenceEnvelope {
         app.prepare_pool
             .submit(deadline, move |ctx| -> Result<Self, IngressError> {
                 ctx.check()?;
-                let request = parse()?;
+                let mut request = parse()?;
                 ctx.check()?;
+                if let Some(routing) = routing {
+                    routing.validate_metadata(&request.metadata)?;
+                    let (needs_text, needs_tokens) =
+                        routing.requirements(request.metadata.model.as_deref());
+                    if needs_text || needs_tokens {
+                        request.routed = Some(routing.prepare(&request.parsed, ctx)?);
+                    }
+                }
                 Ok(request)
             })
             .await?
@@ -327,11 +408,14 @@ impl InferenceEnvelope {
     }
 
     pub(crate) async fn prepare_routing(
-        self,
+        mut self,
         pool: &PrepareHandle,
         routing: &IngressRouting,
-    ) -> Result<(Self, (InferenceMetadata, Option<Vec<u32>>)), IngressError> {
+    ) -> Result<(Self, RoutingPreparation), IngressError> {
         self.check_deadline()?;
+        if let Some(routed) = self.routed.take() {
+            return Ok((self, routed));
+        }
         routing.validate_metadata(&self.metadata)?;
         let (needs_text, needs_tokens) = routing.requirements(self.metadata.model.as_deref());
         if !needs_text && !needs_tokens {
@@ -422,7 +506,7 @@ impl InferenceEnvelope {
 }
 
 #[derive(Clone)]
-pub(crate) struct IngressRouting {
+pub struct IngressRouting {
     policy_registry: Arc<PolicyRegistry>,
     worker_registry: Arc<WorkerRegistry>,
     tokenizer_registry: Arc<TokenizerRegistry>,

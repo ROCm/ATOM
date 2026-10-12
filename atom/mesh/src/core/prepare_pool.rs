@@ -59,6 +59,8 @@ pub enum PrepareError {
     Closed,
     #[error("request preparation input budget is exhausted")]
     BudgetExceeded,
+    #[error("request body exceeds the total preparation input budget")]
+    InputTooLarge,
     #[error("request preparation queue timeout")]
     QueueTimeout,
     #[error("request preparation timeout")]
@@ -75,6 +77,7 @@ impl PrepareError {
     pub fn status_code(self) -> u16 {
         match self {
             Self::QueueTimeout | Self::Timeout => 504,
+            Self::InputTooLarge => 413,
             Self::Panicked | Self::WorkerFailed => 500,
             _ => 503,
         }
@@ -85,6 +88,7 @@ impl PrepareError {
             Self::Full => "prepare_queue_full",
             Self::Closed => "prepare_pool_closed",
             Self::BudgetExceeded => "prepare_input_budget",
+            Self::InputTooLarge => "prepare_input_too_large",
             Self::QueueTimeout => "prepare_queue_timeout",
             Self::Timeout => "prepare_timeout",
             Self::Cancelled => "prepare_cancelled",
@@ -296,6 +300,11 @@ impl PrepareHandle {
             .ok_or_else(|| PrepareError::Closed.count())?;
         let sender = state.sender.lock();
         state.check_open(&sender)?;
+        // A request larger than the whole budget can never be admitted; report it
+        // as non-retryable rather than as transient overload.
+        if bytes > state.control.max_retained_input_bytes {
+            return Err(PrepareError::InputTooLarge.count());
+        }
         state
             .control
             .retained_input_bytes
@@ -1144,6 +1153,19 @@ mod tests {
         assert_eq!(handle.stats().queued_jobs, 0);
         release.send(()).unwrap();
         drop(active.wait().await.unwrap());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_larger_than_total_budget_is_not_retryable() {
+        let mut runtime = PreparePoolRuntime::new(config()).unwrap();
+        let handle = runtime.handle();
+        let error = handle.retain_input(33).unwrap_err();
+        assert_eq!(error, PrepareError::InputTooLarge);
+        assert_eq!(error.status_code(), 413);
+        assert_eq!(handle.stats().retained_input_bytes, 0);
+        // Exactly the whole budget is still admissible.
+        drop(handle.retain_input(32).unwrap());
         runtime.shutdown().await;
     }
 

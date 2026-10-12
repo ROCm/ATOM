@@ -490,6 +490,41 @@ async fn response_resources_preserve_methods_queries_credentials_and_streaming()
         );
     }
 
+    // Decoded IDs must not be able to escape the Responses resource path.
+    for (method, path) in [
+        (
+            Method::POST,
+            "/v1/responses/..%2F..%2Fstart_profile%3F/cancel",
+        ),
+        (Method::GET, "/v1/responses/..%2Fhealth"),
+        (Method::DELETE, "/v1/responses/resp%3Fx%3D1"),
+        (Method::GET, "/v1/responses/resp%23frag/input_items"),
+        (Method::GET, "/v1/responses/resp%20id"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(
+            response.headers()["x-mesh-error-code"],
+            "invalid_response_id"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), captured.recv())
+                .await
+                .is_err(),
+            "invalid response_id reached a backend: {path}"
+        );
+    }
+
     let path = "/v1/responses/resp-test?stream=true&starting_after=13";
     let task = tokio::spawn(app.oneshot(Request::get(path).body(Body::empty()).unwrap()));
     let (parts, _, reply) = tokio::time::timeout(Duration::from_secs(2), captured.recv())

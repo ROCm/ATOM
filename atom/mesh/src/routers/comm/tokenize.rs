@@ -9,7 +9,11 @@ use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    core::{steps::TokenizerConfigRequest, Job, UNKNOWN_MODEL_ID},
+    core::{
+        prepare_pool::{JobContext, PrepareError},
+        steps::TokenizerConfigRequest,
+        Job, UNKNOWN_MODEL_ID,
+    },
     protocols::tokenize::{
         AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
         DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
@@ -29,6 +33,41 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         })),
     )
         .into_response()
+}
+
+fn prepare_error_response(error: PrepareError) -> Response {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    error_response(status, &error.to_string(), error.code())
+}
+
+/// Run CPU-bound tokenizer work and response serialization on the preparation
+/// pool, so Tokio workers stay free for I/O. The input lease is held until the
+/// job finishes.
+async fn run_on_prepare_pool(
+    context: &AppContext,
+    input_bytes: usize,
+    work: impl FnOnce(&JobContext) -> Response + Send + 'static,
+) -> Response {
+    let pool = &context.prepare_pool;
+    let lease = match pool.retain_input(input_bytes) {
+        Ok(lease) => lease,
+        Err(error) => return prepare_error_response(error),
+    };
+    let ticket = pool
+        .submit(pool.prepare_deadline(), move |ctx| {
+            let _lease = lease;
+            ctx.check()?;
+            Ok(work(ctx))
+        })
+        .await;
+    match ticket {
+        Ok(ticket) => match ticket.wait().await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) | Err(error) => prepare_error_response(error),
+        },
+        Err(error) => prepare_error_response(error),
+    }
 }
 
 fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
@@ -61,16 +100,29 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
     }
 }
 
-pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeRequest) -> Response {
+pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
+    let tokenizer = match get_tokenizer(&context.tokenizer_registry, &request.model) {
         Ok(t) => t,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
         }
     };
 
+    let input_bytes = request
+        .prompt
+        .as_strings()
+        .iter()
+        .map(|text| text.len())
+        .sum();
+    run_on_prepare_pool(context, input_bytes, move |_| {
+        encode_prompts(&*tokenizer, &request)
+    })
+    .await
+}
+
+fn encode_prompts(tokenizer: &dyn Tokenizer, request: &TokenizeRequest) -> Response {
     let texts = request.prompt.as_strings();
     let is_batch = request.prompt.is_batch();
 
@@ -121,16 +173,29 @@ pub async fn tokenize(registry: &Arc<TokenizerRegistry>, request: TokenizeReques
     .into_response()
 }
 
-pub async fn detokenize(registry: &Arc<TokenizerRegistry>, request: DetokenizeRequest) -> Response {
+pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(registry, &request.model) {
+    let tokenizer = match get_tokenizer(&context.tokenizer_registry, &request.model) {
         Ok(t) => t,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
         }
     };
 
+    let input_bytes = request
+        .tokens
+        .sequences()
+        .iter()
+        .map(|seq| size_of_val(*seq))
+        .sum();
+    run_on_prepare_pool(context, input_bytes, move |_| {
+        decode_sequences(&*tokenizer, &request)
+    })
+    .await
+}
+
+fn decode_sequences(tokenizer: &dyn Tokenizer, request: &DetokenizeRequest) -> Response {
     let sequences = request.tokens.sequences();
     let is_batch = request.tokens.is_batch();
 

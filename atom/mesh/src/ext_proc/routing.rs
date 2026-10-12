@@ -154,7 +154,10 @@ impl EndpointRouter {
             Some(address) => *address,
             None => Self::address(worker.as_ref()).await?,
         };
-        if worker.is_dp_aware() {
+        let forwards_dp_rank = worker.is_dp_aware()
+            && crate::routers::ingress::EndpointSpec::find(input.metadata.route)
+                .is_some_and(|endpoint| endpoint.forwards_dp_rank(worker.as_ref()));
+        if forwards_dp_rank {
             let body = serde_json::from_slice(&request.raw)?;
             let body = worker.prepare_request(body).await.map_err(|e| {
                 ProcessingError::new(500, "worker_request_preparation_failed", e.to_string())

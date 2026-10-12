@@ -100,6 +100,17 @@ impl RequestEnvelope {
                 }
             }
         }
+        let path = path.ok_or_else(|| ProcessingError::invalid("missing :path"))?;
+        let route = path.split('?').next().unwrap_or("");
+        // Responses resources need fan-out to the owning backend, which only the
+        // HTTP ingress performs; a 405 would wrongly advertise POST for them.
+        if route.starts_with("/v1/responses/") {
+            return Err(ProcessingError::new(
+                501,
+                "unsupported_in_ext_proc",
+                "Responses resource operations require the Mesh HTTP ingress",
+            ));
+        }
         if method.as_deref() != Some(b"POST") {
             return Err(ProcessingError::new(
                 405,
@@ -107,8 +118,6 @@ impl RequestEnvelope {
                 "ext-proc inference routes require POST",
             ));
         }
-        let path = path.ok_or_else(|| ProcessingError::invalid("missing :path"))?;
-        let route = path.split('?').next().unwrap_or("");
         if crate::routers::ingress::EndpointSpec::find(route).is_none() {
             return Err(ProcessingError::new(
                 404,

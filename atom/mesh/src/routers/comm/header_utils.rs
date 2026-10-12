@@ -95,12 +95,15 @@ pub fn inference_request_headers(
         }
     }
     if let Some(key) = api_key {
-        let (name, value) = if path.split('?').next() == Some("/v1/messages") {
-            ("x-api-key", key.to_owned())
-        } else {
-            ("authorization", format!("Bearer {key}"))
-        };
-        result.insert(name, http::HeaderValue::from_str(&value)?);
+        result.insert(
+            "authorization",
+            http::HeaderValue::from_str(&format!("Bearer {key}"))?,
+        );
+        // Anthropic clients authenticate Messages with x-api-key, while
+        // OpenAI-compatible backends serving the same route check the bearer.
+        if path.split('?').next() == Some("/v1/messages") {
+            result.insert("x-api-key", http::HeaderValue::from_str(key)?);
+        }
     }
     Ok(result)
 }

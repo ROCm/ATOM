@@ -64,7 +64,9 @@ upstream and returned in the `x-request-id` response header. Header mutations us
 Chat Completions, Messages and Responses support JSON and SSE through both
 ordinary HTTP and ext-proc. The supplied Envoy wildcard route already covers
 these endpoints; custom path allow-lists must include `/v1/messages` and
-`/v1/responses`.
+`/v1/responses`. Responses resource operations (`GET`/`DELETE
+/v1/responses/{id}`, `/cancel` and `/input_items`) are only served by the Mesh
+HTTP ingress; through ext-proc they return `501 unsupported_in_ext_proc`.
 
 Non-streaming completion:
 
