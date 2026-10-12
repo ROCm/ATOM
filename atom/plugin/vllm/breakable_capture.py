@@ -61,6 +61,5 @@ def install_execution_policy() -> None:
     from atom.model_ops.execution_policy import set_execution_policy
 
     set_execution_policy(
-        capture_breaks_mid_forward=capture_breaks_mid_forward,
         state_probe_blocking=True,
     )

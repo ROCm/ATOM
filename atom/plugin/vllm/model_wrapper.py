@@ -476,8 +476,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # be called -- the object does not exist until this returns.
             from atom.plugin.vllm.breakable_capture import install_execution_policy
             from atom.plugin.vllm.v41_eager_break import apply_v41_eager_break
+            from atom.plugin.vllm.v41_engram_staging import (
+                install_vllm_engram_staging,
+            )
 
             install_execution_policy()
+            # Engram's prefetch must not hold a fork open across a capture
+            # break; picked before the Engram runtime is built below.
+            install_vllm_engram_staging()
             # The attention break this frontend needs, applied to the class
             # before the model below is built out of it.
             apply_v41_eager_break()

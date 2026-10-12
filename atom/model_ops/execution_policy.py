@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Facts about the run that only the frontend driving it knows.
 
-DeepSeek-V4.1 asks two of them -- may a CUDA-graph capture end in the middle
-of a forward, and must the stale-state verdict be rendered in the step that
-asks for it. Both are properties of whoever is driving the model, not of the
-model, and the answers differ between ATOM's own engine and the vLLM plugin.
+DeepSeek-V4.1 asks one of them: must the stale-state verdict be rendered in
+the step that asks for it. It is a property of whoever is driving the model,
+not of the model, and ATOM's own engine and the vLLM plugin answer
+differently.
 
 They are pushed in rather than pulled out. `atom/model_ops/` reaching into
 `atom/plugin/vllm/` for them is the shape this replaces: it points the
@@ -13,51 +13,34 @@ only builds where that frontend is importable, and a second frontend wanting a
 different answer has to be added to the same `if`. Here core owns the
 question and its default, and a frontend states its own answer.
 
+Only one question is left here. The other two this started with -- whether a
+capture may break mid-forward, and whether graphs may be captured at all --
+turned out to have a single reader each, in a class a frontend can subclass:
+`EngramStaging._forks` and `DeepseekV41MetadataBuilder._dummy_cache`. An
+override says the same thing without a flag to keep in sync, so they moved
+there.
+
 The defaults are ATOM's native behaviour, deliberately. This exists to remove
 an import, not to change what anything computes, so a frontend that says
 nothing gets exactly what it got before.
-
-`capture_breaks_mid_forward` holds a callable, not a value: it asks whether a
-capture is recording *right now*, which changes within a single run.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
 
-_capture_breaks_probe: Callable[[], bool] | None = None
 _state_probe_blocking: bool = False
 
 
 def set_execution_policy(
     *,
-    capture_breaks_mid_forward: Callable[[], bool] | None = None,
     state_probe_blocking: bool | None = None,
 ) -> None:
     """State this frontend's answers. Idempotent; omitted ones are left alone."""
-    global _capture_breaks_probe, _state_probe_blocking
+    global _state_probe_blocking
 
-    if capture_breaks_mid_forward is not None:
-        _capture_breaks_probe = capture_breaks_mid_forward
     if state_probe_blocking is not None:
         _state_probe_blocking = bool(state_probe_blocking)
-
-
-def capture_breaks_mid_forward() -> bool:
-    """Whether the frontend may end a capture segment inside one forward.
-
-    A side stream forked earlier in the forward and joined later is still
-    outstanding at such a break, and `capture_end()` refuses it:
-
-        HIP error: capturing stream has unjoined work
-        (hipErrorStreamCaptureUnjoined)
-
-    So a fork whose join is not in the same segment must not be opened while
-    this is true. False by default: ATOM's native engine records one graph per
-    forward and never breaks it.
-    """
-    return bool(_capture_breaks_probe()) if _capture_breaks_probe else False
 
 
 def state_probe_blocking() -> bool:
