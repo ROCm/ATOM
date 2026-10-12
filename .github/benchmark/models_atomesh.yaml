@@ -942,7 +942,7 @@ models:
           vllm:
             source:
               repo: https://github.com/vllm-project/vllm
-              sha: bfa7e5b7afe40ebe48288801a2baf5c1135cd881
+              sha: 99b44c7a4282e903edc0c4703f50d3a72f4d419b
         - &mori_prefix_read_b
           <<: *mori_prefix_read_a
           name: kimi-k3-mori-prefix-read-main-b-nospec-tp8-dcp8-eager
@@ -956,7 +956,7 @@ models:
           vllm:
             source:
               repo: https://github.com/whx-sjtu/vllm
-              sha: c44675d6a2309cdf21546ea4ac680030d322cfec
+              sha: 6460c37b891cfeb830b01f1f7228729aca865d49
         - <<: *mori_prefix_read_b
           name: kimi-k3-mori-prefix-read-main-b-gsm8k-nospec-tp8-dcp8-eager
           run_eval: true

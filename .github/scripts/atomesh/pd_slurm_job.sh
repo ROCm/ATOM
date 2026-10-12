@@ -191,6 +191,7 @@ pre_cleanup_local() {
     --job-id "${JOB_ID}" --run-token "${ATOMESH_RUN_TOKEN}" \
     --node "${SELECTED_NODES[$node_rank]}" --rank "${node_rank}" \
     --cell-id "${ATOMESH_CELL_ID}" \
+    --image "${DOCKER_IMAGE}" \
     "${stale_cell_args[@]}" \
     --out "${RUN_DIR}/gpu-preflight-${node_rank}.json" || return $?
   local deadline=$((SECONDS + 180)) state_rc

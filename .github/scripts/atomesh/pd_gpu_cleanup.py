@@ -182,6 +182,53 @@ class Cleanup:
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             self.event(stage, error=str(error))
 
+    def check_storage(self):
+        if not self.args.image:
+            return
+        docker_root = command(
+            ["docker", "info", "--format", "{{.DockerRootDir}}"]
+        ).strip()
+        if not docker_root.startswith("/"):
+            raise RuntimeError("Cannot determine the Docker storage directory")
+        cached = (
+            self.args.image
+            in command(
+                [
+                    "docker",
+                    "image",
+                    "ls",
+                    "--digests",
+                    "--format",
+                    "{{.Repository}}@{{.Digest}}",
+                ]
+            ).splitlines()
+        )
+        # Native builds need scratch space even when all image layers exist.
+        required = (40 if cached else 200) * 1024**3
+        paths = {Path(docker_root)}
+        if Path("/var/lib/containerd").exists():
+            paths.add(Path("/var/lib/containerd"))
+        for path in sorted(paths):
+            usage = os.statvfs(path)
+            free = usage.f_bavail * usage.f_frsize
+            free_inodes = usage.f_favail
+            self.event(
+                "storage",
+                path=str(path),
+                image=self.args.image,
+                image_cached=cached,
+                free_bytes=free,
+                required_free_bytes=required,
+                free_inodes=free_inodes,
+                total_inodes=usage.f_files,
+            )
+            if free < required or (usage.f_files and free_inodes < 100000):
+                raise RuntimeError(
+                    f"Insufficient image/build storage at {path}: "
+                    f"free_bytes={free}, required={required}, "
+                    f"free_inodes={free_inodes}, image_cached={cached}"
+                )
+
     def run(self):
         args = self.args
         if socket.gethostname().split(".")[0] != args.node:
@@ -204,6 +251,7 @@ class Cleanup:
         self.snapshot_ports("listeners_before")
         self.stop_containers()
         self.snapshot_ports("listeners_after")
+        self.check_storage()
         deadline = time.monotonic() + 60
         while True:
             current = self.snapshot("check")
@@ -229,6 +277,7 @@ def main():
     parser.add_argument("--cell-id")
     parser.add_argument("--stale-cell-id", action="append", default=[])
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--image", help="Pinned image whose storage is checked")
     args = parser.parse_args()
     if None in (
         args.job_id,
