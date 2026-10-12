@@ -1838,7 +1838,7 @@ models:
           trajectory_start_max_ratio: 0.75
           failed_request_threshold: 0.1
           slice_duration: 1.0
-          cancel_drain_timeout: 300
+          cancel_drain_timeout: 10
           http_tcp_user_timeout: 900000
           dataset_weka_live_assistant_responses: 0
           dataset_configuration_timeout: 1800
