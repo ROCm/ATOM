@@ -11,7 +11,8 @@ SCRIPT = Path(__file__).parents[1] / ".github/scripts/atomesh/pd_gpu_cleanup.py"
 SPEC = importlib.util.spec_from_file_location("pd_gpu_cleanup", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
-IMAGE = "example/model@sha256:" + "a" * 64
+IMAGE = "registry.example:5000/example/model:nightly@sha256:" + "a" * 64
+CACHED_IMAGE = "registry.example:5000/example/model@sha256:" + "a" * 64
 
 
 class StoragePreflightTest(unittest.TestCase):
@@ -41,7 +42,7 @@ class StoragePreflightTest(unittest.TestCase):
                     "command",
                     side_effect=[
                         directory,
-                        IMAGE if cached else "",
+                        CACHED_IMAGE if cached else "",
                     ],
                 ),
                 patch.object(MODULE.os, "statvfs", return_value=usage),

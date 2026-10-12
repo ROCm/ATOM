@@ -190,8 +190,12 @@ class Cleanup:
         ).strip()
         if not docker_root.startswith("/"):
             raise RuntimeError("Cannot determine the Docker storage directory")
+        repository, digest = self.args.image.rsplit("@", 1)
+        # Docker lists RepoDigests without tags; keep any registry port intact.
+        if ":" in repository.rsplit("/", 1)[-1]:
+            repository = repository.rsplit(":", 1)[0]
         cached = (
-            self.args.image
+            f"{repository}@{digest}"
             in command(
                 [
                     "docker",
