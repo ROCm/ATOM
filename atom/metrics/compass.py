@@ -3,13 +3,18 @@
 Enabled by ``ATOM_COMPASS_DIR``. Each model-runner rank writes, under
 ``$ATOM_COMPASS_DIR/dp{d}_pp{p}_tp{t}/``:
 
-- ``forward.<pid>.jsonl``: one row per ``run_model`` call (``phase`` target)
-  and per drafter pass (``draft_kv``, ``draft``) -- device-event
-  forward duration, absolute GPU start/end (wall-clock ns, via an anchor
-  event), and the batch shape (graph padding, prefill/decode split, context
-  length sum/max; per-sequence query/context lengths on tp_rank 0 only).
+- ``forward.<pid>.jsonl``: one row per step (``phase`` target) and per
+  drafter pass (``draft_kv``, ``draft``) -- device-event duration, absolute
+  GPU start/end (wall-clock ns, via an anchor event), and the batch shape
+  (graph padding, prefill/decode split, context length sum/max; per-sequence
+  query/context lengths on tp_rank 0 only). A target row's ``scope`` says what
+  its interval covers: ``forward`` is the whole ``ModelRunner.forward`` (input
+  preparation, model, drafter passes, sampling), with the ``run_model`` part
+  in ``model_gpu_*``; ``call`` is the timed call alone, for a ``run_model``
+  reached outside ``forward`` (RapidServe ``prefill_forward``). Drafter rows
+  inside a forward share its ``step``.
 - ``ops.<pid>.jsonl``: during sampled profiler windows, one row per op that
-  launched GPU work inside a forward: op name, input shapes/dtypes, CPU and
+  launched GPU work inside a step: op name, input shapes/dtypes, CPU and
   GPU start/end (wall-clock ns) and its kernels. Kernels replayed from a CUDA
   graph carry no op shapes; they are grouped under their graph launch and the
   step's batch shape is in the forward row with the same ``step``.
@@ -141,6 +146,7 @@ class CompassRecorder:
         self.last_flush = time.monotonic()
 
         self.step = 0
+        self.active = None  # the step being timed: row, nested spans, dropped
         self.pending = deque()
         self.free = []
         self.anchors = deque()  # (event, wall ns), oldest first
@@ -181,16 +187,25 @@ class CompassRecorder:
 
     # -- forward rows -----------------------------------------------------
 
+    def _event_pair(self):
+        if self.free:
+            return self.free.pop()
+        return (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+
     def poll(self):
         while self.pending:
-            row, anchor, start, end = self.pending[0]
-            if not end.query():
+            row, anchor, spans = self.pending[0]
+            if not all(end.query() for _, _, end in spans):
                 break
             self.pending.popleft()
-            row["gpu_start_ns"] = self._wall_ns(anchor, start)
-            row["gpu_end_ns"] = self._wall_ns(anchor, end)
-            row["gpu_ms"] = start.elapsed_time(end)
-            self.free.append((start, end))
+            for prefix, start, end in spans:
+                row[f"{prefix}gpu_start_ns"] = self._wall_ns(anchor, start)
+                row[f"{prefix}gpu_end_ns"] = self._wall_ns(anchor, end)
+                row[f"{prefix}gpu_ms"] = start.elapsed_time(end)
+                self.free.append((start, end))
             self.forward_file.write(json.dumps(row) + "\n")
         # Pending rows hold anchors oldest first; drop the ones none refer to.
         oldest = self.pending[0][1] if self.pending else self.anchors[-1]
@@ -210,13 +225,61 @@ class CompassRecorder:
         self.last_flush = time.monotonic()
 
     @contextmanager
+    def measure_forward(self):
+        """Time one ``ModelRunner.forward`` as the step. Its batch fields come
+        from the ``run_model`` inside, once the forward context exists."""
+        if torch.cuda.is_current_stream_capturing() or self.active is not None:
+            yield
+            return
+        with self._step("target", "forward", None):
+            yield
+
+    @contextmanager
     def measure(self, batch, phase="target"):
-        """Time one GPU phase of a step: the target ``run_model`` forward, or a
-        drafter's ``draft_kv`` / ``draft`` pass (timed at its runner call site)."""
+        """Time one GPU phase: the target ``run_model``, or a drafter's
+        ``draft_kv`` / ``draft`` pass (timed at its runner call site). Inside a
+        timed forward it is a span of that step; otherwise a step of its own."""
         if torch.cuda.is_current_stream_capturing():
             # Events recorded into a graph would time replays, not this call.
             yield
             return
+        if self.active is None:
+            with self._step(phase, "call", batch):
+                yield
+            return
+        active = self.active
+        if active["dropped"]:
+            yield
+            return
+        context = get_forward_context().context
+        start, end = self._event_pair()
+        cpu_start_ns = time.time_ns()
+        start.record()
+        try:
+            yield
+        except BaseException:
+            self.free.append((start, end))
+            raise
+        end.record()
+        fields = _batch_fields(batch, context, self.seq_lists)
+        if phase == "target":
+            active["row"].update(fields)
+            active["spans"].append(("model_", start, end))
+            return
+        row = {
+            "step": active["row"]["step"],
+            "phase": phase,
+            "scope": "call",
+            **self.rank,
+            **fields,
+            "cpu_start_ns": cpu_start_ns,
+            "cpu_end_ns": time.time_ns(),
+            "op_window": self.window is not None,
+        }
+        self.pending.append((row, self.anchors[-1], [("", start, end)]))
+
+    @contextmanager
+    def _step(self, phase, scope, batch):
         self.poll()
         if time.monotonic() - self.anchor_at > self.anchor_interval_s:
             self._reanchor()
@@ -225,13 +288,11 @@ class CompassRecorder:
         self.step += 1
         self._maybe_open_window(step)
 
-        context = get_forward_context().context
-        row = {
-            "step": step,
-            "phase": phase,
-            **self.rank,
-            **_batch_fields(batch, context, self.seq_lists),
-        }
+        row = {"step": step, "phase": phase, "scope": scope, **self.rank}
+        if scope == "call":
+            context = get_forward_context().context
+            row.update(_batch_fields(batch, context, self.seq_lists))
+        active = self.active = {"row": row, "spans": [], "dropped": False}
         if len(self.pending) >= _MAX_PENDING:
             # Never block the forward on the recorder; drop the row instead.
             logger.warning(
@@ -239,17 +300,14 @@ class CompassRecorder:
                 len(self.pending),
                 step,
             )
-            yield
+            active["dropped"] = True
+            try:
+                yield
+            finally:
+                self.active = None
             self._maybe_close_window(step)
             return
-        start, end = (
-            self.free.pop()
-            if self.free
-            else (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-        )
+        start, end = self._event_pair()
         annotate = (
             record_function(f"{_STEP_PREFIX}{step}")
             if self.window is not None
@@ -262,11 +320,16 @@ class CompassRecorder:
                 yield
         except BaseException:
             self.free.append((start, end))
+            self.free.extend((s, e) for _, s, e in active["spans"])
             raise
+        finally:
+            self.active = None
         end.record()
         row["cpu_end_ns"] = time.time_ns()
         row["op_window"] = self.window is not None
-        self.pending.append((row, self.anchors[-1], start, end))
+        self.pending.append(
+            (row, self.anchors[-1], [("", start, end), *active["spans"]])
+        )
         self._maybe_close_window(step)
 
     # -- op windows -------------------------------------------------------
@@ -330,8 +393,8 @@ def window_op_rows(events):
     A kernel shares its correlation id with the runtime launch call and links
     (``linked_correlation_id``) to the innermost CPU op enclosing that launch,
     which carries the input shapes. The launch's CPU time places it inside a
-    ``compass_step:<n>`` annotation. Kernels outside any step (input
-    preparation, sampling) are dropped.
+    ``compass_step:<n>`` annotation, which spans the whole forward (input
+    preparation and sampling included). Kernels outside any step are dropped.
     """
     runtime, ops, steps, kernels = {}, {}, [], []
     for e in events:
@@ -401,5 +464,17 @@ def record_compass(func):
             return func(self, input_ids, batch)
         with recorder.measure(batch):
             return func(self, input_ids, batch)
+
+    return wrapped
+
+
+def record_compass_forward(func):
+    @wraps(func)
+    def wrapped(self, batch):
+        recorder = getattr(self, "compass_recorder", None)
+        if recorder is None:
+            return func(self, batch)
+        with recorder.measure_forward():
+            return func(self, batch)
 
     return wrapped

@@ -44,15 +44,17 @@ def summarize(root, top):
             kinds[kind].append(r)
         print(
             f"  {'kind':<13}{'n':>6}{'gpu_ms p50':>12}{'p90':>9}{'max':>9}"
-            f"{'tokens p50':>12}{'bs p50':>8}"
+            f"{'model p50':>11}{'tokens p50':>12}{'bs p50':>8}"
         )
         for kind, rows in sorted(kinds.items()):
             gpu = [r["gpu_ms"] for r in rows]
+            model = [r["model_gpu_ms"] for r in rows if "model_gpu_ms" in r]
+            model_p50 = f"{median(model):>11.3f}" if model else f"{'-':>11}"
             tokens = [r.get("num_tokens", r["scheduled_tokens"]) for r in rows]
             bs = [r["scheduled_bs"] for r in rows]
             print(
                 f"  {kind:<13}{len(rows):>6}{median(gpu):>12.3f}{_pct(gpu, 0.9):>9.3f}"
-                f"{max(gpu):>9.3f}{median(tokens):>12.0f}{median(bs):>8.0f}"
+                f"{max(gpu):>9.3f}{model_p50}{median(tokens):>12.0f}{median(bs):>8.0f}"
             )
         bad = [
             r

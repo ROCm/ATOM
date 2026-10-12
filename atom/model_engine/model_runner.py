@@ -42,7 +42,11 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
-from atom.metrics.compass import CompassRecorder, record_compass
+from atom.metrics.compass import (
+    CompassRecorder,
+    record_compass,
+    record_compass_forward,
+)
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
@@ -3422,6 +3426,7 @@ class ModelRunner:
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    @record_compass_forward
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
@@ -4534,6 +4539,7 @@ class RapidServeModelRunner(ModelRunner):
 
     @_profile_runner_stage
     @torch.inference_mode()
+    @record_compass_forward
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Decode runs the model forward on a dynamically selected (optionally
         # CU-masked) stream so it doesn't contend with prefill on the shared
