@@ -116,12 +116,27 @@ do not establish a meaningful TP4 service gain. The prompt stays below the
 checkpoint generation. Raw runs are in
 `/tmp/qwen38-tp4-mtp2-{off,on}-{completed,b16-repeat}.jsonl`.
 
-No TP8 checkpoint serving result is reported. During this follow-up, GPU 5
-remained occupied by another workload (up to 100% utilization and 25% VRAM),
-so an eight-GPU throughput comparison would measure contention. The current
-QSA index CP path explicitly accepts only TP2/TP4; enabling its flag at TP8
-raises a configuration error. The merged QKV/index projection has exact TP4
-weight-shape gates, so its TP4 result also cannot be projected onto TP8.
+### TP8 MTP2 serving check
+
+An eight-GPU idle window allowed the local checkpoint to start at TP8+EP8
+with CUDA graphs, MTP2, an 8,192-token maximum context, 16 maximum sequences,
+and `--gpu-memory-utilization 0.80`. With the PR's optimization flags off,
+five-run completed-answer medians after warmup were 939.70, 1,827.86, and
+3,278.27 tokens/s at 4/8/16 concurrent requests. Every list response was
+correct and ended with `stop`; a separate synchronized 16-request arithmetic
+probe scored 16/16 correct. The server reported 100% MTP2 draft acceptance
+for the list workload. Raw runs are in
+`/tmp/qwen38-tp8-mtp2-off-completed.jsonl`.
+
+The subsequent flags-on run returned correct lists and 16/16 arithmetic
+answers, but four other GPU processes entered on ranks 0–3 before its probe,
+each allocating about 43 GB and occupying up to 100% GPU time. Its raw data
+is at `/tmp/qwen38-tp8-mtp2-on-completed.jsonl`; it cannot be compared with
+the idle-GPU baseline as a speedup. The current QSA index CP path explicitly
+accepts only TP2/TP4; enabling its flag at TP8 raises a configuration error.
+The merged QKV/index projection has exact TP4 weight-shape gates, so the TP4
+projection result cannot be projected onto TP8. No 128k/256k checkpoint
+generation was measured at TP8.
 
 Synthetic-weight complete decoder-layer graph reruns on TP4+EP4, 100 replays,
 after the final HC helper cleanup:
