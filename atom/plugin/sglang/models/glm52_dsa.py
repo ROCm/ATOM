@@ -7,9 +7,6 @@ from typing import Any
 
 import torch
 
-logger = logging.getLogger("atom.plugin.sglang.models.glm52_dsa")
-_indexer_run_logged = False
-
 from atom.plugin.sglang.models.deepseek_mla import (
     _align_qknorm_fusion_for_sglang,
     _patch_indexer_layernorm_for_sglang,
@@ -20,6 +17,9 @@ from atom.plugin.sglang.models.deepseek_mla_forward import (
 from atom.plugin.sglang.models.glm52_dsa_attention import (
     SGLangATOMGLM52MLAAttention,
 )
+
+logger = logging.getLogger("atom.plugin.sglang.models.glm52_dsa")
+_indexer_run_logged = False
 
 
 def short_verify_skips_indexer(

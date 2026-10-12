@@ -2,13 +2,12 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
     verify_kernel_positions,
 )
-import numpy as np
-
 from atom.plugin.sglang.glm52_dsa_bridge import (
     GLM52_GRAPH_SEQ_LEN_CAPACITY,
     _cap_context_to_written_tokens,
@@ -146,7 +145,9 @@ def test_graph_fill_does_not_override_a_real_mtp_context():
 
     padded = SimpleNamespace(
         batch_size=4,
-        seq_lens_cpu=torch.tensor([12, sentinel, sentinel, sentinel], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor(
+            [12, sentinel, sentinel, sentinel], dtype=torch.int32
+        ),
         seq_lens_sum=12 + 3 * sentinel,
         num_padding=3,
     )

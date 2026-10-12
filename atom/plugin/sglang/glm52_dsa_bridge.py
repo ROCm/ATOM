@@ -11,8 +11,6 @@ import logging
 
 import numpy as np
 import torch
-
-logger = logging.getLogger("atom.plugin.sglang.glm52_dsa_bridge")
 from aiter import dtypes, get_mla_metadata_info_v1, get_mla_metadata_v1
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 
@@ -20,6 +18,8 @@ from atom.plugin.sglang.runtime.attention_backend_resolver import (
     resolve_sglang_runtime,
 )
 from atom.plugin.sglang.runtime.model_arch import is_glm52_dsa_config
+
+logger = logging.getLogger("atom.plugin.sglang.glm52_dsa_bridge")
 
 DECODE_GRAPH_BUFFERS_ATTR = "_atom_glm52_decode_graph_buffers"
 EMPTY_VALUE_CACHE_ATTR = "_atom_glm52_empty_value_cache"
@@ -221,9 +221,9 @@ def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) 
     if np.array_equal(capped, claimed):
         return
     context.copy_(
-        torch.from_numpy(capped).to(device=context.device, dtype=context.dtype).reshape(
-            context.shape
-        )
+        torch.from_numpy(capped)
+        .to(device=context.device, dtype=context.dtype)
+        .reshape(context.shape)
     )
     if hasattr(metadata, "max_seqlen_k"):
         metadata.max_seqlen_k = int(max(int(capped.max(initial=1)), 1))
@@ -1174,9 +1174,7 @@ def _build_mtp_draft_decode_metadata(
     )
     # The table gather adds ``sub_step + 1`` itself. Feed it the same committed
     # length the resolver just published, not the raw graph-fill seq_lens.
-    committed_np = np.maximum(
-        context_lens_np - int(sub_step) - 1, 0
-    ).astype(np.int32)
+    committed_np = np.maximum(context_lens_np - int(sub_step) - 1, 0).astype(np.int32)
     num_steps = resolve_speculative_num_steps(
         forward_batch, default=max(sub_step + 1, 1)
     )
