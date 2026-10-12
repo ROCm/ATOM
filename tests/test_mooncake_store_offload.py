@@ -288,6 +288,7 @@ class FakeStore:
 
     def close(self):
         self.closed = True
+        self._maybe_raise("close")
         return 0
 
 
@@ -969,6 +970,13 @@ def test_client_setup_and_registration_failures_name_the_cause(cluster):
     cluster.setup_rc = store_client.RPC_FAIL
     with pytest.raises(RuntimeError, match=f"RPC_FAIL.*master={MASTER}.*rdma3"):
         _client()
+    # The client whose setup failed is closed, not left behind with whatever
+    # setup started; and one whose close raises still reports the setup.
+    assert cluster.stores[-1].closed
+    cluster.raise_on = "close"
+    with pytest.raises(RuntimeError, match="RPC_FAIL"):
+        _client()
+    cluster.raise_on = None
     cluster.setup_rc = 0
     client = _client()
     client._store.register_rc = store_client.INVALID_PARAMS

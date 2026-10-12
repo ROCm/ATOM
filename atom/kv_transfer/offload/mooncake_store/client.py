@@ -193,6 +193,15 @@ class MooncakeStoreClient:
             master_server_addr,
         )
         if rc != 0:
+            # The client exists from before `setup`, and so does whatever it
+            # started; a caller that reconnects would leave one per attempt.
+            try:
+                store.close()
+            except Exception:  # the setup failure is the error, not this
+                logger.warning(
+                    "Mooncake Store client close after a failed setup raised",
+                    exc_info=True,
+                )
             raise RuntimeError(
                 f"Mooncake Store client setup failed ({describe(rc)}): master="
                 f"{master_server_addr} metadata={metadata_server} "
