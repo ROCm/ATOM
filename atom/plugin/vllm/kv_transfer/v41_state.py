@@ -366,6 +366,16 @@ class V41StateWorkerLeg:
                 self._views.release_stage(stage)
 
 
+#: The planner most recently built, so the worker-side refusal dump can
+#: read its counters. Scheduler and worker share a process here; when they
+#: do not, this is None and the dump says so rather than guessing.
+_LAST_PLANNER = None
+
+
+def last_planner():
+    return _LAST_PLANNER
+
+
 class V41BoundaryPlanner:
     """Scheduler half: picks the boundaries, and caps hits to them.
 
@@ -409,6 +419,8 @@ class V41BoundaryPlanner:
         self._last_offered: dict[str, int] = {}
         # req_id -> boundary claimed for a purely local prefix hit, read
         # once by `update_state_after_alloc` and dropped there.
+        global _LAST_PLANNER
+        _LAST_PLANNER = self
         self._local_caps: dict[str, int] = {}
         # Requests whose local cap the tier failed to back. They decline
         # on the retry rather than being deferred again and again.
@@ -599,6 +611,9 @@ class V41BoundaryPlanner:
                 boundary -= phase_step
         return 0
 
+    def counters(self) -> dict:
+        return dict(self._counters)
+
     def cap_local_hit(self, request, hit: int) -> int:
         """Shorten vLLM's *own* prefix-cache hit so the tier can back it.
 
@@ -632,6 +647,7 @@ class V41BoundaryPlanner:
         behaviour and is safe.
         """
         hit = int(hit)
+        self._counters["local_cap_calls"] = self._counters.get("local_cap_calls", 0) + 1
         req_id = str(getattr(request, "request_id", "") or "")
         self._local_caps.pop(req_id, None)
         if hit <= 0:

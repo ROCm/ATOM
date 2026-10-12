@@ -1314,6 +1314,39 @@ def _dump_v41_state_rows(snapshot, batch, builder, exc) -> None:
         if cache is not None:
             cursors = cache.cursor[:, 0].tolist()
         logger.error("DeepSeek-V4.1 stale-cursor refusal: %s", exc)
+        # The image counters belong in THIS dump and not only in the
+        # periodic line: that line is rate-limited to 20 s, so the three
+        # runs that died on a refusal each printed their last counters
+        # before the first request and said nothing about the step that
+        # failed. A refusal is exactly when they are worth reading.
+        try:
+            from atom.plugin.vllm.v41_state_image import runtime as _img_rt
+
+            rt = _img_rt()
+            if rt is not None:
+                logger.error(
+                    "  images: %s",
+                    ", ".join(f"{k}={v}" for k, v in sorted(rt.stats().items())),
+                )
+        except Exception:
+            logger.error("  images: counters unavailable")
+        # The planner's counters have the same gap: read at a refusal, they
+        # say whether vLLM's local hit was capped, declined, or never
+        # offered -- three states that a start-up line of zeros cannot tell
+        # apart, and I read one as the third.
+        try:
+            from atom.plugin.vllm.kv_transfer.v41_state import last_planner
+
+            planner = last_planner()
+            if planner is not None:
+                logger.error(
+                    "  planner: %s",
+                    ", ".join(
+                        f"{k}={v}" for k, v in sorted(planner.counters().items())
+                    ),
+                )
+        except Exception:
+            logger.error("  planner: counters unavailable")
         logger.error(
             "  %-4s %-44s %10s %9s %6s %10s",
             "row",
