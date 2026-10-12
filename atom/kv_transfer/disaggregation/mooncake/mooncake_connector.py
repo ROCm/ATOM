@@ -118,6 +118,8 @@ PD_TRANSFER_DEADLINE_S = 120.0
 # Added to a producer's write window (see _write_window_s) for the 1 ns per
 # byte Mooncake adds to a sync write's timeout, up to 60 GB per batch.
 PD_WRITE_WINDOW_SLACK_S = 60.0
+# A receive still waiting on its producer ranks this long is logged once.
+PD_RECV_STALL_LOG_S = 30.0
 # A final prefill's KV-ready event is replaced by a shared, long-complete one
 # this long after it was recorded, if no finished transfer dropped it first
 # (see _drop_stale_kv_ready_events).
@@ -926,6 +928,13 @@ class MooncakeConnector(KVConnectorBase):
         # Producer ranks that acknowledged a request, and when each one's write
         # window ends (time.monotonic()).
         self._pending_recv_acks: dict[ReqId, dict[tuple[int, int], float]] = {}
+        # When each request not yet logged as stalled went out
+        # (time.monotonic()), in dispatch order (see _expire_pending_recvs).
+        self._pending_recv_stall_watch: dict[ReqId, float] = {}
+        # Failed receives not reported yet, and when they may be
+        # (time.monotonic()): a write Mooncake gave up on may still land in
+        # their pages until then (see _complete_recv).
+        self._held_failures: dict[ReqId, float] = {}
         # PP-prefill: consumer stashes stage-0's release address per request, and
         # the producer (stage-0) counts releases to defer freeing the shared page
         # table until every stage has written the KV out.
@@ -1641,6 +1650,7 @@ class MooncakeConnector(KVConnectorBase):
                 with self._completion_lock:
                     self._pending_recv_expected[req_id] = remote_pp_size
                     self._pending_recv_nonce[req_id] = write_nonce
+                    self._pending_recv_stall_watch[req_id] = time.monotonic()
             self._pending_recv.add(req_id)
             # Only delta blocks need fencing; reused prefix blocks are coherent.
             self._pending_recv_blocks[req_id] = list(dst_block_ids)
@@ -1702,6 +1712,7 @@ class MooncakeConnector(KVConnectorBase):
         if self._mla_landing is not None:
             self._mla_landing.sweep()
         self._expire_pending_recvs()
+        self._report_held_failures()
         if self.is_producer:
             # Also when prefill goes idle and records no new batch.
             with self._completed_prefills_lock:
@@ -2219,7 +2230,7 @@ class MooncakeConnector(KVConnectorBase):
         def flush_block_descriptors() -> bool:
             if not src_addrs:
                 return True
-            if not self._rdma_write_with_retry(
+            if not self._rdma_write(
                 target,
                 src_addrs,
                 dst_addrs,
@@ -2688,7 +2699,7 @@ class MooncakeConnector(KVConnectorBase):
             staging = self._mla_staging[pool_idx]
             used = self._gather_mla_rows(stream, staging, pieces)
             src_addrs, dst_addrs, sizes = descriptors(staging, used)
-            return self._rdma_write_with_retry(
+            return self._rdma_write(
                 target,
                 src_addrs,
                 dst_addrs,
@@ -2806,7 +2817,7 @@ class MooncakeConnector(KVConnectorBase):
                     len(src_addrs),
                     sum(sizes),
                 )
-            if not self._rdma_write_with_retry(
+            if not self._rdma_write(
                 target,
                 src_addrs.tolist(),
                 dst_addrs.tolist(),
@@ -2982,7 +2993,7 @@ class MooncakeConnector(KVConnectorBase):
         )
 
         deadline = request_data.get("_deadline")
-        if not self._rdma_write_with_retry(
+        if not self._rdma_write(
             target,
             block_src,
             block_dst,
@@ -3056,7 +3067,7 @@ class MooncakeConnector(KVConnectorBase):
             sum(slot_sizes),
         )
 
-        slot_ok = self._rdma_write_with_retry(
+        slot_ok = self._rdma_write(
             target,
             slot_src,
             slot_dst,
@@ -3071,7 +3082,7 @@ class MooncakeConnector(KVConnectorBase):
 
         if producer_pool_idx >= 0:
             self._staging_slots.release(producer_pool_idx)
-        return slot_ok
+        return bool(slot_ok)
 
     def _wait_for_prefill_data(self, req_id: str) -> dict | None:
         """Wait until prefill data is available for this request.
@@ -3087,7 +3098,7 @@ class MooncakeConnector(KVConnectorBase):
                 return self._completed_prefills[req_id]
             return None
 
-    def _rdma_write_with_retry(
+    def _rdma_write(
         self,
         target: str,
         src_addrs: list[int],
@@ -3098,75 +3109,74 @@ class MooncakeConnector(KVConnectorBase):
         *,
         engine=None,
         deadline: float | None = None,
-    ) -> bool:
-        """Chunked writes and retries on the same request-local engine.
+    ) -> bool | None:
+        """Chunked sync writes on the same request-local engine, each tried once.
 
-        No attempt starts after ``deadline`` (``time.monotonic()``), the
-        request's ``PD_TRANSFER_DEADLINE_S`` from receipt: the write fails
-        instead.
+        Returns True once every chunk was written. Returns False once a chunk
+        failed: its writes may still land, since Mooncake gives up on a sync
+        write at ``MC_TRANSFER_TIMEOUT`` without cancelling the work it
+        posted, and a retry that succeeded would hide them. Returns None if
+        ``deadline`` (``time.monotonic()``, the request's
+        ``PD_TRANSFER_DEADLINE_S`` from receipt) passed before a chunk
+        started, so no write of this call is still in flight.
         """
         if engine is None:
             engine = self.transfer_engine
         max_entries_per_batch = self._MAX_RDMA_ENTRIES_PER_BATCH
         total_entries = len(src_addrs)
-        max_retries = 3
 
         for chunk_start in range(0, total_entries, max_entries_per_batch):
             chunk_end = min(chunk_start + max_entries_per_batch, total_entries)
-            chunk_src = src_addrs[chunk_start:chunk_end]
-            chunk_dst = dst_addrs[chunk_start:chunk_end]
-            chunk_sizes = sizes[chunk_start:chunk_end]
-
-            retry_delay = 2.0
-            for attempt in range(max_retries):
-                if deadline is not None and time.monotonic() > deadline:
-                    logger.error(
-                        "[PRODUCER] %s RDMA for req %s passed its %.0fs transfer "
-                        "deadline; failing it",
-                        label,
-                        req_id,
-                        PD_TRANSFER_DEADLINE_S,
-                    )
-                    return False
-                try:
-                    ret = engine.batch_transfer_sync_write(
-                        target, chunk_src, chunk_dst, chunk_sizes
-                    )
-                    if ret == 0:
-                        break
-                    logger.error(
-                        "[PRODUCER] %s RDMA chunk error %d for req %s → %s "
-                        "(entries %d-%d/%d, attempt %d/%d)",
-                        label,
-                        ret,
-                        req_id,
-                        target,
-                        chunk_start,
-                        chunk_end,
-                        total_entries,
-                        attempt + 1,
-                        max_retries,
-                    )
-                except Exception:
-                    logger.exception(
-                        "[PRODUCER] %s RDMA chunk FAILED for req %s "
-                        "(entries %d-%d/%d, attempt %d/%d)",
-                        label,
-                        req_id,
-                        chunk_start,
-                        chunk_end,
-                        total_entries,
-                        attempt + 1,
-                        max_retries,
-                    )
-                    ret = -1
-                if ret == 0:
-                    break
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    return False
+            if deadline is not None and time.monotonic() > deadline:
+                logger.error(
+                    "[PRODUCER] %s RDMA for req %s passed its %.0fs transfer "
+                    "deadline; failing it",
+                    label,
+                    req_id,
+                    PD_TRANSFER_DEADLINE_S,
+                )
+                return None
+            started = time.monotonic()
+            try:
+                ret = engine.batch_transfer_sync_write(
+                    target,
+                    src_addrs[chunk_start:chunk_end],
+                    dst_addrs[chunk_start:chunk_end],
+                    sizes[chunk_start:chunk_end],
+                )
+            except Exception:
+                logger.exception(
+                    "[PRODUCER] %s RDMA chunk FAILED for req %s → %s "
+                    "(entries %d-%d/%d)",
+                    label,
+                    req_id,
+                    target,
+                    chunk_start,
+                    chunk_end,
+                    total_entries,
+                )
+                return False
+            if ret != 0:
+                elapsed = time.monotonic() - started
+                logger.error(
+                    "[PRODUCER] %s RDMA chunk error %d for req %s → %s "
+                    "(entries %d-%d/%d) after %.1fs%s",
+                    label,
+                    ret,
+                    req_id,
+                    target,
+                    chunk_start,
+                    chunk_end,
+                    total_entries,
+                    elapsed,
+                    (
+                        ": Mooncake's sync timeout, so the writes it posted "
+                        "may still land"
+                        if elapsed >= _mc_transfer_timeout_s()
+                        else ""
+                    ),
+                )
+                return False
         return True
 
     def _send_on_socket(self, addr: str, parts: list, repeat: int = 1) -> None:
@@ -3398,6 +3408,7 @@ class MooncakeConnector(KVConnectorBase):
             self._pending_recv_stages.pop(req_id, None)
             self._pending_recv_nonce.pop(req_id, None)
             self._pending_recv_acks.pop(req_id, None)
+            self._pending_recv_stall_watch.pop(req_id, None)
             failed = req_id in self._pending_recv_failed
             self._pending_recv_failed.discard(req_id)
 
@@ -3450,11 +3461,26 @@ class MooncakeConnector(KVConnectorBase):
         the request's pages can go back to the scheduler; it is presumed dead,
         or its write-done lost. A request with a rank that has neither sent its
         write-done nor acknowledged is never expired: that rank may still get
-        the request and write. Checks the requests that have an ack.
+        the request and write. Checks the requests that have an ack. A request
+        still waiting ``PD_RECV_STALL_LOG_S`` after it went out is logged once,
+        as an error when a rank never acknowledged it.
         """
         now = time.monotonic()
         expired: list[tuple[ReqId, list[tuple[int, int]]]] = []
+        stalled: list[tuple[ReqId, float, int, int, int]] = []
         with self._completion_lock:
+            watch = self._pending_recv_stall_watch
+            for req_id, since in watch.items():
+                if now - since <= PD_RECV_STALL_LOG_S:
+                    break  # dispatch order: the rest went out later
+                expected = self._pending_recv_expected.get(req_id, 0)
+                done = self._pending_recv_stages.get(req_id, set())
+                heard = done | set(self._pending_recv_acks.get(req_id, ()))
+                stalled.append(
+                    (req_id, now - since, len(done), expected, expected - len(heard))
+                )
+            for req_id, *_ in stalled:
+                del watch[req_id]
             for req_id, acks in self._pending_recv_acks.items():
                 expected = self._pending_recv_expected.get(req_id)
                 if expected is None:
@@ -3469,6 +3495,22 @@ class MooncakeConnector(KVConnectorBase):
                 self._pending_recv_stages.pop(req_id, None)
                 self._pending_recv_nonce.pop(req_id, None)
                 self._pending_recv_failed.discard(req_id)
+                self._pending_recv_stall_watch.pop(req_id, None)
+        for req_id, waited, reported, expected, unacked in stalled:
+            (logger.error if unacked > 0 else logger.warning)(
+                "[CONSUMER] req %s has waited %.0fs for its producer ranks: %d of "
+                "%d reported%s",
+                req_id,
+                waited,
+                reported,
+                expected,
+                (
+                    f"; {unacked} never acknowledged it, so it waits for them "
+                    "without a deadline and its pages stay held"
+                    if unacked > 0
+                    else ""
+                ),
+            )
         for req_id, reported in expired:
             logger.error(
                 "[CONSUMER] req %s: producer ranks that acknowledged it sent no "
@@ -3484,25 +3526,28 @@ class MooncakeConnector(KVConnectorBase):
                 logger.exception("[CONSUMER] reporting expired req %s failed", req_id)
 
     def _complete_recv(self, req_id: str, failed: bool) -> None:
-        """Publish a finished receive and let stage-0 free its page table."""
+        """Publish a finished receive and let stage-0 free its page table.
+
+        A failure is reported only ``ATOM_PD_FAILED_WRITE_HOLD_S`` later
+        (``_report_held_failures``): Mooncake gives up on a sync write without
+        cancelling the work it posted, so a failed write may still land in
+        the request's pages, which the scheduler reuses or recomputes into
+        once it hears of the failure. The staging row and stage-0's page
+        table stay held as long.
+        """
         if failed:
-            # Return the staging row to the pool. The scatter is deliberately
-            # skipped -- the bytes never landed -- but the row itself must not
-            # leak, or _staging_slots.acquire() blocks forever once the pool is
-            # exhausted by repeated failures.
-            slot_info = self._pending_recv_slots.pop(req_id, None)
-            if slot_info is not None:
-                _, pool_idx = slot_info
-                if pool_idx >= 0:
-                    self._staging_slots.release(pool_idx)
-            self._pending_recv_blocks.pop(req_id, None)
-            with self._completion_lock:
-                self.failed_recving.add(req_id)
-                self._pending_recv.discard(req_id)
-            logger.error(
-                "[CONSUMER] Producer reported transfer failure for req %s", req_id
-            )
-            self._send_release(req_id)
+            hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
+            if hold_s > 0:
+                with self._completion_lock:
+                    self._held_failures[req_id] = time.monotonic() + hold_s
+                logger.warning(
+                    "[CONSUMER] req %s failed; its pages stay held %.0fs before "
+                    "the failure is reported, as a failed write may still land",
+                    req_id,
+                    hold_s,
+                )
+            else:
+                self._fail_recv(req_id)
             return
 
         slot_info = self._pending_recv_slots.pop(req_id, None)
@@ -3525,4 +3570,36 @@ class MooncakeConnector(KVConnectorBase):
             self.done_recving,
         )
         # PP-prefill: signal stage-0 it may now reuse the shared page table.
+        self._send_release(req_id)
+
+    def _report_held_failures(self) -> None:
+        """Report the failed receives whose hold ended (see _complete_recv)."""
+        now = time.monotonic()
+        with self._completion_lock:
+            due = [r for r, until in self._held_failures.items() if until <= now]
+            for req_id in due:
+                del self._held_failures[req_id]
+        for req_id in due:
+            try:
+                self._fail_recv(req_id)
+            except Exception:
+                # The other held requests still have to be reported.
+                logger.exception("[CONSUMER] reporting failed req %s failed", req_id)
+
+    def _fail_recv(self, req_id: str) -> None:
+        """Publish a failed receive and let stage-0 free its page table."""
+        # Return the staging row to the pool. The scatter is deliberately
+        # skipped -- the bytes never landed -- but the row itself must not
+        # leak, or _staging_slots.acquire() blocks forever once the pool is
+        # exhausted by repeated failures.
+        slot_info = self._pending_recv_slots.pop(req_id, None)
+        if slot_info is not None:
+            _, pool_idx = slot_info
+            if pool_idx >= 0:
+                self._staging_slots.release(pool_idx)
+        self._pending_recv_blocks.pop(req_id, None)
+        with self._completion_lock:
+            self.failed_recving.add(req_id)
+            self._pending_recv.discard(req_id)
+        logger.error("[CONSUMER] Producer reported transfer failure for req %s", req_id)
         self._send_release(req_id)

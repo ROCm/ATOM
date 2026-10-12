@@ -143,6 +143,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the decode side scatters them into the paged KV and returns the slot.
     # 0 = staged per-page writes only.
     "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
+    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
+    # decode holds a failed receive's KV pages this long before reporting the
+    # failure; a prefill keeps a landing slot whose write failed out of use
+    # this long. 0 = release at once.
+    "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
+        os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

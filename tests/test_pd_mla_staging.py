@@ -124,7 +124,7 @@ def test_staged_index_descriptors_stay_inside_one_destination_mr(monkeypatch):
     conn._gather_sharded_index = lambda *_args: (10000, 5)
     conn._nic = _Nic()
     writes = []
-    conn._rdma_write_with_retry = lambda _t, src, dst, sizes, *_a, **_k: (
+    conn._rdma_write = lambda _t, src, dst, sizes, *_a, **_k: (
         writes.append((src, dst, sizes)) or True
     )
     assert conn._execute_staged_index_layer_chunk(
@@ -227,7 +227,7 @@ def _producer(mc, regions, *, pool_size=0, slot_pages=0):
     conn._gather_sharded_index = None
     conn._index_staging_chunk_pages = 0
     conn._nic = _Nic()
-    conn._rdma_write_with_retry = conn._nic.write
+    conn._rdma_write = conn._nic.write
     if pool_size:
         conn._mla_staging = torch.empty(
             (pool_size, slot_pages * PAGE_BYTES), dtype=torch.uint8
@@ -645,9 +645,9 @@ def test_staged_mla_gathers_on_the_gpu(dcp_rank):
     new._cuda_device = device.index
     new._send_worker_streams = threading.local()
     del new._send_worker_stream  # the real per-worker stream
-    old._rdma_write_with_retry = _DeviceNic(regions + dst_old).write
+    old._rdma_write = _DeviceNic(regions + dst_old).write
     nic = _DeviceNic(regions + dst_new + [new._mla_staging])
-    new._rdma_write_with_retry = nic.write
+    new._rdma_write = nic.write
     event = torch.cuda.Event()
     event.record()
     for conn, dst in ((old, dst_old), (new, dst_new)):

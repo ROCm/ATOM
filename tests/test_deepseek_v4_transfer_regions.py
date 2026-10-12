@@ -842,7 +842,7 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
             ctypes.memmove(d, s, size)
         return True
 
-    conn._rdma_write_with_retry = write
+    conn._rdma_write = write
     assert conn._execute_block_slot_transfer(
         req,
         "test",
@@ -904,7 +904,7 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
             conn._block_region_roles = [r.semantic_role for r in regions]
 
     calls = []
-    conn._rdma_write_with_retry = lambda *args: calls.append(args) or True
+    conn._rdma_write = lambda *args: calls.append(args) or True
     with pytest.raises(
         RuntimeError,
         match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map|one-to-one",

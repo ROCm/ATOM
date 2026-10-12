@@ -117,8 +117,9 @@ class _TargetCredits:
     epoch: int
     free: list[int]
     in_flight: set[int] = field(default_factory=set)
-    # Out of use for good: a failed write may still land in them.
-    quarantined: set[int] = field(default_factory=set)
+    # Slot -> time.monotonic() from which it is free again: a failed write
+    # may still land in it until then (ATOM_PD_FAILED_WRITE_HOLD_S).
+    quarantined: dict[int, float] = field(default_factory=dict)
 
 
 class LandingCredits:
@@ -152,6 +153,8 @@ class LandingCredits:
                 credits = self._targets.get(target)
                 if credits is None or credits.epoch != epoch:
                     return None
+                if credits.quarantined:
+                    self._unquarantine_locked(target, credits)
                 if credits.free:
                     slot = credits.free.pop()
                     credits.in_flight.add(slot)
@@ -162,28 +165,46 @@ class LandingCredits:
                 self._cv.wait(remaining)
 
     def quarantine(self, target: str, epoch: int, slot: int) -> None:
-        """Keep a slot out of use after a write to it failed.
+        """Keep a slot out of use for a while after a write to it failed.
 
         Mooncake gives up on a sync write without cancelling the work it
         posted, so that write may still land in the slot. Another request
         writing and announcing the slot meanwhile would then be scattered
-        with the wrong rows. The partition shrinks instead; once no slot is
-        left, every transfer to ``target`` takes the staged path.
+        with the wrong rows. The partition shrinks for
+        ``ATOM_PD_FAILED_WRITE_HOLD_S``; with no slot left meanwhile, every
+        transfer to ``target`` takes the staged path.
         """
+        hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
         with self._cv:
             credits = self._targets.get(target)
             if credits is None or credits.epoch != epoch:
                 return
             credits.in_flight.discard(slot)
-            credits.quarantined.add(slot)
+            credits.quarantined[slot] = time.monotonic() + hold_s
             left = len(credits.free) + len(credits.in_flight)
         logger.warning(
-            "[PD-LANDING] %s slot %d is out of use for good after a failed write; "
-            "%d slots left",
+            "[PD-LANDING] %s slot %d is out of use for %.0fs after a failed write; "
+            "%d slots left meanwhile",
             target,
             slot,
+            hold_s,
             left,
         )
+
+    @staticmethod
+    def _unquarantine_locked(target: str, credits: _TargetCredits) -> None:
+        """Free the quarantined slots whose hold has ended."""
+        now = time.monotonic()
+        back = [slot for slot, until in credits.quarantined.items() if until <= now]
+        for slot in back:
+            del credits.quarantined[slot]
+            credits.free.append(slot)
+        if back:
+            logger.info(
+                "[PD-LANDING] %s slots %s are back in use after a failed write",
+                target,
+                back,
+            )
 
     def release(self, target: str, epoch: int, slots: list[int]) -> None:
         """Return slots the decode rank finished with (or that never landed)."""
@@ -741,7 +762,7 @@ class LandingReceiver:
         logged once. Tombstones are dropped oldest first.
         """
         now = time.monotonic()
-        stalled: list[tuple[str, float, list[int]]] = []
+        stalled: list[tuple[str, float, list[int], list[int]]] = []
         expired: list[tuple[str, list[int]]] = []
         abandoned: list[tuple[str, list[int]]] = []
         outcomes: list[tuple[str, bool]] = []
@@ -777,7 +798,10 @@ class LandingReceiver:
                     not request.stall_logged and now - request.started_at > _STALL_LOG_S
                 ):
                     request.stall_logged = True
-                    stalled.append((req_id, now - request.started_at, list(silent)))
+                    unacked = [pp for pp, s in silent.items() if s.window_end is None]
+                    stalled.append(
+                        (req_id, now - request.started_at, list(silent), unacked)
+                    )
             stale = []
             for key, at in self._tombstones.items():
                 if now - at <= _TOMBSTONE_TTL_S:
@@ -794,12 +818,18 @@ class LandingReceiver:
                     "batches": 0,
                 }
                 elapsed, self._stats_at = now - self._stats_at, now
-        for req_id, waited, running in stalled:
-            logger.warning(
-                "[PD-LANDING] req %s has waited %.0fs for stage(s) %s",
+        for req_id, waited, running, unacked in stalled:
+            (logger.error if unacked else logger.warning)(
+                "[PD-LANDING] req %s has waited %.0fs for stage(s) %s%s",
                 req_id,
                 waited,
                 running,
+                (
+                    f"; stage(s) {unacked} never acknowledged it, so it waits for "
+                    "them without a deadline and its pages stay held"
+                    if unacked
+                    else ""
+                ),
             )
         for req_id, silent in expired:
             logger.error(

@@ -55,6 +55,13 @@ from atom.kv_transfer.disaggregation.types import ConnectorMetadata
 if "aiter" in _stubbed:
     del sys.modules["aiter"]
 
+
+@pytest.fixture(autouse=True)
+def _report_failed_receives_at_once(monkeypatch):
+    """Report a failed receive at once; the hold has tests of its own."""
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
+
+
 # ---------------------------------------------------------------------------
 # pp-aware side-channel port offset
 # ---------------------------------------------------------------------------
@@ -773,6 +780,8 @@ def _make_connector(**overrides):
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}
     conn._pending_recv_acks = {}
+    conn._pending_recv_stall_watch = {}
+    conn._held_failures = {}
     conn._pending_recv = set()
     conn._pending_recv_blocks = {}
     conn._pending_recv_slots = {}
@@ -1057,13 +1066,78 @@ def test_no_rdma_attempt_starts_past_the_transfer_deadline():
     engine = MagicMock()
     engine.batch_transfer_sync_write.return_value = 0
     args = ("consumer:1", [1], [2], [3], "r", "block")
-    assert conn._rdma_write_with_retry(
-        *args, engine=engine, deadline=time.monotonic() + 60
-    )
-    assert not conn._rdma_write_with_retry(
-        *args, engine=engine, deadline=time.monotonic() - 1
-    )
+    assert conn._rdma_write(*args, engine=engine, deadline=time.monotonic() + 60)
+    assert conn._rdma_write(*args, engine=engine, deadline=time.monotonic() - 1) is None
     assert engine.batch_transfer_sync_write.call_count == 1
+
+
+@pytest.mark.parametrize("timed_out", [True, False])
+def test_a_failed_rdma_write_is_not_retried(monkeypatch, caplog, timed_out):
+    """Mooncake returns from a timed-out sync write without cancelling it."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setattr(mc, "_mc_transfer_timeout_s", lambda: 0.0 if timed_out else 1e9)
+    conn = object.__new__(mc.MooncakeConnector)
+    engine = MagicMock()
+    engine.batch_transfer_sync_write.side_effect = [-1, 0]
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        assert (
+            conn._rdma_write("consumer:1", [1], [2], [3], "r", "block", engine=engine)
+            is False
+        )
+    assert engine.batch_transfer_sync_write.call_count == 1
+    (failed,) = [r for r in caplog.records if "[PRODUCER]" in r.getMessage()]
+    assert ("may still land" in failed.getMessage()) == timed_out
+
+
+def test_a_failed_receive_is_reported_only_after_its_hold(monkeypatch):
+    """Its pages and staging row stay held while a failed write may land."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    conn = _make_connector(_staging_slots=mc.SlotPool(), _mla_landing=None)
+    conn._pending_recv_expected["r1"] = 1
+    conn._pending_recv.add("r1")
+    conn._pending_recv_slots["r1"] = (7, 3)
+
+    assert conn._record_write_done("r1", 0, 0, 0, success=False)
+    conn._report_held_failures()
+    assert conn.failed_recving == set() and conn._staging_slots.free == []
+    assert "r1" in conn._pending_recv
+
+    now = time.monotonic()
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 61)
+    conn._report_held_failures()
+    assert conn.failed_recving == {"r1"} and conn._staging_slots.free == [3]
+    assert conn._held_failures == {} and "r1" not in conn._pending_recv
+
+
+@pytest.mark.parametrize("acked", [True, False])
+def test_a_stalled_receive_is_logged_once(monkeypatch, caplog, acked):
+    """As an error when a rank never acknowledged it: it waits without a bound."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = _make_connector(_mla_landing=None)
+    conn._pending_recv_expected["r1"] = 2
+    conn._pending_recv_stall_watch["r1"] = time.monotonic()
+    assert not conn._record_write_done("r1", 0, 0, 0, success=False)
+    if acked:
+        conn._pending_recv_acks["r1"] = {(1, 0): time.monotonic() + 600}
+    conn._expire_pending_recvs()  # too early to log
+
+    now = time.monotonic()
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 31)
+    with caplog.at_level(logging.WARNING, logger="atom"):
+        conn._expire_pending_recvs()
+        conn._expire_pending_recvs()
+    (record,) = [r for r in caplog.records if "has waited" in r.getMessage()]
+    assert "1 of 2 reported" in record.getMessage()
+    assert ("never acknowledged" in record.getMessage()) == (not acked)
+    assert record.levelno == (logging.WARNING if acked else logging.ERROR)
+    assert conn.failed_recving == set()
 
 
 def test_write_done_pp_only_dedup():
@@ -1322,7 +1396,7 @@ def test_dcp_block_descriptors_are_streamed_in_bounded_batches():
         transferred_bytes += sum(sizes)
         return True
 
-    connector._rdma_write_with_retry = record_batch
+    connector._rdma_write = record_batch
     dst_block_ids = list(range(100, 140))
     src_block_ids = list(range(len(dst_block_ids) * 8))
     request_data = {
@@ -1372,7 +1446,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     staging_stream = MagicMock()
     connector._send_worker_stream = MagicMock(return_value=staging_stream)
     connector._execute_staged_index_layer_chunk = MagicMock(return_value=True)
-    connector._rdma_write_with_retry = MagicMock(return_value=True)
+    connector._rdma_write = MagicMock(return_value=True)
     ready_event = object()
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
@@ -1408,7 +1482,7 @@ def test_dcp_index_staging_waits_for_request_ready_event():
     )
     assert all(
         call.kwargs["engine"] is ready_event
-        for call in connector._rdma_write_with_retry.call_args_list
+        for call in connector._rdma_write.call_args_list
     )
 
 
@@ -1430,7 +1504,7 @@ def test_dcp_index_staging_rejects_missing_request_ready_event():
     connector._prepare_sharded_index = MagicMock(return_value=object())
     connector._gather_sharded_index = MagicMock()
     connector._send_worker_stream = MagicMock()
-    connector._rdma_write_with_retry = MagicMock(return_value=True)
+    connector._rdma_write = MagicMock(return_value=True)
     request_data = {
         "consumer_base_addrs": [3_000_000, 4_000_000],
         "consumer_num_layers": 2,
@@ -1757,7 +1831,7 @@ def test_concurrent_pd_requests_keep_their_selected_engine(has_slot_data, matche
         # Both selections must finish before either write. Mutating the
         # connector's shared engine here would send a request on the wrong rail.
         barrier.wait(timeout=10)
-        return conn._rdma_write_with_retry(
+        return conn._rdma_write(
             target, [100], [200], [64], data["request_id"], "test", engine=engine
         )
 
@@ -1815,18 +1889,13 @@ def test_missing_consumer_rail_notifies_failure_without_writing():
 
 
 @pytest.mark.parametrize("succeeds", [False, True])
-def test_rdma_chunks_and_retries_use_selected_engine(monkeypatch, succeeds):
-    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
-
-    monkeypatch.setattr(mc.time, "sleep", lambda _: None)
+def test_rdma_chunks_use_selected_engine(succeeds):
     conn = _matched_rail_producer()
     conn._MAX_RDMA_ENTRIES_PER_BATCH = 2
     selected = MagicMock()
-    selected.batch_transfer_sync_write.side_effect = (
-        [-1, 0, 0] if succeeds else [-1, -1, -1]
-    )
+    selected.batch_transfer_sync_write.side_effect = [0, 0] if succeeds else [-1]
     assert (
-        conn._rdma_write_with_retry(
+        conn._rdma_write(
             "consumer:1234",
             [1, 2, 3],
             [4, 5, 6],
@@ -1838,10 +1907,11 @@ def test_rdma_chunks_and_retries_use_selected_engine(monkeypatch, succeeds):
         is succeeds
     )
     calls = selected.batch_transfer_sync_write.call_args_list
-    assert len(calls) == 3
-    assert calls[0].args == calls[1].args
-    if succeeds:
-        assert calls[-1].args == ("consumer:1234", [3], [6], [64])
+    assert calls[0].args == ("consumer:1234", [1, 2], [4, 5], [64, 64])
+    # A failed chunk is final: its writes may still land, a retry would hide them.
+    assert [c.args for c in calls[1:]] == (
+        [("consumer:1234", [3], [6], [64])] if succeeds else []
+    )
     conn.transfer_engine.batch_transfer_sync_write.assert_not_called()
 
 
@@ -1856,13 +1926,13 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     staging_stream = SimpleNamespace(synchronize=MagicMock())
     conn._send_worker_stream = lambda: staging_stream
     conn._gather_sharded_index = lambda *_args: (10000, 2)
-    conn._rdma_write_with_retry = MagicMock(return_value=True)
+    conn._rdma_write = MagicMock(return_value=True)
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _: nullcontext())
     selected = object()
     assert conn._execute_staged_index_layer_chunk(
         "consumer:1234", 0, 20000, 64, [4, 5], "request", object(), engine=selected
     )
-    conn._rdma_write_with_retry.assert_called_once_with(
+    conn._rdma_write.assert_called_once_with(
         "consumer:1234",
         [10000],
         [20256],

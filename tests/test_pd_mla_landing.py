@@ -837,7 +837,7 @@ def _producer(mc, regions, *, staging_rows=None):
     conn._gather_sharded_index = None
     conn._index_staging_chunk_pages = 0
     conn._nic = _Nic()
-    conn._rdma_write_with_retry = conn._nic.write
+    conn._rdma_write = conn._nic.write
     if staging_rows:
         conn._mla_staging = torch.empty(
             (2, staging_rows * TOKEN_BYTES), dtype=torch.uint8
@@ -1042,7 +1042,7 @@ def test_a_failure_waits_out_another_stages_staged_fallback(monkeypatch):
         assert resume.wait(timeout=10)
         return stage1._nic.write(*args, **kwargs)
 
-    stage1._rdma_write_with_retry = slow_write
+    stage1._rdma_write = slow_write
     result = []
     writer = threading.Thread(
         target=lambda: result.append(
@@ -1105,14 +1105,18 @@ def test_a_failed_ready_send_still_returns_the_written_slot(monkeypatch):
     assert new._landing_credits.acquire("consumer:1", landing["epoch"], 0) == 0
 
 
-@pytest.mark.parametrize("outcome", ["failed", "past-deadline"])
+@pytest.mark.parametrize(
+    "outcome", ["failed", "past-deadline", "deadline-while-waiting-for-staging"]
+)
 def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     # Mooncake gives up on a sync write without cancelling what it posted, so
     # a failed write may still land in the slot. Reused at once, another
     # request's rows written and announced there could be overwritten before
-    # their scatter. A write the deadline stopped before anything was sent
+    # their scatter. A write the deadline stopped before anything was sent,
+    # including one whose deadline passed while it waited for a staging slot,
     # leaves the slot usable.
     mc = _mooncake()
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     monkeypatch.setattr(mc.torch.cuda, "stream", lambda _s: nullcontext())
     monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
     dest = _Dest(num_regions=1, pool_slots=2, slot_rows=16)
@@ -1122,9 +1126,20 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     request = _request(1, 4, 0, dest.regions)
     request["mla_landing"] = landing
     if outcome == "failed":
-        new._rdma_write_with_retry = lambda *_a, **_k: False
-    else:
+        new._rdma_write = lambda *_a, **_k: False
+    elif outcome == "past-deadline":
         request["_deadline"] = time.monotonic() - 1
+    else:
+        request["_deadline"] = time.monotonic() + 0.05
+        acquire = new._mla_staging_slots.acquire
+
+        def acquire_late():
+            time.sleep(0.1)  # the other send workers hold every staging slot
+            return acquire()
+
+        new._mla_staging_slots.acquire = acquire_late
+        new._rdma_write = mc.MooncakeConnector._rdma_write.__get__(new)
+        new.transfer_engine = None  # never reached: the deadline passed
     assert not mc.MooncakeConnector._execute_block_transfer(
         new, request, "consumer:1", [0, 1, 2, 3], [3], "req", object()
     )
@@ -1138,7 +1153,8 @@ def test_a_failed_landed_write_keeps_its_slot_out_of_use(monkeypatch, outcome):
     assert new._mla_staging_slots.free  # the source slot goes back either way
 
 
-def test_quarantined_credits_never_come_back():
+def test_quarantined_credits_come_back_after_the_hold(monkeypatch):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     credits = LandingCredits()
     credits.sync("d0", {"epoch": 1, "slots": [0, 1]})
     first = credits.acquire("d0", 1, 0)
@@ -1148,6 +1164,10 @@ def test_quarantined_credits_never_come_back():
     assert second != first
     credits.quarantine("d0", 1, second)
     assert credits.acquire("d0", 1, 0) is None  # every transfer stages now
+
+    now = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: now + 61)
+    assert {credits.acquire("d0", 1, 0) for _ in range(3)} == {first, second, None}
     credits.sync("d0", {"epoch": 2, "slots": [0, 1]})  # a restarted decode
     assert credits.acquire("d0", 2, 0) is not None
 
