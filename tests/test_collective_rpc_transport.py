@@ -739,11 +739,28 @@ def test_a_barrier_call_that_times_out_still_releases_the_survivors():
     mgr = _mgr(2, procs=[_Alive(), _Dead()])
     mgr.all_ranks_barrier = _Abortable(on_abort=lambda: None)
 
-    results = mgr.collective_rpc("m", RpcPayload("t1", barrier=True), timeout=0)
+    results = mgr.collective_rpc("m", RpcPayload("t1", barrier=True), timeout=0.05)
 
     assert mgr.all_ranks_barrier.broken
     assert "timed out" in results[0].error
     assert "died" in results[1].error
+
+
+@pytest.mark.parametrize(
+    ("rpc", "name"), [("collective_rpc", "m"), ("utility_rpc", "resume_memory")]
+)
+def test_a_call_whose_deadline_has_passed_is_never_sent(rpc, name):
+    """With no time left the call still went out: every rank ran it while the
+    reply wait gave up at once, so the caller heard a failure for work that
+    happened. A resume took effect while the engine kept the weights marked
+    offloaded, and a retry ran a non-idempotent call a second time."""
+    mgr = _mgr(2)
+
+    results = getattr(mgr, rpc)(name, RpcPayload("late"), timeout=0)
+
+    assert mgr.rpc_broadcast_mq.sent == [], "no rank may run it"
+    assert [r.tp_rank for r in results] == [0, 1]
+    assert all("no TP rank ran it" in r.error for r in results)
 
 
 def test_any_call_that_finds_a_rank_dead_releases_the_barrier():

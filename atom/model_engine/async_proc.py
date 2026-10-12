@@ -735,6 +735,20 @@ class AsyncIOProcManager:
                 f"protocol and cannot go through collective_rpc"
             )
 
+        if timeout <= 0:
+            # Sent anyway, every rank ran it while this call gave up at once and
+            # dropped their replies as late: a failure reported for work that
+            # happened -- a resume that took effect while the engine still
+            # recorded the weights offloaded -- which a retry then repeated.
+            error = (
+                f"the deadline for {func_name!r} had passed before it was sent, "
+                f"so no TP rank ran it"
+            )
+            return [
+                RpcResult(payload.request_id, rank, error=error)
+                for rank in range(self.proc_num)
+            ]
+
         logger.debug(
             f"{self.label}: collective_rpc {func_name} id={payload.request_id}"
         )
