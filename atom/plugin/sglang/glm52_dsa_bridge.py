@@ -60,6 +60,29 @@ def get_extend_prefix_lens_cpu(forward_batch, bs: int) -> np.ndarray | None:
     return np.asarray(prefix[:bs], dtype=np.int32)
 
 
+def _is_graph_fill(length: int) -> bool:
+    """True when ``length`` is the CUDA-graph capacity, not a written context."""
+    return int(length) >= int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+
+
+def _prefer_real_length(primary: int, alternate: int) -> int:
+    """Keep a real context when the other source is still the graph fill.
+
+    Capture fills ``seq_lens`` (and sometimes the positions buffer) with
+    ``GLM52_GRAPH_SEQ_LEN_CAPACITY``. ``max(fill, real)`` then walks
+    ``req_to_token`` past the tokens prefill wrote, and the verify indexer
+    memory-faults. A genuine long context, where both sources are past the
+    fill, is left unchanged.
+    """
+    primary_fill = _is_graph_fill(primary)
+    alternate_fill = _is_graph_fill(alternate)
+    if primary_fill and not alternate_fill:
+        return int(alternate)
+    if alternate_fill and not primary_fill:
+        return int(primary)
+    return max(int(primary), int(alternate))
+
+
 def resolve_draft_decode_context_lens(
     forward_batch,
     positions: torch.Tensor | None,
@@ -88,7 +111,9 @@ def resolve_draft_decode_context_lens(
         for row in range(int(committed.size)):
             idx = row * topk if pos_rows.size >= bs * topk else row
             if idx < pos_rows.size:
-                effective[row] = max(int(effective[row]), int(pos_rows[idx]) + 1)
+                from_seq = int(effective[row])
+                from_pos = int(pos_rows[idx]) + 1
+                effective[row] = _prefer_real_length(from_seq, from_pos)
     return effective
 
 
@@ -811,12 +836,24 @@ def resolve_target_verify_lens(
             f"bs={bs}, draft_token_num={draft_token_num}"
         )
     prefix_lens = position_rows[:required:draft_token_num].astype(np.int32)
+    seq_lens = get_seq_lens_cpu(forward_batch, bs)
     if use_positions:
+        # Capture leaves positions at ``capacity - draft``. A shorter committed
+        # seq_lens is the context prefill actually wrote.
+        for row in range(int(prefix_lens.size)):
+            from_pos = int(prefix_lens[row]) + int(draft_token_num)
+            from_seq = int(seq_lens[row]) if row < int(seq_lens.size) else from_pos
+            context = _prefer_real_length(from_pos, from_seq)
+            prefix_lens[row] = max(0, context - int(draft_token_num))
         context_lens = prefix_lens + draft_token_num
     else:
         position_context_lens = prefix_lens + draft_token_num
-        context_lens = np.maximum(
-            get_seq_lens_cpu(forward_batch, bs), position_context_lens
+        context_lens = np.array(
+            [
+                _prefer_real_length(int(seq_lens[row]), int(position_context_lens[row]))
+                for row in range(bs)
+            ],
+            dtype=np.int32,
         )
         prefix_lens = context_lens - draft_token_num
     return prefix_lens, context_lens
@@ -1172,8 +1209,14 @@ def resolve_draft_extend_lens(
         else:
             prefix_lens = prefix_lens.astype(np.int32)
 
-    # Trust the position-derived length. Widening with seq_lens pulls in the
-    # graph-capture fill and the draft indexer reads past the KV pool.
+    # A capture-fill position must not hide a real committed seq_lens, and a
+    # capture-fill seq_lens must not widen a real position. Either one makes
+    # the draft indexer read past the KV that prefill wrote.
+    for row in range(int(prefix_lens.size)):
+        from_pos = int(prefix_lens[row]) + int(draft_token_num)
+        from_seq = int(seq_lens[row]) if row < int(seq_lens.size) else from_pos
+        context = _prefer_real_length(from_pos, from_seq)
+        prefix_lens[row] = max(0, context - int(draft_token_num))
     context_lens = (prefix_lens + draft_token_num).astype(np.int32)
     return prefix_lens.astype(np.int32), context_lens.astype(np.int32)
 

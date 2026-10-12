@@ -660,6 +660,47 @@ def init_sparse_mla_graph_state(backend, max_bs: int, max_num_tokens: int) -> No
     backend._atom_sparse_mla_graph_max_num_tokens = int(max_num_tokens)
 
 
+def _sparse_mla_graph_owner(backend):
+    """Return the backend that actually owns ``req_to_token``.
+
+    Draft CUDA-graph capture publishes the multi-step DSA backend. That parent
+    has no KV pool; each per-step child does. Graph workspaces have to live on
+    a child, or the first draft capture faults before any bucket is allocated.
+    """
+
+    if getattr(backend, "req_to_token", None) is not None:
+        return backend
+    for child in getattr(backend, "attn_backends", None) or []:
+        if getattr(child, "req_to_token", None) is not None:
+            return child
+    full_backend = getattr(backend, "full_attn_backend", None)
+    if getattr(full_backend, "req_to_token", None) is not None:
+        return full_backend
+    return backend
+
+
+def _ensure_sparse_mla_graph_store(backend, batch_size: int, num_tokens: int):
+    owner = _sparse_mla_graph_owner(backend)
+    store = getattr(owner, "_atom_sparse_mla_graph_buffers", None)
+    if store is None:
+        if _is_stream_capturing():
+            raise RuntimeError(
+                "Sparse MLA graph buffers were not initialized on the per-step backend"
+            )
+        init_sparse_mla_graph_state(owner, batch_size, num_tokens)
+        return owner, owner._atom_sparse_mla_graph_buffers
+    if not _is_stream_capturing():
+        owner._atom_sparse_mla_graph_max_bs = max(
+            int(getattr(owner, "_atom_sparse_mla_graph_max_bs", 0)),
+            int(batch_size),
+        )
+        owner._atom_sparse_mla_graph_max_num_tokens = max(
+            int(getattr(owner, "_atom_sparse_mla_graph_max_num_tokens", 0)),
+            int(num_tokens),
+        )
+    return owner, store
+
+
 def _get_or_create_sparse_mla_indexer_graph_buffers(
     *,
     forward_batch,
@@ -671,11 +712,6 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
     )
 
     backend = resolve_sglang_runtime(forward_batch).attn_backend
-    store = getattr(backend, "_atom_sparse_mla_indexer_graph_buffers", None)
-    if store is None:
-        raise RuntimeError(
-            "Sparse MLA indexer graph buffers were not initialized on the backend"
-        )
     batch_size = int(forward_batch.batch_size)
     tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
     num_tokens = int(forward_batch.input_ids.shape[0])
@@ -690,6 +726,7 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
             f"batch_size={batch_size}, tokens_per_req={tokens_per_req}, "
             f"num_tokens={num_tokens}"
         )
+    _, store = _ensure_sparse_mla_graph_store(backend, batch_size, num_tokens)
     key = (
         batch_size,
         tokens_per_req,
@@ -889,11 +926,7 @@ def _get_or_create_sparse_mla_graph_buffers(
     )
 
     backend = resolve_sglang_runtime(forward_batch).attn_backend
-    store = getattr(backend, "_atom_sparse_mla_graph_buffers", None)
-    if store is None:
-        raise RuntimeError(
-            "Sparse MLA graph buffers were not initialized on the per-step backend"
-        )
+    backend, store = _ensure_sparse_mla_graph_store(backend, batch_size, num_tokens)
     key = (
         batch_size,
         tokens_per_req,

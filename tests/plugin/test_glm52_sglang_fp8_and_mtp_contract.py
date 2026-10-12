@@ -7,7 +7,11 @@ import torch
 from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
     verify_kernel_positions,
 )
-from atom.plugin.sglang.glm52_dsa_bridge import GLM52_GRAPH_SEQ_LEN_CAPACITY
+from atom.plugin.sglang.glm52_dsa_bridge import (
+    GLM52_GRAPH_SEQ_LEN_CAPACITY,
+    resolve_draft_decode_context_lens,
+    resolve_target_verify_lens,
+)
 from atom.plugin.sglang.models.glm52_dsa import short_verify_skips_indexer
 
 
@@ -48,6 +52,63 @@ def test_verify_positions_ignore_the_graph_fill_only():
     )
     assert filled.tolist()[:draft] == [0, 1, 2, 3]
     assert filled.tolist()[draft:] == [796, 797, 798, 799]
+
+
+def test_graph_fill_does_not_override_a_real_mtp_context():
+    sentinel = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    batch = SimpleNamespace(
+        batch_size=2,
+        seq_lens_cpu=torch.tensor([sentinel, 800], dtype=torch.int32),
+        spec_info=SimpleNamespace(num_tokens_per_req=1),
+    )
+    positions = torch.tensor([1499, 19], dtype=torch.int64)
+    lens = resolve_draft_decode_context_lens(batch, positions, 2, 0)
+    assert lens.tolist() == [1500, 801]
+
+    verify_batch = SimpleNamespace(
+        batch_size=2,
+        seq_lens_cpu=torch.tensor([800, sentinel], dtype=torch.int32),
+    )
+    verify_positions = torch.tensor(
+        [sentinel - 4, sentinel - 3, sentinel - 2, sentinel - 1, 796, 797, 798, 799],
+        dtype=torch.int64,
+    )
+    prefix, context = resolve_target_verify_lens(
+        verify_batch,
+        verify_positions,
+        2,
+        4,
+        use_positions=True,
+    )
+    assert prefix.tolist() == [796, 796]
+    assert context.tolist() == [800, 800]
+
+    # Both sources at the fill: this is the capture allocation, keep the capacity.
+    wide = SimpleNamespace(
+        batch_size=1,
+        seq_lens_cpu=torch.tensor([sentinel], dtype=torch.int32),
+    )
+    wide_positions = torch.arange(sentinel - 4, sentinel, dtype=torch.int64)
+    _, wide_context = resolve_target_verify_lens(
+        wide, wide_positions, 1, 4, use_positions=True
+    )
+    assert wide_context.tolist() == [sentinel]
+
+    # Capture staging: kernel positions are the draft only, seq_lens is still
+    # the fill. The fill must not become max_seqlen_k.
+    capture_batch = SimpleNamespace(
+        batch_size=1,
+        seq_lens_cpu=torch.tensor([sentinel], dtype=torch.int32),
+    )
+    capture_positions = torch.arange(4, dtype=torch.int64)
+    _, capture_context = resolve_target_verify_lens(
+        capture_batch,
+        capture_positions,
+        1,
+        4,
+        use_positions=True,
+    )
+    assert capture_context.tolist() == [4]
 
 
 def test_head_chunk_keeps_the_padded_flash_stride():
