@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -81,6 +82,77 @@ def test_kernels_group_by_op_and_step():
     assert graph["graph_replay"] and graph["shapes"] == []
     assert (graph["gpu_start_ns"], graph["gpu_end_ns"]) == (190, 260)
     assert len(graph["kernels"]) == 2
+
+
+def test_busy_time_counts_overlapping_kernels_once():
+    events = [
+        Ev("compass_step:0", CPU, 0, 100, 1, ua=True),
+        Ev("aten::mm", CPU, 10, 20, 3, shapes=[[2, 2]]),
+        Ev("hipLaunchKernel", CPU, 11, 12, 10, linked=3),
+        Ev("hipLaunchKernel", CPU, 13, 14, 11, linked=3),
+        Ev("hipLaunchKernel", CPU, 15, 16, 12, linked=3),
+        Ev("k0", CUDA, 100, 150, 10, linked=3),
+        Ev("k1", CUDA, 120, 170, 11, linked=3),  # overlaps k0 on another stream
+        Ev("k2", CUDA, 200, 210, 12, linked=3),
+    ]
+    (row,) = window_op_rows(events)
+    assert row["gpu_kernel_ns"] == 110
+    assert row["gpu_busy_ns"] == 80
+
+
+def _template_events():
+    """The eager warmup of graph bs1_q1: op A launches k0 and k1, op B k2."""
+    return [
+        Ev(compass._TEMPLATE_MARK, CPU, 0, 100, 1, ua=True),
+        Ev("op::A", CPU, 10, 20, 3, shapes=[[1, 64]]),
+        Ev("hipLaunchKernel", CPU, 11, 12, 10, linked=3),
+        Ev("hipLaunchKernel", CPU, 13, 14, 11, linked=3),
+        Ev("op::B", CPU, 30, 40, 4, shapes=[[1, 128]]),
+        Ev("hipLaunchKernel", CPU, 31, 32, 12, linked=4),
+        Ev("k0", CUDA, 50, 60, 10, linked=3),
+        Ev("k1", CUDA, 61, 70, 11, linked=3),
+        Ev("k2", CUDA, 71, 80, 12, linked=4),
+        # After the warmup forward: not part of the template.
+        Ev("aten::zero_", CPU, 200, 210, 5, shapes=[[1]]),
+        Ev("hipLaunchKernel", CPU, 201, 202, 13, linked=5),
+        Ev("zero_k", CUDA, 300, 301, 13, linked=5),
+    ]
+
+
+def test_graph_template_lists_warmup_kernels_with_their_ops():
+    template = compass.graph_template_entries(_template_events())
+    assert template["kernels"] == ["k0", "k1", "k2"]
+    assert template["op_index"] == [0, 0, 1]
+    assert [o["op"] for o in template["ops"]] == ["op::A", "op::B"]
+    assert template["ops"][1]["shapes"] == [[1, 128]]
+
+
+def test_graph_replay_kernels_take_their_template_ops():
+    templates = {"bs1_q1": compass.graph_template_entries(_template_events())}
+    events = [
+        Ev("compass_step:7", CPU, 0, 500, 1, ua=True),
+        Ev("compass_graph:bs1_q1", CPU, 10, 30, 2, ua=True),
+        Ev("hipGraphLaunch", CPU, 12, 20, 20),
+        Ev("k0", CUDA, 100, 110, 20),
+        Ev("k1", CUDA, 111, 120, 20),
+        Ev("extra", CUDA, 121, 125, 20),  # not in the template
+        Ev("k2", CUDA, 126, 140, 20),
+        # A graph launch outside a compass_graph mark keeps one row.
+        Ev("hipGraphLaunch", CPU, 40, 45, 21),
+        Ev("d0", CUDA, 200, 210, 21),
+    ]
+    rows = window_op_rows(events, templates)
+    by_op = {r["op"]: r for r in rows}
+    assert sorted(by_op) == ["hipGraphLaunch", "op::A", "op::B"]
+    a, b = by_op["op::A"], by_op["op::B"]
+    assert a["shapes"] == [[1, 64]] and a["shapes_from"] == "graph_template"
+    assert [k["name"] for k in a["kernels"]] == ["k0", "k1"]
+    assert (a["cpu_start_ns"], a["cpu_end_ns"]) == (12, 20)  # the graph launch
+    assert [k["name"] for k in b["kernels"]] == ["k2"]
+    assert a["graph"] == b["graph"] == "bs1_q1" and a["graph_replay"]
+    rest = [r for r in rows if r["op"] == "hipGraphLaunch"]
+    assert sorted(k["name"] for r in rest for k in r["kernels"]) == ["d0", "extra"]
+    assert all(r["shapes"] == [] and "shapes_from" not in r for r in rest)
 
 
 class FakeEvent:
@@ -172,6 +244,64 @@ def test_failed_forward_leaves_no_row(recorder):
         pass
     (row,) = rows()
     assert row["step"] == 1
+
+
+class FakeProfile:
+    opened = 0
+
+    def __init__(self, **kwargs):
+        self.profiler = SimpleNamespace(kineto_results=SimpleNamespace(events=list))
+
+    def __enter__(self):
+        FakeProfile.opened += 1
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _batch(prefill=False, bs=1, context=100):
+    return SimpleNamespace(
+        total_seqs_num=bs,
+        total_tokens_num_prefill=bs * 8 if prefill else 0,
+        total_tokens_num=bs * 8 if prefill else bs,
+        context_lens=np.full(bs, context),
+    )
+
+
+def test_windows_open_per_bucket_after_warmup_and_drop_the_tail(tmp_path, monkeypatch):
+    FakeEvent.clock = 0
+    FakeProfile.opened = 0
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "fake")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(compass, "profile", FakeProfile)
+    rec = CompassRecorder(
+        str(tmp_path),
+        op_steps=2,
+        op_every=10**9,
+        op_min_seen=1,
+        op_per_bucket=1,
+        anchor_interval_s=1e9,
+    )
+    batches = [_batch()] * 6 + [_batch(bs=3), _batch(bs=4), _batch(bs=4)]
+    batches += [_batch(prefill=True)] * 4
+    for batch in batches:
+        with rec.measure_forward(batch):
+            pass
+    rec.close()
+    (path,) = (tmp_path / "dp0_pp0_tp0").glob("windows.*.jsonl")
+    windows = [json.loads(line) for line in path.read_text().splitlines()]
+    # decode bs1: seen once at step 0, window over steps 1-2, tail step 3;
+    # bs3 and bs4 share the bs<=4 bucket, whose second sighting opens at 7.
+    assert [(w["bucket"], w["steps"], w["tail_step"]) for w in windows] == [
+        (["decode", 1, 0, 128], [1, 2], 3),
+        (["decode", 4, 0, 128], [7, 8], 9),
+        (["prefill", 1, 8, 128], [10, 11], 12),
+    ]
+    assert all(w["reason"] == "bucket" for w in windows)
+    assert FakeProfile.opened == 3
 
 
 def test_spool_reads_whole_lines_and_refuses_escapes(tmp_path):

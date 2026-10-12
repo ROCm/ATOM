@@ -66,16 +66,29 @@ def summarize(root, top):
         if forwards:
             print("  sample forward row:", json.dumps(_trim(forwards[-1])))
 
+        windows = _read_jsonl(os.path.join(rank_dir, "windows.*.jsonl"))
+        if windows:
+            reasons = defaultdict(int)
+            for w in windows:
+                reasons[w["reason"]] += 1
+            graph = sum(w["graph_kernels"] for w in windows)
+            matched = sum(w["graph_kernels_matched"] for w in windows)
+            print(
+                f"  {len(windows)} op windows {dict(reasons)}, "
+                f"{len({json.dumps(w['bucket']) for w in windows})} buckets; "
+                f"graph kernels matched to a template: {matched}/{graph}"
+            )
+
         if not ops:
             continue
         by_op = defaultdict(lambda: [0, 0, set()])
         for r in ops:
             entry = by_op[r["op"]]
             entry[0] += 1
-            entry[1] += r["gpu_kernel_ns"]
+            entry[1] += r.get("gpu_busy_ns", r["gpu_kernel_ns"])
             entry[2].add(json.dumps(r["shapes"]))
         total = sum(e[1] for e in by_op.values())
-        print(f"  top {top} ops by GPU kernel time ({total / 1e6:.1f} ms total):")
+        print(f"  top {top} ops by GPU busy time ({total / 1e6:.1f} ms total):")
         for name, (n, ns, shapes) in sorted(by_op.items(), key=lambda kv: -kv[1][1])[
             :top
         ]:

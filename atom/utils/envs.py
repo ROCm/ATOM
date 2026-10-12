@@ -528,15 +528,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # ATOM Compass data collection (atom/metrics/compass.py): per-rank forward
-    # rows always, per-op rows in profiler windows of OP_STEPS forwards started
-    # every OP_EVERY forwards (OP_STEPS=0 disables ops, OP_MAX_WINDOWS=0 is
-    # unlimited).
+    # rows always, per-op rows in profiler windows of OP_STEPS forwards. A
+    # window opens on a batch bucket seen more than OP_MIN_SEEN times that has
+    # fewer than OP_PER_BUCKET windows, and every OP_EVERY forwards
+    # (OP_STEPS=0 disables ops, OP_MAX_WINDOWS=0 is unlimited). GRAPH_OPS=1
+    # attributes CUDA graph replay kernels to ops via per-graph templates.
     "ATOM_COMPASS_DIR": lambda: os.getenv("ATOM_COMPASS_DIR", None),
     "ATOM_COMPASS_OP_STEPS": lambda: _nonnegative_int_env("ATOM_COMPASS_OP_STEPS", 20),
     "ATOM_COMPASS_OP_EVERY": lambda: max(1, _int_env("ATOM_COMPASS_OP_EVERY", 200)),
     "ATOM_COMPASS_OP_MAX_WINDOWS": lambda: _nonnegative_int_env(
         "ATOM_COMPASS_OP_MAX_WINDOWS", 0
     ),
+    "ATOM_COMPASS_OP_MIN_SEEN": lambda: _nonnegative_int_env(
+        "ATOM_COMPASS_OP_MIN_SEEN", 3
+    ),
+    "ATOM_COMPASS_OP_PER_BUCKET": lambda: _nonnegative_int_env(
+        "ATOM_COMPASS_OP_PER_BUCKET", 1
+    ),
+    "ATOM_COMPASS_GRAPH_OPS": lambda: os.getenv("ATOM_COMPASS_GRAPH_OPS", "1") == "1",
     "ATOM_COMPASS_ANCHOR_S": lambda: _positive_float_env("ATOM_COMPASS_ANCHOR_S", "10"),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections

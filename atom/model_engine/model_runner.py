@@ -960,6 +960,16 @@ class ModelRunner:
         recorder = getattr(self, "compass_recorder", None)
         return nullcontext() if recorder is None else recorder.measure(batch, phase)
 
+    def _compass_graph_replay(self, graph_key):
+        recorder = getattr(self, "compass_recorder", None)
+        return nullcontext() if recorder is None else recorder.graph_replay(graph_key)
+
+    def _compass_graph_template(self, graph_key, enabled):
+        recorder = getattr(self, "compass_recorder", None)
+        if recorder is None or not enabled:
+            return nullcontext()
+        return recorder.graph_template(graph_key)
+
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
             self.gpu_forward_metrics.poll()
@@ -3203,7 +3213,8 @@ class ModelRunner:
                     return logits, hidden_states
 
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
-                self.graphs[graph_key].replay()
+                with self._compass_graph_replay(graph_key):
+                    self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -4202,10 +4213,18 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
-                    model_output = self.model(input_ids[:num_tokens], model_positions)
-                    outputs[:num_tokens] = model_output
-                    if self.logits_in_graph:
-                        self.model.compute_logits(outputs[:num_tokens])
+                    # Compass reads this forward's kernels as the template of
+                    # the graph captured next (not with the capture profiler,
+                    # which owns the profiler, nor for PIECEWISE graphs).
+                    with self._compass_graph_template(
+                        (bs, max_q_len), enabled=prof is None and not _piecewise
+                    ):
+                        model_output = self.model(
+                            input_ids[:num_tokens], model_positions
+                        )
+                        outputs[:num_tokens] = model_output
+                        if self.logits_in_graph:
+                            self.model.compute_logits(outputs[:num_tokens])
 
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
