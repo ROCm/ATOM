@@ -519,19 +519,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         workers = prepare_config.workers,
         tokio_workers = tokio::runtime::Handle::current().metrics().num_workers(),
         queue_capacity = prepare_config.queue_capacity,
-        max_retained_input_bytes = prepare_config.max_retained_input_bytes,
         max_tokenize_bytes = config.router_config.resolved_max_tokenize_bytes(),
         "Request preparation pool started"
     );
-    let max_retained_input_bytes = prepare_config.max_retained_input_bytes;
-    if max_retained_input_bytes < config.router_config.max_payload_size {
-        warn!(
-            max_retained_input_bytes,
-            max_payload_size = config.router_config.max_payload_size,
-            "Inference bodies larger than --prepare-max-retained-input-bytes are rejected \
-             with 413 even though they are within --max-payload-size"
-        );
-    }
     // Drain the pool on both normal shutdown and startup failure.
     let result = serve_with_prepare_pool(&config, http_address, prepare_runtime.handle()).await;
     // Keep submissions open until transport drain ends.

@@ -36,20 +36,6 @@ impl Level {
 
     pub(super) fn hold(self: &Arc<Self>, amount: usize) -> Held {
         self.value.fetch_add(amount, Ordering::AcqRel);
-        self.held(amount)
-    }
-
-    /// Hold `amount` only if the level stays within `limit`.
-    pub(super) fn try_hold(self: &Arc<Self>, amount: usize, limit: usize) -> Option<Held> {
-        self.value
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(amount).filter(|&next| next <= limit)
-            })
-            .ok()?;
-        Some(self.held(amount))
-    }
-
-    fn held(self: &Arc<Self>, amount: usize) -> Held {
         metrics::gauge!(self.gauge).increment(amount as f64);
         Held {
             level: self.clone(),
@@ -63,12 +49,6 @@ impl Level {
 pub(super) struct Held {
     level: Arc<Level>,
     amount: usize,
-}
-
-impl Held {
-    pub(super) fn amount(&self) -> usize {
-        self.amount
-    }
 }
 
 impl Drop for Held {
@@ -102,8 +82,6 @@ pub(super) struct PoolControl {
     pub(super) waiting_jobs: Arc<Level>,
     pub(super) execution_reserved: Arc<Level>,
     pub(super) dispatched_jobs: Arc<Level>,
-    pub(super) retained_input_bytes: Arc<Level>,
-    pub(super) max_retained_input_bytes: usize,
     pub(super) execution_slots: Arc<Semaphore>,
     pub(super) waiting_slots: Arc<Semaphore>,
 }
@@ -118,8 +96,6 @@ impl PoolControl {
             waiting_jobs: Level::new("mesh_prepare_queued_jobs"),
             execution_reserved: Level::new("mesh_prepare_execution_reserved"),
             dispatched_jobs: Level::new("mesh_prepare_dispatched_jobs"),
-            retained_input_bytes: Level::new("mesh_prepare_retained_input_bytes"),
-            max_retained_input_bytes: config.max_retained_input_bytes,
             execution_slots: Arc::new(Semaphore::new(config.workers)),
             waiting_slots: Arc::new(Semaphore::new(config.queue_capacity)),
         })

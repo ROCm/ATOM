@@ -22,7 +22,7 @@ use tokio::sync::{oneshot, Semaphore, TryAcquireError};
 
 pub use self::job::{JobContext, PrepareTicket};
 use self::{
-    control::{Held, PoolControl, Slot},
+    control::{PoolControl, Slot},
     job::{Job, JobControl},
 };
 use crate::config::{ConfigError, ConfigResult};
@@ -34,8 +34,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub struct PoolConfig {
     pub workers: usize,
     pub queue_capacity: usize,
-    /// Input bytes owned by preparation, including waiting work and result handoff.
-    pub max_retained_input_bytes: usize,
     pub queue_timeout: Duration,
     pub prepare_timeout: Duration,
 }
@@ -60,13 +58,6 @@ impl PoolConfig {
                 ));
             }
         }
-        if self.max_retained_input_bytes == 0 {
-            return Err(invalid(
-                "max_retained_input_bytes",
-                "0".to_string(),
-                "Must be greater than zero",
-            ));
-        }
         for (field, value) in [
             ("queue_timeout_ms", self.queue_timeout),
             ("prepare_timeout_ms", self.prepare_timeout),
@@ -89,10 +80,6 @@ pub enum PrepareError {
     Full,
     #[error("request preparation pool is closed")]
     Closed,
-    #[error("request preparation input budget is exhausted")]
-    BudgetExceeded,
-    #[error("request body exceeds the total preparation input budget")]
-    InputTooLarge,
     #[error("request preparation queue timeout")]
     QueueTimeout,
     #[error("request preparation timeout")]
@@ -109,7 +96,6 @@ impl PrepareError {
     pub fn status_code(self) -> u16 {
         match self {
             Self::QueueTimeout | Self::Timeout => 504,
-            Self::InputTooLarge => 413,
             Self::Panicked | Self::WorkerFailed => 500,
             _ => 503,
         }
@@ -119,8 +105,6 @@ impl PrepareError {
         match self {
             Self::Full => "prepare_queue_full",
             Self::Closed => "prepare_pool_closed",
-            Self::BudgetExceeded => "prepare_input_budget",
-            Self::InputTooLarge => "prepare_input_too_large",
             Self::QueueTimeout => "prepare_queue_timeout",
             Self::Timeout => "prepare_timeout",
             Self::Cancelled => "prepare_cancelled",
@@ -148,20 +132,6 @@ pub struct PrepareHandle {
     state: Weak<SubmitState>,
 }
 
-/// One shared preparation input charge, retained through waiting work, execution
-/// and result handoff. Release it before forwarding; raw body clones must not
-/// prolong its lifetime. Cancelled synchronous work keeps its charge until cleanup.
-#[derive(Clone, Debug)]
-pub struct InputLease {
-    charge: Arc<Held>,
-}
-
-impl InputLease {
-    pub fn bytes(&self) -> usize {
-        self.charge.amount()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolStats {
     pub live_workers: usize,
@@ -173,8 +143,6 @@ pub struct PoolStats {
     pub queued_jobs: usize,
     /// Jobs handed to the OS-thread channel that no worker has claimed or discarded.
     pub dispatched_jobs: usize,
-    /// Input bytes still owned by preparation, excluding forwarding bodies.
-    pub retained_input_bytes: usize,
     pub failed: bool,
 }
 
@@ -204,7 +172,6 @@ impl PrepareHandle {
             busy_workers: control.busy_workers.get(),
             queued_jobs: control.waiting_jobs.get(),
             dispatched_jobs: control.dispatched_jobs.get(),
-            retained_input_bytes: control.retained_input_bytes.get(),
             failed: control.is_failed(),
         }
     }
@@ -213,29 +180,6 @@ impl PrepareHandle {
         self.state
             .upgrade()
             .is_some_and(|state| state.control.is_failed())
-    }
-
-    pub fn retain_input(&self, bytes: usize) -> Result<InputLease, PrepareError> {
-        let state = self
-            .state
-            .upgrade()
-            .ok_or_else(|| PrepareError::Closed.count())?;
-        let sender = state.sender.lock();
-        state.open_sender(&sender)?;
-        let control = &state.control;
-        // A request larger than the whole budget can never be admitted; report it
-        // as non-retryable rather than as transient overload.
-        if bytes > control.max_retained_input_bytes {
-            return Err(PrepareError::InputTooLarge.count());
-        }
-        let charge = control
-            .retained_input_bytes
-            .try_hold(bytes, control.max_retained_input_bytes)
-            .ok_or_else(|| PrepareError::BudgetExceeded.count())?;
-        drop(sender);
-        Ok(InputLease {
-            charge: Arc::new(charge),
-        })
     }
 
     /// Wait for execution capacity without blocking Tokio. Only `queue_capacity`
@@ -374,6 +318,15 @@ pub struct PreparePoolRuntime {
     shutdown_grace: Duration,
 }
 
+thread_local! {
+    static WORKER_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Index of the preparation worker running on this thread, if any.
+pub fn current_worker_index() -> Option<usize> {
+    WORKER_INDEX.get()
+}
+
 impl PreparePoolRuntime {
     pub fn new(config: PoolConfig) -> io::Result<Self> {
         config
@@ -388,7 +341,10 @@ impl PreparePoolRuntime {
             // On failure, Drop closes and cancels the partial pool without joining.
             let handle = thread::Builder::new()
                 .name(format!("mesh-prepare-{index}"))
-                .spawn(move || control.run_worker(receiver, live))?;
+                .spawn(move || {
+                    WORKER_INDEX.set(Some(index));
+                    control.run_worker(receiver, live)
+                })?;
             runtime.threads.push(handle);
         }
         // Only real workers retain the Receiver. A dead pool cannot accept jobs.

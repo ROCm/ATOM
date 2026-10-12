@@ -17,7 +17,7 @@ use crate::{
             planner::DefaultPlanner,
             registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
         },
-        prepare_pool::{InputLease, JobContext, PrepareHandle},
+        prepare_pool::{JobContext, PrepareHandle},
         ConnectionMode, Worker, WorkerRegistry, WorkerType,
     },
     policies::PolicyRegistry,
@@ -331,8 +331,6 @@ pub struct InferenceEnvelope {
     /// Routing text and tokens computed in the parse job, so the request does
     /// not queue for the preparation pool a second time.
     routed: Option<RoutingPreparation>,
-    // Remains with the envelope through queued/running jobs and returned results.
-    _input_lease: InputLease,
 }
 
 /// Execution metadata and, when the policy needs them, routing tokens.
@@ -359,7 +357,6 @@ impl InferenceEnvelope {
     ) -> Result<Self, IngressError> {
         Self::validate_headers(&headers)?;
         let deadline = app.prepare_pool.prepare_deadline();
-        let lease = app.prepare_pool.retain_input(body.len())?;
         let pd = app.router_config.mode.is_pd_mode();
         let parse = move || -> Result<Self, IngressError> {
             let started = Instant::now();
@@ -388,7 +385,6 @@ impl InferenceEnvelope {
                 pd_body,
                 prepare_deadline: deadline,
                 routed: None,
-                _input_lease: lease,
             })
         };
         app.prepare_pool
@@ -404,7 +400,7 @@ impl InferenceEnvelope {
             .await?
     }
 
-    /// Move the envelope and its input lease through the job and result together.
+    /// Move the envelope through the job and result together.
     pub(crate) async fn prepare<T: Send + 'static>(
         self,
         pool: &PrepareHandle,
@@ -463,7 +459,7 @@ impl InferenceEnvelope {
     }
 
     /// Consume only after the final preparation result has been received.
-    /// The parsed views and preparation lease are dropped before forwarding.
+    /// The parsed views are dropped before forwarding.
     pub(crate) fn into_http_request(self) -> HttpInferenceRequest {
         HttpInferenceRequest {
             uri: self.uri,
@@ -474,7 +470,7 @@ impl InferenceEnvelope {
     }
 
     /// PD forwards its mutable JSON body, so its duplicate raw and typed bodies
-    /// and preparation lease can be released before either backend executes.
+    /// can be released before either backend executes.
     pub(crate) fn into_pd_parts(self) -> Result<(Uri, HeaderMap, serde_json::Value), IngressError> {
         let body = self.pd_body.ok_or_else(|| {
             IngressError::new(
@@ -486,8 +482,8 @@ impl InferenceEnvelope {
         Ok((self.uri, self.headers, body))
     }
 
-    /// Native backends consume typed requests; release raw JSON and preparation
-    /// accounting before awaiting their own request handling.
+    /// Native backends consume typed requests; release raw JSON before awaiting
+    /// their own request handling.
     pub(crate) fn into_native_parts(self) -> (Uri, HeaderMap, ParsedInference, InferenceMetadata) {
         (self.uri, self.headers, self.parsed, self.metadata)
     }
@@ -705,10 +701,14 @@ impl IngressRouting {
         ) {
             return Err(IngressError::new(http::StatusCode::NOT_IMPLEMENTED, "token_routing_unsupported", "this API has no registered token-routing template; use a policy that does not require exact tokens"));
         }
-        let tokenizer = metadata
+        let entry = metadata
             .model
             .as_deref()
-            .and_then(|m| self.tokenizer_registry.get(m))
+            .and_then(|m| {
+                self.tokenizer_registry
+                    .get_by_name(m)
+                    .or_else(|| self.tokenizer_registry.get_by_id(m))
+            })
             .ok_or_else(|| {
                 IngressError::new(
                     http::StatusCode::SERVICE_UNAVAILABLE,
@@ -723,7 +723,7 @@ impl IngressRouting {
         ctx.check()?;
         let template_started = Instant::now();
         let prompt = if let Some(chat) = parsed.chat() {
-            super::prepare::chat_template::process_chat_messages(chat, &*tokenizer)
+            super::prepare::chat_template::process_chat_messages(chat, &*entry.tokenizer)
                 .map_err(IngressError::invalid)?
                 .text
         } else {
@@ -735,8 +735,9 @@ impl IngressRouting {
         if prompt.len() > limit {
             return Err(Self::tokenizer_input_too_large());
         }
+        let encoder = super::prepare::thread_tokenizer::encoder(&entry);
         let encode_started = Instant::now();
-        let tokens = tokenizer
+        let tokens = encoder
             .encode(&prompt, false)
             .map_err(|e| IngressError::invalid(e.to_string()))?
             .token_ids()

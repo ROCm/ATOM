@@ -266,16 +266,8 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
   `--ext-proc-max-tokenize-bytes` options apply only if the corresponding
   `--prepare-*` option is unset; neither has a default of its own. On shutdown,
   Mesh waits up to 5 seconds for preparation threads after transport draining.
-  `--prepare-max-retained-input-bytes` (default: 32 MiB) caps the raw input bytes
-  held during preparation, including queueing and result handoff. The charge is
-  released before upstream dispatch; forwarding and retries do not hold it.
-  Canceled synchronous work retains its charge until it actually exits.
-  This byte limit can fill before the job queue for large prompts, so size it for
-  the expected concurrent preparation input. A single body larger than the whole
-  budget is rejected with `413 prepare_input_too_large`; Mesh logs a startup
-  warning when the budget is below `--max-payload-size`. Ext-proc's separate
-  `--ext-proc-max-buffered-bytes` limit continues to cover its request buffers
-  through rewriting and dispatch.
+  Ext-proc's separate `--ext-proc-max-buffered-bytes` limit covers its request
+  buffers through rewriting and dispatch.
 - **Retries**: Up to 5 attempts with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)
 - **Circuit breakers**: Per-worker failure/success thresholds (`--cb-failure-threshold`, `--cb-timeout-duration-secs`)
 - **Rate limiting**: Token bucket via `--max-concurrent-requests`, optional queue (`--queue-size`, `--queue-timeout-secs`)

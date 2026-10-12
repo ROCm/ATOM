@@ -264,11 +264,10 @@ async fn lightweight_http_routing_needs_no_second_pool_submission() {
 }
 
 #[tokio::test]
-async fn sequential_prepare_preserves_deadline_body_and_input_lease() {
+async fn sequential_prepare_preserves_deadline_and_body() {
     let raw = Bytes::from_static(br#"{ "model": "m", "text": "test", "extension": [1, 2] }"#);
     let pool = PreparePoolRuntime::new(PoolConfig {
         workers: 1,
-        max_retained_input_bytes: raw.len(),
         ..default_pool()
     })
     .unwrap();
@@ -290,7 +289,6 @@ async fn sequential_prepare_preserves_deadline_body_and_input_lease() {
         "input must not be deep-cloned"
     );
     let deadline = request.prepare_deadline;
-    assert_eq!(handle.stats().retained_input_bytes, raw.len());
     let (request, observed_deadline) = request
         .prepare(&handle, |request, ctx| {
             ctx.check()?;
@@ -306,19 +304,9 @@ async fn sequential_prepare_preserves_deadline_body_and_input_lease() {
     assert_eq!(request.prepare_deadline, deadline);
     assert_eq!(request.uri.to_string(), "/generate?trace=1");
     assert_eq!(request.body, raw);
-    assert_eq!(handle.stats().retained_input_bytes, raw.len());
-    let downstream = request.body.clone();
     let forwarding = request.into_http_request();
-    assert_eq!(
-        handle.stats().retained_input_bytes,
-        0,
-        "forwarding and raw Bytes clones must not retain preparation accounting"
-    );
     assert_eq!(forwarding.body.as_ptr(), raw.as_ptr());
-    assert_eq!(downstream, raw);
     drop(forwarding);
-    drop(downstream);
-    assert_eq!(handle.stats().retained_input_bytes, 0);
 
     let mut request =
         InferenceEnvelope::parse("/generate".parse().unwrap(), json_headers(), raw, &app)
@@ -337,7 +325,6 @@ async fn sequential_prepare_preserves_deadline_body_and_input_lease() {
         .unwrap();
     assert_eq!(error.code, "prepare_timeout");
     assert!(!ran.load(Ordering::Acquire));
-    assert_eq!(handle.stats().retained_input_bytes, 0);
 }
 
 struct TrackedRawInput {
@@ -358,12 +345,11 @@ impl Drop for TrackedRawInput {
 }
 
 #[tokio::test]
-async fn pd_handoff_releases_duplicate_raw_input_and_preparation_budget() {
+async fn pd_handoff_releases_duplicate_raw_input() {
     let (_pool, app, _) =
         preparation_test_router(true, crate::config::PolicyConfig::RoundRobin).await;
     let body = json!({"model":"m","text":"test","vendor":{"keep":[1,2]}});
     let bytes = serde_json::to_vec(&body).unwrap();
-    let size = bytes.len();
     let dropped = Arc::new(AtomicBool::new(false));
     let raw = Bytes::from_owner(TrackedRawInput {
         bytes,
@@ -382,16 +368,14 @@ async fn pd_handoff_releases_duplicate_raw_input_and_preparation_budget() {
         .await
         .unwrap();
     assert!(!dropped.load(Ordering::Acquire));
-    assert_eq!(app.prepare_pool.stats().retained_input_bytes, size);
     let (uri, _, forwarding) = request.into_pd_parts().unwrap();
     assert!(dropped.load(Ordering::Acquire));
-    assert_eq!(app.prepare_pool.stats().retained_input_bytes, 0);
     assert_eq!(uri.to_string(), "/generate?trace=1");
     assert_eq!(forwarding, body);
 }
 
 #[tokio::test]
-async fn running_preparation_keeps_input_budget_after_cancel_or_timeout() {
+async fn running_preparation_keeps_raw_input_after_cancel_or_timeout() {
     for cancel in [true, false] {
         let original = br#"{"model":"m","text":"test"}"#;
         let dropped = Arc::new(AtomicBool::new(false));
@@ -401,7 +385,6 @@ async fn running_preparation_keeps_input_budget_after_cancel_or_timeout() {
         });
         let pool = PreparePoolRuntime::new(PoolConfig {
             workers: 1,
-            max_retained_input_bytes: original.len(),
             ..default_pool()
         })
         .unwrap();
@@ -450,33 +433,21 @@ async fn running_preparation_keeps_input_budget_after_cancel_or_timeout() {
             let result = task.await.unwrap();
             assert_eq!(result.err().unwrap().code, "prepare_timeout");
         }
-        assert_eq!(handle.stats().retained_input_bytes, original.len());
+        assert_eq!(handle.stats().busy_workers, 1);
         assert!(!dropped.load(Ordering::Acquire));
-        let error = InferenceEnvelope::parse(
-            "/generate".parse().unwrap(),
-            json_headers(),
-            Bytes::from_static(original),
-            &app,
-        )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(error.code, "prepare_input_budget");
         drop(release);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while handle.stats().retained_input_bytes != 0 {
+            while !dropped.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert!(dropped.load(Ordering::Acquire));
     }
 }
 
 #[derive(Debug)]
 struct NativeIngressRouter {
-    pool: PrepareHandle,
     raw_dropped: Option<Arc<AtomicBool>>,
 }
 
@@ -505,7 +476,6 @@ impl crate::routers::RouterTrait for NativeIngressRouter {
         assert_eq!(model, Some("m"));
         assert_eq!(body.metadata().text, "test");
         assert_eq!(headers.unwrap().get("x-native").unwrap(), "yes");
-        assert_eq!(self.pool.stats().retained_input_bytes, 0);
         if let Some(dropped) = &self.raw_dropped {
             assert!(dropped.load(Ordering::Acquire));
         }
@@ -536,10 +506,7 @@ async fn native_handoff_keeps_router_contract_and_releases_raw_input() {
             .unwrap(),
     );
     let state = Arc::new(AppState {
-        router: Arc::new(NativeIngressRouter {
-            pool: pool.handle(),
-            raw_dropped: None,
-        }),
+        router: Arc::new(NativeIngressRouter { raw_dropped: None }),
         context,
         router_manager: None,
     });
@@ -578,19 +545,16 @@ async fn native_handoff_keeps_router_contract_and_releases_raw_input() {
                 .await
                 .unwrap();
         assert!(!dropped.load(Ordering::Acquire));
-        assert!(pool.handle().stats().retained_input_bytes > 0);
         if expired {
             request.prepare_deadline = Instant::now() - Duration::from_millis(1);
         }
         let router = NativeIngressRouter {
-            pool: pool.handle(),
             raw_dropped: Some(dropped.clone()),
         };
         // A deadline passing after preparation must not discard the request.
         let response = router.route_inference(request, &app).await;
         assert_eq!(response.status(), http::StatusCode::OK);
         assert!(dropped.load(Ordering::Acquire));
-        assert_eq!(pool.handle().stats().retained_input_bytes, 0);
     }
 }
 
@@ -763,32 +727,6 @@ async fn pd_http_encode_does_not_block_the_tokio_worker() {
     blocked_encode_keeps_tokio_responsive(true).await;
 }
 
-#[tokio::test]
-async fn body_larger_than_total_input_budget_is_rejected_with_413() {
-    let body = br#"{"model":"m","text":"test"}"#;
-    let pool = PreparePoolRuntime::new(PoolConfig {
-        workers: 1,
-        max_retained_input_bytes: body.len() - 1,
-        ..default_pool()
-    })
-    .unwrap();
-    let app = AppContext::from_config(Default::default(), 5, pool.handle())
-        .await
-        .unwrap();
-    let error = InferenceEnvelope::parse(
-        "/generate".parse().unwrap(),
-        json_headers(),
-        Bytes::from_static(body),
-        &app,
-    )
-    .await
-    .err()
-    .unwrap();
-    assert_eq!(error.status, http::StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(error.code, "prepare_input_too_large");
-    assert_eq!(pool.handle().stats().retained_input_bytes, 0);
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn tokenize_endpoint_encodes_on_the_prepare_pool() {
     let pool = PreparePoolRuntime::new(PoolConfig {
@@ -835,7 +773,6 @@ async fn tokenize_endpoint_encodes_on_the_prepare_pool() {
     assert!(watchdog.join().unwrap(), "tokenize encode blocked Tokio");
     let response = task.await.unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
-    assert_eq!(pool.handle().stats().retained_input_bytes, 0);
 }
 
 #[test]

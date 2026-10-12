@@ -417,7 +417,6 @@ mod tests {
             |config: &mut PreparePoolConfig| config.workers = Some(usize::MAX),
             |config: &mut PreparePoolConfig| config.queue_capacity = Some(0),
             |config: &mut PreparePoolConfig| config.queue_capacity = Some(usize::MAX),
-            |config: &mut PreparePoolConfig| config.max_retained_input_bytes = 0,
             |config: &mut PreparePoolConfig| config.queue_timeout_ms = 0,
             |config: &mut PreparePoolConfig| config.prepare_timeout_ms = 0,
             |config: &mut PreparePoolConfig| config.max_tokenize_bytes = Some(0),
