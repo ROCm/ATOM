@@ -443,8 +443,10 @@ FROM base AS atom_image
 ARG ATOM_REPO="https://github.com/ROCm/ATOM.git"
 ARG ATOM_COMMIT="HEAD"
 
-# pip packages (lm-eval is lightweight, install directly)
-RUN pip install lm-eval[api]
+# pip packages (lm-eval is lightweight, install directly).
+# datasets>=5.1 needs huggingface-hub>=1.31 (HfFileSystemResolvedBucketPath).
+# The SGLang image pins huggingface-hub==1.5.0, so keep datasets on 5.0.x.
+RUN pip install 'lm-eval[api]' 'datasets==5.0.0'
 
 # MORI: install the prebuilt nightly wheel directly (no source build needed).
 # The `amd-mori-nightly` PyPI package provides the `mori` Python module.
