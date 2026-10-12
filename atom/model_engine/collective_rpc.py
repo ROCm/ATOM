@@ -33,6 +33,13 @@ COLLECTIVE_RPC_METHODS = frozenset(
         "configure_hidden_states",
         # capability discovery itself
         "get_worker_capabilities",
+        # the trainer's RDMA weight stream (RDMAWeightReceiverMixin); the
+        # transaction steps it drives inside one call stay closed
+        "init_rdma_weight_group",
+        "receive_weights_rdma",
+        "destroy_rdma_weight_group",
+        # the reload fence, read-only
+        "get_weight_update_status",
     }
 )
 

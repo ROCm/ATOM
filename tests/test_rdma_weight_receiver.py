@@ -27,12 +27,43 @@ from aiter_stub import stubbed_aiter
 
 with stubbed_aiter():
     import atom.rollout.rdma_weight_receiver as receiver
+    from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
     from atom.rollout.rdma_weight_receiver import (
         _CMD_BUCKET,
         _CMD_END,
         _HEADER_WORDS,
         _decode_bucket,
     )
+
+
+def test_an_orchestrator_can_reach_every_receiver_rpc():
+    """collective_rpc runs only COLLECTIVE_RPC_METHODS, so a receiver RPC
+    missing from it is refused before any worker sees the call."""
+    public = {
+        name
+        for name in vars(receiver.RDMAWeightReceiverMixin)
+        if not name.startswith("_")
+    }
+    assert public == {
+        "init_rdma_weight_group",
+        "receive_weights_rdma",
+        "destroy_rdma_weight_group",
+    }
+    assert public <= COLLECTIVE_RPC_METHODS
+
+
+def test_the_reload_transaction_steps_stay_off_the_public_path():
+    """receive_weights_rdma runs them in order inside one call. Driven one at
+    a time from outside, a commit could follow no apply at all."""
+    steps = {
+        "begin_weight_update",
+        "apply_weight_bucket",
+        "prepare_weight_commit",
+        "finish_weight_commit",
+        "abort_weight_update",
+        "fence_weight_update",
+    }
+    assert not steps & COLLECTIVE_RPC_METHODS
 
 
 # ── the frozen wire format ─────────────────────────────────────────────────
