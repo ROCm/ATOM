@@ -83,6 +83,46 @@ used the PR's model loader because the older checkout cannot recognize
 `qwen4_exp_text` at TP4 on this host. Request scheduling caused noticeable
 run-to-run variation.
 
+### TP4 MTP2 completed-answer follow-up
+
+The same four MI355X GPUs (0–3) served the local FP8 checkpoint sequentially
+with TP4+EP4, CUDA graphs, `--method mtp --num-speculative-tokens 2`, an
+8,192-token maximum context, and 16 maximum sequences. The flags-off and
+flags-on servers both used this PR's loader: the pre-PR checkout fails at
+startup with `Unrecognized model identifier: qwen4_exp_text` at TP4. The
+flags-on server set `ATOM_QWEN38_MONO_HC=1`, `ATOM_QWEN38_QSA_SHORT=1`, and
+`ATOM_QWEN38_QSA_FUSED_PROJ=1`; QSA index CP was off on both sides. Each
+request generated the correct visible integer list 1–200, used 891 completion
+tokens, and ended with `stop`. The server reported 100% MTP2 draft acceptance
+on this predictable workload. Client-wall-time throughput includes prefill
+and HTTP response time:
+
+| Concurrent requests | PR flags off | PR flags on | Ratio |
+| ---: | ---: | ---: | ---: |
+| 4 | 920.48 | 937.81 | 1.019× |
+| 8 | 1,800.15 | 1,809.75 | 1.005× |
+| 16 | 3,242.45 | 3,254.49 | 1.004× |
+
+The four- and eight-request figures are five-run medians after one warmup.
+At 16 requests, the first flags-off five-run set was unstable: its run rates
+ranged from 364.83 to 3,084.84 tokens/s, with a 39-second stall in one run.
+The table therefore uses a second, seven-run set for **both** variants; their
+run ranges were 2,768.07–3,312.08 and 2,827.73–3,300.84 tokens/s. A
+separate synchronized 16-request arithmetic check with MTP2 and thinking
+disabled returned correct final answers on 16/16 requests with each server.
+These small throughput differences are within the observed run variation and
+do not establish a meaningful TP4 service gain. The prompt stays below the
+2,048-token short-QSA threshold; this probe does not measure 128k/256k
+checkpoint generation. Raw runs are in
+`/tmp/qwen38-tp4-mtp2-{off,on}-{completed,b16-repeat}.jsonl`.
+
+No TP8 checkpoint serving result is reported. During this follow-up, GPU 5
+remained occupied by another workload (up to 100% utilization and 25% VRAM),
+so an eight-GPU throughput comparison would measure contention. The current
+QSA index CP path explicitly accepts only TP2/TP4; enabling its flag at TP8
+raises a configuration error. The merged QKV/index projection has exact TP4
+weight-shape gates, so its TP4 result also cannot be projected onto TP8.
+
 Synthetic-weight complete decoder-layer graph reruns on TP4+EP4, 100 replays,
 after the final HC helper cleanup:
 
