@@ -48,6 +48,8 @@ LM_EVAL_NUM_FEWSHOT="${MATRIX_LM_EVAL_NUM_FEWSHOT:-3}"
 LM_EVAL_NUM_CONCURRENT="${MATRIX_LM_EVAL_NUM_CONCURRENT:-65}"
 LM_EVAL_USE_CHAT_COMPLETIONS="${MATRIX_LM_EVAL_USE_CHAT_COMPLETIONS:-0}"
 LM_EVAL_EXTRA_MODEL_ARGS="${MATRIX_LM_EVAL_EXTRA_MODEL_ARGS:-}"
+LM_EVAL_BATCH_SIZE="${MATRIX_LM_EVAL_BATCH_SIZE:-}"
+LM_EVAL_GEN_KWARGS="${MATRIX_LM_EVAL_GEN_KWARGS:-}"
 ACCURACY_TEST_THRESHOLD="${MATRIX_ACCURACY_TEST_THRESHOLD:-0.0}"
 
 # shellcheck disable=SC1091
@@ -91,7 +93,10 @@ ARG INSTALL_LM_EVAL=1
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 LABEL com.rocm.atom.aiter_artifact_id="${AITER_ARTIFACT_ID}"
 COPY aiter-whl/ /tmp/aiter-whl/
-RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]"; else echo "Skip lm-eval install"; fi
+# datasets (via lm-eval) asks for huggingface-hub>=1.31. Left unconstrained,
+# pip installs hub 2.x, and transformers 5.16.1 refuses to import. That pin
+# stays: Qwen3.8-Flash needs it. Keep hub on the 1.x line both accept.
+RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]" "huggingface-hub>=1.31.0,<2"; else echo "Skip lm-eval install"; fi
 RUN pip install hf_transfer
 RUN pip install --upgrade "pybind11>=3.0.1"
 RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true && \
@@ -114,6 +119,44 @@ EOF
 docker rmi "atom_sglang_base:ci" 2>/dev/null || true
 docker rmi "atom_sglang:ci" 2>/dev/null || true
 
+# Spur dockerd/buildkit uses this directory as TMPDIR. When the mount is
+# absent, reading the Dockerfile fails before any build step runs.
+ensure_buildkit_tmp() {
+  local target="/mnt/m2m_nobackup/docker/tmp"
+  if [[ -d "${target}" ]]; then
+    return 0
+  fi
+  echo "buildkit tmp ${target} is missing; creating it"
+  mkdir -p "${target}" 2>/dev/null || true
+  if [[ ! -d "${target}" ]] && command -v sudo >/dev/null 2>&1; then
+    sudo -n mkdir -p "${target}" || true
+    sudo -n chmod 1777 "${target}" 2>/dev/null || true
+  fi
+  if [[ ! -d "${target}" ]]; then
+    mkdir -p /tmp/docker-buildkit-tmp
+    local parent
+    parent="$(dirname "${target}")"
+    if [[ ! -d "${parent}" ]]; then
+      mkdir -p "${parent}" 2>/dev/null || sudo -n mkdir -p "${parent}" || true
+    fi
+    if [[ -d "${parent}" ]]; then
+      ln -sfn /tmp/docker-buildkit-tmp "${target}" 2>/dev/null \
+        || sudo -n ln -sfn /tmp/docker-buildkit-tmp "${target}" \
+        || true
+    fi
+  fi
+  [[ -d "${target}" ]]
+}
+
+run_docker_build() {
+  if ensure_buildkit_tmp; then
+    DOCKER_BUILDKIT=1 docker build "$@"
+  else
+    echo "buildkit tmp dir is still missing; using the legacy builder"
+    DOCKER_BUILDKIT=0 docker build "$@"
+  fi
+}
+
 BUILD_MODE="full"
 if docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
   LATEST_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${NIGHTLY_SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
@@ -123,7 +166,7 @@ if docker pull "${NIGHTLY_SGLANG_IMAGE_TAG}"; then
 fi
 
 if [[ "${BUILD_MODE}" = "fast" ]]; then
-  DOCKER_BUILDKIT=1 docker build --network=host \
+  run_docker_build --network=host \
     -t atom_sglang:ci \
     --build-arg SGLANG_BASE_IMAGE="${NIGHTLY_SGLANG_IMAGE_TAG}" \
     --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
@@ -133,7 +176,7 @@ if [[ "${BUILD_MODE}" = "fast" ]]; then
     --build-arg INSTALL_LM_EVAL=1 \
     -f Dockerfile.mod .
 else
-  DOCKER_BUILDKIT=1 docker build --pull --network=host \
+  run_docker_build --pull --network=host \
     --no-cache \
     -t atom_sglang_base:ci \
     --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
@@ -144,7 +187,7 @@ else
     --build-arg INSTALL_LM_EVAL=1 \
     -f Dockerfile.mod .
 
-  DOCKER_BUILDKIT=1 docker build --network=host \
+  run_docker_build --network=host \
     --no-cache \
     -t atom_sglang:ci \
     --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
@@ -179,20 +222,30 @@ else
 fi
 
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
-docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
-  -v "${REPO_ROOT}":/workspace \
-  ${MODEL_CACHE_MOUNT} \
-  -w /workspace \
-  --ipc=host --network=host --group-add video \
-  --shm-size=16G \
-  --privileged \
-  --cap-add=SYS_PTRACE \
-  -e HF_TOKEN="${HF_TOKEN:-}" \
-  --security-opt seccomp=unconfined \
-  --ulimit memlock=-1 \
-  --ulimit stack=67108864 \
-  --name "${CONTAINER_NAME}" \
-  "${SGLANG_IMAGE_TAG}"
+start_sglang_container() {
+  local privileged_flag="$1"
+  docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+  # DEVICE_FLAG and MODEL_CACHE_MOUNT are flag strings, so they stay unquoted.
+  # shellcheck disable=SC2086
+  docker run -dt --device=/dev/kfd ${DEVICE_FLAG} \
+    -v "${REPO_ROOT}":/workspace \
+    ${MODEL_CACHE_MOUNT} \
+    -w /workspace \
+    --ipc=host --network=host --group-add video \
+    --shm-size=16G \
+    ${privileged_flag} \
+    --cap-add=SYS_PTRACE \
+    -e HF_TOKEN="${HF_TOKEN:-}" \
+    --security-opt seccomp=unconfined \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
+    --name "${CONTAINER_NAME}" \
+    "${SGLANG_IMAGE_TAG}"
+}
+if ! start_sglang_container --privileged; then
+  echo "docker run --privileged was denied; retrying with device mounts only"
+  start_sglang_container ""
+fi
 
 GPU_PREFLIGHT_KILL_DOCKER=1 bash .github/scripts/gpu_preflight_check.sh "${CONTAINER_NAME}" docker
 
@@ -204,6 +257,14 @@ if [[ -n "${DRAFT_ID}" ]]; then
     DRAFT_RESOLVED_PATH="$(plugin_ci_download_model "${DRAFT_HF_ID}")"
     EXTRA_ARGS="$(plugin_ci_rewrite_extra_args "${EXTRA_ARGS}" "${DRAFT_HF_ID}" "${DRAFT_RESOLVED_PATH}")"
   fi
+fi
+
+eval_docker_env=()
+if [[ -n "${LM_EVAL_BATCH_SIZE}" ]]; then
+  eval_docker_env+=(-e "LM_EVAL_BATCH_SIZE=${LM_EVAL_BATCH_SIZE}")
+fi
+if [[ -n "${LM_EVAL_GEN_KWARGS}" ]]; then
+  eval_docker_env+=(-e "LM_EVAL_GEN_KWARGS=${LM_EVAL_GEN_KWARGS}")
 fi
 
 docker exec \
@@ -218,6 +279,7 @@ docker exec \
   -e LM_EVAL_NUM_CONCURRENT="${LM_EVAL_NUM_CONCURRENT}" \
   -e LM_EVAL_USE_CHAT_COMPLETIONS="${LM_EVAL_USE_CHAT_COMPLETIONS}" \
   -e LM_EVAL_EXTRA_MODEL_ARGS="${LM_EVAL_EXTRA_MODEL_ARGS}" \
+  "${eval_docker_env[@]}" \
   "${CONTAINER_NAME}" bash -lc "
     set -euo pipefail
     bash .github/scripts/atom_sglang_test.sh accuracy

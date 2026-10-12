@@ -226,6 +226,9 @@ def _build_graph_query_ranges_kernel(
     req_id = token_id // TOKENS_PER_REQ
     req_base = req_id * CONTEXT_CAPACITY
     position = tl.load(positions_ptr + token_id)
+    # Replay can see a stale or padded position. Ends index the gathered
+    # K window, which is only CONTEXT_CAPACITY rows per request.
+    position = tl.minimum(tl.maximum(position, 0), CONTEXT_CAPACITY - 1)
     tl.store(starts_ptr + token_id, req_base)
     tl.store(ends_ptr + token_id, req_base + position + 1)
 
@@ -657,6 +660,47 @@ def init_sparse_mla_graph_state(backend, max_bs: int, max_num_tokens: int) -> No
     backend._atom_sparse_mla_graph_max_num_tokens = int(max_num_tokens)
 
 
+def _sparse_mla_graph_owner(backend):
+    """Return the backend that actually owns ``req_to_token``.
+
+    Draft CUDA-graph capture publishes the multi-step DSA backend. That parent
+    has no KV pool; each per-step child does. Graph workspaces have to live on
+    a child, or the first draft capture faults before any bucket is allocated.
+    """
+
+    if getattr(backend, "req_to_token", None) is not None:
+        return backend
+    for child in getattr(backend, "attn_backends", None) or []:
+        if getattr(child, "req_to_token", None) is not None:
+            return child
+    full_backend = getattr(backend, "full_attn_backend", None)
+    if getattr(full_backend, "req_to_token", None) is not None:
+        return full_backend
+    return backend
+
+
+def _ensure_sparse_mla_graph_store(backend, batch_size: int, num_tokens: int):
+    owner = _sparse_mla_graph_owner(backend)
+    store = getattr(owner, "_atom_sparse_mla_graph_buffers", None)
+    if store is None:
+        if _is_stream_capturing():
+            raise RuntimeError(
+                "Sparse MLA graph buffers were not initialized on the per-step backend"
+            )
+        init_sparse_mla_graph_state(owner, batch_size, num_tokens)
+        return owner, owner._atom_sparse_mla_graph_buffers
+    if not _is_stream_capturing():
+        owner._atom_sparse_mla_graph_max_bs = max(
+            int(getattr(owner, "_atom_sparse_mla_graph_max_bs", 0)),
+            int(batch_size),
+        )
+        owner._atom_sparse_mla_graph_max_num_tokens = max(
+            int(getattr(owner, "_atom_sparse_mla_graph_max_num_tokens", 0)),
+            int(num_tokens),
+        )
+    return owner, store
+
+
 def _get_or_create_sparse_mla_indexer_graph_buffers(
     *,
     forward_batch,
@@ -668,11 +712,6 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
     )
 
     backend = resolve_sglang_runtime(forward_batch).attn_backend
-    store = getattr(backend, "_atom_sparse_mla_indexer_graph_buffers", None)
-    if store is None:
-        raise RuntimeError(
-            "Sparse MLA indexer graph buffers were not initialized on the backend"
-        )
     batch_size = int(forward_batch.batch_size)
     tokens_per_req = _mtp_spec_tokens_per_req(forward_batch)
     num_tokens = int(forward_batch.input_ids.shape[0])
@@ -687,6 +726,7 @@ def _get_or_create_sparse_mla_indexer_graph_buffers(
             f"batch_size={batch_size}, tokens_per_req={tokens_per_req}, "
             f"num_tokens={num_tokens}"
         )
+    _, store = _ensure_sparse_mla_graph_store(backend, batch_size, num_tokens)
     key = (
         batch_size,
         tokens_per_req,
@@ -886,11 +926,7 @@ def _get_or_create_sparse_mla_graph_buffers(
     )
 
     backend = resolve_sglang_runtime(forward_batch).attn_backend
-    store = getattr(backend, "_atom_sparse_mla_graph_buffers", None)
-    if store is None:
-        raise RuntimeError(
-            "Sparse MLA graph buffers were not initialized on the per-step backend"
-        )
+    backend, store = _ensure_sparse_mla_graph_store(backend, batch_size, num_tokens)
     key = (
         batch_size,
         tokens_per_req,
@@ -1278,6 +1314,8 @@ def sparse_attn_indexer_sglang_plugin_mode(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    dcp_sparse_kv_indptr_buffer: torch.Tensor,
+    dcp_owned_counts_buffer: torch.Tensor,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1291,7 +1329,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
 ) -> None:
     from atom.plugin.sglang.models.base_model_wrapper import get_current_forward_batch
 
-    del kv_cache, total_seq_lens
+    del kv_cache, total_seq_lens, dcp_sparse_kv_indptr_buffer, dcp_owned_counts_buffer
     forward_batch = get_current_forward_batch()
     if forward_batch is None or forward_batch.forward_mode.is_idle():
         return
@@ -1412,6 +1450,11 @@ def sparse_attn_indexer_sglang_plugin_mode(
             cu_starts, cu_ends, int(num_tokens)
         )
         total_kv = _mtp_eager_total_kv(forward_batch)
+        # top_k_per_row_prefill indexes KV with these ends. A range past the
+        # gathered K is an out-of-bounds device read.
+        kv_limit = torch.tensor(total_kv, dtype=cu_ends.dtype, device=cu_ends.device)
+        cu_ends = torch.minimum(cu_ends, kv_limit)
+        cu_starts = torch.minimum(cu_starts, cu_ends)
         k_fp8 = torch.empty([total_kv, head_dim], device=k.device, dtype=dtypes.fp8)
         k_scale = torch.empty([total_kv, 1], device=k.device, dtype=torch.float32)
         gather_indptr = _build_mtp_eager_gather_indptr(forward_batch)
@@ -1421,6 +1464,11 @@ def sparse_attn_indexer_sglang_plugin_mode(
         k_fp8 = indexer_graph_buffers.k_fp8
         k_scale = indexer_graph_buffers.k_scale
         gather_indptr = indexer_graph_buffers.gather_indptr
+        # Replay positions can still produce an end past the gathered window.
+        # top_k_per_row_prefill indexes KV with these ends. In-place so capture
+        # keeps the static buffer addresses.
+        cu_ends.clamp_(max=int(k_fp8.shape[0]))
+        torch.minimum(cu_starts, cu_ends, out=cu_starts)
     cp_gather_indexer_k_quant_cache(
         kv_cache,
         k_fp8,

@@ -287,10 +287,26 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.spec_info,
             )
         else:
+            seq_lens = forward_batch.seq_lens
+            req_pool_indices = forward_batch.req_pool_indices
+            num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+            # MLA replay builds kv indices from seq_lens inside
+            # _init_mla_cuda_graph_metadata and then leaves kv_lens as None.
+            # Padding rows arrive as seq_len=1, req_pool_index=0. Clear the
+            # length before that builder so those rows do not read request 0.
+            if (
+                self.use_mla
+                and forward_batch.forward_mode.is_decode_or_idle()
+                and num_padding > 0
+                and torch.is_tensor(seq_lens)
+            ):
+                real_bs = int(forward_batch.batch_size) - num_padding
+                seq_lens = seq_lens.clone()
+                seq_lens[real_bs:] = 0
             self.init_forward_metadata_replay_cuda_graph(
                 forward_batch.batch_size,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                req_pool_indices,
+                seq_lens,
                 forward_batch.seq_lens_sum,
                 forward_batch.encoder_lens,
                 forward_batch.forward_mode,
@@ -298,17 +314,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
-            if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and (num_padding := int(getattr(forward_batch, "num_padding", 0))) > 0
-            ):
-                # Decode CUDA graphs pad batches to a captured bucket. SGLang
-                # fills those rows with seq_len=1 and req_pool_index=0, but ATOM
-                # uses kv_lens to derive the KV write slot inside the graph.
-                # Mark padded rows as empty so their slot_mapping becomes -1
-                # instead of overwriting request-pool row 0.
-                real_bs = forward_batch.batch_size - num_padding
-                self.forward_metadata.kv_lens[real_bs:].zero_()
+            if forward_batch.forward_mode.is_decode_or_idle() and num_padding > 0:
+                # MHA stores the padded lengths on kv_lens and uses them as
+                # the KV write slot. MLA leaves kv_lens unset.
+                real_bs = int(forward_batch.batch_size) - num_padding
+                kv_lens = self.forward_metadata.kv_lens
+                if kv_lens is not None:
+                    kv_lens[real_bs:].zero_()
 
     def _set_qwen4_exp_qsa_graph_forward_metadata(self) -> None:
         """Placeholder so the hybrid parent still sees a ForwardMetadata.
@@ -2119,6 +2131,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         if k is None or v is None:
             raise RuntimeError("MHA speculative extend requires explicit k/v tensors")
 
+        # gfx95 extend attention consumes these tensors from a bf16 FMHA kernel.
+        # FP8 storage with a bf16 stride is an HSA aperture violation.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
+
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
@@ -2151,8 +2170,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         cu_seqlens_q = torch.nn.functional.pad(
             torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
         )
-        if q.dtype != k.dtype and k.dtype == dtypes.fp8:
-            q = q.to(dtypes.fp8)
+        # hd256 varlen on gfx95 is the bf16 FMHA kernel. Casting Q down to FP8
+        # still launches that kernel and then strides off the FP8 allocation.
+        if k.dtype != q.dtype:
+            k = k.to(q.dtype)
+        if v.dtype != q.dtype:
+            v = v.to(q.dtype)
         o = flash_attn_varlen_func(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),

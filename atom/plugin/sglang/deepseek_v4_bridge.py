@@ -20,6 +20,20 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
 from atom.plugin.sglang.runtime.context import is_draft_extend_mode
 
 ATOM_DEEPSEEK_V4_BLOCK_SIZE = 128
+
+
+def _init_v4_split_plans(md) -> None:
+    """Publish the V4 decode split-plan fields on a base AttentionMetaData.
+
+    Native sparse attention reads ``split_plan_swa`` directly. The SGLang
+    bridge builds the shared metadata type, which does not declare those
+    fields. None lets aiter choose the plan.
+    """
+    md.split_plan_swa = None
+    md.split_plan_csa = None
+    md.split_plan_hca = None
+
+
 try:
     from atom.model_ops.v4_kernels.v4_quant import (
         V4_DIM_QK_PACKED as ATOM_DEEPSEEK_V4_FP8_PACKED_DIM,
@@ -1678,6 +1692,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         block_tables=block_tables,
         state=AttnState.DECODE,
     )
+    _init_v4_split_plans(md)
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
@@ -1942,6 +1957,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         block_tables=block_tables,
         state=AttnState.PREFILL_NATIVE,
     )
+    _init_v4_split_plans(md)
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size
@@ -2220,6 +2236,7 @@ def build_atom_v4_attention_metadata_from_sglang(
         block_tables=block_tables,
         state=state,
     )
+    _init_v4_split_plans(md)
     md.swa_num_slots = proxy_pool.num_slots
     md.swa_window = proxy_pool.window_size
     md.swa_cs = proxy_pool.swa_cache_size

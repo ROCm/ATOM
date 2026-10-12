@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 from atom.plugin.sglang.patches import prefill_compile_only_patch as compile_only_patch
 from atom.plugin.sglang.patches.prefill_compile_only_patch import (
     apply_prefill_compile_only_patch,
+    resolve_prefill_cuda_graph_config,
 )
 
 
@@ -188,3 +189,72 @@ def test_compile_only_patch_uses_live_batch_without_cudagraph(monkeypatch):
     assert (
         runner.can_replay_locally(**{**base_kwargs, "input_embeds": object()}) is False
     )
+
+
+def test_compile_only_reads_published_prefill_config_when_server_args_is_none(
+    monkeypatch,
+):
+    published = SimpleNamespace(backend="tc_piecewise", tc_compiler="eager")
+
+    def get_exec():
+        return SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(prefill=published))
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.runtime_context",
+        _module("sglang.srt.runtime_context", get_exec=get_exec),
+    )
+    server_args = SimpleNamespace(cuda_graph_config=None)
+    assert resolve_prefill_cuda_graph_config(server_args) is published
+
+    class Backend:
+        TC_PIECEWISE = "tc_piecewise"
+
+    entered = []
+
+    class PrefillCudaGraphRunner:
+        def __init__(self, model_runner):
+            entered.append(model_runner.server_args.cuda_graph_config)
+
+        def capture(self):
+            return None
+
+        def execute(self, forward_batch, **kwargs):
+            return None
+
+        def can_replay_locally(self, **kwargs):
+            return False
+
+    modules = {
+        "sglang.srt.compilation.backend": _module(
+            "sglang.srt.compilation.backend",
+            SGLangBackend=type("SGLangBackend", (), {}),
+        ),
+        "sglang.srt.model_executor.cuda_graph_config": _module(
+            "sglang.srt.model_executor.cuda_graph_config", Backend=Backend
+        ),
+        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner": _module(
+            "sglang.srt.model_executor.runner.prefill_cuda_graph_runner",
+            PrefillCudaGraphRunner=PrefillCudaGraphRunner,
+        ),
+        "sglang.srt.model_executor.runner.shape_key": _module(
+            "sglang.srt.model_executor.runner.shape_key", ShapeKey=object
+        ),
+        "sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend": _module(
+            "sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend",
+            TcPiecewiseCudaGraphBackend=type(
+                "TcPiecewiseCudaGraphBackend",
+                (),
+                {"build_compilation_config": staticmethod(lambda server_args: None)},
+            ),
+        ),
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "1")
+
+    assert apply_prefill_compile_only_patch()
+    PrefillCudaGraphRunner(SimpleNamespace(server_args=server_args))
+    assert entered == [None]
