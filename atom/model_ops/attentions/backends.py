@@ -168,6 +168,13 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
 
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """True when this backend cannot run `batch`'s decode from a captured
+        graph, whatever its width. Read before the step's metadata is built,
+        from the batch alone: every TP rank holds the same batch, so every
+        rank answers alike, and `ForwardMode.decide` agrees it across DP."""
+        return False
+
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()

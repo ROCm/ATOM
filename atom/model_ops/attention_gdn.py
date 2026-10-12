@@ -566,6 +566,13 @@ class GatedDeltaNet(nn.Module):
                     self.dt_bias,
                     non_spec_state_indices_in_tensor,
                     non_spec_state_indices_tensor,
+                    # Write straight into the result; the merge below then
+                    # has nothing to copy.
+                    out=(
+                        core_attn_out[: query_non_spec.shape[1]]
+                        if spec_sequence_masks is None
+                        else None
+                    ),
                 )
             elif use_lossy_gdn_decode:
                 core_attn_out_non_spec, last_recurrent_state = (
@@ -617,7 +624,7 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
+        elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
         # Zero padding tail for CUDA graph replay safety

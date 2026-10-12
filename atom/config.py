@@ -1843,6 +1843,22 @@ def qrep_enabled_for_layer(
     )
 
 
+def qrep_for_step(
+    qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
+) -> bool:
+    """Whether this forward produces the DCP group's query heads locally (QREP)
+    instead of gathering them.
+
+    Decode always does when the layer has QREP. Prefill reaches the QREP-aware
+    branch only as sparse (DSA) prefill -- dense prefill takes the MHA path and
+    never gathers q -- and joins only under ``ATOM_DCP_PREFILL_QREP``
+    (``prefill_qrep``). The seg path is excluded because its q_out is allocated
+    at the per-rank head count. Pure so the prefill clause can be pinned by a
+    test instead of living only as an inline expression.
+    """
+    return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -1939,6 +1955,10 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). On by default;
+    # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
+    enable_decoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -2632,9 +2652,8 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         # PCP changes the compiled graph: when pcp>1 the indexer runs through the
-        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
-        # query) and the indexer takes the round-robin all-gather / separate-rope
-        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # opaque `sparse_attn_indexer_pcp` op and takes the round-robin all-gather
+        # / separate-rope path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
         # identically, so without this factor pcp2 loads pcp1's cached artifact
         # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
         # runtime — the same stale-artifact hazard documented for the vocab-embed
@@ -2656,6 +2675,10 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
+        # graphs (early + late layers) instead of one; both compile under the
+        # `backbone` tag, so the flag must key the artifacts.
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

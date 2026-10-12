@@ -5,6 +5,8 @@ import logging
 from copy import copy
 
 import torch
+from aiter.dist.parallel_state import get_tp_group
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.model_loader.weight_names import WeightsMapper
@@ -19,6 +21,7 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
+from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
@@ -29,6 +32,7 @@ from atom.models.deepseek_v4_dspark import (
     _DSparkInner,
 )
 from atom.models.dspark_draft import DSparkDraftModel
+from atom.utils import envs
 
 from .attention import Attention
 from .config import build_attention_topology
@@ -561,4 +565,51 @@ class DeepseekV41DSpark(DSparkDraftModel):
 
     def head_and_sample(self, out, anchor_ids, num_draft):
         # `num_draft` is the shared surface's; the width rides `out[1]`.
+        if self._sharded_markov_sample():
+            return self._head_and_sample_sharded(*out, anchor_ids)
         return self._head_and_sample(*out, anchor_ids)
+
+    def _sharded_markov_sample(self) -> bool:
+        """Whether the block is sampled off this rank's vocab shard.
+
+        V4's head all-gathers the ``[B * T, V]`` logits for a sampler that only
+        wants each position's argmax. With the fused sampler the argmax of a
+        shard is exact, so the ranks exchange ``(max, id)`` per position
+        instead: T small gathers in place of one of the whole vocab.
+        """
+        head = self.head
+        markov = self.mtp[-1].markov_head
+        return (
+            head is not None
+            and head.tp_size > 1
+            and head.bias is None
+            and markov.fused_sample
+            and markov.markov_w1.weight.dtype in (torch.bfloat16, torch.float16)
+            and markov.markov_w2.weight.dtype is markov.markov_w1.weight.dtype
+        )
+
+    def _head_and_sample_sharded(self, normed, hc_hidden, anchor_ids):
+        """``_head_and_sample`` with the LM head left sharded (see
+        ``_sharded_markov_sample``); the same ids and confidences."""
+        B, T, _ = hc_hidden.shape
+        head, last = self.head, self.mtp[-1]
+        base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B, T, V/tp]
+        tp_group = get_tp_group()
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        out_ids = anchor_ids.new_empty(B, T + 1)
+        out_ids[:, 0] = anchor_ids
+        markov_embeds = [
+            dspark_markov_argmax_tp(
+                base_logits[:, k],
+                out_ids[:, k],
+                last.markov_head.markov_w1.weight,
+                last.markov_head.markov_w2.weight,
+                out_ids[:, k + 1],
+                head.vocab_start_idx,
+                tp_group,
+                use_custom=use_custom,
+            )
+            for k in range(T)
+        ]
+        confidence = last.confidence_head(hc_hidden, torch.stack(markov_embeds, dim=1))
+        return out_ids[:, 1:], confidence

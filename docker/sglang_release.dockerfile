@@ -58,7 +58,7 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
-    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; extras = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']; blocked = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar==', 'transformers'); seen = set(); out = []; walk = lambda names: [None for dep in names for key in [dep.strip()] if key and key not in seen and not seen.add(key) and (walk(extras[key[len('sglang['):-1]]) if key.startswith('sglang[') and key.endswith(']') else out.append(key))]; pkg = lambda dep: dep.split('[')[0].split('=')[0].split('<')[0].split('>')[0].split('!')[0].strip(); walk(extras['runtime_common']); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in out if pkg(dep) != 'numpy' and not any(dep.startswith(p) or pkg(dep) == p.split('=', 1)[0] for p in blocked)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -86,6 +86,18 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \
       "z3-solver==4.15.4.0" && \
     rm -f /tmp/sglang-runtime-common.txt && \
+    TORCH_HIP="$("${VENV_PYTHON}" -c "import torch; print(torch.version.hip or '')")" && \
+    test -n "${TORCH_HIP}" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps "transformers==5.16.1" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir \
+      "huggingface-hub==1.5.0" \
+      "tokenizers==0.23.1" \
+      "safetensors>=0.8.0" \
+      "regex>=2025.10.22" \
+      "typer" \
+      "packaging>=20.0" \
+      "pyyaml>=5.1" \
+      "tqdm>=4.60" && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
@@ -113,7 +125,8 @@ RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" 
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
-    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
+    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer && \
+    "${VENV_PYTHON}" -c "import importlib.metadata as m; import torch; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch'; assert m.version('transformers') == '5.16.1', m.version('transformers'); assert m.version('tokenizers') == '0.23.1', m.version('tokenizers'); assert m.version('huggingface-hub') == '1.5.0', m.version('huggingface-hub'); cfg = AutoConfig.for_model('qwen4_exp_text'); assert cfg.model_type == 'qwen4_exp_text', cfg.model_type"
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true

@@ -34,7 +34,12 @@ from atom.model_ops.v4_kernels.state_writes import (
 )
 from atom.utils import CpuGpuBuffer
 
-from .indices import build_indices, fill_step_indptrs
+from .indices import (
+    build_indices,
+    build_window_rows,
+    fill_step_indptrs,
+    splits_window,
+)
 from .metadata import prepare_batch_step
 from .speculative import TentativeState
 
@@ -298,8 +303,26 @@ class PagedAttentionCache:
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
+        step.swa_replay_start = self._replay_start_zeros(
+            len(requests) if running_bs is None else running_bs
+        )
         step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
         return step
+
+    def _replay_start_zeros(self, running_bs):
+        """Every request's window from position 0: what a step that is not a
+        bounded-replay tail reads as `swa_replay_start`, indexed by batch id up
+        to `running_bs - 1`. One fixed buffer, sized for every slot up front,
+        so the index kernels a capture records keep reading it on replay."""
+        rows = max(running_bs, self.num_slots, 1)
+        zeros = getattr(self, "_replay_zeros", None)
+        if zeros is None or zeros.numel() < rows:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("The replay-start buffer cannot grow under capture")
+            zeros = self._replay_zeros = torch.zeros(
+                rows, dtype=torch.int32, device=self.indptr_device
+            )
+        return zeros
 
     def _private_plans(self, requests, tentative):
         """Plans into freshly allocated buffers, for a caller without any.
@@ -700,26 +723,43 @@ class PagedAttentionCache:
             )
 
     def attention_indices(self, spec, step):
-        """This layer's prefix rows, built with its whole group's on a decode.
+        """This layer's `(prefix, pptr, second, sptr)`: rows into the pool, and
+        rows into the attention's second source.
+
+        A prefill's second source is its own KV (`extend`), its rows built for
+        this layer alone: it pays work rather than dispatch. A decode builds
+        its index group's in one launch: every layer's prefix, window
+        included, or on a split decode (`splits_window`) the selection alone,
+        one plane the group shares, its second source the layer's ring
+        (`ring_view`) and the window rows one list for every layer.
 
         The group's first layer is also the layer that owns its selection, so
         by the time anyone asks, every input the run shares already exists.
         Later layers find theirs written and launch nothing.
         """
-        first = spec.index_group_start
-        if not step.decode or spec.index_group_size == 1:
-            # A run of one, anchored on this layer's own ring, so a spec that
-            # declares no group never has to name a start. A prefill takes this
-            # too: it pays work rather than dispatch, and its `extend` plane is
-            # this layer's alone.
+        if not step.decode:
             prefix, pptr, extend, eptr = self._index_group(spec, step, spec.layer_id, 1)
             return prefix[0], pptr, extend, eptr
+        # a spec that declares no group never names a start: its own
+        first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
+        split = splits_window(step, self.geometry)
         built = step.group_indices.get(first)
         if built is None:
-            built = self._index_group(spec, step, first, spec.index_group_size)
+            layers = 1 if split else spec.index_group_size
+            built = self._index_group(spec, step, first, layers)
             step.group_indices[first] = built
         prefix, pptr, extend, eptr = built
-        return prefix[spec.layer_id - first], pptr, extend, eptr
+        if not split:
+            return prefix[spec.layer_id - first], pptr, extend, eptr
+        if step.window_rows is None:
+            window = self.geometry.window(first, self.num_pages)
+            step.window_rows = build_window_rows(step, self.geometry, window, eptr)
+        return prefix[0], pptr, step.window_rows, eptr
+
+    def ring_view(self, layer):
+        """The BF16 pool from `layer`'s ring start: a split decode's second
+        source, which its window rows index."""
+        return self.pool[self.geometry.window(layer, self.num_pages).ring_start :]
 
     def _index_group(self, spec, step, first, layers):
         """One build covering `layers` consecutive layers from `first`.
