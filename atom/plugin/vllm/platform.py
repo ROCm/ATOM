@@ -225,13 +225,22 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
        step) would swallow the whole backbone rather than break around
        attention. Say NONE outright.
 
-    2. Refuse prefix caching. CSA2 blocks are only reusable once the compressor
-       has run over a whole PAGE, and the per-request STATE side is not
-       replayed by a block-table hit, so vLLM's hash reuse would hand back a
-       prefix whose window ring never existed. ``validate_runtime_config``
-       refuses it too, but only once the worker is already up.
+    2. Refuse prefix caching. vLLM's prefix cache is bookkeeping: registering a
+       cached block is a claim that the backend left recoverable state at that
+       block's boundary, and the mamba-style managers that participate only
+       report a hit as far as a boundary they hold state for. V4.1's forward
+       cannot make that claim -- copying a slot after the forward yields the
+       state at the *end* of the query, while the boundary vLLM asks about is
+       interior to it. Measured on the sibling branch that tried to serve it:
+       setting ``num_prefill_checkpoint_blocks`` to 0 does not opt out, because
+       align mode still caches the last complete block's state and the group
+       still reports the boundary. So this is a property of the contract, not a
+       flag -- any STATE group that joins prefix caching will be handed a
+       boundary nobody wrote. ``validate_runtime_config`` refuses it too, but
+       only once the worker is already up.
 
-    3. Refuse speculative decoding, which the proxy bridge does not drive.
+    3. Refuse every speculative method except DSpark, which vLLM drives itself;
+       see ``_refuse_unsupported_v41_speculation``.
 
     Called from two places, because neither alone covers the process that acts
     on the result: ``ATOMPlatform.check_and_update_config`` is the natural
@@ -252,7 +261,9 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
             "DeepSeek-V4.1 on the vLLM plugin does not support prefix caching: a "
             "block-table hit restores the compressed pages but not the "
             "per-request window ring, compressor rings or Engram cursor that "
-            "CSA2 attention reads alongside them. Pass --no-enable-prefix-caching."
+            "CSA2 attention reads alongside them, and a V4.1 forward cannot "
+            "leave them at the interior block boundary vLLM's cache assumes. "
+            "Pass --no-enable-prefix-caching."
         )
         logger.error(msg)
         raise ValueError(msg)

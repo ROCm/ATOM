@@ -404,9 +404,14 @@ def validate_runtime_config(config):
             and config.speculative_config is not None
             and getattr(config.speculative_config, "method", None) != "dspark",
         ),
-        # TODO: CSA2 blocks are only reusable at whole-PAGE boundaries after
-        # the compressor has run; vLLM's hash-based reuse would hand back
-        # blocks whose STATE side was never replayed.
+        # Not a TODO. vLLM's prefix cache requires the backend to have left
+        # recoverable state at each complete block boundary -- registering a
+        # cached block is that claim -- and a V4.1 forward leaves state only
+        # at the end of the query, never at an interior boundary. Measured on
+        # the sibling branch: zeroing `num_prefill_checkpoint_blocks` does not
+        # opt out of the claim. Reviving this means exporting state at a given
+        # offset (`MambaPrefillCheckpointExporter`), which for V4.1 means
+        # splitting `engram_compress`'s plan there -- not a flag.
         (
             "prefix caching on the vLLM plugin",
             on_vllm_plugin and config.enable_prefix_caching,
