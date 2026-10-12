@@ -47,6 +47,10 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.model_ops.fused_moe.mega_transport_config import (
+    compact_plan_vmm_bytes,
+    mega_dispatch_kwargs,
+)
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -180,8 +184,10 @@ def _cco_per_rank_vmm(
     send all its tokens to one peer -> ws * M recv slots, plus a 2x headroom
     (tokens + combine buffers) and a fixed slack, matching test_moe_layer_ep.py.
 
-    MegaMoE's arena needs strictly less than this (one recv-sized token buffer
-    plus an M*topk combine staging), so the same budget covers both transports.
+    MegaMoE's token-major arena needs strictly less than this (one recv-sized
+    token buffer plus an M*topk combine staging), so the same budget covers both
+    transports. The compact plan's per-route rows do not fit in it; init adds
+    compact_plan_vmm_bytes for them.
     """
     tok_bytes = max_num_inp_token_per_rank * hidden_dim * itemsize
     win_bytes = ep_size * tok_bytes * 2 + (1 << 24)
@@ -225,6 +231,10 @@ if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE"
         "the old name is no longer read"
     )
 _MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
+# aiter's own knob, read here because ATOM names the backend of a quantizing wire
+# itself (mega_dispatch_kwargs). Its default there is mori, which is what such a
+# wire always ran on; aiter's own default, flydsl, still governs a bf16 wire.
+_MEGA_DISPATCH_BACKEND = os.environ.get("MEGA_DISPATCH", "mori")
 
 
 def init_mega_transport(
@@ -252,8 +262,9 @@ def init_mega_transport(
 
     Everything here is per-model: the EP geometry, the cco arena, and the expert
     GEMM recipe. Only the weights differ per layer and those are forward()
-    arguments, so one instance covers the whole model. Which dispatch kernel it
-    uses is aiter's own call (MEGA_DISPATCH=flydsl|mori).
+    arguments, so one instance covers the whole model. Its dispatch kernel is
+    $MEGA_DISPATCH=flydsl|mori; on an fp8/fp4 wire ATOM passes it (default mori),
+    and flydsl there runs aiter's compact plan. See mega_dispatch_kwargs.
 
     ``combine_quant`` names the quantized return-trip format this transport is
     to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
@@ -261,6 +272,7 @@ def init_mega_transport(
     every forward then names the one it wants -- bf16 unless it says otherwise.
     See combine_quant_for_step.
     """
+    dispatch_kwargs = mega_dispatch_kwargs(_MEGA_DISPATCH_WIRE, _MEGA_DISPATCH_BACKEND)
     key = (
         ep_rank,
         ep_size,
@@ -276,9 +288,11 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         # Keyed on: the wire sets the payload width and whether the scale
-        # region exists, and combine_quant sets which combine reduces are
+        # region exists, the dispatch kwargs pick the kernel and (stage1_fused)
+        # a per-route arena, and combine_quant sets which combine reduces are
         # built (the staging layout itself no longer depends on it).
         _MEGA_DISPATCH_WIRE,
+        tuple(sorted(dispatch_kwargs.items())),
         combine_quant,
     )
     cached = _MEGA_TRANSPORTS.get(key)
@@ -286,14 +300,19 @@ def init_mega_transport(
         return cached
 
     MegaMoEGfx1250 = _import_mega()
-    comm = _init_cco_comm(
-        ep_size,
-        ep_rank,
-        ep_src_global_rank,
-        _cco_per_rank_vmm(
-            ep_size, hidden_dim, max_num_inp_token_per_rank, data_type_itemsize
-        ),
+    per_rank_vmm = _cco_per_rank_vmm(
+        ep_size, hidden_dim, max_num_inp_token_per_rank, data_type_itemsize
     )
+    if dispatch_kwargs.get("stage1_fused"):
+        per_rank_vmm += compact_plan_vmm_bytes(
+            ep_size=ep_size,
+            hidden_dim=hidden_dim,
+            max_tokens_per_rank=max_num_inp_token_per_rank,
+            topk=num_experts_per_token,
+            num_experts=num_experts,
+            dispatch_wire=_MEGA_DISPATCH_WIRE,
+        )
+    comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
     mega = MegaMoEGfx1250(
         communicator=comm,
         rank=ep_rank,
@@ -314,15 +333,7 @@ def init_mega_transport(
         # Passed, not left to aiter's own read of the env, so the key and the
         # transport cannot drift.
         dispatch_wire=_MEGA_DISPATCH_WIRE,
-        # Only mori's dispatch carries the scale row, so a quantizing wire has
-        # no other backend to run on. Named here rather than left to
-        # $MEGA_DISPATCH, whose default is flydsl: otherwise asking for fp4 is
-        # rejected at the first MoE layer for a reason the operator did not set.
-        **(
-            {"dispatch_backend": "mori"}
-            if _MEGA_DISPATCH_WIRE in ("fp8", "fp4")
-            else {}
-        ),
+        **dispatch_kwargs,
         # Only injected when asked for: an aiter without the combine-quant
         # epilogue has no such kwarg and would raise TypeError on every run.
         **({"combine_quant": combine_quant} if combine_quant != "none" else {}),
@@ -341,7 +352,8 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s wire=%s combine_quant=%s force_a8w4=%s",
+        "swiglu_limit=%s dispatch=%s stage1_fused=%s wire=%s combine_quant=%s "
+        "force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -356,6 +368,8 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         mega._config.dispatch_backend,
+        # Absent from an aiter without the compact plan, which then never runs it.
+        getattr(mega._config, "stage1_fused", False),
         mega._config.dispatch_wire,
         combine_quant,
         # The other half of the pair: logged together so a mismatch is readable.
