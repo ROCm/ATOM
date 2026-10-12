@@ -276,7 +276,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
     # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
     # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
-    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "0") == "1",
+    # Set to 0 to retain the unmasked path.
+    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "1") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
     # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16

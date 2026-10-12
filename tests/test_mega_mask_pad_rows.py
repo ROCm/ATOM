@@ -140,16 +140,18 @@ def test_disabled_is_identity(run):
     assert out.isnan().all()
 
 
-def test_switch_follows_the_env(monkeypatch):
+def test_switch_defaults_on_and_follows_the_env(monkeypatch):
     enabled = []
     monkeypatch.setattr(
         fc, "enable_pad_rows_device", lambda rows, device: enabled.append(rows)
     )
+    monkeypatch.delenv("ATOM_MEGA_MASK_PAD_ROWS", raising=False)
+    assert mega._enable_mega_pad_row_mask(128) is True
     monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
     assert mega._enable_mega_pad_row_mask(128) is False
     monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "1")
     assert mega._enable_mega_pad_row_mask(128) is True
-    assert enabled == [128]
+    assert enabled == [128, 128]
 
 
 def test_masking_combine_output_is_not_reselected(run, monkeypatch):
