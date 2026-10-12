@@ -463,6 +463,7 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
         ),
         cu_seqlens_q=torch.tensor(starts, dtype=torch.int32, device="cuda"),
         max_seqlen_q=next_n,
+        indexer_meta={},
     )
     monkeypatch.setattr(
         deepseek_v4,
@@ -487,118 +488,6 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
         best = set(want[r, :end].topk(min(topk, end)).indices.tolist())
         assert len(chosen & best) / len(best) > 0.99, r
     assert (got[len(picks) :] == -1).all()
-
-
-@pytest.mark.parametrize(
-    "capture_core", [False, True], ids=["piecewise", "af_piecewise"]
-)
-def test_v4_fp4_graphs_distinguish_equal_token_sequence_shapes(
-    on_gfx950, monkeypatch, capture_core
-):
-    """Replay 8x1, 1x8 and ragged batches over the same eight query rows.
-
-    Only the active prefix of the shared sequence-boundary buffer is refreshed,
-    as in serving. A token-count-only graph reuses the captured sequence count
-    and reads stale boundaries. Check the actual row-group scorer against the
-    dequantized reference, including the stable output consumed downstream.
-    """
-    from atom.config import CUDAGraphMode
-    from atom.models import deepseek_v4
-    from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
-    from atom.utils.forward_context import AttnState
-
-    rows, width, topk = 8, 768, 512
-    table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(
-        rows, 1, width, seed=17
-    )
-    weights = weights.bfloat16()
-    cu = torch.arange(rows + 1, dtype=torch.int32, device="cuda")
-    ends = torch.empty(rows, dtype=torch.int32, device="cuda")
-    metadata = SimpleNamespace(state=AttnState.DECODE)
-    fc = SimpleNamespace(
-        attn_metadata=metadata,
-        context=SimpleNamespace(is_dummy_run=False),
-        in_hipgraph=True,
-        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
-    )
-    monkeypatch.setattr(deepseek_v4, "get_forward_context", lambda: fc)
-    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
-    indexer.kv_cache, indexer.kv_scale = kv, ks
-    indexer._max_model_len_idx, indexer._weights_scale = width, WEIGHTS_SCALE
-
-    def score(q, w, qs):
-        return indexer._score_topk_decode_fp4_flydsl(
-            q, qs, metadata.block_tables, w, topk
-        )
-
-    layer = SimpleNamespace(
-        layer_name="fp4_graph_test",
-        attn_ffn_piecewise=capture_core,
-        indexer=SimpleNamespace(score_topk_from=score),
-    )
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(
-            static_forward_context={layer.layer_name: layer}
-        )
-    )
-    monkeypatch.setattr(deepseek_v4, "get_current_atom_config", lambda: config)
-    runner, outputs = CudagraphCaptureRunner(), StableOutputs()
-    monkeypatch.setattr(deepseek_v4, "v4_indexer_runner", runner)
-    monkeypatch.setattr(deepseek_v4, "v4_indexer_outputs", outputs)
-    # The opaque outer attention op must not capture this scorer into a
-    # token-count-only dense graph again.
-    assert torch.ops.aiter.v4_indexer_topk.spliting_op
-
-    def publish(counts):
-        bs = len(counts)
-        starts = [0, *np.cumsum(counts).tolist()]
-        cu[: bs + 1].copy_(torch.tensor(starts, dtype=torch.int32, device="cuda"))
-        bounds = [width - c + i + 1 for c in counts for i in range(c)]
-        ends.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
-        metadata.cu_seqlens_q = cu[: bs + 1]
-        metadata.csa_n_committed_per_token = ends
-        metadata.max_seqlen_q = max(counts)
-        metadata.block_tables = table[:bs]
-        fc.context.scheduled_bs = bs
-        fc.context.forward_mode = SimpleNamespace(running_bs=bs)
-        return bounds
-
-    def run():
-        return deepseek_v4.v4_indexer_topk(q, weights, qs, layer.layer_name, topk)
-
-    shapes = [[1] * rows, [rows], [3, 1, 4], [4, 4]]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for counts in shapes:
-            publish(counts)
-            run()
-        torch.cuda.synchronize()
-        fc.in_hipgraph = False
-        output_ptr = None
-        for counts in shapes[::-1] + shapes:
-            bounds = publish(counts)
-            got = run()
-            if output_ptr is None:
-                output_ptr = got.data_ptr()
-            assert got.data_ptr() == output_ptr
-            seq = [b for b, count in enumerate(counts) for _ in range(count)]
-            want = _oracle(
-                q, qs, kv, ks, table[: len(counts)], width, weights,
-                lambda keys, seq=seq: keys[seq],
-            )  # fmt: skip
-            for row, end in enumerate(bounds):
-                chosen = set(got[row][got[row] >= 0].tolist())
-                best = set(want[row, :end].topk(topk).indices.tolist())
-                assert len(chosen) == topk and max(chosen) < end
-                assert len(chosen & best) / topk > 0.99
-        # A dummy step must not access the KV cache or invoke the row-group
-        # scorer, but must overwrite the same output consumed by the dense graph.
-        fc.context.is_dummy_run = True
-        got = run()
-        assert got.data_ptr() == output_ptr and (got == -1).all()
-        torch.cuda.synchronize()
-    runner.release_graphs()
 
 
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
@@ -903,3 +792,135 @@ def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
         lambda keys: keys[row_to_batch.long()],
     )
     _assert_agrees(logits, want, local_ends, topk=256)
+
+
+@pytest.mark.parametrize("rows,capacity", [(8, 8), (64, 64), (64, 16)])
+@pytest.mark.parametrize("prefix", ["", "ub0_", "ub1_"])
+def test_v4_fp4_one_graph_replays_sequence_layouts(
+    on_gfx950, monkeypatch, rows, capacity, prefix
+):
+    """One graph, fixed launch, changing GPU metadata (including empty slots)."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.models import deepseek_v4
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttnState
+
+    width, topk = 768, 512
+    table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(
+        rows, 1, width, seed=17
+    )
+    weights = weights.bfloat16()
+    ends = torch.empty(rows, dtype=torch.int32, device="cuda")
+    var = {
+        prefix
+        + "cu_seqlens_q": CpuGpuBuffer(capacity + 1, dtype=torch.int32, device="cuda"),
+        prefix
+        + "v4_fp4_query_start_loc": CpuGpuBuffer(
+            capacity + 1, dtype=torch.int32, device="cuda"
+        ),
+        prefix + "block_tables": SimpleNamespace(gpu=table[:capacity]),
+    }
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 7
+    builder._indexer_fp4 = True
+    builder.indexer_layout = "gfx950"
+    metadata = SimpleNamespace(state=AttnState.DECODE, csa_n_committed_per_token=ends)
+    monkeypatch.setattr(
+        deepseek_v4,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer.kv_cache, indexer.kv_scale = kv, ks
+    indexer._max_model_len_idx, indexer._weights_scale = width, WEIGHTS_SCALE
+
+    def publish(counts, empty=False):
+        bs = len(counts)
+        cu = np.r_[np.int32(0), np.cumsum(counts, dtype=np.int32)]
+        metadata.cu_seqlens_q = builder._stage(prefix + "cu_seqlens_q", cu)
+        metadata.max_seqlen_q = max(counts)
+        metadata.block_tables = table[:bs]
+        bounds = [width - c + i + 1 for c in counts for i in range(c)]
+        bounds += [0] * (rows - len(bounds))
+        if empty:
+            bounds = [0] * rows
+        ends.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
+        metadata.indexer_meta = builder._build_v4_indexer_meta(
+            attn_metadata=metadata,
+            positions_gpu=None,
+            scheduled_bs=bs,
+            total_tokens=int(cu[-1]),
+            device="cuda",
+            buf_prefix_ubatch=prefix,
+        )
+        return bounds
+
+    def run():
+        return indexer._score_topk_decode_fp4_flydsl(
+            q, qs, metadata.block_tables, weights, topk
+        )
+
+    shapes = (
+        [[1] * 8, [8], [3, 1, 4], [4, 4], [1, 0, 3], [0]]
+        if rows == 8
+        else [[1] * 64, [8] * 8, [3, 1, 4] * 8, [4] * 16, [1, 0, 3], [0]]
+    )
+    if capacity < rows:
+        shapes = [[4] * 16, [8] * 8, [3, 1, 4] * 4 + [8] * 4, [1, 0, 3], [0]]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        publish(shapes[0])
+        for _ in range(3):
+            run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            got = run()
+        stream.synchronize()
+        output_ptr = got.data_ptr()
+        metadata_ptr = metadata.indexer_meta["fp4_decode"].query_start_loc.data_ptr()
+
+        # Python-side launches must never run again: every shape replays the
+        # SAME captured row-group scorer and top-k.
+        def no_recapture(*args, **kwargs):
+            raise AssertionError("scorer was relaunched instead of replayed")
+
+        monkeypatch.setattr(deepseek_v4, "flydsl_pa_mqa_logits_fp4", no_recapture)
+        for counts in shapes[::-1] + shapes:
+            bounds = publish(counts)
+            ragged = metadata.indexer_meta["fp4_decode"]
+            assert ragged.query_start_loc.data_ptr() == metadata_ptr
+            assert ragged.query_start_loc.numel() == capacity + 1
+            assert ragged.max_qlen == 8
+            graph.replay()
+            stream.synchronize()
+            assert got.data_ptr() == output_ptr
+            n_real = sum(counts)
+            seq = [b for b, count in enumerate(counts) for _ in range(count)]
+            if n_real:
+                want = _oracle(
+                    q[:n_real],
+                    qs[:n_real],
+                    kv,
+                    ks,
+                    table[: len(counts)],
+                    width,
+                    weights[:n_real],
+                    lambda keys, seq=seq: keys[seq],
+                )
+                for row, end in enumerate(bounds[:n_real]):
+                    chosen = set(got[row][got[row] >= 0].tolist())
+                    best = set(want[row, :end].topk(topk).indices.tolist())
+                    assert len(chosen) == topk and max(chosen) < end
+                    assert len(chosen & best) / topk > 0.99
+            assert bool((got[n_real:] == -1).all())
+        publish(shapes[0], empty=True)
+        graph.replay()
+        stream.synchronize()
+        assert bool((got == -1).all())

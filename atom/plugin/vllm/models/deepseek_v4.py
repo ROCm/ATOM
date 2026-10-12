@@ -65,38 +65,6 @@ class IndexerVllm(IndexerBase):
     Python branches into any graph.
     """
 
-    def score_topk_from(
-        self,
-        q_quant: torch.Tensor,
-        weights: torch.Tensor,
-        q_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Reconcile padded projections before the eager scorer reads metadata."""
-        fc = get_forward_context()
-        attn_md = fc.attn_metadata
-        if (
-            not fc.context.is_dummy_run
-            and attn_md is not None
-            and attn_md.state is not AttnState.DECODE
-        ):
-            num_in = q_quant.size(0)
-            bid = attn_md.batch_id_per_q_token
-            num_real = bid.shape[0] if bid is not None else num_in
-            if num_real < num_in:
-                # The FP4 split scores before the attention adapter can clip.
-                # Q, weights and scales must match the real-sized bounds here.
-                out = super().score_topk_from(
-                    q_quant[:num_real],
-                    weights[:num_real],
-                    q_scale[:num_real] if q_scale is not None else None,
-                )
-                # The split's fake output and downstream dense graph still
-                # expect the padded bucket. Padding denotes no selected KV.
-                return torch.nn.functional.pad(
-                    out, (0, 0, 0, num_in - num_real), value=-1
-                )
-        return super().score_topk_from(q_quant, weights, q_scale)
-
     def indexer_score_topk(
         self,
         q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8 (this vLLM override handles the FP8 dispatch)
@@ -317,7 +285,6 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
         x: torch.Tensor | None = None,
         qr: torch.Tensor | None = None,
         qr_scale: torch.Tensor | None = None,
-        index_topk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # NARROW entry (see class docstring). The pieces upstream produced every
         # per-token tensor at the padded bucket width, but the sparse-attention
@@ -369,19 +336,10 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
                         _clip(x),
                         _clip(qr),
                         _clip(qr_scale),
-                        index_topk=_clip(index_topk),
                     )
                     return torch.nn.functional.pad(o, (0, 0, 0, num_in - num_real))
         return super()._sparse_attention(
-            qkn,
-            positions,
-            idx_q_quant,
-            idx_weights,
-            idx_q_scale,
-            x,
-            qr,
-            qr_scale,
-            index_topk=index_topk,
+            qkn, positions, idx_q_quant, idx_weights, idx_q_scale, x, qr, qr_scale
         )
 
 
