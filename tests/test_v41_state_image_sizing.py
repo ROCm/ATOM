@@ -125,3 +125,93 @@ def test_a_narrowed_image_takes_fewer_units():
     slot -- but the sizing must follow if it ever does."""
     s = sizing_from_geometry(geometry(), image_bytes=UNIT * 3)
     assert s.units == 3
+
+
+# --- the registration vLLM has to end up with ---------------------------
+
+
+def _spec(nbytes=UNIT, block=256, alignment=4096):
+    import torch
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return MambaSpec(
+        shapes=((nbytes,),), dtypes=(torch.uint8,), block_size=block,
+        num_prefill_checkpoint_blocks=1, prefill_checkpoint_alignment=alignment,
+        tp_replicated=False,
+    )
+
+
+def test_the_spec_holds_exactly_one_unit():
+    from atom.plugin.vllm.v41_state_image import image_kv_cache_spec
+
+    s = sizing_from_geometry(geometry())
+    spec = image_kv_cache_spec(s, 256, 4096)
+    assert spec.page_size_bytes == UNIT
+
+
+def test_the_spec_declares_itself_checkpointable():
+    """Without this the scheduler does not know these blocks can be
+    checkpointed at a prefill boundary, and nothing is ever stored."""
+    from atom.plugin.vllm.v41_state_image import image_kv_cache_spec
+
+    spec = image_kv_cache_spec(sizing_from_geometry(geometry()), 256, 4096)
+    assert spec.num_prefill_checkpoint_blocks == 1
+    assert spec.prefill_checkpoint_alignment == 4096
+
+
+def test_the_state_is_per_rank_not_replicated():
+    """Each TP rank holds its own ring and compressor tails; an image is that
+    rank's. Claiming replication would make one rank's image stand for all."""
+    from atom.plugin.vllm.v41_state_image import image_kv_cache_spec
+
+    assert image_kv_cache_spec(sizing_from_geometry(geometry()), 256, 4096).tp_replicated is False
+
+
+def test_a_complete_registration_passes():
+    from atom.plugin.vllm.v41_state_image import check_registration, expected_layer_names
+
+    s = sizing_from_geometry(geometry())
+    check_registration({n: _spec() for n in expected_layer_names(s)}, s)
+
+
+def test_too_few_layers_is_refused():
+    """The tail of every image would be missing, and nothing else would say so."""
+    from atom.plugin.vllm.v41_state_image import check_registration, expected_layer_names
+
+    s = sizing_from_geometry(geometry())
+    names = expected_layer_names(s)[:-1]
+    with pytest.raises(ValueError, match="missing="):
+        check_registration({n: _spec() for n in names}, s)
+
+
+def test_a_gap_in_the_numbering_is_refused():
+    """Unit i goes to layer i, so a hole shifts every unit after it."""
+    from atom.plugin.vllm.v41_state_image import check_registration, expected_layer_names, image_layer_name
+
+    s = sizing_from_geometry(geometry())
+    names = [n for n in expected_layer_names(s) if n != image_layer_name(3)]
+    names.append(image_layer_name(99))
+    with pytest.raises(ValueError, match="missing=|unexpected="):
+        check_registration({n: _spec() for n in names}, s)
+
+
+def test_an_undersized_layer_is_refused():
+    """Every image would be truncated, silently."""
+    from atom.plugin.vllm.v41_state_image import check_registration, expected_layer_names
+
+    s = sizing_from_geometry(geometry())
+    specs = {n: _spec() for n in expected_layer_names(s)}
+    specs[expected_layer_names(s)[2]] = _spec(nbytes=UNIT - 1)
+    with pytest.raises(ValueError, match="short of"):
+        check_registration(specs, s)
+
+
+def test_other_layers_are_ignored_by_the_check():
+    """The proxy and the model's own layers share this dict."""
+    from atom.plugin.vllm.v41_state_image import check_registration, expected_layer_names
+
+    s = sizing_from_geometry(geometry())
+    specs = {n: _spec() for n in expected_layer_names(s)}
+    specs["atom.dsv41.proxy"] = _spec(nbytes=1)
+    specs["model.layers.0.self_attn.attn"] = _spec(nbytes=1)
+    check_registration(specs, s)

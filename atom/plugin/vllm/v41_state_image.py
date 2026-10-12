@@ -156,3 +156,75 @@ def assert_agrees_with_spec(sizing: V41ImageSizing, spec) -> None:
                 f"V4.1 state image {field} disagrees: the scheduler half says "
                 f"{mine}, the runtime's checkpoint spec says {other}"
             )
+
+
+# --- the layers vLLM sees ------------------------------------------------
+#
+# One per image unit. They exist so vLLM allocates, hashes and evicts the
+# image blocks beside the proxy's, which is the whole mechanism: a hit is
+# reported only when the proxy blocks AND the image blocks are all cached, so
+# a prefix that comes back comes back whole.
+#
+# They are declared as `MambaSpec`, not because V4.1 has a Mamba state, but
+# because that is the spec vLLM's scheduler and KV-cache manager already
+# treat as "one block per request, checkpointed at a prefill boundary,
+# reusable by hash". `num_prefill_checkpoint_blocks` and
+# `prefill_checkpoint_alignment` are theirs; `compute_mamba_prefill_checkpoints`
+# decides the boundary. Declaring anything else would mean re-implementing
+# that, and the scheduler would not know these blocks are checkpointable.
+
+
+def image_kv_cache_spec(sizing: V41ImageSizing, block_size: int, alignment: int):
+    """The spec for one image unit.
+
+    `shapes`/`dtypes` are a flat byte run rather than a tensor shape with
+    meaning: the copier addresses the image by byte range through its own
+    descriptor kernel and never reads a shape, so giving one here would be a
+    second description of the same bytes for nothing to check against.
+    """
+    import torch
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return MambaSpec(
+        shapes=((sizing.unit_bytes,),),
+        dtypes=(torch.uint8,),
+        block_size=block_size,
+        # One checkpoint block per request: an image is written at a boundary
+        # and read at a hit, never accumulated.
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=alignment,
+        # The slot is per rank, not replicated: each TP rank holds its own
+        # ring and its own compressor tails, and an image is that rank's.
+        tp_replicated=False,
+    )
+
+
+def expected_layer_names(sizing: V41ImageSizing) -> list[str]:
+    return [image_layer_name(i) for i in range(sizing.units)]
+
+
+def check_registration(specs: dict, sizing: V41ImageSizing) -> None:
+    """Refuse a registration that cannot hold an image, naming what is wrong.
+
+    Three ways it goes wrong quietly, and all three end as bytes read from
+    somewhere nothing wrote: too few layers (the tail of every image is
+    missing), a layer sized under a unit (every image is truncated), and a
+    gap in the numbering (unit *i* is written to layer *i*, so a hole shifts
+    every unit after it).
+    """
+    found = sorted(name for name in specs if is_image_layer(name))
+    want = expected_layer_names(sizing)
+    if found != sorted(want):
+        missing = sorted(set(want) - set(found))
+        extra = sorted(set(found) - set(want))
+        raise ValueError(
+            f"V4.1 state image needs {sizing.units} layers; "
+            f"missing={missing or 'none'} unexpected={extra or 'none'}"
+        )
+    for name in want:
+        got = int(specs[name].page_size_bytes)
+        if got < sizing.unit_bytes:
+            raise ValueError(
+                f"{name} holds {got} B, short of the {sizing.unit_bytes} a "
+                "PAGE unit needs; every image would be truncated"
+            )
