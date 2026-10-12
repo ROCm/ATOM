@@ -201,6 +201,15 @@ and asynchronous weight-update utility sends are rejected because they have no
 owner to finish or abort them. ``AsyncLLMEngine.get_weight_sync_status()``
 reports a fence, an in-progress session and its last failure.
 
+Every update carries the id of the sync it belongs to: one per
+``weight_sync_session()`` until that sync finishes, and one per update sent
+outside a session. A session whose update failed sends nothing more, and an
+engine refuses the remaining updates and the finish of a failed or aborted
+sync, so the rest of a failed sync cannot commit as a new one. Recovering takes
+a new, complete sync. Weights may be resumed while fenced, since after
+``sleep(level=2)`` only a resume gives released parameters storage again; the
+fence keeps serving off until that complete sync commits.
+
 ## Sequence lifecycle
 
 The `Sequence` class (in `atom/model_engine/sequence.py`) is the central data structure tracking a single request through the engine.

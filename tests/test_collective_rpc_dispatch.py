@@ -392,79 +392,102 @@ def test_any_failed_bucket_fences_an_engine_that_was_awake():
     assert not engine._is_rl_weights_offloaded
 
 
-def test_wake_up_cannot_unfence_a_failed_update_but_a_complete_sync_can():
-    h, mgr, out = _handler(
-        replies=[RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]
-    )
-    engine = _Engine()
-    engine._is_rl_weights_offloaded = False
-    engine._weight_sync_fenced = False
-    engine._rl_weights_inconsistent = False
-    _process_one(h, out, engine, "update_weights_shm", {"is_last": False})
-
-    (resume,) = _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
-    assert "weight sync is fenced" in resume["error"]
-    assert engine._weight_sync_fenced
-    assert not engine._is_rl_weights_offloaded
-    assert engine._rl_weights_inconsistent
-
-    mgr._replies = _counts(4, 4)
-    _process_one(
-        h, out, engine, "update_weights_shm", {"is_last": True, "request_id": "last"}
-    )
-    assert engine._weight_sync_fenced
-    assert engine._rl_weights_inconsistent
-
-    _process_one(h, out, engine, "finish_weight_sync", {"completed_request_id": "last"})
-    assert not engine._weight_sync_fenced
-    assert not engine._is_rl_weights_offloaded
-    assert not engine._rl_weights_inconsistent
-
-
 _TWO_RANKS_OK = _counts(4, 4)
 _ONE_RANK_FAILED = [RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]
 
 
+def _bucket(request_id, is_last, sync_id="s1"):
+    return {"sync_id": sync_id, "request_id": request_id, "is_last": is_last}
+
+
+def test_a_failed_sync_recovers_through_sleep_wake_up_and_a_new_sync():
+    """The RL loop after a failed bucket: sleep(level=2) releases the weights,
+    wake_up gives them storage back, then a new sync commits. wake_up was
+    refused while fenced, and only it re-allocates a released parameter, so no
+    later sync could complete and the engine stayed fenced until a restart."""
+    h, mgr, out = _handler(replies=_ONE_RANK_FAILED)
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+
+    mgr._replies = _counts(True, True)
+    _process_one(h, out, engine, "release_memory", {"tags": ["weights"]})
+    assert engine._is_rl_weights_offloaded
+    (resume,) = _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
+    assert "error" not in resume
+    assert not engine._is_rl_weights_offloaded
+    # The storage is back, but nothing in it is a model yet.
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+
+    mgr._replies = _TWO_RANKS_OK
+    _process_one(
+        h, out, engine, "update_weights_shm", _bucket("u2", True, sync_id="s2")
+    )
+    (finish,) = _process_one(
+        h,
+        out,
+        engine,
+        "finish_weight_sync",
+        {"sync_id": "s2", "completed_request_id": "u2"},
+    )
+    assert finish == {"cmd": "finish_weight_sync", "result": True}
+    assert not engine._weight_sync_fenced
+    assert not engine._rl_weights_inconsistent
+    assert not engine._is_rl_weights_offloaded
+
+
 @pytest.mark.parametrize(
-    ("replies", "steps", "finish"),
+    ("replies", "steps", "finish", "refusal"),
     [
         pytest.param(
             _ONE_RANK_FAILED,
-            [("update_weights_shm", {"is_last": True, "request_id": "u1"})],
-            {"completed_request_id": "u1"},
+            [("update_weights_shm", _bucket("u1", True))],
+            {"sync_id": "s1", "completed_request_id": "u1"},
+            "weight sync 's1' failed",
             id="its update failed",
         ),
         pytest.param(
             _TWO_RANKS_OK,
-            [("update_weights_ipc", {"is_last": False, "request_id": "u1"})],
-            {"completed_request_id": "u1"},
+            [("update_weights_ipc", _bucket("u1", False))],
+            {"sync_id": "s1", "completed_request_id": "u1"},
+            "no complete weight update",
             id="only a non-final bucket",
         ),
         pytest.param(
             _TWO_RANKS_OK,
-            [("update_weights_ipc", {"is_last": True, "request_id": "u1"})],
-            {"completed_request_id": "forged"},
+            [("update_weights_ipc", _bucket("u1", True))],
+            {"sync_id": "s1", "completed_request_id": "forged"},
+            "no complete weight update",
             id="a different update",
         ),
         pytest.param(
             _TWO_RANKS_OK,
-            [("update_weights", {"request_id": "u1"})],
-            {},
+            [("update_weights", {"sync_id": "s1", "request_id": "u1"})],
+            {"sync_id": "s1"},
+            "no complete weight update",
             id="no update named",
         ),
         pytest.param(
             _TWO_RANKS_OK,
             [
-                ("update_weights_shm", {"is_last": True, "request_id": "u1"}),
+                ("update_weights_shm", _bucket("u1", True)),
                 ("discard_failed_weight_sync", {}),
             ],
-            {"completed_request_id": "u1"},
+            {"sync_id": "s1", "completed_request_id": "u1"},
+            "weight sync 's1' failed",
             id="its update was aborted",
+        ),
+        pytest.param(
+            _TWO_RANKS_OK,
+            [("update_weights_shm", _bucket("u1", True))],
+            {"sync_id": "s2", "completed_request_id": "u1"},
+            "is not the sync this engine is in",
+            id="a different sync",
         ),
     ],
 )
 def test_finish_cannot_unfence_an_engine_with_no_complete_update_to_commit(
-    replies, steps, finish
+    replies, steps, finish, refusal
 ):
     """A finish cleared the fence and the inconsistent flag whatever had come
     before it, so one reaching an engine any other way served whatever its
@@ -477,9 +500,54 @@ def test_finish_cannot_unfence_an_engine_with_no_complete_update_to_commit(
 
     (reply,) = _process_one(h, out, engine, "finish_weight_sync", finish)
 
-    assert "no complete weight update" in reply["error"]
+    assert refusal in reply["error"]
     assert engine._weight_sync_fenced
     assert engine._rl_weights_inconsistent is inconsistent
+
+
+def test_the_rest_of_a_failed_sync_cannot_commit():
+    """Bucket b2 of sync s1 failed and was discarded. A caller that swallowed
+    that error and sent the last bucket anyway committed a model missing b2:
+    nothing told the rest of s1 apart from a new one-bucket sync."""
+    h, mgr, out = _handler(replies=_TWO_RANKS_OK)
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("b1", False))
+    mgr._replies = _ONE_RANK_FAILED
+    _process_one(h, out, engine, "update_weights_shm", _bucket("b2", False))
+    _process_one(h, out, engine, "discard_failed_weight_sync", {})
+
+    mgr._replies = _TWO_RANKS_OK
+    (last,) = _process_one(h, out, engine, "update_weights_shm", _bucket("b3", True))
+    (finish,) = _process_one(
+        h,
+        out,
+        engine,
+        "finish_weight_sync",
+        {"sync_id": "s1", "completed_request_id": "b3"},
+    )
+
+    assert "already failed" in last["error"]
+    assert "error" in finish
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+    sent = [call for call in mgr.calls if call[0] == "update_weights_from_shm"]
+    assert len(sent) == 2, "the refused bucket must not reach the workers"
+
+
+def test_a_new_sync_first_clears_what_an_abandoned_one_left():
+    """A sync that stopped between buckets without an abort left its packed
+    shards and cached IPC mapping on the workers, for the next sync to build
+    on."""
+    h, mgr, out = _handler(replies=_TWO_RANKS_OK)
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_ipc", _bucket("a1", False))
+    _process_one(
+        h, out, engine, "update_weights_ipc", _bucket("b1", True, sync_id="s2")
+    )
+    assert [call[0] for call in mgr.calls] == [
+        "update_weights_from_ipc",
+        "discard_failed_weight_sync",
+        "update_weights_from_ipc",
+    ]
 
 
 def test_a_global_abort_fences_an_engine_whose_local_update_succeeded():

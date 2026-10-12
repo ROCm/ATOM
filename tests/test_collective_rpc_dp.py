@@ -484,7 +484,8 @@ def test_no_caller_can_finish_or_abort_a_sync_it_does_not_own(send, refusal):
 
 
 def test_the_session_that_owns_a_sync_can_still_abort_it():
-    """The bucket senders abandon a sync from inside their own session."""
+    """The bucket senders abandon a sync from inside their own session, and
+    nothing more of that sync can follow."""
     mgr = _mgr(2)
     mgr.broadcast_utility_command = _answering(
         mgr, [{"cmd": "discard_failed_weight_sync", "result": True}] * 2
@@ -493,7 +494,56 @@ def test_the_session_that_owns_a_sync_can_still_abort_it():
         mgr.broadcast_utility_command_sync(
             "discard_failed_weight_sync", timeout=5, failed_cmd="update_weights_shm"
         )
+        with pytest.raises(RuntimeError, match="already failed"):
+            mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
     assert [cmd for cmd, _ in mgr.sent] == ["discard_failed_weight_sync"]
+
+
+def test_a_failed_session_sends_none_of_the_rest_of_its_sync():
+    """The caller swallowed the failed bucket's RuntimeError and went on, and
+    the last bucket then committed the sync as though the failed one landed."""
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "update_weights_shm", "error": "RuntimeError: boom"}]
+    )
+    with mgr.weight_sync_session():
+        with pytest.raises(RuntimeError, match="boom"):
+            mgr.broadcast_utility_command_sync("update_weights_shm", is_last=False)
+        mgr.broadcast_utility_command = _answering(
+            mgr, [{"cmd": "update_weights_shm", "result": 1}]
+        )
+        with pytest.raises(RuntimeError, match="already failed"):
+            mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
+    assert [cmd for cmd, _ in mgr.sent] == [
+        "update_weights_shm",
+        "discard_failed_weight_sync",
+    ]
+
+    # A new session is a new sync, and that one can complete.
+    with mgr.weight_sync_session():
+        mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
+    assert mgr.sent[-1][0] == "finish_weight_sync"
+
+
+def test_a_sync_keeps_one_id_from_its_first_bucket_to_its_finish():
+    """The id is all that tells the engines where a sync starts."""
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "update_weights_shm", "result": 1}]
+    )
+    with mgr.weight_sync_session():
+        mgr.broadcast_utility_command_sync("update_weights_shm", is_last=False)
+        mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
+        mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
+    mgr.broadcast_utility_command_sync("update_weights", named_tensors=[])
+
+    # bucket, bucket, finish | the session's next sync: bucket, finish |
+    # outside any session: update, finish
+    ids = [kw["sync_id"] for _, kw in mgr.sent]
+    assert len(ids) == 7
+    assert ids[0] == ids[1] == ids[2]
+    assert ids[3] == ids[4] != ids[0]
+    assert ids[5] == ids[6] not in (ids[0], ids[3])
 
 
 def test_sync_raises_the_cause_when_an_engine_reports_an_error():

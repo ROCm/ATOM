@@ -117,7 +117,11 @@ class EngineUtilityHandler:
         self.scheduler = scheduler
         self._weight_sync_fenced = False
         self._weight_sync_in_progress = False
+        # Why the current sync can no longer complete. Its later updates and
+        # its FINISH are refused while this is set.
         self._weight_sync_failure: str | None = None
+        # The sync the last weight update belonged to; a new id starts a new one.
+        self._sync_id: str | None = None
         # Request id of the complete update this engine applied, the only one
         # a FINISH may commit.
         self._awaiting_finish: str | None = None
@@ -143,9 +147,11 @@ class EngineUtilityHandler:
                     # can still fail this bucket. Stay fenced until CoreManager
                     # explicitly finishes a complete sync on every engine.
                     self._weight_sync_fenced = True
-                    self._weight_sync_in_progress = True
                     self._awaiting_finish = None
                     engine._weight_sync_fenced = True
+                    if args.get("sync_id") != self._sync_id:
+                        self._begin_weight_sync(args.get("sync_id"))
+                    self._weight_sync_in_progress = True
                 reply = self._execute_utility_command(cmd, args)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
@@ -168,12 +174,20 @@ class EngineUtilityHandler:
                         isinstance(reply, dict) and reply.get("error")
                     ):
                         engine._is_rl_weights_offloaded = False
-                        logger.info(f"{self.label}: engine exited sleep mode")
+                        if self._weight_sync_fenced:
+                            logger.warning(
+                                f"{self.label}: weights resumed, but serving "
+                                f"stays fenced until a complete sync succeeds"
+                            )
+                        else:
+                            logger.info(f"{self.label}: engine exited sleep mode")
                 elif cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                     failed = isinstance(reply, dict) and bool(reply.get("error"))
                     if failed:
                         self._weight_sync_in_progress = False
-                        self._weight_sync_failure = str(reply["error"])
+                        self._weight_sync_failure = self._weight_sync_failure or str(
+                            reply["error"]
+                        )
                         engine._rl_weights_inconsistent = True
                         logger.error(
                             f"{self.label}: weight update failed; serving stays "
@@ -185,7 +199,7 @@ class EngineUtilityHandler:
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
                     self._awaiting_finish = None
-                    self._weight_sync_failure = str(
+                    self._weight_sync_failure = self._weight_sync_failure or str(
                         args.get("error") or args.get("failed_cmd") or "aborted"
                     )
                     engine._rl_weights_inconsistent = True
@@ -350,6 +364,26 @@ class EngineUtilityHandler:
             )
         )
 
+    def _begin_weight_sync(self, sync_id: str | None) -> None:
+        """Start *sync_id* from a clean slate.
+
+        Its id is all that marks a sync's first update. Without one, the rest
+        of a failed sync's buckets passed for a new sync and committed.
+        """
+        abandoned = self._weight_sync_in_progress
+        self._sync_id = sync_id
+        self._weight_sync_failure = None
+        if abandoned:
+            # The previous sync stopped between buckets and was never aborted;
+            # its packed shards and IPC mapping must not carry into this one.
+            reply = self._discard_failed_update_on_every_rank(
+                "abandoned weight sync", _FAILED_SYNC_CLEANUP_TIMEOUT_S
+            )
+            if reply.get("error"):
+                self._weight_sync_failure = (
+                    f"the abandoned sync's scratch was not cleared: {reply['error']}"
+                )
+
     def _update_on_every_rank(
         self, cmd: str, method: str, args: dict, *call_args, barrier: bool = False
     ) -> dict:
@@ -369,6 +403,12 @@ class EngineUtilityHandler:
         finished, so none moves on while another still reads the caller's
         shared buffer.
         """
+        if self._weight_sync_failure is not None:
+            return {
+                "cmd": cmd,
+                "error": f"weight sync {self._sync_id!r} already failed, so "
+                f"this update cannot complete it: {self._weight_sync_failure}",
+            }
         payload = RpcPayload(
             request_id=f"{cmd}-{uuid.uuid4().hex}", args=call_args, barrier=barrier
         )
@@ -432,14 +472,25 @@ class EngineUtilityHandler:
         """Commit the complete update this engine applied, once CoreManager
         has heard every DP engine apply it."""
         completed = args.get("completed_request_id")
-        if completed is None or completed != self._awaiting_finish:
-            reply = {
-                "cmd": FINISH_WEIGHT_SYNC_CMD,
-                "error": f"no complete weight update {completed!r} succeeded "
-                f"on this engine since its last sync ended",
-            }
+        sync_id = args.get("sync_id")
+        if sync_id is None or sync_id != self._sync_id:
+            error = (
+                f"weight sync {sync_id!r} is not the sync this engine is in "
+                f"({self._sync_id!r})"
+            )
+        elif self._weight_sync_failure is not None:
+            error = f"weight sync {sync_id!r} failed: {self._weight_sync_failure}"
+        elif completed is None or completed != self._awaiting_finish:
+            error = (
+                f"no complete weight update {completed!r} succeeded on this "
+                f"engine since its last sync ended"
+            )
         else:
+            error = None
+        if error is None:
             reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "result": True}
+        else:
+            reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "error": error}
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
@@ -553,16 +604,13 @@ class EngineUtilityHandler:
         return reply
 
     def _handle_resume_memory(self, args: dict) -> dict:
-        """Handle memory resume command (wake up mode)."""
+        """Handle memory resume command (wake up mode).
+
+        Allowed while the weight sync is fenced: a released parameter gets its
+        storage back only here, so refusing left a failed sync nothing to write
+        its retry into. The fence, not residency, is what keeps serving off.
+        """
         tags = args.get("tags", ["weights", "kv_cache"])
-        if "weights" in tags and self._weight_sync_fenced:
-            reply = {
-                "cmd": "resume_memory",
-                "error": "weight sync is fenced; complete a full sync or inspect "
-                "get_weight_sync_status before resuming weights",
-            }
-            self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
-            return reply
         reply = self._utility_on_every_rank(
             "resume_memory",
             "resume_memory",

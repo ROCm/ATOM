@@ -1544,14 +1544,24 @@ class CoreManager:
 
     @contextmanager
     def weight_sync_session(self):
-        """Serialize one complete direct/SHM/IPC synchronization session."""
+        """Serialize one direct/SHM/IPC synchronization session.
+
+        Its updates share one sync id until that sync finishes, and none can
+        be sent once it has failed: the engines would otherwise take the rest
+        of a failed sync's buckets for a new sync and commit them. A nested
+        session joins the outer one's sync.
+        """
         with self._weight_sync_lock:
-            previous = getattr(self._weight_sync_context, "active", False)
-            self._weight_sync_context.active = True
+            ctx = self._weight_sync_context
+            outer = getattr(ctx, "active", False)
+            if not outer:
+                ctx.sync_id = uuid.uuid4().hex
+                ctx.failure = None
+            ctx.active = True
             try:
                 yield
             finally:
-                self._weight_sync_context.active = previous
+                ctx.active = outer
 
     def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
         """Fence every engine this reaches and drop the failed sync's scratch.
@@ -1591,11 +1601,15 @@ class CoreManager:
                 f"{self.label}: {cmd!r} commits a weight sync; only the sync "
                 f"whose complete update succeeded on every DP engine sends it"
             )
-        if cmd == DISCARD_WEIGHT_SYNC_CMD and not owns_sync:
-            raise ValueError(
-                f"{self.label}: {cmd!r} aborts the weight sync in flight; send "
-                f"it from inside the `with weight_sync_session()` that owns it"
-            )
+        if cmd == DISCARD_WEIGHT_SYNC_CMD:
+            if not owns_sync:
+                raise ValueError(
+                    f"{self.label}: {cmd!r} aborts the weight sync in flight; "
+                    f"send it from inside the `with weight_sync_session()` that "
+                    f"owns it"
+                )
+            ctx = self._weight_sync_context
+            ctx.failure = ctx.failure or "aborted by its sender"
         is_nonfinal_bucket = cmd in WEIGHT_UPDATE_UTILITY_CMDS and not (
             completes_weight_sync(cmd, kwargs)
         )
@@ -1614,15 +1628,45 @@ class CoreManager:
             # Re-entrant, so the weight_sync_session() a bucket belongs to
             # takes it again rather than waiting on itself.
             with self._weight_sync_lock:
-                return self._broadcast_and_wait(cmd, timeout, **kwargs)
+                return self._sync_weight_update(cmd, timeout, owns_sync, kwargs)
         return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def _sync_weight_update(
+        self, cmd: str, timeout: float, in_session: bool, kwargs: dict
+    ):
+        """Send one weight update tagged with the sync it belongs to.
+
+        Outside a session the update is a whole sync on its own. Inside one, a
+        failure closes the session's sync and a finish starts its next one.
+        """
+        if not in_session:
+            return self._broadcast_and_wait(
+                cmd, timeout, sync_id=uuid.uuid4().hex, **kwargs
+            )
+        ctx = self._weight_sync_context
+        if ctx.failure is not None:
+            raise RuntimeError(
+                f"{self.label}: this session's weight sync already failed "
+                f"({ctx.failure}), and a failed sync cannot be completed; "
+                f"retry it from a new weight_sync_session()"
+            )
+        try:
+            responses = self._broadcast_and_wait(
+                cmd, timeout, sync_id=ctx.sync_id, **kwargs
+            )
+        except BaseException as exc:
+            ctx.failure = f"{cmd}: {type(exc).__name__}: {exc}"
+            raise
+        if completes_weight_sync(cmd, kwargs):
+            ctx.sync_id = uuid.uuid4().hex
+        return responses
 
     def _broadcast_and_wait(self, cmd: str, timeout: float, **kwargs):
         """The round trip behind broadcast_utility_command_sync, unchecked.
 
-        That method has already refused what its caller may not send and
-        taken the session lock for an update; the only other caller is the
-        FINISH below, which runs under the update's lock.
+        That method has already refused what its caller may not send, and for
+        an update has taken the session lock and named the update's sync. The
+        only other caller is the FINISH below, which runs under that lock.
         """
         timeout = checked_timeout(timeout)
         request_id = uuid.uuid4().hex
@@ -1684,6 +1728,7 @@ class CoreManager:
                 self._broadcast_and_wait(
                     FINISH_WEIGHT_SYNC_CMD,
                     _WEIGHT_SYNC_FINISH_TIMEOUT_S,
+                    sync_id=kwargs.get("sync_id"),
                     completed_cmd=cmd,
                     completed_request_id=request_id,
                 )
