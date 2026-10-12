@@ -11,17 +11,78 @@ import triton
 from rtp_llm.model_factory_register import _model_factory
 from rtp_llm.ops import DataType, HybridAttentionType
 
-from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
+from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
+from atom.models.qwen4_exp import (
+    Qwen4ExpDecoderLayer,
+    qwen4_exp_packed_modules_mapping,
+)
 from atom.plugin.rtpllm.models.qwen3_5 import _ATOMQwen35MoeRuntime
 from atom.plugin.rtpllm.models.qwen4_exp import (
     ATOMQwen4Exp,
+    ATOMQwen4ExpMTP,
+    _ATOMQwen4ExpMTPRuntime,
     _ATOMQwen4ExpRuntime,
 )
 from atom.plugin.rtpllm.utils import qwen4_exp_context
+from atom.plugin.rtpllm.utils.forward_context import (
+    _target_verify_state_slots_graph_kernel,
+)
 from atom.plugin.rtpllm.utils.qwen4_exp_context import (
     RTPQwen4ExpContext,
     _qsa_graph_slots_kernel,
 )
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_ple_writes_every_verify_prefix_in_reverse_order(
+    monkeypatch, draft_steps
+):
+    from atom.models import qwen4_exp as qwen4_exp_module
+
+    width = draft_steps + 1
+    write_slots = torch.tensor(
+        [list(range(10, 10 + width)), list(range(20, 20 + width))],
+        dtype=torch.int32,
+    )
+    metadata = Qwen4ExpPLEMetadata(
+        rtp_spec_state_indices=write_slots,
+        state_indices_out=write_slots[:, -1],
+        query_start_loc=torch.arange(0, 2 * width + 1, width, dtype=torch.int32),
+        ngram_state=torch.empty(0),
+        state_indices_in=torch.tensor([9, 19], dtype=torch.int32),
+        has_initial_state=torch.ones(2, dtype=torch.bool),
+        conv_state=torch.empty(0),
+    )
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=SimpleNamespace(ple_metadata=metadata)),
+    )
+    calls = []
+
+    def forward_with_state(hidden, ids, call_metadata):
+        calls.append(
+            (
+                ids.tolist(),
+                call_metadata.query_start_loc.tolist(),
+                call_metadata.state_indices_out.tolist(),
+            )
+        )
+        return torch.ones_like(hidden)
+
+    layer = SimpleNamespace(ple=SimpleNamespace(forward_with_state=forward_with_state))
+    ids = torch.arange(2 * width)
+    hidden = torch.zeros(2 * width, 3)
+    result = Qwen4ExpDecoderLayer._apply_ple(layer, hidden, ids)
+
+    assert torch.equal(result, torch.ones_like(hidden))
+    assert [len(call[0]) // 2 for call in calls] == list(range(width, 0, -1))
+    for prefix_len, (called_ids, starts, slots) in zip(range(width, 0, -1), calls):
+        assert called_ids == (
+            list(range(prefix_len)) + list(range(width, width + prefix_len))
+        )
+        assert starts == [0, prefix_len, 2 * prefix_len]
+        assert slots == [10 + prefix_len - 1, 20 + prefix_len - 1]
 
 
 def test_qwen4_exp_ngram_mapping_is_shared_across_plugin_paths():
@@ -95,6 +156,34 @@ quant_config.remap_layer_name.assert_called_once()
         [sys.executable, "-c", script], check=False, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_qwen4_exp_target_forward_restores_its_atom_config(monkeypatch):
+    from atom import config as atom_config_module
+    from atom.config import get_current_atom_config, set_current_atom_config
+
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    target_config = SimpleNamespace(name="target")
+    draft_config = SimpleNamespace(name="draft")
+    runtime.model = SimpleNamespace(atom_config=target_config)
+    runtime._rtp_model_config = SimpleNamespace(atom_qwen4_exp_mtp_target=False)
+    expected = object()
+
+    def parent_forward(_self, _inputs, _fmha_impl):
+        assert get_current_atom_config() is target_config
+        return expected
+
+    monkeypatch.setattr(_ATOMQwen35MoeRuntime, "forward", parent_forward)
+    previous = atom_config_module._current_atom_config
+    set_current_atom_config(draft_config)
+    try:
+        result = _ATOMQwen4ExpRuntime.forward(
+            runtime, SimpleNamespace(attention_inputs=None), None
+        )
+        assert result is expected
+        assert get_current_atom_config() is draft_config
+    finally:
+        set_current_atom_config(previous)
 
 
 def test_lazy_model_registry_mapping_accessors_resolve_classes():
@@ -173,6 +262,18 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path):
             SimpleNamespace(seq_size_per_block=64, multi_task_prompt="tasks.json"),
         )
 
+    text_config["mtp_num_hidden_layers"] = 1
+    text_config["mtp"] = {"layer_types": ["full_attention"]}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": text_config}))
+    draft = ATOMQwen4ExpMTP._create_config(str(tmp_path))
+    assert draft.is_mtp and draft.num_layers == 1
+    draft.init_precision_config(None, None)
+    draft.attn_config.tokens_per_block = 64
+    ATOMQwen4ExpMTP._apply_kv_cache_config(
+        draft, SimpleNamespace(seq_size_per_block=64, reuse_cache=True)
+    )
+    assert draft.auxiliary_paged_cache_bytes_per_block == qsa_bytes
+
 
 def test_qwen4_exp_cuda_graph_switch(monkeypatch):
     monkeypatch.setenv("ENABLE_CUDA_GRAPH", "1")
@@ -195,6 +296,108 @@ def test_qwen4_exp_graph_uses_refreshed_device_sequence_lengths(monkeypatch):
     assert runtime._extract_positions(inputs, torch.device("cpu"), 2).tolist() == [
         64,
         129,
+    ]
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_graph_builds_positions_per_request(monkeypatch, draft_steps):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    width = draft_steps + 1
+    runtime._rtp_model_config = SimpleNamespace(gen_num_per_cycle=draft_steps)
+    runtime._cg_meta_bufs = {
+        "qwen4_positions_i32": torch.empty(2 * width, dtype=torch.int32)
+    }
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=True,
+            is_target_verify=True,
+            is_cuda_graph=True,
+            sequence_lengths_plus_1_device=torch.tensor([17, 130], dtype=torch.int32),
+        )
+    )
+    assert runtime._extract_positions(
+        inputs, torch.device("cpu"), 2 * width
+    ).tolist() == list(range(16, 16 + width)) + list(range(129, 129 + width))
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_draft_graph_uses_prefix_lengths(monkeypatch, draft_steps):
+    runtime = object.__new__(_ATOMQwen4ExpMTPRuntime)
+    width = draft_steps + 1
+    runtime._rtp_model_config = SimpleNamespace(
+        is_mtp=True, gen_num_per_cycle=draft_steps
+    )
+    runtime._cg_meta_bufs = {
+        "qwen4_positions_i32": torch.empty(2 * width, dtype=torch.int32)
+    }
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=True,
+            is_target_verify=False,
+            is_cuda_graph=True,
+            prefix_lengths_device=torch.tensor([16, 129], dtype=torch.int32),
+        )
+    )
+    assert runtime._extract_positions(
+        inputs, torch.device("cpu"), 2 * width
+    ).tolist() == list(range(16, 16 + width)) + list(range(129, 129 + width))
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_verify_keeps_per_candidate_state(draft_steps):
+    width = draft_steps + 1
+    block_table = torch.tensor(
+        [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]], dtype=torch.int32
+    )
+    linear = SimpleNamespace(
+        is_prefill=True,
+        is_target_verify=True,
+        input_lengths=torch.tensor([width, width], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, width, 2 * width], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=block_table,
+        sequence_lengths_plus_1_device=torch.tensor([2, 17], dtype=torch.int32),
+    )
+    metadata = RTPQwen4ExpContext._build_gdn_metadata(
+        linear, seq_size_per_block=16, num_tokens=2 * width
+    )
+    assert metadata.num_spec_decodes == 2
+    assert metadata.spec_state_indices_in_tensor.tolist() == [
+        [10] * width,
+        [20] * width,
+    ]
+    assert metadata.spec_state_indices_tensor.tolist() == [
+        list(range(10, 10 + width)),
+        list(range(21, 21 + width)),
+    ]
+    assert (
+        metadata.spec_state_indices_in_tensor.stride()
+        == metadata.spec_state_indices_tensor.stride()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_graph_target_slots(draft_steps):
+    width = draft_steps + 1
+    device = torch.device("cuda")
+    table = torch.tensor(
+        [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24], [0, 0, 0, 0, 0]],
+        dtype=torch.int32,
+        device=device,
+    )
+    lengths = torch.tensor([17, 32, 2], dtype=torch.int32, device=device)
+    reads = torch.empty((3, width), dtype=torch.int32, device=device)
+    writes = torch.empty_like(reads)
+    _target_verify_state_slots_graph_kernel[(1,)](
+        table, lengths, reads, writes, 3, *table.stride(), 5, 16, width, 128
+    )
+    assert reads.cpu().tolist() == [[10] * width, [21] * width, [0] * width]
+    assert writes.cpu().tolist() == [
+        list(range(11, 11 + width)),
+        list(range(21, 21 + width)),
+        [0] * width,
     ]
 
 
@@ -221,7 +424,16 @@ def test_qwen4_exp_graph_prewarms_qsa_caches_before_capture(monkeypatch):
     monkeypatch.setattr(
         _ATOMQwen35MoeRuntime,
         "_ensure_cuda_graph_prewarmed",
-        lambda self: setattr(self, "_cg_meta_bufs", {}),
+        lambda self: setattr(
+            self,
+            "_cg_meta_bufs",
+            {
+                "seq_id": torch.arange(self._cg_max_num_tokens, dtype=torch.int64),
+                "block_table_i32": torch.empty(
+                    self._cg_max_num_tokens, 3, dtype=torch.int32
+                ),
+            },
+        ),
     )
     calls = []
     qsa = SimpleNamespace(is_qsa_attention=True)
@@ -238,6 +450,105 @@ def test_qwen4_exp_graph_prewarms_qsa_caches_before_capture(monkeypatch):
 
     assert calls == [(runtime, [qsa], 64)]
     assert runtime._cg_meta_bufs["physical_block_table_i32"].shape == (2, 3)
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_graph_prewarms_verify_window(monkeypatch, draft_steps):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    monkeypatch.setattr(
+        _ATOMQwen35MoeRuntime,
+        "_ensure_cuda_graph_prewarmed",
+        lambda self: setattr(
+            self,
+            "_cg_meta_bufs",
+            {
+                "seq_id": torch.arange(self._cg_max_num_tokens, dtype=torch.int64),
+                "block_table_i32": torch.empty(
+                    self._cg_max_num_tokens, 3, dtype=torch.int32
+                ),
+            },
+        ),
+    )
+    width = draft_steps + 1
+    runtime._rtp_model_config = SimpleNamespace(
+        atom_qwen4_exp_mtp_target=True, gen_num_per_cycle=draft_steps
+    )
+    runtime._rtp_layer_maps = ({}, {}, {})
+    runtime.kv_cache = SimpleNamespace(get_seq_size_per_block=lambda _: 64)
+    runtime._cg_max_num_tokens = 3
+    runtime._cg_max_seq_len = 128
+    runtime._get_model_device = lambda: torch.device("cpu")
+
+    runtime._ensure_cuda_graph_prewarmed()
+
+    buffers = runtime._cg_meta_bufs
+    assert buffers["query_start_loc"].tolist() == [i * width for i in range(4)]
+    assert buffers["seq_id"].tolist() == [i for i in range(3) for _ in range(width)]
+    assert buffers["seq_id_i32"].tolist() == buffers["seq_id"].tolist()
+    assert buffers["slot_mapping"].shape == (3 * width,)
+    assert buffers["target_read_slots_i32"].shape == (3, width)
+    assert buffers["target_write_slots_i32"].shape == (3, width)
+    assert buffers["block_table_i32"].shape == (3, 3 + draft_steps)
+    assert buffers["physical_block_table_i32"].shape == (3 * width, 2 + width)
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_draft_graph_prewarms_verify_window(monkeypatch, draft_steps):
+    runtime = object.__new__(_ATOMQwen4ExpMTPRuntime)
+    monkeypatch.setattr(
+        _ATOMQwen35MoeRuntime,
+        "_ensure_cuda_graph_prewarmed",
+        lambda self: setattr(
+            self,
+            "_cg_meta_bufs",
+            {
+                "seq_id": torch.arange(self._cg_max_num_tokens, dtype=torch.int64),
+                "block_table_i32": torch.empty(
+                    self._cg_max_num_tokens, 3, dtype=torch.int32
+                ),
+            },
+        ),
+    )
+    width = draft_steps + 1
+    runtime._rtp_model_config = SimpleNamespace(
+        is_mtp=True, gen_num_per_cycle=draft_steps
+    )
+    runtime._rtp_layer_maps = ({}, {}, {})
+    runtime.kv_cache = SimpleNamespace(get_seq_size_per_block=lambda _: 64)
+    runtime._cg_max_num_tokens = 3
+    runtime._cg_max_seq_len = 128
+    runtime._get_model_device = lambda: torch.device("cpu")
+
+    runtime._ensure_cuda_graph_prewarmed()
+
+    buffers = runtime._cg_meta_bufs
+    assert buffers["query_start_loc"].tolist() == [i * width for i in range(4)]
+    assert buffers["seq_id"].tolist() == [i for i in range(3) for _ in range(width)]
+    assert buffers["qwen4_positions_i32"].shape == (3 * width,)
+    assert buffers["slot_mapping"].shape == (3 * width,)
+    assert buffers["block_table_i32"].shape == (3, 3 + draft_steps)
+
+
+@pytest.mark.parametrize("draft_steps", [1, 2, 3])
+def test_qwen4_exp_mtp_draft_graph_warmup_keeps_padding_rows(monkeypatch, draft_steps):
+    width = draft_steps + 1
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attn_inputs = SimpleNamespace(
+        is_prefill=True,
+        is_target_verify=False,
+        prefill_cuda_graph_copy_params=SimpleNamespace(),
+        input_lengths=torch.tensor([width, width, 0], dtype=torch.int32),
+        cu_seqlens_device=torch.tensor(
+            [0, width, 2 * width, 2 * width], dtype=torch.int32
+        ),
+    )
+    query_start_loc = RTPQwen4ExpContext._build_query_start_loc_for_plugin(
+        attn_inputs=attn_inputs,
+        seq_lens=torch.tensor([18, 18, 16], dtype=torch.int32),
+        num_tokens=3 * width,
+        device=torch.device("cpu"),
+    )
+    assert query_start_loc.tolist() == [i * width for i in range(4)]
 
 
 def test_qwen4_exp_decode_state_reads_previous_block_at_boundary():
@@ -552,8 +863,43 @@ def test_qwen4_exp_graph_state_and_qsa_slots_handle_boundary_and_padding():
     slots = torch.empty(4, dtype=torch.int64, device=device)
     compressed = torch.empty_like(slots)
     _qsa_graph_slots_kernel[(triton.cdiv(4, 128),)](
-        table, positions, slots, compressed, 4, *table.stride(), 2, 64, 4, 128
+        table,
+        positions,
+        torch.arange(4, device=device, dtype=torch.int32),
+        slots,
+        compressed,
+        4,
+        *table.stride(),
+        2,
+        64,
+        4,
+        128,
     )
     assert state_inputs.cpu().tolist() == [5, 10, 20, -1]
     assert slots.cpu().tolist() == [320, 703, 1344, -1]
     assert compressed.cpu().tolist() == [-1, 175, -1, -1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen4_exp_mtp_graph_qsa_slots_use_request_rows():
+    device = torch.device("cuda")
+    table = torch.tensor([[5, 6, 7], [10, 11, 12]], device=device, dtype=torch.int32)
+    positions = torch.tensor([15, 16, 31, 32], device=device, dtype=torch.int32)
+    request_ids = torch.tensor([0, 0, 1, 1], device=device, dtype=torch.int32)
+    slots = torch.empty(4, device=device, dtype=torch.int64)
+    compressed = torch.empty_like(slots)
+    _qsa_graph_slots_kernel[(1,)](
+        table,
+        positions,
+        request_ids,
+        slots,
+        compressed,
+        4,
+        *table.stride(),
+        3,
+        16,
+        4,
+        128,
+    )
+    assert slots.cpu().tolist() == [95, 96, 191, 192]
+    assert compressed.cpu().tolist() == [23, -1, 47, -1]
