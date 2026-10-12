@@ -635,6 +635,36 @@ def test_overlapping_weight_sync_sessions_cannot_interleave_their_buckets():
     ]
 
 
+def test_no_argument_lets_an_update_skip_another_sessions_lock():
+    """`_weight_sync_locked=True` was a public parameter that skipped the lock,
+    so any caller could commit an update between another session's buckets."""
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "update_weights_shm", "result": 1}]
+    )
+    with mgr.weight_sync_session():
+        mgr.broadcast_utility_command_sync("update_weights_shm", is_last=False)
+        intruder = threading.Thread(
+            target=mgr.broadcast_utility_command_sync,
+            args=("update_weights_shm",),
+            kwargs={"is_last": True, "_weight_sync_locked": True},
+        )
+        intruder.start()
+        intruder.join(timeout=0.2)
+        assert intruder.is_alive(), "an update ran between the session's buckets"
+        mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
+    intruder.join(timeout=10)
+    assert not intruder.is_alive()
+
+    assert [cmd for cmd, _ in mgr.sent] == [
+        "update_weights_shm",
+        "update_weights_shm",
+        "finish_weight_sync",
+        "update_weights_shm",
+        "finish_weight_sync",
+    ]
+
+
 def test_sync_still_returns_every_reply_when_all_succeed():
     mgr = _mgr(2)
     replies = [{"cmd": "clear_kv_cache", "result": True}] * 2

@@ -1579,9 +1579,6 @@ class CoreManager:
         self,
         cmd: str,
         timeout: float = 300.0,
-        _weight_sync_locked: bool = False,
-        *,
-        _dispatch_token=None,
         **kwargs,
     ):
         """Run *cmd* on every engine and return their replies in DP order.
@@ -1589,10 +1586,7 @@ class CoreManager:
         Raises if an engine reports an error or does not answer in time.
         """
         owns_sync = getattr(self._weight_sync_context, "active", False)
-        if (
-            cmd == FINISH_WEIGHT_SYNC_CMD
-            and _dispatch_token is not self._weight_sync_dispatch_token
-        ):
+        if cmd == FINISH_WEIGHT_SYNC_CMD:
             raise ValueError(
                 f"{self.label}: {cmd!r} commits a weight sync; only the sync "
                 f"whose complete update succeeded on every DP engine sends it"
@@ -1610,20 +1604,26 @@ class CoreManager:
                 f"{self.label}: non-final {cmd!r} needs "
                 f"`with weight_sync_session()` so another sync cannot interleave"
             )
-        if cmd in WEIGHT_UPDATE_UTILITY_CMDS and not _weight_sync_locked:
-            with self._weight_sync_lock:
-                return self.broadcast_utility_command_sync(
-                    cmd,
-                    timeout=timeout,
-                    _weight_sync_locked=True,
-                    **kwargs,
-                )
         if cmd in FIRE_AND_FORGET_UTILITY_CMDS:
             raise ValueError(
                 f"{self.label}: {cmd!r} is fire-and-forget; its handler never "
                 f"answers, so waiting on it could only time out. Send it with "
                 f"broadcast_utility_command instead."
             )
+        if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            # Re-entrant, so the weight_sync_session() a bucket belongs to
+            # takes it again rather than waiting on itself.
+            with self._weight_sync_lock:
+                return self._broadcast_and_wait(cmd, timeout, **kwargs)
+        return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def _broadcast_and_wait(self, cmd: str, timeout: float, **kwargs):
+        """The round trip behind broadcast_utility_command_sync, unchecked.
+
+        That method has already refused what its caller may not send and
+        taken the session lock for an update; the only other caller is the
+        FINISH below, which runs under the update's lock.
+        """
         timeout = checked_timeout(timeout)
         request_id = uuid.uuid4().hex
         # The global engine count on a coordinator, as the broadcast reaches.
@@ -1681,10 +1681,9 @@ class CoreManager:
             )
         if completes_weight_sync(cmd, kwargs):
             try:
-                self.broadcast_utility_command_sync(
+                self._broadcast_and_wait(
                     FINISH_WEIGHT_SYNC_CMD,
-                    timeout=_WEIGHT_SYNC_FINISH_TIMEOUT_S,
-                    _dispatch_token=self._weight_sync_dispatch_token,
+                    _WEIGHT_SYNC_FINISH_TIMEOUT_S,
                     completed_cmd=cmd,
                     completed_request_id=request_id,
                 )
