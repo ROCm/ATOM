@@ -101,7 +101,6 @@ lmcache server --host 127.0.0.1 --port 5555 \
 Then keep the ATOM server command above and add these to its `env \` block:
 
 ```bash
-  ROCR_VISIBLE_DEVICES=0,1,4,5 \
   PYTHONHASHSEED=0 \
   ATOM_KV_OFFLOAD=lmcache_mp \
   ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host":"tcp://127.0.0.1","lmcache.mp.port":5555}' \
@@ -112,7 +111,7 @@ Then keep the ATOM server command above and add these to its `env \` block:
 
 `PYTHONHASHSEED=0` is not optional: without it each TP rank hashes the same prompt to a different cache key and the offload hit rate goes to zero. Do not also pass `--kv-transfer-config` with `lmcache_offload`; ATOM rejects the combination.
 
-- `ROCR_VISIBLE_DEVICES=0,1,4,5` puts two ranks on each NUMA node (GPUs 0–3 are node 0, 4–7 node 1). It is required for the in-process tier: four ranks pinning 256 GB each on one node never came up. It is optional for MP, where one server pins the whole pool. At 48c, `0,1,2,3` with ~83% of the pool on the remote node gave 59,011 tok/s/chip, within the two split runs (58,742–59,479). The split itself is free: no-offload CONC=32 on `0,1,4,5` vs `0,1,2,3` is +0.43% throughput, within the 0.6% noise floor.
+- For the in-process tier, add `ROCR_VISIBLE_DEVICES=0,1,4,5`, which puts two ranks on each NUMA node (GPUs 0–3 are node 0, 4–7 node 1): four ranks pinning 256 GB each on one node never came up. MP does not need it, since one server pins the whole pool. At 48c, `0,1,2,3` with ~83% of the pool on the remote node gave 59,011 tok/s/chip, within the two split runs (58,742–59,479). The split itself is free: no-offload CONC=32 on `0,1,4,5` vs `0,1,2,3` is +0.43% throughput, within the 0.6% noise floor.
 - `--l1-size-gb 1024` is 256 GB per TP4 rank in one pinned pool. `--l1-use-lazy` is required at this size: without it a 1.2 TB pool fails with `hipErrorInvalidDevicePointer`.
 - `--chunk-size` must equal ATOM's `LMCACHE_CHUNK_SIZE` and be a multiple of `--block-size` (128).
 - `--l1-read-ttl-seconds 900`: a lookup read-locks every chunk it hits until the retrieve releases it; a lock nobody releases expires after this TTL, and locked chunks are skipped by eviction.
