@@ -259,6 +259,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         metadata = forward.attn_metadata
         cache, step = metadata.cache, metadata.step
+        plan = step.replay
+        if plan is not None:
+            # A replayed forward ran the decoder, whose rows these come from,
+            # on its tail alone: the draft's window takes the same rows.
+            if plan.tail is None:
+                return
+            rows, step = plan.tail_rows, plan.tail
+            aux_concat, positions = aux_concat[rows], positions[rows]
         # The forward's own width, padding included, because that is what the
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is

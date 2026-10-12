@@ -14,6 +14,10 @@ from atom.model_engine.page_unit_checkpoint import (
 FORK = "fork"
 COPY = "copy"
 NONE = "none"
+# No state is carried or checkpointed: a forward resuming at a prefix hit
+# rebuilds it by recomputing the hash block below the hit
+# (`BlockManager.replay_start`), writing none of what the cache holds there.
+REPLAY = "replay"
 
 
 @dataclass(frozen=True)
@@ -44,8 +48,8 @@ class StateTransfer:
             raise TypeError("fork_tokens must be an integer")
         if not isinstance(self.readable_midstep, bool):
             raise TypeError("readable_midstep must be a bool")
-        if self.kind == NONE and self.readable_midstep:
-            raise ValueError("none transfer has no state to read midstep")
+        if self.kind in (NONE, REPLAY) and self.readable_midstep:
+            raise ValueError(f"{self.kind} transfer has no state to read midstep")
         if self.kind == COPY:
             if self.fork_tokens != 0:
                 raise ValueError("copy transfer cannot bind successor tokens")
@@ -58,15 +62,21 @@ class StateTransfer:
             if self.paged_layout_id is not None:
                 raise ValueError("fork transfer cannot declare a PAGE layout")
             return
-        if self.kind == NONE:
+        if self.kind in (NONE, REPLAY):
             if self.fork_tokens != 0 or self.paged_layout_id is not None:
-                raise ValueError("none transfer cannot carry tokens or a PAGE layout")
+                raise ValueError(
+                    f"{self.kind} transfer cannot carry tokens or a PAGE layout"
+                )
             return
         raise ValueError(f"unknown state transfer kind {self.kind!r}")
 
     @classmethod
     def none(cls) -> "StateTransfer":
         return cls(NONE)
+
+    @classmethod
+    def replay(cls) -> "StateTransfer":
+        return cls(REPLAY)
 
     @classmethod
     def fork(cls, tokens: int, readable_midstep: bool = False) -> "StateTransfer":
@@ -110,8 +120,12 @@ class StateTransfer:
         return self.kind == FORK
 
     @property
+    def replays(self) -> bool:
+        return self.kind == REPLAY
+
+    @property
     def successor_room(self) -> float:
-        return inf if self.kind == NONE else float(self.fork_tokens)
+        return inf if self.kind in (NONE, REPLAY) else float(self.fork_tokens)
 
 
 @dataclass(frozen=True)

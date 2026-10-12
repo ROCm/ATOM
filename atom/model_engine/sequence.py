@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -133,6 +133,19 @@ del _mutator
 def new_block_table(block_ids=()) -> BlockTable:
     """A sequence's physical block ids. See `BlockTable`."""
     return BlockTable(block_ids)
+
+
+class Replay(NamedTuple):
+    """A prefill forward starting below the point its seq resumed at: that
+    point -- the cache holds every row below it --, whether the rows below are
+    the seq's state (a `replay` state transfer brought none; otherwise the
+    state is the one at `until`), and the tokens just before the forward, for
+    state a backend derives from the preceding tokens (V4.1's Engram n-gram
+    history, `Config.replay_history_tokens` of them)."""
+
+    until: int
+    rebuilds: bool
+    history_ids: tuple[int, ...]
 
 
 class SequenceStatus(Enum):
@@ -300,6 +313,10 @@ class Sequence:
         self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # The prefill forward scheduled last, where it backed off below the
+        # point it resumed at (`BlockManager.replay_start`); None when it did
+        # not.
+        self.replay: Replay | None = None
         # Tokens whose blocks are registered in the prefix cache: through the
         # prompt as chunks finalize, then on through decode as generated blocks
         # fill (BlockManager.hash_decode_blocks). Distinct from
@@ -481,6 +498,12 @@ class Sequence:
 
     def __getitem__(self, key):
         return self.token_ids[key]
+
+    @property
+    def replay_until(self) -> int:
+        """Where the prefill forward scheduled last resumed, 0 when it did not
+        back off below it."""
+        return 0 if self.replay is None else self.replay.until
 
     @property
     def num_tokens(self):
