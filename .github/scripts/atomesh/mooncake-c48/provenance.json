@@ -1,0 +1,16 @@
+{
+  "base_vllm_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "source_fix_sha": "b41cf676db9cc124fffbcf305f7fa8c8d2f895b8",
+  "expected_image_source_hashes": {
+    "distributed/kv_transfer/kv_connector/v1/multi_connector.py": "d89facff999c3a80032d9e81e526be14d1b1ff13a9043938e7c2f7e9998e618a",
+    "distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py": "c0d13a4cb6aebc9b558cacf624c731e6f692775ce05a73a6d3a93c6a2665b380",
+    "distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py": "a993f46cebc87e0675bfa400d09f38c23286c795f61a577179c4a6332d5dc739",
+    "distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py": "a8fdf8179b8518510d6be7be12c0ba066aed7d6aa0e11a371d02880ce772a4f0"
+  },
+  "multi_connector_after_sha256": "397e20f11593dfa652d7338a848945db0ab90c4f5424c9b129068278518c5646",
+  "proxy_sha256": "fea24b40fa8ea11d4757c3298271525fdfa16a01b57cc693c00785aa7c28e359",
+  "integration_patch_sha256": "514aed8d5a3c8828a6687d5b01766f05c7d93cde4a855accd98e8e9ebc200112",
+  "historical_config_sha256": "89d3ea28982df2dce11fa8dded4500d35c3fe09745299efc0bb7850f1aa17ef3",
+  "mooncake_sha": "b140c1a904d53d24ed211d01ce9a87fc161cb432",
+  "mooncake_wheel_sha256": "7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6"
+}
