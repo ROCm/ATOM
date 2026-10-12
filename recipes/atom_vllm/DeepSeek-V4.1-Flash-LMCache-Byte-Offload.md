@@ -456,3 +456,38 @@ flexible-extract, against 0.9265 without it and a 0.91 floor), but its
 `loads_attempted` is 0. 20-shot gsm8k re-samples exemplars per question, so
 questions share no prefix. That run shows attaching the connector costs no
 accuracy; it shows nothing about whether the tier returns the right bytes.
+
+## State checkpoint images (vLLM 0.31), 2026-10-12
+
+`ATOM_V41_STATE_IMAGES=1` registers 8 image layers as a `MambaSpec` group so
+vLLM allocates and prefix-caches blocks for V4.1's recurrent state, and
+writes one checkpoint per prefill through its own
+`MambaPrefillCheckpointBuilder`. `ATOM_V41_IMAGE_LOCAL_HITS=1` additionally
+lets a LOCAL prefix hit be capped to that checkpoint position instead of
+refused. Both default off.
+
+Measured on this tree, TP4, graph mode, prefix caching on, LMCache on
+(`RESTORE15`):
+
+    three-arm accuracy   VALID: blind 0/16, cold 16/16, warm 16/16
+    warm tier supply     79.8% of prompt tokens; HBM 76.1%
+    stale-cursor refusals 0
+    local hits capped    11 of 11 (6912 offered -> 6656 returned)
+    tier state loads     11 attempted, 11 completed, cursor_mismatch 0
+    images               18 stored, 0 restored
+
+Read the last two lines together: capping the local hit to the checkpoint
+position is what unlocked these hits, and the TIER's state leg is what backs
+them. The images themselves are written and never read -- they are not yet
+load-bearing on this path, and nothing here measures them.
+
+Two configuration facts worth keeping:
+
+* The image alignment must be the block size, not the tier's state interval.
+  vLLM's `is_mamba_prefill_checkpoint_valid` requires
+  `(checkpoint_position - query_start) % alignment == 0` where the position
+  is the prompt's last block boundary; 4096 fails for most prompt lengths
+  and passes for a few, so it writes images intermittently.
+* The image group must be invisible to the offload connector in BOTH
+  directions. As a recurrent group it produces `KdaStore`s the V4.1 leg
+  cannot read; as an attention group it trips the one-geometry check.
