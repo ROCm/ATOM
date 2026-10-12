@@ -323,7 +323,8 @@ jobs:
   load-config:
     if: ${{ inputs.inspect_run_id == '' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: Load ATOMesh benchmark config
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner || 'atomesh-cicd' }}
+    timeout-minutes: 10
     outputs:
       matrix_json: ${{ steps.matrix.outputs.matrix_json }}
       has_matrix: ${{ steps.matrix.outputs.has_matrix }}
@@ -332,8 +333,26 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Select a storage-qualified pair for the prefix performance A/B
+        env:
+          PREFIX_CASES: ${{ inputs.case_names }}
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+          [[ "${PREFIX_CASES}" == "kimi-k3-mori-prefix-read-main-a-nospec-tp8-dcp8-eager,kimi-k3-mori-prefix-read-main-b-nospec-tp8-dcp8-eager" ]]
+          python3 .github/scripts/atomesh/pd_select_storage_nodes.py \
+            --candidates "${ATOMESH_1P1D_NODES}" --output atomesh-node-selection.json
+
+      - name: Upload node selection evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomesh-node-selection
+          path: atomesh-node-selection.json
+          if-no-files-found: warn
+
       - name: Install YAML parser
-        run: python3 -m pip install pyyaml
+        run: python3 -c 'import yaml' || python3 -m pip install --user pyyaml
 
       - name: Find ATOMesh latest nightly image
         id: image

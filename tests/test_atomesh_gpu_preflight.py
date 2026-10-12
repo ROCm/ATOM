@@ -2,6 +2,7 @@
 
 import importlib.util
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,12 @@ SCRIPT = Path(__file__).parents[1] / ".github/scripts/atomesh/pd_gpu_cleanup.py"
 SPEC = importlib.util.spec_from_file_location("pd_gpu_cleanup", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+SELECT_SCRIPT = SCRIPT.with_name("pd_select_storage_nodes.py")
+SELECT_SPEC = importlib.util.spec_from_file_location(
+    "pd_select_storage_nodes", SELECT_SCRIPT
+)
+SELECT = importlib.util.module_from_spec(SELECT_SPEC)
+SELECT_SPEC.loader.exec_module(SELECT)
 IMAGE = "registry.example:5000/example/model:nightly@sha256:" + "a" * 64
 CACHED_IMAGE = "registry.example:5000/example/model@sha256:" + "a" * 64
 
@@ -70,6 +77,89 @@ class StoragePreflightTest(unittest.TestCase):
                 self.assertEqual(event["kind"], "storage")
                 self.assertEqual(event["image_cached"], cached)
                 self.assertEqual(event["free_bytes"], free_gib * 1024**3)
+
+
+def filesystem_metrics(free_bytes, mountpoint="/", inodes=200000):
+    labels = f'device="/dev/nvme0n1p1",fstype="ext4",mountpoint="{mountpoint}"'
+    values = {
+        "avail_bytes": free_bytes,
+        "files_free": inodes,
+        "files": 1000000,
+        "readonly": 0,
+        "device_error": 0,
+    }
+    return "\n".join(
+        f"node_filesystem_{key}{{{labels}}} {value}" for key, value in values.items()
+    )
+
+
+def host_metrics(free_bytes):
+    return (
+        f"node_time_seconds {time.time()}\n"
+        'node_scrape_collector_success{collector="filesystem"} 1\n'
+        + filesystem_metrics(free_bytes)
+    )
+
+
+class NodeSelectionTest(unittest.TestCase):
+    def test_rejects_archived_g24_capacity_before_gpu_submission(self):
+        report = SELECT.storage_report(host_metrics(12153413632), time.time())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["filesystems"][1]["free_bytes"], 12153413632)
+
+    def test_full_containerd_mount_is_not_hidden_by_large_root(self):
+        metrics = host_metrics(500 * 1024**3)
+        metrics += "\n" + filesystem_metrics(12153413632, "/var/lib/containerd")
+        report = SELECT.storage_report(metrics, time.time())
+        self.assertFalse(report["passed"])
+        self.assertTrue(report["filesystems"][0]["passed"])
+        self.assertFalse(report["filesystems"][1]["passed"])
+
+    def test_incomplete_stale_or_failed_collection_cannot_qualify(self):
+        good = host_metrics(500 * 1024**3)
+        for metrics in (
+            "",
+            good.replace("node_time_seconds", "other_time"),
+            good.replace('collector="filesystem"} 1', 'collector="filesystem"} 0'),
+            good.replace("node_filesystem_files_free", "missing_files_free"),
+        ):
+            with self.subTest(metrics=metrics), self.assertRaises(ValueError):
+                SELECT.storage_report(metrics, time.time())
+        with self.assertRaisesRegex(ValueError, "stale"):
+            SELECT.storage_report(good, time.time() + 3600)
+        self.assertFalse(
+            SELECT.storage_report(
+                good + "\n" + filesystem_metrics(500 * 1024**3, "/tmp", inodes=0),
+                time.time(),
+            )["passed"]
+        )
+
+    def test_selects_exactly_two_healthy_nodes_and_prefers_idle(self):
+        nodes = ["g24", "g42", "g12", "g07", "g25"]
+        records = {node: {"State": "IDLE"} for node in nodes}
+        records["g42"]["State"] = "ALLOCATED"
+        records["g25"]["State"] = "IDLE+DRAIN"
+        calls = []
+
+        def fetch(node):
+            calls.append(node)
+            return host_metrics(12153413632 if node == "g24" else 500 * 1024**3)
+
+        result = SELECT.select_pair(nodes, records, fetch)
+        self.assertEqual(result["selected"], ["g12", "g07"])
+        self.assertNotIn("g25", calls)
+
+    def test_unreachable_metrics_or_one_healthy_node_does_not_select_pair(self):
+        records = {node: {"State": "IDLE"} for node in ("g24", "g42")}
+
+        def fetch(node):
+            if node == "g24":
+                raise TimeoutError("metrics unavailable")
+            return host_metrics(500 * 1024**3)
+
+        result = SELECT.select_pair(list(records), records, fetch)
+        self.assertEqual(result["selected"], [])
+        self.assertIn("TimeoutError", result["nodes"][0]["reason"])
 
 
 if __name__ == "__main__":
