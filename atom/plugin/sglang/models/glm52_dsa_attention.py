@@ -192,11 +192,14 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
         lses = []
         for start in range(0, n_heads, 8):
             head_slice = slice(start, start + 8)
-            rope = None if k_rope is None else k_rope[:, head_slice].contiguous()
+            # Keep the padded row stride. _drop_rope_pad leaves
+            # stride(-1) at the unpadded width on purpose; contiguous()
+            # packs that and the hd256 kernel reads off the end.
+            rope = None if k_rope is None else k_rope[:, head_slice]
             piece = super()._flash_attn_prefill(
-                q[:, head_slice].contiguous(),
-                k[:, head_slice].contiguous(),
-                v[:, head_slice].contiguous(),
+                q[:, head_slice],
+                k[:, head_slice],
+                v[:, head_slice],
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,

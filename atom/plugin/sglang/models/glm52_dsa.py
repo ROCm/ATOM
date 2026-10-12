@@ -16,6 +16,28 @@ from atom.plugin.sglang.models.glm52_dsa_attention import (
 )
 
 
+def short_verify_skips_indexer(
+    metadata: Any,
+    *,
+    is_prefill: bool,
+    dcp_world_size: int,
+    topk_tokens: int,
+) -> bool:
+    """Skip top-k only for a multi-token verify whose context is inside top-k.
+
+    GLM-FP8 decode is one query token. Skipping the indexer there leaves sparse
+    MLA with an empty index buffer, and GSM8K falls to chance.
+    """
+
+    if is_prefill or int(dcp_world_size) != 1 or int(topk_tokens) <= 0:
+        return False
+    if metadata is None:
+        return False
+    max_seqlen_q = int(getattr(metadata, "max_seqlen_q", 1) or 1)
+    max_seqlen_k = int(getattr(metadata, "max_seqlen_k", 0) or 0)
+    return max_seqlen_q > 1 and max_seqlen_k <= int(topk_tokens)
+
+
 def _install_short_verify_indexer_skip(module: Any) -> None:
     """Skip paged MQA top-k when the verify context is already inside top-k.
 
@@ -41,13 +63,11 @@ def _install_short_verify_indexer_skip(module: Any) -> None:
         is_prefill = bool(
             getattr(getattr(context, "context", None), "is_prefill", False)
         )
-        max_seqlen_k = int(getattr(metadata, "max_seqlen_k", 0) or 0)
-        topk_tokens = int(getattr(indexer, "topk_tokens", 0) or 0)
-        if (
-            not is_prefill
-            and get_dcp_world_size() == 1
-            and topk_tokens > 0
-            and max_seqlen_k <= topk_tokens
+        if short_verify_skips_indexer(
+            metadata,
+            is_prefill=is_prefill,
+            dcp_world_size=get_dcp_world_size(),
+            topk_tokens=int(getattr(indexer, "topk_tokens", 0) or 0),
         ):
             return None
         return original(*args, **kwargs)
