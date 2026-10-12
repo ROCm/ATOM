@@ -62,6 +62,5 @@ def install_execution_policy() -> None:
 
     set_execution_policy(
         capture_breaks_mid_forward=capture_breaks_mid_forward,
-        breakable_capture_enabled=breakable_capture_enabled,
         state_probe_blocking=True,
     )

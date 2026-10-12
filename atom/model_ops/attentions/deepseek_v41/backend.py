@@ -26,10 +26,7 @@ from atom.model_ops.engram.device.hashing import (
 from atom.model_ops.engram.device.runtime import EngramInputPreparer
 from atom.model_ops.engram.device.staging import EngramStep
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
-from atom.model_ops.execution_policy import (
-    breakable_capture_enabled,
-    state_probe_blocking,
-)
+from atom.model_ops.execution_policy import state_probe_blocking
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
@@ -469,48 +466,27 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         self.release_kv_pools()
 
     def _dummy_cache(self, pages, slots, running_tokens):
-        """Scratch for a dummy batch: per call, except under graph capture.
+        """Scratch for a dummy batch, allocated per call.
 
         A dummy run must never touch a live PAGE or STATE slot, so it gets its
-        own cache. Allocating a fresh one per call is right while nothing is
-        being captured -- it is freed again immediately, and the eager path
-        pays nothing for it.
+        own cache, and allocating a fresh one each time is right here: it is
+        freed again immediately and nothing outlives the call that asked for
+        it. ATOM's own capture entry fabricates its batch with
+        ``is_dummy_run=False`` against the serving cache, so no graph ever
+        records an address of one of these.
 
-        Under a breakable capture it is fatal, and loudly so. The kernels
-        recorded during capture hold this cache's addresses; the object dies
-        when the capture returns, and the first replay reads freed memory as an
-        illegal access, reported asynchronously somewhere else entirely. So
-        while capture is possible, hand out one cache, allocated once at the
-        capture ceiling and kept alive on the builder. Every bucket's dummy
-        batch fits inside it -- its page, slot and token counts are caps, and
-        the batch indexes from zero -- so one allocation serves them all
-        without the per-bucket cost of a cache each (the STATE side alone is
-        ~5 MiB per slot).
+        A frontend whose captures do run dummy batches overrides this -- a
+        cache freed while a recorded kernel still holds its addresses is read
+        back as an illegal access on the first replay.
         """
-        if not breakable_capture_enabled():
-            return PagedAttentionCache(
-                self.geometry,
-                pages,
-                slots,
-                self.device,
-                max_tokens=running_tokens,
-                workspace=self.score_workspace,
-            )
-        cached = getattr(self, "_capture_dummy_cache", None)
-        if cached is None:
-            ceiling_pages = max(
-                pages, -(-self.max_num_batched_tokens // self.block_size)
-            )
-            cached = PagedAttentionCache(
-                self.geometry,
-                ceiling_pages,
-                max(slots, self.max_bs),
-                self.device,
-                max_tokens=max(running_tokens, self.max_num_batched_tokens),
-                workspace=self.score_workspace,
-            )
-            self._capture_dummy_cache = cached
-        return cached
+        return PagedAttentionCache(
+            self.geometry,
+            pages,
+            slots,
+            self.device,
+            max_tokens=running_tokens,
+            workspace=self.score_workspace,
+        )
 
     def _prepare(
         self,

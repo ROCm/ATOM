@@ -27,23 +27,19 @@ import os
 from collections.abc import Callable
 
 _capture_breaks_probe: Callable[[], bool] | None = None
-_breakable_capture_probe: Callable[[], bool] | None = None
 _state_probe_blocking: bool = False
 
 
 def set_execution_policy(
     *,
     capture_breaks_mid_forward: Callable[[], bool] | None = None,
-    breakable_capture_enabled: Callable[[], bool] | None = None,
     state_probe_blocking: bool | None = None,
 ) -> None:
     """State this frontend's answers. Idempotent; omitted ones are left alone."""
-    global _capture_breaks_probe, _breakable_capture_probe, _state_probe_blocking
+    global _capture_breaks_probe, _state_probe_blocking
 
     if capture_breaks_mid_forward is not None:
         _capture_breaks_probe = capture_breaks_mid_forward
-    if breakable_capture_enabled is not None:
-        _breakable_capture_probe = breakable_capture_enabled
     if state_probe_blocking is not None:
         _state_probe_blocking = bool(state_probe_blocking)
 
@@ -62,17 +58,6 @@ def capture_breaks_mid_forward() -> bool:
     forward and never breaks it.
     """
     return bool(_capture_breaks_probe()) if _capture_breaks_probe else False
-
-
-def breakable_capture_enabled() -> bool:
-    """Whether this run may capture graphs around the model's step work at all.
-
-    Asked before a capture starts, where `capture_breaks_mid_forward` asks
-    whether one is recording at this instant. A builder reads it to decide
-    whether it must keep one dummy cache alive across buckets, so it has to
-    answer for the whole run rather than for this moment.
-    """
-    return bool(_breakable_capture_probe()) if _breakable_capture_probe else False
 
 
 def state_probe_blocking() -> bool:

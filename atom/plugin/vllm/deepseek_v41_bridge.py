@@ -885,8 +885,8 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
     ``prepare_batch_step`` takes the dtype of its request-start array from it;
     int64 matches what native ATOM allocates.
     """
-    from atom.model_ops.attentions.deepseek_v41.backend import (
-        DeepseekV41MetadataBuilder,
+    from atom.plugin.vllm.v41_metadata_builder import (
+        VllmDeepseekV41MetadataBuilder,
     )
     from atom.utils import CpuGpuBuffer
 
@@ -906,7 +906,7 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
             )
         },
     )
-    return DeepseekV41MetadataBuilder(runner)
+    return VllmDeepseekV41MetadataBuilder(runner)
 
 
 def bind_deepseek_v41_proxy_cache(
