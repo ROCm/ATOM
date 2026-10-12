@@ -116,7 +116,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
         self._model_dtype = first_param.dtype
         from atom.plugin.rtpllm.utils import RTPForwardQwen35HybridContext
 
-        self._rtp_forward_context_cls = RTPForwardQwen35HybridContext
+        self._rtp_forward_context_cls = getattr(
+            self, "_rtp_forward_context_cls", RTPForwardQwen35HybridContext
+        )
         # Cache module layer maps once to avoid per-forward model.modules() traversal.
         self._rtp_layer_maps = self._rtp_forward_context_cls.collect_layer_maps(
             model=self.model
@@ -395,6 +397,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             "slot_base": torch.empty(max_bs, device=device, dtype=torch.int32),
             "token_offset": torch.empty(max_bs, device=device, dtype=torch.int32),
             "slot_mapping": torch.empty(max_bs, device=device, dtype=torch.int64),
+            "previous_state_slots_i32": torch.empty(
+                max_bs, device=device, dtype=torch.int32
+            ),
             "seq_lens_i32": torch.empty(max_bs, device=device, dtype=torch.int32),
             "block_table_i32": torch.empty(
                 max_bs, max_blocks, device=device, dtype=torch.int32

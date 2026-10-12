@@ -33,11 +33,10 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
     """Reuse RTP's input/position bridge with QSA and PLE cache metadata."""
 
     def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
         from atom.plugin.rtpllm.utils.qwen4_exp_context import RTPQwen4ExpContext
 
         self._rtp_forward_context_cls = RTPQwen4ExpContext
-        self._rtp_layer_maps = RTPQwen4ExpContext.collect_layer_maps(self.model)
+        super().__init__(*args, **kwargs)
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
 
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
@@ -61,6 +60,17 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         buffers = getattr(self, "_cg_meta_bufs", None)
         if buffers is None or "qsa_compressed_slots" in buffers:
             return
+        qsa_layers = [
+            module
+            for module in self._rtp_layer_maps[1].values()
+            if getattr(module, "is_qsa_attention", False)
+        ]
+        if qsa_layers:
+            self._rtp_forward_context_cls._bind_qsa_caches(
+                self,
+                qsa_layers,
+                int(self.kv_cache.get_seq_size_per_block("full")),
+            )
         max_tokens = int(self._cg_max_num_tokens)
         device = self._get_model_device()
         buffers["seq_id_i32"] = torch.arange(
@@ -75,14 +85,19 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         buffers["qsa_slots_i64"] = torch.empty(
             max_tokens, device=device, dtype=torch.int64
         )
-        buffers["qwen4_previous_slots_i32"] = torch.empty(
-            max_tokens, device=device, dtype=torch.int32
-        )
         buffers["qwen4_has_initial"] = torch.empty(
             max_tokens, device=device, dtype=torch.bool
         )
         buffers["qsa_compressed_slots"] = torch.empty(
             max_tokens, device=device, dtype=torch.int64
+        )
+        kv_cache = self.kv_cache
+        physical_block_size = int(kv_cache.get_seq_size_per_block("full"))
+        max_physical_blocks = (
+            int(self._cg_max_seq_len) + physical_block_size - 1
+        ) // physical_block_size + 1
+        buffers["physical_block_table_i32"] = torch.empty(
+            max_tokens, max_physical_blocks, device=device, dtype=torch.int32
         )
 
     def forward(self, inputs, fmha_impl=None):
@@ -178,7 +193,8 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
         config.layernorm_eps = float(text["rms_norm_eps"])
         config.norm_type = "rmsnorm"
         config.has_pre_decoder_layernorm = False
-        config.has_post_decoder_layernorm = True
+        # Qwen3.8 ends in the hyper-connection mixer, not a separate final RMSNorm.
+        config.has_post_decoder_layernorm = False
         config.activation_type = "SiGLU"
 
         config.moe_k = int(text["num_experts_per_tok"])
@@ -220,8 +236,58 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             KVCacheSpecType.MHA,
         )
 
-    def support_cuda_graph(self) -> bool:
-        return ATOMQwen35Moe.support_cuda_graph(self)
+    @classmethod
+    def _apply_kv_cache_config(cls, model_config: ModelConfig, kv_cache_config) -> None:
+        """Budget QSA/PLE side state before RTP sizes its paged cache pools."""
+        with open(
+            os.path.join(model_config.ckpt_path, "config.json"), encoding="utf-8"
+        ) as file:
+            text = json.load(file)["text_config"]
+        block_size = int(
+            model_config.attn_config.tokens_per_block
+            or kv_cache_config.seq_size_per_block
+        )
+        ratio = int(text["indexer_compress_ratio"])
+        index_dim = int(text["indexer_head_dim"])
+        if len(text["layer_types"]) != model_config.num_layers:
+            raise ValueError("Qwen4Exp QSA layer count differs from RTP model layers")
+        full_layers = sum(layer == "full_attention" for layer in text["layer_types"])
+        if block_size <= 0 or ratio <= 0 or block_size % ratio or index_dim <= 0:
+            raise ValueError(
+                "Qwen4Exp QSA cache requires positive, ratio-aligned block geometry"
+            )
+        # RTP's prefix cache only retains its owned KV/linear-state pools. A
+        # prefix hit would skip the QSA index and PLE history writes while
+        # reusing their physical slots, so those separate pools cannot yet be
+        # restored correctly. Per-request reuse_cache is ANDed with this flag.
+        if getattr(kv_cache_config, "multi_task_prompt", None) or getattr(
+            kv_cache_config, "multi_task_prompt_str", None
+        ):
+            raise ValueError("Qwen4Exp RTP plugin does not support cached task prompts")
+        kv_cache_config.reuse_cache = False
+
+        # _bind_qsa_caches allocates both BF16 arrays for *every* FULL block
+        # on this rank: [block, 1, dim] and [block/ratio, 1, dim].
+        qsa_bytes = full_layers * (block_size + block_size // ratio) * index_dim * 2
+
+        # _ple_metadata allocates one n-gram and one convolution window for
+        # every LINEAR state slot. Both pools are also outside RTP's KV pool.
+        ple_layer_ids = text.get("ple_layer_ids", [])
+        if len(ple_layer_ids) > 1:
+            raise ValueError("Qwen4Exp RTP plugin currently supports one PLE layer")
+        ple_bytes = 0
+        if ple_layer_ids:
+            ngram_size = int(text["ngram_size"])
+            conv_state_len = (int(text["ple_conv_kernel_size"]) - 1) * ngram_size
+            hc_hidden_size = int(text["hidden_size"]) * int(text["hc_count"])
+            if ngram_size < 2 or conv_state_len < 0 or hc_hidden_size <= 0:
+                raise ValueError("Qwen4Exp PLE cache geometry is invalid")
+            ple_bytes = (ngram_size - 1) * 8 + (
+                hc_hidden_size
+                * conv_state_len
+                * torch.empty((), dtype=model_config.compute_dtype).element_size()
+            )
+        model_config.auxiliary_paged_cache_bytes_per_block = qsa_bytes + ple_bytes
 
     def _create_python_model(self):
         from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
@@ -245,7 +311,7 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
                     orig_to_new_prefix={"model.language_model.": "model."}
                 ),
             )
-            named = dict(atom_model.named_parameters())
+            named = dict(atom_model.named_parameters(remove_duplicate=False))
             required = {
                 W.embedding: "model.embed_tokens.weight",
                 W.lm_head: "lm_head.weight",

@@ -112,6 +112,7 @@ def _prepare_model_atom_rtpllm(
 
     if model_arch == "Qwen4ExpForConditionalGeneration":
         from atom.model_loader.loader import WeightsMapper
+        from atom.models.qwen4_exp_mapping import qwen4_exp_packed_modules_mapping
 
         # The RTP bridge below currently feeds token IDs only. Do not build a
         # vision tower that RTP never supplies pixel tensors or mRoPE grids to.
@@ -119,13 +120,10 @@ def _prepare_model_atom_rtpllm(
         hf = (
             getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
         )
-        packed = {
-            **getattr(model_cls, "packed_modules_mapping", {}),
-            **{
-                f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
-                for shard in range(int(hf.split_ngram_parts))
-            },
-        }
+        packed = qwen4_exp_packed_modules_mapping(
+            getattr(model_cls, "packed_modules_mapping", {}),
+            int(hf.split_ngram_parts),
+        )
         atom_config.quant_config.remap_layer_name(
             atom_config.hf_config,
             packed_modules_mapping=packed,

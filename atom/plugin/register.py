@@ -21,6 +21,22 @@ class _LazyModelRegistry(dict):
             self[name] = model
         return model
 
+    def get(self, name, default=None):
+        try:
+            return self[name]
+        except KeyError:
+            return default
+
+    def values(self):
+        for name in self:
+            self[name]
+        return super().values()
+
+    def items(self):
+        for name in self:
+            self[name]
+        return super().items()
+
 
 _ATOM_SUPPORTED_MODELS = _LazyModelRegistry(
     {
@@ -35,15 +51,9 @@ _ATOM_SUPPORTED_MODELS = _LazyModelRegistry(
         "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5MoeForConditionalGenerationTextOnly",
         "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5:Qwen3_5ForConditionalGenerationTextOnly",
+        "Qwen4ExpForConditionalGeneration": "atom.models.qwen4_exp:Qwen4ExpForConditionalGeneration",
     }
 )
-
-if is_rtpllm():
-    from atom.models.qwen4_exp import Qwen4ExpForConditionalGeneration
-
-    _ATOM_SUPPORTED_MODELS["Qwen4ExpForConditionalGeneration"] = (
-        Qwen4ExpForConditionalGeneration
-    )
 
 if is_sglang():
     from atom.models.deepseek_v4 import DeepseekV4ForCausalLM
