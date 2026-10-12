@@ -109,7 +109,8 @@
                 "kv_role": "kv_producer",
                 "kv_load_failure_policy": "fail",
                 "kv_connector_extra_config": {
-                  "backend": "rdma"
+                  "backend": "rdma",
+                  "read_mode": true
                 }
               },
               {
@@ -181,7 +182,8 @@
           "kv_role": "kv_consumer",
           "kv_load_failure_policy": "fail",
           "kv_connector_extra_config": {
-            "backend": "rdma"
+            "backend": "rdma",
+            "read_mode": true
           }
         },
         "speculative-config": {

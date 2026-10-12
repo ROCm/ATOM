@@ -23,6 +23,8 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
     connectors = transfer.get("kv_connector_extra_config", {}).get("connectors", [transfer])
     for connector in connectors:
         if connector["kv_connector"] == "MoRIIOConnector":
+            if connector["kv_connector_extra_config"].get("read_mode") is not True:
+                raise ValueError("C48 Kimi-K3 requires explicit MoRIIO read_mode=true")
             connector["kv_connector_extra_config"].update(
                 proxy_ip=proxy, proxy_ping_port=discovery, http_port=port)
     args.update(host="0.0.0.0", port=port, **{"worker-cls": "pd_c48_worker.ManifestWorker"})
