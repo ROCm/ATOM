@@ -182,11 +182,6 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
             self.load_workers,
         )
 
-    def warmup(self) -> None:
-        from atom.kv_transfer.offload.warmup import warmup_cpu_offload
-
-        warmup_cpu_offload(self)
-
     # -- per-step (RPC thread): only enqueue, never copy ------------------
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):

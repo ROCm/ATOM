@@ -89,27 +89,8 @@ context_proj
 That server log also records `speculative_config=None`; the Kimi case therefore
 uses no draft model or forced acceptance length.
 
-`OFFLOAD_WARMUP=1` runs explicit MLA GPU→CPU→GPU round trips on every rank
-after graph capture and before the server reports ready. With 32 staging chunks,
-it stores and restores 1 chunk, then 33 chunks (covering two staging groups).
-It uses the same LMCache engine and persistent save/load threads as serving,
-checks the CPU hit and actual H2D byte count, and removes the synthetic CPU
-entries. Scratch blocks are used before the scheduler admits requests; block 0
-and the KDA state tier are untouched. A failed warmup fails server startup.
-Look for `[OFFLOAD-WARMUP] rank=... complete rounds=2` on all eight ranks before
-starting the replay.
-
-This opt-in warmup currently requires only LocalCPUBackend, one save and one
-load worker, synchronous per-rank retrieval, and persistent GPU staging. It
-leaves AIPerf's 10 warmup requests per lane in place. Both new switches are
+AIPerf keeps its 10 warmup requests per lane. The chat-template switch is
 captured in benchmark metadata and the recipe fingerprint.
-
-For a focused GPU check without loading model weights, run
-`python -m pytest -q tests/test_offload_warmup_gpu.py` in an ATOM environment
-with LMCache, Triton and one ROCm/CUDA GPU. It checks the K3 per-rank MLA byte
-layout with DCP8 block mapping, restores 33 chunks byte-for-byte, and verifies
-scratch CPU entries are removed while null-block and KDA state bytes are preserved.
-The full TP8 server run must still report completion on all eight ranks.
 
 ## Flow
 

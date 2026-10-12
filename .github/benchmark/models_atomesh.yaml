@@ -718,7 +718,6 @@ models:
               OFFLOAD_GPU_STAGING_CHUNKS: '32'
               OFFLOAD_KV_FOR_HYBRID: '1'
               OFFLOAD_PROFILE: '1'
-              OFFLOAD_WARMUP: '1'
               PYTHONHASHSEED: '0'
               PYTHONNOUSERSITE: '1'
               HTTPS_PROXY: ''

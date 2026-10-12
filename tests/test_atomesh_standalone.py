@@ -276,7 +276,6 @@ export PREFILL_TP_SIZE="$PREFILL_TP" DECODE_TP_SIZE="$DECODE_TP"
             "LMCACHE_CHUNK_SIZE": "1024",
             "LMCACHE_LOCAL_CPU": "True",
             "OFFLOAD_KV_FOR_HYBRID": "1",
-            "OFFLOAD_WARMUP": "1",
         }.items():
             self.assertEqual(env[key], value)
         client = captures["benchmark"]["args"]
