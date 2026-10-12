@@ -90,6 +90,19 @@ impl http_body::Body for ProxyBody {
         }
         result
     }
+
+    // Outer observers and hyper rely on these to complete fixed-length bodies
+    // without an EOF poll.
+    fn is_end_stream(&self) -> bool {
+        self.remaining == Some(0) || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self.remaining {
+            Some(remaining) => http_body::SizeHint::with_exact(remaining),
+            None => self.inner.size_hint(),
+        }
+    }
 }
 
 #[cfg(test)]
