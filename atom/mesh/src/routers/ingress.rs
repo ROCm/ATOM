@@ -13,7 +13,7 @@ use http::{HeaderMap, Uri};
 use crate::{
     app_context::AppContext,
     core::{
-        prepare_pool::{InputLease, JobContext, PrepareError, PrepareHandle},
+        prepare_pool::{InputLease, JobContext, PrepareHandle},
         Worker, WorkerRegistry, WorkerType,
     },
     policies::PolicyRegistry,
@@ -361,11 +361,7 @@ impl InferenceEnvelope {
             })
         };
         if inline {
-            let request = parse()?;
-            if Instant::now() >= deadline {
-                return Err(PrepareError::Timeout.into());
-            }
-            return Ok(request);
+            return parse();
         }
         app.prepare_pool
             .submit(deadline, move |ctx| -> Result<Self, IngressError> {
@@ -412,7 +408,8 @@ impl InferenceEnvelope {
         pool: &PrepareHandle,
         routing: &IngressRouting,
     ) -> Result<(Self, RoutingPreparation), IngressError> {
-        self.check_deadline()?;
+        // The deadline bounds preparation work only. Requests whose preparation
+        // already finished are forwarded instead of discarding that work.
         if let Some(routed) = self.routed.take() {
             return Ok((self, routed));
         }
@@ -420,7 +417,6 @@ impl InferenceEnvelope {
         let (needs_text, needs_tokens) = routing.requirements(self.metadata.model.as_deref());
         if !needs_text && !needs_tokens {
             let metadata = self.metadata.execution_metadata();
-            self.check_deadline()?;
             return Ok((self, (metadata, None)));
         }
         let routing = routing.clone();
@@ -430,17 +426,9 @@ impl InferenceEnvelope {
         .await
     }
 
-    fn check_deadline(&self) -> Result<(), IngressError> {
-        if Instant::now() >= self.prepare_deadline {
-            return Err(PrepareError::Timeout.into());
-        }
-        Ok(())
-    }
-
     /// Consume only after the final preparation result has been received.
     /// The parsed views and preparation lease are dropped before forwarding.
     pub(crate) fn into_http_request(self) -> Result<HttpInferenceRequest, IngressError> {
-        self.check_deadline()?;
         Ok(HttpInferenceRequest {
             uri: self.uri,
             headers: self.headers,
@@ -452,7 +440,6 @@ impl InferenceEnvelope {
     /// PD forwards its mutable JSON body, so its duplicate raw and typed bodies
     /// and preparation lease can be released before either backend executes.
     pub(crate) fn into_pd_parts(self) -> Result<(Uri, HeaderMap, serde_json::Value), IngressError> {
-        self.check_deadline()?;
         let body = self.pd_body.ok_or_else(|| {
             IngressError::new(
                 http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -468,7 +455,6 @@ impl InferenceEnvelope {
     pub(crate) fn into_native_parts(
         self,
     ) -> Result<(Uri, HeaderMap, ParsedInference, InferenceMetadata), IngressError> {
-        self.check_deadline()?;
         Ok((self.uri, self.headers, self.parsed, self.metadata))
     }
 

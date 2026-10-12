@@ -228,7 +228,8 @@ impl FirstOutputSse {
                 || matches!(
                     payload["type"].as_str(),
                     Some(
-                        "message_stop"
+                        "error"
+                            | "message_stop"
                             | "response.completed"
                             | "response.failed"
                             | "response.incomplete"
@@ -284,6 +285,7 @@ impl FirstOutputSse {
             }
             Some(
                 "response.output_text.delta"
+                | "response.refusal.delta"
                 | "response.reasoning_text.delta"
                 | "response.reasoning_summary_text.delta"
                 | "response.function_call_arguments.delta",
@@ -369,6 +371,22 @@ mod tests {
             assert_eq!(detector.model.as_deref(), Some("test-model"));
             assert!(!detector.feed(&bytes));
         }
+    }
+
+    #[test]
+    fn responses_refusal_counts_as_output_and_error_events_are_terminal() {
+        let mut detector = FirstOutputSse::default();
+        assert!(detector.feed(&sse(
+            json!({"type": "response.refusal.delta", "delta": "I can't"})
+        )));
+        let mut detector = FirstOutputSse::default();
+        assert!(!detector.feed(&sse(
+            json!({"type": "error", "code": "server_error", "message": "failed"})
+        )));
+        // Output after a terminal error must not produce a TTFT sample.
+        assert!(!detector.feed(&sse(
+            json!({"type": "response.output_text.delta", "delta": "late"})
+        )));
     }
 
     #[test]

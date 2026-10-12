@@ -417,6 +417,9 @@ mod tests {
             |config: &mut PreparePoolConfig| config.prepare_timeout_ms = 0,
             |config: &mut PreparePoolConfig| config.shutdown_grace_ms = 0,
             |config: &mut PreparePoolConfig| config.max_tokenize_bytes = Some(0),
+            |config: &mut PreparePoolConfig| {
+                config.parse_inline_max_bytes = MAX_PARSE_INLINE_BYTES + 1
+            },
         ] {
             let mut config = RouterConfig::default();
             invalidate(&mut config.prepare_pool);
@@ -424,6 +427,9 @@ mod tests {
             assert!(error.to_string().contains("prepare_pool."), "{error}");
         }
         RouterConfig::default().validate().unwrap();
+        let mut config = RouterConfig::default();
+        config.prepare_pool.parse_inline_max_bytes = MAX_PARSE_INLINE_BYTES;
+        config.validate().unwrap();
     }
 
     #[test]

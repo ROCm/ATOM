@@ -154,7 +154,8 @@ pub struct PreparePoolConfig {
     /// Tokenization byte limit; overrides --ext-proc-max-tokenize-bytes.
     #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
     pub max_tokenize_bytes: Option<usize>,
-    /// Parse bodies up to this size on Tokio; 0 sends all parsing to the pool.
+    /// Parse bodies up to this size on Tokio (at most 64 KiB); 0 sends all
+    /// parsing to the pool.
     #[arg(
         id = "prepare_parse_inline_max_bytes",
         long = "prepare-parse-inline-max-bytes",
@@ -162,6 +163,9 @@ pub struct PreparePoolConfig {
     )]
     pub parse_inline_max_bytes: usize,
 }
+
+/// Upper bound for `--prepare-parse-inline-max-bytes`.
+pub const MAX_PARSE_INLINE_BYTES: usize = 64 * 1024;
 
 impl Default for PreparePoolConfig {
     fn default() -> Self {
@@ -227,6 +231,15 @@ impl PreparePoolConfig {
             }
         }
         self.resolved_queue_capacity(workers)?;
+        // Inline parsing runs on Tokio workers without a concurrency limit, so
+        // keep it to small bodies whose parse cost is negligible.
+        if self.parse_inline_max_bytes > MAX_PARSE_INLINE_BYTES {
+            return Err(ConfigError::InvalidValue {
+                field: "prepare_pool.parse_inline_max_bytes".to_string(),
+                value: self.parse_inline_max_bytes.to_string(),
+                reason: format!("Must not exceed {MAX_PARSE_INLINE_BYTES} bytes"),
+            });
+        }
         for (field, value) in [
             ("queue_timeout_ms", self.queue_timeout_ms),
             ("prepare_timeout_ms", self.prepare_timeout_ms),
