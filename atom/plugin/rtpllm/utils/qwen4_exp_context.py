@@ -24,6 +24,7 @@ from atom.utils.forward_context import get_forward_context
 def _qsa_graph_slots_kernel(
     block_table,
     positions,
+    token_to_request,
     slots,
     compressed_slots,
     rows,
@@ -38,8 +39,9 @@ def _qsa_graph_slots_kernel(
     live = row < rows
     position = tl.load(positions + row, live, -1)
     column = tl.minimum(tl.maximum(position, 0) // block_size, table_cols - 1)
+    request = tl.load(token_to_request + row, live, 0)
     page = tl.load(
-        block_table + row * table_stride_row + column * table_stride_col,
+        block_table + request * table_stride_row + column * table_stride_col,
         live & (position >= 0),
         -1,
     )
@@ -162,7 +164,10 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         if len(ple_layers) != 1:
             raise ValueError("RTP Qwen4Exp currently supports one PLE layer")
         gdn = attn_metadata.gdn_metadata
-        if gdn is None or gdn.non_spec_state_indices_tensor is None:
+        if gdn is None or (
+            gdn.non_spec_state_indices_tensor is None
+            and gdn.spec_state_indices_tensor is None
+        ):
             raise ValueError("PLE requires GDN state-slot metadata")
         ple = ple_layers[0]
         if not gdn_layers:
@@ -183,15 +188,27 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 dtype=model.atom_config.torch_dtype,
             )
             runtime._rtp_ple_cache_signature = signature
-        indices = gdn.non_spec_state_indices_tensor
-        input_indices = gdn.non_spec_state_indices_in_tensor
+        spec_indices = (
+            gdn.spec_state_indices_tensor
+            if getattr(gdn, "rtp_target_verify_block_map", None) is not None
+            else None
+        )
+        if spec_indices is not None:
+            indices = spec_indices[:, -1]
+            input_indices = gdn.spec_state_indices_in_tensor[:, 0]
+        else:
+            indices = gdn.non_spec_state_indices_tensor
+            input_indices = gdn.non_spec_state_indices_in_tensor
         has_initial = gdn.has_initial_state
         if has_initial is None:
             if torch.cuda.is_current_stream_capturing():
                 graph_buffers = runtime._cg_meta_bufs
                 has_initial = graph_buffers["qwen4_has_initial"][: indices.numel()]
+                logical_positions = attn_metadata.qsa_metadata.logical_positions
+                if spec_indices is not None:
+                    logical_positions = logical_positions[0 :: spec_indices.shape[1]]
                 torch.ge(
-                    attn_metadata.qsa_metadata.logical_positions,
+                    logical_positions,
                     0,
                     out=has_initial,
                 )
@@ -204,6 +221,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             state_indices_out=indices,
             has_initial_state=has_initial,
             conv_state=runtime._rtp_ple_conv,
+            rtp_spec_state_indices=spec_indices,
         )
 
     @classmethod
@@ -268,6 +286,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 _qsa_graph_slots_kernel[(triton.cdiv(slots.numel(), 128),)](
                     full_blocks,
                     positions,
+                    graph_buffers["seq_id_i32"][: slots.numel()],
                     slots,
                     compressed,
                     slots.numel(),

@@ -243,33 +243,61 @@ class GatedDeltaNet(nn.Module):
 
         # # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            query_spec, key_spec, value_spec = causal_conv1d_update(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                self.num_k_heads * self.head_k_dim // self.tp_size,
-                self.num_v_heads * self.head_v_dim // self.tp_size,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
-                    : gdn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                # The verify window, which sizes the conv rollback window
-                # (state_len = kernel_width-1 + max_query_len-1) and hence the
-                # kernel's NP2_STATELEN tile. It used to be inferred from the
-                # slot table's last dim, which only coincided with the window
-                # because that table carried one column per draft; state that
-                # dependency explicitly so a narrower table cannot silently
-                # truncate the conv state.
-                max_query_len=(
-                    gdn_metadata.replayssm_max_query_len
-                    if use_replayssm
-                    else spec_state_indices_tensor.size(-1)
-                ),
-                validate_data=False,
-            )
+            rtp_block_map = getattr(gdn_metadata, "rtp_target_verify_block_map", None)
+            if rtp_block_map is not None:
+                # RTP stores the state after *each* verify token in a distinct
+                # reserved block. Its convolution kernel implements that block
+                # addressing without an enlarged speculative history buffer.
+                from rtp_llm.models_py.triton_kernels.causal_conv1d.causal_conv1d import (
+                    causal_conv1d_update as rtp_causal_conv1d_update,
+                )
+
+                batch_size = gdn_metadata.num_spec_decodes
+                query_len = spec_state_indices_tensor.shape[1]
+                mixed_width = mixed_qkv_spec.shape[-1]
+                conv_out = rtp_causal_conv1d_update(
+                    mixed_qkv_spec.reshape(batch_size, query_len, mixed_width)
+                    .transpose(1, 2)
+                    .contiguous(),
+                    conv_state,
+                    conv_weights,
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                    block_map=rtp_block_map,
+                    seq_size_per_block=gdn_metadata.rtp_seq_size_per_block,
+                    sequence_lengths=gdn_metadata.rtp_target_verify_sequence_lengths,
+                )
+                conv_out = conv_out.transpose(1, 2).reshape(-1, mixed_width)
+                query_spec, key_spec, value_spec = torch.split(
+                    conv_out,
+                    [
+                        self.num_k_heads * self.head_k_dim // self.tp_size,
+                        self.num_k_heads * self.head_k_dim // self.tp_size,
+                        self.num_v_heads * self.head_v_dim // self.tp_size,
+                    ],
+                    dim=-1,
+                )
+            else:
+                query_spec, key_spec, value_spec = causal_conv1d_update(
+                    mixed_qkv_spec,
+                    conv_state,
+                    conv_weights,
+                    self.num_k_heads * self.head_k_dim // self.tp_size,
+                    self.num_v_heads * self.head_v_dim // self.tp_size,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=spec_state_indices_tensor[:, 0][
+                        : gdn_metadata.num_spec_decodes
+                    ],
+                    num_accepted_tokens=num_accepted_tokens,
+                    query_start_loc=spec_query_start_loc,
+                    max_query_len=(
+                        gdn_metadata.replayssm_max_query_len
+                        if use_replayssm
+                        else spec_state_indices_tensor.size(-1)
+                    ),
+                    validate_data=False,
+                )
             num_tokens_spec = query_spec.shape[0]
             query_spec = query_spec.view(1, num_tokens_spec, -1, self.head_k_dim)
             key_spec = key_spec.view(1, num_tokens_spec, -1, self.head_k_dim)
@@ -424,6 +452,9 @@ class GatedDeltaNet(nn.Module):
                             : gdn_metadata.num_spec_decodes + 1
                         ],
                         ssm_state_indices=spec_state_indices_tensor,
+                        ssm_state_indices_in=getattr(
+                            gdn_metadata, "spec_state_indices_in_tensor", None
+                        ),
                         num_accepted_tokens=num_accepted_tokens,
                         use_qk_l2norm_in_kernel=True,
                     )

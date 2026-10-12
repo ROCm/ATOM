@@ -158,6 +158,7 @@ class Qwen4ExpMTP(nn.Module):
 
     def __init__(self, atom_config: Config):
         super().__init__()
+        self.atom_config = atom_config
         self.config = atom_config.hf_config
         self.model = Qwen4ExpMultiTokenPredictor(atom_config)
         self.lm_head = ParallelLMHead(

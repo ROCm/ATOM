@@ -114,7 +114,7 @@ def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_dra
         qsa_attention,
         "get_forward_context",
         lambda: SimpleNamespace(
-            context=SimpleNamespace(is_draft=is_draft, is_prefill=False)
+            context=SimpleNamespace(is_draft=is_draft, is_prefill=count > 1)
         ),
     )
     layers = [
