@@ -209,6 +209,9 @@ class CoreManager:
         # outer session call the same synchronous command method per bucket.
         self._weight_sync_lock = RLock()
         self._weight_sync_context = local()
+        # Identity-only marker: unlike request_id, a caller cannot forge it by
+        # choosing a string. Never put it on the wire.
+        self._weight_sync_dispatch_token = object()
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
@@ -1508,10 +1511,13 @@ class CoreManager:
                 )
         return flat
 
-    def broadcast_utility_command(self, cmd: str, **kwargs):
-        if cmd in WEIGHT_UPDATE_UTILITY_CMDS and "request_id" not in kwargs:
+    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+        if (
+            cmd in WEIGHT_UPDATE_UTILITY_CMDS
+            and _dispatch_token is not self._weight_sync_dispatch_token
+        ):
             raise ValueError(
-                f"{self.label}: {cmd!r} must use "
+                f"{self.label}: {cmd!r} cannot be broadcast directly; use "
                 f"broadcast_utility_command_sync so the sync is finished or aborted"
             )
         payload = {"cmd": cmd, **kwargs}
@@ -1581,6 +1587,7 @@ class CoreManager:
         with self._rpc_router.register(request_id) as replies:
             self.broadcast_utility_command(
                 cmd,
+                _dispatch_token=self._weight_sync_dispatch_token,
                 request_id=request_id,
                 timeout=engine_budget(timeout),
                 deadline=worker_deadline,

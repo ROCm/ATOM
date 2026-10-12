@@ -36,6 +36,7 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr._rpc_router = RpcResponseRouter()
     mgr._weight_sync_lock = threading.RLock()
     mgr._weight_sync_context = threading.local()
+    mgr._weight_sync_dispatch_token = object()
     mgr._rpc_ranks_per_engine = tp
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
@@ -399,10 +400,14 @@ def test_sync_refuses_a_fire_and_forget_command_up_front():
     assert mgr.sent == [], "nothing may be sent for a call that cannot complete"
 
 
-def test_weight_updates_cannot_be_sent_without_a_finish_or_abort_owner():
+@pytest.mark.parametrize("request_id", [None, "forged-id"])
+def test_weight_broadcast_cannot_bypass_its_finish_or_abort_owner(request_id):
     mgr = _mgr(1)
-    with pytest.raises(ValueError, match="must use.*sync"):
-        CoreManager.broadcast_utility_command(mgr, "update_weights_shm", is_last=False)
+    kwargs = {"is_last": False}
+    if request_id is not None:
+        kwargs["request_id"] = request_id
+    with pytest.raises(ValueError, match="cannot be broadcast directly"):
+        CoreManager.broadcast_utility_command(mgr, "update_weights_shm", **kwargs)
     assert mgr.sent == []
 
 
