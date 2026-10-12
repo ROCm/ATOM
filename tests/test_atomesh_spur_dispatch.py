@@ -83,6 +83,19 @@ class SpurDispatchTest(unittest.TestCase):
             rank = os.environ["SPUR_TASK_OFFSET"]
             with (Path(os.environ["TEST_ROOT"]) / ("docker-" + rank + ".jsonl")).open("a") as stream:
                 stream.write(json.dumps(sys.argv[1:]) + "\\n")
+            if sys.argv[1:3] == ["image", "inspect"] and os.environ.get("FAKE_IMAGE_ID"):
+                print(os.environ["FAKE_IMAGE_ID"])
+            if sys.argv[1] == "run" and "--entrypoint" in sys.argv and "test-image" in sys.argv:
+                import io
+                import tarfile
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w") as archive:
+                    data = b"kernel"
+                    info = tarfile.TarInfo("./launch_gemm_0/abc.pkl")
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+                sys.stdout.buffer.write(buffer.getvalue())
+                sys.exit(0)
             if sys.argv[1] == "run" and os.environ.get("CONTAINER_LOG_BYTES"):
                 size = int(os.environ["CONTAINER_LOG_BYTES"])
                 sys.stdout.write("container stdout start\\n" + "x" * size)
@@ -288,6 +301,26 @@ class SpurDispatchTest(unittest.TestCase):
         run = next(call for call in self.docker_calls(0) if call[0] == "run")
         self.assertIn("NCCL_SOCKET_IFNAME==custom0", run)
         self.assertIn("MORI_SOCKET_IFNAME=custom1", run)
+
+    def test_flydsl_aot_cache_is_extracted_once_and_mounted(self):
+        aot_root = self.root / "flydsl-aot"
+        for _ in range(2):
+            self.run_job(
+                "--spur-worker",
+                FAKE_IMAGE_ID="sha256:0123456789abcdef0123",
+                ATOMESH_FLYDSL_AOT_ROOT=str(aot_root),
+            )
+        cache = aot_root / "0123456789abcdef"
+        self.assertEqual((cache / "launch_gemm_0/abc.pkl").read_bytes(), b"kernel")
+        self.assertTrue((cache / ".complete").exists())
+        runs = [call for call in self.docker_calls(0) if call[0] == "run"]
+        extracts = [run for run in runs if "--entrypoint" in run]
+        self.assertEqual(len(extracts), 1)
+        workers = [run for run in runs if "--entrypoint" not in run]
+        self.assertEqual(len(workers), 2)
+        for run in workers:
+            self.assertIn(f"{cache}:/opt/atomesh/flydsl-aot", run)
+            self.assertIn("ATOMESH_FLYDSL_AOT_DIR=/opt/atomesh/flydsl-aot", run)
 
     def test_missing_node_interface_fails_before_container_start(self):
         result = self.run_job(
