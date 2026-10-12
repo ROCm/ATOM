@@ -43,21 +43,26 @@ logger = logging.getLogger("atom")
 ENGRAM_ROWS = "v41_engram_rows"
 
 
-def _staging_advances(embeddings, step) -> bool:
-    """Whether this step's Engram rows carry a staging that advances the cursor.
+def _staging_advances(staged) -> bool:
+    """Whether this step's Engram staging will advance the cursor itself.
 
-    `EngramStaging.start` does it on the way past; a plain mapping of rows has
-    no `stage` and does nothing. The caller needs the difference because the
-    advance has to happen exactly once, down one path or the other.
+    The advance has to happen exactly once, down one path or the other.
+    `EngramStaging._advance_cursor` does it on the way past, and stands down on
+    a step carrying candidate cursors -- a verify step's cursor is the accepted
+    prefix's, which only the sampler knows.
+
+    Takes the `EngramStep`, which is the object that answers both halves. An
+    earlier version of this took the batch step instead and asked it for
+    `candidates`: both types carry that name, but the batch step's is the
+    indexer's per-layer block ids, a `dict` with a `default_factory`, so
+    `is None` was false for every step ever built. The gate was a constant,
+    and what it silently dropped was the `staged is None` test it had
+    replaced -- leaving the caller to advance a cursor the staging was about
+    to advance too.
     """
-    if getattr(embeddings, "stage", None) is None:
+    if staged is None:
         return False
-    # `EngramStaging._advance_cursor` stands down on a step that carries
-    # candidates -- a verify step's cursor belongs to the sampler. Asking only
-    # whether a `stage` exists left the same hole twice over: staging skipped
-    # the advance, the caller saw a `stage` and skipped it too, and neither
-    # thought it owed one.
-    return getattr(step, "candidates", None) is None
+    return staged.candidates is None
 
 
 def build_v41_pool_geometry(
@@ -799,7 +804,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         elif (
             not metadata.dummy
             and not step.tentative
-            and not _staging_advances(embeddings, step)
+            and not _staging_advances(staged)
         ):
             # Owed to `EngramStaging.start` only when there is a staging to do
             # it. The condition used to be `staged is None`, which assumed the

@@ -475,8 +475,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # in every worker, and it runs before the model it configures can
             # be called -- the object does not exist until this returns.
             from atom.plugin.vllm.breakable_capture import install_execution_policy
+            from atom.plugin.vllm.v41_eager_break import apply_v41_eager_break
 
             install_execution_policy()
+            # The attention break this frontend needs, applied to the class
+            # before the model below is built out of it.
+            apply_v41_eager_break()
         if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
             self.atom_config, "enable_decoder_swa_bounded_replay", False
         ):
