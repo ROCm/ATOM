@@ -467,23 +467,34 @@ generation parity. The request phase took 14:01 on the pre-PR checkout and
 TP1 exercises HC, short-context QSA and gfx950 GDN decode, but not the TP4
 merged projection or index CP.
 
-A separate local API probe used 78-token prompts and generated exactly 96
-tokens per request. With seven steady runs per batch, median completion
-throughput was:
+A separate TP1 API screening probe ran on one MI355X per variant with CUDA
+graphs, MTP off, and at most eight sequences. Each request used a 78-token
+prompt and a 96-token output cap. Seven-run medians below are
+`usage.completion_tokens` divided by client wall time, including prefill and
+HTTP response time:
 
-| TP1 concurrent requests | Pre-PR ATOM | This PR | Gain |
-| ---: | ---: | ---: | ---: |
-| 1 | 98.62 tokens/s | 100.68 tokens/s | 1.02× |
-| 4 | 318.82 tokens/s | 333.19 tokens/s | 1.05× |
-| 8 | 610.42 tokens/s | 640.87 tokens/s | 1.05× |
+| TP1 concurrent requests | Pre-PR ATOM | This PR |
+| ---: | ---: | ---: |
+| 1 | 98.62 tokens/s | 100.68 tokens/s |
+| 4 | 318.82 tokens/s | 333.19 tokens/s |
+| 8 | 610.42 tokens/s | 640.87 tokens/s |
+
+A spot-check of this workload returned 96 reasoning tokens,
+`finish_reason=length`, and empty visible content. These figures describe
+capped decode work, not completed-answer throughput. The variants ran on
+different GPUs at different times, so the observed 2–5% ratios do not
+establish a reliable serving speedup. A later same-GPU run found similar
+absolute rates, but a subsequent baseline repeat slowed sharply under
+changing machine conditions; no replacement ratio is claimed.
 
 For a checkpoint-weight TP4+EP4 check, 16 concurrent deterministic math
 prompts produced the same correct final answer with all Qwen optimization
 flags on and off. The flags-off comparison used this PR's model loader because
-the older checkout does not recognize `qwen4_exp_text` at TP4. A steady
-96-token, 16-request API probe measured median 849.96 → 891.30 completion
-tokens/s over five runs (1.05×); individual batches varied with scheduling.
-This probe used a short context, so it did not exercise long-context index CP.
+the older checkout does not recognize `qwen4_exp_text` at TP4. A separate
+96-token-capped, default-thinking API probe measured five-run medians of
+849.96 and 891.30 `usage.completion_tokens`/s with flags off and on.
+Individual batches varied with scheduling. This short-context probe has the
+same capped-workload limitation and did not exercise long-context index CP.
 
 The local AITER/FlyDSL build could not compile some AITER GDN prefill and BF16
 GEMM kernels. Both sides used the existing Triton GDN prefill and the same
