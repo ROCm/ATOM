@@ -40,7 +40,7 @@ def test_a_hit_is_refused_when_no_image_can_back_it(monkeypatch):
     assert leg._counters["local_cap_image"] == 0
 
 
-def test_a_hit_is_capped_to_the_checkpoint_an_image_sits_at(monkeypatch):
+def test_a_hit_lands_on_a_position_an_image_sits_at(monkeypatch):
     monkeypatch.setattr(v41_state, "_images_can_serve", lambda: True)
     monkeypatch.setattr(v41_state, "_IMAGE_LOCAL_HITS_ENABLED", True)
     monkeypatch.setattr(v41_state, "_LOCAL_PREFIX_HITS_ENABLED", False)

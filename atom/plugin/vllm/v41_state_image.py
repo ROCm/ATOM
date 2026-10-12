@@ -1060,6 +1060,9 @@ _RUNNER = None
 _WRITE_COL_CALLS: list = []
 _WRITE_COL_NULL: list = []
 _WRITE_COL_EMPTY: list = []
+#: Columns vLLM asked for at an interior offset, which the post-forward
+#: state cannot fill. Declined rather than filled with the wrong position.
+_WRITE_COL_INTERIOR: list = []
 _STORE_NO_SLOTS: list = []
 _STORE_NO_MARKS: list = []
 _RESTORE_NO_BATCH: list = []
@@ -1180,6 +1183,9 @@ def publish_image_halves(vllm_config, common_attn_metadata, num_reqs: int) -> bo
         )
         shim.block_table_tensor = table[:num_reqs]
         builder = _checkpoint_builder(vllm_config, image_spec(vllm_config))
+        m_query_lens = [
+            int(x) for x in common_attn_metadata.query_start_loc_cpu.diff().tolist()
+        ]
         meta = builder.build(shim, list(range(int(num_reqs))))
         if meta is None:
             # vLLM says no checkpoint is written this step. Counted,
@@ -1187,7 +1193,22 @@ def publish_image_halves(vllm_config, common_attn_metadata, num_reqs: int) -> bo
             # `image_stored=0` and nothing else distinguishes them.
             _WRITE_COL_NULL.append(1)
             return True
-        _LAST_STORE_MARKS.extend(int(b) for b in meta.state_indices.tolist())
+        # `checkpoint_offsets` is where INSIDE the query the state must be
+        # captured -- vLLM's own words are "mid-prefill checkpoint". The
+        # store runs after the forward and therefore holds the state at the
+        # END of the query. Those coincide only when the offset is the
+        # query length; anywhere else, writing it means labelling the state
+        # at 1362 tokens as the state at 1280, which no later reader could
+        # tell apart. Measured: that is exactly what the one image this
+        # branch ever stored contained.
+        offsets = meta.checkpoint_offsets.tolist()
+        qlens = m_query_lens
+        for i, block in enumerate(meta.state_indices.tolist()):
+            if i < len(offsets) and i < len(qlens) and int(offsets[i]) == int(qlens[i]):
+                _LAST_STORE_MARKS.append(int(block))
+            else:
+                _LAST_STORE_MARKS.append(-1)
+                _WRITE_COL_INTERIOR.append(1)
         if not _LAST_STORE_MARKS:
             _WRITE_COL_EMPTY.append(1)
         return True
@@ -1201,11 +1222,62 @@ def note_store_decline(reason: str) -> None:
     {"slots": _STORE_NO_SLOTS, "marks": _STORE_NO_MARKS}[reason].append(1)
 
 
+def boundary_marks_for_ends(slots, ends):
+    """`[(slot, block)]` for rows whose step ended exactly on a boundary.
+
+    vLLM marks one column per prefill, `cdiv(seq_len, block) - 2`, and that
+    is one block BELOW where a repeat of the same prompt resumes. Measured:
+    33 images stored, 0 ever restored, because no hit ever landed on the
+    only column anything was written to.
+
+    A row is only eligible when its step ENDED on a block boundary, because
+    that is the only position whose state the forward actually leaves
+    behind. A boundary crossed in the middle of a chunk is gone by the time
+    this runs, and writing the end state there would be an image of the
+    wrong position that nothing downstream could tell apart.
+    """
+    if not ends:
+        return []
+    table = image_block_table()
+    if table is None:
+        _RESTORE_NO_BATCH.append(1)
+        return []
+    block_size = _IMAGE_BLOCK_SIZE or 256
+    out = []
+    for row in range(min(len(slots), len(ends))):
+        end = int(ends[row])
+        if end <= 0 or end % block_size:
+            _BOUNDARY_UNALIGNED.append(1)
+            continue
+        col = image_read_column(end, block_size)
+        if row >= table.shape[0] or col >= table.shape[1]:
+            _BOUNDARY_OFF_TABLE.append(1)
+            continue
+        block = int(table[row, col].item())
+        if block <= 0:
+            _BOUNDARY_NO_BLOCK.append(1)
+            continue
+        out.append((int(slots[row]), block))
+    _BOUNDARY_MARKS.append(len(out))
+    return out
+
+
+_BOUNDARY_UNALIGNED: list = []
+_BOUNDARY_OFF_TABLE: list = []
+_BOUNDARY_NO_BLOCK: list = []
+_BOUNDARY_MARKS: list = []
+
+
 def restore_declines() -> dict:
     return {
+        "image_boundary_marks": sum(_BOUNDARY_MARKS),
+        "image_boundary_unaligned": len(_BOUNDARY_UNALIGNED),
+        "image_boundary_no_block": len(_BOUNDARY_NO_BLOCK),
+        "image_boundary_off_table": len(_BOUNDARY_OFF_TABLE),
         "image_write_col_calls": len(_WRITE_COL_CALLS),
         "image_write_col_null": len(_WRITE_COL_NULL),
         "image_write_col_empty": len(_WRITE_COL_EMPTY),
+        "image_write_col_interior": len(_WRITE_COL_INTERIOR),
         "image_store_no_slots": len(_STORE_NO_SLOTS),
         "image_store_no_marks": len(_STORE_NO_MARKS),
         "image_restore_no_table": len(_RESTORE_NO_BATCH),

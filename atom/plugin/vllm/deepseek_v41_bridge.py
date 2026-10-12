@@ -700,8 +700,15 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     from atom.plugin.vllm.v41_state_image import publish_image_halves
 
     publish_image_halves(vllm_config, common_attn_metadata, len(slots))
-    # Remembered for the store after the forward.
+    # Remembered for the store after the forward. The ends go with them:
+    # vLLM marks one column per prefill and it is not the one a repeat of
+    # the same prompt resumes at, so the store also writes this step's own
+    # end boundary -- see `boundary_marks_for_ends`.
     prepared.image_slots = list(slots)
+    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
+    prepared.image_ends = (
+        [int(e) for e in snapshot.ends] if snapshot is not None else []
+    )
 
 
 def v41_store_images_after_forward(prepared) -> int:
@@ -713,6 +720,7 @@ def v41_store_images_after_forward(prepared) -> int:
     tell.
     """
     from atom.plugin.vllm.v41_state_image import (
+        boundary_marks_for_ends,
         note_store_decline,
         runtime,
         take_store_marks,
@@ -726,11 +734,24 @@ def v41_store_images_after_forward(prepared) -> int:
     if not slots:
         note_store_decline("slots")
         return 0
-    if not marks:
+    rows = []
+    # vLLM's own column, when it marked one this step.
+    for i in range(min(len(slots), len(marks))):
+        if int(marks[i]) > 0:
+            rows.append((int(slots[i]), int(marks[i])))
+    # This step's own end boundary, which vLLM never marks and which is the
+    # position a repeat of the same prompt resumes at. vLLM writes exactly
+    # one image per prefill, one block BELOW the end, so without this the
+    # images could not carry a hit at all -- measured, 33 stored and 0 ever
+    # restored. The state being written is the one the forward just
+    # produced, the same provenance as vLLM's own checkpoint.
+    rows.extend(
+        boundary_marks_for_ends(slots, getattr(prepared, "image_ends", None))
+    )
+    if not rows:
         note_store_decline("marks")
         return 0
-    n = min(len(slots), len(marks))
-    return rt.store_for([(int(slots[i]), int(marks[i])) for i in range(n)])
+    return rt.store_for(rows)
 
 
 class AtomDeepseekV41ProxyBackend(AttentionBackend):

@@ -523,3 +523,31 @@ Making the images carry hits in general needs a checkpoint at every reusable
 boundary, not one per prefill -- vLLM's `compute_mamba_prefill_checkpoints`
 returns a single position per row, so that is an upstream change, not a
 configuration.
+
+### Why the images stay inert: vLLM's checkpoint is interior
+
+`MambaPrefillCheckpointMetadata.checkpoint_offsets` says where INSIDE the
+query the state must be captured -- vLLM's own words are "mid-prefill
+checkpoint". A store that runs after the forward holds the state at the END
+of the query. The two coincide only when the offset equals the query
+length.
+
+Anywhere else, writing it labels the state at 1362 tokens as the state at
+1280, and nothing downstream can tell: the cursor contract compares the
+position a request WANTS against the one the slot reports, and a restore
+sets both. This is the only defect in this mechanism that produces a wrong
+answer rather than a dead engine. The store now declines those columns --
+17 of 17 on the measured run -- so what it writes is position-correct, and
+what it writes is only the end-of-query case.
+
+Filling vLLM's column properly means exporting during the forward at that
+offset, through `MambaPrefillCheckpointExporter`. V4.1 advances its state
+through `engram_compress` over pre-built compression plans, so that means
+splitting the plan at the checkpoint offset and exporting between the
+halves -- a model-op change, not a bridge one.
+
+The cheaper route is the one the error message already names: reuse the
+compressed prefix up to a PAGE boundary and replay the last <=128 tokens to
+rebuild STATE, paying one window per hit instead. Either way the tier
+already covers this workload (warm 16/16, 79.8% supplied), so the images
+are not on the critical path for offload.

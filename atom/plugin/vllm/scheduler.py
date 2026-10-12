@@ -311,16 +311,15 @@ def _image_only_cap(num_local: int, block_size: int) -> int:
             num_local, block_size, drop_eagle_block=False
         )
     )
-    # Refused unless the hit IS the checkpoint. vLLM writes exactly one
-    # image per prefill, at that prompt's own last block boundary, and a
-    # shared-prefix hit has no reason to land there: measured without a
-    # tier, a 1362-token prompt put its image at 1280 while the hit came in
-    # at 1024, and the engine died on `needs state at 1024, found 3`.
-    #
-    # With a tier the capped position is backed by a state load and this
-    # does not arise -- 11 of 11 completed. Without one there is nothing
-    # behind an unbacked hit but a dead engine, so the hit is given up.
-    # Giving it up costs a recompute; taking it costs the server.
+    # Given up rather than taken when it is not itself a checkpoint.
+    # Accepting block-aligned hits was tried on the grounds that the store
+    # writes one at every step end that lands on a boundary -- but a step
+    # end almost never does: measured, `image_boundary_unaligned=2087` and
+    # `image_boundary_marks=0`, and the engine died on the same hit again. There is nothing behind
+    # an unbacked hit but a dead engine: measured, a 1362-token prompt put
+    # its image at 1280 while the hit arrived at 1024, and the server went
+    # down on `needs state at 1024, found 3`. Giving it up costs a
+    # recompute; taking it costs the server.
     if position != num_local:
         return 0
     return position

@@ -18,7 +18,19 @@ def test_a_hit_that_is_not_the_checkpoint_is_refused(monkeypatch):
     monkeypatch.setattr(
         "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
     )
-    assert sched._image_only_cap(6912, 256) == 0
+    # Not block-aligned, so nothing was written there.
+    assert sched._image_only_cap(6900, 256) == 0
+    assert sched._image_only_cap(1000, 256) == 0
+
+
+def test_a_block_aligned_hit_is_not_kept_on_that_ground(monkeypatch):
+    """Accepting these was tried, on the grounds that the store writes an
+    image at every step end landing on a boundary. A step end almost never
+    does: `image_boundary_unaligned=2087`, `image_boundary_marks=0`, and
+    the engine died on the same hit again."""
+    monkeypatch.setattr(
+        "atom.plugin.vllm.v41_state_image.images_can_serve", lambda: True
+    )
     assert sched._image_only_cap(1024, 256) == 0
 
 

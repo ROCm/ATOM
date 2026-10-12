@@ -30,6 +30,7 @@ LIVE = [
     "image_read_column",
     "restore_stale_rows",
     "restore_declines",
+    "boundary_marks_for_ends",
     "group_lookup_failures",
     "publish_image_halves",
     "take_store_marks",
