@@ -236,9 +236,7 @@ class DSparkConfidenceHead(nn.Module):
         x = torch.cat([hidden_states, markov_embeds], dim=-1)
         weight = self.proj.weight
         if not x.is_cuda:
-            logit = torch.nn.functional.linear(
-                x.float(), weight.float()
-            ).squeeze(-1)
+            logit = torch.nn.functional.linear(x.float(), weight.float()).squeeze(-1)
             return torch.sigmoid(logit)
 
         import aiter
