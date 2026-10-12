@@ -219,7 +219,8 @@ def test_unverified_step_anchors_every_row_on_its_last(mixed_forward_context):
 def test_mixed_step_is_never_shrunk_even_with_unchanged_composition():
     """Two mixed steps can carry identical req_ids (a chunked prefill beside
     the same decodes), so "the composition changed" does not keep ragged off.
-    The prefill guard at the top of `_dspark_apply_q_bucket` does."""
+    The prefill guard at the top of `dspark_scheduler.apply_q_bucket`, which
+    the runner's `_dspark_apply_q_bucket` delegates to, does."""
     from atom.model_engine.model_runner import ModelRunner
 
     runner = SimpleNamespace(

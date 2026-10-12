@@ -551,6 +551,7 @@ class tokenIDProcessor:
             # Both regions start from the scheduler's ids: exact for prefill and
             # for a decode row with nothing deferred; a placeholder the kernel
             # below overwrites for a deferred one.
+            total_tokens = batch.total_tokens_num
             self.input_ids.np[:total_tokens] = scheduled_tokens[:total_tokens]
             n_decode_seqs = batch.total_seqs_num_decode
             if self.use_spec:
