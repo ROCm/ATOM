@@ -687,6 +687,7 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     )
     # Remembered for the store after the forward.
     prepared.image_slots = list(slots)
+    rt.log_stats()
 
 
 def v41_store_images_after_forward(prepared) -> int:

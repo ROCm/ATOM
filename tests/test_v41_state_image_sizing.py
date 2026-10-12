@@ -220,17 +220,18 @@ def test_other_layers_are_ignored_by_the_check():
 # --- the gate the wiring has to open, not the environment ---------------
 
 
-def test_the_gate_is_shut_while_the_restore_is_incomplete(monkeypatch):
-    """The store round-trips byte for byte; the restore reads the wrong
-    column of the block table -- `MambaPrefillCheckpointBuilder` reports
-    where a checkpoint is WRITTEN, not where a resuming request reads one.
-    With the gate open that was `needs state at 2304, found 3`."""
+def test_the_gate_needs_both_registration_and_a_restore(monkeypatch):
+    """Two conditions because they failed separately. Registration alone
+    served hits over blocks nothing had written; a restore that read the
+    WRITE column resumed from a block nothing filled (`needs state at 2304,
+    found 3`). The constant is what each fix flipped."""
     import atom.plugin.vllm.v41_state_image as img
 
     monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
-    assert img.images_registered() is True
-    assert img._RESTORE_IMPLEMENTED is False
+    monkeypatch.setattr(img, "_RESTORE_IMPLEMENTED", False)
     assert img.images_can_serve() is False
+    monkeypatch.setattr(img, "_RESTORE_IMPLEMENTED", True)
+    assert img.images_can_serve() is True
 
 
 def test_the_gate_opens_only_when_both_hold(monkeypatch):
@@ -265,3 +266,22 @@ def test_the_prefix_caching_gates_ask_the_module_not_the_environment(monkeypatch
     monkeypatch.setattr(img2, "_RESTORE_IMPLEMENTED", True)
     assert plat._v41_state_images_enabled() is True
     assert cfg._v41_state_images_enabled() is True
+
+
+def test_the_layer_class_can_actually_be_built():
+    """A whole class was once removed by an edit and every test stayed green.
+
+    Nothing here touched the layer -- the sizing and copier tests do not --
+    so the first thing to notice was the engine failing to start with
+    `NameError: name '_V41ImageLayer' is not defined`. Building one is the
+    cheapest check that the thing vLLM will instantiate exists.
+    """
+    from atom.plugin.vllm.v41_state_image import image_layer_class
+
+    cls = image_layer_class()
+    layer = cls("atom.dsv41.state_image.0", 0, UNIT, 256, 4096)
+    spec = layer.get_kv_cache_spec(None)
+    assert spec.page_size_bytes == UNIT
+    assert spec.num_prefill_checkpoint_blocks == 1
+    assert layer.get_attn_backend().is_ssm() is True
+    assert layer.get_attn_backend().get_builder_cls() is not None

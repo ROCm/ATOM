@@ -56,8 +56,13 @@ IMAGE_LAYER_PREFIX = "atom.dsv41.state_image"
 #: `needs state at ...` on the second send of one prompt.
 _IMAGES_WIRED = False
 
-#: The restore half is incomplete; see `images_can_serve`. Flipping this
-#: without fixing it admits prefix hits that resume from the wrong bytes.
+#: False because the store and the restore never execute: `wired=4` on four
+#: ranks, and `log_stats` -- called on the same line that records this step's
+#: slots -- emitted nothing across a whole run. So
+#: `_v41_images_around_forward` is not reaching a runtime or a `prepared`,
+#: and every fix made downstream of it so far has been made on a path that
+#: does not run. That is the next thing to find, and until it is found
+#: flipping this admits prefix hits that resume from whatever the slot held.
 _RESTORE_IMPLEMENTED = False
 
 
@@ -523,6 +528,36 @@ def image_layer_class():
     from vllm.v1.attention.backend import AttentionBackend, AttentionMetadataBuilder
     from vllm.v1.kv_cache_interface import MambaSpec
 
+    class _V41ImageBackend(AttentionBackend):
+        """A backend that answers questions and runs nothing.
+
+        vLLM asks every layer's backend whether it is an SSM, to decide which
+        block sizes the others may pick (`_find_non_ssm_backends`). The image
+        layers are state, not attention, so they say so -- and returning None
+        takes the engine down naming the caller, `'NoneType' object has no
+        attribute 'is_ssm'`, rather than the layer.
+        """
+
+        @staticmethod
+        def get_name() -> str:
+            return "ATOM_DEEPSEEK_V41_STATE_IMAGE"
+
+        @classmethod
+        def is_ssm(cls) -> bool:
+            return True
+
+        @staticmethod
+        def get_impl_cls():
+            return nn.Identity
+
+        @staticmethod
+        def get_builder_cls():
+            return _V41ImageMetadataBuilder
+
+        @classmethod
+        def full_cls_name(cls):
+            return (cls.__module__, cls.__qualname__)
+
     class _V41ImageMetadataBuilder(AttentionMetadataBuilder):
         """Builds nothing. The image layers run no attention.
 
@@ -553,66 +588,74 @@ def image_layer_class():
             return None
 
         def _publish(self, m):
+            """Publish both columns: the one to read, and the one to write.
+
+            They are NOT the same column, which is the mistake this replaces.
+            vLLM's `MambaPrefillCheckpointBuilder` reports where a checkpoint
+            is WRITTEN this step. What a resuming request READS is
+            `mamba_get_block_table_tensor`'s rule for align mode:
+            `start = (seq_len - 1) // block_size`, the last state block of
+            what the request already has. Using the write column for both
+            resumed requests from a block nothing had filled -- measured as
+            `needs state at 2304, found 3`.
+            """
             from vllm.model_executor.layers.mamba.checkpoint import (
                 MambaPrefillCheckpointBuilder,
             )
 
             if m is None:
                 return
+            step = _step_id(m)
+
+            # --- the read column, for a restore ---
+            read_blocks = self._read_columns(m)
+            if read_blocks is not None:
+                offer_restore_half(step, blocks=read_blocks)
+
+            # --- the write column, for the store after the forward ---
             if self._ckpt is None:
                 self._ckpt = MambaPrefillCheckpointBuilder(
                     self.vllm_config, self.kv_cache_spec
                 )
-            rows = list(range(int(m.num_reqs)))
-            meta = self._ckpt.build(m, rows)
-            if meta is None:
-                return
-            blocks = meta.state_indices.tolist()
-            offer_restore_half(_step_id(m), blocks=blocks)
+            meta = self._ckpt.build(m, list(range(int(m.num_reqs))))
             _LAST_STORE_MARKS.clear()
-            _LAST_STORE_MARKS.extend(int(b) for b in blocks)
+            if meta is not None:
+                _LAST_STORE_MARKS.extend(
+                    int(b) for b in meta.state_indices.tolist()
+                )
 
-        def build_for_cudagraph_capture(self, common_attn_metadata):
-            return None
+        def _read_columns(self, m):
+            """The block each row would resume its state from, or None.
 
-    class _V41ImageBackend(AttentionBackend):
-        """A backend that answers questions and runs nothing.
+            Taken through vLLM's own rule rather than re-derived: a column
+            picked differently here than the one the scheduler filled is a
+            restore from somebody else's state, and nothing downstream
+            compares the two.
+            """
+            import torch
+            from vllm.v1.attention.backends.utils import (
+                mamba_get_block_table_tensor,
+            )
 
-        vLLM asks every layer's backend whether it is an SSM, to decide which
-        block sizes it may pick for the others
-        (`_find_non_ssm_backends`). The image layers are state, not
-        attention, so they say so -- and a layer returning None here takes
-        the engine down at startup with `'NoneType' object has no attribute
-        'is_ssm'`, which names the caller rather than the layer.
-        """
-
-        @staticmethod
-        def get_name() -> str:
-            return "ATOM_DEEPSEEK_V41_STATE_IMAGE"
-
-        @classmethod
-        def is_ssm(cls) -> bool:
-            return True
-
-        @staticmethod
-        def get_impl_cls():
-            return nn.Identity
-
-        @staticmethod
-        def get_builder_cls():
-            return _V41ImageMetadataBuilder
-
-        @classmethod
-        def full_cls_name(cls):
-            return (cls.__module__, cls.__qualname__)
+            table = getattr(m, "block_table_tensor", None)
+            seq_lens = getattr(m, "seq_lens", None)
+            if table is None or seq_lens is None:
+                return None
+            cols = mamba_get_block_table_tensor(
+                table, seq_lens, self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
+            if cols.dim() == 2:
+                cols = cols[:, 0]
+            return [int(b) for b in cols.tolist()]
 
     class _V41ImageLayer(nn.Module, AttentionLayerBase):
         """One image unit, as vLLM sees it.
 
         Deliberately inert. vLLM allocates for it and this records what it
-        got; whether those are the bytes an image is written to is NOT
-        assumed here. `describe_binding` reports the allocation so the
-        question can be settled by reading it rather than by modelling it.
+        got; whether those are the bytes an image is written to is not
+        assumed -- `describe_binding` reports the allocation so the question
+        is settled by reading it.
         """
 
         def __init__(self, prefix, part, unit_bytes, block_size, alignment):
@@ -650,7 +693,9 @@ def image_layer_class():
                 return {
                     "layer": self.prefix,
                     "blocks": blocks,
-                    "bytes_per_block": int(t.numel() * t.element_size() // max(1, blocks)),
+                    "bytes_per_block": int(
+                        t.numel() * t.element_size() // max(1, blocks)
+                    ),
                     "base": int(t.data_ptr()),
                     "device": str(t.device),
                 }
@@ -733,11 +778,33 @@ class V41ImageRuntime:
         return n
 
     def stats(self) -> dict:
-        return {
+        d = {
             "image_stored": self.stored,
             "image_restored": self.restored,
             "image_declined_null": self.exporter.declined_null,
         }
+        d.update(rendezvous_stats())
+        d["image_mark_failures"] = mark_failures()
+        return d
+
+    def log_stats(self, interval_s: float = 20.0) -> None:
+        """Say what the two directions did, including when they did nothing.
+
+        Unconditional and periodic for the reason every counter on this
+        branch is: a mechanism that stored exactly zero images otherwise
+        produces exactly zero lines saying so, and a by-construction null
+        reads as a quiet success.
+        """
+        import time
+
+        now = time.monotonic()
+        if now - getattr(self, "_last_log", 0.0) < interval_s:
+            return
+        self._last_log = now
+        logger.info(
+            "V4.1 state images: %s",
+            ", ".join(f"{k}={v}" for k, v in sorted(self.stats().items())),
+        )
 
 
 _RUNTIME = None
