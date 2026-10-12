@@ -398,14 +398,16 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return self._load_winner.get(getattr(seq, "id", None))
 
     def carries_state_load(self, seq: Any) -> bool:
-        """Whether the sub that owns this request's load also carries its state.
+        """Whether the sub that owns this request's load also carries the
+        tier's state leg.
 
-        The state leg can only ride a load of the tier sub. When another sub --
-        a P/D connector -- won the KV arbitration, the tier sub's load was
-        cancelled and nothing will restore the state, while the scheduler still
-        parks on the winner's report and would resume over an unfilled slot.
-        With no KV owner the load, if any, is state-only and the tier sub
-        carries it (`_state_only_carrier`).
+        The tier's state leg can only ride a load of the tier sub. When another
+        sub -- a P/D connector -- won the KV arbitration, the tier sub's load
+        was cancelled, so the leg has no carrier while the scheduler parks on
+        the winner's report; the scheduler then gives it back
+        (`Scheduler._release_uncarried_state_load`). With no KV owner the load,
+        if any, is state-only and the tier sub carries it
+        (`_state_only_carrier`).
         """
         owner = self._load_owner(seq)
         return owner is None or owner is self._state_tier_sub()

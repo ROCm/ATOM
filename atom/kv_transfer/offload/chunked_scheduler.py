@@ -1231,8 +1231,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if floor is not None and entry is not None:
             # The LMCache hit was not actually loaded. Let the recomputed
             # [HBM, LMC) chunks be saved again instead of permanently treating
-            # them as already persisted.
-            entry[1] = self._chunk_floor(floor)
+            # them as already persisted. Lowered only, never raised: a failed
+            # load is no evidence that anything below the tracked frontier was
+            # ever stored.
+            entry[1] = min(int(entry[1]), self._chunk_floor(floor))
         self._record_failed_load_attempt(sid)
         # Drop the hit too. `_repeat_load_suppressed` already answers for this
         # request, but the memo must not outlive the load spec it would imply

@@ -470,6 +470,18 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         super()._clear_pending_load(sid)
         self._state_only_loads.pop(sid, None)
 
+    def _note_handed_off(self, seq) -> None:
+        """Tell the engine's state index this load is now going to a worker.
+
+        Until then a teardown abandons the load rather than holding its slot
+        for a report that cannot come (`StateOffloadIndex.orphan`). The index
+        is reached through the bound block manager, as the late-save path
+        reaches the prefix cache.
+        """
+        index = getattr(getattr(self, "_block_manager", None), "state_offload", None)
+        if index is not None:
+            index.note_handed_off(seq.id)
+
     def _state_load_spec(self, seq) -> StateLoadSpec:
         joint = seq.offload_joint
         return StateLoadSpec(
@@ -498,6 +510,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             if int(seq.offload_joint.load_hash) == -1:
                 continue
             req.state_load_spec = self._state_load_spec(seq)
+            self._note_handed_off(seq)
         # Anything left never reached the metadata as a KV load. A parked joint
         # load dropped there is reported by the base (`take_undispatched_loads`).
         self._state_load_seqs.clear()
@@ -519,6 +532,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
                     state_load_spec=self._state_load_spec(seq),
                 )
             )
+            self._note_handed_off(seq)
         self._state_only_loads.clear()
         return meta
 

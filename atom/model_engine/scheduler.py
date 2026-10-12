@@ -2695,11 +2695,14 @@ class Scheduler:
         """Drop a state leg the load this request parks on will not carry.
 
         Under `kv_connector: multi` a P/D sub can win the KV leg, and only the
-        tier sub carries a state leg. Parked on the winner's report alone, the
-        request would resume over a state slot nothing restored. Give the state
-        load back and disown its boundary; the request still waits for the
-        winner's KV. False when the disown cannot be backed -- the caller then
-        abandons this admission rather than resume over a shared prefix.
+        tier sub carries the tier's state leg. Left armed, it has no carrier:
+        the request would resume on the winner's report alone -- over a slot
+        nothing restored, or, since a K3 P/D transfer brings its own recurrent
+        state, with a second writer racing the winner's into the slot. Give the
+        state load back and disown its boundary; the request still waits for
+        the winner's transfer. False when the disown cannot be backed -- the
+        caller then abandons this admission rather than resume over a shared
+        prefix.
         """
         if seq.offload_joint.load_hash == -1 or self._connector_carries_state_load(seq):
             return True
@@ -3842,10 +3845,9 @@ class Scheduler:
                 continue
             self.failed_recving_kv_req_ids.append(req_id)
 
-        # The two loading channels carry state-tier loads as well as KV ones,
-        # which buys the state leg the aggregator's per-request quorum for free.
-        # They cannot be confused: a KV load is refused for any sequence with a
-        # per-request cache, and a state load exists only for such a sequence.
+        # A hybrid's state leg rides its request's load and reports in that
+        # load's one completion, so every completion is offered to the state
+        # index; it settles only the requests it holds an entry for.
         offload = self._state_offload()
         for req_id in kv_connector_output.finished_loading or ():
             if metrics := getattr(self, "metrics", None):

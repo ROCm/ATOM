@@ -17,6 +17,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from time import monotonic
 
+#: Window for `stale_live_loads` when orphan reclamation is disabled: no
+#: state transfer legitimately stays outstanding this long.
+_STALE_DEFAULT_S = 300.0
+
 logger = logging.getLogger("atom")
 
 
@@ -27,9 +31,13 @@ class _OutstandingLoad:
     prefix_hash: int
     slot: int
     at: float
-    # Set when the request is torn down while its load is still in flight. The
-    # slot then belongs to this index rather than to the sequence, because the
-    # worker may still be scattering into it.
+    # Set when the connector hands the load to a worker (`note_handed_off`).
+    # Before that nothing can be writing the slot, so a teardown abandons the
+    # entry instead of holding the slot for a report that will never come.
+    handed_off: bool = False
+    # Set when the request is torn down while its load is in a worker's hands.
+    # The slot then belongs to this index rather than to the sequence, because
+    # the worker may still be scattering into it.
     orphaned: bool = False
 
 
@@ -60,8 +68,13 @@ class StateOffloadIndex:
     `hashes` answers the membership half of the tier's vote. It is deliberately
     optimistic: LMCache's own LRU can drop bytes at any time, so a hash here
     means "was stored once", never "is still there". The false positive costs
-    one lookup and a park/unpark, and is handled by the load-failure path
-    (`fail_load(missing=True)` -> `forget`).
+    one lookup and a park/unpark, and is retracted on the evidence of a miss:
+    on the native path the worker's TP-quorumed state-`get` verdict
+    (`Scheduler` -> `forget`), on the vLLM plugin path the KDA leg's own result
+    (`fail_load(missing=True)`).
+
+    The counter identity holds by construction, so it cannot see a load that
+    never settles; `stale_live_loads` is what does (see `reclaim`).
     """
 
     def __init__(
@@ -110,6 +123,10 @@ class StateOffloadIndex:
         self._detach_nonce = 0
         self.dispatched = 0
         self.settled = 0
+        # Of `dispatched`, how many a connector actually handed to a worker.
+        self.loads_handed_off = 0
+        # Gauge, refreshed by `reclaim`: live loads outstanding past the window.
+        self.stale_live_loads = 0
         self.loads_completed = 0
         self.loads_failed = 0
         self.loads_abandoned = 0
@@ -137,27 +154,6 @@ class StateOffloadIndex:
     def outstanding(self) -> int:
         """Loads dispatched and not yet settled."""
         return len(self._outstanding)
-
-    @property
-    def pending_loads(self) -> dict:
-        """req_id -> prefix hash for every load still in flight.
-
-        Rebuilds the dict, so it is for introspection and tests. The serving
-        path wants `hash_of`: the scheduler reads this one key at a time inside
-        its `failed_loading` loop, and rebuilding an N-entry dict per failure
-        made a backend outage quadratic exactly when the engine most needs to
-        drain.
-        """
-        return {
-            req_id: p.prefix_hash
-            for req_id, p in self._outstanding.items()
-            if not isinstance(req_id, _DetachedOrphan)
-        }
-
-    def hash_of(self, req_id) -> int | None:
-        """The prefix hash of `req_id`'s in-flight load, or None."""
-        pending = self._outstanding.get(req_id)
-        return None if pending is None else pending.prefix_hash
 
     def check_invariant(self, *, deep: bool = True) -> None:
         """Assert this object's whole contract.
@@ -317,13 +313,29 @@ class StateOffloadIndex:
         self.dispatched += 1
         return True
 
-    def orphan(self, req_id, slot: int) -> bool:
-        """The request is being torn down while its load is still in flight.
+    def note_handed_off(self, req_id) -> None:
+        """The connector put this load in a worker's hands.
 
-        The slot passes to this index: the worker may still be scattering into
-        it, so it cannot go back on the free list until the report lands.
-        Returns False when nothing was in flight -- the ordinary case, and it
-        means the caller keeps the slot.
+        From here a worker may be writing the slot, so a teardown must hold it
+        (`orphan`); before it, nothing can be, and a teardown abandons the load.
+        Restamps `at`, so a stale live load is aged from the handoff.
+        """
+        pending = self._outstanding.get(req_id)
+        if pending is None or pending.handed_off:
+            return
+        pending.handed_off = True
+        pending.at = monotonic()
+        self.loads_handed_off += 1
+
+    def orphan(self, req_id, slot: int) -> bool:
+        """The request is being torn down with its load outstanding.
+
+        Returns True when the slot passes to this index: the load is in a
+        worker's hands, so the slot cannot go back on the free list until the
+        report lands. False means the caller keeps the slot -- nothing was in
+        flight, the slot is not this load's, or the load was never handed to a
+        worker, in which case it is abandoned here: no writer exists and no
+        report will come, so holding the slot would only leak it until `reclaim`.
 
         `slot` is the committed slot the caller is about to free, and the claim
         is taken only if it is the one this load writes into. The request id
@@ -337,15 +349,15 @@ class StateOffloadIndex:
         pending = self._outstanding.get(req_id)
         if pending is None or pending.slot != int(slot):
             return False
+        if not pending.handed_off:
+            self.abandon_load(req_id)
+            return False
         pending.orphaned = True
-        # Restamp. `reclaim` ages an entry from `at`, and `at` was the dispatch
-        # time, so the safety window it enforces was `timeout_s` MINUS the
-        # load's in-flight age -- a load already outstanding longer than
-        # `timeout_s`, which is precisely the hung-worker case reclamation
-        # exists for, became eligible the instant it was orphaned and the next
-        # reconcile tick handed the slot out while the worker was still
-        # scattering into it. The window starts here, where the slot passes to
-        # this index, exactly as the deleted `_orphan_load_slots` stamped it.
+        # Restamp. `reclaim` ages an orphan from `at`, and the safety window it
+        # enforces must start where the slot passes to this index, not at
+        # dispatch: a load already outstanding longer than the window -- the
+        # hung-worker case reclamation exists for -- would otherwise be
+        # eligible the instant it was orphaned.
         pending.at = monotonic()
         return True
 
@@ -439,15 +451,23 @@ class StateOffloadIndex:
         gate refuses every hybrid request, with no error and no warning.
 
         Only *orphaned* entries are reclaimed. A live request's slot must never
-        be yanked out from under a worker that may still be writing into it; a
-        live request whose report is lost shows up as `outstanding` climbing,
-        which is what `check_invariant` is for. `timeout_s <= 0` disables
-        reclamation, matching the store-pin reconciler, and must not be tighter
-        than that window or this becomes the hazard it exists to prevent.
+        be yanked out from under a worker that may still be writing into it. A
+        live load whose report is lost is not visible to `check_invariant` --
+        an entry that never settles just stays in `outstanding`, and the
+        identity still holds -- so this pass also refreshes `stale_live_loads`:
+        live entries outstanding past the same window (`_STALE_DEFAULT_S` when
+        reclamation is off). Non-zero means a request is parked on a report
+        that is not coming. `timeout_s <= 0` disables reclamation, matching the
+        store-pin reconciler, and must not be tighter than that window or this
+        becomes the hazard it exists to prevent.
         """
+        now = monotonic()
+        self._refresh_stale_live_loads(
+            now, timeout_s if timeout_s > 0 else _STALE_DEFAULT_S
+        )
         if timeout_s <= 0 or not self._outstanding:
             return 0
-        deadline = monotonic() - timeout_s
+        deadline = now - timeout_s
         stale = [
             req_id
             for req_id, pending in self._outstanding.items()
@@ -468,6 +488,22 @@ class StateOffloadIndex:
                 timeout_s,
             )
         return len(stale)
+
+    def _refresh_stale_live_loads(self, now: float, window_s: float) -> None:
+        stale = sum(
+            1
+            for pending in self._outstanding.values()
+            if not pending.orphaned and now - pending.at > window_s
+        )
+        if stale > self.stale_live_loads:
+            logger.warning(
+                "state offload: %d live state load(s) outstanding for over "
+                "%.0fs; their requests are parked on reports that are not "
+                "coming.",
+                stale,
+                window_s,
+            )
+        self.stale_live_loads = stale
 
     def stats(self) -> dict[str, int]:
         """Counters for the periodic `state checkpoints:` line.
@@ -494,14 +530,20 @@ class StateOffloadIndex:
             "stores_failed": self.stores_failed,
             "stores_refused": self.stores_refused,
             "stores_untrusted": self.stores_untrusted,
-            # Load leg.
+            # Load leg. `loads_attempted` keeps main's meaning -- counted when
+            # the engine requests the load at admission (`dispatched` here) --
+            # and `loads_handed_off` is how many of those reached a worker; the
+            # rest were abandoned before dispatch. `stale_live_loads`, not
+            # `invariant_violations`, is what says a load will never settle.
+            # The orphan-reclaim count is in `checkpoint_funnel` already.
             "loads_attempted": self.dispatched,
+            "loads_handed_off": self.loads_handed_off,
             "loads_settled": self.settled,
             "loads_outstanding": self.outstanding,
+            "stale_live_loads": self.stale_live_loads,
             "loads_completed": self.loads_completed,
             "loads_failed": self.loads_failed,
             "loads_abandoned": self.loads_abandoned,
-            "orphan_load_slots_reclaimed": self.orphan_load_slots_reclaimed,
             "invariant_violations": self.invariant_violations,
             "indexed": len(self.hashes),
             # Non-zero means the index hit its `_hash_cap` and is dropping the

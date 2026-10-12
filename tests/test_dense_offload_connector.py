@@ -1471,3 +1471,19 @@ def test_dense_request_finished_releases_the_failed_load_mark(monkeypatch):
 
     sched.request_finished(seq)
     assert sched._load_failed_seqs == {}
+
+
+@pytest.mark.parametrize("tracked, expected", [(32, 16), (8, 8)])
+def test_a_failed_load_only_ever_lowers_the_save_frontier(
+    monkeypatch, tracked, expected
+):
+    """The failed load's `[HBM, LMC)` was never loaded, so the save frontier
+    drops back to HBM and those chunks are saved again. It must not RISE: a
+    frontier below the load's floor means the chunks in between were never
+    stored, and raising it would mark them persisted and never offload them."""
+    scheduler = _scheduler(monkeypatch, "kv_consumer")
+    seq = _load_seq(71, num_prompt_tokens=40)
+    scheduler._load_save_floors["71"] = 16
+    scheduler._save_tracker["71"] = [seq, tracked]
+    assert scheduler.load_failed("71") is True
+    assert scheduler._save_tracker["71"][1] == expected

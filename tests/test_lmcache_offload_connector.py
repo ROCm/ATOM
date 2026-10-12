@@ -7183,6 +7183,51 @@ def test_a_state_only_load_travels_as_a_request_of_its_own(monkeypatch):
     assert s.build_connector_meta().requests == []
 
 
+def test_the_index_learns_which_state_loads_reach_a_worker(monkeypatch):
+    """`StateOffloadIndex.orphan` holds a torn-down request's slot only for a
+    load a worker may be writing. The connector is what knows when that starts:
+    when it puts the state leg on a request -- a state-only one here, a joint
+    one below."""
+    handed = []
+    s = _k3_state_only_scheduler(monkeypatch, [])
+    s._block_manager = SimpleNamespace(
+        state_offload=SimpleNamespace(note_handed_off=handed.append)
+    )
+    seq = SimpleNamespace(
+        id="r1",
+        state_slot=4,
+        num_cached_tokens=1024,
+        has_per_req_cache=True,
+        offload_joint=OffloadJointRecord(load_hash=99, boundary_tokens=768),
+    )
+    s.update_state_after_alloc(seq)
+    s.should_park_for_load_after_alloc(seq)
+    assert handed == [], "parked is not dispatched"
+    s.build_connector_meta()
+    assert handed == ["r1"]
+
+    joint = SimpleNamespace(
+        id="r2",
+        state_slot=5,
+        offload_joint=OffloadJointRecord(load_hash=98, boundary_tokens=512),
+    )
+    s._state_load_seqs["r2"] = joint
+    meta = LMCacheOffloadMetadata()
+    meta.add_request(
+        LMCacheReqMeta(
+            req_id="r2",
+            token_ids=[],
+            block_ids=[],
+            load_spec=LoadSpec(0, 512, can_load=True),
+        )
+    )
+    monkeypatch.setattr(
+        DenseOffloadScheduler, "build_connector_meta", lambda self: meta
+    )
+    s.build_connector_meta()
+    assert handed == ["r1", "r2"]
+
+
 def test_a_state_only_load_the_composite_withdrew_does_not_park(monkeypatch):
     s = _k3_state_only_scheduler(monkeypatch, [])
     seq = SimpleNamespace(

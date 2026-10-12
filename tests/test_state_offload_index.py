@@ -126,6 +126,7 @@ class TestSlotOwnership:
     def test_an_orphaned_slot_comes_back_when_the_load_settles(self):
         index = _index(1)
         index.request_load("a", 1, slot=5)
+        index.note_handed_off("a")
         assert index.orphan("a", 5) is True
         index.fail_load("a")
         assert index.released == [5]
@@ -142,8 +143,10 @@ class TestSlotOwnership:
         the id alone would keep it off the free list and leak it."""
         index = _index(1)
         index.request_load("r", 1, slot=5)
+        index.note_handed_off("r")
         assert index.orphan("r", 5) is True
 
+        index.note_handed_off("r")
         assert index.orphan("r", 9) is False, "slot 9 is not this load's"
         index.fail_load("r")
         assert index.released == [5]
@@ -156,6 +159,7 @@ class TestSlotOwnership:
         completion while the earlier load may still be writing the slot."""
         index = _index(1, 2)
         index.request_load("r", 1, slot=5)
+        index.note_handed_off("r")
         assert index.orphan("r", 5) is True
 
         index.detach_orphan("r")  # the request is admitted again
@@ -182,10 +186,37 @@ class TestSlotOwnership:
         assert index.outstanding == 0
         index.check_invariant()
 
+    def test_a_load_never_handed_to_a_worker_is_abandoned_not_orphaned(self):
+        """Holding the slot is for a worker that may still be writing it. A
+        load the connector never dispatched has no writer and will never
+        report, so holding it would only leak the slot until `reclaim` -- and
+        forever with reclamation off. The merge base purged such loads too."""
+        index = _index(1)
+        index.request_load("r", 1, slot=5)
+
+        assert index.orphan("r", 5) is False, "the caller keeps (frees) the slot"
+        assert index.outstanding == 0
+        assert index.loads_abandoned == 1
+        assert index.released == []
+        assert index.could_serve(1), "an abandon must not retract the hash"
+        index.check_invariant()
+
+    def test_handing_off_is_counted_once_and_restarts_the_age(self):
+        index = _index(1)
+        index.request_load("r", 1, slot=5)
+        index._outstanding["r"].at -= 3600.0
+        index.note_handed_off("r")
+        index.note_handed_off("r")
+        assert index.loads_handed_off == 1
+        assert index._outstanding["r"].at > 0
+        index.reclaim(timeout_s=60.0)
+        assert index.stale_live_loads == 0
+
     def test_reclaim_frees_only_an_orphan_whose_report_never_came(self):
         index = _index(1, 2)
         index.request_load("live", 1, slot=5)
         index.request_load("gone", 2, slot=6)
+        index.note_handed_off("gone")
         index.orphan("gone", 6)
         for entry in index._outstanding.values():
             entry.at -= 3600.0
@@ -210,6 +241,7 @@ class TestSlotOwnership:
         # Already far older than any window. The worker may still be writing.
         index._outstanding["gone"].at -= 3600.0
 
+        index.note_handed_off("gone")
         index.orphan("gone", 6)
 
         assert index.reclaim(timeout_s=1.0) == 0, (
@@ -223,6 +255,7 @@ class TestSlotOwnership:
     def test_reclaim_spares_an_orphan_still_inside_its_window(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
+        index.note_handed_off("gone")
         index.orphan("gone", 6)
         assert index.reclaim(timeout_s=3600.0) == 0
         assert index.released == []
@@ -230,6 +263,7 @@ class TestSlotOwnership:
     def test_reclaim_is_disabled_by_a_nonpositive_window(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
+        index.note_handed_off("gone")
         index.orphan("gone", 6)
         index._outstanding["gone"].at -= 3600.0
         assert index.reclaim(timeout_s=0.0) == 0
@@ -237,6 +271,7 @@ class TestSlotOwnership:
     def test_a_late_report_after_reclaim_releases_nothing_twice(self):
         index = _index(1)
         index.request_load("gone", 1, slot=6)
+        index.note_handed_off("gone")
         index.orphan("gone", 6)
         index._outstanding["gone"].at -= 3600.0
         index.reclaim(timeout_s=1.0)
@@ -278,7 +313,10 @@ def test_the_stats_line_carries_the_invariants_three_terms():
     assert stats["loads_settled"] == 1
     assert stats["loads_outstanding"] == 1
     assert stats["indexed"] == 2
-    assert "orphan_load_slots_reclaimed" in stats
+    assert stats["loads_handed_off"] == 0
+    assert stats["stale_live_loads"] == 0
+    # Exported once, by `checkpoint_funnel`, not twice.
+    assert "orphan_load_slots_reclaimed" not in stats
 
 
 class TestTheInvariantIsActuallyWiredUp:
@@ -578,3 +616,35 @@ def test_only_a_state_leg_can_need_a_park_the_lookup_did_not_ask_for():
     stateful = SimpleNamespace(offload_joint=SimpleNamespace(load_hash=7))
     assert sched._confirm_remote_load_after_alloc(stateful, False) is True
     assert asked == [stateful]
+
+
+class TestALoadThatNeverSettlesIsVisible:
+    """`dispatched == settled + outstanding` holds by construction, so an entry
+    that never settles just stays in `outstanding` and the identity stays true.
+    `stale_live_loads` is what makes such a request visible."""
+
+    def test_a_live_load_past_the_window_is_counted_and_warned(self, caplog):
+        import logging
+
+        index = _index(1, 2)
+        index.request_load("live", 1, slot=5)
+        index.note_handed_off("live")
+        index.request_load("gone", 2, slot=6)
+        index.note_handed_off("gone")
+        index.orphan("gone", 6)
+        for entry in index._outstanding.values():
+            entry.at -= 3600.0
+
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            index.reclaim(timeout_s=60.0)
+        assert index.stale_live_loads == 1, "the orphan is reclaim's, not stale"
+        assert index.stats()["stale_live_loads"] == 1
+        assert any("not coming" in r.message for r in caplog.records)
+        index.check_invariant()
+
+    def test_it_is_counted_with_reclamation_disabled_too(self):
+        index = _index(1)
+        index.request_load("live", 1, slot=5)
+        index._outstanding["live"].at -= 3600.0
+        assert index.reclaim(timeout_s=0.0) == 0
+        assert index.stale_live_loads == 1
