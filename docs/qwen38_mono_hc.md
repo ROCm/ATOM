@@ -14,11 +14,12 @@ without partitioning the KV cache or GDN/PLE state.
 Set `ATOM_QWEN38_MONO_HC=1` before starting ATOM. The default is off. Dispatch
 requires gfx950, contiguous BF16 data and weights, FP32 norm weights, and the
 Flash-Next geometry: HC=4, hidden=2560, low rank=320. The served decoder calls
-`mix_fused`, which uses three FlyDSL launches at 4 and 8 decode tokens:
+`mix_fused`, which uses three FlyDSL launches at 3/4/6/8/9/12 decode tokens:
 deferred combine plus grouped norm, fused down and injection projection, then
-up projection plus gated mean. At 16 tokens it uses the same first two FlyDSL
-launches, the existing AITER CK MFMA up GEMM, and a FlyDSL gated mean. It keeps
-the existing two-launch path at 1–2 tokens and native GEMMs above 16 tokens.
+up projection plus gated mean. At 16/18/24 tokens it uses the same first two
+FlyDSL launches, the existing AITER CK MFMA up GEMM, and a FlyDSL gated mean.
+It keeps the existing two-launch path at 1–2 tokens. All other row counts,
+including 15, 21, and rows above 24, use the native path.
 The standalone `mix` and `combine` calls used by the MTP
 drafter use three launches at 1–16 tokens and one launch at 1–128 tokens,
 respectively. Unsupported shapes use the native operators. The kernel and its
@@ -57,9 +58,28 @@ logits, the same benchmark measured:
 | 16 | 26.72 | 21.28 | 1.26× | FlyDSL norm/down/mean, CK MFMA up |
 
 These are HC component times with synthetic weights. The production path's
-three launches at 4–8 tokens and four at 16 are part of a decoder layer with
+three launches at selected 3–12-token sizes and four at 16/18/24 are part of
+a decoder layer with
 separate attention, MoE, communication, state update, and QSA launches. The
 table does not measure whole-layer latency or model throughput.
+
+MTP2 target verification supplies three rows per live request, so the former
+4/8/16-row gate missed its common target shapes. The graph microbench below
+used three repeats on one MI355X with the same synthetic HC module. The
+production gate now selects the measured winners, while 15 and 32 rows stay
+native and 21 rows retains native after a marginal isolated gain:
+
+| MTP verify rows | Native `mix_fused` | Candidate FlyDSL | Candidate gain |
+| ---: | ---: | ---: | ---: |
+| 3 | 26.58 µs | 13.78 µs | 1.93× |
+| 6 | 26.61 µs | 17.38 µs | 1.53× |
+| 9 | 26.44 µs | 22.36 µs | 1.18× |
+| 12 | 26.89 µs | 24.25 µs | 1.11× |
+| 15 | 26.53 µs | 30.63 µs | 0.87× |
+| 18 | 26.13 µs | 22.70 µs | 1.15× |
+| 21 | 26.96 µs | 26.00 µs | 1.04× |
+| 24 | 27.03 µs | 25.22 µs | 1.07× |
+| 32 | 27.34 µs | 28.52 µs | 0.96× |
 
 A one-launch resident FlyDSL HC experiment for 1–2 rows matched the native
 outputs and graph replay, but took 15.8/20.6 µs versus the native two-launch
@@ -303,6 +323,30 @@ nor FlyDSL source was changed. These are still synthetic-weight layer times:
 | QSA | 256k | 16 | 371.02 → 280.79 µs | 1.32× |
 | GDN, FP32 state | — | 16 | 203.12 → 181.39 µs | 1.12× |
 
+After adding MTP2 verification shapes, a separate TP1+EP1 synthetic-weight
+QSA layer run at 2k context and 50 graph replays measured:
+
+| Verify rows | Native layer | Tuned layer | Gain |
+| ---: | ---: | ---: | ---: |
+| 3 | 239.28 µs | 205.11 µs | 1.17× |
+| 12 | 253.01 µs | 236.53 µs | 1.07× |
+| 24 | 274.02 µs | 255.65 µs | 1.07× |
+
+Selected QSA IDs matched exactly. Stream and pending output NRMSE across the
+three cases was at most 0.0041 with synthetic weights. The stage graphs at
+three rows took about 19 µs per HC call, 102 µs for QSA, and 74 µs for MoE;
+the independent stage times do not add directly to the complete graph.
+
+The same TP1 setup with a GDN layer and FP32 recurrent state measured
+196.35 → 165.29 µs at three rows (1.19×), 275.65 → 257.56 µs at 12 rows
+(1.07×), and 333.20 → 315.57 µs at 24 rows (1.06×). Recurrent-state NRMSE
+stayed below 0.00002. The synthetic MoE had one different top-10 routed
+expert at 24 rows and pending-output NRMSE up to 0.0165, so these dummy-weight
+layer tests are performance and numerical checks rather than checkpoint
+generation accuracy. Their synthetic QSA metadata uses one distinct request
+per row, whereas MTP2 verification has three tokens per request. The paired
+checkpoint API tests below cover the actual MTP2 scheduling and output quality.
+
 One initial 128k/four-row baseline capture took 325 µs while its tuned side
 stayed near 220 µs; an idle-GPU rerun measured 262.24 → 220.14 µs and is
 reported above. Selected QSA IDs matched the unsplit path in every final rerun.
@@ -426,8 +470,10 @@ expert kernel or reusing its selected IDs would be incorrect.
 
 `tests/model_ops/test_qwen38_mono_hyperconnection.py` checks 1/2/4/8/16-token
 mix+combine parity, 32/64/128-token combine parity, served `mix_fused` parity
-at 4/8/16 tokens including the final mixer without injection, fallback, and
-changed-input graph replay.
+at 3/4/6/8/9/12/16/18/24 tokens including the final mixer without injection,
+the MTP2 dispatch and native fallbacks, and changed-input graph replay.
+`tests/test_qwen4_exp_mtp.py` also checks that Qwen's draft PCP gate does not
+import unrelated DeepSeek kernels.
 `tests/model_ops/test_qwen38_qsa_short.py` checks exact all-visible selection
 for 64/512/2,048-token contexts with ragged/padded rows and changed metadata
 under graph replay. `tools/bench_qwen38_qsa_short.py` compares selection and
@@ -449,7 +495,8 @@ The complete local FP8 checkpoint (131 shards) served through native ATOM on
 MI355X without downloading model or evaluation data. A paired GSM8K run used
 all 1,319 test questions, 5-shot multiturn chat, greedy generation and a
 4,096-token output limit. The pre-PR ATOM checkout and this PR each used one
-GPU, eight concurrent requests, an 8,192-token context and CUDA graphs.
+GPU, eight concurrent requests, an 8,192-token context and CUDA graphs. MTP
+was disabled for this accuracy comparison.
 Document and prompt hashes matched for every paired question; neither run
 reported API errors.
 
@@ -467,25 +514,47 @@ generation parity. The request phase took 14:01 on the pre-PR checkout and
 TP1 exercises HC, short-context QSA and gfx950 GDN decode, but not the TP4
 merged projection or index CP.
 
-A separate TP1 API screening probe ran on one MI355X per variant with CUDA
-graphs, MTP off, and at most eight sequences. Each request used a 78-token
-prompt and a 96-token output cap. Seven-run medians below are
-`usage.completion_tokens` divided by client wall time, including prefill and
-HTTP response time:
+A separate MTP2 accuracy check used the first 100 GSM8K test questions with
+the same 5-shot template and 4,096-token output limit. The pre-PR and PR
+prompt/document hashes matched; both runs completed without API errors.
+Flexible and strict extraction each scored 98/100 on pre-PR ATOM and 99/100
+on the PR. The extracted answer matched on 99/100 questions. On the one
+difference, the pre-PR answer was 44 and the PR answer was the correct 104.
+Raw generations matched on 30/100 questions, so this check establishes answer
+quality on this subset rather than identical text or a general accuracy gain.
 
-| TP1 concurrent requests | Pre-PR ATOM | This PR |
-| ---: | ---: | ---: |
-| 1 | 98.62 tokens/s | 100.68 tokens/s |
-| 4 | 318.82 tokens/s | 333.19 tokens/s |
-| 8 | 610.42 tokens/s | 640.87 tokens/s |
+A previous TP1 API screening probe disabled MTP and capped default-thinking
+output at 96 tokens. Its responses had no visible answer, and its variants
+ran on different GPUs. Those figures are not a Qwen MTP serving comparison.
+The pre-PR Qwen recipe already runs the checkpoint's native draft layer with
+`--method mtp --num-speculative-tokens 2`; the bare server command enables
+speculation only when these flags are supplied.
 
-A spot-check of this workload returned 96 reasoning tokens,
-`finish_reason=length`, and empty visible content. These figures describe
-capped decode work, not completed-answer throughput. The variants ran on
-different GPUs at different times, so the observed 2–5% ratios do not
-establish a reliable serving speedup. A later same-GPU run found similar
-absolute rates, but a subsequent baseline repeat slowed sharply under
-changing machine conditions; no replacement ratio is claimed.
+A new same-GPU TP1 probe ran that MTP2 recipe on the pre-PR checkout and this
+PR with CUDA graphs, eight maximum sequences, and an 8,192-token context.
+The PR enabled `ATOM_QWEN38_MONO_HC=1` and `ATOM_QWEN38_QSA_SHORT=1`. For a
+completed-answer workload, each request asked for integers 1–200 with
+thinking disabled. Every response on both sides contained the correct list,
+used 891 completion tokens, had no reasoning content, and ended with
+`finish_reason=stop`. Five-run medians of total completion tokens divided by
+client wall time, including prefill and HTTP time, were:
+
+| Concurrent requests | Pre-PR MTP2 | This PR MTP2 | Ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 218.51 tokens/s | 237.61 tokens/s | 1.09× |
+| 4 | 825.09 tokens/s | 854.22 tokens/s | 1.04× |
+| 8 | 1,573.86 tokens/s | 1,657.36 tokens/s | 1.05× |
+
+Both sides reported 100% MTP draft acceptance on this predictable list. A
+second PR run after the pre-PR checkout measured 238.82/856.67/1,662.62
+tokens/s at 1/4/8 requests, close to the first PR run. Raw completed-answer
+records are in `/tmp/qwen38-mtp2-{original,pr-mtp-shapes,pr-mtp-shapes-repeat}-completed.jsonl`.
+A separate 256-token-capped default-thinking probe had lower acceptance (about
+67%); its same-GPU medians were 164.54/549.39/1,010.97 tokens/s pre-PR and
+177.87/579.33/1,038.10 tokens/s with this PR at 1/4/8 requests. That probe
+stopped at its token cap without a visible answer. These short-context API
+probes show a single-digit to roughly 9% service gain in the measured setup,
+not a 2× whole-model gain.
 
 For a checkpoint-weight TP4+EP4 check, 16 concurrent deterministic math
 prompts produced the same correct final answer with all Qwen optimization

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Offline, synthetic-weight Qwen3.8 decode-layer benchmark on TP4 + EP4.
+"""Offline, synthetic-weight Qwen3.8 decode-layer benchmark on TP1 or TP4.
 
 Example::
 
@@ -150,8 +150,10 @@ def run(args: argparse.Namespace) -> dict:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
-    if world != 4 or args.rows not in (4, 8, 16):
-        raise ValueError("This measured setup requires TP4 + EP4 and 4, 8 or 16 rows")
+    if world not in (1, 4) or args.rows not in (3, 4, 6, 8, 9, 12, 16, 18, 24):
+        raise ValueError(
+            "This setup requires TP1 or TP4 and a supported decode row count"
+        )
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
     init_distributed_environment(local_rank=local_rank)
@@ -343,7 +345,11 @@ def run(args: argparse.Namespace) -> dict:
             baseline_index = layer.self_attn.indexer.index_qk_proj(mixed)
             projection_errors = [
                 _error(fused_qkv, baseline_qkv),
-                _error(fused_index, baseline_index),
+                (
+                    _error(fused_index, baseline_index)
+                    if fused_index is not None
+                    else None
+                ),
             ]
             os.environ["ATOM_QWEN38_QSA_FUSED_PROJ"] = "1"
             metadata = context.attn_metadata.qsa_metadata.for_tokens(args.rows)
@@ -429,7 +435,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="local config directory")
     parser.add_argument("--layer", choices=("qsa", "gdn"), required=True)
-    parser.add_argument("--rows", type=int, choices=(4, 8, 16), required=True)
+    parser.add_argument(
+        "--rows", type=int, choices=(3, 4, 6, 8, 9, 12, 16, 18, 24), required=True
+    )
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--profile", action="store_true")

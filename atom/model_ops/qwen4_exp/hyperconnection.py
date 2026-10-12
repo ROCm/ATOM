@@ -218,13 +218,13 @@ class Qwen4ExpHyperConnection(nn.Module):
         hyper-connection. Returns the mixed activation and `(streams,
         inject_logits)`; the logits are None when there is no block injection.
         """
-        # The served decoder uses mix_fused, not mix/combine. At four and
-        # eight rows the FlyDSL path folds deferred combine into norm and the
-        # next injection projection into the down GEMV (three launches).
-        # The existing two-launch path wins at one/two rows. At sixteen rows,
-        # the full TP4+EP4 QSA layer benefits even though isolated HC timing
-        # is close to the native path.
-        if hyper_input.shape[0] in (4, 8, 16) and self._mono_supported(hyper_input, 16):
+        # MTP-2 verification runs three rows per request. Keep its measured
+        # winning sizes alongside the ordinary decode sizes. Native is faster
+        # at 1, 2, 15 and 32 rows; 21 rows gains too little to dispatch.
+        rows = hyper_input.shape[0]
+        if rows in (3, 4, 6, 8, 9, 12, 16, 18, 24) and self._mono_supported(
+            hyper_input, 24
+        ):
             fused_weight = getattr(self, "fused_w_cat", None)
             fused_rows = getattr(self, "fused_rank", 0) + (
                 self.hc_count if self.block_inject_weight is not None else 0

@@ -579,13 +579,13 @@ def mix_fused(hc, hyper_input: torch.Tensor, pending=None):
     """Run the served HC path: deferred combine, norm, mix and next injection.
 
     The deferred combine shares the norm CTA, and the next injection logits
-    share the down-projection CTA. At 16 rows the up projection uses the
+    share the down-projection CTA. From 16 rows the up projection uses the
     existing MFMA GEMM, followed by a FlyDSL gated mean; smaller batches use
     one FlyDSL up-and-mean launch.
     """
     samples, device = hyper_input.shape[0], hyper_input.device
-    if not 1 <= samples <= 16:
-        raise ValueError("Qwen3.8 fused HC FlyDSL kernels require 1..16 tokens")
+    if not 1 <= samples <= 32:
+        raise ValueError("Qwen3.8 fused HC FlyDSL kernels require 1..32 tokens")
     if (
         not hyper_input.is_cuda
         or getattr(torch.cuda.get_device_properties(device), "gcnArchName", "").split(
@@ -646,7 +646,7 @@ def mix_fused(hc, hyper_input: torch.Tensor, pending=None):
         raw_out.data_ptr() if has_inject else low.data_ptr(),
         stream=stream,
     )
-    if samples == 16:
+    if samples >= 16:
         projected = tgemm.mm(low, hc.input_mix_weight_up.weight, otype=torch.bfloat16)
         _launch_gated_mean(
             normed.data_ptr(),

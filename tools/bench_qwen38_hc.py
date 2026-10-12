@@ -194,8 +194,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--dump-ir-dir", type=Path)
     args = parser.parse_args()
-    if any(not 1 <= n <= 16 for n in args.batches):
-        raise ValueError("batches must be 1..16")
+    if any(not 1 <= n <= 32 for n in args.batches):
+        raise ValueError("batches must be 1..32")
     if args.dump_ir_dir:
         os.environ["FLYDSL_DUMP_IR"] = "1"
         os.environ["FLYDSL_DUMP_DIR"] = str(args.dump_ir_dir)
@@ -218,8 +218,10 @@ def main():
         "batches": {},
     }
     for samples in args.batches:
-        report["batches"][str(samples)] = benchmark_batch(hc, samples, args.repeats)
-        if args.dump_ir_dir:
+        report["batches"][str(samples)] = (
+            benchmark_batch(hc, samples, args.repeats) if samples <= 16 else {}
+        )
+        if args.dump_ir_dir and samples <= 16:
             report["batches"][str(samples)]["isa"] = isa_summary(args.dump_ir_dir)
         report["batches"][str(samples)]["served_fused"] = benchmark_served(
             hc, samples, args.repeats

@@ -11,6 +11,7 @@ pytest.importorskip("triton")
 
 from atom.model_ops import linear
 from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
+from atom.model_ops.qwen4_exp.ops import hc_flydsl
 
 
 def test_served_bf16_default_keeps_hc_dispatch_eligible(monkeypatch):
@@ -55,8 +56,8 @@ def hc(monkeypatch):
 
 
 def _assert_deferred_streams_close(actual, expected, rows, has_pending):
-    if rows == 16 and has_pending:
-        # The deferred combine has only a few BF16 ties among 163,840 values.
+    if rows in (12, 16, 18, 24) and has_pending:
+        # The deferred combine has only a few BF16 ties among the stream values.
         # Bound both their count and their bit distance instead of relaxing
         # the tolerance for the whole residual stream.
         differing = actual != expected
@@ -155,7 +156,7 @@ def test_large_batch_combine_graph_replay(hc, monkeypatch):
         torch.testing.assert_close(actual, reference, atol=0.004, rtol=0.02)
 
 
-@pytest.mark.parametrize("rows", [4, 8, 16])
+@pytest.mark.parametrize("rows", [3, 4, 6, 8, 9, 12, 16, 18, 24])
 @pytest.mark.parametrize("has_pending", [False, True])
 def test_served_mix_fused_matches_native(hc, monkeypatch, rows, has_pending):
     hc.process_weights_after_loading()
@@ -181,7 +182,7 @@ def test_served_mix_fused_matches_native(hc, monkeypatch, rows, has_pending):
     torch.testing.assert_close(actual_raw, expected_raw, atol=0.004, rtol=0.02)
 
 
-@pytest.mark.parametrize("rows", [8, 16])
+@pytest.mark.parametrize("rows", [3, 8, 12, 16, 24])
 def test_served_mix_fused_graph_replay(hc, monkeypatch, rows):
     hc.process_weights_after_loading()
     x = torch.zeros(rows, 10240, device="cuda", dtype=torch.bfloat16)
@@ -203,8 +204,31 @@ def test_served_mix_fused_graph_replay(hc, monkeypatch, rows):
         expected, (expected_streams, expected_inject) = hc.mix_fused(x, (block, raw))
         monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
         torch.testing.assert_close(actual, expected, atol=0.004, rtol=0.02)
-        torch.testing.assert_close(streams, expected_streams, atol=1e-5, rtol=0)
+        _assert_deferred_streams_close(streams, expected_streams, rows, True)
         torch.testing.assert_close(inject, expected_inject, atol=0.004, rtol=0.02)
+
+
+@pytest.mark.parametrize(
+    "rows, uses_flydsl", [(3, True), (12, True), (15, False), (24, True), (32, False)]
+)
+def test_mtp_verification_shape_dispatch(hc, monkeypatch, rows, uses_flydsl):
+    hc.process_weights_after_loading()
+    x = torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16)
+    pending = (
+        torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16),
+        torch.randn(rows, 4, device="cuda", dtype=torch.bfloat16),
+    )
+    calls = []
+    original = hc_flydsl.mix_fused
+
+    def trace(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(hc_flydsl, "mix_fused", trace)
+    monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
+    hc.mix_fused(x, pending)
+    assert bool(calls) == uses_flydsl
 
 
 @pytest.mark.parametrize("rows", [4, 16])
