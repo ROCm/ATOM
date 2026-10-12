@@ -68,11 +68,11 @@ def main() -> None:
     additions["C48_DIAG_DIR"] = str(options.output.parent / "model-manifests")
     record = {"config": str(options.config), "config_sha256": hashlib.sha256(options.config.read_bytes()).hexdigest(),
               "role": options.role, "argv": argv, "environment_overrides": additions,
-              "diagnostic": "Preserve explicit synthetic AL; apply the recorded RDMA startup port fix to the pinned engine"}
+              "diagnostic": "Preserve explicit synthetic AL; verify the recorded read-only RDMA startup source mount"}
     options.output.parent.mkdir(parents=True, exist_ok=True)
     if options.execute:
         import vllm
-        from pd_c48_port_patch import apply_port_patch
+        from pd_c48_port_patch import verify_port_patch
         record["vllm_file"] = vllm.__file__
         record["versions"] = {}
         for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori"):
@@ -81,7 +81,7 @@ def main() -> None:
             except importlib.metadata.PackageNotFoundError:
                 record["versions"][name] = None
         assert "81198e97b" in record["versions"]["vllm"], record["versions"]
-        record["engine_startup_patch"] = apply_port_patch(Path(vllm.__file__).parent)
+        record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
         record["model_files"] = {}
         for root in (Path(options.model), draft_path(options.model)):
             assert (root / "config.json").is_file(), root

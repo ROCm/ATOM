@@ -1,4 +1,4 @@
-"""Apply the shared RDMA startup fix to the exact pinned vLLM Python source."""
+"""Verify the shared RDMA startup fix mounted over the pinned Python source."""
 from __future__ import annotations
 
 import hashlib
@@ -16,27 +16,27 @@ AFTER = (
 )
 
 
-def apply_port_patch(vllm_root: Path) -> dict:
+def verify_port_patch(vllm_root: Path) -> dict:
     path = vllm_root / RELATIVE_PATH
     source = path.read_bytes()
     digest = hashlib.sha256(source).hexdigest()
-    if digest == BASE_SHA256:
-        assert source.count(BEFORE) == 1
-        patched = source.replace(BEFORE, AFTER)
-        assert hashlib.sha256(patched).hexdigest() == PATCHED_SHA256
-        temporary = path.with_name(path.name + f".c48-{os.getpid()}.tmp")
-        temporary.write_bytes(patched)
-        temporary.chmod(path.stat().st_mode & 0o777)
-        temporary.replace(path)
-    elif digest != PATCHED_SHA256:
-        raise RuntimeError(f"C48 port fix refuses unexpected vLLM source: {path} sha256={digest}")
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == PATCHED_SHA256
+    if digest != PATCHED_SHA256:
+        raise RuntimeError(f"C48 requires the prepared read-only source mount: {path} sha256={digest}")
+    # Evidence only: this function never writes to the root-owned image package.
+    readonly_mount = False
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        fields = line.split()
+        if fields[4].replace('\\040', ' ') == str(path):
+            readonly_mount = 'ro' in fields[5].split(',')
     return {
         "name": "mori_rdma_atomic_listener_bind",
         "base_engine_sha": BASE_ENGINE_SHA,
         "path": str(path),
         "base_sha256": BASE_SHA256,
         "patched_sha256": PATCHED_SHA256,
-        "source_before_patch_sha256": digest,
+        "observed_sha256": digest,
+        "deployment": "single_file_readonly_bind_mount",
+        "readonly_mount_observed": readonly_mount,
+        "runtime_uid": os.geteuid(),
         "scope": "RDMA listener allocation during startup; shared by all four cases",
     }

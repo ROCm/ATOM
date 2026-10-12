@@ -334,6 +334,10 @@ EOF
     -v /mnt:/mnt
     -v /data:/data
   )
+  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+    source "${REPO_ROOT}/.github/scripts/atomesh/pd_c48_port_mount.sh"
+    c48_append_port_mount "${REPO_ROOT}" || return $?
+  fi
   if [[ -d /shared_nfs ]]; then
     docker_args+=(-v /shared_nfs:/shared_nfs)
   fi
