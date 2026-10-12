@@ -68,8 +68,52 @@ _QWEN4_EXP_HF_MAPPER = WeightsMapper(
 )
 
 
+def hide_fused_shared_expert_suffix(experts: Any, install: Any) -> None:
+    """Show the stacked loader only the contiguous routed EP range.
+
+    ``#2418`` appends fused shared-expert slot ids after the ``-1`` holes in
+    ``expert_map``. Native ``install_stacked_expert_loaders`` rejects that
+    gap. The stacked checkpoint has only routed rows, and the closures it
+    installs capture the slice, so the full map can be restored for fused
+    forward immediately after.
+    """
+
+    expert_map = getattr(experts, "expert_map", None)
+    num_routed = int(
+        getattr(getattr(experts, "expert_layout", None), "num_routed", 0) or 0
+    )
+    if (
+        not torch.is_tensor(expert_map)
+        or num_routed <= 0
+        or int(expert_map.shape[0]) <= num_routed
+    ):
+        install(experts)
+        return
+    saved = expert_map
+    experts.expert_map = expert_map[:num_routed]
+    try:
+        install(experts)
+    finally:
+        experts.expert_map = saved
+
+
+def install_routed_stacked_expert_loader() -> None:
+    import atom.models.qwen4_exp as native
+
+    current = native.install_stacked_expert_loaders
+    if getattr(current, "_atom_hides_fused_shared_suffix", False):
+        return
+
+    def install(experts: Any) -> None:
+        hide_fused_shared_expert_suffix(experts, current)
+
+    install._atom_hides_fused_shared_suffix = True
+    native.install_stacked_expert_loaders = install
+
+
 def apply_prepare_qwen4_exp_adaptations(atom_config: Any, model_arch: str) -> None:
     del model_arch
+    install_routed_stacked_expert_loader()
     native = _require_native()
     quant_config = getattr(atom_config, "quant_config", None)
     if quant_config is None:
