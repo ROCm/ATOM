@@ -356,6 +356,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
+    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: os.getenv(
+        "ATOM_DCP_SPARSE_PREFILL_NONPS", "1"
+    )
+    == "1",
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
