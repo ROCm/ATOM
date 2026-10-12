@@ -596,15 +596,16 @@ class DeepseekV41DSpark(DSparkDraftModel):
         base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B, T, V/tp]
         tp_group = get_tp_group()
         use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
-        out_ids = anchor_ids.new_empty(B, T + 1)
-        out_ids[:, 0] = anchor_ids
+        # Position k's id lands in column k and is position k + 1's previous
+        # id; position 0 reads the anchors where they are, not a copy of them.
+        out_ids = anchor_ids.new_empty(B, T)
         markov_embeds = [
             dspark_markov_argmax_tp(
                 base_logits[:, k],
-                out_ids[:, k],
+                anchor_ids if k == 0 else out_ids[:, k - 1],
                 last.markov_head.markov_w1.weight,
                 last.markov_head.markov_w2.weight,
-                out_ids[:, k + 1],
+                out_ids[:, k],
                 head.vocab_start_idx,
                 tp_group,
                 use_custom=use_custom,
@@ -612,4 +613,4 @@ class DeepseekV41DSpark(DSparkDraftModel):
             for k in range(T)
         ]
         confidence = last.confidence_head(hc_hidden, torch.stack(markov_embeds, dim=1))
-        return out_ids[:, 1:], confidence
+        return out_ids, confidence

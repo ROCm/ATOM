@@ -218,6 +218,44 @@ def _dspark_markov_argmax_stage2(
     tl.store(out_ptr + row * stride_out, winner.to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _dspark_markov_pick_rank(
+    gathered_ptr,
+    out_ptr,
+    num_rows,
+    stride_out,
+    WORLD: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+):
+    """Each row's id from every rank's ``(max, id)``, into ``out``.
+
+    ``torch.argmax`` over the ranks' maxima, then their ids gathered at the
+    winner, then the copy into the strided destination -- three launches --
+    as one. The same pick: the lowest rank among equal maxima, and the first
+    NaN if any rank published one (``torch.argmax`` takes NaN as the max).
+    """
+    rows = tl.program_id(0) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    mask = rows < num_rows
+    best = tl.load(gathered_ptr + rows * 2, mask=mask, other=0.0)
+    best_id = tl.load(gathered_ptr + rows * 2 + 1, mask=mask, other=0.0)
+    best_nan = best != best  # noqa: PLR0124 -- NaN test in Triton
+    for r in tl.static_range(1, WORLD):
+        base = gathered_ptr + (r * num_rows + rows) * 2
+        val = tl.load(base, mask=mask, other=0.0)
+        idx = tl.load(base + 1, mask=mask, other=0.0)
+        val_nan = val != val  # noqa: PLR0124
+        # strict `>`: an equal max keeps the lower rank
+        take = (~best_nan) & (val_nan | (val > best))
+        best = tl.where(take, val, best)
+        best_id = tl.where(take, idx, best_id)
+        best_nan = best_nan | val_nan
+    tl.store(
+        out_ptr + rows * stride_out,
+        best_id.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
 def _dspark_markov_argmax_fake(
     base_logits: torch.Tensor,
     prev_ids: torch.Tensor,
@@ -438,7 +476,14 @@ def dspark_markov_argmax_tp(
         base_logits, prev_ids, markov_w1, markov_w2, out, vocab_start, packed
     )
     gathered = tp_group.all_gather(packed, dim=0, use_custom=use_custom)
-    gathered = gathered.view(tp_group.world_size, num_rows, 2)
-    winner = gathered[:, :, 0].argmax(dim=0)
-    out.copy_(gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0))
+    block_row = min(1024, triton.next_power_of_2(num_rows))
+    _dspark_markov_pick_rank[(triton.cdiv(num_rows, block_row),)](
+        gathered,
+        out,
+        num_rows,
+        out.stride(0),
+        WORLD=tp_group.world_size,
+        BLOCK_ROW=block_row,
+        num_warps=1 if block_row <= 64 else 4,
+    )
     return markov_embed

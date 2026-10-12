@@ -14,6 +14,7 @@ hand back then is a copy, so a returned id tensor could not be trusted.
 
 import pytest
 import torch
+import triton
 
 pytest.importorskip("aiter", reason="the Markov sampler is a Triton/AITER op")
 
@@ -189,3 +190,33 @@ def test_sharded_sampling_matches_the_whole_vocab(tp, rows):
         )
         torch.testing.assert_close(out, ref, rtol=0, atol=0)
         torch.testing.assert_close(embed, ref_embed, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 32, 160, 2048])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_rank_pick_is_the_argmax_gather_it_replaces(tp, rows, dtype):
+    """The fused cross-rank pick against the three ops it replaces --
+    `argmax` over the ranks' maxima, the id gather and the copy -- with ties
+    between ranks and NaN maxima, written into a strided id column."""
+    from atom.model_ops.dspark_markov_sample import _dspark_markov_pick_rank
+
+    g = torch.Generator(device="cuda").manual_seed(rows * tp)
+    vals = torch.randint(0, 4, (tp, rows), device="cuda", generator=g).float()
+    ids = torch.randint(0, 129280, (tp, rows), device="cuda", generator=g).float()
+    nan = torch.rand(tp, rows, device="cuda", generator=g) < 0.1
+    vals[nan] = float("nan")
+    gathered = torch.stack((vals, ids), dim=-1).contiguous()
+    winner = gathered[:, :, 0].argmax(dim=0)
+    ref = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0).to(dtype)
+
+    block = torch.full((rows, 3), -1, dtype=dtype, device="cuda")
+    out = block[:, 1]
+    block_row = min(1024, triton.next_power_of_2(rows))
+    _dspark_markov_pick_rank[(triton.cdiv(rows, block_row),)](
+        gathered, out, rows, out.stride(0), WORLD=tp, BLOCK_ROW=block_row
+    )
+    assert torch.equal(out, ref)
+    # the neighbouring columns are untouched
+    assert torch.all(block[:, 0] == -1) and torch.all(block[:, 2] == -1)
