@@ -37,8 +37,8 @@ def adjust(job, out, command):
         return {"already_applied": True, "job_id": job, "nodes": NODES}
     held = False
     try:
-        command("hold", job)
         held = True
+        command("hold", job)
         validate(show("held.txt"), job)
         command("update", f"JobId={job}", f"NodeList={NODES}")
         after = validate(show("updated.txt"), job)
@@ -46,9 +46,11 @@ def adjust(job, out, command):
         return {"updated": True, "job_id": job, "nodes": NODES,
                 "account": after["Account"], "qos": after["QOS"], "node_count": 2}
     finally:
-        if held:
-            command("release", job)
-        show("final.txt")
+        try:
+            if held:
+                command("release", job)
+        finally:
+            show("final.txt")
 
 
 def main():
