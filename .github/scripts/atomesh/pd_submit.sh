@@ -369,6 +369,11 @@ PY
 fi
 
 mkdir -p "${LOG_ROOT}"
+if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_c48_previous_jobs.py" \
+    --controller "${SPUR_CONTROLLER_ADDR}" \
+    --output "${RESULT_DIR}/${ATOMESH_CELL_ID}-previous-jobs.json"
+fi
 # Recorded before sbatch so the job summary can point at the logs even when the
 # Slurm job never starts or dies before copying anything back.
 printf '%s\n' "${LOG_ROOT}" > "${RESULT_DIR}/${ATOMESH_CELL_ID}.log-root"

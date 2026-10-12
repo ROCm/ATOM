@@ -1574,7 +1574,7 @@ jobs:
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
     timeout-minutes: ${{ matrix.run_eval && matrix.accuracy.task == 'swebench_lite' && 780 || 420 }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 1
       matrix: ${{ fromJson(needs.load-config.outputs.matrix_json) }}
     steps:

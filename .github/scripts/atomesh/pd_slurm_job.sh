@@ -262,7 +262,16 @@ EOF
 
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then
-    docker pull "${DOCKER_IMAGE}"
+    if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+      {
+        date -u
+        docker info --format '{{.DockerRootDir}}'
+        df -PB1 /var/lib/docker /var/lib/containerd /tmp "${RUN_DIR}" || true
+        df -Pi /var/lib/docker /var/lib/containerd /tmp "${RUN_DIR}" || true
+        docker image inspect --format '{{.Id}}' "${DOCKER_IMAGE}" || true
+      } > "${rank_dir}/host-storage-before-pull.txt" 2>&1
+    fi
+    docker pull "${DOCKER_IMAGE}" || return $?
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
