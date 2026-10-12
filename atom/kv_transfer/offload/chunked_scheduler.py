@@ -276,24 +276,45 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
 
-    def skip_tier_lookup(self, seq, hbm_tokens: int) -> bool:
-        """Admit `seq` without a tier lookup because HBM already covers it.
+    def tier_lookup_cannot_load(self, seq, hbm_tokens: int) -> bool:
+        """Whether no tier answer could make this request load anything.
 
-        The scheduler calls this only when the HBM prefix leaves fewer than
-        `OFFLOAD_MIN_LOAD_TOKENS` uncached, where `_decide_load_after_alloc`
-        refuses every load: the lookup could not add reuse. Any async lookup
-        already sent is discarded so its read locks are released.
+        Every load path compares the tier hit against the post-allocation HBM
+        frontier and refuses below `_min_load_tokens`
+        (`_decide_load_after_alloc`: `need = lmc - hbm < min_load` is
+        "too_small"; the unaligned handoff demands as much again past its
+        boundary; subclasses only add refusals). A tier hit never exceeds the
+        prompt, so `num_tokens - hbm < min_load` bounds every possible `need`
+        below the threshold: whatever the lookup returns, nothing is loaded.
 
-        The lookup's one side effect that still matters is the save floor:
-        without it the save tracker starts at 0 and stores the whole resident
-        prefix again. The HBM prefix was computed, and saved, by an earlier
-        request, so its chunk floor stands in for the hit. If the tier evicted
-        it meanwhile, later lookups just stop at the hole; nothing is wrong.
-
-        False leaves the ordinary lookup path in charge: a load or lookup this
-        lifecycle already armed must be finished by that path.
+        The threshold is this connector's own, so the skip and the load
+        decision cannot drift apart.
         """
         if not self._do_load or self._lookup_client is None:
+            return False
+        gap = int(seq.num_tokens) - max(0, int(hbm_tokens))
+        return gap < int(getattr(self, "_min_load_tokens", 8192))
+
+    def skip_tier_lookup(self, seq, hbm_tokens: int) -> bool:
+        """Admit `seq` without waiting for a tier lookup that cannot load.
+
+        Only for `tier_lookup_cannot_load`. The lookup is still SENT, without
+        being waited on: on the LMCache MP server a lookup is what refreshes
+        the prefix's L1 recency (prefetch hit -> touch) and what opens the
+        session whose `end_session` later touches every chunk of the request.
+        Dropping it would let a conversation's oldest chunks -- the ones every
+        later lookup must match first -- age out of L1 ahead of their turn.
+        The answer is discarded; `discard` releases its read locks when it
+        arrives.
+
+        The lookup's one consumed side effect, the save floor, comes from the
+        HBM prefix instead: it was computed, and saved, by an earlier request.
+        At worst a chunk the tier already holds is stored again.
+
+        False leaves the ordinary path in charge: the gap is too large, or a
+        load or lookup this lifecycle already armed must be finished there.
+        """
+        if not self.tier_lookup_cannot_load(seq, hbm_tokens):
             return False
         sid = str(seq.id)
         if sid in self._load_specs or sid in self._lookup_results:
@@ -301,7 +322,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if sid in self._active_load_operations:
             return False
         self._begin_load_lifecycle(seq)
-        discard = getattr(self._lookup_client, "discard", None)
+        client = self._lookup_client
+        submit = getattr(client, "submit", None)
+        if callable(submit) and self._lookup_len(seq) > 0:
+            # No-op when a prefetch already sent it; otherwise send it now.
+            if submit(self._lookup_token_ids(seq), sid):
+                self._perf_bump("lookup_fire_and_forget")
+        discard = getattr(client, "discard", None)
         if callable(discard):
             discard(sid)
         self._lookup_defer_since.pop(sid, None)

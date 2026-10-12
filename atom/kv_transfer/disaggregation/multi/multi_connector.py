@@ -378,6 +378,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return False
         return all([bool(fn(seq, hbm_tokens)) for fn in subs])
 
+    def tier_lookup_cannot_load(self, seq: Any, hbm_tokens: int) -> bool:
+        """True only if every sub with a tier lookup says it cannot load."""
+        checks = [
+            getattr(c, "tier_lookup_cannot_load", None)
+            for c in self._connectors
+            if callable(getattr(c, "tier_lookup_cannot_load", None))
+        ]
+        return bool(checks) and all(bool(fn(seq, hbm_tokens)) for fn in checks)
+
     def prefetch_lookups(self, seqs: Any) -> None:
         """Let each sub send its external-tier lookups ahead of admission."""
         seqs = list(seqs)
