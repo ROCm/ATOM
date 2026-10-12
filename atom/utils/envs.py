@@ -356,6 +356,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
+    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: os.getenv(
+        "ATOM_DCP_SPARSE_PREFILL_NONPS", "1"
+    )
+    == "1",
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
@@ -673,12 +679,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
         os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
-    # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
+    # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
+    # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
-    # FlyDSL GPU work planner, built once per forward in the metadata
-    # builder. Needs ATOM_PA_FLYDSL=1. On by default so enabling FlyDSL gets the
-    # measured configuration (+20.5% interactivity at conc 20).
-    "ATOM_PA_FLYDSL_PLAN": lambda: (os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
