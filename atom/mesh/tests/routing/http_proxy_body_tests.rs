@@ -4,6 +4,7 @@ use crate::{
     core::{BasicWorkerBuilder, WorkerLoadGuard},
     policies::{LoadBalancingPolicy, SelectWorkerInfo},
 };
+use http_body::Body as _;
 use http_body_util::BodyExt;
 use std::sync::Mutex;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
@@ -69,12 +70,15 @@ async fn fixed_length_and_empty_completion_is_recorded_without_an_eof_poll() {
         let (response, server) = upstream(response).await;
         assert_eq!(response.content_length(), Some(payload.len() as u64));
         let (mut body, worker, policy) = wrap(response);
+        assert_eq!(body.size_hint().exact(), Some(payload.len() as u64));
         let mut received = Vec::new();
         while received.len() < payload.len() {
             let frame = body.frame().await.unwrap().unwrap();
             received.extend_from_slice(frame.data_ref().unwrap());
         }
         assert_eq!(received, payload);
+        // Outer observers (request metrics) complete on this, as hyper does.
+        assert!(body.is_end_stream());
         // A real HTTP server stops reading at Content-Length, without polling None.
         assert_eq!(*policy.0.lock().unwrap(), vec![status.is_success()]);
         drop(body);
