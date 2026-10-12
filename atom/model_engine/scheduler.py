@@ -38,6 +38,7 @@ from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
+    Replay,
     Sequence,
     SequenceStatus,
     SequenceType,
@@ -196,6 +197,13 @@ class ScheduledBatch:
         self.num_bonus = np.asarray(
             [seq.num_bonus_tokens for seq in seqs.values()], dtype=np.int32
         )
+        # By batch index, the seqs whose forward starts below where they
+        # resumed; empty in almost every batch.
+        self.replaying = {
+            i: seq.replay
+            for i, seq in enumerate(seqs.values())
+            if seq.replay is not None and seq.num_cached_tokens < seq.replay.until
+        }
         # One entry per state-holding seq: that seq's whole slot set, in
         # allocation order. `[0]` is the committed state and `[1:]` is
         # speculation rollback, one slot per speculated token. The sets are not
@@ -534,6 +542,8 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        # tokens a replaying forward carries from before it (`Replay.history_ids`)
+        self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -805,10 +815,12 @@ class Scheduler:
             for seq in self.running:
                 if not seq.is_partial_prefill:
                     continue
-                chunk = self._partial_prefill_chunk(seq, pending)
+                resume = seq.num_cached_tokens
+                start = self.block_manager.replay_start(seq, resume, hit=False)
+                chunk = self._partial_prefill_chunk(seq, start, resume, pending)
                 if not chunk:
                     break
-                chunk = self._preview_prefill_chunk(seq, seq.num_cached_tokens, chunk)
+                chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
                 pending += chunk
                 if pending >= budget:
                     break
@@ -820,7 +832,8 @@ class Scheduler:
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
-                cached = self._offload_prefill_start(seq)
+                resume = self._offload_prefill_start(seq)
+                cached = self.block_manager.replay_start(seq, resume, hit=False)
             else:
                 if probed_tokens >= budget:
                     break
@@ -836,18 +849,21 @@ class Scheduler:
                     # fill or mistake an individually fitting request for idle.
                     prefillable = True
                     break
-                cached = cached_blocks * self.block_manager.hash_block_size
+                resume = cached_blocks * self.block_manager.hash_block_size
+                cached = self.block_manager.replay_start(seq, resume, hit=True)
             remaining = (
                 seq.num_tokens - cached
                 if offload_resume
-                else self._new_prefill_tokens(seq, cached)
+                else self._new_prefill_tokens(seq, cached, resume)
             )
             chunk = self._prefill_chunk_for_budget(remaining, budget - pending, pending)
-            if chunk is None or (
-                self._requires_atomic_prefill(seq) and chunk < remaining
+            if (
+                chunk is None
+                or (self._requires_atomic_prefill(seq) and chunk < remaining)
+                or cached + chunk <= resume
             ):
                 break
-            chunk = self._preview_prefill_chunk(seq, cached, chunk)
+            chunk = self._preview_prefill_chunk(seq, cached, resume, chunk)
             prefillable = True
             pending += chunk
             slots -= 1
@@ -863,31 +879,66 @@ class Scheduler:
         hbs = self.block_manager.hash_block_size
         return max(0, (seq.num_tokens - 1) // hbs * hbs)
 
-    def _new_prefill_tokens(self, seq: Sequence, cached_tokens: int) -> int:
+    def _new_prefill_tokens(
+        self, seq: Sequence, cached_tokens: int, resume: int | None = None
+    ) -> int:
+        """Rows a prefill from `cached_tokens` asks for. `resume`: where it
+        resumed, at or above `cached_tokens` (`BlockManager.replay_start`); the
+        long-prefill cap counts from there, the recomputed rows riding on top."""
+        resume = cached_tokens if resume is None else resume
         remaining = seq.num_tokens - cached_tokens
         if (
             not self._requires_atomic_prefill(seq)
             and self.enable_chunked_prefill
-            and 0 < self.long_prefill_token_threshold < remaining
+            and 0 < self.long_prefill_token_threshold < seq.num_tokens - resume
         ):
-            remaining = self.long_prefill_token_threshold
+            remaining = self.long_prefill_token_threshold + resume - cached_tokens
         return remaining
 
-    def _partial_prefill_chunk(self, seq: Sequence, batched_tokens: int) -> int:
-        remaining = seq.num_tokens - seq.num_cached_tokens
-        if 0 < self.long_prefill_token_threshold < remaining:
-            remaining = self.long_prefill_token_threshold
-        return self._chunked_prefill_size(
+    def _resume_prefill(self, seq: Sequence, start: int, *, hit: bool) -> None:
+        """Start `seq`'s prefill forward at `start`, where `BlockManager.
+        replay_start` puts it for the point it resumes at, which `seq.replay`
+        keeps when the two differ. `hit`: it resumes at a prefix hit."""
+        resume = seq.num_cached_tokens
+        seq.replay = (
+            Replay(
+                resume,
+                hit and self.block_manager.state.transfer.replays,
+                tuple(
+                    seq.token_ids[max(0, start - self.replay_history_tokens) : start]
+                ),
+            )
+            if start < resume
+            else None
+        )
+        seq.num_cached_tokens = start
+
+    def _partial_prefill_chunk(
+        self, seq: Sequence, start: int, resume: int, batched_tokens: int
+    ) -> int:
+        """The next chunk of a running prefill that resumes at `resume` and
+        starts at `start`, or 0. A chunk ending at or below `resume` only
+        recomputes rows the cache holds, and the next pass would back off the
+        same way again, forever: it waits for a step with room instead."""
+        remaining = seq.num_tokens - start
+        if 0 < self.long_prefill_token_threshold < seq.num_tokens - resume:
+            remaining = self.long_prefill_token_threshold + resume - start
+        chunk = self._chunked_prefill_size(
             remaining, self.max_num_batched_tokens - batched_tokens, batched_tokens
         )
+        return chunk if start + chunk > resume else 0
 
-    def _preview_prefill_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
+    def _preview_prefill_chunk(
+        self, seq: Sequence, start: int, resume: int, chunk: int
+    ) -> int:
         # Estimation must not cancel a state fork. Only the actual admission
         # finalizes that decision after the delayer releases the batch.
         if self._requires_atomic_prefill(seq):
             return chunk
+        # The state starts at `resume`, a forward recomputing rows below it
+        # (`BlockManager.replay_start`) notwithstanding.
         target = self.block_manager.checkpoint_cut(
-            seq, start, start + chunk, record=False
+            seq, max(start, resume), start + chunk, record=False
         )
         return target - start if target else chunk
 
@@ -1636,11 +1687,14 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                chunk = self._partial_prefill_chunk(seq, num_batched_tokens)
+                resume = seq.num_cached_tokens
+                start = self.block_manager.replay_start(seq, resume, hit=False)
+                chunk = self._partial_prefill_chunk(
+                    seq, start, resume, num_batched_tokens
+                )
                 if chunk:
-                    chunk = self._finalize_prefill_chunk(
-                        seq, seq.num_cached_tokens, chunk
-                    )
+                    self._resume_prefill(seq, start, hit=False)
+                    chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 if chunk <= 0:
                     break
                 num_batched_tokens += chunk
@@ -1745,8 +1799,7 @@ class Scheduler:
                 # prefill off it is `_assert_positive_prefill_chunk` that fires
                 # instead, in the engine loop.
                 tier_hit = seq.num_cached_tokens
-                num_new_tokens = seq.num_tokens - tier_hit
-                if num_new_tokens <= 0:
+                if seq.num_tokens <= tier_hit:
                     # The tier can cover the request whole: its lookup runs
                     # over the entire prompt and is not bounded below it, where
                     # `can_allocate`'s HBM match stops one hash block short so
@@ -1760,15 +1813,19 @@ class Scheduler:
                     # regardless: the first decode samples from the logits this
                     # prefill produces, and there is nowhere else to get them.
                     seq.num_cached_tokens = self._offload_prefill_start(seq)
-                    num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+                start = self.block_manager.replay_start(
+                    seq, seq.num_cached_tokens, hit=False
+                )
+                num_new_tokens = seq.num_tokens - start
                 budget_remaining = self.max_num_batched_tokens - num_batched_tokens
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens, budget_remaining, num_batched_tokens
                 )
-                if chunk is None:
+                if chunk is None or start + chunk <= seq.num_cached_tokens:
                     self.waiting.appendleft(seq)
                     break
-                chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
+                self._resume_prefill(seq, start, hit=False)
+                chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
                 )
@@ -1821,9 +1878,12 @@ class Scheduler:
             # their decoded tokens — preempt() frees their KV blocks but keeps
             # the token_ids, so num_tokens > num_prompt_tokens and those tokens
             # still need KV recomputed.
-            num_new_tokens = self._new_prefill_tokens(
-                seq, num_cached_blocks * self.block_manager.hash_block_size
-            )
+            # From where the forward will really start: a replayed hit starts
+            # below itself (`BlockManager.replay_start`), and its budget counts
+            # the rows it recomputes.
+            resume = num_cached_blocks * self.block_manager.hash_block_size
+            start = self.block_manager.replay_start(seq, resume, hit=True)
+            num_new_tokens = self._new_prefill_tokens(seq, start, resume)
             if (
                 self._local_prefill_coalescing
                 and (not needs_remote_load or self._connector_flag("is_offload"))
@@ -1842,7 +1902,11 @@ class Scheduler:
             chunk = self._prefill_chunk_for_budget(
                 num_new_tokens, budget_remaining, num_batched_tokens
             )
-            if chunk is None or (atomic_prefill and chunk < num_new_tokens):
+            if (
+                chunk is None
+                or (atomic_prefill and chunk < num_new_tokens)
+                or start + chunk <= resume
+            ):
                 self.waiting.appendleft(seq)
                 break
             self.block_manager.record_allocation(seq, num_cached_blocks, block_hashes)
@@ -1940,6 +2004,11 @@ class Scheduler:
             # this with an inherited PD hit is a *failed* remote recv, and there
             # the local hit is the truthful number.
             seq.prefix_cache_hit_tokens = seq.num_cached_tokens
+            self._resume_prefill(
+                seq,
+                self.block_manager.replay_start(seq, seq.num_cached_tokens, hit=True),
+                hit=True,
+            )
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
@@ -1957,7 +2026,10 @@ class Scheduler:
             # admission and wait for a step that can, exactly as the joint-disown
             # path above requeues. `num_cached_tokens` is post-allocation, so
             # this stays correct even if the prefix was disowned.
-            if atomic_prefill and chunk < seq.num_tokens - seq.num_cached_tokens:
+            if (
+                atomic_prefill and chunk < seq.num_tokens - seq.num_cached_tokens
+            ) or seq.num_cached_tokens + chunk <= seq.replay_until:
+                # A replayed hit that cannot pass its hit this step waits too.
                 self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
                 break
@@ -2583,7 +2655,9 @@ class Scheduler:
         bm = self.block_manager
         if self._requires_atomic_prefill(seq):
             return chunk
-        target = bm.checkpoint_cut(seq, start, start + chunk)
+        # The state starts where the seq resumed, a forward recomputing rows
+        # below it (`Sequence.replay_until`) notwithstanding.
+        target = bm.checkpoint_cut(seq, max(start, seq.replay_until), start + chunk)
         if target:
             chunk = target - start
         # `cancel_state_fork` runs only when the first two hold, and returning
@@ -2659,8 +2733,10 @@ class Scheduler:
             # making `wanted - cached` negative. `seq.num_cached_tokens` is
             # deliberately NOT clamped: the forward must skip what was loaded.
             wanted_tokens = seq.num_wanted_hit_blocks * hbs
-            hbm_cached_tokens = min(seq.num_cached_tokens, wanted_tokens)
-            offload_tokens = seq.num_cached_tokens - hbm_cached_tokens
+            # where it resumed, not where a replaying forward starts below it
+            cached_tokens = max(seq.num_cached_tokens, seq.replay_until)
+            hbm_cached_tokens = min(cached_tokens, wanted_tokens)
+            offload_tokens = cached_tokens - hbm_cached_tokens
             self.engine_stats.update_cache(
                 hbm_cached_tokens,
                 seq.num_tokens,

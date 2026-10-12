@@ -606,6 +606,54 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
     cache.prepare_state(begin_step(cache, [replace(fresh, request_id=32)]))
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("histories", [True, False])
+def test_a_forward_recomputing_below_its_state_keeps_it(
+    small_config, device, histories
+):
+    """A forward starting below the point its state is at (decoder bounded
+    replay backing off): the slot must be at that point, keeps its state, and
+    its cursor's history starts over from the forward's own start; a rebuild
+    from the same start (encoder replay: no state came along) resets it."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.state_bytes[0].fill_(5)
+    cache.cursor[0] = torch.tensor([48, 19, -1, 27], device=device)
+    kept = [cache.state.view(name)[:, 0].clone() for name in ("window", "compress_kv")]
+    request = PagedRequest(41, 32, 0, 20, 0, (0, 1))
+    start = np.asarray([[7, 8, 9]], np.int64)
+
+    def prepare(cached_until):
+        step = begin_step(
+            cache,
+            [request],
+            floors=np.asarray([32], np.int32),
+            cached_until=np.asarray([cached_until], np.int32),
+            start_histories=start,
+        )
+        return cache.prepare_state(step, histories=histories)
+
+    restored = prepare(48)
+    if histories:
+        np.testing.assert_array_equal(restored, start)
+    assert cache.cursor[0, 1:].tolist() == [7, 8, 9]
+    for name, before in zip(("window", "compress_kv"), kept):
+        assert torch.equal(cache.state.view(name)[:, 0], before)
+    # where the slot is not at the point the forward resumes from
+    cache.cursor[0, 0] = 40
+    with pytest.raises(ValueError, match="needs state at 48"):
+        prepare(48)
+        cache.prepare_state(begin_step(cache, [replace(request, request_id=42)]))
+    # a rebuild: nothing kept below its start, the slot starts over there
+    cache.cursor[0] = torch.tensor([91, 19, -1, 27], device=device)
+    prepare(0)
+    for name in ("window", "compress_kv"):
+        assert cache.state.view(name)[:, 0].count_nonzero() == 0
+    assert cache.cursor[0, 1:].tolist() == [7, 8, 9]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("decode", [False, True])

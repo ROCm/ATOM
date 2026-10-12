@@ -23,13 +23,14 @@ runs (a plane is `rows * row_bytes` and both factors are already coarse), and
 an index plane is aligned once over the whole pool rather than per page, so
 four owners cost at most four alignments. The two terms that do move are the
 internal fragmentation of each request's last page -- `(block_size - 1)` tokens
-at 3200 B (BF16 KV and index), so 816 KB per in-flight request at 256, ~0.1% of
-a pool -- and the block table, `[max_num_seqs, max_model_len / block_size]`
+at 3200 B (BF16 KV and index), so 406 KB per in-flight request at 128, ~0.05%
+of a pool -- and the block table, `[max_num_seqs, max_model_len / block_size]`
 int32 held twice and copied to the device every forward: 134 MB at block 16
-against 8.4 MB at 256, for a million-token context. The block table is the
+against 16.8 MB at 128, for a million-token context. The block table is the
 larger of the two and it is per-forward traffic, which is why CSA2 takes a
-coarse page, as DeepSeek-V4 does. What a coarse page costs is prefix reuse
-below its own size, which no longer matches at all.
+coarse page. What a coarse page costs is prefix reuse below its own size,
+which no longer matches at all, and the rows encoder bounded replay recomputes
+below a hit, a whole page; 128 keeps both at the window's size.
 """
 
 from dataclasses import dataclass

@@ -115,6 +115,7 @@ def make_compress_plans(
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
     extra_write: int,
+    write_from: np.ndarray | None = None,
 ) -> dict[int, CompressPlan]:
     """Build a CompressPlan per (ratio, overlap) variant.
 
@@ -188,6 +189,11 @@ def make_compress_plans(
                     is invisible wherever `K_pool >= 1 + max_spec_steps` (V4: 8
                     and 128), which is exactly why nobody should get it by
                     default.
+      write_from: optional np[bs] int — per seq, the position below which the
+                    cache already holds its compressed rows: a group ending
+                    there is dropped from the compress plan, so a forward that
+                    recomputes rows to rebuild its state (V4.1 encoder bounded
+                    replay) writes none of them. 0 drops nothing.
 
     Returns:
       dict[ratio] -> CompressPlan. On empty fwd (`extend_lens_cpu.sum() == 0`)
@@ -318,6 +324,9 @@ def make_compress_plans(
 
         # compress: token at a compression boundary
         compress_mask = (positions + 1) % ratio == 0
+        if write_from is not None:
+            # a group the cache already holds whole is not compressed again
+            compress_mask &= positions >= write_from[batch_ids]
         compress_plan = plan_rows[compress_mask]
         # cu_compress: per-seq prefix-sum of boundary counts (for caller slicing).
         # bincount preserves seq order because compress_plan rows are already

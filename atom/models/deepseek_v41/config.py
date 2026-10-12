@@ -389,6 +389,13 @@ def validate_runtime_config(config):
             "a KV cache other than bf16 or fp4",
             config.kv_cache_dtype not in ("bf16", "fp4"),
         ),
+        (
+            # A hit rebuilds the window a row at it reads from the one PAGE
+            # below it (`BlockManager.replay_start`).
+            "encoder SWA bounded replay with a PAGE shorter than the window - 1",
+            config.enable_encoder_swa_bounded_replay
+            and config.kv_cache_block_size < config.hf_config.sliding_window - 1,
+        ),
     ):
         if enabled:
             unsupported.append(name)

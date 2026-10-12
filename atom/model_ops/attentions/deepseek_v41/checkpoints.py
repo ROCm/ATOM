@@ -13,7 +13,11 @@ from atom.model_ops.attentions.pool_layout.paged_state_copy import (
 
 class StateCopies:
     def __init__(self, cache, spec, max_batch):
+        """`spec` None: no checkpoint images (a `replay` state transfer), only
+        slot relocation."""
         self.cache, self.spec = cache, spec
+        if spec is None:
+            return
         if (spec.page_unit_bytes, spec.slot_bytes, spec.image_bytes) != (
             cache.geometry.paged_bytes,
             cache.geometry.state_bytes,
@@ -137,7 +141,7 @@ class StateCopies:
             (page if storing else state).copy_(state if storing else page)
 
     def warmup(self):
-        if not self.cache.pool.is_cuda:
+        if self.spec is None or not self.cache.pool.is_cuda:
             return
         src = np.asarray([self._range_addresses(0)], dtype=np.int64)
         dst = np.zeros(
