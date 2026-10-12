@@ -431,6 +431,23 @@ def test_the_cut_and_late_layers_run_on_nested_tails(monkeypatch):
     assert metadata.step is step
 
 
+def test_requests_within_the_cut_layers_tail_skip_trimming_it(monkeypatch):
+    """No request longer than `ring + window - 1`: the cut layer runs every
+    row on the forward's own step, and only the late layers trim."""
+    pytest.importorskip("aiter")
+    lengths, ring, window = [4, 2, 5], 3, 3
+    step = _step(lengths, [0, 50, 7])
+    total, seen = sum(lengths), []
+    model, metadata = _replaying_model(monkeypatch, step, ring, window, seen)
+    out = model(torch.zeros(total, dtype=torch.int64), None)
+    tail = _last_rows(lengths, ring)
+    assert [stage for stage, _ in seen] == ["write_kv", "cut", "late"]
+    torch.testing.assert_close(seen[1][1], torch.arange(total))
+    torch.testing.assert_close(seen[2][1], tail)
+    torch.testing.assert_close(out[tail], tail[:, None].float().expand(-1, 6))
+    assert metadata.step is step
+
+
 def test_aux_capture_at_the_cut_layer_is_refused():
     pytest.importorskip("aiter")
     from atom.models.deepseek_v41 import runtime

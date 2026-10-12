@@ -320,24 +320,46 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self._write_cut_kv(forward, seam[0])
         ring = replay_rows(forward, seam[0].shape[0]) if self.replay_enabled else None
         if ring is None:
-            return self.late(*self.cut(*seam))
+            state = self.cut(*seam)
+            # the seam is every row's; free it before the late layers run
+            del seam
+            return self.late(*state)
         metadata = forward.attn_metadata
-        extended = build_late_layer_tail(
-            metadata.step, cut_layer_rows(metadata.cache.geometry), self.cut_specs
-        )
+        step, num_tokens = metadata.step, input_ids.numel()
+        cut_rows = cut_layer_rows(metadata.cache.geometry)
+        if not any(span.length > cut_rows for span in step.requests):
+            # Every request fits the cut layer's tail whole: it runs on every
+            # row, on the forward's own step, and only the late layers trim.
+            state = self.cut(*seam)
+            del seam
+            return self._late_on_tail(metadata, step, ring, state, None, num_tokens)
+        extended = build_late_layer_tail(step, cut_rows, self.cut_specs)
         # Release the early graph's every-row seam as soon as the extended
         # tail's rows are out of it; only those are needed from here on.
         seam = _take_rows(seam, extended.token_indices)
         with late_layer_tail(metadata, extended):
             state = self.cut(*seam)
             del seam
-            tail = build_late_layer_tail(extended.step, ring, self.late_specs)
-            state = _take_rows(state, tail.token_indices)
-            with late_layer_tail(metadata, tail):
-                hidden = self.late(*state)
-        return self._scatter_tail(
-            hidden, extended.token_indices[tail.token_indices], input_ids.numel()
+            return self._late_on_tail(
+                metadata,
+                extended.step,
+                ring,
+                state,
+                extended.token_indices,
+                num_tokens,
+            )
+
+    def _late_on_tail(self, metadata, step, ring, state, base_rows, num_tokens):
+        """The late layers on each request's last ``ring`` rows of ``step``,
+        whose rows are ``base_rows`` of the forward's (all of them when None)."""
+        tail = build_late_layer_tail(step, ring, self.late_specs)
+        state = _take_rows(state, tail.token_indices)
+        with late_layer_tail(metadata, tail):
+            hidden = self.late(*state)
+        rows = (
+            tail.token_indices if base_rows is None else base_rows[tail.token_indices]
         )
+        return self._scatter_tail(hidden, rows, num_tokens)
 
     def _write_cut_kv(self, forward, normed):
         """The cut layer's cache writes, on every row (`Block.write_kv`).
