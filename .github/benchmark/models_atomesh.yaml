@@ -890,6 +890,9 @@ models:
             common_args:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 144
+              # Unsharded, the KDA gate GEMM (K=128, N=12288) has no tuned FP8
+              # kernel and aiter's fallback rejects K=128, so it stays bf16.
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
