@@ -292,6 +292,27 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
 _CAP_LOG = [0]
 
 
+def _image_only_cap(num_local: int, block_size: int) -> int:
+    """Cap to the checkpoint position when images are the only state source.
+
+    Returns the hit unchanged when images are not wired, which leaves
+    vLLM's answer alone for every model that has none.
+    """
+    try:
+        from atom.plugin.vllm.v41_state_image import images_can_serve
+    except Exception:
+        return num_local
+    if not images_can_serve():
+        return num_local
+    from vllm.v1.kv_cache_interface import get_mamba_prefill_checkpoint_position
+
+    return int(
+        get_mamba_prefill_checkpoint_position(
+            num_local, block_size, drop_eagle_block=False
+        )
+    )
+
+
 def _log_cap_decision(num_local, planner, capped=None) -> None:
     """Say what the wrapper saw, for the first few and then every 64th."""
     _CAP_LOG[0] += 1
@@ -347,9 +368,18 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
         # refusal dump, it could not see the planner at all: that lives in
         # this process.
         _log_cap_decision(num_local, planner)
-        if planner is None or num_local <= 0:
+        if num_local <= 0:
             return blocks, num_local, boundary, divergent
-        capped = int(planner.cap_local_hit(request, int(num_local)))
+        if planner is not None:
+            capped = int(planner.cap_local_hit(request, int(num_local)))
+        else:
+            # No connector, so no planner -- but capping a local hit to the
+            # checkpoint position is a property of the state images, not of
+            # the tier. Without this the images could never be shown to
+            # carry anything: every arm that had them also had a tier, and
+            # the tier reached the boundary first (measured: 11 state loads
+            # completed, 0 images restored).
+            capped = _image_only_cap(int(num_local), int(self.cache_config.block_size))
         _log_cap_decision(num_local, planner, capped)
         if capped >= num_local:
             return blocks, num_local, boundary, divergent
