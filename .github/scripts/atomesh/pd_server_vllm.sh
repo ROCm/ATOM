@@ -325,4 +325,8 @@ start_router() {
   echo "[router] vllm-router sidecar on :${ROUTER_PORT}, discovery :${VLLM_DISCOVERY_PORT}"
 }
 
-apply_vllm_fork_overlay
+if [[ -n "${ATOMESH_C48_CASE:-}" ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/pd_c48_server.sh"
+else
+  apply_vllm_fork_overlay
+fi

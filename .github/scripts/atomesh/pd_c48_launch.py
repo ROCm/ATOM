@@ -1,0 +1,93 @@
+"""Pinned C48 diagnostic launcher; explicit recipe AL is never recomputed."""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import sys
+
+
+def render(config: dict, role: str, model: str, host: str, proxy: str,
+           port: int, discovery: int) -> tuple[list[str], dict[str, str]]:
+    args = copy.deepcopy(config["roles"][role]["args"])
+    args["speculative-config"]["model"] = "/mnt/models/Inferact/Kimi-K3-DSpark"
+    transfer = args["kv-transfer-config"]
+    connectors = transfer.get("kv_connector_extra_config", {}).get("connectors", [transfer])
+    for connector in connectors:
+        if connector["kv_connector"] == "MoRIIOConnector":
+            connector["kv_connector_extra_config"].update(
+                proxy_ip=proxy, proxy_ping_port=discovery, http_port=port)
+    args.update(host="0.0.0.0", port=port, **{"worker-cls": "pd_c48_worker.ManifestWorker"})
+    argv = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", model]
+    for key, value in args.items():
+        if isinstance(value, bool):
+            argv.append("--" + ("" if value else "no-") + key)
+        else:
+            argv += ["--" + key, json.dumps(value, separators=(",", ":"))
+                     if isinstance(value, (dict, list)) else str(value)]
+    env = {str(k): str(v) for k, v in config["roles"][role]["env"].items()}
+    # TensorWave exposes ionic_* HCAs; bootstrap follows the allocated host IP.
+    # The Slurm launcher supplies these platform values to every case equally.
+    for key in ("NCCL_IB_HCA", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME"):
+        env.pop(key, None)
+    env["GLOO_SOCKET_IFNAME"] = os.environ.get("MORI_SOCKET_IFNAME", "")
+    env["VLLM_HOST_IP"] = host
+    env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    env["C48_DIAG_ROLE"] = role
+    env["C48_DIAG_PTPC"] = str(int("quantization-config" in args))
+    return argv, env
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--role", choices=["prefill", "decode"], required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--proxy", required=True)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--discovery", type=int, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--execute", action="store_true")
+    options = parser.parse_args()
+    config = json.loads(options.config.read_text())
+    argv, additions = render(config, options.role, options.model, options.host,
+                             options.proxy, options.port, options.discovery)
+    additions["C48_DIAG_DIR"] = str(options.output.parent / "model-manifests")
+    record = {"config": str(options.config), "config_sha256": hashlib.sha256(options.config.read_bytes()).hexdigest(),
+              "role": options.role, "argv": argv, "environment_overrides": additions,
+              "diagnostic": "Preserve archived arguments, including explicit synthetic AL; no engine overlay"}
+    options.output.parent.mkdir(parents=True, exist_ok=True)
+    if options.execute:
+        import vllm
+        record["vllm_file"] = vllm.__file__
+        record["versions"] = {}
+        for name in ("vllm", "torch", "triton", "aiter", "mori"):
+            try:
+                record["versions"][name] = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                record["versions"][name] = None
+        assert "81198e97b" in record["versions"]["vllm"], record["versions"]
+        record["model_files"] = {}
+        for root in (Path(options.model), Path("/mnt/models/Inferact/Kimi-K3-DSpark")):
+            assert (root / "config.json").is_file(), root
+            record["model_files"][str(root)] = {
+                p.name: {"bytes": p.stat().st_size,
+                         "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                for p in root.iterdir() if p.is_file() and p.suffix == ".json"}
+        record["platform_environment"] = {key: value for key, value in os.environ.items()
+            if key.startswith(("NCCL_", "MORI_", "HSA_", "HIP_", "GLOO_"))}
+    options.output.write_text(json.dumps(record, indent=2) + "\n")
+    print("[C48] " + json.dumps(record), flush=True)
+    if options.execute:
+        env = os.environ.copy()
+        env.update(additions)
+        os.execvpe(argv[0], argv, env)
+
+
+if __name__ == "__main__":
+    main()
