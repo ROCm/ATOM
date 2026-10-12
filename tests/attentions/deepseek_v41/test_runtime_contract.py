@@ -464,6 +464,8 @@ def test_legacy_engine_dp_is_normalized_before_v41_admission(
     hf = normalize_hf_config(json.loads(fixture.read_text()))
     monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
     monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
+    # Quantization resolves AITER enums; keep this admission test CPU-only.
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
     validated = []
     validate = v41_config.validate_runtime_config
 
