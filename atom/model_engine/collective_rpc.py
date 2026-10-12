@@ -22,6 +22,20 @@ COLLECTIVE_RPC_CMD = "collective_rpc"
 DISCARD_WEIGHT_SYNC_CMD = "discard_failed_weight_sync"
 FINISH_WEIGHT_SYNC_CMD = "finish_weight_sync"
 
+# The runner methods the public collective_rpc runs, and so the ones a
+# capability report advertises. An allowlist: the rest of a runner -- its
+# profiler, KV allocation, graph capture, dummy forwards -- has engine state
+# around it that a direct call bypasses, and under DP a dummy forward on one
+# engine waits on peers that never join it. A method is opened by adding it.
+COLLECTIVE_RPC_METHODS = frozenset(
+    {
+        # hidden-state extraction
+        "configure_hidden_states",
+        # capability discovery itself
+        "get_worker_capabilities",
+    }
+)
+
 # These methods have an EngineUtilityHandler command that owns engine state
 # around the worker call. Driving the worker method directly would bypass that
 # state -- sleeping/offload flags and all-rank update checks included.

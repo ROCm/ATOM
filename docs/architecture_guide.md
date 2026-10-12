@@ -189,11 +189,13 @@ The API is synchronous and intended for control messages, not bulk tensor
 transfer. A target returns plain data -- `None`, `bool`, `int`, `float`, `str`
 and `bytes`, in lists, tuples and dicts -- since its reply is unpickled in
 EngineCore and again in the API server; anything else, a tensor included, is
-returned as that rank's error. Methods whose utility handlers own EngineCore
-state -- weight updates, memory release/resume and KV-cache clearing -- are
-rejected on this generic path. Pipeline-parallel and prefill/decode-disaggregated
-engines are also rejected because their engine processes are not one-to-one DP
-ranks.
+returned as that rank's error. Only the runner methods listed in
+`COLLECTIVE_RPC_METHODS` run on this generic path, and they are exactly what
+`get_worker_capabilities` advertises: the rest of a runner -- weight updates,
+memory release/resume, its profiler, KV allocation, graph capture, dummy
+forwards -- has EngineCore state around it that a direct call would bypass.
+Pipeline-parallel and prefill/decode-disaggregated engines are also rejected
+because their engine processes are not one-to-one DP ranks.
 RPC targets must not perform cross-DP collectives: each EngineCore dequeues
 control work independently, so another DP engine may already be waiting in the
 busy loop's state all-reduce.

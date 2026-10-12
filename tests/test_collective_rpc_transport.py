@@ -28,6 +28,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aiter_stub import stubbed_aiter
 
@@ -379,6 +381,9 @@ class _Mq:
         self.sent.append(msg)
 
 
+_STAND_IN_METHODS = frozenset({"m", "some_method", "slow_method"})
+
+
 def _mgr(proc_num=4, *, procs=None):
     """An ``AsyncIOProcManager`` with only what ``collective_rpc`` reads.
 
@@ -388,6 +393,8 @@ def _mgr(proc_num=4, *, procs=None):
     mgr = object.__new__(AsyncIOProcManager)
     mgr.label = "test-mgr"
     mgr.proc_num = proc_num
+    # The transport tests drive stand-in method names.
+    mgr._PUBLIC_RPC_METHODS = COLLECTIVE_RPC_METHODS | _STAND_IN_METHODS
     mgr.rpc_broadcast_mq = _Mq()
     mgr.rpc_outputs_queues = [queue.Queue() for _ in range(proc_num)]
     mgr.procs = [_Alive() for _ in range(proc_num)] if procs is None else procs
@@ -450,7 +457,7 @@ def test_names_the_engine_protocol_owns_are_refused(name):
     """Protocol names and methods whose utility handlers own engine state
     cannot be driven around those owners."""
     mgr = _mgr(1)
-    with pytest.raises(ValueError, match="reserved"):
+    with pytest.raises(ValueError, match="not open to collective_rpc"):
         mgr.collective_rpc(name, RpcPayload(request_id="x1"))
     assert mgr.rpc_broadcast_mq.sent == [], "nothing may reach the workers"
 
@@ -460,9 +467,43 @@ def test_names_the_engine_protocol_owns_are_refused(name):
 )
 def test_private_worker_methods_are_not_a_public_rpc_surface(name):
     mgr = _mgr(1)
-    with pytest.raises(ValueError, match="reserved"):
+    with pytest.raises(ValueError, match="not open to collective_rpc"):
         mgr.collective_rpc(name, RpcPayload("private"), timeout=5)
     assert mgr.rpc_broadcast_mq.sent == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "start_profiler",
+        "dummy_execution",
+        "capture_cudagraph",
+        "allocate_kv_cache",
+        "model",
+    ],
+)
+def test_a_runner_attribute_that_is_not_listed_is_refused(name):
+    """A blocklist let these through: each has engine state around it that a
+    direct call bypasses, and under DP a dummy forward on one engine waits on
+    peers that never join it."""
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="not open to collective_rpc"):
+        mgr.collective_rpc(name, RpcPayload("unlisted"), timeout=5)
+    assert mgr.rpc_broadcast_mq.sent == []
+
+
+@pytest.mark.parametrize("name", ["forward", "exit", "async_proc_aggregation"])
+def test_the_utility_transport_still_refuses_the_wire_protocol(name):
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="reserved"):
+        mgr.utility_rpc(name, RpcPayload("protocol"), timeout=5)
+    assert mgr.rpc_broadcast_mq.sent == []
+
+
+def test_nothing_the_engine_owns_is_listed_as_public():
+    assert not COLLECTIVE_RPC_METHODS & AsyncIOProcManager._RESERVED_RPC_NAMES
+    assert not any(name.startswith("_") for name in COLLECTIVE_RPC_METHODS)
+    assert AsyncIOProcManager._PUBLIC_RPC_METHODS is COLLECTIVE_RPC_METHODS
 
 
 @pytest.mark.parametrize(

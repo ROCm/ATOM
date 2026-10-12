@@ -36,6 +36,7 @@ from atom.model_engine.block_table_codec import (
     BlockTableDeltaEncoder,
 )
 from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_METHODS,
     UTILITY_MANAGED_RUNNER_METHODS,
     RpcPayload,
     RpcResult,
@@ -449,9 +450,12 @@ class AsyncIOProcManager:
         *args: Additional arguments forwarded to the runner constructor.
     """
 
-    # Names that collective_rpc refuses. Some belong to the engine's wire
-    # protocol; the utility-managed ones need EngineUtilityHandler to maintain
-    # engine state around their worker call.
+    # The public collective_rpc runs only these.
+    _PUBLIC_RPC_METHODS: ClassVar[frozenset[str]] = COLLECTIVE_RPC_METHODS
+    # Names the engine's wire protocol owns, which even the utility handler's
+    # transport may not send. With the utility-managed ones, which need
+    # EngineUtilityHandler to keep engine state around their worker call,
+    # they are what must never be opened to the public path.
     _PROTOCOL_RPC_NAMES: ClassVar[frozenset[str]] = frozenset(
         {FORWARD_RPC, "exit", *AsyncIOProc._KV_FUNC_NAMES}
     )
@@ -668,7 +672,7 @@ class AsyncIOProcManager:
         payload: RpcPayload,
         timeout: float = 300.0,
     ) -> list[RpcResult]:
-        """Public worker RPC: utility-managed methods are not callable here."""
+        """Public worker RPC: runs only the methods in COLLECTIVE_RPC_METHODS."""
         return self._collective_rpc(
             func_name, payload, timeout, allow_utility_managed=False
         )
@@ -717,20 +721,13 @@ class AsyncIOProcManager:
         # Reached from the utility handler too, with whatever timeout the
         # utility command carried.
         timeout = checked_timeout(timeout)
-        is_private = (
-            isinstance(func_name, str)
-            and func_name.startswith("_")
-            and not allow_utility_managed
-        )
-        is_reserved = (
-            is_private
-            or func_name in self._PROTOCOL_RPC_NAMES
-            or (
-                func_name in UTILITY_MANAGED_RUNNER_METHODS
-                and not allow_utility_managed
-            )
-        )
-        if is_reserved:
+        if not allow_utility_managed:
+            if func_name not in self._PUBLIC_RPC_METHODS:
+                raise ValueError(
+                    f"{self.label}: {func_name!r} is not open to collective_rpc, "
+                    f"which runs only {sorted(self._PUBLIC_RPC_METHODS)}"
+                )
+        elif func_name in self._PROTOCOL_RPC_NAMES:
             # Each would break the protocol this path goes around. The workers'
             # decoder resets its cached rows on a forward the encoder never saw,
             # failing the next scheduled one. Exit tears down every worker's

@@ -12,19 +12,9 @@ useful failure.
 import logging
 
 from atom.model_engine.capabilities import COLLECTIVE_RPC_PROTOCOL_VERSION
+from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
 
 logger = logging.getLogger("atom")
-
-# Control-plane methods a consumer may reasonably drive. Deliberately a fixed
-# list rather than a dir() sweep: dir() would advertise every private helper and
-# turn any refactor into a capability change, and it would leak methods that are
-# not safe to call from outside.
-_ADVERTISED_METHODS = (
-    # hidden-state extraction
-    "configure_hidden_states",
-    # capability discovery itself
-    "get_worker_capabilities",
-)
 
 
 class CapabilityProviderMixin:
@@ -37,8 +27,13 @@ class CapabilityProviderMixin:
         picklable across the worker boundary without the engine and the worker
         having to agree on a class definition.
         """
+        # The fixed list collective_rpc runs, not a dir() sweep: that would
+        # advertise every private helper, turn any refactor into a capability
+        # change, and offer methods that are not safe to call from outside.
         methods = sorted(
-            name for name in _ADVERTISED_METHODS if callable(getattr(self, name, None))
+            name
+            for name in COLLECTIVE_RPC_METHODS
+            if callable(getattr(self, name, None))
         )
 
         features = set()
