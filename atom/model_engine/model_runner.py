@@ -1821,6 +1821,16 @@ class ModelRunner:
         # This prevents OOM when other processes share the GPU. Free HBM must
         # cover the connector buffers too.
         free_for_kv = free - connector_bytes
+        if connector_bytes and free_for_kv <= 0:
+            # Otherwise the KV cache gets nothing and the connector allocates
+            # from memory that is not there.
+            raise RuntimeError(
+                f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
+                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
+                "buffers need after the KV cache is sized; free GPU memory or "
+                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
+                "ATOM_PD_MLA_LANDING=0)."
+            )
         available_for_kv = min(available_for_kv_budget, free_for_kv)
 
         torch.set_default_device(None)

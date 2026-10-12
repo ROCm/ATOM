@@ -1337,10 +1337,14 @@ class MooncakeConnector(KVConnectorBase):
             return None
         token_views: dict[int, torch.Tensor] = {}
         for region_idx, (region, view) in enumerate(zip(tt.block_regions, views)):
+            # A published view is a uint8 alias of its region whatever the KV
+            # dtype (page_region), so a row of it is one token's bytes. Any
+            # other view keeps the per-token path rather than gather it wrong.
             if (
                 region.semantic_role != MLA_KV_ROLE
                 or region.unit_bytes % self.block_size
                 or not view.is_cuda
+                or view.dtype != torch.uint8
             ):
                 continue
             token_views[region_idx] = view.view(

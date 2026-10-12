@@ -555,6 +555,41 @@ def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
     assert conn._stream.waited == [event, event]
 
 
+def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
+    # page_region publishes every PAGE view as a uint8 alias, so a bf16 KV
+    # cache's rows are still one token's bytes; a view of another dtype would
+    # be reshaped wrong, so it keeps the per-token path instead.
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.page_region import page_region
+
+    mc = _mooncake()
+    monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
+    kv = torch.zeros((4, 16, 576), dtype=torch.bfloat16)
+    published = page_region(kv, semantic_role=MLA_KV_ROLE)
+    assert published.view.dtype == torch.uint8
+    assert published.region.unit_bytes == 16 * 576 * 2
+
+    class _Bf16View:
+        is_cuda = True
+        dtype = torch.bfloat16
+
+        def view(self, *_shape):
+            raise AssertionError("a non-byte view must not be reshaped")
+
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.is_producer = True
+    conn.dcp_size = 1
+    conn.block_size = 16
+    conn._has_slot_regions = False
+    conn._num_send_workers = 16
+    tt = SimpleNamespace(
+        block_regions=[published.region], block_tensor_views=[_Bf16View()]
+    )
+    assert conn._build_mla_staging(tt) is None
+    assert conn._mla_staging is None
+
+
 def test_mla_staging_is_disabled_by_env(monkeypatch):
     mc = _mooncake()
     monkeypatch.setenv("ATOM_PD_MLA_STAGING", "0")
