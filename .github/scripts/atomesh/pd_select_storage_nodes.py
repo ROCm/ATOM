@@ -149,22 +149,26 @@ def main():
     }
     try:
         output = subprocess.run(
-            ["scontrol", "show", "nodes", "--oneliner"],
+            ["scontrol", "show", "nodes", ",".join(candidates)],
             check=True,
             capture_output=True,
             text=True,
             timeout=20,
         ).stdout
         records = {}
-        for line in output.splitlines():
+        # Spur puts each node's fields on separate lines. Slurm may put the
+        # entire record on one line; start each record at its NodeName field.
+        for section in re.split(r"(?=\bNodeName=)", output):
             record = dict(
-                re.findall(r"(?:^|\s)(NodeName|NodeAddr|State)=([^\s]+)", line)
+                re.findall(r"(?:^|\s)(NodeName|NodeAddr|State)=([^\s]+)", section)
             )
             if "NodeName" in record:
                 records[record["NodeName"]] = record
         report.update(select_pair(candidates, records))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
+        if isinstance(error, subprocess.CalledProcessError):
+            report["command_stderr"] = (error.stderr or "")[-2000:]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))

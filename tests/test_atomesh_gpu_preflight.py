@@ -1,6 +1,7 @@
 """Reject image extraction failures before starting either model server."""
 
 import importlib.util
+import os
 import tempfile
 import time
 import unittest
@@ -102,6 +103,58 @@ def host_metrics(free_bytes):
 
 
 class NodeSelectionTest(unittest.TestCase):
+    def test_spur_command_and_multiline_node_records_reach_pair_selection(self):
+        # Replay the layout from the 2026-10-12 Spur node-details artifact.
+        # Spur accepts `show nodes <nodelist>`, without Slurm's --oneliner.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = root / "scontrol"
+            command.write_text(
+                "#!/bin/sh\n"
+                'if [ "$*" != "show nodes pit2-p03-g23,pit2-p03-g42" ]; then\n'
+                '  echo "Unsupported Spur show arguments" >&2; exit 1\n'
+                "fi\n"
+                "cat <<'NODES'\n"
+                "NodeName=pit2-p03-g23\n"
+                "   State=MIXED Reason=\n"
+                "   Partitions=amd-spur\n"
+                "   CPUTot=128 CPUAlloc=6 RealMemory=3095781 FreeMem=3034177\n\n"
+                "NodeName=pit2-p03-g42\n"
+                "   State=ALLOCATED Reason=\n"
+                "   Partitions=amd-spur\n"
+                "   CPUTot=128 CPUAlloc=128 RealMemory=3095781 FreeMem=2976596\n"
+                "NODES\n"
+            )
+            command.chmod(0o755)
+            output = root / "selection.json"
+            github_env = root / "github-env"
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "select",
+                        "--candidates",
+                        "pit2-p03-g23,pit2-p03-g42",
+                        "--output",
+                        str(output),
+                    ],
+                ),
+                patch.dict(
+                    os.environ,
+                    PATH=f"{root}:{os.environ['PATH']}",
+                    GITHUB_ENV=str(github_env),
+                ),
+                patch.object(SELECT.urllib.request, "build_opener") as opener,
+            ):
+                response = opener.return_value.open.return_value.__enter__.return_value
+                response.read.return_value = host_metrics(500 * 1024**3).encode()
+                SELECT.main()
+            self.assertEqual(
+                github_env.read_text(),
+                "ATOMESH_1P1D_NODES=pit2-p03-g23,pit2-p03-g42\n"
+                "ATOMESH_NODE_POOL=pit2-p03-g23,pit2-p03-g42\n",
+            )
+
     def test_rejects_archived_g24_capacity_before_gpu_submission(self):
         report = SELECT.storage_report(host_metrics(12153413632), time.time())
         self.assertFalse(report["passed"])
