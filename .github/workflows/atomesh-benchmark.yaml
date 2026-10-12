@@ -94,8 +94,9 @@ on:
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16,
             glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c24
 
-          Kimi-K3 (standalone case connects directly to ATOM without Mesh):
+          Kimi-K3 (standalone cases connect directly to ATOM without Mesh):
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48,
+            kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,

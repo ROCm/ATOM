@@ -10,9 +10,11 @@ two catalogs: [`models_agentic.json`](./models_agentic.json) for the default
 manual test, and [`models_agentic_nightly.json`](./models_agentic_nightly.json)
 for the daily 08:17 UTC run. Both use `rocm/atom-dev:latest` and checked-out branch
 code. The manual `test` catalog contains DeepSeek V4.1 Flash + DSpark5,
-TP4 with FULL graphs, concurrency 2/4 and 900 seconds per point, plus Kimi-K3
-without speculative decoding, TP8/DCP8, concurrency 48 and 3600 seconds. An empty `models` input
-selects both models. Nightly remains DeepSeek only, based on InferenceX PR #3387
+TP4 with FULL graphs, concurrency 2/4 and 900 seconds per point. Kimi-K3 standalone
+STATE checkpoint cases use the **Atomesh Benchmark** workflow and
+[`models_atomesh.yaml`](./models_atomesh.yaml), with TP8/DCP8, no speculative
+decoding, concurrency 48/72 and 3600 seconds per point.
+Nightly remains DeepSeek only, based on InferenceX PR #3387
 with a custom grid: TP2 c=1/2/4/8/16/32/64/128 and TP4 c=1/4/8,
 3600 seconds per point, 5 warmup requests per lane and fixed AL 3.51.
 The DeepSeek recipes set GPU memory utilization to 0.95, omit the max-num-seqs
@@ -36,18 +38,25 @@ consumers, including AgenticViewer. See
 for capture and verification details.
 
 
-## Kimi-K3 single-server Agentic case
+## Kimi-K3 single-server Agentic cases
 
-In **ATOM Agentic Benchmark**, select the branch containing the implementation,
-set `profile=test` and `models=kimi-k3`, and leave concurrency and duration empty
-for the recipe's C48 / 3600-second point. Set `dry_run=true` to preview the
-matrix without allocating a GPU runner. The catalog entry is in
-[`models_agentic.json`](./models_agentic.json); it starts a single ATOM server
-through `benchmark-tmpl.yml` and does not invoke ATOMesh or a Dynamo frontend.
+In **Atomesh Benchmark**, select the branch containing the implementation,
+set `suite=nightly`, and set `case_names` to either of these entries:
 
-The case uses TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
-`max-num-seqs=96`, `max-num-batched-tokens=8192`, no speculative decoding,
-and FULL graph capture sizes 1 through 96. It loads the K3 FP4
+- `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48`
+- `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72`
+
+Select both with a comma-separated list. Leave `benchmark_concurrency` empty
+to use each case's concurrency. Each case runs for 3600 seconds with a fresh
+single ATOM server and independent caches. The entries in
+[`models_atomesh.yaml`](./models_atomesh.yaml) share the same replay settings.
+C48 uses `max-num-seqs=96`; C72 uses `max-num-seqs=144`. The standalone launch
+path connects AIPerf directly to ATOM without starting Mesh or a separate decode
+worker.
+
+Both cases use TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
+`max-num-batched-tokens=8192`, no speculative decoding,
+and FULL graph capture sizes 1 through 96. Each loads the K3 FP4
 weights, uses FP8 KV and LMCache DRAM offload with 128 GiB per rank, block size
 128, and LMCache chunk size 1024. The Agentic trace context cap is 1,048,576
 tokens; request lengths come from the dataset rather than random ISL/OSL flags.

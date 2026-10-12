@@ -668,7 +668,8 @@ models:
         # Single ATOM server migrated from models_agentic.json; AIPerf connects
         # directly. The prefill block configures the combined server; no Mesh or
         # separate decode worker is started.
-        - name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48
+        - &kimi_k3_standalone_state
+          name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48
           topology: standalone_tp8_dcp8
           display_topology: STANDALONE-TP8-DCP8-STATE
           pd_worker_layout: standalone
@@ -684,7 +685,7 @@ models:
             cudagraph_mode: FULL
             compilation_level: 3
           server:
-            common_args:
+            common_args: &kimi_k3_standalone_state_args
               gpu_memory_utilization: 0.9
               max_num_seqs: 96
               max_num_batched_tokens: 8192
@@ -741,6 +742,14 @@ models:
             unsafe_override: 0
             wait_server_timeout: 4500
           run_eval: false
+
+        - <<: *kimi_k3_standalone_state
+          name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_standalone_state_args
+              max_num_seqs: 144
 
         # One concurrency per job keeps the prefix/state caches independent.
         - <<: &kimi_k3_agentic_tp8
