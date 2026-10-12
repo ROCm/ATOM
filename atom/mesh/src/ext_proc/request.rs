@@ -6,7 +6,9 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use prost_types::value::Kind;
 
 use crate::{
-    app_context::AppContext, core::prepare_pool::PrepareHandle, routers::ingress::IngressRouting,
+    app_context::AppContext,
+    core::prepare_pool::PrepareHandle,
+    routers::ingress::{DpRankBody, IngressRouting},
 };
 
 use super::{core, error::ProcessingError, pb};
@@ -28,6 +30,7 @@ pub(super) struct RoutingInput {
     pub metadata: InferenceMetadata,
     pub tokens: Option<Vec<u32>>,
     pub state_reference: bool,
+    pub dp_rank_body: Option<DpRankBody>,
 }
 impl std::ops::Deref for RoutingInput {
     type Target = InferenceMetadata;
@@ -274,6 +277,7 @@ impl RequestParser {
                     .map_err(ProcessingError::invalid)?;
                 let (metadata, tokens) = routing.prepare(&parsed, context)?;
                 let input = RoutingInput {
+                    dp_rank_body: routing.dp_rank_body(&metadata, &request.raw),
                     metadata,
                     tokens,
                     state_reference: parsed.requires_state_domain(),

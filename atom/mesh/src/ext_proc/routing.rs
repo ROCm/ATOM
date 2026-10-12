@@ -11,7 +11,7 @@ use crate::{
         Worker, WorkerLoadGuard,
     },
     policies::LoadBalancingPolicy,
-    routers::ingress::{dp_rank_body, IngressRouting},
+    routers::ingress::{dp_ranked_body, IngressRouting},
 };
 
 use super::{
@@ -153,13 +153,13 @@ impl EndpointRouter {
             Some(address) => *address,
             None => Self::address(worker.as_ref()).await?,
         };
-        if let Some(body) =
-            dp_rank_body(worker.as_ref(), input.metadata.route, &request.raw).await?
-        {
-            request.replace_body(
-                serde_json::to_vec(&body)?,
-                self.app.router_config.ext_proc.max_body_bytes,
-            )?;
+        if let Some(body) = dp_ranked_body(
+            worker.as_ref(),
+            input.metadata.route,
+            input.dp_rank_body.as_ref(),
+            &request.raw,
+        )? {
+            request.replace_body(body.into(), self.app.router_config.ext_proc.max_body_bytes)?;
         }
         let api_key = worker.api_key().clone();
         Ok(RoutingDecision {
