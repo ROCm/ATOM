@@ -105,3 +105,90 @@ def test_sparse_attention_forwards_topk_with_matching_rows(
     expected = (qkn.q_sa if topk is None else topk).clone()
     expected[expected_rows:] = 0
     torch.testing.assert_close(out, expected)
+
+
+def _load_indexer(fc, base):
+    tree = ast.parse(_SOURCE.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "IndexerVllm"
+    )
+    cls.body = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "score_topk_from"
+    ] or [ast.Pass()]
+    namespace = {
+        "torch": torch,
+        "IndexerBase": base,
+        "get_forward_context": lambda: fc,
+        "AttnState": SimpleNamespace(DECODE=_DECODE),
+    }
+    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    exec(compile(module, str(_SOURCE), "exec"), namespace)  # noqa: S102
+    return namespace["IndexerVllm"]()
+
+
+@pytest.mark.parametrize("with_scale", [False, True])
+@pytest.mark.parametrize("state", ["prefill", "mixed", "decode"])
+@pytest.mark.parametrize("num_real", [5, 8])
+def test_scorer_clips_before_reading_bounds_and_restores_bucket(
+    state, num_real, with_scale
+):
+    # Prefill/mixed metadata describes real tokens. Decode metadata is already
+    # bucket-padded, even when only five tokens will be sampled.
+    num_metadata = 8 if state == "decode" else num_real
+    md = SimpleNamespace(
+        state=_DECODE if state == "decode" else object(),
+        batch_id_per_q_token=torch.zeros(num_metadata, dtype=torch.int32),
+        indexer_meta={"visible_end_gpu": torch.arange(num_metadata) + 10},
+    )
+    fc = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=md,
+    )
+
+    class BoundedScorer:
+        def score_topk_from(self, q_quant, weights, q_scale=None):
+            self.received = (q_quant, weights, q_scale)
+            # Read a bound for EVERY scored query. With the old adapter, a
+            # padded prefill reaches rows 5..7 and raises IndexError here.
+            rows = torch.arange(q_quant.size(0))
+            bounds = md.indexer_meta["visible_end_gpu"][rows]
+            self.result = bounds[:, None].expand(-1, 3).to(torch.int32)
+            return self.result
+
+    indexer = _load_indexer(fc, BoundedScorer)
+    q_quant = torch.arange(8 * 2 * 4, dtype=torch.uint8).reshape(8, 2, 4)
+    weights = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    q_scale = (
+        torch.arange(8 * 4 * 16, dtype=torch.uint8).reshape(8, 1, 4, 16, 1)
+        if with_scale
+        else None
+    )
+    topk = indexer.score_topk_from(q_quant, weights, q_scale)
+    for original, received in zip(
+        (q_quant, weights, q_scale), indexer.received, strict=True
+    ):
+        if original is None:
+            assert received is None
+        else:
+            torch.testing.assert_close(received, original[:num_metadata])
+            assert received.data_ptr() == original.data_ptr()
+
+    assert topk.shape == (8, 3)
+    torch.testing.assert_close(topk[:num_metadata], indexer.result)
+    assert bool((topk[num_metadata:] == -1).all())
+    if num_metadata == 8:
+        assert topk is indexer.result
+
+    # Follow the actual ordering: scorer -> sparse-attention padding adapter.
+    # The attention backend sees real rows; its caller gets the padded bucket.
+    attention = _load_attention(fc)
+    out = attention._sparse_attention(
+        _QKN(torch.ones(8, 2)), torch.arange(8), index_topk=topk
+    )
+    assert attention.received[2].shape == (num_metadata, 3)
+    torch.testing.assert_close(out[:num_metadata], indexer.result)
+    assert bool((out[num_metadata:] == 0).all())
