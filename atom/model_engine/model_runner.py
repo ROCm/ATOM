@@ -3386,9 +3386,6 @@ class ModelRunner:
         if callable(callback):
             callback(req_ids)
 
-    @_profile_runner_stage
-    @torch.inference_mode()
-    @with_eplb_forward_monitor
     def _maybe_log_memstats(self) -> None:
         # Debug-only (ATOM_MEMSTATS_INTERVAL_S > 0): host-side allocator counters, no device sync.
         interval = float(os.environ.get("ATOM_MEMSTATS_INTERVAL_S", "0") or 0)
@@ -3418,6 +3415,9 @@ class ModelRunner:
         )
         torch.cuda.reset_peak_memory_stats()
 
+    @_profile_runner_stage
+    @torch.inference_mode()
+    @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         self._maybe_log_memstats()
         # Make this forward's staging buffers safe to overwrite before
