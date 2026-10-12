@@ -551,3 +551,22 @@ compressed prefix up to a PAGE boundary and replay the last <=128 tokens to
 rebuild STATE, paying one window per hit instead. Either way the tier
 already covers this workload (warm 16/16, 79.8% supplied), so the images
 are not on the critical path for offload.
+
+### Known collision: state images and the DSpark draft group
+
+`ATOM_V41_STATE_IMAGES=1` registers a `MambaSpec` group, and #2494's
+`_build_v41_proxy_draft_groups` (`atom/plugin/vllm/spec_decode_patch.py`)
+splits kv-cache groups into exactly two -- the proxy, and everything else --
+then calls `rest_specs[0].merge(rest_specs)`, which asserts all specs are
+the same type. With images on AND DSpark on, "everything else" holds a
+`MambaSpec` and a `SlidingWindowMLASpec`, and that assert fires.
+
+Reachable today: the images need no connector, so `LMCACHE=off` + images +
+DSpark is a legal combination. The connector's own refusal of speculation
+alongside offload does not cover it. Nobody hits it only because
+`ATOM_V41_STATE_IMAGES` defaults off.
+
+Sharing a page does not avoid it: the image unit is 739,840 B, byte-for-byte
+the proxy's page, but `merge` asserts on spec TYPE and the images must be a
+`MambaSpec` for vLLM to allocate and hash them. The fix is to split those
+groups by spec type rather than proxy-vs-rest, which lives in that file.
