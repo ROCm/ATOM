@@ -67,7 +67,6 @@ def test_cap_and_pending():
     assert mgr._rank_reqs == [3, 3, 3, 3], mgr._rank_reqs
     assert sum(len(s) for s in mgr.sent) == 12
     assert len(mgr._bp_pending) == 88
-    print("OK cap+pending: dispatched=12 pending=88 reqs=", mgr._rank_reqs)
 
 
 def test_refill_feeds_fast_rank_more():
@@ -95,16 +94,6 @@ def test_refill_feeds_fast_rank_more():
     assert all(r <= 3 for r in mgr._rank_reqs), mgr._rank_reqs
     # Pending shrank by the 10 refills.
     assert len(mgr._bp_pending) == 40 - 12 - 10, len(mgr._bp_pending)
-    print(
-        "OK refill: rank0 processed",
-        len(mgr.sent[0]),
-        "vs peers",
-        [len(mgr.sent[i]) for i in (1, 2, 3)],
-        "| in-flight",
-        mgr._rank_reqs,
-        "| pending",
-        len(mgr._bp_pending),
-    )
 
 
 def test_drains_everything():
@@ -124,11 +113,3 @@ def test_drains_everything():
     dispatched = [sid for rank_ids in mgr.sent for sid in rank_ids]
     assert len(dispatched) == 20  # every seq dispatched exactly once
     assert len(set(dispatched)) == 20  # no duplicates
-    print("OK drain: all 20 dispatched exactly once, nothing stuck")
-
-
-if __name__ == "__main__":
-    test_cap_and_pending()
-    test_refill_feeds_fast_rank_more()
-    test_drains_everything()
-    print("\nALL BACKPRESSURE TESTS PASSED")

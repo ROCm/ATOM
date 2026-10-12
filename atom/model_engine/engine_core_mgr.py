@@ -67,7 +67,8 @@ def build_internode_dp_socket_plan(
     selects the IPC path (and, with it, the connect/bind polarity) further down.
 
     Three ports per engine: requests, outputs, and control. Control is separate
-    so the request socket keeps a single writer thread (see _send_request).
+    so utility, abort, and shutdown never share ``input_sockets`` with add and
+    backpressure refill (see _send_request).
     """
     base = master_port + INTERNODE_DP_SOCKET_PORT_OFFSET
     return [
@@ -263,18 +264,23 @@ class CoreManager:
         self._seq_load = {}
         self._lb_lock = Lock()
         # --- Backpressure (lazy) DP dispatch --------------------------------
-        # ATOM_DP_DISPATCH_DEPTH > 0 enables it; 0 keeps the legacy behaviour of
-        # spraying every seq across ranks up front. The value is the per-rank cap
-        # on in-flight (charged-but-unfinished) requests. Un-dispatched
-        # load-balanced seqs wait in _bp_pending and are released to the lightest
-        # rank only as that rank drains, so a rank that finishes early keeps
-        # getting re-fed instead of running dry and dragging the lockstep DP
-        # group onto the forced-eager path. Must stay >= max_num_seqs so each
-        # rank can still fill a full running batch; ~1.2-1.5x is a good start.
-        try:
-            self._bp_depth = int(os.getenv("ATOM_DP_DISPATCH_DEPTH", "0"))
-        except ValueError:
-            self._bp_depth = 0
+        # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
+        # releases them to the lightest rank only up to that in-flight cap. A
+        # rank that finishes its share early is re-fed instead of sitting on a
+        # dummy decode while peers still open prefills. A prefill on any rank
+        # takes the whole lockstep group off CUDA-graph replay; an idle rank's
+        # dummy batch does not. Finishing prefills together lets the tail stay
+        # all-decode and on the graph. 0 keeps the legacy up-front spray. Depth
+        # should stay >= max_num_seqs so each rank can fill a full running batch.
+        self._bp_depth = envs.ATOM_DP_DISPATCH_DEPTH
+        if 0 < self._bp_depth < config.max_num_seqs:
+            logger.warning(
+                "%s: ATOM_DP_DISPATCH_DEPTH=%d is below max_num_seqs=%d; "
+                "each rank's running batch is capped below a full step",
+                label,
+                self._bp_depth,
+                config.max_num_seqs,
+            )
         self._bp_pending: deque = deque()
         # Backpressure refill runs on the per-rank output threads, which then
         # also write input_sockets. A ZMQ socket is not thread-safe, so every
@@ -875,24 +881,22 @@ class CoreManager:
     def _send_request(self, dp_rank: int, payload: bytes) -> None:
         """Send one already-pickled request to an engine core. Hot path.
 
-        Deliberately unsynchronized: ``input_sockets`` carries nothing but
-        ``add_request``, which runs on a single thread (the API server's event
-        loop online, the caller's thread offline). Everything that can be sent
-        from another thread -- utility commands, abort, shutdown -- goes to
-        :meth:`_send_control` on a separate socket instead.
+        Every ``input_sockets`` write goes through here and holds
+        ``_input_send_lock``. Two caller classes share the socket: the request
+        thread (``add_request``: the API server's event loop online, the
+        caller's thread offline) and the per-rank output threads (backpressure
+        refill when ``ATOM_DP_DISPATCH_DEPTH`` > 0). A ZMQ socket is not
+        thread-safe: unserialized ``send_multipart`` calls interleave frames,
+        the DEALER reads a routing identity where a payload should be, and its
+        input thread dies on ``UnpicklingError``. Nothing recovers from that.
 
-        That separation is load-bearing, not stylistic. A ZMQ socket is not
-        thread-safe: two unserialized ``send_multipart`` calls interleave their
-        frames, the DEALER on the other end then reads a routing identity where
-        a payload should be, and its input thread dies on ``UnpicklingError``.
-        Nothing recovers from that -- the engine spins on a forever-empty input
-        queue, the workers idle, and every client hangs with no error logged
-        anywhere but that thread's own traceback. So: never send to
-        ``input_sockets`` from anywhere but here.
+        Refill sends the same ADD payload as the request thread, so it reuses
+        this socket under the lock. A second ROUTER would need another
+        engine-side reader for the same queue. Utility commands, abort, and
+        shutdown stay on :meth:`_send_control`, which is why control has its
+        own socket. Never send to ``input_sockets`` from anywhere but here.
+        The lock is uncontended when backpressure is off.
         """
-        # Serialized because backpressure refill (ATOM_DP_DISPATCH_DEPTH) sends
-        # from the per-rank output threads too, not just the single request
-        # thread. The lock is uncontended when backpressure is off.
         with self._input_send_lock:
             self.input_sockets[dp_rank].send_multipart(
                 [self.engine_core_identities[dp_rank], payload], copy=False
@@ -983,11 +987,11 @@ class CoreManager:
         # getattr/int pass per seq.
         hints = self._resolve_and_validate_hints(seqs)
 
-        # Backpressure (lazy) dispatch. Only engages for plain load-balanced
-        # batches (no explicit rank hints, no sticky sessions) so the
-        # hinted/affinity semantics below are never altered. Offline batch
-        # inference takes exactly this path, which is where a rank that drains
-        # early otherwise forces the lockstep DP group onto the eager path.
+        # Backpressure (lazy) dispatch. Only plain load-balanced batches (no
+        # explicit rank hints, no sticky sessions), which is the offline path.
+        # Holding work back makes every rank finish prefilling together, so the
+        # tail can stay all-decode and on CUDA-graph replay. A prefill on any
+        # rank is what takes the group off the graph; an idle dummy batch is not.
         if (
             getattr(self, "_bp_depth", 0) > 0
             and not self._dp_session_affinity_enabled
@@ -1433,8 +1437,15 @@ class CoreManager:
             self._rank_reqs = [0] * self._routable_engine_count
             self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
-            if getattr(self, "_bp_pending", None) is not None:
-                self._bp_pending.clear()
+            pending = getattr(self, "_bp_pending", None)
+            if pending:
+                logger.warning(
+                    "%s: reset_dp_router() dropping %d undispatched "
+                    "request(s) still in the backpressure pool",
+                    self.label,
+                    len(pending),
+                )
+                pending.clear()
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
 
