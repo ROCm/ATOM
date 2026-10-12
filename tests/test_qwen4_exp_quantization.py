@@ -273,3 +273,56 @@ def test_ptpc_ple_loads_fp8_shards_and_scalar_scale(make_embedding):
         embedding.weight_scale.weight_loader(embedding.weight_scale, torch.ones(2))
     with pytest.raises(ValueError, match="expected torch.float8_e4m3fn"):
         embedding.weight.weight_loader(embedding.weight, weight.to(torch.bfloat16), 0)
+
+
+def test_ep0_stacked_loader_captures_routed_slice_and_keeps_the_map():
+    """EP rank 0 is the map #2418 makes non-contiguous; the loader must still run.
+
+    Rank 1's positives already form one run ending at the fused shared slot, so
+    a length-512 stacked tensor clamps its slice and that rank never raises.
+    """
+
+    from atom.model_ops.fused_moe.expert_layout import determine_expert_map
+
+    num_routed = 512
+    local_num, expert_map = determine_expert_map(2, 0, num_routed)
+    fused_map = torch.cat(
+        (
+            expert_map,
+            torch.tensor([local_num], dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+        )
+    )
+    assert fused_map.shape[0] == num_routed + 2
+    positives = torch.nonzero(fused_map >= 0).flatten()
+    first, last = int(positives[0]), int(positives[-1])
+    assert last - first + 1 != int(positives.numel())
+
+    hidden, intermediate = 4, 2
+    w13 = torch.nn.Parameter(torch.empty(local_num, intermediate * 2, hidden))
+    w2 = torch.nn.Parameter(torch.empty(local_num, hidden, intermediate))
+    w13.weight_loader = lambda *args, **kwargs: None
+    w2.weight_loader = lambda *args, **kwargs: None
+    experts = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(tp_rank=0),
+        expert_map=fused_map,
+        expert_layout=SimpleNamespace(num_routed=num_routed),
+        w13_weight=w13,
+        w2_weight=w2,
+    )
+    qwen4_exp.install_stacked_expert_loaders(experts)
+    assert experts.expert_map is fused_map
+    assert experts.expert_map.shape[0] == num_routed + 2
+    assert qwen4_exp.routed_expert_slice(fused_map, num_routed) == slice(0, local_num)
+
+    stacked_w13 = torch.arange(
+        num_routed * intermediate * 2 * hidden, dtype=torch.float32
+    ).reshape(num_routed, intermediate * 2, hidden)
+    experts.w13_weight.weight_loader(experts.w13_weight, stacked_w13)
+    torch.testing.assert_close(experts.w13_weight.data, stacked_w13[:local_num])
+
+    stacked_w2 = torch.arange(
+        num_routed * hidden * intermediate, dtype=torch.float32
+    ).reshape(num_routed, hidden, intermediate)
+    experts.w2_weight.weight_loader(experts.w2_weight, stacked_w2)
+    torch.testing.assert_close(experts.w2_weight.data, stacked_w2[:local_num])
