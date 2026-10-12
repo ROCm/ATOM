@@ -793,6 +793,92 @@ fn dp_rank_is_forwarded_to_messages_and_responses_only_when_listed() {
     assert!(!endpoint("/v1/responses").supports(&labeled));
 }
 
+fn single_rank(body: &[u8]) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let text = std::str::from_utf8(body).unwrap();
+    assert_eq!(text.matches("data_parallel_rank").count(), 1, "{text}");
+    value
+}
+
+#[test]
+fn dp_rank_body_replaces_the_client_rank_and_keeps_other_fields() {
+    let empty = DpRankBody::prepare(br#"{"data_parallel_rank":9}"#).unwrap();
+    assert_eq!(&empty.with_rank(3)[..], br#"{"data_parallel_rank":3}"#);
+    assert_eq!(
+        &DpRankBody::prepare(b"{}").unwrap().with_rank(0)[..],
+        br#"{"data_parallel_rank":0}"#
+    );
+    let body = DpRankBody::prepare(
+        br#"{"model":"m","data_parallel_rank":7,"vendor":{"keep":[1,{"x":null}]},"text":"t"}"#,
+    )
+    .unwrap();
+    for rank in [0, 12] {
+        let value = single_rank(&body.with_rank(rank));
+        assert_eq!(
+            value,
+            json!({"model":"m","vendor":{"keep":[1,{"x":null}]},"text":"t","data_parallel_rank":rank})
+        );
+    }
+    let error = DpRankBody::prepare(b"[1]").err().unwrap();
+    assert_eq!(error.status, http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error.code, "worker_request_preparation_failed");
+}
+
+#[tokio::test]
+async fn dp_rank_body_is_prepared_in_the_pool_and_reused_for_each_rank() {
+    let (_pool, app, _router) =
+        preparation_test_router(false, crate::config::PolicyConfig::RoundRobin).await;
+    let raw = Bytes::from_static(br#"{"model":"m","text":"t","data_parallel_rank":7}"#);
+    let parse = || {
+        InferenceEnvelope::parse_for_routing(
+            "/generate".parse().unwrap(),
+            json_headers(),
+            raw.clone(),
+            &app,
+            Some(IngressRouting::new(&app)),
+        )
+    };
+    let regular = parse().await.unwrap().into_http_request();
+    assert!(regular.dp_rank_body.is_none());
+
+    let workers: Vec<Arc<dyn Worker>> = (0..2)
+        .map(|rank| {
+            Arc::new(
+                crate::core::DPAwareWorkerBuilder::new("http://127.0.0.1:1", rank, 2)
+                    .model_id("m")
+                    .build(),
+            ) as Arc<dyn Worker>
+        })
+        .collect();
+    for worker in &workers {
+        app.worker_registry.register(worker.clone());
+    }
+    let request = parse().await.unwrap().into_http_request();
+    let prepared = request.dp_rank_body.as_ref();
+    assert!(prepared.is_some());
+    for (rank, worker) in workers.iter().enumerate() {
+        // Every attempt uses the prepared bytes, never the raw body.
+        let body = dp_ranked_body(worker.as_ref(), "/generate", prepared, b"not json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(single_rank(&body)["data_parallel_rank"], rank);
+        // A worker registered after preparation builds the body on forwarding.
+        let late = dp_ranked_body(worker.as_ref(), "/generate", None, &raw)
+            .unwrap()
+            .unwrap();
+        assert_eq!(late, body);
+    }
+    let basic = BasicWorkerBuilder::new("http://127.0.0.1:2").build();
+    assert!(dp_ranked_body(&basic, "/generate", prepared, &raw)
+        .unwrap()
+        .is_none());
+    assert!(
+        dp_ranked_body(workers[0].as_ref(), "/v1/messages", prepared, &raw)
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn token_routing_is_prepared_in_the_parse_job_or_needs_the_pool_again() {
     // Without parse-job preparation, token routing needs another pool job.

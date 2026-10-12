@@ -288,26 +288,77 @@ pub(crate) struct PreparedPlacement {
     pub planner: DefaultPlanner,
 }
 
-/// The body a DP-aware worker receives with its `data_parallel_rank`, or `None`
-/// when the raw body is forwarded unchanged.
-pub(crate) async fn dp_rank_body(
+/// A request body serialized without `data_parallel_rank` and its closing
+/// brace, so each DP-aware attempt appends its rank without reparsing.
+#[derive(Clone, Debug)]
+pub(crate) struct DpRankBody {
+    head: Bytes,
+    empty: bool,
+}
+
+impl DpRankBody {
+    /// Parse once and drop any client rank; Mesh sets the selected worker's.
+    pub(crate) fn prepare(raw: &[u8]) -> Result<Self, IngressError> {
+        let mut body: serde_json::Value =
+            serde_json::from_slice(raw).map_err(|e| IngressError::invalid(e.to_string()))?;
+        let Some(object) = body.as_object_mut() else {
+            return Err(IngressError::new(
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "worker_request_preparation_failed",
+                crate::core::WorkerError::InvalidConfiguration {
+                    message: "Request must be a JSON object for DP-aware routing".into(),
+                }
+                .to_string(),
+            ));
+        };
+        object.shift_remove("data_parallel_rank");
+        let empty = object.is_empty();
+        let mut head =
+            serde_json::to_vec(&body).map_err(|e| IngressError::invalid(e.to_string()))?;
+        head.pop();
+        Ok(Self {
+            head: head.into(),
+            empty,
+        })
+    }
+
+    pub(crate) fn with_rank(&self, rank: usize) -> Bytes {
+        let rank = rank.to_string();
+        let mut body = Vec::with_capacity(self.head.len() + rank.len() + 24);
+        body.extend_from_slice(&self.head);
+        if !self.empty {
+            body.push(b',');
+        }
+        body.extend_from_slice(b"\"data_parallel_rank\":");
+        body.extend_from_slice(rank.as_bytes());
+        body.push(b'}');
+        body.into()
+    }
+}
+
+/// The body `worker` receives with its `data_parallel_rank`, or `None` when the
+/// raw body is forwarded unchanged.
+pub(crate) fn dp_ranked_body(
     worker: &dyn Worker,
     route: &str,
+    prepared: Option<&DpRankBody>,
     raw: &[u8],
-) -> Result<Option<serde_json::Value>, IngressError> {
-    let forwards_dp_rank = worker.is_dp_aware()
-        && EndpointSpec::find(route).is_some_and(|endpoint| endpoint.forwards_dp_rank(worker));
-    if !forwards_dp_rank {
+) -> Result<Option<Bytes>, IngressError> {
+    let Some(rank) = worker.dp_rank().filter(|_| {
+        worker.is_dp_aware()
+            && EndpointSpec::find(route).is_some_and(|endpoint| endpoint.forwards_dp_rank(worker))
+    }) else {
         return Ok(None);
+    };
+    match prepared {
+        Some(body) => Ok(Some(body.with_rank(rank))),
+        None => prepare_dp_rank_body_unpooled(raw).map(|body| Some(body.with_rank(rank))),
     }
-    let body = serde_json::from_slice(raw).map_err(|e| IngressError::invalid(e.to_string()))?;
-    worker.prepare_request(body).await.map(Some).map_err(|e| {
-        IngressError::new(
-            http::StatusCode::INTERNAL_SERVER_ERROR,
-            "worker_request_preparation_failed",
-            e.to_string(),
-        )
-    })
+}
+
+/// Rare path: a DP-aware worker was registered after the request was prepared.
+fn prepare_dp_rank_body_unpooled(raw: &[u8]) -> Result<DpRankBody, IngressError> {
+    DpRankBody::prepare(raw)
 }
 
 /// The regular HTTP forwarding phase no longer owns preparation state.
@@ -316,6 +367,7 @@ pub(crate) struct HttpInferenceRequest {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub metadata: InferenceMetadata,
+    pub dp_rank_body: Option<DpRankBody>,
 }
 
 pub struct InferenceEnvelope {
@@ -326,6 +378,8 @@ pub struct InferenceEnvelope {
     pub metadata: InferenceMetadata,
     // PD needs a mutable JSON body while preserving backend-specific fields.
     pd_body: Option<serde_json::Value>,
+    /// Prepared when a DP-aware worker may receive this request.
+    dp_rank_body: Option<DpRankBody>,
     /// Shared by JSON parsing and every subsequent prepare submission.
     pub(crate) prepare_deadline: Instant,
     /// Routing text and tokens computed in the parse job, so the request does
@@ -383,6 +437,7 @@ impl InferenceEnvelope {
                 parsed,
                 metadata,
                 pd_body,
+                dp_rank_body: None,
                 prepare_deadline: deadline,
                 routed: None,
             })
@@ -392,6 +447,7 @@ impl InferenceEnvelope {
                 let mut request = parse()?;
                 if let Some(routing) = routing {
                     request.routed = Some(routing.prepare(&request.parsed, ctx)?);
+                    request.dp_rank_body = routing.dp_rank_body(&request.metadata, &request.body);
                 }
                 Ok(request)
             })
@@ -466,6 +522,7 @@ impl InferenceEnvelope {
             headers: self.headers,
             body: self.body,
             metadata: self.metadata,
+            dp_rank_body: self.dp_rank_body,
         }
     }
 
@@ -610,6 +667,29 @@ impl IngressRouting {
             None
         };
         Ok((metadata, tokens))
+    }
+
+    /// The rank-agnostic body when a DP-aware worker serving this request
+    /// receives `data_parallel_rank`. A body that cannot carry a rank fails at
+    /// forwarding, and only if a DP-aware worker is selected.
+    pub(crate) fn dp_rank_body(
+        &self,
+        metadata: &InferenceMetadata,
+        raw: &[u8],
+    ) -> Option<DpRankBody> {
+        if self.pd {
+            return None;
+        }
+        let endpoint = EndpointSpec::find(metadata.route)?;
+        let workers: Arc<[Arc<dyn Worker>]> = match metadata.model.as_deref() {
+            Some(model) => self.worker_registry.get_by_model(model),
+            None => self.worker_registry.get_all().into(),
+        };
+        workers
+            .iter()
+            .any(|w| w.is_dp_aware() && endpoint.forwards_dp_rank(w.as_ref()))
+            .then(|| DpRankBody::prepare(raw).ok())
+            .flatten()
     }
 
     /// A planner restricted to `candidates`.

@@ -116,10 +116,15 @@ impl Router {
                 ),
             )
             .headers(headers);
-        builder = match super::ingress::dp_rank_body(worker.as_ref(), metadata.route, &request.body)
-            .await
-        {
-            Ok(Some(body)) => builder.json(&body),
+        builder = match super::ingress::dp_ranked_body(
+            worker.as_ref(),
+            metadata.route,
+            request.dp_rank_body.as_ref(),
+            &request.body,
+        ) {
+            Ok(Some(body)) => builder
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(body),
             Ok(None) => builder
                 .header(
                     CONTENT_TYPE,

@@ -700,7 +700,11 @@ async fn dp_rank_uses_origin_address_and_preserves_extension_fields() {
     fixture.app.worker_registry.register(worker.clone());
     let mut stream = fixture.open().await;
     stream.headers_only().await;
-    stream.body(Stream::BODY, true).await;
+    let mut client_rank: serde_json::Value = serde_json::from_slice(Stream::BODY).unwrap();
+    client_rank["data_parallel_rank"] = 0.into();
+    stream
+        .body(&serde_json::to_vec(&client_rank).unwrap(), true)
+        .await;
     assert_eq!(stream.destination().await, "[::1]:18003");
     let Response::RequestBody(body) = stream.recv().await else {
         panic!();
@@ -711,6 +715,14 @@ async fn dp_rank_uses_origin_address_and_preserves_extension_fields() {
         panic!();
     };
     let value: serde_json::Value = serde_json::from_slice(&body.body).unwrap();
+    // Mesh's rank replaces the client's rather than adding a duplicate key.
+    assert_eq!(
+        std::str::from_utf8(&body.body)
+            .unwrap()
+            .matches("data_parallel_rank")
+            .count(),
+        1
+    );
     assert_eq!(value["data_parallel_rank"], 2);
     assert_eq!(value["vendor_extension"]["keep"], 42);
     stream.response_headers(true).await;
