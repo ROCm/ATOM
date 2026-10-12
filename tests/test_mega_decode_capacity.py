@@ -266,6 +266,18 @@ def test_capacity_boundary_uses_the_published_row_count(
     assert torch.all(output == expected_capacity)
 
 
+@pytest.mark.parametrize("decode_mtpr", [256, 512, 1024])
+def test_configured_decode_capacity_moves_the_boundary(
+    runtime, monkeypatch, decode_mtpr
+):
+    monkeypatch.setattr(mega, "_MEGA_DECODE_MTPR", decode_mtpr)
+    runtime.run(_context(decode_mtpr))
+    runtime.run(_context(decode_mtpr + 1))
+
+    assert _forwarded(runtime) == [decode_mtpr, LARGE_CAPACITY]
+    assert _built(runtime) == [LARGE_CAPACITY, decode_mtpr]
+
+
 def test_missing_context_retains_original_capacity(runtime):
     runtime.run(None, rows=64)
     assert _forwarded(runtime) == [LARGE_CAPACITY]

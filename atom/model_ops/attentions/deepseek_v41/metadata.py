@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 """Request spans shared by CSA2 paging, compression and Engram staging."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -62,9 +65,19 @@ class BatchStep:
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
+    # candidate source layer -> its `CandidateBlocks`, bound for every layer
+    # its candidates bound
+    candidate_blocks: dict[int, object] = field(default_factory=dict)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
     group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    # A split decode's window rows (`indices.build_window_rows`), every layer's.
+    window_rows: torch.Tensor | None = None
+    # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
+    # bounded_replay`): the rows its decoder ran on, for what else reads the
+    # decoder's rows after it (the DSpark draft's window). None where the
+    # forward did not replay.
+    replay: object | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
@@ -80,6 +93,41 @@ class BatchStep:
     request_positions: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.int32)
     )
+    # Host, per request, filled by `begin_step` (a bounded-replay row step
+    # has none). `request_floors`: the lowest position it has a window row at,
+    # above 0 for a forward recomputing rows below where it resumed
+    # (`Sequence.replay_until`), which starts there. `request_cached_until`:
+    # for such a forward whose state came with it, where it resumed -- its
+    # ring already holds every row below, exact, and keeps them -- 0 for every
+    # other (`swa_cached_until`). `request_finals`: whether its forward ends
+    # its prompt. `start_histories`: the Engram history a recomputing forward
+    # starts its slot's cursor at, if any request runs one.
+    request_floors: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    request_cached_until: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    request_finals: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.bool_)
+    )
+    start_histories: np.ndarray | None = None
+    # buffer name -> GPU view of what a step planner (`add_step_planner`)
+    # laid out for this step; absent when it planned nothing
+    planned: dict[str, torch.Tensor] = field(default_factory=dict)
+    # name -> what a step planner worked out on the host (`StepPlan.host`)
+    planned_host: dict[str, object] = field(default_factory=dict)
+    # [requests] int32: the lowest position whose window row a request's
+    # queries may read (SGLang's `swa_replay_start`). Zeros (the cache's fixed
+    # buffer, so a capture records one address) except on a bounded-replay
+    # tail step (`models.deepseek_v41.bounded_replay`), whose decoder layers
+    # wrote no window row below the tail, and `request_floors`'.
+    swa_replay_start: torch.Tensor | None = None
+    # [requests] int32, `request_cached_until` on the device: zeros (as
+    # `swa_replay_start`) but where a forward recomputes rows below a point
+    # its ring already holds. Its rows from there on read the ring below it,
+    # and only they are written to the ring.
+    swa_cached_until: torch.Tensor | None = None
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -91,7 +139,10 @@ class BatchStep:
         self.selected.clear()
         self.candidates.clear()
         self.tiles.clear()
+        self.candidate_blocks.clear()
         self.group_indices.clear()
+        self.window_rows = None
+        self.replay = None
 
     @property
     def width(self):
@@ -106,6 +157,15 @@ class BatchStep:
         # Verification has ring slack for the entire tentative block. All rows
         # can use the same causal paged-decode kernel as autoregressive decode.
         return self.tentative or all(request.length == 1 for request in self.requests)
+
+
+class StepPlan(NamedTuple):
+    """What a step planner (`add_step_planner`) laid out for a step: the rows
+    each of its buffers publishes, by name, and what it worked out on the
+    host, by name (`BatchStep.planned_host`)."""
+
+    rows: dict[str, int]
+    host: Mapping[str, object] = MappingProxyType({})
 
 
 def visible_buffer_name(ratio):
@@ -129,6 +189,7 @@ def prepare_batch_step(
     publication_group=None,
     query_prefix_ready=False,
     query_prefix_republish_reason=None,
+    planners=(),
 ):
     """Stage request metadata using the same persistent buffers/layout as V4.
 
@@ -137,6 +198,8 @@ def prepare_batch_step(
     The published views span the forward's full width, padding included, since
     that is the width its kernels run; the backing token map uses V4's -1
     padding sentinel and block-table stride stays fixed across steps.
+    `planners` are called as `planner(buffers, running_tokens)` once the rows
+    are staged, return a `StepPlan`, and need the serving buffers.
     """
     scheduled_bs = len(requests)
     lengths = np.asarray([span.length for span in requests], dtype=np.int32)
@@ -211,6 +274,13 @@ def prepare_batch_step(
         np.floor_divide(visible, ratio, out=visible)
     batches = buffers["batch_id_per_q_token"]
     build_batch_ids(lengths, pad_to=running_tokens, out=batches.np)
+    # Planners read the rows staged above and publish with them.
+    planned, planned_host = {}, {}
+    for planner in planners:
+        plan = planner(buffers, running_tokens)
+        planned.update(plan.rows)
+        planned_host.update(plan.host)
+    required.update(planned)
     if state_slot_out is None:
         # Isolated eager cache callers have no metadata builder. Serving passes
         # the already-published V4 state_slot_out view; it is never restaged here.
@@ -228,7 +298,7 @@ def prepare_batch_step(
                 publication_group.counts[i] = running_bs
             elif member.name in required:
                 publication_group.counts[i] = required[member.name]
-            # Plans and state slots were staged by the builder. Preserve
+            # Builder-staged members (plans, state slots, Engram rows) keep
             # their counts in this combined publication, before indptrs run.
         tables.publish(running_bs if grouped_tables else None, group=publication_group)
         published = {
@@ -267,4 +337,6 @@ def prepare_batch_step(
         tentative=tentative,
         visible={ratio: published[visible_buffer_name(ratio)] for ratio in ratios},
         request_positions=starts,
+        planned={name: published[name] for name in planned},
+        planned_host=planned_host,
     )

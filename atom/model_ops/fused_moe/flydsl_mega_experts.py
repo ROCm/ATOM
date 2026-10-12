@@ -49,7 +49,13 @@ logger = logging.getLogger("atom")
 _MEGA_CACHE: dict = {}
 _MEGA_ROUTE_ROWS: dict[tuple[torch.device, int], torch.Tensor] = {}
 _MEGA_BUILD_DBG = False
-_MEGA_DECODE_MTPR = 128
+_MEGA_DECODE_MTPRS = (128, 256, 512, 1024)
+_MEGA_DECODE_MTPR = envs.ATOM_MEGA_DECODE_MTPR
+if _MEGA_DECODE_MTPR not in _MEGA_DECODE_MTPRS:
+    raise ValueError(
+        f"ATOM_MEGA_DECODE_MTPR must be one of {_MEGA_DECODE_MTPRS}, "
+        f"got {_MEGA_DECODE_MTPR}"
+    )
 _MEGA_CAPACITY_LOGGED: set[tuple[bool, int, int]] = set()
 
 
@@ -217,10 +223,14 @@ def run_mega_moe(
     mtpr: int,
     swiglu_limit: float,
     quant: str = "a8w4",
+    mask_pad_rows: bool = False,
 ) -> torch.Tensor:
     """Replace EP experts with MegaMoEV2. x: [tokens, model_dim] bf16 (this rank's
     local tokens, pre-dispatch). topk_ids: global (physical) expert ids. Returns
-    [tokens, model_dim] bf16."""
+    [tokens, model_dim] bf16.
+
+    mask_pad_rows: return this pass's DP pad rows as zeros without dispatching
+    them (see _enable_mega_pad_row_mask)."""
     from aiter.dist.parallel_state import get_ep_group
 
     # Do NOT "simplify" this to get_ep_group().rank_in_group / .world_size.
@@ -307,11 +317,45 @@ def run_mega_moe(
 
     wts = topk_weights.to(torch.float32).contiguous()
     ids = topk_ids.to(torch.int32).contiguous()
+    pad_rows = None
+    if mask_pad_rows:
+        from atom.utils.forward_context import step_pad_rows
+
+        pad_rows = step_pad_rows(run_tokens)
+    if pad_rows is not None:
+        # Whole rows: every top-k slot, the fused shared-expert slot included.
+        ids = torch.where(pad_rows, -1, ids)
+    # An aiter whose combine skips -1 slots returns the pad rows as zeros itself.
+    # The check is not free, so ask for it only on passes that mask rows.
+    combine_can_mask = getattr(mega, "supports_combine_mask", False)
+    forward_kwargs = (
+        {"mask_invalid_slots": pad_rows is not None} if combine_can_mask else {}
+    )
     with torch.inference_mode(False), torch.no_grad():
         # swiglu_limit is NOT a forward arg -- it is baked into the instance at
         # construction (see the cache key above).
-        out = mega.forward(x.contiguous(), wts, ids)
+        out = mega.forward(x.contiguous(), wts, ids, **forward_kwargs)
+    if pad_rows is not None and not combine_can_mask:
+        # Older aiter: combine sums every top-k slot, and a -1 slot holds whatever
+        # an earlier call left there (possibly non-finite). Select zeros.
+        out = torch.where(pad_rows, 0, out)
     return out
+
+
+def _enable_mega_pad_row_mask(mtpr: int) -> bool:
+    """Whether Mega masks DP pad rows (ATOM_MEGA_MASK_PAD_ROWS).
+
+    MegaMoEV2 never counts, sends or computes a top-k id < 0, so whole pad rows
+    routed to -1 cost nothing; only combine needs care (see run_mega_moe).
+    Allocates the device mask now, at layer init, before any graph capture
+    records its address. Plugin frontends never publish it.
+    """
+    if not envs.ATOM_MEGA_MASK_PAD_ROWS or is_plugin_mode():
+        return False
+    from atom.utils.forward_context import enable_pad_rows_device
+
+    enable_pad_rows_device(mtpr, torch.device("cuda"))
+    return True
 
 
 class MegaFusedExperts:
@@ -349,6 +393,7 @@ class MegaFusedExperts:
         self._inter_dim = inter_dim
         self._mtpr = mtpr
         self._quant = quant
+        self._mask_pad_rows = _enable_mega_pad_row_mask(mtpr)
 
     def __call__(
         self,
@@ -402,4 +447,5 @@ class MegaFusedExperts:
             mtpr=self._mtpr,
             swiglu_limit=getattr(self._layer, "swiglu_limit", 0.0),
             quant=self._quant,
+            mask_pad_rows=self._mask_pad_rows,
         )

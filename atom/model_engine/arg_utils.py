@@ -132,6 +132,8 @@ class EngineArgs:
     attn_prefill_chunk_size: int = 16384
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
+    enable_decoder_swa_bounded_replay: bool = True
+    enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
@@ -139,7 +141,7 @@ class EngineArgs:
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = "[1,2,4,8,16,32,48,64,128,256]"
+    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
@@ -315,7 +317,7 @@ class EngineArgs:
         parser.add_argument(
             "--cudagraph-capture-sizes",
             type=str,
-            default="[1,2,4,8,16,32,48,64,128,256,512]",
+            default=EngineArgs.cudagraph_capture_sizes,
             help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
         )
         parser.add_argument(
@@ -505,6 +507,38 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--decoder-swa-bounded-replay",
+            "--enable-decoder-swa-bounded-replay",
+            dest="enable_decoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: in prefill, run the decoder (the last KV-source "
+                "layer and those after it) only on each request's last window "
+                "rows, their windows truncated there, and the last layer on its "
+                "last row (the V4.1 report's SWA Bounded Replay). Faster "
+                "prefill; not numerically equivalent to a full prefill. On by "
+                "default; --no-decoder-swa-bounded-replay turns it off. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-swa-bounded-replay",
+            "--enable-encoder-swa-bounded-replay",
+            dest="enable_encoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: a prefix hit resumes without a state checkpoint, "
+                "rebuilding the sliding-window state by recomputing the hash "
+                "block below the hit (no cached row is rewritten); no state "
+                "checkpoint is kept, so no prefill chunk is cut for one. Not "
+                "numerically equivalent to resuming a checkpoint. On by "
+                "default; --no-encoder-swa-bounded-replay keeps checkpoints. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
             "--state-checkpoint-demand",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -512,8 +546,8 @@ class EngineArgs:
                 "Let a hit that was refused for want of a checkpoint place a "
                 "rung of its own. --no-state-checkpoint-demand leaves the "
                 "prompt-end anchor as the only placement. On measured traces a "
-                "demand is 47% of all checkpoint writes but reads back 2.8% of "
-                "the time, against 85.2% for an anchor, so the rung's write "
+                "demand is 47%% of all checkpoint writes but reads back 2.8%% of "
+                "the time, against 85.2%% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
         )

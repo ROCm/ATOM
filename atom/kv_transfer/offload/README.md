@@ -153,6 +153,20 @@ lmcache server --host 127.0.0.1 --port 5555 \
   --eviction-policy LRU
 ```
 
+For a large L1 and a high-concurrency DP-attention deployment, add:
+
+- `--l1-use-lazy` once L1 is near a terabyte or more. Pinning the whole pool
+  up front made `register_kv_cache` fail with `hipErrorInvalidDevicePointer`
+  at 1.2 TB on MI355X; the lazy allocator registers at once and grows the
+  pool in the background.
+- `--l1-read-ttl-seconds` above the longest admission wait (for example 900).
+  A lookup's read locks expire after this TTL; under a long queue its chunks
+  can be evicted before the retrieve, which then fails into a full recompute.
+- `--eviction-trigger-watermark 0.98`; the default 0.8 evicts a fifth of a
+  pool that is far from full.
+- Leave `--max-gpu-workers` at its default. Per-thread lazy initialisation
+  with many GPU workers stalled the server past the client heartbeat.
+
 For example, add the following settings to a DSv4 launch that publishes the
 native-state contract:
 

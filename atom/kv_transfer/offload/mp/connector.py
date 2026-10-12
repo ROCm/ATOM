@@ -188,6 +188,15 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def request_finished(self, seq: Any) -> None:
         self._require_impl().request_finished(seq)
 
+    def prefetch_lookups(self, seqs: Any) -> None:
+        prefetch = getattr(self._require_impl(), "prefetch_lookups", None)
+        if callable(prefetch):
+            prefetch(seqs)
+
+    def lookup_pending(self, seq: Any) -> bool:
+        pending = getattr(self._require_impl(), "lookup_pending", None)
+        return bool(pending(seq)) if callable(pending) else False
+
     def should_defer_free(self, seq: Any) -> bool:
         return self._require_impl().should_defer_free(seq)
 

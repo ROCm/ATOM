@@ -24,6 +24,7 @@ def make_runner(
     q=1,
     dcp=1,
     sparse=False,
+    fp4=False,
     tbo=True,
     base=None,
     bind=True,
@@ -50,7 +51,8 @@ def make_runner(
     runner.device = torch.device("cuda", 0)
     runner.max_bs = 4
     runner.max_num_batched_tokens = 64
-    runner.block_size = 16
+    # the FP4 index cache's e8m0 swizzle describes 64-row blocks
+    runner.block_size = 64 if fp4 else 16
     runner.kv_cache_dtype = "bf16"
     runner.num_spec_tokens = q - 1
     runner.has_mla_indexer = sparse
@@ -63,7 +65,7 @@ def make_runner(
         enable_tbo=tbo,
         enable_tbo_decode=tbo,
         kv_cache_dtype="bf16",
-        index_cache_dtype="fp8",
+        index_cache_dtype="fp4" if fp4 else "fp8",
         attn_prefill_chunk_size=0,
         compilation_config=SimpleNamespace(static_forward_context={}),
         speculative_config=SimpleNamespace(num_speculative_tokens=q - 1),
@@ -72,6 +74,8 @@ def make_runner(
             num_key_value_heads=1,
             index_topk=8,
             index_kpool=1,
+            index_head_dim=128,
+            index_n_heads=32,
             indexer_compress_ratio=4,
             ngram_size=2,
             ple_layer_ids=[0],
@@ -99,7 +103,6 @@ def make_runner(
         builder.set_mla_persistent_worker_buffers = lambda *a, **kw: {}
         builder._set_mla_persistent_worker_buffers_sparse_mtp = lambda *a, **kw: {}
         builder._set_ubatch_mla_buffers = lambda *a, **kw: None
-        builder._publish_indexer_fp4_decode_schedule = lambda *a, **kw: None
         builder._publish_indexer_fp4_prefill_schedule = lambda *a, **kw: None
     runner.attn_metadata_builder = builder
     runner._init_forward_vars_ring()
@@ -157,18 +160,20 @@ def assert_repeat_does_not_write(runner, call):
 @pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp", [1, 2])
 @pytest.mark.parametrize(
-    "kind,q,dcp,sparse,tbo",
+    "kind,q,dcp,sparse,tbo,fp4",
     [
-        ("mha", 1, 1, False, True),
-        ("mha", 3, 1, False, True),
-        ("mla", 1, 1, False, True),
-        ("mla", 3, 2, False, True),
-        ("mla", 1, 2, True, True),
-        ("mla", 3, 2, True, False),
+        ("mha", 1, 1, False, True, False),
+        ("mha", 3, 1, False, True, False),
+        ("mla", 1, 1, False, True, False),
+        ("mla", 3, 2, False, True, False),
+        ("mla", 1, 2, True, True, False),
+        ("mla", 3, 2, True, False, False),
+        ("mla", 3, 1, True, True, True),
+        ("mla", 1, 2, True, True, True),
     ],
 )
 def test_decode_csr_tbo_delayed_slot_reuse(
-    monkeypatch, pp, kind, q, dcp, sparse, tbo, transport
+    monkeypatch, pp, kind, q, dcp, sparse, tbo, fp4, transport
 ):
     runner, builder = make_runner(
         monkeypatch,
@@ -177,6 +182,7 @@ def test_decode_csr_tbo_delayed_slot_reuse(
         q=q,
         dcp=dcp,
         sparse=sparse,
+        fp4=fp4,
         tbo=tbo,
         transport=transport,
     )
@@ -192,7 +198,11 @@ def test_decode_csr_tbo_delayed_slot_reuse(
         if dcp > 1:
             names.append("g_kv_indptr")
         if sparse:
-            names.extend(("sparse_kv_indptr", "dcp_local_context_lens"))
+            names.append("sparse_kv_indptr")
+        if sparse and dcp > 1:
+            names.append("dcp_local_context_lens")
+        if fp4:
+            names.append("index_row_ends")
         for name in names:
             assert (
                 runner.forward_vars[name]._publication._epoch == runner.h2d_owner.epoch
@@ -216,13 +226,20 @@ def test_decode_csr_tbo_delayed_slot_reuse(
                 [0] + np.cumsum(lengths).tolist() + [int(lengths.sum())] * (4 - count)
             )
             saved.append((md.g_kv_indptr.clone(), expected_global))
-        if sparse:
+        if sparse and dcp > 1:
             expected_local = [
                 (int(n) - q + j + 1 + dcp - 1 - builder.dcp_rank) // dcp
                 for n in lengths
                 for j in range(q)
             ] + [0] * ((4 - count) * q)
             saved.append((md.dcp_local_context_lens.clone(), expected_local))
+        if fp4:
+            # the FP4 indexer's bound: row j of a request sees context - q + j + 1
+            expected_rows = [int(n) - q + j + 1 for n in lengths for j in range(q)]
+            saved.append(
+                (md.index_row_ends.clone(), expected_rows + [0] * ((4 - count) * q))
+            )
+        if sparse:
             effective = [min(int(n) - q + j + 1, 8) for n in lengths for j in range(q)]
             expected_sparse = (
                 [0]

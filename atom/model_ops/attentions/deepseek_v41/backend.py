@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
+import logging
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,11 +16,14 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 from atom.model_ops.engram.device.hashing import (
+    EngramBatch,
     engram_compress,
     engram_cursor_rows,
 )
-from atom.model_ops.engram.device.runtime import EngramBatch, EngramInputPreparer
+from atom.model_ops.engram.device.runtime import EngramInputPreparer
+from atom.model_ops.engram.device.staging import EngramStep
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
@@ -27,6 +31,12 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
+from .score_planner import ScorePlanner
+
+logger = logging.getLogger("atom")
+
+# the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
+ENGRAM_ROWS = "v41_engram_rows"
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -120,6 +130,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # a candidate list be a block table. A GPU that cannot page that
             # short refuses when asked, so there is nothing to pre-empt here.
             index_block_rows=self.config.candidate_block_size,
+            index_fp4=model_runner.config.index_cache_dtype == "fp4",
         )
         model_runner.forward_vars.update(
             self._compress_plan_buffers(
@@ -128,7 +139,31 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             | self._visible_buffers(
                 self.geometry, self.max_num_batched_tokens, self.device
             )
+            | self._engram_rows_buffer(self.max_num_batched_tokens, self.device)
         )
+        # Before the memory profile, so the budget counts it; and so before
+        # the pool is sized, which its packed logits follow: the weights are
+        # in, so what is left of the budget bounds the PAGEs from above.
+        self.score_workspace = ScoreWorkspace(
+            self.geometry,
+            self.max_num_batched_tokens,
+            self.block_table_cols,
+            self.device,
+            pages=self._page_bound(model_runner.config.gpu_memory_utilization),
+        )
+        logger.info(
+            "V4.1 score workspace: %s logits, %.2f GiB",
+            "packed" if self.score_workspace.packed else "plane",
+            self.score_workspace.capacity * 4 / (1 << 30),
+        )
+        if self.score_workspace.packed:
+            self.add_step_planner(
+                ScorePlanner(
+                    self.score_workspace,
+                    (ratio for ratio, _ in self.geometry.compress_ratios),
+                    self.max_num_batched_tokens,
+                )
+            )
         self.cache = self.copies = self.engram = None
         self.dummy_weights = bool(model_runner.config.load_dummy)
         if not self.dummy_weights and self.config.engram_layer_ids:
@@ -138,6 +173,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 self.device,
             )
+
+    step_planners = ()
+
+    def add_step_planner(self, planner):
+        """Have `planner` lay its per-step tables out of each step's staged rows
+        (`prepare_batch_step`), in buffers of its own published with the step,
+        and hand the step what it works out on the host (`StepPlan`). Before
+        the forward buffers are bound to their publication."""
+        self.model_runner.forward_vars.update(planner.buffers(self.device, "v41_step"))
+        self.step_planners = (*self.step_planners, planner)
 
     # V4's plan builder asks for the ratio set under this name.
     _unique_compress_ratios_overlap = property(
@@ -208,6 +253,21 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return buffers
 
     @staticmethod
+    def _engram_rows_buffer(max_num_batched_tokens, device):
+        """Engram's per-forward inputs the forward's graph cannot take as
+        arguments: word 0 the live tokens (0: the kernels touch nothing), then
+        each token's no-own-id flag (``EngramStep``). Published with the step."""
+        return {
+            ENGRAM_ROWS: CpuGpuBuffer(
+                max_num_batched_tokens + 1,
+                dtype=torch.int32,
+                device=device,
+                pin_memory=device != "cpu",
+                publication_group="v41_step",
+            )
+        }
+
+    @staticmethod
     def _visible_buffers(geometry, max_num_batched_tokens, device):
         """Fixed-address per-ratio visibility, one row per query token.
 
@@ -231,11 +291,37 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state_pool(STATE_SLOT_CLASS, self.geometry.state_bytes, entries_per_req=1),
         ]
 
+    def _page_bound(self, utilization):
+        """PAGEs the pool can reach at most: the budget the weights leave.
+
+        The pool is sized later from what the memory profile leaves, which
+        starts from at least what is allocated now.
+        """
+        total = torch.cuda.mem_get_info(self.device)[1]
+        left = int(total * utilization) - torch.cuda.memory_allocated(self.device)
+        return max(1, left // self.geometry.paged_bytes)
+
+    def step_needs_eager(self, batch):
+        """True when the step's rows cannot all be packed at once: a captured
+        graph scores one band, so such a step runs eagerly, in bands.
+
+        A row sees at most its request's context; shared prefixes, counted
+        once in the pool, are why the pool-sized buffer can fall short.
+        """
+        return not self.score_workspace.fits(
+            batch.num_scheduled_tokens, batch.context_lens
+        )
+
     def state_transfer(self):
+        # Encoder SWA bounded replay: a hit rebuilds the state from the PAGE
+        # below it instead of restoring a checkpoint (`BlockManager.
+        # replay_start`).
+        if self.model_runner.config.enable_encoder_swa_bounded_replay:
+            return StateTransfer.replay()
         return StateTransfer.copy(self.geometry.layout_id)
 
     def checkpoint_image_bytes(self):
-        return self.geometry.state_bytes
+        return self.geometry.checkpoint_image_bytes
 
     def allocate_kv_cache_tensors(self, *, blocks, buf):
         self.num_blocks = blocks
@@ -248,6 +334,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             entries[STATE_SLOT_CLASS],
             self.device,
             max_tokens=self.max_num_batched_tokens,
+            workspace=self.score_workspace,
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -270,8 +357,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         """PAGE units and the native checkpoint contract, for `lmcache_mp`.
 
         A PAGE unit is its main page plus that page's rows in each index plane
-        (`PagedAttentionCache.unit_regions`). Each plane is published whole as
-        one region, in that order -- the order `StateCopies` cuts a checkpoint
+        (`PagedAttentionCache.unit_regions`; an FP4 owner has two, its values
+        and its scales). Each plane is published whole as one region, in that
+        order -- the order `StateCopies` cuts a checkpoint
         image into, which `build_native_state_mp_layout` aliases unit by unit.
         Nothing else is published: no SLOT and no P/D staging, since the only
         transport admitted (`validate_runtime_config`) is the native-state MP
@@ -287,9 +375,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             raise RuntimeError(
                 "DeepSeek-V4.1 publishes transfer regions after allocation"
             )
+        names = [name for name, _ in self.cache.geometry.index_planes]
         planes = [("dsv41.page", self.cache.page_bytes)] + [
-            (f"dsv41.index_plane.{owner}", plane)
-            for owner, plane in self.cache.index_planes.items()
+            (f"dsv41.{name}_plane.{owner}", plane)
+            for owner, owned in self.cache.index_planes.items()
+            for name, plane in zip(names, owned)
         ]
         pages = [page_region(plane, semantic_role=role) for role, plane in planes]
         spec = runner.state_runtime.checkpoint_spec
@@ -336,7 +426,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         tentative=False,
         start_positions=None,
         query_prefix_ready=False,
+        engram_live=True,
     ):
+        """``engram_live`` False: Engram's forward kernels run on no token (a
+        capture: they record on serving's buffers, touching none)."""
         spans, rows, offset, next_page = [], [], 0, 0
         slots = batch.state_slots_committed
         if not batch.is_dummy_run and len(slots) != batch.total_seqs_num:
@@ -366,6 +459,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             offset += length
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
+        # Each span's batch index: zero-token scheduler rows have none.
+        scheduled = np.flatnonzero(batch.num_scheduled_tokens)
+        resumes, floors, cached_until, histories = (
+            (None,) * 4
+            if batch.is_dummy_run or not batch.replaying
+            else self._replay_layout(batch.replaying, scheduled, spans)
+        )
         cache = (
             PagedAttentionCache(
                 self.geometry,
@@ -373,6 +473,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 max(len(spans), 1),
                 self.device,
                 max_tokens=running_tokens,
+                workspace=self.score_workspace,
             )
             if batch.is_dummy_run
             else self.cache
@@ -405,10 +506,23 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         plans = self._build_compress_plans(
             np.asarray([span.length for span in spans], dtype=np.int32),
             np.asarray([span.end for span in spans], dtype=np.int32),
+            write_from=resumes,
             running_bs=None if max_q_len is None else running_bs,
             max_q_len=max_q_len,
             extra_write=self.geometry.speculative_tokens if verifying else 0,
             defer_to=combined,
+        )
+        token_mask = self._token_mask(batch, spans, offset)
+        step_group = (
+            combined
+            if combined is not None
+            else None if groups is None else groups["v41_step"]
+        )
+        live = offset if engram_live and not batch.is_dummy_run else 0
+        self._stage(
+            ENGRAM_ROWS,
+            np.concatenate(([live], ~token_mask)).astype(np.int32),
+            publication_group=step_group,
         )
         step = cache.begin_step(
             spans,
@@ -420,11 +534,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             max_q_len=max_q_len,
             state_slot_out=state_slot_out,
             plans=plans,
-            publication_group=(
-                combined
-                if combined is not None
-                else None if groups is None else groups["v41_step"]
+            planners=self.step_planners,
+            floors=floors,
+            cached_until=cached_until,
+            finals=(
+                None
+                if batch.is_final_chunk is None or batch.is_dummy_run
+                else np.asarray(batch.is_final_chunk)[scheduled]
             ),
+            start_histories=histories,
+            publication_group=step_group,
             query_prefix_ready=query_prefix_ready and len(spans) == len(batch.req_ids),
             query_prefix_republish_reason=(
                 "compact zero-token scheduler rows for CSA2 after input assembly"
@@ -444,9 +563,22 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
         )
         metadata.cache, metadata.step = cache, step
+        # A bounded replay's `QueryRows`, while a layer runs on some rows only
+        metadata.queries = None
         metadata.state_slot_out = state_slot_out
         metadata.dummy = batch.is_dummy_run
-        token_mask = np.ones(offset, dtype=np.bool_)
+        metadata.token_mask = token_mask
+        metadata.image_mask = (
+            torch.from_numpy(~token_mask).to(self.device).unsqueeze(0)
+            if not token_mask.all()
+            else None
+        )
+        return metadata, positions.gpu[:running_tokens]
+
+    @staticmethod
+    def _token_mask(batch, spans, tokens):
+        """False where a token carries no id of its own (an image row)."""
+        token_mask = np.ones(tokens, dtype=np.bool_)
         for span in spans:
             data = getattr(batch, "multimodal_data", {}).get(span.request_id)
             if data is not None:
@@ -455,13 +587,35 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                     if first < end:
                         at = span.offset + first - span.position
                         token_mask[at : at + end - first] = False
-        metadata.token_mask = token_mask
-        metadata.image_mask = (
-            torch.from_numpy(~token_mask).to(self.device).unsqueeze(0)
-            if not token_mask.all()
-            else None
+        return token_mask
+
+    def _replay_layout(self, replaying, scheduled, spans):
+        """Per span, for the forwards starting below where they resumed
+        (`ScheduledBatch.replaying`), 0 for every other: that point, below
+        which it writes no global KV; its window floor, the forward's start;
+        that point again where its state came along, its ring exact below it;
+        and, with Engram, the history its cursor starts at, as a full prefill
+        leaves it there."""
+        resumes, floors, cached = np.zeros((3, len(spans)), np.int32)
+        histories = (
+            None
+            if self.engram is None
+            else np.full((len(spans), self.geometry.history_size), -1, np.int64)
         )
-        return metadata, positions.gpu[:running_tokens]
+        for k in np.flatnonzero(np.isin(scheduled, list(replaying))):
+            replay = replaying[int(scheduled[k])]
+            resumes[k], floors[k] = replay.until, spans[k].position
+            cached[k] = 0 if replay.rebuilds else replay.until
+            if histories is not None:
+                mapping = self.engram.mapping
+                ids = np.asarray(replay.history_ids, np.int64)
+                # An image position, which carries the image id, is DEAD.
+                image = getattr(self.config, "image_token_id", None)
+                compressed = mapping.compress_tokens(
+                    ids, None if image is None else (ids != image)[None]
+                )
+                histories[k] = mapping.advance_history(None, compressed)[0]
+        return resumes, floors, cached, histories
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
@@ -512,12 +666,27 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             history_index=step.slots[: step.scheduled_bs],
         )
 
-    def _write_engram_cursor(self, step, cache, batch):
-        """Advance the cursor, or stage every prefix a verify step may accept.
+    def _engram_step(self, step, cache, input_ids):
+        """This forward's Engram inputs at fixed addresses, for the forward to
+        run on (overlap only; a synthetic batch's live count is 0)."""
+        if self.engram is None or self.engram.host.overlap is None:
+            return None
+        rows = self.model_runner.forward_vars[ENGRAM_ROWS].gpu
+        return EngramStep(
+            input_ids=input_ids,
+            live=rows[:1],
+            dead=rows[1:],
+            batch_ids=step.batch_ids,
+            cu_seqlens=step.cu_seqlens_q,
+            positions=step.positions,
+            cursor=cache.cursor,
+            history_index=step.slots,
+            candidates=cache.tentative_staging.gpu if step.tentative else None,
+        )
 
-        A verify step's cursor is the sampler's, so its candidates wait in the
-        plane `commit_tentative` selects from; anything else commits outright.
-        """
+    def _write_engram_cursor(self, step, cache, batch):
+        """Advance the cursor, or stage every prefix a verify step may accept
+        (its cursor is the sampler's: `commit_tentative` picks one)."""
         tentative = step.tentative
         engram_cursor_rows(
             self.engram.host.hash_tables,
@@ -533,8 +702,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             ),
             candidates=step.max_q_len if tentative else 0,
         )
-        if tentative:
-            cache.pending.staged_on_device = True
 
     def prepare_model_inputs(self, input_ids, metadata):
         step, cache = metadata.step, metadata.cache
@@ -542,24 +709,19 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # tail is zeroed inside `run_model`, after this, so what stands there
         # now is the previous step's ids. The width goes separately.
         tokens = input_ids[: step.scheduled]
-        # Before `prepare_state`, because it decides what that waits for: with
-        # a device batch nothing on the host reads this step's history, so the
-        # readback carrying it becomes a deferred probe. A synthetic batch
-        # stages addresses only -- the slots are somebody else's, and
-        # `prepare_state`'s position-0 reset would zero their state.
-        batch = self._engram_batch(step, cache, metadata, tokens)
-        # Tentative candidates have separate storage: freeze the hash inputs
-        # and stage every accepted prefix with one kernel. Committed cursors
-        # may alias history, so that path still advances AFTER the snapshot.
-        stage_cursor = (
-            batch is not None
-            and step.tentative
-            and self.engram.host.overlap is not None
+        # Before `prepare_state`: a device path defers its history readback.
+        # A synthetic batch's slots are someone else's: it never moves them.
+        staged = self._engram_step(step, cache, input_ids)
+        batch = (
+            None
+            if staged is not None
+            else self._engram_batch(step, cache, metadata, tokens)
         )
+        on_device = not metadata.dummy and (staged is not None or batch is not None)
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=batch is None)
+            else cache.prepare_state(step, histories=not on_device)
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
@@ -570,15 +732,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 token_mask=metadata.token_mask,
                 padded_rows=step.width,
                 batch=batch,
-                cursor_positions=step.positions if stage_cursor else None,
-                cursor_out=(
-                    cache.tentative_staging.gpu[: step.scheduled_bs]
-                    if stage_cursor
-                    else None
-                ),
+                staged=staged,
             )
             embeddings, histories = prepared.embeddings, prepared.histories
-            if batch is None and cache.pending is not None:
+            if not on_device and cache.pending is not None:
                 for span, compressed in zip(step.requests, prepared.compressed_rows):
                     cache.pending.stage_history(span, compressed)
         else:
@@ -597,25 +754,18 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 for span in step.requests:
                     cache.pending.stage_history(span, [-1] * span.length)
         metadata.engram_embeddings = embeddings
-        # Last, and here rather than in the model: the forward is a graph whose
-        # replay runs no Python, and everything reading the cursor this
-        # overwrites -- the hash kernel, the staging above -- has already run.
-        # A tentative step's cursor is the sampler's to write, so the device
-        # path stages its candidates here and commits them there.
-        if stage_cursor:
-            cache.pending.staged_on_device = True
-        elif batch is not None:
+        # Last: every reader of the cursor this overwrites has run (`staged`:
+        # the forward advances it, after its snapshot).
+        if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif not metadata.dummy and not step.tentative:
+        elif staged is None and not metadata.dummy and not step.tentative:
             cache.advance_cursor(step, histories)
+        if on_device and step.tentative:
+            cache.pending.staged_on_device = True
 
     def commit_speculative_state(self, metadata, last_token_indices):
-        step = metadata.step
         if metadata.cache.pending is not None:
-            counts = (
-                last_token_indices - step.cu_seqlens_q[: last_token_indices.numel()] + 1
-            )
-            metadata.cache.commit_tentative(step, counts)
+            metadata.cache.commit_tentative(metadata.step, last_token_indices)
 
     def build_for_cudagraph_capture(self, bs, max_q_len=1):
         # Binds the serving allocation, as V4 does: a scratch cache would bake
@@ -648,6 +798,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             block_tables=((0,) * pages,) * bs,
             total_seqs_num=bs,
             total_tokens_num=tokens,
+            is_final_chunk=None,
+            replaying={},
         )
         metadata, positions = self._prepare(
             batch,
@@ -655,6 +807,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             tokens,
             max_q_len=max_q_len,
             tentative=bool(geometry.speculative_tokens),
+            engram_live=False,
         )
         metadata.dummy = True  # No host Engram lookup for synthetic tokens.
         self.prepare_model_inputs(

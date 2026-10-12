@@ -154,7 +154,6 @@ class CompilationConfig:
     use_cudagraph: bool = True
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
-    # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
     cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
@@ -970,6 +969,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None and text_config is not hf_config:
+        # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
+        # replaces the text config's own, then is checked like any other.
+        for attr_name in ("mlp_layer_types", "moe_layer_freq"):
+            attr_value = getattr(hf_config, attr_name, None)
+            if attr_value is not None:
+                setattr(text_config, attr_name, attr_value)
     _normalize_minimax_m3_mlp_layer_types(
         text_config if text_config is not None else hf_config
     )
@@ -1837,6 +1843,22 @@ def qrep_enabled_for_layer(
     )
 
 
+def qrep_for_step(
+    qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
+) -> bool:
+    """Whether this forward produces the DCP group's query heads locally (QREP)
+    instead of gathering them.
+
+    Decode always does when the layer has QREP. Prefill reaches the QREP-aware
+    branch only as sparse (DSA) prefill -- dense prefill takes the MHA path and
+    never gathers q -- and joins only under ``ATOM_DCP_PREFILL_QREP``
+    (``prefill_qrep``). The seg path is excluded because its q_out is allocated
+    at the per-rank head count. Pure so the prefill clause can be pinned by a
+    test instead of living only as an inline expression.
+    """
+    return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -1933,6 +1955,23 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). On by default;
+    # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
+    enable_decoder_swa_bounded_replay: bool = True
+    # The fewest rows the forward that finishes a prompt runs: one that resumes
+    # closer to the prompt's end starts that much earlier, recomputing rows
+    # the cache already holds (`BlockManager.replay_start`). Set by the model,
+    # not a flag: V4.1's decoder bounded replay reads the last `window` rows.
+    min_final_prefill_rows: int = 0
+    # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
+    # Set by the model: V4.1's Engram n-gram lookback.
+    replay_history_tokens: int = 0
+    # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
+    # checkpoint and rebuilds it by recomputing the window rows below the hit
+    # (`--encoder-swa-bounded-replay`). On by default;
+    # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
+    enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -2105,7 +2144,7 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
-            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+            return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
     def __post_init__(self):
@@ -2586,13 +2625,18 @@ class Config:
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
             # tiles -- and its ratio-2 owners halve the PAGE before that count
-            # is taken, which makes the floor twice the tile. 256 rather than
-            # that floor, and for the reason DeepSeek-V4 takes it: the block
-            # table is `[max_num_seqs, max_model_len / block_size]` int32 held
-            # twice and copied to the device every forward, 8 MB here against
-            # 134 MB at the 16 this field defaults to. What it costs is prefix
-            # reuse shorter than a PAGE, which stops matching at all.
-            self.kv_cache_block_size = 256
+            # is taken, which makes the floor twice the tile. 128 rather than
+            # that floor: the block table is `[max_num_seqs, max_model_len /
+            # block_size]` int32 held twice and copied to the device every
+            # forward, 17 MB here against 134 MB at the 16 this field defaults
+            # to. Not the 256 DeepSeek-V4 takes: a PAGE is also the prefix
+            # cache's hash block, so it is the granularity of prefix reuse and
+            # of the rows encoder bounded replay recomputes below a hit: one
+            # PAGE, which must cover the window - 1 rows a row at the hit reads.
+            self.kv_cache_block_size = 128
+            if self.enable_decoder_swa_bounded_replay:
+                self.min_final_prefill_rows = self.hf_config.sliding_window
+            self.replay_history_tokens = self.hf_config.engram_max_ngram_size - 1
 
             from atom.models.deepseek_v41.config import validate_runtime_config
 
@@ -2626,9 +2670,8 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         # PCP changes the compiled graph: when pcp>1 the indexer runs through the
-        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
-        # query) and the indexer takes the round-robin all-gather / separate-rope
-        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # opaque `sparse_attn_indexer_pcp` op and takes the round-robin all-gather
+        # / separate-rope path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
         # identically, so without this factor pcp2 loads pcp1's cached artifact
         # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
         # runtime — the same stale-artifact hazard documented for the vocab-embed
@@ -2650,6 +2693,10 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
+        # graphs (early + late layers) instead of one; both compile under the
+        # `backbone` tag, so the flag must key the artifacts.
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (

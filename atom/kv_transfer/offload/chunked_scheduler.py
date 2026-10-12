@@ -27,6 +27,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -158,6 +159,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
         self._block_manager = None
+        self._lookup_defer_since: dict[str, float] = {}
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -184,6 +186,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """The prompt extent this layout can safely ask the tier to resume."""
         return list(seq.token_ids[: seq.num_prompt_tokens])
 
+    def _lookup_len(self, seq) -> int:
+        """`len(self._lookup_token_ids(seq))` without copying the prompt."""
+        return int(seq.num_prompt_tokens)
+
     def install_hit_cap_hook(self, hook) -> None:
         """Let a hybrid connector shorten every hit this scheduler reports.
 
@@ -194,6 +200,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._hit_cap_hook = hook
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
+        t0 = time.perf_counter()
+        try:
+            return self._get_num_new_matched_tokens(seq)
+        finally:
+            self._perf_bump("matched_us", int((time.perf_counter() - t0) * 1e6))
+            self._perf_bump("matched_n")
+
+    def _get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         """How many extra prompt tokens the external tier can supply.
 
         Called once per step for as long as the request stays unadmitted, so
@@ -210,7 +224,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
             return 0, False
-        if not self._lookup_token_ids(seq):
+        if self._lookup_len(seq) <= 0:
             return 0, False
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
@@ -227,6 +241,72 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         return self._answer_from_tier_hit(seq, sid, hit)
 
+    def prefetch_lookups(self, seqs) -> None:
+        """Send lookups for waiting requests before they reach admission.
+
+        Called once per scheduling pass with the head of the waiting queue.
+        The answer is consumed by the ordinary `_fresh_tier_lookup` when the
+        request is admitted, so only the round trip moves off the admission
+        path; the hit, its pin and the memo are exactly what a synchronous
+        lookup would have produced.
+        """
+        client = self._lookup_client
+        submit = getattr(client, "submit", None)
+        if submit is None or not self._do_load:
+            return
+        t0 = time.perf_counter()
+        client.pump()
+        budget = envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
+        memo = self._tier_hit_memo or {}
+        pending = client.pending_ids()
+        for seq in seqs:
+            if budget <= 0:
+                break
+            sid = str(seq.id)
+            if sid in pending or sid in self._lookup_results or sid in self._load_specs:
+                continue
+            entry = memo.get(sid)
+            if entry is not None and entry[0]() is seq:
+                continue
+            if self._load_failed_seqs.get(sid) is seq:
+                continue
+            # Its lookup was consumed when it parked; a finished load moves it
+            # to the head before admission sets `offload_loaded`.
+            if getattr(seq, "status", None) == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if resumes_offload_prefill(seq):
+                continue
+            if self._lookup_len(seq) <= 0:
+                continue
+            budget -= 1
+            if submit(self._lookup_token_ids(seq), sid):
+                self._perf_bump("lookup_prefetched")
+        self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
+
+    def lookup_pending(self, seq) -> bool:
+        """True while admission should pass over `seq`: its lookup is in flight.
+
+        Waiting a step or two for an answer that may carry tens of thousands of
+        prompt tokens is cheaper than either blocking the scheduler thread on
+        it (every DP rank waits in lockstep) or admitting the request without
+        it (a recompute). Bounded by `OFFLOAD_LOOKUP_DEFER_S`, after which the
+        ordinary synchronous lookup waits for the answer.
+        """
+        client = self._lookup_client
+        if getattr(client, "is_pending", None) is None:
+            return False
+        sid = str(seq.id)
+        if not client.is_pending(sid) or client.poll(sid):
+            self._lookup_defer_since.pop(sid, None)
+            return False
+        now = time.monotonic()
+        first = self._lookup_defer_since.setdefault(sid, now)
+        if now - first > envs.OFFLOAD_LOOKUP_DEFER_S:
+            self._perf_bump("lookup_defer_expired")
+            return False
+        self._perf_bump("lookup_deferred")
+        return True
+
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
 
@@ -235,8 +315,20 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         self._lookup_results[sid] = (seq, 0)
+        _t0 = time.perf_counter()
         try:
             hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            _us = int((time.perf_counter() - _t0) * 1e6)
+            self._perf_bump("lookup_n")
+            self._perf_bump("lookup_us", _us)
+            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
+                self._perf_lookup_max_us = _us
+                self._perf_counters["lookup_max_us"] = _us
+            self._perf_bump("lookup_prompt_tokens", num_prompt)
+            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
+            self._perf_bump("lookup_hit_tokens", int(hit or 0))
+            if hit is None:
+                self._perf_bump("lookup_none")
         except Exception:
             # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
             # a half-run lookup may have taken.
@@ -487,6 +579,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         return target, block_ids, keep
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
+        _perf_t0 = time.perf_counter()
         meta = LMCacheOffloadMetadata()
 
         # Loads
@@ -525,6 +618,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
+            # The scheduler needs the physical load floor to publish the
+            # restored blocks' hashes before resuming suffix prefill.
+            seq.offload_load_start_tokens = hbm
             seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for
@@ -575,6 +671,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not self._do_save:
                 continue
             if not self._may_emit_save():
+                self._perf_bump("save_cap_block_steps")
                 break
             seq, saved = entry
             if sid in self._reqs_need_recv or sid in loading_sids:
@@ -614,8 +711,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             ):
                 late_source = self._late_save_source(seq, saved, aligned)
                 if late_source is None:
+                    self._perf_bump("late_save_dropped")
+                    self._perf_bump("late_save_dropped_tokens", aligned - saved)
                     self._save_tracker.pop(sid, None)
                     continue
+                self._perf_bump("late_save_emit")
                 aligned, block_ids, late_acquired = late_source
             else:
                 block_ids = list(
@@ -663,6 +763,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
+        self._perf_bump("build_meta_us", int((time.perf_counter() - _perf_t0) * 1e6))
+        self._perf_bump("build_meta_n")
+        self._perf_maybe_log()
         return meta
 
     def should_defer_free(self, seq) -> bool:
@@ -1208,6 +1311,19 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._load_lifecycles.pop(sid, None)
         self._release_failed_load_attempt(sid, seq)
         self._forget_tier_hit(sid)
+        self._lookup_defer_since.pop(sid, None)
+        discard = getattr(self._lookup_client, "discard", None)
+        if discard is not None:
+            try:
+                discard(sid)
+            except Exception:
+                # Its read locks are then released only by the server's
+                # session cleanup or read TTL.
+                logger.warning(
+                    "LMCache offload: async lookup discard failed for %s",
+                    sid,
+                    exc_info=True,
+                )
         entry = self._save_tracker.get(sid)
         if entry is not None and entry[0] is seq:
             if self._early_release:

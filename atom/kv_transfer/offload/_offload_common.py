@@ -11,6 +11,8 @@ payload mapping and PAGE/SLOT policy.
 
 from __future__ import annotations
 
+import collections
+import json
 import logging
 import os
 import threading
@@ -978,6 +980,43 @@ class OffloadSchedulerMixin(ABC):
         )
         return True
 
+    def _perf_bump(self, key: str, n: int = 1) -> None:
+        """Cumulative diagnostic counter, summarised by `_perf_maybe_log`."""
+
+        counters = self.__dict__.get("_perf_counters")
+        if counters is None:
+            counters = self._perf_counters = collections.Counter()
+        counters[key] += int(n)
+
+    def _perf_maybe_log(self) -> None:
+        """One INFO line per minute with the diagnostic counters and statistics.
+
+        Only with `OFFLOAD_PROFILE`; the counters themselves are always kept.
+        """
+
+        if not envs.OFFLOAD_PROFILE:
+            return
+        now = time.monotonic()
+        last = self.__dict__.get("_perf_last_log")
+        if last is None:
+            self._perf_last_log = now
+            return
+        if now - last < 60.0:
+            return
+        self._perf_last_log = now
+        counters = self.__dict__.get("_perf_counters")
+        if not counters:
+            return
+        try:
+            statistics = self.get_statistics()
+        except Exception:  # noqa: BLE001  # diagnostics must never fail a step
+            statistics = {}
+        logger.info(
+            "[OFFLOAD-PERF] %s | %s",
+            json.dumps(dict(sorted(counters.items()))),
+            json.dumps(statistics),
+        )
+
     def _mark_load_skip(
         self,
         seq,
@@ -988,6 +1027,8 @@ class OffloadSchedulerMixin(ABC):
         chunk: int,
     ) -> None:
         seq.offload_loaded_tokens = hbm
+        self._perf_bump("skip_" + reason)
+        self._perf_bump("skip_tokens_" + reason, max(0, lmc - hbm))
         min_load = int(getattr(self, "_min_load_tokens", 8192))
         logger.debug(
             "[OFFLOAD-LOAD-SKIP] seq=%s hbm_cached=%d lmc_cached=%d "

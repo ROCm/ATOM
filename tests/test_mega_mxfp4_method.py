@@ -31,6 +31,30 @@ def test_mxfp4_method_selection(monkeypatch, backend_name):
     assert selected is (mega_method if backend_name == "mega" else standard_method)
 
 
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_fp8_activations_interleave_without_the_env_flag(monkeypatch, fp8_activations):
+    # aiter's A8W4 kernels read interleaved gate/up rows only, so a layer that
+    # asks for MXFP8 activations must get that layout whatever the env says.
+    monkeypatch.setattr(
+        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+    )
+    monkeypatch.setattr(moe_mod, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(moe_mod.envs, "is_set", lambda _name: True)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_USE_TRITON_MOE", False)
+    monkeypatch.setattr(moe_mod.envs, "ATOM_MOE_GU_ITLV", False)
+    quant_config = SimpleNamespace(
+        quant_type=object(), quant_dtype=object(), quant_method=None, is_dynamic=True
+    )
+    moe_config = SimpleNamespace(
+        a_quant_dtype=None, mxfp4_fp8_activations=fp8_activations, use_ep=False
+    )
+
+    method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
+
+    assert method.fp8_activations is fp8_activations
+    assert method.is_guinterleave is fp8_activations
+
+
 @pytest.mark.parametrize(
     ("eplb_enabled", "expected_triton"),
     [(False, True), (True, False)],
@@ -54,7 +78,9 @@ def test_eplb_controls_effective_triton_backend(
     )
     # TP, not EP: `use_triton` is `use_triton_moe and not use_ep`, so the
     # expectation below is about the TP half of that pair.
-    moe_config = SimpleNamespace(a_quant_dtype=None, use_ep=False)
+    moe_config = SimpleNamespace(
+        a_quant_dtype=None, mxfp4_fp8_activations=False, use_ep=False
+    )
 
     method = moe_mod.Mxfp4MoEMethod(quant_config, moe_config)
 
@@ -62,7 +88,8 @@ def test_eplb_controls_effective_triton_backend(
     assert method.use_triton_decode is expected_triton
 
 
-def test_standard_post_routing_arguments_are_preserved(monkeypatch):
+@pytest.mark.parametrize("fp8_activations", [False, True])
+def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activations):
     calls = []
 
     def fake_fused_moe(*args, **kwargs):
@@ -74,6 +101,7 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
     method.fused_experts = None
     method.quant_type = "mxfp4"
     method.is_guinterleave = True
+    method.fp8_activations = fp8_activations
     method.hidden_pad = 0
     method.intermediate_pad = 0
     # Skip both pre-routing early returns so apply() reaches the post-routing
@@ -115,6 +143,11 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
     assert result == "output"
     args, kwargs = calls.pop()
     assert args == ("x", "w1", "w2", "topk_weights", "topk_ids")
+    # An A8W4 layer names its activation dtype rather than leaving it to
+    # aiter's per-arch default.
+    assert kwargs.pop("quant_dtype_a", None) == (
+        moe_mod.dtypes.fp8 if fp8_activations else None
+    )
     assert kwargs == {
         "expert_mask": "mask",
         "activation": "silu",
@@ -124,8 +157,6 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch):
         "a1_scale": "a1_scale",
         "a2_scale": "a2_scale",
         "doweight_stage1": False,
-        "hidden_pad": 0,
-        "intermediate_pad": 0,
         "bias1": "b1",
         "bias2": "b2",
         "gate_mode": moe_mod.GateMode.INTERLEAVE.value,

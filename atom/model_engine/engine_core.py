@@ -77,6 +77,10 @@ class EngineCore:
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
+        # Separate from memory residency: an update in progress, or one that
+        # failed after an in-place write, must not serve.
+        self._weight_sync_fenced = False
+        self._rl_weights_inconsistent = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -290,13 +294,17 @@ class EngineCore:
                 "runner exit call failed; shared memory may already be freed",
                 exc_info=True,
             )
+        # One deadline for all workers, so a long ATOM_SHUTDOWN_TIMEOUT_S is not
+        # paid once per worker.
+        timeout = envs.ATOM_SHUTDOWN_TIMEOUT_S
+        deadline = time.monotonic() + timeout
         for proc in self.runner_mgr.procs:
             try:
                 alive = proc.is_alive()
             except ValueError:
                 continue  # process object already closed by CoreManager
             if alive:
-                proc.join(timeout=5)
+                proc.join(timeout=max(deadline - time.monotonic(), 0))
                 # The join above has a timeout; nothing after it did. A worker
                 # that outlives it keeps its VRAM slice and its all-reduce IPC
                 # handles, and `multiprocessing`'s atexit handler then joins the
@@ -310,9 +318,11 @@ class EngineCore:
                 try:
                     if proc.is_alive():
                         logger.warning(
-                            "%s: worker pid=%s still alive after 5s; terminating",
+                            "%s: worker pid=%s still alive after %gs "
+                            "(ATOM_SHUTDOWN_TIMEOUT_S); terminating",
                             self.label,
                             getattr(proc, "pid", "?"),
+                            timeout,
                         )
                         proc.terminate()
                         proc.join(timeout=5)
@@ -362,7 +372,7 @@ class EngineCore:
         When offloaded, busy-wait with a short delay to avoid CPU spin.
         Returns True if the caller should skip model execution this tick.
         """
-        if self._is_rl_weights_offloaded:
+        if self._is_rl_weights_offloaded or self._weight_sync_fenced:
             time.sleep(0.01)
             return True
         return False
@@ -800,14 +810,15 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = (
-                    not self.scheduler.is_finished()
-                    and not self._is_rl_weights_offloaded
+                local_unfinished = not self.scheduler.is_finished() and not (
+                    self._is_rl_weights_offloaded or self._weight_sync_fenced
                 )
 
                 global_has_unfinished, global_shutdown, global_offloaded = (
                     self._sync_dp_state(
-                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                        local_unfinished,
+                        shutdown,
+                        self._is_rl_weights_offloaded or self._weight_sync_fenced,
                     )
                 )
 

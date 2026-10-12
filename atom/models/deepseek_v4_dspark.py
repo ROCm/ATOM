@@ -844,7 +844,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
             # accessor (lazy); `bufs.views` raises if stage 0 did not fill first.
             bufs = self.index_buffers(T, W, x.device)
             if self.stage_id == 0:
-                bufs.build(a.swa_window, slots, positions)
+                bufs.build(a.swa_window, slots, positions, a.n_local_heads)
             kv_indices, kv_indptr, draft_rows = bufs.views(B)
             batch_ids = bufs.batch_ids[: B * T]
 
@@ -895,6 +895,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
                 q_rope_in=qkn.q_rope,
                 qo_indptr=bufs.qo_indptr[: B * T + 1],
                 prefix=f"{a.layer_name}.dspark_attn_fp8",
+                split_plan=bufs.split_plan,
             )  # [B*T, n_heads, head_dim]
             out = out.view(B, T, a.n_local_heads, a.head_dim)
         else:

@@ -4,10 +4,17 @@
 The two models share this layer. Routing is `sqrtsoftplus` with a
 selection-only per-expert bias, renormalized top-k and a `routed_scaling_factor`;
 the experts use the inherited V4 quantization, clamped SwiGLU and whole-expert
-ownership. Activation format, routing-weight placement and kernel dispatch
-are owned by V4/FusedMoE. `DeepseekV4Args`
-reads all of it off the V4.1 config by its HF names, so V4's `MoE` constructs
-directly. vLLM's ROCm V4.1 reuses the V4 MoE the same way.
+ownership. The routed FP4 experts take MXFP8 activations, as the checkpoint's
+reference runs them: aiter's gfx950 default for them is MXFP4, which put the
+routed output ~12% off the reference and cost ~1.4pp of GSM8K. Activation
+format, routing-weight placement and kernel dispatch are owned by V4/FusedMoE.
+`DeepseekV4Args` reads all of it off the V4.1 config by its HF names, so V4's
+`MoE` constructs directly. vLLM's ROCm V4.1 reuses the V4 MoE the same way.
+
+The gate's GEMM at decode widths (`router_supported`) is the fixed-order router
+GEMV of `atom.model_ops.deepseek_v41.router`, the one the mono decode's MoE
+kernel runs, so the two decode paths route alike bit for bit; other widths and
+shapes keep the gate's own GEMM.
 
 `bias_vl` is the one V4.1-only tensor: a second routing bias for image sentinel
 tokens. Mixed image/text prefills use the shared fused two-bias router;
@@ -21,6 +28,10 @@ no fused variant to inherit.
 
 import torch
 
+from atom.model_ops.deepseek_v41.router import (
+    router_logits as fixed_order_router_logits,
+)
+from atom.model_ops.deepseek_v41.router import router_supported
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import mm_topk
 from atom.model_ops.utils import atom_parameter
@@ -41,6 +52,7 @@ class MoE(V4MoE):
     ):
         args = DeepseekV4Args.from_hf_config(config)
         args.quant_config = quant_config
+        args.moe_fp8_activations = True
         super().__init__(layer_id, args, prefix=prefix, alt_stream=alt_stream)
         self.gate.bias_vl = atom_parameter(
             torch.empty(args.n_routed_experts, dtype=torch.float32)
@@ -80,6 +92,28 @@ class MoE(V4MoE):
             image_mask=image_mask.flatten(),
         )
         return weights, ids
+
+    def router_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """The gate: at decode widths the fixed-order router GEMV that the mono
+        decode's MoE kernel runs too, else the gate's own GEMM."""
+        if router_supported(x, self.gate.weight):
+            return fixed_order_router_logits(x, self.gate.weight)
+        return self.gate(x)
+
+    def routed_expert_forward(
+        self,
+        x: torch.Tensor,
+        shared_partial: torch.Tensor | None = None,
+        before_stage2=None,
+        stage2_stream: torch.cuda.Stream | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        return self.experts.forward_maybe_comm_fused(
+            x,
+            self.router_logits(x),
+            shared_partial,
+            before_stage2=before_stage2,
+            stage2_stream=stage2_stream,
+        )
 
     def forward(self, hidden):
         return super().forward(hidden.reshape(-1, hidden.shape[-1])).view_as(hidden)

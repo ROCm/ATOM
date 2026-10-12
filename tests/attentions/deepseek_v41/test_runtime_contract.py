@@ -57,7 +57,11 @@ def test_production_geometry_has_only_four_global_owners():
     assert geo.paged_bytes == 32 * (3 / 2 + 1) * (512 * 2 + 132)
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes
     assert geo.state_fields[0].layers == 40
-    assert all(field.in_checkpoint for field in geo.state_fields)
+    # Rings and cursor are checkpointed; the compressor tails are not.
+    assert [f.name for f in geo.state_fields if f.in_checkpoint] == [
+        "window",
+        "cursor",
+    ]
 
 
 def runtime_config(**overrides):
@@ -82,7 +86,8 @@ def runtime_config(**overrides):
         "kv_cache_block_size": 16,
         "tensor_parallel_size": 4,
         "enable_expert_parallel": True,
-        "hf_config": SimpleNamespace(),
+        "hf_config": SimpleNamespace(sliding_window=128),
+        "enable_encoder_swa_bounded_replay": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -109,6 +114,8 @@ def runtime_config(**overrides):
         {"kv_cache_dtype": "fp8"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
+        # a hit's one-PAGE rebuild would not cover the window
+        {"enable_encoder_swa_bounded_replay": True},
     ],
 )
 def test_unimplemented_modes_fail_before_loading(override):
@@ -133,6 +140,19 @@ def test_lmcache_mp_is_the_only_kv_transfer_admitted():
                 enable_rapidserve=True,
             )
         )
+
+
+def _attach_uncompiled_backbone(model):
+    """The runtime model's one compiled graph, built bare and run uncompiled,
+    for a model assembled without its constructor."""
+    from atom.models.deepseek_v41 import runtime
+
+    model.replay = False
+    backbone = runtime._Backbone.__new__(runtime._Backbone)
+    torch.nn.Module.__init__(backbone)
+    backbone.do_not_compile = True
+    backbone.__dict__["owner"] = model
+    model.backbone = backbone
 
 
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
@@ -160,6 +180,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_backbone(model)
     # No layers are constructed: a step with no requests must not reach one.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert output.shape == (8, 64) and output.count_nonzero() == 0
@@ -209,6 +230,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_backbone(model)
     model(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
     assert seen == {name: {} for name in memos}
 
@@ -231,15 +253,20 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
     )
 
 
-@pytest.mark.parametrize("index_dtype", ["bf16", "fp4"])
-def test_an_index_plane_other_than_fp8_is_refused(index_dtype):
-    """The paged scorer is the only one a cache has, and it reads FP8.
+@pytest.mark.parametrize("index_dtype", ["bf16", "fp8_e4m3"])
+def test_an_index_plane_other_than_fp8_or_fp4_is_refused(index_dtype):
+    """The paged scorer reads FP8 or FP4 and nothing else.
 
     A plane stored otherwise has no reader, which is a load-time refusal and
-    not a slower path: the format is the runtime's, not a tuning knob.
+    not a slower path.
     """
-    with pytest.raises(ValueError, match="index plane other than fp8"):
+    with pytest.raises(ValueError, match="index plane other than fp8 or fp4"):
         validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
+
+
+@pytest.mark.parametrize("index_dtype", ["fp8", "fp4"])
+def test_an_fp8_or_fp4_index_plane_is_admitted(index_dtype):
+    validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
 
 
 @pytest.mark.parametrize("graph", [False, True])
