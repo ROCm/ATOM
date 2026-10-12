@@ -62,6 +62,50 @@ def test_decode_plan_uses_one_token_pages(monkeypatch):
     assert torch.equal(last_page[:bs], torch.ones(bs, dtype=torch.int32))
 
 
+def test_decode_plan_reads_sglang_work_metadata_field(monkeypatch):
+    """SGLang stores the plan on work_metadata, not ATOM's work_meta_data."""
+
+    captured = {}
+
+    def fake_get(*args, **kwargs):
+        captured["args"] = args
+
+    try:
+        import aiter
+    except ImportError:
+        aiter = types.ModuleType("aiter")
+        monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setattr(aiter, "get_mla_metadata_v1", fake_get, raising=False)
+
+    work = torch.empty(4)
+    metadata = types.SimpleNamespace(
+        kv_indptr=torch.tensor([0, 4], dtype=torch.int32),
+        kv_last_page_len=torch.tensor([128], dtype=torch.int32),
+        qo_indptr=torch.tensor([0, 128], dtype=torch.int32),
+        work_metadata=work,
+        work_info_set=torch.empty(4),
+        work_indptr=torch.empty(4),
+        reduce_indptr=torch.empty(4),
+        reduce_final_map=torch.empty(4),
+        reduce_partial_map=torch.empty(4),
+    )
+
+    assert retarget_kimi_k3_decode_mla_plan(
+        metadata,
+        batch_size=1,
+        num_heads=16,
+        dtype_q=torch.bfloat16,
+        dtype_kv=torch.bfloat16,
+        fast_mode=True,
+        intra_batch_mode=False,
+        max_split_per_batch=None,
+    )
+    assert captured["args"][6] is work
+    assert metadata.work_meta_data is work
+    assert metadata.work_metadata is work
+    assert int(metadata.kv_last_page_len[0]) == 1
+
+
 def test_decode_plan_skips_when_sglang_did_not_allocate_persistent_buffers():
     metadata = types.SimpleNamespace(
         kv_indptr=torch.zeros(2, dtype=torch.int32),

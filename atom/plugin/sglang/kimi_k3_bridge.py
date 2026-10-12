@@ -494,6 +494,16 @@ def _build_block_table(
     )
 
 
+def _sglang_mla_work_metadata(forward_metadata: Any) -> torch.Tensor | None:
+    """SGLang names this buffer ``work_metadata``; ATOM reads ``work_meta_data``."""
+
+    for name in ("work_meta_data", "work_metadata"):
+        value = getattr(forward_metadata, name, None)
+        if torch.is_tensor(value):
+            return value
+    return None
+
+
 def retarget_kimi_k3_decode_mla_plan(
     forward_metadata: Any,
     *,
@@ -507,20 +517,24 @@ def retarget_kimi_k3_decode_mla_plan(
 ) -> bool:
     """Rewrite SGLang's persistent MLA plan onto ATOM's per-token pages.
 
-    PR #1821 attached SGLang's decode plan unchanged. That plan is built at
-    the server page size (128). ATOM's K3 kernel, with ``ATOM_MLA_PAGE_SIZE=1``,
-    consumes one KV slot per index. A 128-token plan under-reads that cache:
-    padding no longer clobbers slot 0 (that was the jump from ~0 to ~0.39),
-    but decode still attends the wrong tokens. ``get_mla_metadata_v1`` writes
-    the existing work buffers in place, so a captured CUDA graph keeps its
-    pointers and only the contents change.
+    PR #1821 attached SGLang's decode plan unchanged. ``make_mla_meta_data``
+    builds that plan with ``kv_granularity=page_size`` (128 on this server)
+    and stores it on ``ForwardMetadata.work_metadata``. ATOM's K3 kernel, with
+    ``ATOM_MLA_PAGE_SIZE=1``, reads ``work_meta_data`` and consumes one KV slot
+    per index at granularity 16. The old lookup never saw SGLang's buffer, so
+    the 128-granularity plan stayed in place: padding no longer clobbers slot
+    0, but decode still attends the wrong tokens.
+
+    ``get_mla_metadata_v1`` writes the existing work buffers in place, so a
+    captured CUDA graph keeps its pointers and only the contents change.
     """
 
     if forward_metadata is None or batch_size <= 0:
         return False
     kv_indptr = getattr(forward_metadata, "kv_indptr", None)
+    work_metadata = _sglang_mla_work_metadata(forward_metadata)
     work_buffers = (
-        getattr(forward_metadata, "work_meta_data", None),
+        work_metadata,
         getattr(forward_metadata, "work_info_set", None),
         getattr(forward_metadata, "work_indptr", None),
         getattr(forward_metadata, "reduce_indptr", None),
@@ -556,7 +570,7 @@ def retarget_kimi_k3_decode_mla_plan(
         max(int(num_heads), 16),
         1,
         True,
-        forward_metadata.work_meta_data,
+        work_metadata,
         forward_metadata.work_info_set,
         forward_metadata.work_indptr,
         forward_metadata.reduce_indptr,
@@ -574,6 +588,9 @@ def retarget_kimi_k3_decode_mla_plan(
         dtype_q=dtype_q,
         dtype_kv=dtype_kv,
     )
+    # The captured kernel and ATOM's decode path both have to see this buffer.
+    forward_metadata.work_metadata = work_metadata
+    forward_metadata.work_meta_data = work_metadata
     return True
 
 
@@ -597,7 +614,7 @@ def _attach_sglang_mla_metadata(metadata: Any) -> Any:
     metadata.kv_indptr = getattr(forward_metadata, "kv_indptr", None)
     metadata.kv_indices = getattr(forward_metadata, "kv_indices", None)
     metadata.kv_last_page_lens = getattr(forward_metadata, "kv_last_page_len", None)
-    metadata.work_meta_data = getattr(forward_metadata, "work_meta_data", None)
+    metadata.work_meta_data = _sglang_mla_work_metadata(forward_metadata)
     metadata.work_info_set = getattr(forward_metadata, "work_info_set", None)
     metadata.work_indptr = getattr(forward_metadata, "work_indptr", None)
     metadata.reduce_indptr = getattr(forward_metadata, "reduce_indptr", None)
