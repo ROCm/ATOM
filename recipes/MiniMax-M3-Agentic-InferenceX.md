@@ -58,7 +58,7 @@ env \
 
 gluon splits every request in a batch the same way. An agentic decode batch is not uniform — measured over 30,400 steps at CONC=32, the step-internal `max/min` context ratio is p50 2.49, p90 22.2, and 31.2% of steps exceed 4× — so one long request owns the critical path. The planner sizes each request's partition count from its real context length instead, under a workgroup budget.
 
-Shapes outside FlyDSL's domain fall back to gluon on their own. It requires aiter with #5809 (explicit work plans); with an older aiter the first FlyDSL decode fails, so upgrade ATOM and aiter together. Measured against the gluon path on the same node with the pre-#5809 FlyDSL kernel and planner (#2366; planner on the dense sites only), p90 interactivity: −0.0% at CONC=1, +4.0% at 10, +11.8% at 15, +20.5% at 20. The #5809 adaptation measured neutral against that path (C24/C32) and has not been re-measured against gluon. The gain needs a batch with something to rebalance, which is why CONC=1 is flat.
+Shapes outside FlyDSL's domain fall back to gluon on their own. It requires aiter with #5809 (explicit work plans); with an older aiter ATOM logs `ATOM_PA_FLYDSL=1 but this aiter predates the #5809 FlyDSL paged decode API; using gluon.` once and runs gluon, so upgrade ATOM and aiter together and check the server log for that line. Measured against the gluon path on the same node with the pre-#5809 FlyDSL kernel and planner (#2366; planner on the dense sites only), p90 interactivity: −0.0% at CONC=1, +4.0% at 10, +11.8% at 15, +20.5% at 20. The #5809 adaptation measured neutral against that path (C24/C32) and has not been re-measured against gluon. The gain needs a batch with something to rebalance, which is why CONC=1 is flat.
 
 ## Indexer-only decode context parallelism
 
@@ -117,7 +117,7 @@ Then keep the ATOM server command above and add these to its `env \` block:
 - `--chunk-size` must equal ATOM's `LMCACHE_CHUNK_SIZE` and be a multiple of `--block-size` (128).
 - `--l1-read-ttl-seconds 900`: a lookup read-locks every chunk it hits until the retrieve releases it; a lock nobody releases expires after this TTL, and locked chunks are skipped by eviction.
 - `--max-workers 4` sets both server pools — the GPU pool (STORE/RETRIEVE, `--max-gpu-workers`) and the CPU pool (LOOKUP, `--max-cpu-workers`) — to 4, one slot per TP rank (default 1 each). It cuts lookup p90 from 121 to 92 ms at 40c; throughput and recompute are unchanged, so it is optional.
-- Tested with LMCache 0.5.6.dev139 (`rocm/atom-dev:nightly_202610031557`). The server needs `--null-block-id` and `--separate-object-groups`.
+- Tested with LMCache 0.5.6.dev139 (`rocm/atom-dev:nightly_202610031557`), ATOM `5c169c702` / `e35f51b8a` and aiter `b1cdc19eb`. That aiter and the image's bundled aiter both predate aiter #5809, so these runs used the pre-#5809 FlyDSL decode; current ATOM on that image's aiter runs gluon instead (see [FlyDSL paged decode](#flydsl-paged-decode)). The server needs `--null-block-id` and `--separate-object-groups`.
 - `/metrics` `prefix_cache_cached_tokens_total` does not count tokens restored from the MP tier, and ATOM prints no `OFFLOAD-LOAD-PROF` / `OFFLOAD-SAVE-PROF` lines in this mode. Read the tier from the server log (`Stored` / `Retrieved`) and ATOM's `[OFFLOAD-PROMOTE]` lines.
 
 ### Eviction watermark and ratio
@@ -135,14 +135,18 @@ The cost of 0.995 / 0.01 is that a few stores land while the pool is full: 38 `F
 
 ### Measured: MP against the in-process tier
 
-8×MI355X, TP4 + EAGLE3 + indexer CP, recipe command above plus the optional `--cudagraph-capture-sizes` list from the Notes, 3600 s, one node and one ATOM tree for both arms. The in-process arm is `lmcache_offload` with 256 GB per rank and LRU (`ATOM_SLRU` measured the same: +0.16%).
+8×MI355X, TP4 + EAGLE3 + indexer CP, recipe command above plus the optional `--cudagraph-capture-sizes` list from the Notes, 3600 s, one node and one ATOM tree for both arms of each concurrency (40c: ATOM `5c169c702`; 48c: ATOM `e35f51b8a`, another node; aiter `b1cdc19eb` for both). The in-process arm is `lmcache_offload` with 256 GB per rank and LRU (`ATOM_SLRU` measured the same: +0.16%).
 
 | conc | CPU tier | runs | tok/s/chip | intvty_p90 | TTFT p90 (ms) | recompute | realised hit |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 40 | in-process | 3 | 58,943–59,026 | 89.2–91.0 | 1,041–1,089 | 24.5–25.5 M | 97.1–97.2% |
 | 40 | **MP** | 1 | **58,602** | 92.2 | 1,318 | 25.5 M | 97.1% |
+| 48 | in-process | 2 | 61,253–61,657 | 49.6–49.7 | 2,008–2,072 | 46.2–46.3 M | 94.8% |
+| 48 | **MP** | 2 | **58,742–59,479** | 46.1–46.7 | 2,853–2,897 | 47.5–48.1 M | 94.4% |
 
-MP and the in-process tier recompute the same prefill, and throughput is within noise. MP's TTFT p90 is higher; ITL p50 / p90 are 7.01 / 10.85 ms against 7.10–7.11 / 10.99–11.21 ms. 48c has not been measured with MP yet.
+At 40c MP and the in-process tier recompute the same prefill, and throughput is within noise. MP's TTFT p90 is higher; ITL p50 / p90 are 7.01 / 10.85 ms against 7.10–7.11 / 10.99–11.21 ms.
+
+At 48c MP is slower: 3.8% lower throughput on average (−4.7% with MP run first, −2.9% with in-process first), about 6.5% lower p90 interactivity, and TTFT p90 about 40% higher. Recompute and realised hit are nearly the same, so the gap is not cache misses; its cause is still under investigation.
 
 ## aiperf
 
