@@ -488,11 +488,14 @@ a copy into each slot (and the reverse).
   unmounts takes its own objects, late write included, and the mark lives on
   in the others). The worker retries a mark the Store does not take, with
   backoff up to 30 s, logging each failure as an error, while its own loads
-  stay off. Every worker looks for the mark at startup and before it loads
-  (at most once a second), and every scheduler lookup asks for it with the
-  chunks; a process that has seen it loads nothing from that Store for the
-  rest of its life, and a look that gets no answer refuses that load or
-  lookup. A worker that cannot tell at startup refuses to start. A load needs
+  stay off. Every worker looks for the mark at startup, right before every
+  get and again after a load's last get (a mark placed while a get ran fails
+  that load), never trusting an earlier look, and every scheduler lookup asks
+  for it with the chunks; a process that has seen it loads nothing from that
+  Store for the rest of its life, and a look that gets no answer refuses that
+  load or lookup. What no look can catch is a late write that lands, and is
+  read by a load that ends, between Mooncake giving up the put and the mark
+  landing: one master call when the Store takes the mark at once. A worker that cannot tell at startup refuses to start. A load needs
   every rank's chunks, so every load of an engine on a tainted Store fails
   and its request prefills. Saves go on.
 - A taint clears only when the Store restarts: its master and owners, which

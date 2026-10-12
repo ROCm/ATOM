@@ -17,7 +17,8 @@ object is hard-pinned, so eviction never takes it, carries a replica on every
 segment it can (a segment that unmounts takes its own objects with it, and the
 marker lives on in the others), and is created by the master alone, with no
 transfer, so it gets there while the fabric is stalled. Every worker looks for
-it at startup and before it loads (``MooncakeStoreOffloadConnector``), and
+it at startup, before every get and after a load's last get
+(``MooncakeStoreOffloadConnector``), and
 every scheduler lookup asks for it with the chunks (``_StoreLookup``); a
 process that has seen it never trusts that Store again, and one that cannot
 tell does not load. The mark goes only with the Store: a restart of its master

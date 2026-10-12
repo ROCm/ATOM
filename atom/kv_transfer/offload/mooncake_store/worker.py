@@ -31,8 +31,8 @@ Completion protocol, per worker and operation:
 * A put that leaves its slot quarantined may also still write the owner
   memory the Store took back, inside another key's object: from then on the
   worker loads nothing from the Store, and marks it tainted so that no client
-  of it does (``_distrust_store``, :mod:`.taint`). Before every load it looks
-  for that mark (``_load_refusal``).
+  of it does (``_distrust_store``, :mod:`.taint`). Before every get, and
+  after a load's last one, it looks for that mark (``_load_refusal``).
 """
 
 from __future__ import annotations
@@ -91,10 +91,6 @@ _WARNING_INTERVAL_S = 30.0
 # A save stops reading its source blocks this long (at most) before the
 # scheduler may reclaim them; see `_source_read_deadline`.
 _MAX_SOURCE_READ_MARGIN_S = 60.0
-# Seconds a load trusts the last look for the Store's taint marker
-# (`_load_refusal`): a worker stops loading from a Store another client marked
-# within this.
-_TAINT_RECHECK_S = 1.0
 
 
 def _tp_group():
@@ -177,7 +173,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         # Places the taint marker in this worker's Store; and when a load
         # next looks for one there (`_load_refusal`).
         self._taint_marker: TaintMarker | None = None
-        self._taint_checked_until = 0.0
         timeout = self._store_cfg.save_abandon_timeout_s
         self._source_read_window_s = timeout - min(
             _MAX_SOURCE_READ_MARGIN_S, timeout / 5
@@ -260,7 +255,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 client=client,
             )
             self._probe_store(client, pool, namespace, rank)
-            checked_at = time.monotonic()
             tainted, detail = self._look_for_taint(client)
             if tainted is None:
                 raise RuntimeError(
@@ -277,7 +271,6 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 client.close()
             gpu_connector.close()
             raise
-        self._taint_checked_until = checked_at + _TAINT_RECHECK_S
         if tainted:
             self._refuse_loads_from_marked_store(store_pool.master)
         self._gpu_connector = gpu_connector
@@ -792,6 +785,14 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             # Both paths synchronized before returning: the slots are idle.
             pool.release(slots)
             loaded_chunks += len(window)
+        if failure is None:
+            # And once after the last get: a mark placed while a get ran is
+            # one the look before it missed, and that get may have read what
+            # the given-up put wrote. The load fails, so nothing it unpacked
+            # is used.
+            refusal = self._load_refusal(client)
+            if refusal is not None:
+                failure, detail = "store_distrusted", refusal
         if failure is not None:
             self._warn_rate_limited(
                 f"load:{failure}",
@@ -970,21 +971,18 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """Why this worker may not load from its Store now; None when it may.
 
         Its own verdict holds for good (`_distrust_store`). The Store's taint
-        marker is looked for at most every `_TAINT_RECHECK_S`; once seen it
-        holds for good too, and a look that gets no answer refuses this load
-        only.
+        marker is looked for right before every get and after a load's last
+        get, never trusted from an earlier look: another client may have
+        marked the Store a moment ago. Once seen it holds for good too, and a
+        look that gets no answer refuses this load only.
         """
         if self._store_distrusted is not None:
             return self._store_distrusted
-        checked_at = time.monotonic()
-        if checked_at < self._taint_checked_until:
-            return None
         tainted, detail = self._look_for_taint(client)
         if tainted is None:
             return f"cannot tell whether the Store carries the taint marker ({detail})"
         if tainted:
             return self._refuse_loads_from_marked_store(client.master_server_addr)
-        self._taint_checked_until = checked_at + _TAINT_RECHECK_S
         return None
 
     @staticmethod

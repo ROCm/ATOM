@@ -2361,8 +2361,8 @@ def test_a_load_that_cannot_look_for_the_marker_gets_nothing(cluster, make_worke
     worker._do_load_req(load)
     assert worker.get_finished().failed_loading == {load.load_operation}
     assert not any(call[0] == "get" for call in store.calls)
-    # That refuses the one load: the next look is answered, and its answer
-    # serves the loads that follow for a while.
+    # That refuses the one load: the next look is answered, and every load
+    # looks again rather than trust an earlier answer.
     del store.exist_codes[keys.STORE_TAINT_KEY]
     for generation in (1, 2):
         again = _load_req(
@@ -2373,7 +2373,51 @@ def test_a_load_that_cannot_look_for_the_marker_gets_nothing(cluster, make_worke
     looks = [
         c for c in store.calls if c[0] == "exists" and c[1] == [keys.STORE_TAINT_KEY]
     ]
-    assert len(looks) == 2
+    # The refused load's one, and one before and one after each other's get.
+    assert len(looks) == 1 + 2 * 2
+
+
+def test_a_load_right_after_another_client_marked_the_store_gets_nothing(
+    cluster, make_worker
+):
+    # A look kept for a second let a get through a moment after another
+    # client's mark landed; the get could then install the object the
+    # abandoned write corrupted.
+    worker, _ = make_worker()
+    worker._do_save_req(_save_req(64, 16))
+    worker.get_finished()
+    load = _load_req(64, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    worker._do_load_req(load)
+    assert worker.get_finished().finished_loading == {load.load_operation}
+    store = worker._client._store
+    gets = sum(call[0] == "get" for call in store.calls)
+    cluster.exist_codes[keys.STORE_TAINT_KEY] = 1  # another client's mark
+    again = _load_req(64, hbm=0, lmc=16, block_ids=[8, 9, 10, 11], generation=1)
+    worker._do_load_req(again)
+    assert worker.get_finished().failed_loading == {again.load_operation}
+    assert sum(call[0] == "get" for call in store.calls) == gets
+
+
+def test_a_load_whose_get_ran_while_the_store_was_marked_fails(cluster, make_worker):
+    # The look before a get cannot see a mark placed while the get runs, and
+    # that get may have read an object the abandoned write corrupted: the load
+    # looks again after its last get, and fails if the mark is there.
+    worker, _ = make_worker()
+    worker._do_save_req(_save_req(64, 16))
+    worker.get_finished()
+    store = worker._client._store
+    get = store.batch_get_into
+
+    def get_while_another_client_marks(names, ptrs, sizes):
+        cluster.exist_codes[keys.STORE_TAINT_KEY] = 1
+        return get(names, ptrs, sizes)
+
+    store.batch_get_into = get_while_another_client_marks
+    # Two chunks, one window: one get, looked for before it and after it.
+    load = _load_req(64, hbm=0, lmc=16, block_ids=[8, 9, 10, 11])
+    worker._do_load_req(load)
+    assert sum(call[0] == "get" for call in store.calls) == 1
+    assert worker.get_finished().failed_loading == {load.load_operation}
 
 
 def test_a_region_with_no_usable_slot_fails_saves_at_once(cluster, make_worker):
