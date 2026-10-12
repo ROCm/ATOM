@@ -4,6 +4,7 @@
 import ctypes
 import queue
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -70,6 +71,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
     c._chunked_prefills = {}
     c._chunked_local_ids = {}
+    c._retired_chunked_transfers = OrderedDict()
     c._kv_cache_ready_events = {}
     c._pending_chunked_requests = []
     c._completion_lock = threading.Lock()
@@ -893,3 +895,384 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
             p._write_listener()
     p._notify_transfer_result.assert_called_once_with(request, success=False)
     assert not p._pending_chunked_requests
+
+
+@pytest.mark.parametrize("waiting_cleanup", [False, True])
+@pytest.mark.parametrize("composite", [False, True])
+def test_scheduler_abort_keeps_source_until_readers_and_tp_pp_drain(
+    monkeypatch, seq_factory, waiting_cleanup, composite
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+
+    sched = Scheduler(MockConfig(max_num_batched_tokens=4))
+    connector = sched.kv_connector = scheduler_connector(monkeypatch, True)
+    seq = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "xfer-a",
+        },
+    )
+    sched.add(seq)
+    batch, seqs = sched.schedule()
+    worker, _, request, _, _ = producer()
+    worker._chunked_prefills.clear()
+    worker._chunked_local_ids.clear()
+    worker.start_load_kv(batch.connector_meta_output)
+    state = worker._chunked_prefills["xfer-a"]
+    request["prompt_digest"] = state.prompt_digest
+    publish(state, 4)
+    entered, release = threading.Event(), threading.Event()
+    write = worker.transfer_engine.batch_transfer_sync_write
+
+    def blocked_write(*args):
+        entered.set()
+        assert release.wait(5)
+        return write(*args)
+
+    worker.transfer_engine.batch_transfer_sync_write = blocked_write
+    if composite:
+        from atom.kv_transfer.disaggregation.multi.multi_connector import (
+            MultiConnectorScheduler,
+        )
+
+        multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+        multi._connectors = [connector]
+        multi._load_winner = {}
+        multi.is_producer, multi.is_offload = True, False
+        sched.kv_connector = multi
+    deallocate = MagicMock(wraps=sched.block_manager.deallocate)
+    monkeypatch.setattr(sched.block_manager, "deallocate", deallocate)
+    with ThreadPoolExecutor(1) as pool:
+        transfer = pool.submit(worker._execute_transfer, request)
+        try:
+            assert entered.wait(5)
+            if waiting_cleanup:
+                # Also cover the cleanup path used by an aborted parked load.
+                sched.running.remove(seq)
+                sched.waiting.append(seq)
+            assert sched.abort_request(seq.id)
+            if not waiting_cleanup:
+                sched.postprocess(
+                    list(seqs.values()),
+                    ScheduledBatchOutput([seq.id], [(42,)], None, None, None),
+                    batch=batch,
+                )
+            assert not state.cancelled  # Cancellation is still scheduler metadata.
+            assert state.readers == 1 and not state.source_safe()
+            assert connector.should_defer_free(seq)
+            assert seq.id in sched.deferred_free_blocks
+            deallocate.assert_not_called()
+            worker.start_load_kv(connector.build_connector_meta())
+            assert state.cancelled
+            sched._update_from_kv_xfer_finished(worker.get_finished())
+            deallocate.assert_not_called()
+        finally:
+            # Keep assertion failures bounded on an implementation that drops
+            # the scheduler claim before it delivers worker cancellation.
+            state.cancel()
+            release.set()
+            transfer.result(timeout=5)
+
+    event = worker.get_finished()
+    tp = [KVOutputAggregator(2) for _ in range(2)]
+    pp = PPKVAggregator(2)
+    for stage in range(2):
+        partial = tp[stage].aggregate([event, KVConnectorOutput()])
+        sched._update_from_kv_xfer_finished(pp.ingest(stage, partial))
+        deallocate.assert_not_called()
+        complete = tp[stage].aggregate([KVConnectorOutput(), event])
+        sched._update_from_kv_xfer_finished(pp.ingest(stage, complete))
+        if stage == 0:
+            deallocate.assert_not_called()
+    deallocate.assert_called_once_with(seq)
+    assert not seq.block_table
+    assert not connector.should_defer_free(seq)
+
+
+@pytest.mark.parametrize("p_hits,d_hits", [(4, 0), (4, 8), (0, 8)])
+def test_handoff_cache_hits_reach_final_chat_response(
+    monkeypatch, seq_factory, p_hits, d_hits
+):
+    from conftest import MockConfig
+
+    from atom.entrypoints.openai.serving_chat import build_chat_response
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.sampling_params import SamplingParams
+
+    sched = Scheduler(MockConfig(enable_prefix_caching=True))
+    sched.kv_connector = scheduler_connector(monkeypatch, False)
+    if d_hits:
+        seed = seq_factory(list(range(d_hits)) + [99, 99])
+        assert sched.block_manager.allocate(seed)
+        sched.block_manager.hash_blocks(seed, d_hits)
+        sched.block_manager.deallocate(seed)
+    seq = seq_factory(
+        list(range(10)),
+        sampling_params=SamplingParams(max_tokens=2),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_prefill": True,
+            "transfer_id": "xfer-a",
+            "block_size": 4,
+            "dcp_size": 1,
+        },
+    )
+    sched.add(seq)
+    _, seqs = sched.schedule()
+    assert not seqs
+    assert seq.prefix_cache_hit_tokens == d_hits
+    sched._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={seq.id},
+            received_handoffs={seq.id: PrefillHandoff(seq.id, 42, (), p_hits)},
+        )
+    )
+    batch, seqs = sched.schedule()
+    assert batch.total_seqs_num_decode == 1
+    assert seq.prefix_cache_hit_tokens == p_hits
+    outputs = queue.Queue()
+    assert sched.postprocess(
+        list(seqs.values()),
+        ScheduledBatchOutput([seq.id], [(43,)], None, None, None),
+        stream_output_queue=outputs,
+        batch=batch,
+    ) == [seq]
+    request_id, output = outputs.get_nowait()[0]
+    assert output.finished
+    assert output.num_cached_tokens == p_hits
+    response = build_chat_response(
+        str(request_id),
+        "test-model",
+        "answer",
+        {
+            "finish_reason": output.finish_reason,
+            "num_tokens_input": seq.num_prompt_tokens,
+            "num_tokens_output": len(output.output_tokens),
+            "num_cached_tokens": output.num_cached_tokens,
+        },
+    )
+    assert (
+        response.model_dump()["usage"]["prompt_tokens_details"]["cached_tokens"]
+        == p_hits
+    )
+
+
+def test_opposite_admission_order_with_exhausted_kv_pools(monkeypatch, seq_factory):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+    from atom.sampling_params import SamplingParams
+
+    p = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=10))
+    d = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=10))
+    p.kv_connector = scheduler_connector(monkeypatch, True)
+    d.kv_connector = scheduler_connector(monkeypatch, False)
+
+    def request(name, is_producer):
+        return seq_factory(
+            list(range(10)),
+            sampling_params=SamplingParams(max_tokens=1 if is_producer else 2),
+            kv_transfer_params={
+                "chunked_transfer": True,
+                "do_remote_decode" if is_producer else "do_remote_prefill": True,
+                "transfer_id": name,
+                "block_size": 4,
+                "dcp_size": 1,
+            },
+        )
+
+    pa, pb = request("xfer-a", True), request("xfer-b", True)
+    da, db = request("xfer-a", False), request("xfer-b", False)
+    for seq in (pa, pb):
+        p.add(seq)
+    for seq in (db, da):
+        d.add(seq)
+    pbatch, pseqs = p.schedule()
+    _, dseqs = d.schedule()
+    assert list(pseqs) == [pa.id] and not dseqs
+    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 0
+    assert not pb.block_table and not da.block_table
+
+    worker, _, wire, _, _ = producer()
+    worker._chunked_prefills.clear()
+    worker._chunked_local_ids.clear()
+    worker._send_executor = SimpleNamespace(submit=lambda fn, *a, **kw: fn(*a, **kw))
+    worker.start_load_kv(pbatch.connector_meta_output)
+    wire_b = dict(wire, request_id=db.id, transfer_id="xfer-b")
+    # D's B reservation has already asked P for a transfer, but P only has A.
+    worker._pending_chunked_requests.append((wire_b, mc.time.monotonic()))
+    worker._dispatch_ready_chunked_requests()
+    assert len(worker._pending_chunked_requests) == 1
+    publish(worker._chunked_prefills["xfer-a"], 10)
+    p.postprocess(
+        list(pseqs.values()),
+        ScheduledBatchOutput([pa.id], [(42,)], None, None, None),
+        batch=pbatch,
+    )
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    # P cannot allocate B. Even a snapshot containing ONLY the capacity signal
+    # must count as work, or the idle engine will never dispatch it.
+    pressure, seqs = p.schedule()
+    assert not seqs and pressure.connector_meta_output.has_work()
+    assert pressure.connector_meta_output.reclaim_unclaimed_prefills
+    assert not pressure.connector_meta_output.reqs_to_save
+    worker.start_load_kv(pressure.connector_meta_output)
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    assert not pa.block_table and p.block_manager.kv.num_free == 3
+
+    # P can now finish B and satisfy D's existing reservation, without a timer.
+    pbatch, pseqs = p.schedule()
+    assert list(pseqs) == [pb.id]
+    worker.start_load_kv(pbatch.connector_meta_output)
+    state_b = worker._chunked_prefills["xfer-b"]
+    wire_b["prompt_digest"] = state_b.prompt_digest
+    p.postprocess(
+        list(pseqs.values()),
+        ScheduledBatchOutput([pb.id], [(42,)], None, None, None),
+        batch=pbatch,
+    )
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    publish(state_b, 10)
+    worker._dispatch_ready_chunked_requests()
+    worker._notify_transfer_result.assert_called_once_with(wire_b, success=True)
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    assert not pb.block_table
+    d._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={db.id},
+            received_handoffs={
+                db.id: PrefillHandoff.from_wire(db.id, wire_b["prefill_handoff"])
+            },
+        )
+    )
+    dbatch, dseqs = d.schedule()
+    assert list(dseqs) == [db.id]
+    assert d.postprocess(
+        list(dseqs.values()),
+        ScheduledBatchOutput([db.id], [(43,)], None, None, None),
+        batch=dbatch,
+    ) == [db]
+
+    # D's late A admission gets an immediate failure for the retired source,
+    # then completes by the existing local-prefill fallback using the same pool.
+    _, seqs = d.schedule()
+    assert not seqs and da.block_table
+    wire_a = dict(wire, request_id=da.id)
+    worker._pending_chunked_requests.append((wire_a, mc.time.monotonic()))
+    worker._dispatch_ready_chunked_requests()
+    worker._notify_transfer_result.assert_called_with(wire_a, success=False)
+    assert not worker._pending_chunked_requests
+    d._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={da.id}))
+    dbatch, dseqs = d.schedule()
+    assert list(dseqs) == [da.id] and dbatch.total_seqs_num_prefill == 1
+    d.postprocess(
+        list(dseqs.values()),
+        ScheduledBatchOutput([da.id], [(44,)], None, None, None),
+        batch=dbatch,
+    )
+    dbatch, dseqs = d.schedule()
+    assert d.postprocess(
+        list(dseqs.values()),
+        ScheduledBatchOutput([da.id], [(45,)], None, None, None),
+        batch=dbatch,
+    ) == [da]
+    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 3
+    assert not p.deferred_free_blocks and not d.deferred_free_blocks
+
+
+@pytest.mark.parametrize("reader_done", [False, True])
+def test_capacity_reclaim_preserves_active_and_partially_served_sources(reader_done):
+    worker, state, _, _, _ = producer()
+    publish(state, 10)
+    state.finish({"first_token_id": 42})
+    assert state.acquire(("first-consumer",), 2)
+    if reader_done:
+        state.release()
+    pressure = ConnectorMetadata()
+    pressure.reclaim_unclaimed_prefills = True
+    worker.start_load_kv(pressure)
+    assert not state.cancelled and not state.source_safe()
+    assert worker.get_finished().is_empty()
+
+
+def test_late_metadata_cannot_resurrect_retired_source():
+    worker, state, wire, _, _ = producer()
+    state.cancel()
+    assert worker.get_finished().connector_completions
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_save(
+        state.req_id,
+        list(state.block_ids),
+        {
+            "transfer_id": "xfer-a",
+            "chunked_transfer": True,
+            "num_prompt_tokens": 10,
+            "prefill_handoff": {"first_token_id": 42},
+        },
+    )
+    worker.start_load_kv(meta)
+    assert not worker._chunked_prefills and worker.get_finished().is_empty()
+    worker._execute_transfer(wire)
+    worker._notify_transfer_result.assert_called_once_with(wire, success=False)
+    assert worker.transfer_engine.writes.empty()
+
+
+def test_capacity_signal_survives_composite_metadata(monkeypatch, seq_factory):
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    connector = scheduler_connector(monkeypatch, True)
+    seq = seq_factory(
+        list(range(10)),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode": True,
+            "transfer_id": "xfer-a",
+        },
+    )
+    seq.block_table = [1, 2, 3]
+    connector.update_state_after_alloc(seq)
+    connector.build_connector_meta()
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [connector]
+    multi.admission_blocked()
+    meta = multi.build_connector_meta()
+    assert meta.has_work() and meta.metas[0].reclaim_unclaimed_prefills
+    assert not multi.build_connector_meta().has_work()
+
+
+def test_capacity_reclaim_waits_for_final_prefill():
+    worker, state, _, _, _ = producer()
+    publish(state, 4)
+    pressure = ConnectorMetadata()
+    pressure.reclaim_unclaimed_prefills = True
+    worker.start_load_kv(pressure)
+    assert not state.cancelled and not state.source_safe()
+
+
+def test_terminal_transfer_history_is_bounded_without_retaining_sources(monkeypatch):
+    monkeypatch.setattr(mc, "CHUNKED_RETIRED_TRANSFER_LIMIT", 2)
+    worker, state, _, _, _ = producer()
+    state.cancel()
+    worker.get_finished()
+    for transfer_id in ("xfer-b", "xfer-c"):
+        meta = ConnectorMetadata()
+        meta.add_new_req_to_save(
+            7,
+            [5, 1, 8],
+            {
+                "transfer_id": transfer_id,
+                "chunked_transfer": True,
+                "num_prompt_tokens": 10,
+                "prefill_aborted": True,
+            },
+        )
+        worker.start_load_kv(meta)
+        worker.get_finished()
+    assert list(worker._retired_chunked_transfers) == ["xfer-b", "xfer-c"]
+    assert not worker._chunked_prefills and not worker._chunked_local_ids

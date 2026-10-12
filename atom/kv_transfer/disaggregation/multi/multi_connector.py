@@ -771,6 +771,20 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "has_pending_work")
         )
 
+    def admission_blocked(self) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "admission_blocked", None)
+            if callable(callback):
+                callback()
+
+    def abort_send(self, seq: Any) -> None:
+        for connector in self._connectors:
+            callback = getattr(connector, "abort_send", None)
+            if callable(callback):
+                callback(seq)
+            elif hasattr(connector, "send_finished"):
+                connector.send_finished(seq.id)
+
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         for connector in self._connectors:
             callback = getattr(connector, "process_pd_completions", None)

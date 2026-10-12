@@ -124,6 +124,19 @@ class ChunkedPrefill:
             self.cancelled = True
             self.cv.notify_all()
 
+    def cancel_if_unclaimed(self):
+        """Relinquish a finished source under capacity pressure, before any read.
+
+        A partially served fan-out must finish normally: ``readers == 0`` alone
+        could mean one consumer has finished while another has yet to arrive.
+        """
+        with self.cv:
+            if self.handoff is None or self.claims:
+                return False
+            self.cancelled = True
+            self.cv.notify_all()
+            return True
+
     def acquire(self, consumer_identity, expected_readers):
         """Claim one consumer's reads of this producer rank's source blocks.
 
