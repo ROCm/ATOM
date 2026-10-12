@@ -111,8 +111,6 @@ pub struct RouterConfig {
     pub tokenizer_cache: TokenizerCacheConfig,
 }
 
-/// Default `--prepare-max-retained-input-bytes`.
-pub const DEFAULT_MAX_RETAINED_INPUT_BYTES: usize = 32 * 1024 * 1024;
 /// Default `--prepare-queue-timeout-ms`.
 pub const DEFAULT_PREPARE_QUEUE_TIMEOUT_MS: u64 = 250;
 /// Default `--prepare-timeout-ms`.
@@ -134,13 +132,6 @@ pub struct PreparePoolConfig {
     /// Jobs waiting for a preparation thread (default: 10 per thread).
     #[arg(id = "prepare_queue_capacity", long = "prepare-queue-capacity")]
     pub queue_capacity: Option<usize>,
-    /// Input bytes held by queued or running preparation, released before forwarding.
-    #[arg(
-        id = "prepare_max_retained_input_bytes",
-        long = "prepare-max-retained-input-bytes",
-        default_value_t = DEFAULT_MAX_RETAINED_INPUT_BYTES
-    )]
-    pub max_retained_input_bytes: usize,
     /// Queue wait limit.
     #[arg(
         id = "prepare_queue_timeout_ms",
@@ -165,7 +156,6 @@ impl Default for PreparePoolConfig {
         Self {
             workers: None,
             queue_capacity: None,
-            max_retained_input_bytes: DEFAULT_MAX_RETAINED_INPUT_BYTES,
             queue_timeout_ms: DEFAULT_PREPARE_QUEUE_TIMEOUT_MS,
             prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
             max_tokenize_bytes: None,
@@ -516,7 +506,6 @@ impl RouterConfig {
         let pool = PoolConfig {
             workers,
             queue_capacity,
-            max_retained_input_bytes: config.max_retained_input_bytes,
             queue_timeout: Duration::from_millis(config.queue_timeout_ms),
             prepare_timeout: Duration::from_millis(config.prepare_timeout_ms),
         };
@@ -593,7 +582,6 @@ mod tests {
         assert_eq!(config.resolved_prepare_workers(), workers);
         let pool = config.resolved_prepare_pool().unwrap();
         assert_eq!(pool.queue_capacity, workers * 10);
-        assert_eq!(pool.max_retained_input_bytes, 32 * 1024 * 1024);
         assert_eq!(pool.queue_timeout, Duration::from_millis(250));
         assert_eq!(pool.prepare_timeout, Duration::from_secs(5));
         assert_eq!(config.prepare_pool.queue_capacity, None);
@@ -605,12 +593,12 @@ mod tests {
 
         // Removed options in saved configs are ignored.
         let partial: PreparePoolConfig = serde_json::from_str(
-            r#"{"workers":2,"shutdown_grace_ms":3000,"parse_inline_max_bytes":1024}"#,
+            r#"{"workers":2,"shutdown_grace_ms":3000,"parse_inline_max_bytes":1024,
+                "max_retained_input_bytes":1024}"#,
         )
         .unwrap();
         assert_eq!(partial.workers, Some(2));
         assert_eq!(partial.queue_capacity, None);
-        assert_eq!(partial.max_retained_input_bytes, 32 * 1024 * 1024);
         let config = RouterConfig {
             prepare_pool: partial,
             ..Default::default()

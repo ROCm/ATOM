@@ -14,7 +14,6 @@ fn config() -> PoolConfig {
     PoolConfig {
         workers: 1,
         queue_capacity: 2,
-        max_retained_input_bytes: 32,
         queue_timeout: Duration::from_secs(2),
         prepare_timeout: Duration::from_secs(5),
     }
@@ -26,22 +25,18 @@ fn start(settings: PoolConfig) -> PreparePoolRuntime {
     runtime
 }
 
-async fn blocked(
+async fn blocked<T: Send + 'static>(
     handle: &PrepareHandle,
-    lease: InputLease,
+    output: T,
     deadline: Instant,
-) -> (
-    PrepareTicket<InputLease>,
-    oneshot::Receiver<()>,
-    mpsc::Sender<()>,
-) {
+) -> (PrepareTicket<T>, oneshot::Receiver<()>, mpsc::Sender<()>) {
     let (started_tx, started) = oneshot::channel();
     let (release, gate) = mpsc::channel();
     let ticket = handle
         .submit(deadline, move |_| {
             let _ = started_tx.send(());
             gate.recv_timeout(Duration::from_secs(5)).unwrap();
-            lease
+            output
         })
         .await
         .unwrap();
@@ -110,19 +105,15 @@ async fn burst_fills_execution_and_queue_capacity_without_idle_workers() {
 async fn canceled_waiter_releases_queue_slot_and_input_immediately() {
     let mut runtime = start(config());
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(5).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
     started.await.unwrap();
     let called = Arc::new(AtomicBool::new(false));
     let job_called = called.clone();
-    let lease = handle.retain_input(7).unwrap();
+    let input = Arc::new(());
+    let job_input = input.clone();
     let mut canceled = Box::pin(handle.submit(handle.prepare_deadline(), move |_| {
         job_called.store(true, Ordering::Release);
-        lease
+        job_input
     }));
     assert!(poll!(&mut canceled).is_pending());
     let mut waiting = Box::pin(handle.submit(handle.prepare_deadline(), |_| 42));
@@ -134,13 +125,13 @@ async fn canceled_waiter_releases_queue_slot_and_input_immediately() {
     ));
     drop(canceled);
     assert_eq!(handle.stats().queued_jobs, 1);
-    assert_eq!(handle.stats().retained_input_bytes, 5);
+    assert_eq!(Arc::strong_count(&input), 1);
     assert_eq!(handle.stats().execution_reserved, 1);
     let mut replacement = Box::pin(handle.submit(handle.prepare_deadline(), |_| ()));
     assert!(poll!(&mut replacement).is_pending());
     drop(replacement);
     release.send(()).unwrap();
-    drop(active.wait().await.unwrap());
+    active.wait().await.unwrap();
     assert_eq!(waiting.await.unwrap().wait().await.unwrap(), 42);
     assert!(!called.load(Ordering::Acquire));
     runtime.shutdown().await;
@@ -150,17 +141,12 @@ async fn canceled_waiter_releases_queue_slot_and_input_immediately() {
 async fn waiting_jobs_are_fifo_and_new_submitters_cannot_bypass_them() {
     let mut runtime = start(config());
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(1).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
     started.await.unwrap();
     let mut first = Box::pin(handle.submit(handle.prepare_deadline(), |_| 1));
     assert!(poll!(&mut first).is_pending());
     release.send(()).unwrap();
-    drop(active.wait().await.unwrap());
+    active.wait().await.unwrap();
     eventually(|| handle.stats().busy_workers == 0).await;
     // The released permit belongs to the first waiter even before it polls.
     let mut second = Box::pin(handle.submit(handle.prepare_deadline(), |_| 2));
@@ -176,23 +162,19 @@ async fn queue_and_overall_deadlines_free_waiting_slot_and_input_without_running
     settings.queue_timeout = Duration::from_millis(20);
     let mut runtime = start(settings);
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(5).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
     started.await.unwrap();
-    let lease = handle.retain_input(7).unwrap();
+    let input = Arc::new(());
+    let job_input = input.clone();
     let result = handle
         .submit(handle.prepare_deadline(), move |_| {
-            drop(lease);
+            drop(job_input);
             panic!("expired waiting job must not execute");
         })
         .await;
     assert!(matches!(result, Err(PrepareError::QueueTimeout)));
     assert_eq!(handle.stats().queued_jobs, 0);
-    assert_eq!(handle.stats().retained_input_bytes, 5);
+    assert_eq!(Arc::strong_count(&input), 1);
     assert_eq!(handle.stats().execution_reserved, 1);
     // An overall deadline earlier than the queue deadline reports Timeout.
     let result = handle
@@ -201,7 +183,7 @@ async fn queue_and_overall_deadlines_free_waiting_slot_and_input_without_running
     assert!(matches!(result, Err(PrepareError::Timeout)));
     assert_eq!(handle.stats().queued_jobs, 0);
     release.send(()).unwrap();
-    drop(active.wait().await.unwrap());
+    active.wait().await.unwrap();
     runtime.shutdown().await;
 }
 
@@ -209,14 +191,14 @@ async fn queue_and_overall_deadlines_free_waiting_slot_and_input_without_running
 async fn running_cancellation_and_timeout_hold_execution_and_input_until_return() {
     let mut runtime = start(config());
     let handle = runtime.handle();
+    let input = Arc::new(());
     for timeout in [false, true] {
         let deadline = if timeout {
             Instant::now() + Duration::from_millis(30)
         } else {
             handle.prepare_deadline()
         };
-        let (active, started, release) =
-            blocked(&handle, handle.retain_input(32).unwrap(), deadline).await;
+        let (active, started, release) = blocked(&handle, input.clone(), deadline).await;
         started.await.unwrap();
         if timeout {
             assert!(matches!(active.wait().await, Err(PrepareError::Timeout)));
@@ -227,16 +209,12 @@ async fn running_cancellation_and_timeout_hold_execution_and_input_until_return(
         assert_eq!(handle.stats().live_workers, 1);
         assert_eq!(handle.stats().execution_reserved, 1);
         assert_eq!(handle.stats().busy_workers, 1);
-        assert_eq!(handle.stats().retained_input_bytes, 32);
-        assert!(matches!(
-            handle.retain_input(1),
-            Err(PrepareError::BudgetExceeded)
-        ));
+        assert_eq!(Arc::strong_count(&input), 2);
         let mut next = Box::pin(handle.submit(handle.prepare_deadline(), |_| 9));
         assert!(poll!(&mut next).is_pending());
         release.send(()).unwrap();
         assert_eq!(next.await.unwrap().wait().await.unwrap(), 9);
-        eventually(|| handle.stats().retained_input_bytes == 0).await;
+        eventually(|| Arc::strong_count(&input) == 1).await;
     }
     runtime.shutdown().await;
 }
@@ -247,19 +225,14 @@ async fn queue_timer_cannot_timeout_an_already_running_job() {
     settings.queue_timeout = Duration::from_millis(20);
     let mut runtime = start(settings);
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(1).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, 1, handle.prepare_deadline()).await;
     started.await.unwrap();
     let release_later = async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
         release.send(()).unwrap();
     };
     let (result, ()) = tokio::join!(active.wait(), release_later);
-    assert_eq!(result.unwrap().bytes(), 1);
+    assert_eq!(result.unwrap(), 1);
     runtime.shutdown().await;
 }
 
@@ -269,10 +242,11 @@ async fn dispatched_timeout_holds_execution_slot_until_worker_cleanup() {
     settings.queue_timeout = Duration::from_millis(20);
     let (mut runtime, receiver) = deferred_worker(settings);
     let handle = runtime.handle();
-    let lease = handle.retain_input(7).unwrap();
+    let input = Arc::new(());
+    let job_input = input.clone();
     let ticket = handle
         .submit(handle.prepare_deadline(), move |_| {
-            drop(lease);
+            drop(job_input);
             panic!("canceled dispatched job must not execute");
         })
         .await
@@ -283,10 +257,10 @@ async fn dispatched_timeout_holds_execution_slot_until_worker_cleanup() {
     ));
     assert_eq!(handle.stats().execution_reserved, 1);
     assert_eq!(handle.stats().dispatched_jobs, 1);
-    assert_eq!(handle.stats().retained_input_bytes, 7);
+    assert_eq!(Arc::strong_count(&input), 2);
     receiver.recv().unwrap().execute();
     assert_eq!(handle.stats().execution_reserved, 0);
-    assert_eq!(handle.stats().retained_input_bytes, 0);
+    assert_eq!(Arc::strong_count(&input), 1);
     // The worker checks the queue deadline even if the ticket was never polled.
     let ticket = handle
         .submit(handle.prepare_deadline(), |_| panic!("expired job ran"))
@@ -330,7 +304,7 @@ async fn slow_output_cleanup_retains_execution_capacity_and_input() {
     struct SlowOutput {
         started: Option<oneshot::Sender<()>>,
         gate: mpsc::Receiver<()>,
-        _lease: InputLease,
+        _input: Arc<()>,
     }
     impl Drop for SlowOutput {
         fn drop(&mut self) {
@@ -340,6 +314,7 @@ async fn slow_output_cleanup_retains_execution_capacity_and_input() {
     }
     let mut runtime = start(config());
     let handle = runtime.handle();
+    let input = Arc::new(());
     let (work_started_tx, work_started) = oneshot::channel();
     let (work_release, work_gate) = mpsc::channel();
     let (cleanup_started_tx, cleanup_started) = oneshot::channel();
@@ -347,7 +322,7 @@ async fn slow_output_cleanup_retains_execution_capacity_and_input() {
     let output = SlowOutput {
         started: Some(cleanup_started_tx),
         gate: cleanup_gate,
-        _lease: handle.retain_input(32).unwrap(),
+        _input: input.clone(),
     };
     let ticket = handle
         .submit(handle.prepare_deadline(), move |_| {
@@ -365,44 +340,10 @@ async fn slow_output_cleanup_retains_execution_capacity_and_input() {
     assert!(poll!(&mut next).is_pending());
     assert_eq!(handle.stats().busy_workers, 1);
     assert_eq!(handle.stats().execution_reserved, 1);
-    assert_eq!(handle.stats().retained_input_bytes, 32);
+    assert_eq!(Arc::strong_count(&input), 2);
     cleanup_release.send(()).unwrap();
     assert_eq!(next.await.unwrap().wait().await.unwrap(), 9);
-    assert_eq!(handle.stats().retained_input_bytes, 0);
-    runtime.shutdown().await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn result_and_lease_clones_keep_one_charge_after_worker_finishes() {
-    let mut runtime = start(config());
-    let handle = runtime.handle();
-    let lease = handle.retain_input(32).unwrap();
-    let shared = lease.clone();
-    let ticket = handle
-        .submit(handle.prepare_deadline(), move |_| lease)
-        .await
-        .unwrap();
-    eventually(|| handle.stats().execution_reserved == 0).await;
-    assert_eq!(handle.stats().retained_input_bytes, 32);
-    assert!(matches!(
-        handle.retain_input(1),
-        Err(PrepareError::BudgetExceeded)
-    ));
-    drop(ticket);
-    assert_eq!(handle.stats().retained_input_bytes, 32);
-    drop(shared);
-    assert_eq!(handle.stats().retained_input_bytes, 0);
-    let lease = handle.retain_input(32).unwrap();
-    let returned = handle
-        .submit(handle.prepare_deadline(), move |_| lease)
-        .await
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
-    assert_eq!(handle.stats().retained_input_bytes, 32);
-    drop(returned);
-    assert_eq!(handle.stats().retained_input_bytes, 0);
+    assert_eq!(Arc::strong_count(&input), 1);
     runtime.shutdown().await;
 }
 
@@ -410,27 +351,22 @@ async fn result_and_lease_clones_keep_one_charge_after_worker_finishes() {
 async fn close_wakes_waiters_and_rejects_new_submissions() {
     let mut runtime = start(config());
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(5).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
     started.await.unwrap();
-    let lease = handle.retain_input(7).unwrap();
-    let mut waiting = Box::pin(handle.submit(handle.prepare_deadline(), move |_| lease));
+    let input = Arc::new(());
+    let job_input = input.clone();
+    let mut waiting = Box::pin(handle.submit(handle.prepare_deadline(), move |_| job_input));
     assert!(poll!(&mut waiting).is_pending());
     runtime.close();
     assert!(matches!(waiting.await, Err(PrepareError::Closed)));
     assert_eq!(handle.stats().queued_jobs, 0);
-    assert_eq!(handle.stats().retained_input_bytes, 5);
+    assert_eq!(Arc::strong_count(&input), 1);
     assert!(matches!(
         handle.submit(handle.prepare_deadline(), |_| ()).await,
         Err(PrepareError::Closed)
     ));
-    assert!(matches!(handle.retain_input(1), Err(PrepareError::Closed)));
     release.send(()).unwrap();
-    drop(active.wait().await.unwrap());
+    active.wait().await.unwrap();
     assert_eq!(runtime.shutdown().await, 0);
 }
 
@@ -438,12 +374,7 @@ async fn close_wakes_waiters_and_rejects_new_submissions() {
 async fn shutdown_is_bounded_with_worker_still_blocked_and_wakes_waiters() {
     let mut runtime = start(config());
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(5).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
     started.await.unwrap();
     let mut waiting = Box::pin(handle.submit(handle.prepare_deadline(), |_| ()));
     assert!(poll!(&mut waiting).is_pending());
@@ -456,24 +387,21 @@ async fn shutdown_is_bounded_with_worker_still_blocked_and_wakes_waiters() {
     release.send(()).unwrap();
     assert!(matches!(active.wait().await, Err(PrepareError::Cancelled)));
     eventually(|| handle.stats().live_workers == 0).await;
-    assert_eq!(handle.stats().retained_input_bytes, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn dropped_runtime_does_not_join_and_weak_handles_do_not_keep_it_open() {
     let runtime = start(config());
     let handle = runtime.handle();
-    let (active, started, release) = blocked(
-        &handle,
-        handle.retain_input(5).unwrap(),
-        handle.prepare_deadline(),
-    )
-    .await;
+    let (active, started, release) = blocked(&handle, (), handle.prepare_deadline()).await;
     started.await.unwrap();
     let start = Instant::now();
     drop(runtime);
     assert!(start.elapsed() < Duration::from_secs(1));
-    assert!(matches!(handle.retain_input(1), Err(PrepareError::Closed)));
+    assert!(matches!(
+        handle.submit(handle.prepare_deadline(), |_| ()).await,
+        Err(PrepareError::Closed)
+    ));
     release.send(()).unwrap();
     assert!(matches!(active.wait().await, Err(PrepareError::Cancelled)));
 }
@@ -610,7 +538,7 @@ async fn concurrent_submitters_cannot_submit_after_close_returns() {
 }
 
 #[test]
-fn invalid_config_and_oversized_input_are_rejected() {
+fn invalid_config_is_rejected() {
     for settings in [
         PoolConfig {
             workers: 0,
@@ -618,10 +546,6 @@ fn invalid_config_and_oversized_input_are_rejected() {
         },
         PoolConfig {
             queue_capacity: 0,
-            ..config()
-        },
-        PoolConfig {
-            max_retained_input_bytes: 0,
             ..config()
         },
         PoolConfig {
@@ -639,13 +563,4 @@ fn invalid_config_and_oversized_input_are_rejected() {
     ] {
         assert!(PreparePoolRuntime::new(settings).is_err());
     }
-    // Input larger than the whole budget can never fit, so it is not retryable.
-    let (runtime, _receiver) = deferred_worker(config());
-    let handle = runtime.handle();
-    let error = handle.retain_input(33).unwrap_err();
-    assert_eq!(error, PrepareError::InputTooLarge);
-    assert_eq!(error.status_code(), 413);
-    assert_eq!(handle.stats().retained_input_bytes, 0);
-    // Exactly the whole budget is still admissible.
-    drop(handle.retain_input(32).unwrap());
 }

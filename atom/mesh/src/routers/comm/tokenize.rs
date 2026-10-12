@@ -42,34 +42,29 @@ fn prepare_error_response(error: PrepareError) -> Response {
 }
 
 /// Run CPU-bound tokenizer work and response serialization on the preparation
-/// pool, so Tokio workers stay free for I/O. The input lease is held until the
-/// job finishes.
+/// pool, so Tokio workers stay free for I/O.
 async fn run_on_prepare_pool(
     context: &AppContext,
-    input_bytes: usize,
     work: impl FnOnce(&JobContext) -> Response + Send + 'static,
 ) -> Response {
     let pool = &context.prepare_pool;
-    let lease = match pool.retain_input(input_bytes) {
-        Ok(lease) => lease,
-        Err(error) => return prepare_error_response(error),
-    };
-    let ticket = pool
-        .submit(pool.prepare_deadline(), move |ctx| {
-            let _lease = lease;
-            work(ctx)
-        })
-        .await;
+    let ticket = pool.submit(pool.prepare_deadline(), work).await;
     match ticket {
         Ok(ticket) => ticket.wait().await.unwrap_or_else(prepare_error_response),
         Err(error) => prepare_error_response(error),
     }
 }
 
-fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn Tokenizer>, String> {
-    if let Some(tokenizer) = registry.get(model) {
+fn get_tokenizer_entry(
+    registry: &TokenizerRegistry,
+    model: &str,
+) -> Result<TokenizerEntry, String> {
+    if let Some(entry) = registry
+        .get_by_name(model)
+        .or_else(|| registry.get_by_id(model))
+    {
         debug!("Found tokenizer for model: {}", model);
-        return Ok(tokenizer);
+        return Ok(entry);
     }
 
     if model == UNKNOWN_MODEL_ID || model.is_empty() {
@@ -79,7 +74,7 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
                 "Using first available tokenizer '{}' as default",
                 first.name
             );
-            return Ok(first.tokenizer.clone());
+            return Ok(first.clone());
         }
     }
 
@@ -99,21 +94,16 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
 pub async fn tokenize(context: &Arc<AppContext>, request: TokenizeRequest) -> Response {
     debug!("Tokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(&context.tokenizer_registry, &request.model) {
-        Ok(t) => t,
+    let entry = match get_tokenizer_entry(&context.tokenizer_registry, &request.model) {
+        Ok(entry) => entry,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
         }
     };
 
-    let input_bytes = request
-        .prompt
-        .as_strings()
-        .iter()
-        .map(|text| text.len())
-        .sum();
-    run_on_prepare_pool(context, input_bytes, move |_| {
-        encode_prompts(&*tokenizer, &request)
+    run_on_prepare_pool(context, move |_| {
+        let encoder = crate::routers::prepare::thread_tokenizer::encoder(&entry);
+        encode_prompts(&*encoder, &request)
     })
     .await
 }
@@ -172,23 +162,14 @@ fn encode_prompts(tokenizer: &dyn Tokenizer, request: &TokenizeRequest) -> Respo
 pub async fn detokenize(context: &Arc<AppContext>, request: DetokenizeRequest) -> Response {
     debug!("Detokenize request for model: {}", request.model);
 
-    let tokenizer = match get_tokenizer(&context.tokenizer_registry, &request.model) {
-        Ok(t) => t,
+    let tokenizer = match get_tokenizer_entry(&context.tokenizer_registry, &request.model) {
+        Ok(entry) => entry.tokenizer,
         Err(e) => {
             return error_response(StatusCode::BAD_REQUEST, &e, "tokenizer_not_found");
         }
     };
 
-    let input_bytes = request
-        .tokens
-        .sequences()
-        .iter()
-        .map(|seq| size_of_val(*seq))
-        .sum();
-    run_on_prepare_pool(context, input_bytes, move |_| {
-        decode_sequences(&*tokenizer, &request)
-    })
-    .await
+    run_on_prepare_pool(context, move |_| decode_sequences(&*tokenizer, &request)).await
 }
 
 fn decode_sequences(tokenizer: &dyn Tokenizer, request: &DetokenizeRequest) -> Response {

@@ -730,8 +730,6 @@ mod tests {
             "2",
             "--prepare-queue-capacity",
             "6",
-            "--prepare-max-retained-input-bytes",
-            "65536",
             "--prepare-queue-timeout-ms",
             "100",
             "--prepare-timeout-ms",
@@ -746,7 +744,6 @@ mod tests {
             crate::config::PreparePoolConfig {
                 workers: Some(2),
                 queue_capacity: Some(6),
-                max_retained_input_bytes: 65536,
                 queue_timeout_ms: 100,
                 prepare_timeout_ms: 2000,
                 max_tokenize_bytes: Some(8192),

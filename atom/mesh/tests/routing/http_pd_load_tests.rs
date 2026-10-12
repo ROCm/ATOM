@@ -260,7 +260,7 @@ impl IngressBackend {
             worker: Arc::new(
                 BasicWorkerBuilder::new(url)
                     .worker_type(role)
-                    .model_id("budget-test")
+                    .model_id("pd-ingress-test")
                     .build(),
             ),
             requests,
@@ -283,7 +283,7 @@ impl Drop for IngressBackend {
 }
 
 #[tokio::test]
-async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
+async fn pd_ingress_dispatches_next_request_while_prefill_body_is_blocked() {
     use crate::{
         app_context::AppContext,
         config::{PolicyConfig, PreparePoolConfig, RouterConfig, RoutingMode},
@@ -297,7 +297,7 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
     .await;
     let mut decode = IngressBackend::start(WorkerType::Decode).await;
     let raw = Bytes::from_static(
-        br#"{"model":"budget-test","messages":[{"role":"user","content":"hello"}],"vendor":{"keep":[1,2]}}"#,
+        br#"{"model":"pd-ingress-test","messages":[{"role":"user","content":"hello"}],"vendor":{"keep":[1,2]}}"#,
     );
     let config = RouterConfig {
         mode: RoutingMode::PrefillDecode {
@@ -311,15 +311,13 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
         disable_retries: true,
         prepare_pool: PreparePoolConfig {
             workers: Some(1),
-            max_retained_input_bytes: raw.len(),
             ..Default::default()
         },
         ..Default::default()
     };
     let mut pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
-    let handle = pool.handle();
     let app = Arc::new(
-        AppContext::from_config(config, 5, handle.clone())
+        AppContext::from_config(config, 5, pool.handle())
             .await
             .unwrap(),
     );
@@ -341,9 +339,7 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
         let router = router.clone();
         tokio::spawn(async move { router.route_inference(request, &app).await })
     };
-    let first = parse().await.unwrap();
-    assert_eq!(handle.stats().retained_input_bytes, raw.len());
-    let first = dispatch(first);
+    let first = dispatch(parse().await.unwrap());
     let (first_prefill, prefill_reply) = prefill.next_request().await;
     let (first_decode, decode_reply) = decode.next_request().await;
     assert_eq!(first_prefill["vendor"], json!({"keep":[1,2]}));
@@ -389,14 +385,9 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
         !first.is_finished(),
         "prefill body must still block the first request"
     );
-    assert_eq!(
-        handle.stats().retained_input_bytes,
-        0,
-        "backend response latency must not retain the preparation input budget"
-    );
 
-    // This identical input exhausts the entire configured budget on its own.
-    // It must reach both workers while the first prefill body is still gated.
+    // An identical request must reach both workers while the first prefill
+    // body is still gated.
     let second = dispatch(parse().await.unwrap());
     let (second_prefill, prefill_reply) = prefill.next_request().await;
     let (second_decode, decode_reply) = decode.next_request().await;
@@ -410,7 +401,6 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
     assert_eq!(second.status(), StatusCode::OK);
     second.into_body().collect().await.unwrap();
     assert!(!first.is_finished());
-    assert_eq!(handle.stats().retained_input_bytes, 0);
 
     release_body.send(()).unwrap();
     let first = result(first).await;
