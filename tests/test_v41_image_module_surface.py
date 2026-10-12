@@ -79,3 +79,16 @@ def test_the_whole_batch_restore_is_gone_and_stays_gone():
 
     with pytest.raises(NotImplementedError):
         mod.offer_restore_half(0, slots=[1], blocks=[2])
+
+
+def test_the_runtime_counts_the_steps_it_skipped():
+    """With the gate shut both directions are skipped, and that has to be
+    visible: "no images stored" otherwise reads the same whether the work
+    was skipped on purpose or silently failed."""
+    rt = mod.V41ImageRuntime.__new__(mod.V41ImageRuntime)
+    rt.stored = rt.restored = rt.missing_slots = rt.store_skipped = 0
+    rt.exporter = mod.V41ImageExporter.__new__(mod.V41ImageExporter)
+    rt.exporter.declined_null = 0
+    assert rt.stats()["image_skipped_gate_shut"] == 0
+    rt.store_skipped = 7
+    assert rt.stats()["image_skipped_gate_shut"] == 7

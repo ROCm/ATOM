@@ -680,10 +680,19 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     produces. So the marks vLLM set are carried to `wait_for_save`, which runs
     after it.
     """
-    from atom.plugin.vllm.v41_state_image import runtime
+    from atom.plugin.vllm.v41_state_image import images_can_serve, runtime
 
     rt = runtime()
     if rt is None or prepared is None:
+        return
+    if not images_can_serve():
+        # Registered but not serving: nothing will ever read these, so
+        # writing them is pure cost on the critical path. The gate is shut
+        # because vLLM's align-mode prefix caching wants state at a block
+        # boundary this backend cannot leave it at -- see
+        # `_RESTORE_IMPLEMENTED`. When that changes, this starts again with
+        # it rather than needing its own switch.
+        rt.store_skipped += 1
         return
     # Before the early return below, not after: a step that declines still
     # has to be able to say it declined. With the log after it, three runs
@@ -721,13 +730,14 @@ def v41_store_images_after_forward(prepared) -> int:
     """
     from atom.plugin.vllm.v41_state_image import (
         boundary_marks_for_ends,
+        images_can_serve,
         note_store_decline,
         runtime,
         take_store_marks,
     )
 
     rt = runtime()
-    if rt is None or prepared is None:
+    if rt is None or prepared is None or not images_can_serve():
         return 0
     slots = getattr(prepared, "image_slots", None)
     marks = take_store_marks()

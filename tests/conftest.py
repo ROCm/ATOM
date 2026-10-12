@@ -252,3 +252,34 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+@pytest.fixture(autouse=True)
+def v41_image_module_state_is_restored():
+    """Put `v41_state_image`'s module globals back after every test.
+
+    They are process-wide: a wired runtime, a cached layer class, a learned
+    group index. A test that sets one leaves every later test looking at a
+    model that has state-image layers registered -- measured, two tests in
+    other files failed in the full suite and passed alone.
+
+    A no-op when the module was never imported, which is most runs.
+    """
+    mod = sys.modules.get("atom.plugin.vllm.v41_state_image")
+    if mod is None:
+        yield
+        return
+    names = [
+        "_RUNTIME",
+        "_IMAGES_WIRED",
+        "_IMAGE_LAYER_CLS",
+        "_IMAGE_GROUP_INDEX",
+        "_IMAGE_BLOCK_SIZE",
+        "_RUNNER",
+        "_CKPT_BUILDER",
+    ]
+    before = {n: getattr(mod, n, None) for n in names}
+    yield
+    for n, v in before.items():
+        if hasattr(mod, n):
+            setattr(mod, n, v)

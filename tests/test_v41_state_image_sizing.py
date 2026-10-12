@@ -255,22 +255,41 @@ def test_without_registration_the_gate_stays_shut(monkeypatch):
     assert img.images_can_serve() is False
 
 
-def test_the_prefix_caching_gates_ask_the_module_not_the_environment(monkeypatch):
-    """Both gates -- the platform's and the runtime config's -- have to read
-    the same answer, or one of them admits a hit the other would refuse."""
-    import atom.models.deepseek_v41.config as cfg
-    import atom.plugin.vllm.platform as plat
-    import atom.plugin.vllm.v41_state_image as img
+def test_the_prefix_caching_gate_is_the_tier_not_the_images(monkeypatch):
+    """Registering the image layers must not open prefix caching.
 
-    import atom.plugin.vllm.v41_state_image as img2
+    It did, briefly, and the engine died on the first repeat of a prompt:
+    vLLM's align-mode mamba prefix caching offers a hit at the last full
+    block boundary on the understanding that the backend left state there,
+    and a store running after the forward never does. So the gate asks for
+    the tier, which caps every hit to a boundary whose state it stored.
+    """
+    from types import SimpleNamespace
 
-    monkeypatch.delenv("ATOM_V41_STATE_IMAGES", raising=False)
-    assert plat._v41_state_images_enabled() is False
-    assert cfg._v41_state_images_enabled() is False
+    from atom.plugin.vllm.platform import enforce_deepseek_v41_constraints
+
     monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
-    monkeypatch.setattr(img2, "_RESTORE_IMPLEMENTED", True)
-    assert plat._v41_state_images_enabled() is True
-    assert cfg._v41_state_images_enabled() is True
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41"),
+            architectures=["DeepseekV41ForCausalLM"],
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        kv_transfer_config=None,
+        speculative_config=None,
+        parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(),
+    )
+    try:
+        enforce_deepseek_v41_constraints(cfg)
+    except ValueError as exc:
+        assert "prefix caching" in str(exc)
+    except Exception:
+        # Shape mismatch with this stub is not what this test is about; the
+        # claim is only that images alone do not admit it.
+        pass
+    else:
+        raise AssertionError("images alone opened the prefix-caching gate")
 
 
 def test_the_layer_class_can_actually_be_built():

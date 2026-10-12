@@ -214,22 +214,6 @@ def _breakable_cudagraph_available() -> bool:
     return bool(is_breakable_cudagraph_enabled())
 
 
-def _v41_state_images_enabled() -> bool:
-    """Whether a prefix hit may be served from a checkpoint image.
-
-    Asks the image module rather than the environment: registering the layers
-    makes vLLM allocate and hash the image blocks, but a hit served from
-    blocks nothing has written is the stale cursor this gate exists to
-    prevent. Opening it on registration alone killed the engine on the second
-    send of one prompt, which is how this distinction got its own function.
-    """
-    try:
-        from atom.plugin.vllm.v41_state_image import images_can_serve
-    except Exception:
-        return False
-    return images_can_serve()
-
-
 def _v41_state_tier_configured(vllm_config) -> bool:
     """Whether this run has a connector that owns V4.1's per-request state."""
     kv = getattr(vllm_config, "kv_transfer_config", None)
@@ -276,7 +260,6 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         cache_config is not None
         and getattr(cache_config, "enable_prefix_caching", False)
         and not _v41_state_tier_configured(vllm_config)
-        and not _v41_state_images_enabled()
     ):
         msg = (
             "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "

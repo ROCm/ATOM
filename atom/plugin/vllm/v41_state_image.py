@@ -817,6 +817,10 @@ class V41ImageRuntime:
         #: objects disagree about which one owns them, which is how this
         #: path once did nothing at all without saying so.
         self.missing_slots = 0
+        #: Steps that skipped both directions because the gate is shut.
+        #: Non-zero is the expected reading today, and says the cost is
+        #: not being paid for images nothing will read.
+        self.store_skipped = 0
 
     # -- restore, before the forward -------------------------------------
     def restore_for(self, rows) -> int:
@@ -844,6 +848,7 @@ class V41ImageRuntime:
             "image_restored": self.restored,
             "image_declined_null": self.exporter.declined_null,
             "image_missing_slots": self.missing_slots,
+            "image_skipped_gate_shut": self.store_skipped,
         }
         d.update(rendezvous_stats())
         d["image_mark_failures"] = mark_failures()

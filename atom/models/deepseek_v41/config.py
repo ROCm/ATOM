@@ -338,22 +338,6 @@ def validate_speculative_config(config):
 _VLLM_PLUGIN_KV_CONNECTORS = ("AtomLMCacheOffloadConnector",)
 
 
-def _v41_state_images_enabled() -> bool:
-    """Whether a prefix hit may be served from a checkpoint image.
-
-    Asks the image module rather than the environment: registering the layers
-    makes vLLM allocate and hash the image blocks, but a hit served from
-    blocks nothing has written is the stale cursor this gate exists to
-    prevent. Opening it on registration alone killed the engine on the second
-    send of one prompt, which is how this distinction got its own function.
-    """
-    try:
-        from atom.plugin.vllm.v41_state_image import images_can_serve
-    except Exception:
-        return False
-    return images_can_serve()
-
-
 def _kv_connector_owns_v41_state(config) -> bool:
     """Whether a connector with a tier for V4.1's per-request state is on."""
     kv = config.kv_transfer_config or {}
@@ -466,7 +450,6 @@ def validate_runtime_config(config):
             # the image are both cached, so the hit is already a complete
             # resume. The sentence above -- "the STATE side is not replayed
             # by a block-table hit" -- is what stops being true.
-            and not _v41_state_images_enabled(),
         ),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
