@@ -220,34 +220,33 @@ def test_other_layers_are_ignored_by_the_check():
 # --- the gate the wiring has to open, not the environment ---------------
 
 
-def test_registration_alone_does_not_admit_a_prefix_hit(monkeypatch):
-    """Measured the hard way. vLLM allocates and hashes the image blocks as
-    soon as the layers are declared, whether or not anything fills them, so
-    opening the prefix-caching gate on registration served a hit from
-    unwritten blocks and killed the engine with `needs state at ...` on the
-    second send of one prompt."""
+def test_the_gate_is_shut_while_the_restore_is_incomplete(monkeypatch):
+    """The store round-trips byte for byte; the restore reads the wrong
+    column of the block table -- `MambaPrefillCheckpointBuilder` reports
+    where a checkpoint is WRITTEN, not where a resuming request reads one.
+    With the gate open that was `needs state at 2304, found 3`."""
     import atom.plugin.vllm.v41_state_image as img
 
     monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
-    monkeypatch.setattr(img, "_IMAGES_WIRED", False)
     assert img.images_registered() is True
+    assert img._RESTORE_IMPLEMENTED is False
     assert img.images_can_serve() is False
 
 
-def test_wiring_without_registration_does_not_admit_one_either(monkeypatch):
+def test_the_gate_opens_only_when_both_hold(monkeypatch):
+    import atom.plugin.vllm.v41_state_image as img
+
+    monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
+    monkeypatch.setattr(img, "_RESTORE_IMPLEMENTED", True)
+    assert img.images_can_serve() is True
+
+
+def test_without_registration_the_gate_stays_shut(monkeypatch):
     import atom.plugin.vllm.v41_state_image as img
 
     monkeypatch.delenv("ATOM_V41_STATE_IMAGES", raising=False)
     monkeypatch.setattr(img, "_IMAGES_WIRED", True)
     assert img.images_can_serve() is False
-
-
-def test_both_together_admit_one(monkeypatch):
-    import atom.plugin.vllm.v41_state_image as img
-
-    monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
-    monkeypatch.setattr(img, "_IMAGES_WIRED", True)
-    assert img.images_can_serve() is True
 
 
 def test_the_prefix_caching_gates_ask_the_module_not_the_environment(monkeypatch):
@@ -257,10 +256,12 @@ def test_the_prefix_caching_gates_ask_the_module_not_the_environment(monkeypatch
     import atom.plugin.vllm.platform as plat
     import atom.plugin.vllm.v41_state_image as img
 
-    monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
-    monkeypatch.setattr(img, "_IMAGES_WIRED", False)
+    import atom.plugin.vllm.v41_state_image as img2
+
+    monkeypatch.delenv("ATOM_V41_STATE_IMAGES", raising=False)
     assert plat._v41_state_images_enabled() is False
     assert cfg._v41_state_images_enabled() is False
-    monkeypatch.setattr(img, "_IMAGES_WIRED", True)
+    monkeypatch.setenv("ATOM_V41_STATE_IMAGES", "1")
+    monkeypatch.setattr(img2, "_RESTORE_IMPLEMENTED", True)
     assert plat._v41_state_images_enabled() is True
     assert cfg._v41_state_images_enabled() is True

@@ -648,7 +648,66 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
         )
         if prepared is not None:
             common_attn_metadata.atom_v41_prepared = prepared
+        if not capturing:
+            # Checkpoint images, both directions, around the forward this
+            # builder is staging for. Here because this runs once per step,
+            # before `set_forward_context` and outside anything a graph
+            # captures -- the same reason the rest of the staging is here.
+            _v41_images_around_forward(
+                self.vllm_config, common_attn_metadata, prepared
+            )
         return common_attn_metadata
+
+
+def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
+    """Publish this step's slots; store what the last forward produced.
+
+    The slot half of a restore is here because this is where the batch is
+    staged -- the same `slots` the forward will read state through. Taking
+    them from anywhere else is how a checkpoint gets written from one request
+    and read into another. The block half comes from the image group's own
+    builder, and whichever arrives second performs the restore.
+
+    The store is the other direction and cannot happen here: this runs BEFORE
+    the forward, and the bytes worth storing are the ones that forward
+    produces. So the marks vLLM set are carried to `wait_for_save`, which runs
+    after it.
+    """
+    from atom.plugin.vllm.v41_state_image import offer_restore_half, runtime
+
+    rt = runtime()
+    if rt is None or prepared is None:
+        return
+    slots = getattr(prepared, "state_slots_committed", None)
+    if slots is None:
+        return
+    offer_restore_half(
+        id(getattr(common_attn_metadata, "query_start_loc", common_attn_metadata)),
+        slots=list(slots),
+    )
+    # Remembered for the store after the forward.
+    prepared.image_slots = list(slots)
+
+
+def v41_store_images_after_forward(prepared) -> int:
+    """Write the images this step's forward just produced. Returns rows stored.
+
+    Called after the forward rather than from the builder, because a
+    checkpoint taken before it would hold the state of the step before --
+    which is a real image of the wrong boundary, and nothing downstream could
+    tell.
+    """
+    from atom.plugin.vllm.v41_state_image import runtime, take_store_marks
+
+    rt = runtime()
+    if rt is None or prepared is None:
+        return 0
+    slots = getattr(prepared, "image_slots", None)
+    marks = take_store_marks()
+    if not slots or not marks:
+        return 0
+    n = min(len(slots), len(marks))
+    return rt.store_for([(int(slots[i]), int(marks[i])) for i in range(n)])
 
 
 class AtomDeepseekV41ProxyBackend(AttentionBackend):
@@ -1095,7 +1154,45 @@ def bind_deepseek_v41_proxy_cache(
         raw.numel(),
         v41_kv_cache_dtype(vllm_config),
     )
+    _v41_install_image_runtime(vllm_config, builder.cache, num_slots)
     return True
+
+
+def _v41_install_image_runtime(vllm_config, cache, num_slots) -> None:
+    """Stand up the image runtime now the pool exists, and open the gates.
+
+    Here because this is the first moment both halves exist: the state arena
+    to copy out of, and the tensors vLLM gave the image layers. A failure is
+    loud rather than silent -- with images registered the pool was already
+    sized for them and prefix caching was admitted on the promise that
+    something would fill them, so carrying on without a runtime is the one
+    outcome that must not happen quietly.
+    """
+    from atom.plugin.vllm.v41_state_image import (
+        build_runtime,
+        images_registered,
+        install_runtime,
+        runtime,
+    )
+
+    if not images_registered() or runtime() is not None:
+        return
+    try:
+        rt = build_runtime(vllm_config, cache, cache.state_bytes, max_batch=num_slots)
+    except Exception as exc:
+        raise RuntimeError(
+            "DeepSeek-V4.1 state images are registered but their runtime "
+            f"could not be built: {exc}. Prefix caching was admitted on the "
+            "promise that something fills the image blocks, and the pool was "
+            "sized for them, so starting without it would serve hits from "
+            "blocks nothing wrote."
+        ) from exc
+    if rt is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 state images are registered but no runtime was "
+            "built. See the sentence above: this cannot be a no-op."
+        )
+    install_runtime(rt)
 
 
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
@@ -1785,4 +1882,16 @@ def atom_deepseek_v41_forward_context(
     try:
         yield step_positions
     finally:
+        # After the forward, which is the only moment the bytes worth
+        # checkpointing exist: a store taken before it would hold the state
+        # of the step before, a real image of the wrong boundary that nothing
+        # downstream could tell apart. In `finally` because a step that
+        # raised has no image to take and must still release the context.
+        if prepared is not None:
+            try:
+                v41_store_images_after_forward(prepared)
+            except Exception:
+                logger.warning(
+                    "V4.1 image store failed after a forward", exc_info=True
+                )
         reset_forward_context()

@@ -56,6 +56,10 @@ IMAGE_LAYER_PREFIX = "atom.dsv41.state_image"
 #: `needs state at ...` on the second send of one prompt.
 _IMAGES_WIRED = False
 
+#: The restore half is incomplete; see `images_can_serve`. Flipping this
+#: without fixing it admits prefix hits that resume from the wrong bytes.
+_RESTORE_IMPLEMENTED = False
+
 
 def images_registered() -> bool:
     """Whether the layers are declared to vLLM."""
@@ -67,11 +71,26 @@ def images_registered() -> bool:
 def images_can_serve() -> bool:
     """Whether a prefix hit may be served from an image.
 
-    Registration is necessary and not sufficient. This is what the prefix
-    caching gates ask, and it stays False until the store and the restore are
-    both installed.
+    Registration, and only registration -- because this is asked at CONFIG
+    time, before any pool is bound, and whether a runtime got installed is a
+    fact that does not exist yet. An earlier version asked for the wiring too
+    and therefore always said no.
+
+    What stops a hit being served from blocks nothing wrote is not this
+    predicate: it is that installing the runtime at bind time is MANDATORY
+    once the layers are registered. If it cannot be built the engine fails to
+    start, which is the same protection moved to a place that can actually
+    see the answer. `_IMAGES_WIRED` stays as an observable, not as a gate.
+
+    `_RESTORE_IMPLEMENTED` is False, so this is False, and a configuration
+    that turns images on is refused at startup rather than dying mid-run.
+    The store side works -- the byte round trip is covered -- but the restore
+    reads the wrong column: `MambaPrefillCheckpointBuilder` reports where a
+    checkpoint is WRITTEN, and a resuming request reads a different column of
+    the block table. Measured as `needs state at 2304, found 3` with the
+    gate open, which is what this constant now prevents.
     """
-    return images_registered() and _IMAGES_WIRED
+    return images_registered() and _RESTORE_IMPLEMENTED
 
 
 def image_layer_name(index: int) -> str:
@@ -518,9 +537,40 @@ def image_layer_class():
             self.layer_names = layer_names
             self.vllm_config = vllm_config
             self.device = device
+            self._ckpt = None
 
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            # vLLM decides which rows checkpoint, in lockstep with the
+            # scheduler; this only reads the answer out of THIS group's
+            # block table, which is the half the proxy's builder cannot see.
+            try:
+                self._publish(common_attn_metadata)
+            except Exception:
+                # A step without images is worse than a step without this
+                # bookkeeping, and the counters say when it happened.
+                logger.warning("V4.1 image marks failed for a step", exc_info=True)
+                _MARK_FAILURES.append(1)
             return None
+
+        def _publish(self, m):
+            from vllm.model_executor.layers.mamba.checkpoint import (
+                MambaPrefillCheckpointBuilder,
+            )
+
+            if m is None:
+                return
+            if self._ckpt is None:
+                self._ckpt = MambaPrefillCheckpointBuilder(
+                    self.vllm_config, self.kv_cache_spec
+                )
+            rows = list(range(int(m.num_reqs)))
+            meta = self._ckpt.build(m, rows)
+            if meta is None:
+                return
+            blocks = meta.state_indices.tolist()
+            offer_restore_half(_step_id(m), blocks=blocks)
+            _LAST_STORE_MARKS.clear()
+            _LAST_STORE_MARKS.extend(int(b) for b in blocks)
 
         def build_for_cudagraph_capture(self, common_attn_metadata):
             return None
@@ -642,3 +692,191 @@ def describe_registration(vllm_config, sizing: V41ImageSizing) -> list[dict]:
         out.append({"layer": name, "error": "absent"} if layer is None
                    else layer.describe_binding())
     return out
+
+
+# --- wiring: where a store and a restore actually happen ----------------
+
+
+class V41ImageRuntime:
+    """The worker-side half: a copier, an exporter, and vLLM's own builder.
+
+    Built once the proxy pool is bound, because until then there is no state
+    arena to copy out of and vLLM has not handed the image layers their
+    tensors. `install` is what flips `_IMAGES_WIRED`, so the prefix-caching
+    gates open on the wiring existing rather than on the layers being
+    declared -- registration alone served hits from blocks nothing had
+    written, which killed the engine.
+    """
+
+    def __init__(self, sizing: V41ImageSizing, copier, builder=None):
+        self.sizing = sizing
+        self.copier = copier
+        self.exporter = V41ImageExporter(sizing, copier)
+        self.vllm_builder = builder
+        self.restored = 0
+        self.stored = 0
+        self.restore_declined = 0
+
+    # -- restore, before the forward -------------------------------------
+    def restore_for(self, rows) -> int:
+        """`[(slot, block_id)]` for rows resuming at a hit boundary."""
+        n = self.exporter.restore(rows)
+        self.restored += n
+        return n
+
+    # -- store, after the forward ----------------------------------------
+    def store_for(self, rows) -> int:
+        before = self.exporter.stored
+        self.exporter.export(None, rows=rows)
+        n = self.exporter.stored - before
+        self.stored += n
+        return n
+
+    def stats(self) -> dict:
+        return {
+            "image_stored": self.stored,
+            "image_restored": self.restored,
+            "image_declined_null": self.exporter.declined_null,
+        }
+
+
+_RUNTIME = None
+
+
+def runtime():
+    return _RUNTIME
+
+
+def install_runtime(rt: V41ImageRuntime) -> None:
+    """Make the runtime current and open the prefix-caching gates.
+
+    The flag and the runtime are set together on purpose: they are the same
+    claim -- that something will fill the image blocks -- and splitting them
+    is how the gates once opened over blocks nothing wrote.
+    """
+    global _RUNTIME, _IMAGES_WIRED
+    _RUNTIME = rt
+    _IMAGES_WIRED = True
+    logger.info(
+        "DeepSeek-V4.1 state images wired: %d units of %d B, prefix hits may "
+        "now be served from an image",
+        rt.sizing.units,
+        rt.sizing.unit_bytes,
+    )
+
+
+def build_runtime(vllm_config, cache, state_bytes, max_batch: int = 64):
+    """Assemble the runtime from the bound pool. None when images are off."""
+    if not images_registered():
+        return None
+    sizing = sizing_from_geometry(cache.geometry)
+    sfc = vllm_config.compilation_config.static_forward_context
+    tensors = []
+    for name in expected_layer_names(sizing):
+        layer = sfc.get(name)
+        if layer is None:
+            raise ValueError(
+                f"image layer {name} is missing at bind time; the pool was "
+                "sized without it and a store would write unreserved bytes"
+            )
+        t = layer.kv_cache
+        t = t[0] if isinstance(t, tuple) else t
+        if getattr(t, "numel", None) is None or t.numel() == 0:
+            raise ValueError(
+                f"image layer {name} has no tensor bound; vLLM allocates "
+                "these, so an empty one means the layer was not in the "
+                "kv-cache config it built"
+            )
+        tensors.append(t)
+    copier = V41ImageCopier(sizing, state_bytes, tensors, max_batch=max_batch)
+    return V41ImageRuntime(sizing, copier)
+
+
+# --- the two halves of a step meet here ---------------------------------
+#
+# A restore needs a STATE slot and an image block id, and they are built in
+# different places: the slot by the proxy's metadata builder, which stages
+# the batch, and the block by the image group's, which holds that group's
+# block table. vLLM calls builders per group and does not promise an order,
+# so neither can assume it runs second.
+#
+# So both publish, and whoever completes the pair performs the restore. The
+# alternative -- picking one and hoping -- fails by doing nothing, which is a
+# prefix served from an unrestored slot: the silent half of the failure this
+# whole mechanism exists to prevent.
+
+
+class _StepRendezvous:
+    def __init__(self):
+        self.slots = None
+        self.blocks = None
+        self.step = -1
+        self.completed = 0
+        self.half_steps = 0
+
+    def begin(self, step: int) -> None:
+        if step != self.step:
+            if self.slots is not None or self.blocks is not None:
+                # One half arrived last step and the other never did.
+                self.half_steps += 1
+            self.slots = self.blocks = None
+            self.step = step
+
+    def offer(self, step: int, *, slots=None, blocks=None):
+        self.begin(step)
+        if slots is not None:
+            self.slots = list(slots)
+        if blocks is not None:
+            self.blocks = list(blocks)
+        if self.slots is None or self.blocks is None:
+            return None
+        n = min(len(self.slots), len(self.blocks))
+        rows = [(int(self.slots[i]), int(self.blocks[i])) for i in range(n)]
+        self.slots = self.blocks = None
+        self.completed += 1
+        return rows
+
+
+_RENDEZVOUS = _StepRendezvous()
+#: Blocks vLLM marked this step, for the store that follows the forward.
+_LAST_STORE_MARKS: list = []
+_MARK_FAILURES: list = []
+
+
+def _step_id(m) -> int:
+    """Something that changes every step and nothing else. The query-start
+    tensor is rebuilt per step, so its identity serves without adding a
+    counter two builders would have to agree on."""
+    return id(getattr(m, "query_start_loc", m))
+
+
+def take_store_marks() -> list:
+    marks = list(_LAST_STORE_MARKS)
+    _LAST_STORE_MARKS.clear()
+    return marks
+
+
+def mark_failures() -> int:
+    return len(_MARK_FAILURES)
+
+
+def rendezvous():
+    return _RENDEZVOUS
+
+
+def offer_restore_half(step: int, *, slots=None, blocks=None) -> int:
+    """Publish one half; perform the restore when both are in. Returns rows done."""
+    rt = runtime()
+    rows = _RENDEZVOUS.offer(step, slots=slots, blocks=blocks)
+    if rows is None or rt is None:
+        return 0
+    return rt.restore_for(rows)
+
+
+def rendezvous_stats() -> dict:
+    return {
+        "image_steps_paired": _RENDEZVOUS.completed,
+        # Non-zero means one half of a step never arrived. Not fatal, and not
+        # harmless: that step's hit resumed from whatever the slot held.
+        "image_steps_half": _RENDEZVOUS.half_steps,
+    }
