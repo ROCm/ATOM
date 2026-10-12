@@ -409,14 +409,77 @@ def test_wake_up_cannot_unfence_a_failed_update_but_a_complete_sync_can():
     assert engine._rl_weights_inconsistent
 
     mgr._replies = _counts(4, 4)
-    _process_one(h, out, engine, "update_weights_shm", {"is_last": True})
+    _process_one(
+        h, out, engine, "update_weights_shm", {"is_last": True, "request_id": "last"}
+    )
     assert engine._weight_sync_fenced
     assert engine._rl_weights_inconsistent
 
-    _process_one(h, out, engine, "finish_weight_sync", {})
+    _process_one(h, out, engine, "finish_weight_sync", {"completed_request_id": "last"})
     assert not engine._weight_sync_fenced
     assert not engine._is_rl_weights_offloaded
     assert not engine._rl_weights_inconsistent
+
+
+_TWO_RANKS_OK = _counts(4, 4)
+_ONE_RANK_FAILED = [RpcResult("u", 0, value=4), RpcResult("u", 1, error="boom")]
+
+
+@pytest.mark.parametrize(
+    ("replies", "steps", "finish"),
+    [
+        pytest.param(
+            _ONE_RANK_FAILED,
+            [("update_weights_shm", {"is_last": True, "request_id": "u1"})],
+            {"completed_request_id": "u1"},
+            id="its update failed",
+        ),
+        pytest.param(
+            _TWO_RANKS_OK,
+            [("update_weights_ipc", {"is_last": False, "request_id": "u1"})],
+            {"completed_request_id": "u1"},
+            id="only a non-final bucket",
+        ),
+        pytest.param(
+            _TWO_RANKS_OK,
+            [("update_weights_ipc", {"is_last": True, "request_id": "u1"})],
+            {"completed_request_id": "forged"},
+            id="a different update",
+        ),
+        pytest.param(
+            _TWO_RANKS_OK,
+            [("update_weights", {"request_id": "u1"})],
+            {},
+            id="no update named",
+        ),
+        pytest.param(
+            _TWO_RANKS_OK,
+            [
+                ("update_weights_shm", {"is_last": True, "request_id": "u1"}),
+                ("discard_failed_weight_sync", {}),
+            ],
+            {"completed_request_id": "u1"},
+            id="its update was aborted",
+        ),
+    ],
+)
+def test_finish_cannot_unfence_an_engine_with_no_complete_update_to_commit(
+    replies, steps, finish
+):
+    """A finish cleared the fence and the inconsistent flag whatever had come
+    before it, so one reaching an engine any other way served whatever its
+    weights had become."""
+    h, _, out = _handler(replies=replies)
+    engine = _Engine()
+    for cmd, args in steps:
+        _process_one(h, out, engine, cmd, args)
+    inconsistent = engine._rl_weights_inconsistent
+
+    (reply,) = _process_one(h, out, engine, "finish_weight_sync", finish)
+
+    assert "no complete weight update" in reply["error"]
+    assert engine._weight_sync_fenced
+    assert engine._rl_weights_inconsistent is inconsistent
 
 
 def test_a_global_abort_fences_an_engine_whose_local_update_succeeded():

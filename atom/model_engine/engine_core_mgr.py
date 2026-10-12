@@ -33,6 +33,7 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
     WEIGHT_UPDATE_UTILITY_CMDS,
+    completes_weight_sync,
 )
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
@@ -45,6 +46,12 @@ from atom.utils import (
 
 logger = logging.getLogger("atom")
 _WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
+# Only the sync that owns them sends these. A FINISH unfences every engine,
+# and a DISCARD aborts whichever sync is between its buckets.
+_WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
+    FINISH_WEIGHT_SYNC_CMD,
+    DISCARD_WEIGHT_SYNC_CMD,
+}
 
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
@@ -1346,6 +1353,7 @@ class CoreManager:
             self._dp_session_prompt_tokens.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
+        self._refuse_unowned_weight_sync_cmd(cmd, None)
         if dp_rank is None:
             # Send to all DP ranks
             for rank in range(len(self.control_sockets)):
@@ -1511,15 +1519,19 @@ class CoreManager:
                 )
         return flat
 
-    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+    def _refuse_unowned_weight_sync_cmd(self, cmd: str, dispatch_token) -> None:
         if (
-            cmd in WEIGHT_UPDATE_UTILITY_CMDS
-            and _dispatch_token is not self._weight_sync_dispatch_token
+            cmd in _WEIGHT_SYNC_OWNED_CMDS
+            and dispatch_token is not self._weight_sync_dispatch_token
         ):
             raise ValueError(
-                f"{self.label}: {cmd!r} cannot be broadcast directly; use "
-                f"broadcast_utility_command_sync so the sync is finished or aborted"
+                f"{self.label}: {cmd!r} cannot be sent directly; weight syncs "
+                f"go through broadcast_utility_command_sync, which alone "
+                f"finishes or aborts them"
             )
+
+    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+        self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
@@ -1541,24 +1553,59 @@ class CoreManager:
             finally:
                 self._weight_sync_context.active = previous
 
+    def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
+        """Fence every engine this reaches and drop the failed sync's scratch.
+
+        Tried on every rank and never raises: the caller is already raising
+        the failure that matters, and a rank whose socket fails here must not
+        keep its peers, which may hold the failed update, from hearing it.
+        """
+        payload = pickle.dumps(
+            (
+                EngineCoreRequestType.UTILITY,
+                {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd},
+            )
+        )
+        for rank in range(len(self.control_sockets)):
+            try:
+                self._send_control(rank, payload, copy=True)
+            except Exception:
+                logger.exception(
+                    f"{self.label}: could not tell DP rank {rank} to discard "
+                    f"the failed {failed_cmd!r}"
+                )
+
     def broadcast_utility_command_sync(
         self,
         cmd: str,
         timeout: float = 300.0,
         _weight_sync_locked: bool = False,
+        *,
+        _dispatch_token=None,
         **kwargs,
     ):
         """Run *cmd* on every engine and return their replies in DP order.
 
         Raises if an engine reports an error or does not answer in time.
         """
-        is_nonfinal_bucket = cmd in {
-            "update_weights_shm",
-            "update_weights_ipc",
-        } and not bool(kwargs.get("is_last", True))
-        if is_nonfinal_bucket and not getattr(
-            self._weight_sync_context, "active", False
+        owns_sync = getattr(self._weight_sync_context, "active", False)
+        if (
+            cmd == FINISH_WEIGHT_SYNC_CMD
+            and _dispatch_token is not self._weight_sync_dispatch_token
         ):
+            raise ValueError(
+                f"{self.label}: {cmd!r} commits a weight sync; only the sync "
+                f"whose complete update succeeded on every DP engine sends it"
+            )
+        if cmd == DISCARD_WEIGHT_SYNC_CMD and not owns_sync:
+            raise ValueError(
+                f"{self.label}: {cmd!r} aborts the weight sync in flight; send "
+                f"it from inside the `with weight_sync_session()` that owns it"
+            )
+        is_nonfinal_bucket = cmd in WEIGHT_UPDATE_UTILITY_CMDS and not (
+            completes_weight_sync(cmd, kwargs)
+        )
+        if is_nonfinal_bucket and not owns_sync:
             raise ValueError(
                 f"{self.label}: non-final {cmd!r} needs "
                 f"`with weight_sync_session()` so another sync cannot interleave"
@@ -1585,14 +1632,20 @@ class CoreManager:
         worker_deadline = time.time() + engine_budget(timeout)
         by_dp_rank: dict[int, object] = {}
         with self._rpc_router.register(request_id) as replies:
-            self.broadcast_utility_command(
-                cmd,
-                _dispatch_token=self._weight_sync_dispatch_token,
-                request_id=request_id,
-                timeout=engine_budget(timeout),
-                deadline=worker_deadline,
-                **kwargs,
-            )
+            try:
+                self.broadcast_utility_command(
+                    cmd,
+                    _dispatch_token=self._weight_sync_dispatch_token,
+                    request_id=request_id,
+                    timeout=engine_budget(timeout),
+                    deadline=worker_deadline,
+                    **kwargs,
+                )
+            except Exception:
+                # The engines before the failed send already hold this update.
+                if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                    self._discard_failed_weight_sync(cmd)
+                raise
             while len(by_dp_rank) < engine_count:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1607,7 +1660,7 @@ class CoreManager:
         missing = sorted(set(range(engine_count)) - set(by_dp_rank))
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-                self.broadcast_utility_command(DISCARD_WEIGHT_SYNC_CMD, failed_cmd=cmd)
+                self._discard_failed_weight_sync(cmd)
             raise TimeoutError(
                 f"{self.label}: no reply to utility command {cmd!r} from DP "
                 f"rank(s) {missing} within {timeout}s"
@@ -1618,7 +1671,7 @@ class CoreManager:
                 # An engine whose local TP ranks all succeeded has no local
                 # reason to discard its packed/expert/IPC scratch. Once any DP
                 # engine failed, every engine belongs to the abandoned sync.
-                self.broadcast_utility_command(DISCARD_WEIGHT_SYNC_CMD, failed_cmd=cmd)
+                self._discard_failed_weight_sync(cmd)
             # Callers read r["result"]; an error reply has none, and handing it
             # back would turn a named failure into a KeyError somewhere else.
             raise RuntimeError(
@@ -1626,19 +1679,17 @@ class CoreManager:
                 f"of {len(responses)} engine(s): "
                 + "; ".join(str(r["error"]) for r in failed)
             )
-        is_complete_weight_sync = cmd == "update_weights" or (
-            cmd in {"update_weights_shm", "update_weights_ipc"}
-            and bool(kwargs.get("is_last", True))
-        )
-        if is_complete_weight_sync:
+        if completes_weight_sync(cmd, kwargs):
             try:
                 self.broadcast_utility_command_sync(
                     FINISH_WEIGHT_SYNC_CMD,
                     timeout=_WEIGHT_SYNC_FINISH_TIMEOUT_S,
+                    _dispatch_token=self._weight_sync_dispatch_token,
                     completed_cmd=cmd,
+                    completed_request_id=request_id,
                 )
             except Exception:
-                self.broadcast_utility_command(DISCARD_WEIGHT_SYNC_CMD, failed_cmd=cmd)
+                self._discard_failed_weight_sync(cmd)
                 raise
         return responses
 

@@ -3,11 +3,13 @@
 
 """The DP half: request-id routing for collective and ordinary utility calls."""
 
+import pickle
 import threading
 import time
 from contextlib import ExitStack
 
 import pytest
+import zmq
 
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -40,7 +42,25 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr._rpc_ranks_per_engine = tp
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
+    # What reaches one rank at a time, as a failed sync's cleanup does.
+    mgr._send_control = lambda dp_rank, payload, copy=False: mgr.sent.append(
+        _on_rank(dp_rank, payload)
+    )
     return mgr
+
+
+def _on_rank(dp_rank, payload):
+    """One control message, recorded like a broadcast plus the rank it reached."""
+    _, body = pickle.loads(payload)
+    body = dict(body)
+    return body.pop("cmd"), {**body, "dp_rank": dp_rank}
+
+
+def _discarded(mgr):
+    """The DP ranks told to discard a failed sync."""
+    return [
+        kw["dp_rank"] for cmd, kw in mgr.sent if cmd == "discard_failed_weight_sync"
+    ]
 
 
 def _tp_body(request_id, method="m", results=None, error=None):
@@ -376,8 +396,6 @@ def _answering(mgr, replies, ranks=None):
 
     def broadcast(cmd, **kw):
         mgr.sent.append((cmd, kw))
-        if "request_id" not in kw:  # a fire-and-forget cleanup broadcast
-            return
         for dp_rank, body in zip(ranks or range(len(replies)), replies):
             mgr._route_utility_response(
                 dp_rank, {**body, "request_id": kw["request_id"]}
@@ -406,9 +424,76 @@ def test_weight_broadcast_cannot_bypass_its_finish_or_abort_owner(request_id):
     kwargs = {"is_last": False}
     if request_id is not None:
         kwargs["request_id"] = request_id
-    with pytest.raises(ValueError, match="cannot be broadcast directly"):
+    with pytest.raises(ValueError, match="cannot be sent directly"):
         CoreManager.broadcast_utility_command(mgr, "update_weights_shm", **kwargs)
     assert mgr.sent == []
+
+
+@pytest.mark.parametrize(
+    ("send", "refusal"),
+    [
+        pytest.param(
+            lambda mgr: CoreManager.broadcast_utility_command(
+                mgr, "finish_weight_sync"
+            ),
+            "cannot be sent directly",
+            id="broadcast a finish",
+        ),
+        pytest.param(
+            lambda mgr: CoreManager.broadcast_utility_command(
+                mgr, "discard_failed_weight_sync"
+            ),
+            "cannot be sent directly",
+            id="broadcast an abort",
+        ),
+        pytest.param(
+            lambda mgr: mgr.broadcast_utility_command_sync(
+                "finish_weight_sync", completed_request_id="forged"
+            ),
+            "commits a weight sync",
+            id="wait on a finish",
+        ),
+        pytest.param(
+            lambda mgr: mgr.broadcast_utility_command_sync(
+                "discard_failed_weight_sync"
+            ),
+            "aborts the weight sync in flight",
+            id="wait on an abort outside its session",
+        ),
+        pytest.param(
+            lambda mgr: mgr.send_utility_command("finish_weight_sync"),
+            "cannot be sent directly",
+            id="send a finish",
+        ),
+        pytest.param(
+            lambda mgr: mgr.send_utility_command("update_weights", dp_rank=0),
+            "cannot be sent directly",
+            id="send an update to one rank",
+        ),
+    ],
+)
+def test_no_caller_can_finish_or_abort_a_sync_it_does_not_own(send, refusal):
+    """A finish lifts the fence on every engine, so one from anything but the
+    sync it commits could serve a model that was only partly written. An abort
+    from outside could land between another caller's buckets."""
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(mgr, [{"result": True}] * 2)
+    with pytest.raises(ValueError, match=refusal):
+        send(mgr)
+    assert mgr.sent == []
+
+
+def test_the_session_that_owns_a_sync_can_still_abort_it():
+    """The bucket senders abandon a sync from inside their own session."""
+    mgr = _mgr(2)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "discard_failed_weight_sync", "result": True}] * 2
+    )
+    with mgr.weight_sync_session():
+        mgr.broadcast_utility_command_sync(
+            "discard_failed_weight_sync", timeout=5, failed_cmd="update_weights_shm"
+        )
+    assert [cmd for cmd, _ in mgr.sent] == ["discard_failed_weight_sync"]
 
 
 def test_sync_raises_the_cause_when_an_engine_reports_an_error():
@@ -422,7 +507,7 @@ def test_sync_raises_the_cause_when_an_engine_reports_an_error():
     )
     with pytest.raises(RuntimeError, match="1 of 2 engine.*loader rejected"):
         mgr.broadcast_utility_command_sync("update_weights", named_tensors=[])
-    assert mgr.sent[-1][0] == "discard_failed_weight_sync"
+    assert _discarded(mgr) == [0, 1]
 
 
 def test_a_timeout_cleans_update_scratch_on_every_dp_engine_too():
@@ -432,7 +517,34 @@ def test_a_timeout_cleans_update_scratch_on_every_dp_engine_too():
     )
     with pytest.raises(TimeoutError, match=r"DP rank\(s\) \[1\]"):
         mgr.broadcast_utility_command_sync("update_weights_ipc", timeout=0.2)
-    assert mgr.sent[-1][0] == "discard_failed_weight_sync"
+    assert _discarded(mgr) == [0, 1]
+
+
+def test_an_update_whose_send_fails_partway_is_discarded_where_it_landed():
+    """Rank 0 took the update before rank 1's socket failed, and the raise left
+    the call before any cleanup ran, so rank 0 stayed fenced on a sync nothing
+    would finish or abort. Rank 2 still hears the abort: one failed send must
+    not keep the rest from it."""
+    mgr = _mgr(3)
+    del mgr.broadcast_utility_command  # the real fan-out, so it can fail partway
+    record = mgr._send_control
+
+    def send(dp_rank, payload, copy=False):
+        if dp_rank == 1:
+            raise zmq.ZMQError(zmq.EHOSTUNREACH)
+        record(dp_rank, payload, copy)
+
+    mgr._send_control = send
+    with pytest.raises(zmq.ZMQError):
+        mgr.broadcast_utility_command_sync(
+            "update_weights", named_tensors=[], timeout=5
+        )
+
+    assert [(cmd, kw["dp_rank"]) for cmd, kw in mgr.sent] == [
+        ("update_weights", 0),
+        ("discard_failed_weight_sync", 0),
+        ("discard_failed_weight_sync", 2),
+    ]
 
 
 def test_a_complete_weight_sync_finishes_only_after_every_dp_engine_succeeds():
@@ -452,6 +564,8 @@ def test_a_complete_weight_sync_finishes_only_after_every_dp_engine_succeeds():
         "finish_weight_sync",
     ]
     assert mgr.sent[1][1]["timeout"] == engine_budget(30.0)
+    # The engines commit only the update this names.
+    assert mgr.sent[1][1]["completed_request_id"] == mgr.sent[0][1]["request_id"]
 
 
 def test_a_nonfinal_bucket_stays_fenced_for_the_rest_of_its_sync():

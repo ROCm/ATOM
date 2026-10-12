@@ -25,6 +25,15 @@ FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
+
+
+def completes_weight_sync(cmd: str, args: dict) -> bool:
+    """Whether *cmd* is the update a sync ends on: direct, or a last bucket."""
+    return cmd == "update_weights" or (
+        cmd in WEIGHT_UPDATE_UTILITY_CMDS and bool(args.get("is_last", True))
+    )
+
+
 # For a direct weight update whose sender gives no deadline of its own;
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
@@ -109,6 +118,9 @@ class EngineUtilityHandler:
         self._weight_sync_fenced = False
         self._weight_sync_in_progress = False
         self._weight_sync_failure: str | None = None
+        # Request id of the complete update this engine applied, the only one
+        # a FINISH may commit.
+        self._awaiting_finish: str | None = None
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -132,6 +144,7 @@ class EngineUtilityHandler:
                     # explicitly finishes a complete sync on every engine.
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = True
+                    self._awaiting_finish = None
                     engine._weight_sync_fenced = True
                 reply = self._execute_utility_command(cmd, args)
                 # Track sleep/wake transitions
@@ -166,9 +179,12 @@ class EngineUtilityHandler:
                             f"{self.label}: weight update failed; serving stays "
                             f"fenced until a complete sync succeeds: {reply['error']}"
                         )
+                    elif completes_weight_sync(cmd, args):
+                        self._awaiting_finish = args.get("request_id")
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD:
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
+                    self._awaiting_finish = None
                     self._weight_sync_failure = str(
                         args.get("error") or args.get("failed_cmd") or "aborted"
                     )
@@ -179,16 +195,23 @@ class EngineUtilityHandler:
                         f"fenced until a complete sync succeeds"
                     )
                 elif cmd == FINISH_WEIGHT_SYNC_CMD:
-                    self._weight_sync_fenced = False
-                    self._weight_sync_in_progress = False
-                    self._weight_sync_failure = None
-                    engine._rl_weights_inconsistent = False
-                    engine._weight_sync_fenced = False
-                    engine._is_rl_weights_offloaded = False
-                    logger.info(
-                        f"{self.label}: globally complete weight sync committed; "
-                        f"engine exited sleep mode"
-                    )
+                    if isinstance(reply, dict) and reply.get("error"):
+                        logger.error(
+                            f"{self.label}: weight sync not committed; serving "
+                            f"stays fenced: {reply['error']}"
+                        )
+                    else:
+                        self._weight_sync_fenced = False
+                        self._weight_sync_in_progress = False
+                        self._weight_sync_failure = None
+                        self._awaiting_finish = None
+                        engine._rl_weights_inconsistent = False
+                        engine._weight_sync_fenced = False
+                        engine._is_rl_weights_offloaded = False
+                        logger.info(
+                            f"{self.label}: globally complete weight sync "
+                            f"committed; engine exited sleep mode"
+                        )
             except queue.Empty:
                 engine._has_pending_utility = False
                 break
@@ -406,8 +429,17 @@ class EngineUtilityHandler:
         return reply
 
     def _handle_finish_weight_sync(self, args: dict) -> dict:
-        """Acknowledge CoreManager's globally successful complete sync."""
-        reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "result": True}
+        """Commit the complete update this engine applied, once CoreManager
+        has heard every DP engine apply it."""
+        completed = args.get("completed_request_id")
+        if completed is None or completed != self._awaiting_finish:
+            reply = {
+                "cmd": FINISH_WEIGHT_SYNC_CMD,
+                "error": f"no complete weight update {completed!r} succeeded "
+                f"on this engine since its last sync ended",
+            }
+        else:
+            reply = {"cmd": FINISH_WEIGHT_SYNC_CMD, "result": True}
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
