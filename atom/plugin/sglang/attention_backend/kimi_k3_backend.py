@@ -138,6 +138,24 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
         forward_batch.atom_kimi_k3_graph_metadata = self.atom_kimi_k3_graph_metadata
         type(self)._last_atom_kimi_k3_graph_metadata = self.atom_kimi_k3_graph_metadata
 
+    def _retarget_kimi_decode_mla_plan(self, forward_batch: Any) -> None:
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        import sglang.srt.layers.attention.aiter_backend as sglang_aiter
+
+        from atom.plugin.sglang.kimi_k3_bridge import retarget_kimi_k3_decode_mla_plan
+
+        retarget_kimi_k3_decode_mla_plan(
+            getattr(self, "forward_metadata", None),
+            batch_size=int(forward_batch.batch_size),
+            num_heads=int(getattr(self, "num_head_padded", 16)),
+            dtype_q=getattr(self, "kv_cache_dtype", torch.bfloat16),
+            dtype_kv=getattr(self, "kv_cache_dtype", torch.bfloat16),
+            fast_mode=bool(sglang_aiter.fast_mode),
+            intra_batch_mode=bool(sglang_aiter.intra_batch_mode),
+            max_split_per_batch=getattr(self, "max_split_per_batch", None),
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int, *args, **kwargs):
         result = super().init_cuda_graph_state(max_bs, max_num_tokens, *args, **kwargs)
         self._init_kimi_graph_buffers(int(max_bs))
@@ -145,6 +163,9 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        # super() just wrote a page-128 plan into the persistent work buffers.
+        # Rewrite it before the graph records or replays those addresses.
+        self._retarget_kimi_decode_mla_plan(forward_batch)
         self._build_kimi_decode_graph_metadata(forward_batch)
 
     def init_forward_metadata_in_graph(self, forward_batch):
@@ -155,3 +176,4 @@ class ATOMKimiK3BackendForSgl(ATOMAttnBackendForSgl):
 
     def init_forward_metadata(self, forward_batch):
         super().init_forward_metadata(forward_batch)
+        self._retarget_kimi_decode_mla_plan(forward_batch)

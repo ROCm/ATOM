@@ -494,6 +494,89 @@ def _build_block_table(
     )
 
 
+def retarget_kimi_k3_decode_mla_plan(
+    forward_metadata: Any,
+    *,
+    batch_size: int,
+    num_heads: int,
+    dtype_q,
+    dtype_kv,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    max_split_per_batch: int | None,
+) -> bool:
+    """Rewrite SGLang's persistent MLA plan onto ATOM's per-token pages.
+
+    PR #1821 attached SGLang's decode plan unchanged. That plan is built at
+    the server page size (128). ATOM's K3 kernel, with ``ATOM_MLA_PAGE_SIZE=1``,
+    consumes one KV slot per index. A 128-token plan under-reads that cache:
+    padding no longer clobbers slot 0 (that was the jump from ~0 to ~0.39),
+    but decode still attends the wrong tokens. ``get_mla_metadata_v1`` writes
+    the existing work buffers in place, so a captured CUDA graph keeps its
+    pointers and only the contents change.
+    """
+
+    if forward_metadata is None or batch_size <= 0:
+        return False
+    kv_indptr = getattr(forward_metadata, "kv_indptr", None)
+    work_buffers = (
+        getattr(forward_metadata, "work_meta_data", None),
+        getattr(forward_metadata, "work_info_set", None),
+        getattr(forward_metadata, "work_indptr", None),
+        getattr(forward_metadata, "reduce_indptr", None),
+        getattr(forward_metadata, "reduce_final_map", None),
+        getattr(forward_metadata, "reduce_partial_map", None),
+        kv_indptr,
+    )
+    if not all(torch.is_tensor(buf) for buf in work_buffers):
+        return False
+    last_page = getattr(forward_metadata, "kv_last_page_len", None)
+    if not torch.is_tensor(last_page) or int(last_page.numel()) < batch_size:
+        return False
+
+    # Page size 1 means every occupied page holds one token.
+    last_page[:batch_size].fill_(1)
+    qo = getattr(forward_metadata, "qo_indptr", None)
+    if torch.is_tensor(qo) and int(qo.numel()) >= batch_size + 1:
+        qo_indptr = qo[: batch_size + 1]
+        qo_indptr.copy_(
+            torch.arange(batch_size + 1, dtype=qo_indptr.dtype, device=qo_indptr.device)
+        )
+    else:
+        qo_indptr = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=kv_indptr.device
+        )
+
+    from aiter import get_mla_metadata_v1
+
+    get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr[: batch_size + 1],
+        last_page[:batch_size],
+        max(int(num_heads), 16),
+        1,
+        True,
+        forward_metadata.work_meta_data,
+        forward_metadata.work_info_set,
+        forward_metadata.work_indptr,
+        forward_metadata.reduce_indptr,
+        forward_metadata.reduce_final_map,
+        forward_metadata.reduce_partial_map,
+        page_size=1,
+        kv_granularity=16,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=fast_mode,
+        max_split_per_batch=(
+            -1 if max_split_per_batch is None else int(max_split_per_batch)
+        ),
+        intra_batch_mode=intra_batch_mode,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+    )
+    return True
+
+
 def _attach_sglang_mla_metadata(metadata: Any) -> Any:
     """Reuse the active SGLang backend's graph-stable MLA decode buffers."""
 
