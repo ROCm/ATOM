@@ -30,8 +30,6 @@ from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
-
-
 from .checkpoints import StateCopies
 from .metadata import RequestSpan, visible_buffer_name
 from .score_planner import ScorePlanner

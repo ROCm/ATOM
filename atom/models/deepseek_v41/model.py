@@ -184,7 +184,10 @@ class DeepseekV41ForCausalLM(nn.Module):
     # constructor -- as the runtime-contract tests do, with `__new__` -- is
     # still asked for them by `DeepseekV41RuntimeModel.forward`.
     aux_hidden_state_layers: tuple[int, ...] = ()
-    _aux_hidden_states: list = []
+    # `ClassVar` because this is the default, not per-instance storage: the
+    # constructor rebinds it, and so does every write below, so the shared
+    # empty list is never mutated in place.
+    _aux_hidden_states: ClassVar[list] = []
 
     # Disk-name -> param-name rules for `atom.model_loader.loader.load_model`.
     # V4's two tables carry over as they are; V4.1 needs one rename V4's

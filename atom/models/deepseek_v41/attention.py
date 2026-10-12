@@ -376,7 +376,7 @@ class Attention(nn.Module):
         here puts the buffer in what stays inside the graph, so the capture
         records one address and every replay finds it.
         """
-        return None
+        return
 
     def forward(self, hidden, hidden_scale, cache, step, rope):
         attn_out = self._attn_out_buffer(hidden)

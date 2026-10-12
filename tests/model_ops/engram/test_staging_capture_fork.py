@@ -24,7 +24,12 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+
+# `staging` imports `hashing`, which imports triton at module scope, so this
+# file cannot be collected on the non-GPU CI runner without the guard.
+pytest.importorskip("triton")
 
 from atom.model_ops.engram.device import staging as staging_mod
 
