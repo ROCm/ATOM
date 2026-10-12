@@ -1558,6 +1558,19 @@ models:
               max_num_seqs: 96
               decode_max_num_seqs: 96
 
+        # DPA c48: same shape as the weekly DPA cells (cache_aware, TBO on
+        # prefill), admission 2x CONC, decode graphs up to slots / 8 per rank.
+        - <<: *dsv4_0813_agentic_dpa_no_offload
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-no-offload-c48
+          concurrency: [48]
+          server:
+            common_args:
+              max_num_seqs: 96
+              decode_max_num_seqs: 96
+          decode:
+            <<: *dsv4_0813_agentic_dpa_decode
+            cudagraph: "[1,2,3,4,5,6,7,8,9,10,11,12]"
+
       # Manual accuracy suite: no performance workload or synthetic acceptance.
       accuracy:
         - name: ds-v4-0813-1p1d-tp8-dspark3-gsm8k-only-c16
