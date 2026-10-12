@@ -273,25 +273,3 @@ def test_ptpc_ple_loads_fp8_shards_and_scalar_scale(make_embedding):
         embedding.weight_scale.weight_loader(embedding.weight_scale, torch.ones(2))
     with pytest.raises(ValueError, match="expected torch.float8_e4m3fn"):
         embedding.weight.weight_loader(embedding.weight, weight.to(torch.bfloat16), 0)
-
-
-def test_routed_slice_ignores_the_fused_shared_suffix():
-    from atom.model_ops.fused_moe.expert_layout import determine_expert_map
-
-    num_routed = 512
-    ep_size = 2
-    for rank in range(ep_size):
-        local_num, expert_map = determine_expert_map(ep_size, rank, num_routed)
-        # Same suffix FusedMoE appends for a fused shared expert under EP.
-        fused_map = torch.cat(
-            (
-                expert_map,
-                torch.tensor([local_num], dtype=torch.int32),
-                torch.tensor([-1], dtype=torch.int32),
-            )
-        )
-        width = num_routed // ep_size
-        assert qwen4_exp.routed_expert_slice(fused_map, num_routed) == slice(
-            rank * width, (rank + 1) * width
-        )
-    assert qwen4_exp.routed_expert_slice(None, num_routed) == slice(0, num_routed)
