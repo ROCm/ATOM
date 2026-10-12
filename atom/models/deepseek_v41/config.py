@@ -371,14 +371,8 @@ def validate_runtime_config(config):
         ),
         ("decode TBO", config.enable_tbo_decode),
         (
-            "prefill TBO without multi-rank DP attention",
-            config.enable_tbo
-            and (
-                not config.enable_dp_attention
-                or config.tensor_parallel_size
-                * config.parallel_config.data_parallel_size
-                <= 1
-            ),
+            "prefill TBO without DP attention",
+            config.enable_tbo and not config.enable_dp_attention,
         ),
         (
             # `lmcache_mp` is the one transport admitted: it checkpoints STATE
@@ -413,3 +407,15 @@ def validate_runtime_config(config):
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
     validate_speculative_config(config)
+
+
+def validate_tbo_parallelism(config):
+    """Check the final topology after the engine applies legacy DP settings."""
+    if config.enable_tbo and (
+        not config.enable_dp_attention
+        or config.tensor_parallel_size * config.parallel_config.data_parallel_size <= 1
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 runtime does not support prefill TBO without "
+            "multi-rank DP attention"
+        )

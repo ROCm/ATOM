@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
+from atom.models.deepseek_v41.config import (
+    normalize_hf_config,
+    validate_runtime_config,
+    validate_tbo_parallelism,
+)
 from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
 
@@ -392,14 +396,19 @@ def test_prefill_tbo_requires_multi_rank_dpa(tp_size, dp_size, dpa, ep):
         enable_expert_parallel=ep,
         parallel_config=SimpleNamespace(data_parallel_size=dp_size),
     )
-    if dpa and tp_size * dp_size > 1:
+    if dpa:
+        # Config construction can precede the legacy DP kwargs, so rank-count
+        # admission belongs to the model's startup check below.
         validate_runtime_config(cfg)
+    if dpa and tp_size * dp_size > 1:
+        validate_tbo_parallelism(cfg)
         cfg.enable_tbo_decode = True
         with pytest.raises(ValueError, match="decode TBO"):
             validate_runtime_config(cfg)
     else:
         with pytest.raises(ValueError, match="prefill TBO"):
             validate_runtime_config(cfg)
+            validate_tbo_parallelism(cfg)
 
 
 @pytest.mark.parametrize("tp,dp", [(4, 1), (2, 1), (1, 4), (2, 2)])
@@ -443,22 +452,20 @@ def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
         parallel_config=SimpleNamespace(data_parallel_size=dp),
     )
     for _ in range(2):
+        validate_runtime_config(cfg)
         if tp * dp > 1:
-            validate_runtime_config(cfg)
+            validate_tbo_parallelism(cfg)
         else:
             with pytest.raises(ValueError, match="multi-rank DP attention"):
-                validate_runtime_config(cfg)
+                validate_tbo_parallelism(cfg)
         cfg.parallel_config.data_parallel_size = tp * dp
         cfg.tensor_parallel_size = 1
 
 
 @pytest.mark.parametrize("explicit_parallel", [False, True])
-def test_legacy_engine_dp_is_normalized_before_v41_admission(
-    monkeypatch, explicit_parallel
-):
+def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     import atom.config as config_module
     import atom.model_engine.llm_engine as engine_module
-    import atom.models.deepseek_v41.config as v41_config
 
     fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
     hf = normalize_hf_config(json.loads(fixture.read_text()))
@@ -467,24 +474,23 @@ def test_legacy_engine_dp_is_normalized_before_v41_admission(
     # Quantization resolves AITER enums; keep this admission test CPU-only.
     monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
     validated = []
-    validate = v41_config.validate_runtime_config
 
-    def checked(config):
-        validate(config)
+    def start_core(config):
+        # Exercise the unchanged LLMEngine constructor through its handoff to
+        # CoreManager without starting GPU workers.
+        validate_tbo_parallelism(config)
         assert (
             config.tensor_parallel_size * config.parallel_config.data_parallel_size == 4
         )
         assert config.parallel_config.data_parallel_master_port == 27123
         validated.append(config.parallel_config)
 
-    class ReachedTokenizer(Exception):
-        pass
-
-    def stop_before_startup(*args):
-        raise ReachedTokenizer
-
-    monkeypatch.setattr(v41_config, "validate_runtime_config", checked)
-    monkeypatch.setattr(engine_module, "_load_tokenizer", stop_before_startup)
+    monkeypatch.setattr(engine_module, "CoreManager", start_core)
+    monkeypatch.setattr(
+        engine_module,
+        "_load_tokenizer",
+        lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
+    )
     kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}
     if explicit_parallel:
         parallel = config_module.ParallelConfig(
@@ -497,18 +503,17 @@ def test_legacy_engine_dp_is_normalized_before_v41_admission(
             data_parallel_size=8,
             data_parallel_master_port=27124,
         )
-    with pytest.raises(ReachedTokenizer):
-        engine_module.LLMEngine(
-            "v41-test",
-            tensor_parallel_size=1,
-            enable_dp_attention=True,
-            enable_tbo=True,
-            enable_tbo_decode=False,
-            enforce_eager=True,
-            kv_cache_dtype="bf16",
-            index_cache_dtype="fp8",
-            **kwargs,
-        )
+    engine_module.LLMEngine(
+        "v41-test",
+        tensor_parallel_size=1,
+        enable_dp_attention=True,
+        enable_tbo=True,
+        enable_tbo_decode=False,
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        **kwargs,
+    )
     assert len(validated) == 1
     if explicit_parallel:
         assert validated[0] is parallel

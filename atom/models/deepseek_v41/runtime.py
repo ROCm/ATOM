@@ -20,6 +20,7 @@ from .bounded_replay import (
     late_layer_tail,
     replay_rows,
 )
+from .config import validate_tbo_parallelism
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
 
@@ -198,6 +199,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
     def __init__(self, atom_config):
         config = atom_config
+        # Config is built before legacy DP kwargs and DPA rank expansion apply.
+        # Validate their final width here, before allocating model parameters.
+        validate_tbo_parallelism(config)
         super().__init__(
             config.hf_config,
             max_length=config.max_model_len,
