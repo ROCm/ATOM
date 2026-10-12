@@ -2874,9 +2874,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         #
         # Every decode row is exactly `num_spec_step + 1` wide here, so the
         # check can be a product: DSpark's ragged / q-bucket shrink never runs
-        # on a mixed step (`_dspark_apply_q_bucket` returns before either on
-        # any batch with prefill tokens). If that guard moves, this check must
-        # become a comparison against the real per-row lengths.
+        # on a mixed step (`dspark_scheduler.apply_q_bucket` returns before
+        # either on any batch with prefill tokens). If that guard moves, this
+        # check must become a comparison against the real per-row lengths.
         decode_max_q = batch.num_spec_step + 1
         if var["cu_seqlens_q"].np[n_d_seqs] != n_d_seqs * decode_max_q:
             raise RuntimeError(

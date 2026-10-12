@@ -132,7 +132,7 @@ merged.state_slot_out = _pad_to(running_bs, torch.cat([prefill_meta.state_slot_o
 
 - **`num_rejected` 回滚**：`prepare_decode` 直接读 `tokenID_processor.num_rejected`（全批数组）做 `ctx -= num_rejected`。经 view 调用时必须切到 decode 行：view 增加 `row_offset = n_p`，`prepare_decode` 用 `num_rejected[row_offset : row_offset + scheduled_bs]`。**不能**靠 `__getattr__` 兜底——这个数组不在 batch 上，guard 抓不到。
 - `_MixedDecodeView` 补切 `scheduled_spec_decode_tokens`、`num_rejected`、`num_bonus`（虽然当前 V4 decode 路径未必读，但 view 的原则是"每行字段要么切要么 raise"）；`scheduled_tokens`（长度 = 总 token 数）目前会**静默**穿透，guard 只查长度 = 总 seq 数的字段——改成显式切 `[n_p_tokens:]` 或显式 raise。
-- `prepare_mixed` 里 `cu[n_d] == n_d * decode_max_q` 的检查：mixed step 上 ragged/q-bucket 都不生效，decode 宽度恒为 K+1，检查仍成立。依据是 `_dspark_apply_q_bucket` 开头的 `if batch.total_tokens_num_prefill > 0: return None`——ragged 分支在它**之后**分派，所以一个守卫同时关掉两者。（"ragged 要求 prev/cur req_ids 相同、mixed 组成必变"**不成立**：一个跨多步的 chunked prefill 配同一组 decode 行，连续两个 mixed step 的 req_ids 完全相同。）检查旁注明依赖的是这个守卫，并加单测锁住"组成不变的连续 mixed step 也不 shrink"。
+- `prepare_mixed` 里 `cu[n_d] == n_d * decode_max_q` 的检查：mixed step 上 ragged/q-bucket 都不生效，decode 宽度恒为 K+1，检查仍成立。依据是 `dspark_scheduler.apply_q_bucket`（原 `_dspark_apply_q_bucket` 内联逻辑，main #2332 后移出）开头的 `if batch.total_tokens_num_prefill > 0: return None`——ragged 分支在它**之后**分派，所以一个守卫同时关掉两者。（"ragged 要求 prev/cur req_ids 相同、mixed 组成必变"**不成立**：一个跨多步的 chunked prefill 配同一组 decode 行，连续两个 mixed step 的 req_ids 完全相同。）检查旁注明依赖的是这个守卫，并加单测锁住"组成不变的连续 mixed step 也不 shrink"。
 - 注释/docstring 里 "1 token per decode seq, no MTP in mixed" 同步更新（name-matches-function）。
 
 ### 4.7 不需要改的部分
@@ -221,7 +221,7 @@ V4-Flash-DSpark tp4 + dp-attention，K=5，`--max-num-batched-tokens 2048`（强
 1. mixed 采样行索引：给定 `n_p, prefill 段长, decode lens`，断言 `bonus/target/cu_num_draft` 与手算一致，`input_ids[shift:]` gather 出的 draft id 正确（含 0-draft 的 prefill 行、新入 decode 行）。
 2. verdict 换算：prefill 行（含中间 chunk）anchor 落在段尾、reject 为 0；decode 行 anchor 等于 `cu[i] + num_accepted`；无 verify 时每段最后一行。
 3. **（必须）** `postprocess` prefill 行 `num_reject == 0`、`next_token_locs == 0`；并端到端断言：一个在 mixed step 走完 prefill 的请求，下一步 decode 时 V4 `prepare_decode` 算出的 positions 与"纯 prefill → decode"路径完全一致（§4.4 的错位就在这里显形）。
-3b. 组成不变的连续两个 mixed step：`_dspark_apply_q_bucket` 返回 None，`num_scheduled_tokens` 未被改写（§4.6）。
+3b. 组成不变的连续两个 mixed step：`dspark_scheduler.apply_q_bucket`（runner 的 `_dspark_apply_q_bucket` 委托给它）返回 None，`num_scheduled_tokens` 未被改写（§4.6）。
 3c. 刚走完 prefill 的请求的首个 decode step：`decode_src` 指向它上一步的 prefill 行，draft 取自该行（§4.5 全批 propose）。
 4. deferred remap：chunked prefill 中间 chunk 在 prev_batch 里时不被当成 deferred 行。
 5. view：`num_rejected` 按 `row_offset` 切；`scheduled_tokens` 不再静默穿透。
