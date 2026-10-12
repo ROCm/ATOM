@@ -34,6 +34,8 @@ def _mgr(engine_count=2, tp=1, cls=CoreManager):
     mgr.label = "test-mgr"
     mgr.control_sockets = [_Socket() for _ in range(engine_count)]
     mgr._rpc_router = RpcResponseRouter()
+    mgr._weight_sync_lock = threading.RLock()
+    mgr._weight_sync_context = threading.local()
     mgr._rpc_ranks_per_engine = tp
     mgr.sent = []
     mgr.broadcast_utility_command = lambda cmd, **kw: mgr.sent.append((cmd, kw))
@@ -457,9 +459,61 @@ def test_a_nonfinal_bucket_stays_fenced_for_the_rest_of_its_sync():
         ],
     )
 
-    mgr.broadcast_utility_command_sync("update_weights_shm", timeout=5, is_last=False)
+    with mgr.weight_sync_session():
+        mgr.broadcast_utility_command_sync(
+            "update_weights_shm", timeout=5, is_last=False
+        )
 
     assert [cmd for cmd, _ in mgr.sent] == ["update_weights_shm"]
+
+
+def test_a_raw_nonfinal_bucket_requires_an_owned_session():
+    mgr = _mgr(1)
+    with pytest.raises(ValueError, match="weight_sync_session"):
+        mgr.broadcast_utility_command_sync("update_weights_ipc", is_last=False)
+    assert mgr.sent == []
+
+
+def test_overlapping_weight_sync_sessions_cannot_interleave_their_buckets():
+    mgr = _mgr(1)
+    mgr.broadcast_utility_command = _answering(
+        mgr, [{"cmd": "update_weights_shm", "result": 1}]
+    )
+    first_bucket_done = threading.Event()
+    finish_first = threading.Event()
+    second_done = threading.Event()
+
+    def first_sync():
+        with mgr.weight_sync_session():
+            mgr.broadcast_utility_command_sync("update_weights_shm", is_last=False)
+            first_bucket_done.set()
+            assert finish_first.wait(timeout=10)
+            mgr.broadcast_utility_command_sync("update_weights_shm", is_last=True)
+
+    def second_sync():
+        assert first_bucket_done.wait(timeout=10)
+        mgr.broadcast_utility_command_sync("update_weights", named_tensors=[])
+        second_done.set()
+
+    first = threading.Thread(target=first_sync)
+    second = threading.Thread(target=second_sync)
+    first.start()
+    second.start()
+    assert first_bucket_done.wait(timeout=10)
+    time.sleep(0.05)
+    assert not second_done.is_set(), "the second session entered between A's buckets"
+    finish_first.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+
+    assert [cmd for cmd, _ in mgr.sent] == [
+        "update_weights_shm",
+        "update_weights_shm",
+        "finish_weight_sync",
+        "update_weights",
+        "finish_weight_sync",
+    ]
 
 
 def test_sync_still_returns_every_reply_when_all_succeed():

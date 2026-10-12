@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from functools import wraps
 from multiprocessing import shared_memory
 
 import torch
@@ -13,6 +14,17 @@ import torch
 from atom.model_engine.collective_rpc import DISCARD_WEIGHT_SYNC_CMD
 
 logger = logging.getLogger("atom")
+
+
+def _serialized_weight_sync(func):
+    """Hold CoreManager's session lock across every bucket and abort/finish."""
+
+    @wraps(func)
+    def wrapped(core_mgr, *args, **kwargs):
+        with core_mgr.weight_sync_session():
+            return func(core_mgr, *args, **kwargs)
+
+    return wrapped
 
 
 def rebuild_ipc_handle(
@@ -52,6 +64,7 @@ def _abort_weight_sync(core_mgr, path: str) -> None:
         logger.exception("%s: failed to abort abandoned weight sync", path)
 
 
+@_serialized_weight_sync
 def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
     """Load weights from a generator/iterator using shared memory.
 
@@ -151,6 +164,7 @@ def load_weights_via_shm(core_mgr, weights, bucket_size_mb: int = 2048):
     logger.info(f"load_weights_via_shm: done – {total_params} params via SHM")
 
 
+@_serialized_weight_sync
 def load_weights_via_ipc(
     core_mgr, weights, bucket_size_mb: int = 2048, num_gpus: int = 1
 ):

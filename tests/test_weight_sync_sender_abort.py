@@ -3,6 +3,8 @@
 
 """A bucket sender owns the sync it starts and aborts it if iteration fails."""
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -19,6 +21,9 @@ class _CoreManager:
 
     def broadcast_utility_command(self, cmd, **kwargs):
         self.calls.append((cmd, kwargs))
+
+    def weight_sync_session(self):
+        return nullcontext()
 
 
 def test_a_sender_that_stops_after_a_nonfinal_bucket_aborts_the_sync():

@@ -137,11 +137,18 @@ class EngineUtilityHandler:
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
-                    if "weights" in tags and not (
-                        isinstance(reply, dict) and reply.get("error")
-                    ):
+                    if "weights" in tags:
+                        # Some ranks may already have released their weights
+                        # before a peer reports failure. Conservatively stop
+                        # serving until an all-rank resume succeeds.
                         engine._is_rl_weights_offloaded = True
-                        logger.info(f"{self.label}: engine entered sleep mode")
+                        if isinstance(reply, dict) and reply.get("error"):
+                            logger.error(
+                                f"{self.label}: partial weight release; engine "
+                                f"stays idle until resume succeeds: {reply['error']}"
+                            )
+                        else:
+                            logger.info(f"{self.label}: engine entered sleep mode")
                 elif cmd == "resume_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
                     if "weights" in tags and not (

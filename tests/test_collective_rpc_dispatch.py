@@ -457,20 +457,27 @@ def test_every_answered_utility_command_stamps_the_callers_request_id():
     ]
 
 
-def test_a_memory_failure_on_a_nonzero_rank_is_answered():
-    h, _, out = _handler(
+def test_a_partial_weight_release_stops_serving_until_all_rank_resume():
+    h, mgr, out = _handler(
         replies=[
             RpcResult("m", 0, value=True),
             RpcResult("m", 1, error="RuntimeError: cannot release weights"),
         ]
     )
-    h._execute_utility_command("release_memory", {"tags": ["weights"]})
-    assert _responses(out) == [
+    engine = _Engine()
+    engine._is_rl_weights_offloaded = False
+    replies = _process_one(h, out, engine, "release_memory", {"tags": ["weights"]})
+    assert replies == [
         {
             "cmd": "release_memory",
             "error": "TP rank 1: RuntimeError: cannot release weights",
         }
     ]
+    assert engine._is_rl_weights_offloaded
+
+    mgr._replies = _counts(True, True)
+    _process_one(h, out, engine, "resume_memory", {"tags": ["weights"]})
+    assert not engine._is_rl_weights_offloaded
 
 
 @pytest.mark.parametrize("field", ["args", "kwargs"])

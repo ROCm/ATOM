@@ -12,8 +12,9 @@ import queue
 import time
 import uuid
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread, local
 
 import zmq
 import zmq.asyncio
@@ -204,6 +205,10 @@ class CoreManager:
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
         self._rpc_router = RpcResponseRouter()
+        # Held across every bucket plus FINISH/abort. RLock lets the sender's
+        # outer session call the same synchronous command method per bucket.
+        self._weight_sync_lock = RLock()
+        self._weight_sync_context = local()
         # Runner processes behind each engine -- EngineCore's own sizing -- so
         # an engine that never answers still fails one result per rank. Read
         # with defaults: managers are also built from bare stand-in configs.
@@ -1519,13 +1524,47 @@ class CoreManager:
             # copy=True: the same buffer is reused for every rank.
             self._send_control(rank, serialized_payload, copy=True)
 
+    @contextmanager
+    def weight_sync_session(self):
+        """Serialize one complete direct/SHM/IPC synchronization session."""
+        with self._weight_sync_lock:
+            previous = getattr(self._weight_sync_context, "active", False)
+            self._weight_sync_context.active = True
+            try:
+                yield
+            finally:
+                self._weight_sync_context.active = previous
+
     def broadcast_utility_command_sync(
-        self, cmd: str, timeout: float = 300.0, **kwargs
+        self,
+        cmd: str,
+        timeout: float = 300.0,
+        _weight_sync_locked: bool = False,
+        **kwargs,
     ):
         """Run *cmd* on every engine and return their replies in DP order.
 
         Raises if an engine reports an error or does not answer in time.
         """
+        is_nonfinal_bucket = cmd in {
+            "update_weights_shm",
+            "update_weights_ipc",
+        } and not bool(kwargs.get("is_last", True))
+        if is_nonfinal_bucket and not getattr(
+            self._weight_sync_context, "active", False
+        ):
+            raise ValueError(
+                f"{self.label}: non-final {cmd!r} needs "
+                f"`with weight_sync_session()` so another sync cannot interleave"
+            )
+        if cmd in WEIGHT_UPDATE_UTILITY_CMDS and not _weight_sync_locked:
+            with self._weight_sync_lock:
+                return self.broadcast_utility_command_sync(
+                    cmd,
+                    timeout=timeout,
+                    _weight_sync_locked=True,
+                    **kwargs,
+                )
         if cmd in FIRE_AND_FORGET_UTILITY_CMDS:
             raise ValueError(
                 f"{self.label}: {cmd!r} is fire-and-forget; its handler never "
