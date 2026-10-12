@@ -3,10 +3,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{ConfigError, ConfigResult};
-use crate::core::{
-    prepare_pool::{PoolConfig, DEFAULT_PREPARE_WORKERS},
-    ConnectionMode,
-};
+use crate::core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode};
 
 /// Backend runtime type for inference workers.
 /// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
@@ -119,7 +116,8 @@ pub struct RouterConfig {
 #[command(next_help_heading = "Request Preparation")]
 #[serde(default)]
 pub struct PreparePoolConfig {
-    /// Fixed preparation threads (default: 10). Overrides --ext-proc-parser-concurrency.
+    /// Preparation threads (default: half the available CPUs, at least 1).
+    /// Overrides --ext-proc-parser-concurrency.
     #[arg(id = "prepare_workers", long = "prepare-workers")]
     pub workers: Option<usize>,
     /// Jobs waiting for a preparation thread (default: 10 per thread).
@@ -182,7 +180,7 @@ impl Default for PreparePoolConfig {
 
 impl PreparePoolConfig {
     pub fn validate(&self) -> ConfigResult<()> {
-        self.validate_with_workers(self.workers.unwrap_or(DEFAULT_PREPARE_WORKERS))
+        self.validate_with_workers(self.workers.unwrap_or_else(default_prepare_workers))
     }
 
     pub(crate) fn resolved_queue_capacity(&self, workers: usize) -> ConfigResult<usize> {
@@ -587,7 +585,7 @@ impl RouterConfig {
                 .parser_concurrency
                 .min(self.ext_proc.max_streams);
         }
-        DEFAULT_PREPARE_WORKERS
+        default_prepare_workers()
     }
 
     pub fn prepare_workers_source(&self) -> &'static str {
@@ -665,8 +663,9 @@ mod tests {
     #[test]
     fn prepare_pool_defaults_and_legacy_config_deserialization() {
         let config = RouterConfig::default();
-        assert_eq!(config.resolved_prepare_workers(), 10);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 100);
+        let workers = default_prepare_workers();
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        assert_eq!(config.resolved_prepare_pool().queue_capacity, workers * 10);
         assert_eq!(config.prepare_pool.queue_capacity, None);
         assert_eq!(config.prepare_workers_source(), "default");
         assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
@@ -707,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_pool_defaults_to_ten_in_pd_mode() {
+    fn prepare_pool_defaults_to_half_available_cpus_in_pd_mode() {
         let config = RouterConfig {
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: Vec::new(),
@@ -717,8 +716,9 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(config.resolved_prepare_pool().workers, 10);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 100);
+        let workers = default_prepare_workers();
+        assert_eq!(config.resolved_prepare_pool().workers, workers);
+        assert_eq!(config.resolved_prepare_pool().queue_capacity, workers * 10);
     }
 
     #[cfg(feature = "ext-proc")]
@@ -726,13 +726,17 @@ mod tests {
     fn prepare_pool_resolves_enabled_legacy_options_and_common_overrides() {
         let mut config = RouterConfig::default();
         config.ext_proc.enabled = true;
-        assert_eq!(config.resolved_prepare_workers(), 10);
+        let workers = default_prepare_workers();
+        assert_eq!(
+            config.resolved_prepare_workers(),
+            workers.min(config.ext_proc.max_streams)
+        );
         config.ext_proc.enabled = false;
         config.ext_proc.parser_concurrency = 8;
         config.ext_proc.max_streams = 3;
         config.ext_proc.max_tokenize_bytes = 4096;
         // Merely compiling ext-proc must not change the ordinary HTTP limits.
-        assert_eq!(config.resolved_prepare_workers(), 10);
+        assert_eq!(config.resolved_prepare_workers(), workers);
         assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
         config.ext_proc.enabled = true;
         assert_eq!(config.resolved_prepare_workers(), 3);
