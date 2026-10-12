@@ -37,8 +37,7 @@ The `common/` directory provides shared test utilities used across all test modu
 | `api_endpoints_test.rs` | 35 | Core HTTP endpoint coverage: `/liveness`, `/readiness`, `/health`, `/health_generate`, `/generate`, `/v1/chat/completions`. Tests status codes, response formats, error handling, concurrent requests, and health check behavior with healthy/unhealthy workers. |
 | `parser_endpoints_test.rs` | 12 | Tests for `/parse/function_call` and `/parse/reasoning` endpoints. Verifies function call extraction from model output and reasoning/thinking block parsing. |
 | `request_formats_test.rs` | 6 | Request format validation for `/generate`, `/v1/chat/completions`, and `/v1/completions`. Tests various payload shapes: text, input_ids, batch requests, sampling params, and special parameters (logprobs, json_schema, ignore_eos). |
-| `proxy_contract_test.rs` | 6 | Request/response preservation, API errors, cancellation, and Responses resource forwarding. |
-| `resource_fanout_test.rs` | 7 | Responses resource credential passthrough and overrides, candidate filtering, address deduplication, error priority, immediate success, and credential validation before dispatch. |
+| `proxy_contract_test.rs` | 6 | Request/response preservation, API errors, cancellation, and no retry after a failed Responses submission. Responses resource forwarding: methods, queries, worker credentials, DP origin deduplication, streaming, rejected `response_id` path segments, and error precedence across backends. |
 | `responses_api_test.rs` | 11 | Responses API (conversations) CRUD operations. Tests creating, listing, retrieving, and deleting conversation sessions via the conversation handlers. |
 | `streaming_tests.rs` | 7 | SSE streaming response tests. Verifies streaming output for `/generate` and `/v1/chat/completions`, including chunked transfer and stream termination. |
 
@@ -52,9 +51,9 @@ The `common/` directory provides shared test utilities used across all test modu
 | `header_forwarding_test.rs` | 6 | Header propagation tests. Verifies that custom headers are correctly forwarded from client through the router to backend workers. |
 | `payload_size_test.rs` | 5 | Request payload size limit tests. Verifies behavior with oversized payloads and boundary conditions. |
 | `pd_routing_test.rs` | 3 | Prefill/Decode disaggregation routing. Tests routing decisions that split prefill and decode phases to different workers. |
-| `ingress_tests.rs` | 4 | Shared metadata, capabilities, token routing and Responses state-domain checks. Library unit tests. |
-| `http_pd_load_tests.rs` | 12 | PD worker load lifecycle across ATOM, vLLM and SGLang dispatch, including streaming, errors and cancellation. Compiled as a library unit test module. |
-| `http_proxy_body_tests.rs` | 3 | Real HTTP framing regression tests for exactly-once completion, worker outcomes, empty responses, cancellation and truncated bodies. Compiled as a library unit test module. |
+| `ingress_tests.rs` | 14 | Shared metadata, capabilities, token routing, Responses state-domain checks, DP rank forwarding, preparation in the parse job, and Tokio responsiveness during tokenization. Library unit tests. |
+| `http_pd_load_tests.rs` | 14 | PD worker load lifecycle across ATOM, vLLM and SGLang dispatch, including streaming, errors and cancellation. Compiled as a library unit test module. |
+| `http_proxy_body_tests.rs` | 2 | Real HTTP framing regression tests for exactly-once completion, worker outcomes, empty responses, cancellation and truncated bodies. Compiled as a library unit test module. |
 | `pd_topology_test.rs` | 18 | PD topology end-to-end tests: 1P1D, 2P2D, and Regular mode. Verifies complete request flows through the router with mock worker backends. |
 | `test_pd_routing.rs` | 23 | PD routing unit-level tests. Covers PD selection policies, worker assignment, context construction, and routing decisions with various topology configurations. |
 | `policy_registry_integration.rs` | 3 | PolicyRegistry integration with RouterManager. Tests policy registration, lookup, and lifecycle management. |
