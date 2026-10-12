@@ -11,10 +11,14 @@ from pathlib import Path
 import sys
 
 
+def draft_path(model: str) -> Path:
+    return Path(model).parent.parent / "Inferact/Kimi-K3-DSpark"
+
+
 def render(config: dict, role: str, model: str, host: str, proxy: str,
            port: int, discovery: int) -> tuple[list[str], dict[str, str]]:
     args = copy.deepcopy(config["roles"][role]["args"])
-    args["speculative-config"]["model"] = "/mnt/models/Inferact/Kimi-K3-DSpark"
+    args["speculative-config"]["model"] = str(draft_path(model))
     transfer = args["kv-transfer-config"]
     connectors = transfer.get("kv_connector_extra_config", {}).get("connectors", [transfer])
     for connector in connectors:
@@ -73,7 +77,7 @@ def main() -> None:
                 record["versions"][name] = None
         assert "81198e97b" in record["versions"]["vllm"], record["versions"]
         record["model_files"] = {}
-        for root in (Path(options.model), Path("/mnt/models/Inferact/Kimi-K3-DSpark")):
+        for root in (Path(options.model), draft_path(options.model)):
             assert (root / "config.json").is_file(), root
             record["model_files"][str(root)] = {
                 p.name: {"bytes": p.stat().st_size,
