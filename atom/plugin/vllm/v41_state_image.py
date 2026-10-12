@@ -48,6 +48,31 @@ logger = logging.getLogger(__name__)
 #: is the key space, so a renumbering makes every stored image unreadable.
 IMAGE_LAYER_PREFIX = "atom.dsv41.state_image"
 
+#: Flipped by the wiring that writes and reads images. Registration alone is
+#: not enough to admit a prefix hit: vLLM will allocate and hash the image
+#: blocks whether or not anything fills them, and a hit served from unwritten
+#: blocks is the stale cursor the refusal exists to prevent. Measured the
+#: hard way -- opening the gate on registration alone killed the engine with
+#: `needs state at ...` on the second send of one prompt.
+_IMAGES_WIRED = False
+
+
+def images_registered() -> bool:
+    """Whether the layers are declared to vLLM."""
+    import os
+
+    return os.environ.get("ATOM_V41_STATE_IMAGES") in ("1", "true", "True")
+
+
+def images_can_serve() -> bool:
+    """Whether a prefix hit may be served from an image.
+
+    Registration is necessary and not sufficient. This is what the prefix
+    caching gates ask, and it stays False until the store and the restore are
+    both installed.
+    """
+    return images_registered() and _IMAGES_WIRED
+
 
 def image_layer_name(index: int) -> str:
     return f"{IMAGE_LAYER_PREFIX}.{index}"
@@ -348,3 +373,169 @@ class V41ImageExporter:
             return 0
         self._copier([], ops)
         return len(ops)
+
+
+# --- registration, and reading back what vLLM did with it ---------------
+
+
+_IMAGE_LAYER_CLS = None
+
+
+def image_layer_class():
+    """Build the layer class lazily, with vLLM's bases.
+
+    Lazily because this module is imported by tests that never touch vLLM,
+    and a real `nn.Module` + `AttentionLayerBase` subclass is required rather
+    than optional: vLLM finds layers by `isinstance` over
+    `static_forward_context`, so a duck-typed class is registered, ignored,
+    and leaves no trace -- the pool is sized without the image blocks and the
+    first store writes somewhere nothing reserved.
+    """
+    global _IMAGE_LAYER_CLS
+    if _IMAGE_LAYER_CLS is not None:
+        return _IMAGE_LAYER_CLS
+
+    import torch
+    from torch import nn
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.v1.attention.backend import AttentionBackend, AttentionMetadataBuilder
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    class _V41ImageMetadataBuilder(AttentionMetadataBuilder):
+        """Builds nothing. The image layers run no attention.
+
+        It exists because vLLM reads class attributes off every group's
+        builder -- `requires_block_table_width` first -- and a backend whose
+        `get_builder_cls` returns None takes the engine down at startup
+        naming the attribute rather than the layer.
+        """
+
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device, **kw):
+            self.kv_cache_spec = kv_cache_spec
+            self.layer_names = layer_names
+            self.vllm_config = vllm_config
+            self.device = device
+
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return None
+
+        def build_for_cudagraph_capture(self, common_attn_metadata):
+            return None
+
+    class _V41ImageBackend(AttentionBackend):
+        """A backend that answers questions and runs nothing.
+
+        vLLM asks every layer's backend whether it is an SSM, to decide which
+        block sizes it may pick for the others
+        (`_find_non_ssm_backends`). The image layers are state, not
+        attention, so they say so -- and a layer returning None here takes
+        the engine down at startup with `'NoneType' object has no attribute
+        'is_ssm'`, which names the caller rather than the layer.
+        """
+
+        @staticmethod
+        def get_name() -> str:
+            return "ATOM_DEEPSEEK_V41_STATE_IMAGE"
+
+        @classmethod
+        def is_ssm(cls) -> bool:
+            return True
+
+        @staticmethod
+        def get_impl_cls():
+            return nn.Identity
+
+        @staticmethod
+        def get_builder_cls():
+            return _V41ImageMetadataBuilder
+
+        @classmethod
+        def full_cls_name(cls):
+            return (cls.__module__, cls.__qualname__)
+
+    class _V41ImageLayer(nn.Module, AttentionLayerBase):
+        """One image unit, as vLLM sees it.
+
+        Deliberately inert. vLLM allocates for it and this records what it
+        got; whether those are the bytes an image is written to is NOT
+        assumed here. `describe_binding` reports the allocation so the
+        question can be settled by reading it rather than by modelling it.
+        """
+
+        def __init__(self, prefix, part, unit_bytes, block_size, alignment):
+            super().__init__()
+            self.prefix = prefix
+            self.part = int(part)
+            self.unit_bytes = int(unit_bytes)
+            self.image_block_size = int(block_size)
+            self.alignment = alignment
+            self.kv_cache = torch.tensor([])
+            self.impl = nn.Identity()
+            self._atom_v41_image_layer = True
+
+        def get_attn_backend(self):
+            return _V41ImageBackend
+
+        def get_kv_cache_spec(self, vllm_config):
+            return MambaSpec(
+                shapes=((self.unit_bytes,),),
+                dtypes=(torch.uint8,),
+                block_size=self.image_block_size,
+                num_prefill_checkpoint_blocks=1,
+                prefill_checkpoint_alignment=self.alignment,
+                tp_replicated=False,
+            )
+
+        def bind_kv_cache(self, kv_cache) -> None:
+            self.kv_cache = (kv_cache.reshape(kv_cache.shape[0], -1),)
+
+        def describe_binding(self) -> dict:
+            t = self.kv_cache
+            t = t[0] if isinstance(t, tuple) else t
+            try:
+                blocks = int(t.shape[0])
+                return {
+                    "layer": self.prefix,
+                    "blocks": blocks,
+                    "bytes_per_block": int(t.numel() * t.element_size() // max(1, blocks)),
+                    "base": int(t.data_ptr()),
+                    "device": str(t.device),
+                }
+            except Exception as exc:
+                return {"layer": self.prefix, "error": f"{type(exc).__name__}: {exc}"}
+
+    _IMAGE_LAYER_CLS = _V41ImageLayer
+    return _IMAGE_LAYER_CLS
+
+
+def register_image_layers(vllm_config, sizing: V41ImageSizing, block_size: int,
+                          alignment: int) -> list[str]:
+    """Put the image layers in vLLM's static forward context. Idempotent."""
+    cls = image_layer_class()
+    sfc = vllm_config.compilation_config.static_forward_context
+    names = expected_layer_names(sizing)
+    for i, name in enumerate(names):
+        existing = sfc.get(name)
+        if existing is not None:
+            if not getattr(existing, "_atom_v41_image_layer", False):
+                raise ValueError(f"Duplicate layer name: {name}")
+            continue
+        sfc[name] = cls(name, i, sizing.unit_bytes, block_size, alignment)
+    logger.info(
+        "DeepSeek-V4.1 state images: %d layers of %d B registered "
+        "(image %d B of a %d B slot, %d B padding)",
+        len(names), sizing.unit_bytes, sizing.image_bytes, sizing.slot_bytes,
+        sizing.padded_bytes - sizing.image_bytes,
+    )
+    return names
+
+
+def describe_registration(vllm_config, sizing: V41ImageSizing) -> list[dict]:
+    """What vLLM gave each image layer, for reading rather than assuming."""
+    sfc = vllm_config.compilation_config.static_forward_context
+    out = []
+    for name in expected_layer_names(sizing):
+        layer = sfc.get(name)
+        out.append({"layer": name, "error": "absent"} if layer is None
+                   else layer.describe_binding())
+    return out
