@@ -948,7 +948,8 @@ mooncake_setting() {
 }
 
 # mooncake_pool_port <base port> <pool>: the pool's master, metadata or
-# metrics port, 100 apart so the owners' service ports stay clear.
+# metrics port, 100 apart (check_mooncake_store_ports refuses a plan whose
+# owners' service ports reach one).
 mooncake_pool_port() {
   echo $(( $1 + 100 * $2 ))
 }
@@ -1072,14 +1073,48 @@ plan_mooncake_store_pools() {
       exit 2
       ;;
   esac
-  local base port last=$(( ${#mooncake_pool_devices[@]} - 1 ))
-  for base in ATOMESH_MOONCAKE_MASTER_PORT ATOMESH_MOONCAKE_METADATA_PORT ATOMESH_MOONCAKE_METRICS_PORT; do
-    port="$(mooncake_pool_port "${!base}" "${last}")"
+}
+
+# Refuses a Store port outside the TCP range, or one that two Store processes
+# of a node would bind: each pool's master, metadata and metrics ports, and the
+# owners' service ports, on the prefill node, which runs the masters; the
+# decode node's owners only join them. Needs both plans.
+check_mooncake_store_ports() {
+  local -a names=() ports=() decode_numa=() decode_gib=() decode_devices=()
+  local pool base i
+  for pool in "${!mooncake_pool_devices[@]}"; do
+    for base in ATOMESH_MOONCAKE_MASTER_PORT ATOMESH_MOONCAKE_METADATA_PORT ATOMESH_MOONCAKE_METRICS_PORT; do
+      names+=("pool ${pool}'s port ${base} + 100 x ${pool}")
+      ports+=("$(mooncake_pool_port "${!base}" "${pool}")")
+    done
+  done
+  for i in "${!mooncake_owner_plan_numa[@]}"; do
+    names+=("owner ${i}'s port ATOMESH_MOONCAKE_OWNER_PORT + ${i}")
+    ports+=("$(( ATOMESH_MOONCAKE_OWNER_PORT + i ))")
+  done
+  local -A bound_by=()
+  local port
+  for i in "${!ports[@]}"; do
+    port="${ports[i]}"
     if (( port > 65535 )); then
-      echo "[mooncake-store][FAIL] pool ${last}'s port ${base} + 100 x ${last} = ${port} is outside the valid TCP port range" >&2
+      echo "[mooncake-store][FAIL] ${names[i]} = ${port} is outside the valid TCP port range" >&2
       exit 2
     fi
+    if [[ -n "${bound_by[${port}]:-}" ]]; then
+      echo "[mooncake-store][FAIL] ${names[i]} = ${port} is ${bound_by[${port}]} too; move ATOMESH_MOONCAKE_OWNER_PORT clear of the master, metadata and metrics ports of every pool" >&2
+      exit 2
+    fi
+    bound_by[${port}]="${names[i]}"
   done
+  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
+    parse_mooncake_owner_spec MOONCAKE_STORE_DECODE_OWNERS \
+      decode_numa decode_gib decode_devices
+    port=$(( ATOMESH_MOONCAKE_OWNER_PORT + ${#decode_numa[@]} - 1 ))
+    if (( port > 65535 )); then
+      echo "[mooncake-store][FAIL] decode owner $(( ${#decode_numa[@]} - 1 ))'s port ATOMESH_MOONCAKE_OWNER_PORT + $(( ${#decode_numa[@]} - 1 )) = ${port} is outside the valid TCP port range" >&2
+      exit 2
+    fi
+  fi
 }
 
 # The owners' devices, each once, in plan order.
@@ -1189,6 +1224,7 @@ check_mooncake_store_settings() {
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
   plan_mooncake_store_owners
   plan_mooncake_store_pools
+  check_mooncake_store_ports
 }
 
 # The image must carry the Store: the master and owner binaries, which only a

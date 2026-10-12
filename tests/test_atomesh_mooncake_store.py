@@ -503,20 +503,77 @@ done
             # Without a list of its own an owner takes rdma4-rdma7.
             ({**per_nic, "MOONCAKE_STORE_OWNERS": "0:64"}, "needs exactly one NIC"),
             ({"MOONCAKE_STORE_POOLS": "ring"}, "neither shared nor per_nic"),
-            (
-                {
-                    **per_nic,
-                    "MOONCAKE_STORE_OWNERS": "0:8:rdma0;0:8:rdma1",
-                    "ATOMESH_MOONCAKE_METRICS_PORT": "65500",
-                },
-                "port ATOMESH_MOONCAKE_METRICS_PORT + 100 x 1 = 65600",
-            ),
         ):
             with self.subTest(env=env):
                 result = self.run_shell(
                     "plan_mooncake_store_pools\n", expect_rc=2, **env
                 )
                 self.assertIn(message, result.stderr)
+
+    def test_store_ports_must_fit_the_tcp_range_and_not_collide(self):
+        # Pool p's master, metadata and metrics ports are 50051, 50180 and
+        # 50190 + 100 x p, owner i's service port 50152 + i.
+        master = {"ATOMESH_MOONCAKE_MASTER_PORT": "50051"}
+        plan = (
+            "plan_mooncake_store_owners\nplan_mooncake_store_pools\n"
+            "check_mooncake_store_ports\n"
+        )
+
+        def owners(n):
+            return ";".join(["0:1"] * n)
+
+        for env, message in (
+            (
+                {"MOONCAKE_STORE_OWNERS": owners(29)},
+                (
+                    "owner 28's port ATOMESH_MOONCAKE_OWNER_PORT + 28 = 50180 is "
+                    "pool 0's port ATOMESH_MOONCAKE_METADATA_PORT + 100 x 0 too"
+                ),
+            ),
+            (
+                {
+                    "MOONCAKE_STORE_POOLS": "per_nic",
+                    "MOONCAKE_STORE_OWNERS": "0:8:rdma0;0:8:rdma1",
+                    "ATOMESH_MOONCAKE_METRICS_PORT": "65500",
+                },
+                (
+                    "pool 1's port ATOMESH_MOONCAKE_METRICS_PORT + 100 x 1 = 65600 "
+                    "is outside the valid TCP port range"
+                ),
+            ),
+            (
+                {
+                    "MOONCAKE_STORE_OWNERS": "0:8;1:8",
+                    "ATOMESH_MOONCAKE_OWNER_PORT": "65535",
+                },
+                "owner 1's port ATOMESH_MOONCAKE_OWNER_PORT + 1 = 65536 is outside",
+            ),
+            # The decode node's owners join the prefill node's masters, so
+            # only their range is checked; they count from the same base.
+            (
+                {
+                    "MOONCAKE_STORE_OWNERS": "0:8",
+                    "MOONCAKE_STORE_DECODE_OWNERS": "0:8;1:8",
+                    "ATOMESH_MOONCAKE_OWNER_PORT": "65535",
+                },
+                (
+                    "decode owner 1's port ATOMESH_MOONCAKE_OWNER_PORT + 1 = 65536 "
+                    "is outside"
+                ),
+            ),
+        ):
+            with self.subTest(env=env):
+                result = self.run_shell(plan, expect_rc=2, **master, **env)
+                self.assertIn(message, result.stderr)
+        self.run_shell(plan, **master, MOONCAKE_STORE_OWNERS=owners(28))
+        # Refused before anything starts, with the other settings.
+        result = self.run_shell(
+            "check_mooncake_store_settings\n",
+            expect_rc=2,
+            **master,
+            MOONCAKE_STORE_OWNERS=owners(29),
+        )
+        self.assertIn("ATOMESH_MOONCAKE_METADATA_PORT + 100 x 0 too", result.stderr)
 
     def test_decode_owners_need_their_own_nodes_and_one_prefill_node(self):
         decode_owners = {"MOONCAKE_STORE_DECODE_OWNERS": "0:8:rdma0"}
