@@ -81,6 +81,20 @@ _SAVE_RECONCILE_INTERVAL_S = 5.0
 
 
 
+def _v41_image_group_ids(kv_cache_config) -> set:
+    """Group ids whose layers are ALL DeepSeek-V4.1 state images."""
+    from atom.plugin.vllm.v41_state_image import is_image_layer
+
+    out = set()
+    for gid, group in enumerate(
+        getattr(kv_cache_config, "kv_cache_groups", None) or ()
+    ):
+        names = list(getattr(group, "layer_names", []) or [])
+        if names and all(is_image_layer(n) for n in names):
+            out.add(gid)
+    return out
+
+
 def _without_v41_image_groups(groups, kv_cache_config):
     """Drop DeepSeek-V4.1's checkpoint-image group from the recurrent leg.
 
@@ -672,7 +686,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if len(groups) <= 1:
             return 0
         mamba_ids = {group_id for group_id, _ in self._mamba_groups}
-        others = [gid for gid in range(len(groups)) if gid not in mamba_ids]
+        # V4.1's state-image group is neither: it is dropped from the
+        # recurrent leg above, and counting it here as an attention group
+        # made this refuse to start with `found [0, 1]`. It is ATOM's own
+        # state and the connector never touches it in either direction.
+        image_ids = _v41_image_group_ids(kv_cache_config)
+        others = [
+            gid
+            for gid in range(len(groups))
+            if gid not in mamba_ids and gid not in image_ids
+        ]
         if len(others) != 1:
             raise ValueError(
                 "ATOM offload connector: expected exactly one non-recurrent KV "

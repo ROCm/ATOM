@@ -53,3 +53,20 @@ def test_a_mixed_group_is_kept():
 def test_no_config_leaves_the_groups_alone():
     kept = _without_v41_image_groups([(1, "spec")], SimpleNamespace())
     assert kept == [(1, "spec")]
+
+
+def test_the_image_group_is_not_an_attention_group_either():
+    """Dropping it from the recurrent leg alone moved it to the other side:
+    `expected exactly one non-recurrent KV cache group, found [0, 1]`, and
+    the engine refused to start. It is neither."""
+    from atom.plugin.vllm.kv_transfer.connector import _v41_image_group_ids
+
+    cfg = _cfg(["model.layers.0.self_attn"], _image_names())
+    assert _v41_image_group_ids(cfg) == {1}
+
+
+def test_a_model_without_images_has_none():
+    cfg = _cfg(["model.layers.0.self_attn"], ["model.layers.3.linear_attn"])
+    from atom.plugin.vllm.kv_transfer.connector import _v41_image_group_ids
+
+    assert _v41_image_group_ids(cfg) == set()
