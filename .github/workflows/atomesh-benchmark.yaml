@@ -6,6 +6,7 @@ on:
     paths:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
+      - '.github/benchmark/aiter/**'
       - '.github/scripts/atomesh/**'
       - 'atom/entrypoints/openai/**'
       - '.github/scripts/slurm_submit_helpers.sh'
@@ -17,6 +18,7 @@ on:
     paths:
       - 'atom/mesh/**'
       - '.github/benchmark/models_atomesh.yaml'
+      - '.github/benchmark/aiter/**'
       - '.github/scripts/atomesh/**'
       - 'atom/entrypoints/openai/**'
       - '.github/scripts/slurm_submit_helpers.sh'
@@ -127,6 +129,9 @@ on:
             minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c48,
             minimax-m3-fp8-1p1d-tp4,minimax-m3-fp8-2p1d-dpa-tp4,
             minimax-m3-fp8-1p1d-tp4-eagle3,minimax-m3-fp8-2p1d-dpa-tp4-eagle3
+
+          MiniMax (accuracy):
+            minimax-m3-fp4-1p1d-tp4-eagle3-lmcache-gsm8k-only-c40
         required: false
         default: ''
         type: string

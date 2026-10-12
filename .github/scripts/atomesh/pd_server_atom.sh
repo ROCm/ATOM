@@ -1666,30 +1666,8 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-result_dir = Path(sys.argv[1])
-eval_conc = sys.argv[2]
-json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
-if not json_files:
-    print("[eval] ERROR: no result JSON found")
-    raise SystemExit(1)
-
-result_file = max(json_files, key=lambda path: path.stat().st_mtime)
-data = json.loads(result_file.read_text(encoding="utf-8"))
-score = (
-    data.get("results", {})
-    .get("gsm8k", {})
-    .get("exact_match,flexible-extract", "N/A")
-)
-print("=========================================")
-print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
-print("=========================================")
-print(json.dumps(data.get("results", {}), indent=2))
-PY
+    python3 "${ATOMESH_SCRIPT_DIR}/check_gsm8k_result.py" \
+      "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}"
   done
 
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"

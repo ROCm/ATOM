@@ -139,6 +139,21 @@ class V4WorkflowTest(unittest.TestCase):
             )
 
 
+    def test_manual_minimax_accuracy_case_selection(self):
+        name = "minimax-m3-fp4-1p1d-tp4-eagle3-lmcache-gsm8k-only-c40"
+        cells = self.matrix(
+            event="workflow_dispatch",
+            SUITE="accuracy",
+            RUN_ALL_MODELS="false",
+            CASE_NAMES=name,
+            ATOMESH_EVAL_CONCURRENCY="40",
+        )
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(cells[0]["name"], name)
+        self.assertTrue(cells[0]["eval_only"])
+        self.assertEqual(cells[0]["accuracy"]["concurrency"], [40])
+
+
 class V4AccuracyPhaseTest(unittest.TestCase):
     def test_eval_phase_dispatch_and_server_args(self):
         source = (SCRIPTS / "pd_server_atom.sh").read_text()

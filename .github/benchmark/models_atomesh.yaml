@@ -1270,6 +1270,9 @@ models:
               MC_DISABLE_HIP: "1"
               AITER_SITUV2_A4W4: "1"
               AITER_FLYDSL_STAGE2_FP8: "1"
+              # Avoid the 32K warmup scatter_reduce fault in run 37867633847.
+              # Pin the paired pre-scatter M3 kernels; see benchmark/aiter/README.md.
+              AITER_CONFIG_FMOE: /workspace/ATOM/.github/benchmark/aiter/minimax_m3_fp4_reduce_tuned_fmoe.csv
               ATOM_PA_FLYDSL: "1"
               ATOM_PA_FLYDSL_PLAN: "1"
               ATOM_M3_INDEXER_CP: "1"
@@ -1305,6 +1308,28 @@ models:
               <<: *minimax_m3_agentic_lmcache_args
               max_num_seqs: 96
               decode_max_num_seqs: 96
+
+      accuracy:
+        - <<: *minimax_m3_agentic_lmcache_tp4_tp4
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-lmcache-gsm8k-only-c40
+          # Keep the C40 service configuration; only run real-token GSM8K.
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [40]
+          # Match the existing eval-only runner; omit AgentX report generation.
+          benchmark:
+            kind: random
+            wait_server_timeout: 4500
+            wait_router_timeout: 600
+          server:
+            common_args:
+              <<: *minimax_m3_agentic_lmcache_args
+              spec_decode_acceptance_length: ""
+          accuracy:
+            batch_size: 40
+            # Initial gate from models_accuracy.json (M3 TP8 / EAGLE3 TP8).
+            # This is an acceptance target, not a measured TP4 PD baseline.
+            threshold: 0.93
 
     accuracy:
       task: gsm8k

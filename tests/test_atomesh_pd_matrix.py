@@ -3,8 +3,10 @@
 
 """CPU-only tests for ATOMesh Slurm node selection and cell expansion."""
 
+import csv
 import importlib.util
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -164,6 +166,171 @@ class TopologyKindTest(unittest.TestCase):
             with self.subTest(topology=topology):
                 cell = expand_cell(topology=topology, layout="single_node")
                 self.assertIs(cell["disaggregated"], disaggregated)
+
+
+class MiniMaxAccuracyTest(unittest.TestCase):
+    def test_c40_accuracy_preserves_the_reference_service(self):
+        cfg = pd_matrix.load_config(
+            SCRIPT.parents[2] / "benchmark/models_atomesh.yaml"
+        )
+        model_name = "MiniMax-M3-MXFP4"
+        env = {
+            "ATOMESH_MODEL_ROOT": "/models",
+            "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+            "ATOMESH_SLURM_ACCOUNT": "",
+            "ATOMESH_SLURM_PARTITION": "",
+            "ATOMESH_LOG_ROOT": "/logs",
+            "ATOMESH_1P1D_NODES": "",
+            "ATOMESH_SINGLE_NODE": "auto",
+            "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+        }
+        kwargs = dict(
+            model_filter={model_name},
+            benchmark_kind_filter=None,
+            override_image=None,
+            override_benchmark_concurrency=None,
+            override_eval_concurrency=None,
+        )
+        with patch.dict(os.environ, env):
+            accuracy_cells = pd_matrix.build_cells(
+                cfg, suite="accuracy", case_filter=None, **kwargs
+            )
+            perf = pd_matrix.build_cells(
+                cfg,
+                suite="nightly",
+                case_filter={
+                    "minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40"
+                },
+                **kwargs,
+            )[0]
+        self.assertEqual(len(accuracy_cells), 1)
+        accuracy = accuracy_cells[0]
+        self.assertTrue(accuracy["run_eval"])
+        self.assertTrue(accuracy["eval_only"])
+        self.assertEqual(accuracy["num_nodes"], 1)
+        self.assertTrue(accuracy["disaggregated"])
+        self.assertEqual(accuracy["concurrency"], [40])
+        self.assertEqual(accuracy["accuracy"]["concurrency"], [40])
+        self.assertEqual(accuracy["accuracy"]["batch_size"], 40)
+        self.assertEqual(accuracy["accuracy"]["threshold"], 0.93)
+        self.assertIsNone(accuracy["accuracy"]["limit"])
+        self.assertEqual(accuracy["accuracy"]["fewshot"], 5)
+        self.assertEqual(accuracy["accuracy"]["max_gen_toks"], 16384)
+        self.assertEqual(accuracy["service"], perf["service"])
+        self.assertEqual(accuracy["env"], perf["env"])
+        self.assertEqual(
+            accuracy["server_args"],
+            dict(perf["server_args"], spec_decode_acceptance_length=""),
+        )
+        self.assertEqual(accuracy["benchmark"]["kind"], "random")
+        self.assertFalse(perf["run_eval"])
+        self.assertEqual(perf["server_args"]["spec_decode_acceptance_length"], 2.78)
+
+
+class MiniMaxTuningTest(unittest.TestCase):
+    CONFIG_PATH = (
+        Path(__file__).resolve().parents[1]
+        / ".github/benchmark/aiter/minimax_m3_fp4_reduce_tuned_fmoe.csv"
+    )
+    CONTAINER_PATH = (
+        "/workspace/ATOM/.github/benchmark/aiter/"
+        "minimax_m3_fp4_reduce_tuned_fmoe.csv"
+    )
+
+    def test_tuning_override_reaches_only_the_c40_family(self):
+        cfg = pd_matrix.load_config(
+            SCRIPT.parents[2] / "benchmark/models_atomesh.yaml"
+        )
+        env = {
+            "ATOMESH_MODEL_ROOT": "/models",
+            "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+            "ATOMESH_SLURM_ACCOUNT": "",
+            "ATOMESH_SLURM_PARTITION": "",
+            "ATOMESH_LOG_ROOT": "/logs",
+            "ATOMESH_1P1D_NODES": "",
+            "ATOMESH_SINGLE_NODE": "auto",
+            "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+        }
+        cases = [
+            ("nightly", "minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40", 40),
+            ("nightly", "minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c48", 48),
+            ("accuracy", "minimax-m3-fp4-1p1d-tp4-eagle3-lmcache-gsm8k-only-c40", 40),
+            ("nightly", "minimax-m3-fp4-1p1d-tp4", None),
+        ]
+        self.assertTrue(self.CONFIG_PATH.is_file())
+        with patch.dict(os.environ, env):
+            for suite, name, concurrency in cases:
+                with self.subTest(case=name):
+                    cells = pd_matrix.build_cells(
+                        cfg,
+                        suite=suite,
+                        model_filter={"MiniMax-M3-MXFP4"},
+                        case_filter={name},
+                        benchmark_kind_filter=None,
+                        override_image=None,
+                        override_benchmark_concurrency=None,
+                        override_eval_concurrency=None,
+                    )
+                    self.assertEqual(len(cells), 1)
+                    cell = cells[0]
+                    if concurrency is None:
+                        self.assertNotIn("AITER_CONFIG_FMOE", cell["env"]["common"])
+                        continue
+                    self.assertEqual(
+                        cell["env"]["common"]["AITER_CONFIG_FMOE"],
+                        self.CONTAINER_PATH,
+                    )
+                    self.assertEqual(cell["num_nodes"], 1)
+                    self.assertEqual(cell["concurrency"], [concurrency])
+                    self.assertEqual(
+                        cell["server_args"]["max_num_batched_tokens"], 32768
+                    )
+                    for role in ("prefill", "decode"):
+                        self.assertEqual(cell["service"][role]["workers"], 1)
+                        self.assertEqual(cell["service"][role]["tp"], 4)
+                        self.assertEqual(cell["service"][role]["cudagraph_mode"], "FULL")
+                        self.assertEqual(
+                            cell["env"][role]["AITER_CONFIG_FMOE"],
+                            self.CONTAINER_PATH,
+                        )
+                    self.assertEqual(
+                        cell["env"]["prefill"]["HIP_VISIBLE_DEVICES"], "0,1,2,3"
+                    )
+                    self.assertEqual(
+                        cell["env"]["decode"]["HIP_VISIBLE_DEVICES"], "4,5,6,7"
+                    )
+
+    def test_tuning_table_covers_decode_and_32k_warmup_with_matching_layouts(self):
+        with self.CONFIG_PATH.open(newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        # An explicit AITER_CONFIG_FMOE replaces the default tables: preserve
+        # every token bucket, including decode, instead of shipping only 32K.
+        by_shape = {(int(row["inter_dim"]), int(row["token"])): row for row in rows}
+        expected = {(dim, 2**power) for dim in (384, 768) for power in range(16)}
+        self.assertEqual(set(by_shape), expected)
+        self.assertEqual(len(rows), len(expected))
+        for (dim, tokens), row in by_shape.items():
+            with self.subTest(inter_dim=dim, tokens=tokens):
+                self.assertEqual(
+                    (row["gfx"], row["model_dim"], row["topk"]),
+                    ("gfx950", "6144", "5"),
+                )
+                self.assertEqual(row["expert"], "129")
+                # GEMM2 must agree with sorting and the paired GEMM1 tile.
+                g1 = re.search(r"_(?:t)?(\d+)x\d+x\d+", row["kernelName1"])
+                g2 = re.search(
+                    r"_t(\d+)x\d+x\d+_(atomic|reduce)(?:_[a-z]+)*_sbm(\d+)$",
+                    row["kernelName2"],
+                )
+                self.assertIsNotNone(g1)
+                self.assertIsNotNone(g2)
+                self.assertEqual(g1[1], row["block_m"])
+                self.assertEqual(g2[1], row["block_m"])
+                self.assertEqual(g2[3], row["block_m"])
+                if tokens >= 16384:
+                    self.assertEqual(g2[2], "reduce")
+                    if dim == 384:
+                        self.assertEqual(row["block_m"], "64")
 
 
 if __name__ == "__main__":
