@@ -120,6 +120,13 @@ class KVConnectorSchedulerBase(ABC):
         """Preserve completions unless the backend consumes chunked P/D metadata."""
         return output
 
+    def admission_blocked(self) -> None:
+        """Notify the connector that KV capacity prevented prefill admission."""
+
+    def abort_send(self, seq: Any) -> None:
+        """Retire an unsent abort; streaming senders must wait for reader drain."""
+        self.send_finished(seq.id)
+
     @abstractmethod
     def request_finished(self, seq: Any) -> None:
         """Populate KV transfer output metadata when a request completes."""
