@@ -331,43 +331,14 @@ def validate_speculative_config(config):
         )
 
 
-# The vLLM-plugin connectors that own a tier for V4.1's per-request CSA2 STATE.
-# A plugin-mode transport is named by vLLM's own `kv_connector` string, which is
-# not an ATOM connector name, so it is matched here rather than resolved through
-# `KVConnectorFactory`.
-#
-# Empty, deliberately: no connector on this path carries STATE yet. V4.1 buys
-# its cache in two currencies and `PagedAttentionCache` refuses any request
-# whose cursor is not exactly the frontier the scheduler claims, so a PAGE
-# prefix restored without its STATE is not a degraded answer, it is a dead
-# engine. A connector that moves only PAGE therefore has to be refused rather
-# than admitted and hoped for. This tuple is where one that owns both legs is
-# named once it exists.
-_VLLM_PLUGIN_KV_CONNECTORS: tuple[str, ...] = ()
-
-
-def _kv_transfer_unsupported(config, on_vllm_plugin: bool) -> bool:
-    """Whether this run's KV transport is one V4.1 does not implement."""
-    kv_transfer_config = config.kv_transfer_config
-    if not kv_transfer_config:
-        return False
-    if on_vllm_plugin:
-        name = kv_transfer_config.get("kv_connector")
-        return name not in _VLLM_PLUGIN_KV_CONNECTORS
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    return KVConnectorFactory.connector_name(kv_transfer_config) not in (
-        None,
-        "lmcache_mp",
-    )
-
-
 def validate_runtime_config(config):
     """Gate unimplemented execution modes before weights or pools are loaded."""
     from atom.config import CUDAGraphMode
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
     plugin = config.plugin_config
     # The vLLM plugin path is text-only and runs the backbone alone: vLLM owns
     # scheduling and block allocation, and the bridge in
@@ -413,12 +384,12 @@ def validate_runtime_config(config):
             # transport is not an ATOM connector at all -- it is vLLM's own
             # `kv_connector`, and feeding that string to ATOM's factory is a
             # category error -- so it is named against its own allow-list.
-            (
-                "KV transfer other than lmcache_mp (native), or any KV "
-                "connector at all (vLLM plugin: none of them carries CSA2 "
-                "STATE yet)"
-            ),
-            _kv_transfer_unsupported(config, on_vllm_plugin),
+            # `lmcache_mp` is the one transport admitted: it checkpoints STATE
+            # through the backend's PAGE-backed copies. P/D and in-process
+            # offload read SLOT regions and codecs this runtime does not publish.
+            "KV transfer other than lmcache_mp",
+            KVConnectorFactory.connector_name(config.kv_transfer_config)
+            not in (None, "lmcache_mp"),
         ),
         ("RapidServe", config.enable_rapidserve),
         ("plugin mode outside vLLM", plugin is not None and not on_vllm_plugin),

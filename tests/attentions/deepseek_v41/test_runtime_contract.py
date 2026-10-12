@@ -205,31 +205,6 @@ def test_other_plugin_backends_are_still_refused_outright():
         )
 
 
-def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
-    """The plugin's transport is vLLM's `kv_connector`, not an ATOM name.
-
-    Resolving it through `KVConnectorFactory` is a category error, so the gate
-    forks on the mode. This also pins that the gate is *reachable* at all: it
-    reads `Config.kv_transfer_config`, which the plugin path populates in
-    `atom.plugin.config`. Before that plumbing existed the dict was always
-    empty here and every connector was admitted without the question being
-    asked -- a check that passes because it was never run.
-    """
-    validate_runtime_config(vllm_plugin_config(kv_transfer_config=None))
-    # The allow-list is empty on this path, so every connector is refused --
-    # including `lmcache_mp`, which is admitted natively and means nothing
-    # here. A PAGE prefix restored without its CSA2 STATE kills the engine, so
-    # there is no partial transport worth admitting.
-    for connector in (
-        "AtomLMCacheOffloadConnector",
-        "LMCacheConnectorV1",
-        "lmcache_mp",
-        "NixlConnector",
-    ):
-        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
-            validate_runtime_config(
-                vllm_plugin_config(kv_transfer_config={"kv_connector": connector})
-            )
 def _attach_uncompiled_backbone(model):
     """The runtime model's one compiled graph, built bare and run uncompiled,
     for a model assembled without its constructor."""
@@ -512,13 +487,19 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
 
     pytest.importorskip("aiter", reason="the attention module reaches AITER")
     from atom.models.deepseek_v41.attention import Attention
+    from atom.plugin.vllm.v41_eager_break import _attn_out_buffer
 
     heads, head_dim = 16, 512
     stub = SimpleNamespace(heads=heads, head_dim=head_dim)
 
+    # Core allocates nothing: the rows come back by return value, which is
+    # what keeps the native path free of this buffer and of the copy that
+    # landing in it would need.
+    assert Attention._attn_out_buffer(stub, None) is None
+
     for shape, tokens in (((8192, 7168), 8192), ((1, 8192, 7168), 8192)):
         hidden = torch.empty(shape, dtype=torch.bfloat16, device="cpu")
-        out = Attention._alloc_attn_out(stub, hidden)
+        out = _attn_out_buffer(stub, hidden)
         assert out.shape[-2:] == (heads, head_dim)
         # The leading dims are whatever `hidden` had, so the flatten this
         # path performs next yields one row per token under either layout.

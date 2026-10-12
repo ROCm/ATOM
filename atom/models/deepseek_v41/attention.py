@@ -361,32 +361,28 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
-    def _alloc_attn_out(self, hidden):
-        """The buffer the attention region writes its rows into.
+    def _attn_out_buffer(self, hidden):
+        """A buffer for the attention rows, or None to let them be returned.
 
-        Caller-owned, because breakable cudagraph capture requires the eager
-        region to write in place: a region that returns a fresh tensor hands
-        back a different address every step, and a replay reruns no host code
-        to learn the new one. Allocated here, in what stays inside the graph,
-        so the capture records one address and every replay finds it.
+        None here, which is ATOM's own shape: the kernels answer in a buffer
+        of their own and it is handed back up by return value, with nothing
+        allocated and nothing copied.
+
+        A frontend that breaks a capture around `_attend_block` replaces this
+        with a real allocation, because a broken-out region may not hand back
+        a fresh tensor -- its address would change every replay while the
+        captured segments after it still point at the first one. Allocating
+        here puts the buffer in what stays inside the graph, so the capture
+        records one address and every replay finds it.
         """
-        # Every leading dimension of `hidden`, not just the first: ATOM hands
-        # this layer `[batch, tokens, dim]` where upstream's native V4.1 gets
-        # `[tokens, dim]`, so `hidden.shape[0]` is the batch and sizing from
-        # it yields one row per sequence instead of one per token. The rest of
-        # this path flattens the leading pair, which turns that into a kernel
-        # `out=` mismatch rather than a wrong answer -- loud, but only because
-        # the kernel checks.
-        return torch.empty(
-            (*hidden.shape[:-1], self.heads, self.head_dim),
-            dtype=hidden.dtype,
-            device=hidden.device,
-        )
+        return None
 
     def forward(self, hidden, hidden_scale, cache, step, rope):
-        attn_out = self._alloc_attn_out(hidden)
-        self._attend_block(attn_out, hidden, hidden_scale, cache, step, rope)
-        return self._project_out(attn_out, rope, cache.rope_positions(step))
+        attn_out = self._attn_out_buffer(hidden)
+        rows = self._attend_block(attn_out, hidden, hidden_scale, cache, step, rope)
+        return self._project_out(
+            rows if attn_out is None else attn_out, rope, cache.rope_positions(step)
+        )
 
     def _attend_block(self, attn_out, hidden, hidden_scale, cache, _step, rope):
         """Everything from the compressor fork to the attention rows.
@@ -410,9 +406,11 @@ class Attention(nn.Module):
         side is silent, so this takes the side that is right either way until
         there is a measurement saying the narrower region is worth it.
 
-        Writes into `attn_out` and returns nothing, which is the contract the
-        decorator is held to: a region that returned rows would hand back a
-        new address every step and a replay reruns no host code to find it.
+        With a buffer it writes into it and returns None, which is the
+        contract the decorator is held to: a region that returned rows would
+        hand back a new address every step and a replay reruns no host code to
+        find it. Without one -- ATOM's own path, where nothing is decorated --
+        it returns the rows and nothing is allocated or copied.
         """
         step = getattr(cache, "current_step", None) or _step
         compressed = self._fork_compress(hidden, cache, step, rope)
@@ -424,7 +422,9 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        self._attend(attn_out, query, kv_normed, selecting, cache, step, rope)
+        return self._attend(
+            attn_out, query, kv_normed, selecting, cache, step, rope
+        )
 
     def _attend(self, attn_out, query, kv_normed, selecting, cache, step, rope):
         """The sparse indexer's join and the MLA attention, into `attn_out`.
@@ -449,7 +449,9 @@ class Attention(nn.Module):
             self.spec, step
         )
         flat_query = query.flatten(0, 1)
-        flat_out = attn_out.flatten(0, 1)
+        # None on ATOM's own path: nothing was allocated to land in, so the
+        # kernels answer where they like and the rows go back by return value.
+        flat_out = None if attn_out is None else attn_out.flatten(0, 1)
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
             if cache.packed:
@@ -488,15 +490,20 @@ class Attention(nn.Module):
                 second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_out,
+                out=flat_query if flat_out is None else flat_out,
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        # Outside the branch, because both reach it. `out=` is a request, not a
-        # guarantee: these kernels are shared with V4 and may answer in a
-        # buffer of their own, and the decode pair is not even offered one.
-        # Ignoring the return would leave `attn_out` holding whatever was there
-        # before, with nothing raised -- and this region has to write through
-        # the caller's buffer, which is what lets it be an eager break.
+        if flat_out is None:
+            # ATOM's own shape, unchanged: hand the rows back and let the
+            # caller project them. No allocation, no copy.
+            return output.view_as(query)
+        # A caller that supplied a buffer gets the rows in it. `out=` is a
+        # request, not a guarantee: these kernels are shared with V4 and may
+        # answer in a buffer of their own, and the decode pair is not even
+        # offered one. Ignoring the return would leave the buffer holding
+        # whatever was there before, with nothing raised -- and a broken-out
+        # region has to write through the caller's buffer to be one at all.
         if output.data_ptr() != flat_out.data_ptr():
             flat_out.copy_(output)
+        return None
