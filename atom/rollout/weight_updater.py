@@ -890,6 +890,14 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+        # Deliberately do not transform MXFP4 weight_scale here. The rollout
+        # update protocol ignores incoming scale tensors and does not provide a
+        # new row-major scale paired with this weight; the module therefore
+        # still owns the loader-prepared consumer-layout scale. Applying the
+        # load-time row-major -> consumer transform again would double-shuffle
+        # it. Supporting independently quantized MXFP4 updates requires syncing
+        # weight and row-major scale as one explicit protocol change.
+
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
     ) -> int:

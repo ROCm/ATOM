@@ -24,6 +24,11 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
+from atom.model_ops.fp4_layout import (
+    MXScaleLayout,
+    mxfp4_scale_buffer_shape,
+    resolve_current_fp4_backend_spec,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -179,6 +184,7 @@ def _aiter_rms_quant_fake(
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
     e8m0_scale: bool = False,
+    mxfp4_scale_layout: int = MXScaleLayout.AITER_E8M0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
@@ -191,12 +197,12 @@ def _aiter_rms_quant_fake(
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         scale = torch.empty((M, N // 32), dtype=torch.float8_e8m0fnu, device=x.device)
     elif quant_type_value == _QV_PER_1X32:
-        # MXFP4: out=(M, N/2) fp4x2; scale=(⌈M/256⌉*256, ⌈⌈N/32⌉/8⌉*8) UE8M0
-        # bytes (kernel writes one uint8 per group; passing fp8_e8m0fnu
-        # directly yields the matching byte layout — no fp32 view).
+        # MXFP4: the consumer contract determines the physical E8M0 buffer
+        # shape; the logical scale is always (M, ceil(N/32)).
         out = torch.empty((M, N // 2), dtype=torch.float4_e2m1fn_x2, device=x.device)
-        scale_m = ((M + 255) // 256) * 256
-        scale_n = ((((N + 31) // 32) + 7) // 8) * 8
+        scale_m, scale_n = mxfp4_scale_buffer_shape(
+            M, (N + 31) // 32, mxfp4_scale_layout
+        )
         scale = torch.empty(
             (scale_m, scale_n), dtype=torch.float8_e8m0fnu, device=x.device
         )
@@ -231,11 +237,20 @@ def _aiter_rms_quant(
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
     e8m0_scale: bool = False,
+    mxfp4_scale_layout: int = MXScaleLayout.AITER_E8M0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
     out, scale, out_res1 = _aiter_rms_quant_fake(
-        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype, e8m0_scale
+        x,
+        weight,
+        eps,
+        quant_type_value,
+        transpose_scale,
+        res1,
+        value_dtype,
+        e8m0_scale,
+        mxfp4_scale_layout,
     )
     if _is_mxfp8(quant_type_value, value_dtype):
         # The FP8 width is carried by `out`'s dtype and the UE8M0 format by
@@ -243,17 +258,47 @@ def _aiter_rms_quant(
         # the only thing left to state is that the scale stays row-major.
         group_size, shuffle = 32, False
     elif quant_type_value == _QV_PER_1X32:
-        group_size, shuffle = 32, True
+        group_size, shuffle = 32, False
     elif quant_type_value == _QV_PER_1X128:
         group_size, shuffle = 128, transpose_scale
     else:  # _QV_PER_TOKEN
         group_size, shuffle = 0, False
     if res1 is None:
-        rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
+        if quant_type_value == _QV_PER_1X32 and not _is_mxfp8(
+            quant_type_value, value_dtype
+        ):
+            rmsnorm_quant(
+                out,
+                x,
+                scale,
+                weight,
+                eps,
+                group_size,
+                shuffle,
+                scale_layout=mxfp4_scale_layout,
+            )
+        else:
+            rmsnorm_quant(out, x, scale, weight, eps, group_size, shuffle)
     else:
-        add_rmsnorm_quant(
-            out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
-        )
+        if quant_type_value == _QV_PER_1X32 and not _is_mxfp8(
+            quant_type_value, value_dtype
+        ):
+            add_rmsnorm_quant(
+                out,
+                x,
+                res1,
+                out_res1,
+                scale,
+                weight,
+                eps,
+                group_size,
+                shuffle,
+                scale_layout=mxfp4_scale_layout,
+            )
+        else:
+            add_rmsnorm_quant(
+                out, x, res1, out_res1, scale, weight, eps, group_size, shuffle
+            )
     return out, scale, out_res1
 
 
@@ -268,6 +313,7 @@ class RMSNorm(nn.Module):
         fused_quant_emit_bf16: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mxfp4_scale_layout: int | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -295,6 +341,17 @@ class RMSNorm(nn.Module):
         params_dtype = layer_quant_config.quant_dtype
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        self._mxfp4_scale_layout_explicit = mxfp4_scale_layout is not None
+        fp4_backend_spec = resolve_current_fp4_backend_spec(params_dtype)
+        self.mxfp4_scale_layout = (
+            int(mxfp4_scale_layout)
+            if mxfp4_scale_layout is not None
+            else (
+                int(fp4_backend_spec.activation_scale_layout)
+                if fp4_backend_spec is not None
+                else MXScaleLayout.AITER_E8M0
+            )
+        )
         # transpose_scale (column-major scale) only applies to per_1x128 with
         # the preshuffle GEMM consumer; resolve the env once at init time so
         # forward sees a hot static bool instead of an env lookup per call.
@@ -357,6 +414,10 @@ class RMSNorm(nn.Module):
 
         self.quant_type = online_quant_type
         self.params_dtype = online_cfg.quant_dtype
+        if not self._mxfp4_scale_layout_explicit:
+            fp4_backend_spec = resolve_current_fp4_backend_spec(self.params_dtype)
+            if fp4_backend_spec is not None:
+                self.mxfp4_scale_layout = int(fp4_backend_spec.activation_scale_layout)
         self._aiter_transpose_scale = (
             self.quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
@@ -514,6 +575,7 @@ class RMSNorm(nn.Module):
                     ),
                     self.params_dtype,
                     self._aiter_e8m0_scale,
+                    self.mxfp4_scale_layout,
                 )
                 if batched:
                     x = x.view(*lead, -1)

@@ -31,6 +31,11 @@ if not torch.cuda.is_available():
 from aiter import QuantType, dtypes
 
 from atom.model_ops import linear as linear_mod
+from atom.model_ops.fp4_layout import (
+    Fp4BackendKind,
+    Fp4BackendSpec,
+    MXScaleLayout,
+)
 from atom.model_ops.linear import (
     LinearBase,
     weight_is_stored_preshuffled,
@@ -158,8 +163,37 @@ def _loader_shuffles(monkeypatch, case, *, dim=2):
     monkeypatch.setattr(
         linear_mod.fp4_utils, "e8m0_shuffle", lambda scale: scale, raising=False
     )
+    monkeypatch.setattr(
+        linear_mod, "to_mxfp4_scale_layout", lambda scale, _layout: scale
+    )
     LinearBase.process_weights_after_loading(_linear_double(*case, dim=dim))
     return bool(calls)
+
+
+def test_loader_converts_mxfp4_scale_to_resolved_backend(monkeypatch):
+    spec = Fp4BackendSpec(
+        Fp4BackendKind.DEFAULT_AITER,
+        MXScaleLayout.OPUS_F4,
+        MXScaleLayout.OPUS_F4,
+    )
+    converted = []
+    monkeypatch.setattr(
+        linear_mod, "resolve_current_fp4_backend_spec", lambda _dtype: spec
+    )
+    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        linear_mod,
+        "to_mxfp4_scale_layout",
+        lambda scale, layout: converted.append((scale, layout)) or scale,
+    )
+    module = _linear_double(QuantType.per_1x32, dtypes.fp4x2, False)
+
+    LinearBase.process_weights_after_loading(module)
+
+    assert module.fp4_backend_spec is spec
+    assert len(converted) == 1
+    assert converted[0][0].data_ptr() == module.weight_scale.data_ptr()
+    assert converted[0][1] == MXScaleLayout.OPUS_F4
 
 
 def _sync_shuffles(monkeypatch, case, *, dim=2):

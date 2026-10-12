@@ -21,7 +21,6 @@ from atom.model_ops.base_attention import Attention
 from atom.model_ops.utils import dynamic_per_batched_tensor_quant
 from atom.models.deepseek_v2 import (
     _fuse_rmsnorm_quant,
-    _mxfp4_activation_quant_layout,
 )
 from atom.models.utils import maybe_prefix
 from atom.plugin.sglang.models.kv_cache_utils import is_fp8_kv_cache_dtype
@@ -199,10 +198,10 @@ def _fuse_qk_rmsnorm_and_q_quant(
     """Fuse q/k RMSNorm and q quant using ATOM's DeepSeek-V2 path."""
 
     if getattr(attn, "quant_dtype", None) == dtypes.fp4x2:
-        q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(q.shape[0])
+        spec = attn.q_b_proj.fp4_backend_spec
+        mxfp4_scale_layout = spec.activation_scale_layout if spec is not None else None
     else:
-        q_shuffle = False
-        q_scale_shuffle_padding = False
+        mxfp4_scale_layout = None
 
     (q_quantized, q_scale), q_normed, k_nope_normed, _ = _fuse_rmsnorm_quant(
         q,
@@ -213,12 +212,13 @@ def _fuse_qk_rmsnorm_and_q_quant(
         attn.kv_a_layernorm.eps,
         None,
         dtype_quant=attn.quant_dtype,
-        shuffle=q_shuffle,
-        scale_shuffle_padding=q_scale_shuffle_padding,
+        shuffle=False,
+        scale_shuffle_padding=False,
         group_size=128,
         quant_type=_linear_quant_type_value(attn.q_b_proj),
         output_unquantized_inp1=output_unquantized_q,
         transpose_scale=True,
+        mxfp4_scale_layout=mxfp4_scale_layout,
     )
     return q_quantized, q_scale, q_normed, k_nope_normed
 

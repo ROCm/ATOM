@@ -450,14 +450,12 @@ class K3DSparkMLAAttention(nn.Module):
         # degrades to a plain fused norm pair with q_scale None.
         q_shuffle = False
         q_scale_shuffle_padding = False
-        if self.qknorm_dtype == dtypes.fp4x2:
-            from atom.model_ops.linear import use_triton_gemm
-            from atom.models.deepseek_v2 import _mxfp4_activation_quant_layout
-
-            if not use_triton_gemm():
-                q_shuffle, q_scale_shuffle_padding = _mxfp4_activation_quant_layout(
-                    q_lora.shape[0]
-                )
+        q_backend = self.q_b_proj.fp4_backend_spec
+        mxfp4_scale_layout = (
+            q_backend.activation_scale_layout
+            if self.qknorm_dtype == dtypes.fp4x2 and q_backend is not None
+            else None
+        )
         (q_c, q_scale), _, kv_c, _ = _fuse_rmsnorm_quant(
             q_lora,
             self.q_a_layernorm.weight,
@@ -473,6 +471,7 @@ class K3DSparkMLAAttention(nn.Module):
             quant_type=self.qknorm_quant_type_value,
             output_unquantized_inp1=False,
             transpose_scale=True,
+            mxfp4_scale_layout=mxfp4_scale_layout,
         )
         return self.mla_attn(q_c, kv_c, k_pe, positions, q_scale=q_scale)
 
