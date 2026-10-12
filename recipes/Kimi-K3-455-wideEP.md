@@ -529,7 +529,11 @@ until curl -sf -m 5 http://10.210.11.24:8000/v1/models >/dev/null; do sleep 15; 
   flydsl, +11% on mori; TTFT median drops 30–40%.
 - **flydsl vs mori dispatch.** flydsl (compact plan, #2522) gives 6% more output throughput than mori at 14k/500,
   con32, with 2048 batched tokens, and 10% more with 16384. To run without #2522, set `MEGA_DISPATCH=mori`.
-- **The fp4 combine wire** is accurate, and gives no measurable throughput change at 14k/500.
+- **The fp4 combine wire** is accurate, and gives no measurable throughput change. It quantizes the combine on
+  prefill steps only.
+  - Full GSM8K: 0.9621 with fp4 against 0.9629 with bf16. 19 and 20 questions flip in either direction.
+  - 14k/500 con32, two launches each: output 280.0 against 278.8 tok/s. The spread within each arm was 0.8–0.9%.
+  - TTFT and TPOT medians are equal.
 - **The LM head.** The default allgather head (custom all-gather, #5431) hangs rarely; see
   [Known issues](#known-issues). The replicated head avoids it:
   `ATOM_DP_LM_HEAD_MODE=default ATOM_USE_CUSTOM_ALL_GATHER=0`, without `AITER_CUSTOM_AR_USE_SYMM_MEM`. That
@@ -573,6 +577,7 @@ only `content`, so a small budget scores 0.
 | server (dp8ep8, 0.90) | strict-match | flexible-extract | time |
 |---|---|---|---|
 | flydsl dispatch, fp4 combine, 16384, no prefix caching | **0.9621 ±0.0053** | 0.9613 | 7 min |
+| the same with the bf16 combine | 0.9629 ±0.0052 | 0.9621 | 8 min |
 | the same with prefix caching (#2532 + #2533, replicated LM head) | **0.9621 ±0.0053** | 0.9613 | 12 min |
 | mori dispatch, bf16 combine, 2048, no prefix caching | 0.9575 ±0.0056 | 0.9568 | 5½ min |
 
