@@ -226,6 +226,9 @@ def test_qwen35_prefill_reads_prefix_state_and_writes_last_chunk_block():
     assert md.non_spec_state_indices_in_tensor.tolist() == [10, 20]
     assert md.non_spec_state_indices_tensor.tolist() == [12, 20]
     assert md.has_initial_state.tolist() == [True, False]
+    assert md.non_spec_state_indices_i64.tolist() == [12, 20]
+    assert md.non_spec_state_indices_in_i64.tolist() == [10, 20]
+    assert md.no_initial_state.tolist() == [False, True]
 
 
 def test_qwen35_decode_mixed_boundary_reads_previous_and_writes_current_block():
