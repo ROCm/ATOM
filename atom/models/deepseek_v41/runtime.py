@@ -201,7 +201,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         config = atom_config
         # Config is built before legacy DP kwargs and DPA rank expansion apply.
         # Validate their final width here, before allocating model parameters.
-        validate_tbo_parallelism(config)
+        if getattr(config, "enable_tbo", False):
+            validate_tbo_parallelism(config)
         super().__init__(
             config.hf_config,
             max_length=config.max_model_len,
