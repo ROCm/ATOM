@@ -262,9 +262,10 @@ impl Backend {
             disable_retries: true,
             ..Default::default()
         };
-        let prepare_runtime =
-            mesh::core::prepare_pool::PreparePoolRuntime::new(config.resolved_prepare_pool())
-                .unwrap();
+        let prepare_runtime = mesh::core::prepare_pool::PreparePoolRuntime::new(
+            config.resolved_prepare_pool().unwrap(),
+        )
+        .unwrap();
         let app = Arc::new(
             AppContext::from_config(config, 5, prepare_runtime.handle())
                 .await

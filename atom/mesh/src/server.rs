@@ -512,19 +512,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let mut prepare_runtime = crate::core::prepare_pool::PreparePoolRuntime::new(
-        config.router_config.resolved_prepare_pool(),
-    )?;
+    let prepare_config = config.router_config.resolved_prepare_pool()?;
+    let mut prepare_runtime =
+        crate::core::prepare_pool::PreparePoolRuntime::new(prepare_config.clone())?;
     info!(
-        workers = config.router_config.resolved_prepare_workers(),
+        workers = prepare_config.workers,
         tokio_workers = tokio::runtime::Handle::current().metrics().num_workers(),
-        source = config.router_config.prepare_workers_source(),
-        queue_capacity = config.router_config.resolved_prepare_pool().queue_capacity,
-        max_retained_input_bytes = config.router_config.prepare_pool.max_retained_input_bytes,
+        queue_capacity = prepare_config.queue_capacity,
+        max_retained_input_bytes = prepare_config.max_retained_input_bytes,
         max_tokenize_bytes = config.router_config.resolved_max_tokenize_bytes(),
         "Request preparation pool started"
     );
-    let max_retained_input_bytes = config.router_config.prepare_pool.max_retained_input_bytes;
+    let max_retained_input_bytes = prepare_config.max_retained_input_bytes;
     if max_retained_input_bytes < config.router_config.max_payload_size {
         warn!(
             max_retained_input_bytes,
@@ -533,27 +532,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
              with 413 even though they are within --max-payload-size"
         );
     }
-    #[cfg(feature = "ext-proc")]
-    if config.router_config.ext_proc.enabled
-        && config
-            .router_config
-            .prepare_pool
-            .max_tokenize_bytes
-            .is_some()
-    {
-        info!(
-            legacy_limit = config.router_config.ext_proc.max_tokenize_bytes,
-            effective_limit = config.router_config.resolved_max_tokenize_bytes(),
-            "Common preparation tokenization limit overrides the ext-proc setting"
-        );
-    }
     // Drain the pool on both normal shutdown and startup failure.
     let result = serve_with_prepare_pool(&config, http_address, prepare_runtime.handle()).await;
     // Keep submissions open until transport drain ends.
-    let shutdown = prepare_runtime.shutdown().await;
-    if shutdown.remaining_workers != 0 {
+    let remaining_workers = prepare_runtime.shutdown().await;
+    if remaining_workers != 0 {
         warn!(
-            remaining_workers = shutdown.remaining_workers,
+            remaining_workers,
             "Preparation shutdown deadline reached; synchronous jobs are still finishing"
         );
     }

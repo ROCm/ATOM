@@ -234,11 +234,7 @@ impl RequestEnvelope {
 
     pub fn append(&mut self, body: &[u8], limit: usize) -> Result<(), ProcessingError> {
         if body.len() > limit.saturating_sub(self.raw.len()) {
-            return Err(ProcessingError::new(
-                413,
-                "body_too_large",
-                "request body limit exceeded",
-            ));
+            return Err(crate::routers::comm::error::IngressError::body_too_large().into());
         }
         self.reserve_buffer(self.raw.len() + body.len(), limit)?;
         self.buffered_bytes += body.len();
@@ -284,7 +280,6 @@ impl RequestParser {
         let (input, preparing) = self
             .pool
             .submit(deadline, move |context| {
-                context.check()?;
                 let parsed =
                     ParsedInference::parse(&preparing.request.path, &preparing.request.raw)
                         .map_err(ProcessingError::invalid)?;
@@ -368,7 +363,7 @@ mod tests {
         config.prepare_pool.workers = Some(1);
         config.prepare_pool.max_retained_input_bytes = input_bytes;
         config.ext_proc.max_buffered_bytes = 1024;
-        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
         let app = AppContext::from_config(config, 5, runtime.handle())
             .await
             .unwrap();
@@ -460,7 +455,7 @@ mod tests {
             load_factor: 1.25,
         };
         config.prepare_pool.max_tokenize_bytes = Some(4);
-        let _runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let _runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
         let mut app = AppContext::from_config(config, 5, _runtime.handle())
             .await
             .unwrap();
@@ -554,7 +549,7 @@ mod tests {
         config.prepare_pool.workers = Some(1);
         config.prepare_pool.max_retained_input_bytes = 1024;
         config.ext_proc.max_buffered_bytes = 1024;
-        let mut runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+        let mut runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
         let pool = runtime.handle();
         let app = AppContext::from_config(config, 5, pool.clone())
             .await

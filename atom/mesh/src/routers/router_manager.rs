@@ -20,10 +20,6 @@ use crate::{
     app_context::AppContext,
     config::RoutingMode,
     core::{ConnectionMode, WorkerRegistry},
-    protocols::{
-        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-        responses::ResponsesRequest,
-    },
     routers::RouterTrait,
     server::ServerConfig,
 };
@@ -311,83 +307,6 @@ impl RouterTrait for RouterManager {
                 "model not found or no router available",
             )
             .response(request.uri.path()),
-        }
-    }
-
-    async fn route_generate(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
-
-        if let Some(router) = router {
-            router.route_generate(headers, body, model_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available for this request",
-            )
-                .into_response()
-        }
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
-
-        if let Some(router) = router {
-            router.route_chat(headers, body, model_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
-
-        if let Some(router) = router {
-            router.route_completion(headers, body, model_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
-    }
-
-    async fn route_responses(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ResponsesRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let selected_model = model_id.or(Some(body.model.as_str()));
-        let router = self.select_router_for_request(headers, selected_model);
-
-        if let Some(router) = router {
-            router.route_responses(headers, body, selected_model).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available to handle responses request",
-            )
-                .into_response()
         }
     }
 

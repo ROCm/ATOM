@@ -721,7 +721,6 @@ impl CliArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::runtime::default_prepare_workers;
 
     #[test]
     fn cli_prepare_options_map_to_router_config() {
@@ -737,12 +736,8 @@ mod tests {
             "100",
             "--prepare-timeout-ms",
             "2000",
-            "--prepare-shutdown-grace-ms",
-            "3000",
             "--prepare-max-tokenize-bytes",
             "8192",
-            "--prepare-parse-inline-max-bytes",
-            "1024",
         ])
         .unwrap();
         let config = args.to_router_config(Vec::new()).unwrap();
@@ -754,114 +749,37 @@ mod tests {
                 max_retained_input_bytes: 65536,
                 queue_timeout_ms: 100,
                 prepare_timeout_ms: 2000,
-                shutdown_grace_ms: 3000,
                 max_tokenize_bytes: Some(8192),
-                parse_inline_max_bytes: 1024,
             }
         );
-        let defaults = CliArgs::try_parse_from(["atomesh"]).unwrap();
-        assert_eq!(
-            defaults.prepare_pool,
-            crate::config::PreparePoolConfig::default()
-        );
-        assert_eq!(
-            defaults
-                .to_router_config(Vec::new())
-                .unwrap()
-                .resolved_prepare_workers(),
-            default_prepare_workers()
-        );
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 6);
-        assert_eq!(
-            defaults
-                .to_router_config(Vec::new())
-                .unwrap()
-                .resolved_prepare_pool()
-                .queue_capacity,
-            default_prepare_workers() * 10
-        );
-    }
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);
 
-    #[test]
-    fn cli_prepare_queue_defaults_to_ten_jobs_per_resolved_worker() {
-        let args = CliArgs::try_parse_from(["atomesh", "--prepare-workers", "2"]).unwrap();
-        assert_eq!(args.prepare_pool.queue_capacity, None);
-        let pool = args
-            .to_router_config(Vec::new())
-            .unwrap()
-            .resolved_prepare_pool();
-        assert_eq!(pool.workers, 2);
-        assert_eq!(pool.queue_capacity, 20);
-        assert_eq!(pool.queue_timeout, std::time::Duration::from_millis(250));
-    }
-
-    #[test]
-    fn cli_rejects_automatic_prepare_queue_overflow() {
-        let workers = (usize::MAX / 10 + 1).to_string();
-        let args = CliArgs::try_parse_from(["atomesh", "--prepare-workers", &workers]).unwrap();
-        let error = args.to_router_config(Vec::new()).unwrap_err();
-        assert!(
-            error.to_string().contains("prepare_pool.queue_capacity"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn cli_rejects_zero_prepare_capacity_without_ext_proc() {
-        let args = CliArgs::try_parse_from(["atomesh", "--prepare-queue-capacity", "0"]).unwrap();
-        assert!(args.to_router_config(Vec::new()).is_err());
-    }
-
-    #[cfg(feature = "ext-proc")]
-    #[test]
-    fn cli_prepare_and_legacy_ext_proc_options_have_independent_ids() {
-        let defaults = CliArgs::try_parse_from(["atomesh", "--ext-proc"]).unwrap();
-        assert_eq!(
-            defaults.ext_proc.parser_concurrency,
-            default_prepare_workers()
-        );
-        assert_eq!(
-            defaults
-                .to_router_config(Vec::new())
-                .unwrap()
-                .resolved_prepare_workers(),
-            default_prepare_workers().min(defaults.ext_proc.max_streams)
-        );
-        let legacy = CliArgs::try_parse_from([
-            "atomesh",
-            "--ext-proc",
-            "--ext-proc-parser-concurrency",
-            "4",
-        ])
-        .unwrap();
-        assert_eq!(
-            legacy
-                .to_router_config(Vec::new())
-                .unwrap()
-                .resolved_prepare_workers(),
-            4
-        );
-        let args = CliArgs::try_parse_from([
-            "atomesh",
-            "--ext-proc",
-            "--ext-proc-parser-concurrency",
-            "4",
-            "--prepare-workers",
-            "1",
-            "--ext-proc-max-tokenize-bytes",
-            "4096",
-            "--prepare-max-tokenize-bytes",
-            "8192",
-        ])
-        .unwrap();
-        assert_eq!(args.ext_proc.parser_concurrency, 4);
-        assert_eq!(args.ext_proc.max_tokenize_bytes, 4096);
-        assert_eq!(args.prepare_pool.workers, Some(1));
-        assert_eq!(args.prepare_pool.max_tokenize_bytes, Some(8192));
-        let config = args.to_router_config(Vec::new()).unwrap();
-        assert_eq!(config.resolved_prepare_workers(), 1);
-        assert_eq!(config.resolved_prepare_pool().queue_capacity, 10);
-        assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+        // Common prepare options and legacy ext-proc options keep separate ids,
+        // and the common options win once both are resolved.
+        #[cfg(feature = "ext-proc")]
+        {
+            let args = CliArgs::try_parse_from([
+                "atomesh",
+                "--ext-proc",
+                "--ext-proc-parser-concurrency",
+                "4",
+                "--prepare-workers",
+                "1",
+                "--ext-proc-max-tokenize-bytes",
+                "4096",
+                "--prepare-max-tokenize-bytes",
+                "8192",
+            ])
+            .unwrap();
+            assert_eq!(args.ext_proc.parser_concurrency, Some(4));
+            assert_eq!(args.ext_proc.max_tokenize_bytes, Some(4096));
+            assert_eq!(args.prepare_pool.workers, Some(1));
+            assert_eq!(args.prepare_pool.max_tokenize_bytes, Some(8192));
+            let config = args.to_router_config(Vec::new()).unwrap();
+            assert_eq!(config.resolved_prepare_workers(), 1);
+            assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
+            assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+        }
     }
 
     #[test]

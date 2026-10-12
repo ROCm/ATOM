@@ -68,13 +68,7 @@ impl Mutation {
                 path,
                 Some(key),
             )
-            .map_err(|_| {
-                super::error::ProcessingError::new(
-                    503,
-                    "invalid_backend_credentials",
-                    "configured worker credential is not a valid HTTP header",
-                )
-            })?;
+            .map_err(super::error::ProcessingError::from)?;
             for name in ["authorization", "x-api-key"] {
                 if let Some(value) = resolved.get(name) {
                     headers

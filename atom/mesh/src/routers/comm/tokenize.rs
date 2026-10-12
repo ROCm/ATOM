@@ -57,15 +57,11 @@ async fn run_on_prepare_pool(
     let ticket = pool
         .submit(pool.prepare_deadline(), move |ctx| {
             let _lease = lease;
-            ctx.check()?;
-            Ok(work(ctx))
+            work(ctx)
         })
         .await;
     match ticket {
-        Ok(ticket) => match ticket.wait().await {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) | Err(error) => prepare_error_response(error),
-        },
+        Ok(ticket) => ticket.wait().await.unwrap_or_else(prepare_error_response),
         Err(error) => prepare_error_response(error),
     }
 }

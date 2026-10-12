@@ -59,7 +59,7 @@ async fn create_mocker_context_inner(
     config: RouterConfig,
     with_parsers: bool,
 ) -> (Arc<AppContext>, PreparePoolRuntime) {
-    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let prepare_runtime = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
     let client = reqwest::Client::new();
     let rate_limiter = match config.max_concurrent_requests {
         n if n <= 0 => None,

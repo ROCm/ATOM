@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{ConfigError, ConfigResult, RouterConfig},
-    core::{runtime::default_prepare_workers, ConnectionMode},
+    core::ConnectionMode,
 };
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]
@@ -39,20 +39,18 @@ pub struct ExtProcConfig {
         help_heading = "External Processing"
     )]
     pub max_buffered_bytes: usize,
-    /// Preparation threads when --prepare-workers is unset (default: half the available CPUs).
+    /// Legacy: preparation threads when --prepare-workers is unset.
     #[arg(
         long = "ext-proc-parser-concurrency",
-        default_value_t = default_prepare_workers(),
         help_heading = "External Processing"
     )]
-    pub parser_concurrency: usize,
-    /// Maximum UTF-8 prompt size passed to synchronous tokenization.
+    pub parser_concurrency: Option<usize>,
+    /// Legacy: tokenization byte limit when --prepare-max-tokenize-bytes is unset.
     #[arg(
         long = "ext-proc-max-tokenize-bytes",
-        default_value_t = 1048576,
         help_heading = "External Processing"
     )]
-    pub max_tokenize_bytes: usize,
+    pub max_tokenize_bytes: Option<usize>,
     /// Deadline for the executor to receive and validate a reserved request.
     #[arg(
         long = "ext-proc-reservation-timeout-secs",
@@ -133,8 +131,8 @@ impl Default for ExtProcConfig {
             max_body_bytes: 8_388_608,
             max_streams: 256,
             max_buffered_bytes: 268_435_456,
-            parser_concurrency: default_prepare_workers(),
-            max_tokenize_bytes: 1_048_576,
+            parser_concurrency: None,
+            max_tokenize_bytes: None,
             reservation_timeout_secs: 10,
             body_timeout_secs: 30,
             decision_timeout_secs: 60,
@@ -183,14 +181,11 @@ impl ExtProcConfig {
                 "executor advertised address must be a concrete IP and nonzero port",
             ));
         }
+        // Legacy parser limits are validated as preparation settings.
         if self.max_buffered_bytes < self.max_body_bytes
             || self.max_buffered_bytes > u32::MAX as usize
-            || self.parser_concurrency == 0
-            || self.max_tokenize_bytes == 0
         {
-            return Err(invalid(
-                "buffer budget must cover one request and fit u32; parser limits must be positive",
-            ));
+            return Err(invalid("buffer budget must cover one request and fit u32"));
         }
         if self.max_message_bytes < 131_072 || self.max_body_bytes == 0 || self.max_streams == 0 {
             return Err(invalid(
@@ -234,8 +229,6 @@ mod tests {
         for change in [
             |c: &mut ExtProcConfig| c.max_buffered_bytes = c.max_body_bytes - 1,
             |c: &mut ExtProcConfig| c.max_buffered_bytes = u32::MAX as usize + 1,
-            |c: &mut ExtProcConfig| c.parser_concurrency = 0,
-            |c: &mut ExtProcConfig| c.max_tokenize_bytes = 0,
             |c: &mut ExtProcConfig| c.reservation_timeout_secs = 0,
         ] {
             let mut invalid = config.clone();

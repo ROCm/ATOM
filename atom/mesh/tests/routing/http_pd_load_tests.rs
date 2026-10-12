@@ -152,7 +152,6 @@ fn dispatch_with_headers(
             return_logprob: false,
             request_text: None,
             tokens: None,
-            planner: None,
             model_id: None,
             headers: headers.clone().map(Arc::new),
         };
@@ -311,7 +310,7 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
         },
         ..Default::default()
     };
-    let mut pool = PreparePoolRuntime::new(config.resolved_prepare_pool()).unwrap();
+    let mut pool = PreparePoolRuntime::new(config.resolved_prepare_pool().unwrap()).unwrap();
     let handle = pool.handle();
     let app = Arc::new(
         AppContext::from_config(config, 5, handle.clone())
@@ -412,7 +411,7 @@ async fn pd_ingress_releases_preparation_budget_before_prefill_body_finishes() {
     assert_eq!(first.status(), StatusCode::OK);
     first.into_body().collect().await.unwrap();
     assert_eq!((prefill.worker.load(), decode.worker.load()), (0, 0));
-    assert_eq!(pool.shutdown().await.remaining_workers, 0);
+    assert_eq!(pool.shutdown().await, 0);
 }
 
 #[tokio::test]

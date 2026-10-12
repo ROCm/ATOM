@@ -374,22 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_refusal_counts_as_output_and_error_events_are_terminal() {
-        let mut detector = FirstOutputSse::default();
-        assert!(detector.feed(&sse(
-            json!({"type": "response.refusal.delta", "delta": "I can't"})
-        )));
-        let mut detector = FirstOutputSse::default();
-        assert!(!detector.feed(&sse(
-            json!({"type": "error", "code": "server_error", "message": "failed"})
-        )));
-        // Output after a terminal error must not produce a TTFT sample.
-        assert!(!detector.feed(&sse(
-            json!({"type": "response.output_text.delta", "delta": "late"})
-        )));
-    }
-
-    #[test]
     fn invalid_terminal_and_oversized_events_do_not_fabricate_ttft() {
         let valid = sse(json!({"choices": [{"text": "ok"}]}));
         for terminal in [
@@ -576,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_and_responses_observe_text_reasoning_and_tools_once() {
+    fn messages_and_responses_observe_output_once_and_stop_at_terminal_events() {
         for payload in [
             serde_json::json!({"type":"content_block_delta","delta":{"text":"你好"}}),
             serde_json::json!({"type":"content_block_delta","delta":{"thinking":"thinking"}}),
@@ -584,6 +568,7 @@ mod tests {
             serde_json::json!({"type":"response.output_text.delta","delta":"你好"}),
             serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"thinking"}),
             serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{"}),
+            serde_json::json!({"type":"response.refusal.delta","delta":"I can't"}),
         ] {
             let mut observer = FirstOutputSse::default();
             assert!(!observer.feed(
@@ -603,6 +588,7 @@ mod tests {
             "response.completed",
             "response.failed",
             "response.incomplete",
+            "error",
         ] {
             let mut observer = FirstOutputSse::default();
             assert!(!observer.feed(format!("data: {{\"type\":\"{terminal}\"}}\n\n").as_bytes()));

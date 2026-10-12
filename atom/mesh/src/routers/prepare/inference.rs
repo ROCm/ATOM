@@ -117,7 +117,20 @@ pub enum ParsedInference {
     Responses(serde_json::Value),
 }
 impl ParsedInference {
+    /// Every ingress parses here, so an empty model is rejected for all routers.
     pub fn parse(path: &str, bytes: &[u8]) -> Result<Self, String> {
+        let parsed = Self::parse_body(path, bytes)?;
+        if parsed
+            .metadata_with_text(false)
+            .model
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err("model is required".into());
+        }
+        Ok(parsed)
+    }
+
+    fn parse_body(path: &str, bytes: &[u8]) -> Result<Self, String> {
         use crate::routers::ingress::{Api, EndpointSpec};
         let endpoint = EndpointSpec::find(path).ok_or("unsupported inference API")?;
         match endpoint.api {

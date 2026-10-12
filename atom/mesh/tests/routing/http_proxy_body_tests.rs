@@ -53,16 +53,18 @@ fn wrap(response: reqwest::Response) -> (Body, Arc<dyn Worker>, Arc<RecordingPol
 }
 
 #[tokio::test]
-async fn fixed_length_completion_is_recorded_without_an_eof_poll() {
-    for status in [
-        StatusCode::OK,
-        StatusCode::BAD_REQUEST,
-        StatusCode::SERVICE_UNAVAILABLE,
+async fn fixed_length_and_empty_completion_is_recorded_without_an_eof_poll() {
+    let json: &[u8] = b"{\"ok\":true}";
+    for (status, payload) in [
+        (StatusCode::OK, json),
+        (StatusCode::BAD_REQUEST, json),
+        (StatusCode::SERVICE_UNAVAILABLE, json),
+        // An empty body completes without ever being polled.
+        (StatusCode::OK, b"".as_slice()),
     ] {
-        let payload = b"{\"ok\":true}";
         let response = Response::builder()
             .status(status)
-            .body(Body::from(payload.as_slice()))
+            .body(Body::from(payload))
             .unwrap();
         let (response, server) = upstream(response).await;
         assert_eq!(response.content_length(), Some(payload.len() as u64));
@@ -88,18 +90,6 @@ async fn fixed_length_completion_is_recorded_without_an_eof_poll() {
         assert_eq!(worker.load(), 0);
         server.abort();
     }
-}
-
-#[tokio::test]
-async fn empty_response_completes_without_polling_its_body() {
-    let (response, server) = upstream(Response::new(Body::empty())).await;
-    assert_eq!(response.content_length(), Some(0));
-    let (body, worker, policy) = wrap(response);
-    drop(body);
-    assert_eq!(*policy.0.lock().unwrap(), vec![true]);
-    assert_eq!(worker.circuit_breaker().stats().total_successes, 1);
-    assert_eq!(worker.load(), 0);
-    server.abort();
 }
 
 #[tokio::test]

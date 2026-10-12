@@ -44,16 +44,6 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Gracefully release router-owned resources during server shutdown.
     async fn shutdown(&self) {}
 
-    /// Routers that place requests through `IngressRouting` return it so ingress
-    /// can prepare routing text and tokens in the parse job, queueing each
-    /// request for the preparation pool once.
-    fn ingress_routing(
-        &self,
-        _app: &crate::app_context::AppContext,
-    ) -> Option<ingress::IngressRouting> {
-        None
-    }
-
     /// Raw ingress dispatch. Native backends retain their existing typed API handling.
     async fn route_inference(
         &self,
@@ -61,11 +51,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         _app: &std::sync::Arc<crate::app_context::AppContext>,
     ) -> Response {
         use prepare::inference::ParsedInference;
-        let route = request.metadata.route;
-        let (uri, headers, parsed, metadata) = match request.into_native_parts() {
-            Ok(parts) => parts,
-            Err(err) => return err.response(route),
-        };
+        let (uri, headers, parsed, metadata) = request.into_native_parts();
         let headers = Some(&headers);
         let model = metadata.model.as_deref();
         match parsed {
@@ -143,10 +129,16 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route a chat completion request
     async fn route_chat(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response;
+        _headers: Option<&HeaderMap>,
+        _body: &ChatCompletionRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Chat completions endpoint not implemented",
+        )
+            .into_response()
+    }
 
     /// Route a completion request
     async fn route_completion(
