@@ -49,7 +49,10 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
-from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
+from atom.kv_transfer.offload._block_gpu_connector import (
+    _DEFAULT_GPU_STAGING_BYTES,
+    BlockGPUConnector,
+)
 from atom.kv_transfer.offload._offload_common import pp_aware_rank_and_world
 from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
@@ -79,6 +82,7 @@ from atom.kv_transfer.offload.mooncake_store.scheduler import (
     require_monotonic_clock_id,
 )
 from atom.kv_transfer.offload.mooncake_store.taint import TaintMarker
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -91,6 +95,17 @@ _WARNING_INTERVAL_S = 30.0
 # A save stops reading its source blocks this long (at most) before the
 # scheduler may reclaim them; see `_source_read_deadline`.
 _MAX_SOURCE_READ_MARGIN_S = 60.0
+
+
+def _staging_buffer_bound() -> int:
+    """Bytes each staging buffer of the block GPU connector may hold.
+
+    Windows whose slots are scattered go through it, one buffer per copy
+    thread, allocated after the KV cache is sized. A bound from settings alone,
+    not from the KV geometry, is one ``kv_budget_reserve_bytes`` can hold back.
+    """
+    bound = envs.OFFLOAD_GPU_STAGING_MAX_BYTES
+    return _DEFAULT_GPU_STAGING_BYTES if bound is None else int(bound)
 
 
 def _tp_group():
@@ -180,10 +195,20 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config: Any) -> int:
-        """The transfer slot pool, which `register_kv_caches` allocates in HBM."""
+        """HBM this worker allocates once the KV cache is sized.
+
+        The transfer slot pool, which `register_kv_caches` allocates, and a
+        staging buffer per save and load thread (the widths
+        `_init_worker_common` gives the executors), each at most
+        `_staging_buffer_bound`.
+        """
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         cfg = parse_mooncake_store_config(kvc)
-        return pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
+        threads = envs.OFFLOAD_COPY_WORKERS + envs.OFFLOAD_LOAD_WORKERS
+        return (
+            pool_allocation_bytes(cfg.save_pool_bytes, cfg.load_pool_bytes)
+            + threads * _staging_buffer_bound()
+        )
 
     def close(self) -> None:
         """Join the executors, then release the GPU connector, pool and client."""
@@ -235,6 +260,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             chunk_size=self.chunk_size,
             virtual_block_size=self.virtual_block_size,
             source_safe_callback=self._source_group_safe,
+            max_staging_bytes=_staging_buffer_bound(),
         )
         client = pool = None
         try:

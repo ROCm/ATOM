@@ -3137,12 +3137,19 @@ def test_registration_builds_the_pool_and_probes_the_store(cluster, one_rank):
     assert store.closed and store.registered == {}
 
 
-def test_the_kv_budget_holds_back_the_transfer_pool_it_allocates(cluster, one_rank):
+def test_the_kv_budget_holds_back_the_transfer_pool_it_allocates(
+    cluster, one_rank, monkeypatch
+):
+    for name in ("OFFLOAD_COPY_WORKERS", "OFFLOAD_LOAD_WORKERS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
     config = _config(extra=_extra(save_pool_mib=3, load_pool_mib=5))
     # Asked through the factory, before any connector exists, as the model
-    # runner sizes the KV cache: both regions and the base's alignment.
+    # runner sizes the KV cache: both regions and the base's alignment, and a
+    # staging buffer for each of the one save and one load thread.
     reserve = KVConnectorFactory.kv_budget_reserve_bytes(config)
-    assert reserve == (3 + 5) * (1 << 20) + (2 << 20)
+    pool_bytes = (3 + 5) * (1 << 20) + (2 << 20)
+    assert reserve == pool_bytes + 2 * (48 << 20)
     # Beside a P/D connector that reserves nothing, under `multi`, as
     # ATOM_KV_OFFLOAD composes it.
     multi = copy.copy(config)
@@ -3166,8 +3173,49 @@ def test_the_kv_budget_holds_back_the_transfer_pool_it_allocates(cluster, one_ra
     worker = MooncakeStoreOffloadConnector(config)
     try:
         worker.register_kv_caches(_kv_caches(), num_blocks=8)
-        # What registration allocates is what was held back.
-        assert worker._pool._backing.numel() == reserve
+        # What registration allocates is what was held back for the pool.
+        assert worker._pool._backing.numel() == pool_bytes
+    finally:
+        worker.close()
+
+
+def test_the_kv_budget_holds_back_a_staging_buffer_per_copy_thread(
+    cluster, one_rank, monkeypatch
+):
+    # A window whose slots are scattered stages through the block GPU
+    # connector, which keeps a buffer per save and load thread, allocated
+    # after the KV cache is sized. However many chunks a buffer is asked for,
+    # it stops at a bound the KV budget held back for every thread.
+    monkeypatch.setenv("OFFLOAD_COPY_WORKERS", "2")
+    monkeypatch.setenv("OFFLOAD_LOAD_WORKERS", "3")
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1000000")
+    monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
+    config = _registering_config()
+    pool_bytes = 2 * (1 << 20) + (2 << 20)
+
+    def registered_buffer_bytes() -> int:
+        worker = MooncakeStoreOffloadConnector(config)
+        try:
+            worker.register_kv_caches(_kv_caches(), num_blocks=8)
+            assert worker.save_workers + worker.load_workers == 5
+            return worker._gpu_connector.gpu_staging_buffer_bytes
+        finally:
+            worker.close()
+
+    reserve = KVConnectorFactory.kv_budget_reserve_bytes(config)
+    assert reserve == pool_bytes + 5 * (48 << 20)
+    assert registered_buffer_bytes() == 48 << 20
+    # A bound set in the environment is the one held back. 128-byte chunks.
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_MAX_BYTES", "1000")
+    reserve = KVConnectorFactory.kv_budget_reserve_bytes(config)
+    assert reserve == pool_bytes + 5 * 1000
+    assert registered_buffer_bytes() == 7 * 128
+    # One that cannot hold a chunk refuses to start.
+    monkeypatch.setenv("OFFLOAD_GPU_STAGING_MAX_BYTES", "100")
+    worker = MooncakeStoreOffloadConnector(config)
+    try:
+        with pytest.raises(ValueError, match="at least one LMCache chunk"):
+            worker.register_kv_caches(_kv_caches(), num_blocks=8)
     finally:
         worker.close()
 

@@ -604,8 +604,11 @@ this worker config.
   a get that completes later returns `LEASE_EXPIRED` and fails its load. Every
   transfer batch waits at most 60 s, hard-coded in Mooncake.
 - **HBM.** The pool (1.25 GiB per worker by default, plus 2 MiB to align it)
-  is allocated after the KV cache, and the model runner holds exactly that
-  back from the KV budget (`kv_budget_reserve_bytes`).
+  is allocated after the KV cache, and so are the staging buffers scattered
+  windows go through: one per save and load thread, each at most
+  `OFFLOAD_GPU_STAGING_MAX_BYTES` (48 MiB unset; a chunk larger than that
+  refuses to start). The model runner holds both back from the KV budget
+  (`kv_budget_reserve_bytes`).
   `MC_MAX_MR_SIZE=1 GiB` splits its registration into 1 GiB regions.
 - **Store contents outlive the server.** The namespace covers the layout and
   the revision an HF config names, not the bytes of local weights: restart
@@ -1480,7 +1483,7 @@ Connector-specific tuning (env):
 | `OFFLOAD_LOAD_WORKERS` | 1 | LOAD daemon threads. One is enough until the CPU tier serves real traffic; past that, requests park inside `retrieve` and the scheduler admits fewer of them. Each thread costs one more `gpu_staging_buffer_bytes` per rank. |
 | `OFFLOAD_MAX_PENDING_SAVES` | `max(2, 2 × OFFLOAD_COPY_WORKERS)` | Positive integer bound on total admitted worker saves (running + queued), acquired before SLOT snapshot or executor submission. |
 | `OFFLOAD_GPU_STAGING_CHUNKS` | 48 MiB worth, clamped to `[2, 64]` | Chunks per bounded GPU staging buffer. Unset, the count is derived from a byte target so geometries with different bytes-per-chunk get the same buffer size. Sizes **each** buffer — load and save own separate ones, so resident HBM ≈ `(OFFLOAD_LOAD_WORKERS + OFFLOAD_COPY_WORKERS) × chunks × chunk_bytes`. |
-| `OFFLOAD_GPU_STAGING_MAX_BYTES` | — | Hard cap on staging bytes (clamps the chunk count). |
+| `OFFLOAD_GPU_STAGING_MAX_BYTES` | — (48 MiB for `mooncake_store`) | Hard cap on staging bytes (clamps the chunk count). |
 | `OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER` | 0 | Free the staging buffer after each transfer (lower idle HBM, higher churn). |
 | `OFFLOAD_SLOT_STAGING_SLOTS` | 1 | DSV4 only: number of persistent full-SLOT GPU staging rows. Must be at least 1; HBM cost is this value × `slot_bytes`. |
 | `OFFLOAD_PUBLICATION_TIMEOUT_S` | 5.0 | Finite, nonnegative maximum wait after PAGE or AOS1 submission for session visibility. `0` performs exactly one immediate probe. |

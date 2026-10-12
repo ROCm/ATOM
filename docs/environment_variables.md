@@ -341,7 +341,7 @@ derive a bound.
 | **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
 | **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
 | **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
-| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. |
+| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. Unset, `mooncake_store` bounds it at 48 MiB, which it holds back from the KV budget per save and load thread. |
 | **OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER** | bool | 0 | Free the GPU staging buffer after each transfer instead of keeping it. |
 | **OFFLOAD_SLOT_STAGING_SLOTS** | int | 1 | DSV4 in-process SLOT sidecar staging rows. Overridden by `slot_sidecar_staging_slots`. |
 | **OFFLOAD_COMMITTED_SIDECAR_CAPACITY** | int | 65536 | DSV4 in-process committed SLOT sidecar index capacity. Overridden by `committed_sidecar_index_capacity`. |
