@@ -34,11 +34,12 @@ jobs:
   benchmark:
     name: c=${{ join(matrix.concurrency, ',') }}
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    # Cells run in parallel, so this covers waiting in the Slurm queue; the
+    # Configs run in parallel, so this covers waiting in the Slurm queue; the
     # Slurm job's own --time (runner.time_limit) bounds the run itself.
     timeout-minutes: 1440
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix: ${{ fromJson(inputs.matrix_json) }}
     steps:
       - name: Checkout ATOM repo

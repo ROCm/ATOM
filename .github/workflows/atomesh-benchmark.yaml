@@ -1533,6 +1533,9 @@ jobs:
       )
     strategy:
       fail-fast: false
+      # The template runs a config's cells one at a time, so a run holds at most
+      # this many of the shared atomesh runners.
+      max-parallel: 4
       matrix:
         group: ${{ fromJson(needs.load-config.outputs.groups_json) }}
     uses: ./.github/workflows/atomesh-benchmark-tmpl.yaml
