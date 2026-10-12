@@ -33,7 +33,6 @@ LIVE = [
     "group_lookup_failures",
     "publish_image_halves",
     "take_store_marks",
-    "offer_restore_half",
 ]
 
 
@@ -57,3 +56,14 @@ def test_the_restore_hook_the_cache_installs_is_this_function():
     ever points somewhere else, this is where it shows."""
     src = inspect.getsource(mod.install_runtime)
     assert "install_image_restore_hook(restore_stale_rows)" in src
+
+
+def test_the_whole_batch_restore_is_gone_and_stays_gone():
+    """It restored every row of every step from blocks nothing had written,
+    erasing state a prefill had just built. Reconnecting it looks like a
+    one-line convenience, so the function refuses rather than being absent
+    -- an absent name invites a fresh one with the same shape."""
+    import pytest
+
+    with pytest.raises(NotImplementedError):
+        mod.offer_restore_half(0, slots=[1], blocks=[2])

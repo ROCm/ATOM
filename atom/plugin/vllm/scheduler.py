@@ -289,6 +289,24 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
     logger.info("ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary.")
 
 
+_CAP_LOG = [0]
+
+
+def _log_cap_decision(num_local, planner, capped=None) -> None:
+    """Say what the wrapper saw, for the first few and then every 64th."""
+    _CAP_LOG[0] += 1
+    n = _CAP_LOG[0]
+    if n > 16 and n % 64 != 0:
+        return
+    logger.info(
+        "DeepSeek-V4.1 local hit #%d: vllm offered %s, planner %s, cap %s",
+        n,
+        num_local,
+        "present" if planner is not None else "ABSENT",
+        "not reached" if capped is None else capped,
+    )
+
+
 def apply_vllm_v41_local_hit_cap_patch() -> None:
     """Wrap vLLM's local prefix-cache hit so V4.1's is capped. Idempotent.
 
@@ -322,9 +340,17 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
     def _wrapped(self, request):
         blocks, num_local, boundary, divergent = original(self, request)
         planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        # Logged BEFORE the early return, and from the scheduler rather than
+        # the worker. Placed after it, a silent log meant any of three
+        # things -- wrapper not installed, no planner, no hit -- and a run
+        # produced zero lines without saying which. Placed in the worker's
+        # refusal dump, it could not see the planner at all: that lives in
+        # this process.
+        _log_cap_decision(num_local, planner)
         if planner is None or num_local <= 0:
             return blocks, num_local, boundary, divergent
         capped = int(planner.cap_local_hit(request, int(num_local)))
+        _log_cap_decision(num_local, planner, capped)
         if capped >= num_local:
             return blocks, num_local, boundary, divergent
         block_size = int(self.cache_config.block_size)

@@ -611,10 +611,17 @@ def image_layer_class():
                 return
             step = _step_id(m)
 
-            # --- the read column, for a restore ---
-            read_blocks = self._read_columns(m)
-            if read_blocks is not None:
-                offer_restore_half(step, blocks=read_blocks)
+            # No read column here, and no rendezvous. Publishing one
+            # made this builder half of an unconditional, whole-batch
+            # restore: paired with the slots the bridge publishes, it
+            # copied an image into EVERY row's slot every step it ran --
+            # 199 restores over 5 pairings, with one image ever written --
+            # and so erased the state a prefill had just built. The row
+            # that died was a decode step at `computed=6912, query=1` whose
+            # cursor had been reset to 0, not a prefix hit at all.
+            #
+            # Restores are driven from the cache, for the rows whose cursor
+            # is actually wrong, and are judged by the contract afterwards.
 
             # --- the write column, for the store after the forward ---
             if self._ckpt is None:
@@ -961,13 +968,22 @@ def rendezvous():
     return _RENDEZVOUS
 
 
-def offer_restore_half(step: int, *, slots=None, blocks=None) -> int:
-    """Publish one half; perform the restore when both are in. Returns rows done."""
-    rt = runtime()
-    rows = _RENDEZVOUS.offer(step, slots=slots, blocks=blocks)
-    if rows is None or rt is None:
-        return 0
-    return rt.restore_for(rows)
+def offer_restore_half(*a, **kw) -> int:
+    """Removed. A whole-batch restore is never correct here.
+
+    This paired a slot half with a block half and restored EVERY row of the
+    step. With one image ever written it copied empty blocks over live
+    state: 199 restores across 5 pairings, and the engine died on a decode
+    step at `computed=6912, query=1` whose cursor had been reset to 0 --
+    which reads exactly like a failed prefix hit and is not one.
+
+    Restores are driven from `PagedAttentionCache.prepare_state`, for the
+    rows whose cursor is not where the scheduler wants it, and are judged
+    by the stale-cursor contract immediately afterwards.
+    """
+    raise NotImplementedError(
+        "whole-batch image restore was removed; use restore_stale_rows"
+    )
 
 
 def rendezvous_stats() -> dict:

@@ -661,11 +661,32 @@ class V41BoundaryPlanner:
             # state is restored from the image in the same block vLLM served
             # the pages from -- whichever level holds the hit restores it.
             #
-            # Kept whole rather than capped: capping would push the request
-            # below the block its image sits in, which is the same invented
-            # position by a different route.
+            # Capped to the checkpoint, not kept whole. vLLM writes one
+            # image per prefill, at `(seq_len - 1) // hash * hash` -- for a
+            # 6912-token prompt, 6656, column `cdiv(6912, 256) - 2 = 25`.
+            # It then offers a later request the whole 6912, which is one
+            # block PAST the only state that exists: measured as
+            # `needs state at 6912, found 0` with
+            # `image_restore_no_block=2` and exactly one image ever stored.
+            #
+            # At the capped position the read column is
+            # `(6656 - 1) // 256 = 25` -- the column the writer used, and
+            # the same physical block, since prefix-cached blocks are
+            # shared by column.
+            from vllm.v1.kv_cache_interface import (
+                get_mamba_prefill_checkpoint_position,
+            )
+
+            position = int(
+                get_mamba_prefill_checkpoint_position(
+                    hit, self.hash_block_size, drop_eagle_block=False
+                )
+            )
+            if position <= 0:
+                self._counters["local_cap_declined"] += 1
+                return 0
             self._counters["local_cap_image"] += 1
-            return hit
+            return min(hit, position)
         if not _LOCAL_PREFIX_HITS_ENABLED:
             # Off, and the reason is structural rather than a race that is
             # waiting to be found. Traced, for one request:

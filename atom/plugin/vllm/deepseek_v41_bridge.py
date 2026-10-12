@@ -680,7 +680,7 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     produces. So the marks vLLM set are carried to `wait_for_save`, which runs
     after it.
     """
-    from atom.plugin.vllm.v41_state_image import offer_restore_half, runtime
+    from atom.plugin.vllm.v41_state_image import runtime
 
     rt = runtime()
     if rt is None or prepared is None:
@@ -693,8 +693,6 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     if slots is None:
         rt.missing_slots += 1
         return
-    step = id(getattr(common_attn_metadata, "query_start_loc", common_attn_metadata))
-    offer_restore_half(step, slots=list(slots))
     # Where this step's checkpoints are written, for the store that runs
     # after the forward. The read direction is not here: it is driven from
     # the cache, which owns the one point between a slot being assigned and
