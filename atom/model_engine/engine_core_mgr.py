@@ -655,7 +655,16 @@ class CoreManager:
                         break
 
                     obj = output_socket.recv(copy=False)
-                    request_type, data = pickle.loads(obj)
+                    try:
+                        request_type, data = pickle.loads(obj)
+                    except Exception:
+                        # Every request on this DP rank waits on this thread,
+                        # so one message it cannot decode must not end it.
+                        logger.exception(
+                            f"{self.label} (DP {dp_rank}): dropping an engine "
+                            f"message that cannot be decoded"
+                        )
+                        continue
                     if request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"

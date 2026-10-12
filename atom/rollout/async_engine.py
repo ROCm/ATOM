@@ -52,7 +52,9 @@ class AsyncLLMEngine(LLMEngine):
         including failed ranks; vLLM's similarly named coroutine raises on a
         worker failure. An adapter must flatten and raise if it wants that
         interface. Intended for small control messages: bulk tensors belong on
-        the weight-sync data plane.
+        the weight-sync data plane. A target returns plain data -- None, bool,
+        int, float, str and bytes, in lists, tuples and dicts -- and anything
+        else comes back as that rank's error.
 
         Note this stalls the affected DP rank's scheduling for the call's
         duration, since the handler runs in the EngineCore busy loop. That is

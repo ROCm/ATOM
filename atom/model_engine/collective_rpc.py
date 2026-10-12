@@ -68,6 +68,38 @@ def engine_budget(timeout: float) -> float:
     return max(0.0, timeout - min(5.0, 0.1 * timeout))
 
 
+_PLAIN_SCALARS = (type(None), bool, int, float, str, bytes)
+_PLAIN_DEPTH_LIMIT = 64
+
+
+def is_plain_rpc_value(value) -> bool:
+    """Whether *value* is builtin data that any process can unpickle.
+
+    A generic RPC's return is unpickled in EngineCore and again in the API
+    server. A class only the worker imports ended the API server's output
+    thread for that DP rank, and a CUDA tensor was rebuilt on its device in
+    each process, with a HIP context of its own. Exact types: a subclass of a
+    builtin needs its own import as well.
+    """
+
+    def plain(item, depth: int) -> bool:
+        if depth > _PLAIN_DEPTH_LIMIT:
+            return False
+        kind = type(item)
+        if kind in _PLAIN_SCALARS:
+            return True
+        if kind in (list, tuple):
+            return all(plain(element, depth + 1) for element in item)
+        if kind is dict:
+            return all(
+                plain(key, depth + 1) and plain(element, depth + 1)
+                for key, element in item.items()
+            )
+        return False
+
+    return plain(value, 0)
+
+
 @dataclass(frozen=True)
 class RpcPayload:
     """One generic collective-RPC call: kwargs plus an explicit barrier request.

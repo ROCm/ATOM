@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aiter_stub import stubbed_aiter
@@ -54,9 +55,6 @@ class _Runner:
 
     def raises(self):
         raise ValueError("boom")
-
-    def returns_unpicklable(self):
-        return lambda x: x  # local functions cannot be pickled
 
 
 class _Barrier:
@@ -211,14 +209,55 @@ def test_a_raising_target_is_reported_not_propagated():
 def test_an_unpicklable_result_becomes_an_error():
     """The sender serializes once and replaces a bad value without dying."""
     proc = _proc()
-    out = proc._run_generic_rpc(
-        proc.runners[0], "returns_unpicklable", (), {}, RpcPayload(request_id="r4")
-    )
-    request_id, body = proc._serialize_rpc_result(out)
+    request_id, body = proc._serialize_rpc_result(RpcResult("r4", 0, value=lambda x: x))
     wire = pickle.loads(body)
     assert request_id == b"r4"
     assert not wire.ok
     assert "unpicklable" in wire.error
+
+
+class _OnlyTheWorkerImports:
+    pass
+
+
+class _TaggedDict(dict):
+    pass
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(_OnlyTheWorkerImports(), id="a class of the worker's"),
+        pytest.param({"nested": [_OnlyTheWorkerImports()]}, id="one inside plain data"),
+        pytest.param(_TaggedDict(a=1), id="a subclass of a builtin"),
+        pytest.param(torch.zeros(2), id="a tensor"),
+        pytest.param(lambda x: x, id="a function"),
+    ],
+)
+def test_a_return_that_is_not_plain_data_is_refused_on_the_worker(value):
+    """A reply is unpickled in EngineCore and again in the API server. A class
+    only the worker imports ended the API server's output thread for that DP
+    rank, and a CUDA tensor was rebuilt on its device in both processes, each
+    with a HIP context of its own."""
+    runner = SimpleNamespace(returns=lambda: value)
+    out = _proc(runners=[runner])._run_generic_rpc(
+        runner, "returns", (), {}, RpcPayload("not-plain")
+    )
+    assert not out.ok
+    assert "not plain data" in out.error
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, True, 7, 2.5, "text", b"bytes", [1, (2, "x")], {"k": [1, {"n": None}]}],
+)
+def test_plain_data_crosses_as_it_was_returned(value):
+    runner = SimpleNamespace(returns=lambda: value)
+    out = _proc(runners=[runner])._run_generic_rpc(
+        runner, "returns", (), {}, RpcPayload("plain")
+    )
+    assert out.ok, out.error
+    assert out.value == value
 
 
 # ── the payload contract ───────────────────────────────────────────────────

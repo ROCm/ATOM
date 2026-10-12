@@ -40,6 +40,7 @@ from atom.model_engine.collective_rpc import (
     RpcPayload,
     RpcResult,
     checked_timeout,
+    is_plain_rpc_value,
 )
 from atom.utils import (
     envs,
@@ -373,11 +374,12 @@ class AsyncIOProc:
         """Invoke one generic RPC, converting every outcome into a reply.
 
         Never raises and never returns ``None``: a missing or malformed method
-        name and a raising target become an ``RpcResult`` carrying ``error``;
-        the RPC sender converts an unpicklable value before it writes the
-        socket. Anything else would leave the caller
-        blocked in an untimed queue get, which is how a typo in a method name
-        currently costs five minutes and reports a timeout instead of the typo.
+        name, a raising target and a return that is not plain data become an
+        ``RpcResult`` carrying ``error``; the RPC sender still converts an
+        unpicklable value before it writes the socket. Anything else would
+        leave the caller blocked in an untimed queue get, which is how a typo
+        in a method name currently costs five minutes and reports a timeout
+        instead of the typo.
         """
         try:
             func = getattr(runner, func_name, None)
@@ -394,12 +396,17 @@ class AsyncIOProc:
                 payload, f"{type(runner).__name__} has no method {func_name!r}"
             )
         try:
-            result = RpcResult(
-                payload.request_id, self.rank, value=func(*call_args, **call_kwargs)
-            )
+            value = func(*call_args, **call_kwargs)
         except Exception as exc:  # noqa: BLE001 - reported to the caller instead
             return self._failure(payload, f"{type(exc).__name__}: {exc}")
-        return result
+        if not is_plain_rpc_value(value):
+            return self._failure(
+                payload,
+                f"{func_name!r} returned a {type(value).__name__} that is not "
+                f"plain data: an RPC reply may hold only None, bool, int, "
+                f"float, str and bytes, in lists, tuples and dicts",
+            )
+        return RpcResult(payload.request_id, self.rank, value=value)
 
     def _failure(self, payload: RpcPayload, error: str) -> RpcResult:
         """This rank's reply to *payload* when the call could not succeed."""

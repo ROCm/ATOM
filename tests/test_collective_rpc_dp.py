@@ -6,6 +6,7 @@
 import pickle
 import threading
 import time
+import uuid
 from contextlib import ExitStack
 
 import pytest
@@ -18,6 +19,7 @@ from atom.model_engine.collective_rpc import (
     engine_budget,
 )
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 # ── harness ────────────────────────────────────────────────────────────────
 
@@ -133,6 +135,45 @@ def test_a_reply_reaches_the_caller_holding_its_id():
     with mgr._rpc_router.register("r1") as replies:
         mgr._route_utility_response(0, _tp_body("r1", results=[_tp(0, "v")]))
         assert replies.get_nowait()[0] == 0
+
+
+def test_a_message_the_output_thread_cannot_decode_does_not_end_it():
+    """Every request on a DP rank waits on its output thread, which had no
+    guard around pickle.loads: one reply naming a class this process cannot
+    import ended the thread and hung that rank's requests."""
+    mgr = _mgr(1)
+    mgr.ctx = zmq.Context()
+    tag = uuid.uuid4().hex
+    out_addr, stop_addr = f"inproc://out-{tag}", f"inproc://stop-{tag}"
+    pull = mgr.ctx.socket(zmq.PULL)
+    pull.bind(out_addr)
+    push = mgr.ctx.socket(zmq.PUSH)
+    push.connect(out_addr)
+    stop = mgr.ctx.socket(zmq.PAIR)
+    stop.connect(stop_addr)
+    thread = mgr._create_output_thread(0, pull, stop_addr)
+    thread.start()
+    try:
+        with mgr._rpc_router.register("after") as replies:
+            push.send(b"cno_module_this_process_has\nGone\n.")
+            push.send(
+                pickle.dumps(
+                    (
+                        EngineCoreRequestType.UTILITY_RESPONSE,
+                        {"cmd": "clear_kv_cache", "request_id": "after", "result": 1},
+                    )
+                )
+            )
+            dp_rank, body = replies.get(timeout=5)
+        assert (dp_rank, body["result"]) == (0, 1)
+        assert thread.is_alive()
+    finally:
+        try:
+            stop.send(b"", zmq.NOBLOCK)
+        except zmq.Again:
+            pass  # the thread already ended, which the assertions report
+        thread.join(timeout=10)
+        mgr.ctx.destroy(linger=0)
 
 
 def test_a_reply_nobody_waits_for_is_dropped_without_raising():

@@ -186,10 +186,14 @@ Worker exceptions are returned as `RpcResult.error`, preserving successful
 rank results as well.
 
 The API is synchronous and intended for control messages, not bulk tensor
-transfer. Methods whose utility handlers own EngineCore state -- weight
-updates, memory release/resume and KV-cache clearing -- are rejected on this
-generic path. Pipeline-parallel and prefill/decode-disaggregated engines are
-also rejected because their engine processes are not one-to-one DP ranks.
+transfer. A target returns plain data -- `None`, `bool`, `int`, `float`, `str`
+and `bytes`, in lists, tuples and dicts -- since its reply is unpickled in
+EngineCore and again in the API server; anything else, a tensor included, is
+returned as that rank's error. Methods whose utility handlers own EngineCore
+state -- weight updates, memory release/resume and KV-cache clearing -- are
+rejected on this generic path. Pipeline-parallel and prefill/decode-disaggregated
+engines are also rejected because their engine processes are not one-to-one DP
+ranks.
 RPC targets must not perform cross-DP collectives: each EngineCore dequeues
 control work independently, so another DP engine may already be waiting in the
 busy loop's state all-reduce.
