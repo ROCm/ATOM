@@ -186,3 +186,39 @@ def test_scheduler_keeps_the_lookup_when_joint_state_offload_is_on(monkeypatch):
 def test_scheduler_keeps_the_lookup_on_a_refused_probe(monkeypatch):
     skipped, conn = _gate(monkeypatch, conn=_Conn(), hit_blocks=-1)
     assert not skipped and conn.skipped == []
+
+
+# ── session ordering: free the locks, then end the session ───────────────
+
+
+def _with_session_log(adapter):
+    events = []
+    orig_free = adapter.free_lookup_locks
+
+    def free(**kw):
+        events.append(("free", kw["request_id"]))
+        orig_free(**kw)
+
+    adapter.free_lookup_locks = free
+    adapter.end_session = lambda rid: events.append(("end", rid))
+    return events
+
+
+def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
+    """`end_session` before the orphan answers would leave its state-group
+    read locks pinned until the L1 read TTL (the server recreates an empty
+    session for the late `free_lookup_locks`)."""
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
+    events = _with_session_log(adapter)
+    seq = _seq()
+    sched.skip_tier_lookup(seq, 60)
+
+    sched._pending_session_ends()["7"] = seq
+    sched._end_finished_sessions()
+    assert events == []  # lookup still in flight: session kept
+
+    adapter._client.lookup_future.done = True
+    sched._end_finished_sessions()
+    kinds = [k for k, _ in events]
+    assert kinds == ["free", "end"], events
+    assert "7" not in sched._pending_session_ends()

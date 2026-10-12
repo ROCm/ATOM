@@ -237,11 +237,28 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self.__dict__.setdefault("_sessions_to_end", {})
 
     def _end_finished_sessions(self) -> None:
-        """End each finished request's session once no save of it can follow."""
+        """End each finished request's session once nothing of it can follow.
+
+        Nothing means no save, and no lookup still in flight. A lookup sent
+        without being waited on (`skip_tier_lookup`) can outlive its request:
+        if `end_session` drops the server session first, the eventual
+        `free_lookup_locks` recreates an empty one, finds no prefetch record,
+        and releases only the full-attention groups -- the state groups'
+        read locks then pin their L1 objects until the read TTL, and L1 can
+        no longer evict. So pump the lookups first, and keep the session
+        until its lookup answered and released its locks.
+        """
         pending = self._pending_session_ends()
+        client = self._lookup_client
+        pump = getattr(client, "pump", None)
+        if pending and callable(pump):
+            pump()
+        in_flight = getattr(client, "is_pending", None)
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
             if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
+                continue
+            if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
             try:
