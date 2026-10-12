@@ -7,14 +7,14 @@ import subprocess
 import time
 
 PRIOR = {
-    '7530': ('v0', '20261012124411'),
+    '7732': ('v0', '20261012181354'),
 }
 TERMINAL = {'CANCELLED', 'COMPLETED', 'FAILED', 'TIMEOUT', 'NODE_FAIL', 'OUT_OF_MEMORY'}
 
 
 def fields(text, job_id, case):
     values = dict(re.findall(r'(\w+)=([^\s]+)', text))
-    expected = f'kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-{case}-vllm-38250766430-1'
+    expected = f'kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-{case}-vllm-38289351181-1'
     assert values.get('JobId') == job_id and values.get('JobName') == expected, values
     assert values.get('Account') == 'amd-frameworks', values
     return values
@@ -48,7 +48,7 @@ def main():
             record['never_allocated'] = unallocated
             if not unallocated:
                 cell = f'kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-{case}-vllm'
-                directory = Path(f'/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/{cell}-38250766430-{stamp}/slurm_job-{job_id}')
+                directory = Path(f'/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/{cell}-38289351181-{stamp}/slurm_job-{job_id}')
                 record['cleanup'] = {}
                 for rank in (0, 1):
                     proof = json.loads((directory / f'cleanup-complete-{rank}.json').read_text())

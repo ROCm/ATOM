@@ -1,5 +1,6 @@
 """One-time model-load evidence. No forward, scheduling, or sampling overrides."""
 import json
+import math
 import os
 from pathlib import Path
 
@@ -29,6 +30,21 @@ def inspect_model(model):
     return result
 
 
+def inspect_speculative(spec, expected_drafts, expected_al):
+    rates = spec.synthetic_acceptance_rates
+    resolved_al = 1 + sum(rates) if rates is not None else None
+    if (spec.rejection_sample_method != "synthetic" or rates is None
+            or spec.num_speculative_tokens != expected_drafts
+            or len(rates) != expected_drafts
+            or not math.isclose(resolved_al, expected_al, rel_tol=0, abs_tol=1e-9)):
+        raise ValueError(f"C48 synthetic acceptance mismatch: drafts={spec.num_speculative_tokens}, rates={rates}, expected_AL={expected_al}")
+    return {"num_speculative_tokens": spec.num_speculative_tokens,
+            "synthetic_acceptance_length": spec.synthetic_acceptance_length,
+            "synthetic_acceptance_rates": rates,
+            "resolved_acceptance_length": resolved_al,
+            "rejection_sample_method": spec.rejection_sample_method}
+
+
 class ManifestWorker(Worker):
     def load_model(self, *, load_dummy_weights=False):
         super().load_model(load_dummy_weights=load_dummy_weights)
@@ -40,9 +56,9 @@ class ManifestWorker(Worker):
         spec = self.vllm_config.speculative_config
         data = {"role": os.environ["C48_DIAG_ROLE"], "rank": self.rank,
                 "target": target, "draft": draft, "ptpc_counts": counts,
-                "speculative": {"num_speculative_tokens": spec.num_speculative_tokens,
-                    "synthetic_acceptance_length": spec.synthetic_acceptance_length,
-                    "rejection_sample_method": spec.rejection_sample_method}}
+                "speculative": inspect_speculative(spec,
+                    int(os.environ["C48_DIAG_DRAFT_TOKENS"]),
+                    float(os.environ["C48_DIAG_AL"]))}
         out = Path(os.environ["C48_DIAG_DIR"])
         out.mkdir(parents=True, exist_ok=True)
         (out / f'{data["role"]}-rank-{self.rank}.json').write_text(json.dumps(data, indent=2) + "\n")
