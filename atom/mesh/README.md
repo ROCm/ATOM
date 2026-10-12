@@ -35,19 +35,24 @@ HTTP backends that support `/v1/responses`. A `mesh.apis` label restricts suppor
 APIs using comma-separated paths, such as `/v1/chat/completions,/v1/responses`;
 omitting the label preserves the default of accepting all supported API routes.
 
-Resource operations use the same credential rules as inference: a configured
-worker API key overrides client credentials, and eligible backends without a
-worker key receive the client's `authorization` and `x-api-key` headers.
+A configured worker API key replaces client credentials and is sent as
+`authorization: Bearer <key>`; Messages requests also carry it as `x-api-key`.
+Backends without a worker key receive the client's `authorization` and
+`x-api-key` headers. Resource operations use the same credential rules as
+inference.
 Workers sharing one backend address must have matching credential configuration.
 The first successful probe is returned immediately. If all probes fail, non-404
 client errors take precedence over server or connection errors; 404 is the
 fallback. Errors with equal priority are selected by backend address order.
 
 DP-aware forwarding writes the selected worker's rank to `data_parallel_rank` in
-the request body, including Messages and Responses, overriding any client value.
-The backend must consume that field to route to the selected rank. Verify support
-for each backend and API before including it in a DP worker's `mesh.apis` label;
-accepting an unknown JSON field does not establish rank-routing support.
+the request body for Chat Completions, Completions and Generate, overriding any
+client value. Messages and Responses receive the rank only when the DP worker's
+`mesh.apis` label explicitly lists `/v1/messages` or `/v1/responses`; without the
+label they are forwarded unchanged, so the backend chooses the rank and DP
+placement is only a load-balancing estimate. The backend must consume the field
+to route to the selected rank. Verify support for each backend and API before
+listing it; accepting an unknown JSON field does not establish rank-routing support.
 
 ## Installation
 
@@ -260,7 +265,9 @@ In PD mode, use `--prefill-policy` and `--decode-policy` for per-mode overrides.
   released before upstream dispatch; forwarding and retries do not hold it.
   Canceled synchronous work retains its charge until it actually exits.
   This byte limit can fill before the job queue for large prompts, so size it for
-  the expected concurrent preparation input. Ext-proc's separate
+  the expected concurrent preparation input. A single body larger than the whole
+  budget is rejected with `413 prepare_input_too_large`; Mesh logs a startup
+  warning when the budget is below `--max-payload-size`. Ext-proc's separate
   `--ext-proc-max-buffered-bytes` limit continues to cover its request buffers
   through rewriting and dispatch.
 - **Retries**: Up to 5 attempts with exponential backoff and jitter (`--retry-max-retries`, `--retry-initial-backoff-ms`)

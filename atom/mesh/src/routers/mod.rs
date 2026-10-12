@@ -44,6 +44,16 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Gracefully release router-owned resources during server shutdown.
     async fn shutdown(&self) {}
 
+    /// Routers that place requests through `IngressRouting` return it so ingress
+    /// can prepare routing text and tokens in the parse job, queueing each
+    /// request for the preparation pool once.
+    fn ingress_routing(
+        &self,
+        _app: &crate::app_context::AppContext,
+    ) -> Option<ingress::IngressRouting> {
+        None
+    }
+
     /// Raw ingress dispatch. Native backends retain their existing typed API handling.
     async fn route_inference(
         &self,

@@ -139,7 +139,10 @@ impl Router {
                 ),
             )
             .headers(headers);
-        if worker.is_dp_aware() {
+        let forwards_dp_rank = worker.is_dp_aware()
+            && super::ingress::EndpointSpec::find(metadata.route)
+                .is_some_and(|endpoint| endpoint.forwards_dp_rank(worker.as_ref()));
+        if forwards_dp_rank {
             let body: serde_json::Value = match serde_json::from_slice(&request.body) {
                 Ok(body) => body,
                 Err(err) => return IngressError::invalid(err.to_string()).response(metadata.route),
@@ -708,6 +711,10 @@ use async_trait::async_trait;
 impl RouterTrait for Router {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn ingress_routing(&self, app: &AppContext) -> Option<super::ingress::IngressRouting> {
+        Some(super::ingress::IngressRouting::new(app))
     }
 
     async fn route_inference(

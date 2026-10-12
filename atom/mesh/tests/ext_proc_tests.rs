@@ -757,6 +757,10 @@ async fn protocol_modes_encoding_and_api_paths_are_explicitly_rejected() {
         ("/v1/not-an-api", "POST", "identity", 404),
         ("/v1/chat/completions", "GET", "identity", 405),
         ("/v1/chat/completions", "POST", "gzip", 415),
+        ("/v1/responses/resp-1", "GET", "identity", 501),
+        ("/v1/responses/resp-1", "DELETE", "identity", 501),
+        ("/v1/responses/resp-1/cancel", "POST", "identity", 501),
+        ("/v1/responses/resp-1/input_items", "GET", "identity", 501),
     ] {
         let mut stream = fixture.open().await;
         stream

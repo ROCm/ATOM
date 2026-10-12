@@ -859,3 +859,137 @@ async fn regular_http_encode_does_not_block_the_tokio_worker() {
 async fn pd_http_encode_does_not_block_the_tokio_worker() {
     blocked_encode_keeps_tokio_responsive(true).await;
 }
+
+#[tokio::test]
+async fn body_larger_than_total_input_budget_is_rejected_with_413() {
+    let body = br#"{"model":"m","text":"test"}"#;
+    let pool = PreparePoolRuntime::new(PoolConfig {
+        workers: 1,
+        max_retained_input_bytes: body.len() - 1,
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    let app = AppContext::from_config(Default::default(), 5, pool.handle())
+        .await
+        .unwrap();
+    let error = InferenceEnvelope::parse(
+        "/generate".parse().unwrap(),
+        json_headers(),
+        Bytes::from_static(body),
+        &app,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.status, http::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error.code, "prepare_input_too_large");
+    assert_eq!(pool.handle().stats().retained_input_bytes, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tokenize_endpoint_encodes_on_the_prepare_pool() {
+    let pool = PreparePoolRuntime::new(PoolConfig {
+        workers: 1,
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    let context = Arc::new(
+        AppContext::from_config(Default::default(), 5, pool.handle())
+            .await
+            .unwrap(),
+    );
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> = Arc::new(GatedTokenizer {
+        inner: crate::tokenizer::MockTokenizer::new(),
+        started: std::sync::Mutex::new(Some(started_tx)),
+        gate: gate.clone(),
+    });
+    context
+        .tokenizer_registry
+        .load("gated-tokenize", "m", "gated", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    // On a single-threaded runtime, inline encode would stall Tokio until the
+    // watchdog releases the gate.
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        let advanced = progress_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        advanced
+    });
+    let request: crate::protocols::tokenize::TokenizeRequest =
+        serde_json::from_value(json!({"model": "m", "prompt": "hello world"})).unwrap();
+    let task_context = context.clone();
+    let task = tokio::spawn(async move {
+        crate::routers::comm::tokenize::tokenize(&task_context, request).await
+    });
+    started_rx.await.unwrap();
+    tokio::task::yield_now().await;
+    let _ = progress_tx.send(());
+    assert!(watchdog.join().unwrap(), "tokenize encode blocked Tokio");
+    let response = task.await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(pool.handle().stats().retained_input_bytes, 0);
+}
+
+#[test]
+fn dp_rank_is_forwarded_to_messages_and_responses_only_when_listed() {
+    let unlabeled = crate::core::DPAwareWorkerBuilder::new("http://127.0.0.1:1", 0, 2).build();
+    let labeled = crate::core::DPAwareWorkerBuilder::new("http://127.0.0.1:1", 1, 2)
+        .label("mesh.apis", "/v1/chat/completions, /v1/messages")
+        .build();
+    let endpoint = |path| EndpointSpec::find(path).unwrap();
+    for path in ["/v1/chat/completions", "/v1/completions", "/generate"] {
+        assert!(endpoint(path).forwards_dp_rank(&unlabeled), "{path}");
+    }
+    for path in ["/v1/messages", "/v1/responses"] {
+        assert!(endpoint(path).supports(&unlabeled), "{path}");
+        assert!(!endpoint(path).forwards_dp_rank(&unlabeled), "{path}");
+    }
+    assert!(endpoint("/v1/messages").forwards_dp_rank(&labeled));
+    assert!(!endpoint("/v1/responses").supports(&labeled));
+}
+
+#[tokio::test]
+async fn http_ingress_prepares_routing_tokens_in_the_parse_job() {
+    let pool = PreparePoolRuntime::new(PoolConfig {
+        workers: 1,
+        ..PoolConfig::default()
+    })
+    .unwrap();
+    let config = crate::config::RouterConfig {
+        policy: crate::config::PolicyConfig::PrefixHash {
+            prefix_token_count: 4,
+            load_factor: 1.25,
+        },
+        ..Default::default()
+    };
+    let app = AppContext::from_config(config, 5, pool.handle())
+        .await
+        .unwrap();
+    let tokenizer: Arc<dyn crate::tokenizer::traits::Tokenizer> =
+        Arc::new(crate::tokenizer::MockTokenizer::new());
+    app.tokenizer_registry
+        .load("mock-id", "m", "mock", || async { Ok(tokenizer) })
+        .await
+        .unwrap();
+    let routing = IngressRouting::new(&app);
+    let request = InferenceEnvelope::parse_for_routing(
+        "/generate".parse().unwrap(),
+        json_headers(),
+        Bytes::from_static(br#"{"model":"m","text":"hello world"}"#),
+        &app,
+        Some(routing.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(request.routed.is_some());
+    // A closed pool proves routing needs no second preparation job.
+    let closed = PrepareHandle::closed();
+    let (_, (metadata, tokens)) = request.prepare_routing(&closed, &routing).await.unwrap();
+    assert_eq!(metadata.text, "hello world");
+    assert!(tokens.is_some_and(|tokens| !tokens.is_empty()));
+}

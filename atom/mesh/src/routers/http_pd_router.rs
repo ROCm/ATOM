@@ -1957,6 +1957,13 @@ impl RouterTrait for PDRouter {
             .await
     }
 
+    fn ingress_routing(
+        &self,
+        app: &crate::app_context::AppContext,
+    ) -> Option<super::ingress::IngressRouting> {
+        Some(super::ingress::IngressRouting::new(app))
+    }
+
     async fn route_inference(
         &self,
         request: super::ingress::InferenceEnvelope,

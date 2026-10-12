@@ -366,7 +366,7 @@ impl Backend {
                     if let Some(key) = key {
                         if *path == "/v1/messages" {
                             assert_eq!(captured.headers["x-api-key"], key);
-                            assert!(!captured.headers.contains_key("authorization"));
+                            assert_eq!(captured.headers["authorization"], format!("Bearer {key}"));
                         } else {
                             assert_eq!(captured.headers["authorization"], format!("Bearer {key}"));
                             assert!(!captured.headers.contains_key("x-api-key"));
