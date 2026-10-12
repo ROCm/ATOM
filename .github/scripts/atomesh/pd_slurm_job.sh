@@ -19,6 +19,9 @@ echo "RCCL RDMA GID index: ${NCCL_IB_GID_INDEX}"
 
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 SCRIPT_PATH="${REPO_ROOT}/.github/scripts/atomesh/pd_server_atom.sh"
+if [[ "${TOPOLOGY}" == "0p1d" ]]; then
+  SCRIPT_PATH="${REPO_ROOT}/.github/scripts/pr59070/entry.sh"
+fi
 JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
 CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 RUN_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
@@ -283,7 +286,7 @@ EOF
   if [[ "${rank}" -eq 0 && "${BACKEND}" == "atom" ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
-  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" ]]; then
+  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" && "${TOPOLOGY}" != "0p1d" ]]; then
     router_container="${container}-router"
     start_vllm_router "${router_container}" \
       "${rank_dir}/router${phase_suffix}.log" "${service_port_offset}" || return $?
@@ -393,7 +396,7 @@ EOF
   docker_args+=(
     --entrypoint bash
     "${DOCKER_IMAGE}"
-    -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
+    -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash ${SCRIPT_PATH#"${REPO_ROOT}/"}"
   )
 
   local docker_rc

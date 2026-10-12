@@ -38,6 +38,10 @@ install_native_vllm() {
   uv venv --system-site-packages "${venv}"
   uv pip install --python "${venv}/bin/python" \
     setuptools-scm setuptools-rust wheel ninja cmake
+  if [[ "${TOPOLOGY}" == "0p1d" ]]; then
+    uv pip install --python "${venv}/bin/python" \
+      'transformers==5.17.0' 'tokenizers>=0.23.2'
+  fi
   local log="${RUNTIME_LOG_DIR}/native-build-rank-${NODE_RANK}.log"
   env CCACHE_DIR="${venv}/ccache" CCACHE_TEMPDIR="${venv}/ccache/tmp" \
     PYTHONPATH= VLLM_TARGET_DEVICE=rocm PYTORCH_ROCM_ARCH=gfx950 MAX_JOBS=32 \
