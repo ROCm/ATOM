@@ -489,7 +489,9 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
     assert (got[len(picks) :] == -1).all()
 
 
-@pytest.mark.parametrize("capture_core", [False, True], ids=["piecewise", "af_piecewise"])
+@pytest.mark.parametrize(
+    "capture_core", [False, True], ids=["piecewise", "af_piecewise"]
+)
 def test_v4_fp4_graphs_distinguish_equal_token_sequence_shapes(
     on_gfx950, monkeypatch, capture_core
 ):
@@ -583,7 +585,7 @@ def test_v4_fp4_graphs_distinguish_equal_token_sequence_shapes(
             seq = [b for b, count in enumerate(counts) for _ in range(count)]
             want = _oracle(
                 q, qs, kv, ks, table[: len(counts)], width, weights,
-                lambda keys: keys[seq],
+                lambda keys, seq=seq: keys[seq],
             )  # fmt: skip
             for row, end in enumerate(bounds):
                 chosen = set(got[row][got[row] >= 0].tolist())
