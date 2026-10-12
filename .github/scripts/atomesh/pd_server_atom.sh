@@ -1590,14 +1590,20 @@ report_mooncake_store_owners() {
   done
 }
 
-# mooncake_store_cross_node_timeout: the wait for the other node's part of the
-# Store, MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes
-# first there: numa_memory_budget.py compacts each NUMA node with pins in turn,
-# two at most, and stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
+# mooncake_store_cross_node_timeout <owner setting>: the wait for the other
+# node's part of the Store, whose owners <owner setting> lists:
+# MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes first
+# there: numa_memory_budget.py compacts each NUMA node with pins in turn, and
+# stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
 mooncake_store_cross_node_timeout() {
+  local -a numa=() gib=() devices=()
+  parse_mooncake_owner_spec "$1" numa gib devices
+  local nodes
+  nodes="$(printf '%s\n' "${numa[@]}" | sort -u | wc -l)"
   awk -v wait="$(mooncake_store_wait_timeout)" \
     -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
-    'BEGIN { s = wait + 2 * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
+    -v nodes="${nodes}" \
+    'BEGIN { s = wait + nodes * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
 }
 
 # The connector's mooncake_store.pools for per_nic pools: each pool's NIC and
@@ -1676,7 +1682,7 @@ start_mooncake_store() {
   owners_timeout="$(mooncake_store_wait_timeout)"
   if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
     # The decode node mounts its owners only once it has compacted its memory.
-    owners_timeout="$(mooncake_store_cross_node_timeout)"
+    owners_timeout="$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)"
   fi
   wait_for_mooncake_store "owners" "${owners_timeout}" \
     mooncake_store_capacity_reaches "${host_ip}"
@@ -1714,7 +1720,8 @@ start_mooncake_store_decode_owners() {
   local timeout
   timeout="$(mooncake_store_wait_timeout)"
   # The prefill node starts its masters only once it has compacted its memory.
-  wait_for_mooncake_store "prefill-node masters" "$(mooncake_store_cross_node_timeout)" \
+  wait_for_mooncake_store "prefill-node masters" \
+    "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"

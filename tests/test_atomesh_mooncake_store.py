@@ -733,8 +733,8 @@ stop_mooncake_store
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="4",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="1",
         )
-        # The wait, plus the prefill node's compaction of two NUMA nodes.
-        self.assertIn("prefill-node masters not ready after 6s", result.stderr)
+        # The wait, plus the prefill node's compaction of its one NUMA node.
+        self.assertIn("prefill-node masters not ready after 5s", result.stderr)
         self.assertEqual(self.store_calls("mooncake_client"), [])
         # The page cache dropper is stopped with the rest.
         for pid in self.stub_pids():
@@ -742,8 +742,8 @@ stop_mooncake_store
 
     def test_the_prefill_node_allows_for_the_decode_nodes_compaction(self):
         # The decode node mounts its owners only once it has compacted its
-        # memory: here 5 s into a 2 s wait, inside the 2 x 10 s it allows for
-        # that compaction.
+        # memory: here 5 s into a 2 s wait, inside the 10 s it allows for the
+        # compaction of that node's one NUMA node.
         self.run_shell(
             f"""
 (
@@ -787,14 +787,28 @@ stop_mooncake_store
     def test_a_decode_node_reads_the_wait_timeouts_in_decimal(self):
         result = self.run_shell(
             'echo "WAIT=$(mooncake_store_wait_timeout) '
-            'CROSS=$(mooncake_store_cross_node_timeout)"\n',
+            'CROSS=$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)"\n',
             MOONCAKE_STORE="0",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="0900",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="0600",
         )
-        # The cross-node wait adds two compactions of 600 s.
+        # The default owners sit on two NUMA nodes: two compactions of 600 s.
         self.assertIn("WAIT=900 CROSS=2100", result.stdout)
+
+    def test_the_cross_node_wait_counts_the_other_nodes_numa_nodes(self):
+        # That node compacts each NUMA node its owners pin, one at a time:
+        # four under NPS4, one however many owners share it.
+        for owners, cross in (("0:8;1:8;2:8;3:8", 900 + 4 * 600), ("0:8;0:8", 1500)):
+            with self.subTest(owners=owners):
+                result = self.run_shell(
+                    'echo "CROSS=$(mooncake_store_cross_node_timeout '
+                    'MOONCAKE_STORE_DECODE_OWNERS)"\n',
+                    MOONCAKE_STORE_DECODE_OWNERS=owners,
+                    MOONCAKE_STORE_WAIT_TIMEOUT="900",
+                    MOONCAKE_STORE_COMPACT_TIMEOUT="600",
+                )
+                self.assertIn(f"CROSS={cross}\n", result.stdout)
 
     def test_several_prefill_workers_on_a_node_are_refused_before_anything_starts(
         self,
