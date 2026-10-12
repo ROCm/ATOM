@@ -26,7 +26,6 @@ from atom.model_ops.engram.device.hashing import (
 from atom.model_ops.engram.device.runtime import EngramInputPreparer
 from atom.model_ops.engram.device.staging import EngramStep
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
-from atom.model_ops.execution_policy import state_probe_blocking
 from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
@@ -470,6 +469,41 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
+    # Whether to render the stale-slot verdict in the step that asks for it.
+    # False is ATOM's own answer; a frontend that needs the other overrides
+    # the attribute rather than the method, so the env override below stays
+    # written once. See `_state_probe_blocking`.
+    _state_probe_blocking_default = False
+
+    def _state_probe_blocking(self) -> bool:
+        """Whether this step's stale-state verdict is rendered now or later.
+
+        `prepare_state` can ship the cursor rows asynchronously and judge them
+        a step later, which takes one blocking D2H (~58 us) off each decode
+        step. That deferred path is wrong under concurrency, and wrong in the
+        direction that costs most: it refuses correct state and takes the
+        engine down with it. Measured on the vLLM plugin, FULL_AND_PIECEWISE,
+        64 concurrent GSM8K requests, no KV connector of any kind:
+
+            needs state at 952, found 951
+
+        while the state-row dump for that same request, printed beside it,
+        reads `computed 953, cursor 953` -- self-consistent. The verdict is
+        rendered against a claim from one step and a `_probe` buffer that
+        later steps have already reused, so the two describe different
+        moments.
+
+        A guard, not a fix: the register slip in the deferred probe is still
+        not understood, and a check that fails closed on correct state is
+        worse than the microseconds it saves.
+
+        `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
+        """
+        override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+        if override is not None and override != "":
+            return override not in ("0", "false", "False")
+        return self._state_probe_blocking_default
+
     def _dummy_cache(self, pages, slots, running_tokens):
         """Scratch for a dummy batch, allocated per call.
 
@@ -763,7 +797,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
             else cache.prepare_state(
-                step, histories=not on_device or state_probe_blocking()
+                step, histories=not on_device or self._state_probe_blocking()
             )
         )
         if self.engram is not None:

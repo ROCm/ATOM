@@ -30,7 +30,13 @@ from atom.plugin.vllm.breakable_capture import breakable_capture_enabled
 
 
 class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
-    """The builder ATOM ships, plus a dummy cache a capture can hold on to."""
+    """The builder ATOM ships, with this path's two answers."""
+
+    # The deferred stale-state verdict is wrong under concurrency here, and
+    # wrong in the direction that takes the engine down -- it refuses correct
+    # state. `DeepseekV41MetadataBuilder._state_probe_blocking` carries the
+    # measurement; this is where this path says it wants the blocking one.
+    _state_probe_blocking_default = True
 
     def _dummy_cache(self, pages, slots, running_tokens):
         if not breakable_capture_enabled():

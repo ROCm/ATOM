@@ -470,17 +470,15 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
         if model_arch in _DEEPSEEK_V41_ARCHES:
-            # Core asks neither of these of the plugin any more; the plugin
-            # states them. Here rather than at registration because this runs
-            # in every worker, and it runs before the model it configures can
-            # be called -- the object does not exist until this returns.
-            from atom.plugin.vllm.breakable_capture import install_execution_policy
+            # Every one of these is installed on a class, here rather than at
+            # registration, because this runs in every worker and it returns
+            # before the model it configures can be called -- the object does
+            # not exist until it does.
             from atom.plugin.vllm.v41_eager_break import apply_v41_eager_break
             from atom.plugin.vllm.v41_engram_staging import (
                 install_vllm_engram_staging,
             )
 
-            install_execution_policy()
             # Engram's prefetch must not hold a fork open across a capture
             # break; picked before the Engram runtime is built below.
             install_vllm_engram_staging()
