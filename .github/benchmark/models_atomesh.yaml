@@ -861,6 +861,7 @@ models:
         VLLM_DCP_Q_REPLICATE: '0'
         ATOMESH_STALE_CELL_IDS: ''
         ATOMESH_EVAL_ONLY: '0'
+        ATOMESH_LM_EVAL_HUB_VERSION: '1.31.0'
         VLLM_USE_V2_MODEL_RUNNER: '1'
         VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
         MC_MAX_CONCURRENT_REG_MR: '1'
@@ -897,7 +898,8 @@ models:
           --mamba-cache-mode align
     suites:
       vllm:
-      - name: kimi-k3-mooncake-store-dspark3-tp8-dcp8-agentic-c16
+      - &kimi_k3_mooncake_c16_case
+        name: kimi-k3-mooncake-store-dspark3-tp8-dcp8-agentic-c16
         topology: 1p1d
         display_topology: 1P1D-TP8-DCP8
         pd_worker_layout: multi_node
@@ -941,6 +943,11 @@ models:
           wait_server_timeout: 10800
           wait_router_timeout: 600
         run_eval: true
+      - <<: *kimi_k3_mooncake_c16_case
+        name: kimi-k3-mooncake-store-dspark3-tp8-dcp8-gsm8k
+        env:
+          common:
+            ATOMESH_EVAL_ONLY: '1'
     accuracy:
       task: gsm8k
       fewshot: 5

@@ -1250,14 +1250,22 @@ snapshot_eval_metrics() {
 }
 
 run_lm_eval() {
-  if [[ "${ATOMESH_EVAL_ONLY:-0}" != "1" ]] && command -v lm_eval >/dev/null 2>&1; then
+  if [[ "${ATOMESH_EVAL_ONLY:-0}" != "1" && -z "${ATOMESH_LM_EVAL_HUB_VERSION:-}" ]] \
+    && command -v lm_eval >/dev/null 2>&1; then
     lm_eval "$@"
     return
   fi
   local eval_venv="/tmp/atomesh-lm-eval-${RUN_DIR##*/}"
   if [[ ! -f "${eval_venv}/.complete" ]]; then
+    local requirements=('lm-eval[api]==0.4.13')
+    if [[ -n "${ATOMESH_LM_EVAL_HUB_VERSION:-}" ]]; then
+      # The resolver otherwise upgrades Hub without constraining the inherited transformers.
+      requirements+=("huggingface-hub==${ATOMESH_LM_EVAL_HUB_VERSION}")
+    fi
     uv venv --clear --system-site-packages --python "$(command -v python3)" "${eval_venv}"
-    uv pip install --python "${eval_venv}/bin/python" 'lm-eval[api]==0.4.13'
+    uv pip install --python "${eval_venv}/bin/python" "${requirements[@]}"
+    "${eval_venv}/bin/python" -c \
+      'import transformers; from lm_eval.models.openai_completions import LocalCompletionsAPI'
     touch "${eval_venv}/.complete"
   fi
   "${eval_venv}/bin/python" -m lm_eval "$@"
