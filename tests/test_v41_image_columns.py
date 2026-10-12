@@ -75,3 +75,17 @@ def test_write_and_read_disagree_for_a_mid_prefill_checkpoint():
     reading = read_col(2304, row)
     if write_cols and write_cols[0] >= 0:
         assert row[write_cols[0]] != reading or write_cols[0] == 8
+
+
+def test_the_read_column_is_the_last_block_the_request_already_has():
+    """Align mode's rule, and the boundary cases that distinguish it from
+    the write column: a position exactly on a block edge reads the block
+    BELOW it, because that is the block whose state covers those tokens."""
+    from atom.plugin.vllm.v41_state_image import image_read_column
+
+    assert image_read_column(256, 256) == 0
+    assert image_read_column(257, 256) == 1
+    assert image_read_column(512, 256) == 1
+    assert image_read_column(4096, 256) == 15
+    # Never negative, whatever a caller hands it.
+    assert image_read_column(0, 256) == 0

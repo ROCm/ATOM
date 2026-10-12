@@ -713,6 +713,8 @@ def image_layer_class():
 def register_image_layers(vllm_config, sizing: V41ImageSizing, block_size: int,
                           alignment: int) -> list[str]:
     """Put the image layers in vLLM's static forward context. Idempotent."""
+    global _IMAGE_BLOCK_SIZE
+    _IMAGE_BLOCK_SIZE = int(block_size)
     cls = image_layer_class()
     sfc = vllm_config.compilation_config.static_forward_context
     names = expected_layer_names(sizing)
@@ -801,6 +803,7 @@ class V41ImageRuntime:
         d["image_mark_failures"] = mark_failures()
         d["image_builds"] = len(_BUILD_CALLS)
         d["image_group_misses"] = group_lookup_failures()
+        d.update(restore_declines())
         return d
 
     def log_stats(self, interval_s: float = 20.0) -> None:
@@ -840,6 +843,13 @@ def install_runtime(rt: V41ImageRuntime) -> None:
     global _RUNTIME, _IMAGES_WIRED
     _RUNTIME = rt
     _IMAGES_WIRED = True
+    # The cache drives restores, because it owns the one point between a
+    # slot being assigned and its cursor being judged.
+    from atom.model_ops.attentions.deepseek_v41.cache import (
+        install_image_restore_hook,
+    )
+
+    install_image_restore_hook(restore_stale_rows)
     logger.info(
         "DeepSeek-V4.1 state images wired: %d units of %d B, prefix hits may "
         "now be served from an image",
@@ -984,6 +994,10 @@ def rendezvous_stats() -> dict:
 
 
 _IMAGE_GROUP_INDEX = None
+#: The block size the image layers were registered with. Recorded at
+#: registration rather than re-derived, so the column a restore reads is
+#: computed against the same grid vLLM allocated on.
+_IMAGE_BLOCK_SIZE = 0
 _GROUP_LOOKUP_FAILURES: list = []
 
 
@@ -1008,94 +1022,95 @@ def image_group_index(vllm_config=None, kv_cache_config=None):
     return None
 
 
-def image_blocks_for_rows(input_batch, num_reqs: int, seq_lens, block_size: int):
-    """`[block_id]` per row: the block each row resumes its image from.
+def image_read_column(position: int, block_size: int) -> int:
+    """The column a request resuming at `position` reads its image from.
 
-    The column is align mode's own rule, `(seq_len - 1) // block_size`, the
-    last state block the request already has -- not the column a checkpoint
-    is written to, which is a different thing and was the first wrong answer
-    here.
+    Align mode's own rule, `(seq_len - 1) // block_size`: the last state
+    block of what the request already has. NOT the column a checkpoint is
+    written to -- a different thing, and using the write column for both was
+    the first wrong answer here, measured as `needs state at 2304, found 3`.
     """
-    if _IMAGE_GROUP_INDEX is None or input_batch is None:
+    return max(0, (int(position) - 1) // int(block_size))
+
+
+#: The model runner, caught where the group index is. vLLM 0.31 ships two
+#: of them and they keep the per-group block tables in different places: the
+#: V1 runner hangs a `MultiGroupBlockTable` off the input batch, while the
+#: V2 runner -- the one DeepSeek-V4.1 runs on -- keeps `BlockTables` on
+#: itself and the input batch has no `block_table` at all. Reading only the
+#: first cost a run: every write column raised `'InputBatch' object has no
+#: attribute 'block_table'`, counted as `image_mark_failures=4`.
+_RUNNER = None
+_RESTORE_NO_BATCH: list = []
+_RESTORE_NO_BLOCK: list = []
+_RESTORE_OUT_OF_TABLE: list = []
+
+
+def image_block_table():
+    """This group's `[rows, blocks]` block table, from whichever runner.
+
+    None is a decline, counted -- not an exception on a serving path.
+    """
+    if _IMAGE_GROUP_INDEX is None:
         return None
-    try:
-        table = input_batch.block_table[_IMAGE_GROUP_INDEX].block_table.np
-    except Exception:
-        _GROUP_LOOKUP_FAILURES.append(1)
-        return None
-    out = []
-    for row in range(int(num_reqs)):
-        if row >= table.shape[0]:
-            break
-        n = int(seq_lens[row]) if row < len(seq_lens) else 0
-        col = max(0, (n - 1) // int(block_size))
-        out.append(int(table[row, col]) if col < table.shape[1] else 0)
-    return out
+    tables = getattr(getattr(_RUNNER, "block_tables", None), "block_tables", None)
+    if tables is not None and _IMAGE_GROUP_INDEX < len(tables):
+        return tables[_IMAGE_GROUP_INDEX].gpu
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+    multi = getattr(get_current_input_batch(), "block_table", None)
+    if multi is not None:
+        try:
+            return multi[_IMAGE_GROUP_INDEX].get_device_tensor()
+        except Exception:
+            pass
+    _GROUP_LOOKUP_FAILURES.append(1)
+    return None
+
+
+def restore_stale_rows(rows) -> int:
+    """Restore exactly the rows whose cursor is not where it is wanted.
+
+    `rows` is `[(slot, start_token, batch_row)]`, handed over by the cache at
+    the one point between slot assignment and the stale-cursor contract.
+
+    Nothing here checks that the block belongs to this request. The contract
+    this returns into does, by comparing the restored cursor against
+    `start_token` -- so a row-order mistake is a loud death rather than a
+    prefix answered out of somebody else's state.
+    """
+    rt = runtime()
+    if rt is None or not rows:
+        return 0
+    table = image_block_table()
+    if table is None:
+        _RESTORE_NO_BATCH.append(1)
+        return 0
+    block_size = _IMAGE_BLOCK_SIZE or 256
+    pairs = []
+    for slot, start, row in rows:
+        col = image_read_column(start, block_size)
+        if row >= table.shape[0] or col >= table.shape[1]:
+            _RESTORE_OUT_OF_TABLE.append(1)
+            continue
+        block = int(table[row, col].item())
+        if block <= 0:
+            # vLLM's own "no block here"; nothing was ever written to it.
+            _RESTORE_NO_BLOCK.append(1)
+            continue
+        pairs.append((int(slot), block))
+    if not pairs:
+        return 0
+    return rt.restore_for(pairs)
 
 
 def image_spec(vllm_config):
     """The MambaSpec vLLM built the image group from, read back off a layer."""
     sfc = vllm_config.compilation_config.static_forward_context
-    for name, layer in sfc.items():
+    for layer in sfc.values():
         if getattr(layer, "_atom_v41_image_layer", False):
             return layer.get_kv_cache_spec(vllm_config)
     return None
-
-
-def publish_image_halves(vllm_config, common_attn_metadata, input_batch,
-                         num_reqs: int, seq_lens, block_size: int) -> bool:
-    """Publish both columns for this step from the runner's own block table.
-
-    Both, because they are different columns and conflating them is the
-    measured failure this replaces: what a resuming request READS is align
-    mode's `(seq_len - 1) // block_size`, while where a checkpoint is
-    WRITTEN comes from vLLM's `MambaPrefillCheckpointBuilder`. Using the
-    read column for the store writes an image over the block the next
-    request would have resumed from.
-
-    The builder would have been handed the image group's block table. It is
-    never called (`image_builds=0`), so the table is taken from the runner
-    and vLLM's own builder is run against it here -- running vLLM's rule on
-    the right table, rather than re-deriving either half.
-    """
-    import torch
-
-    step = _step_id(common_attn_metadata)
-    read_blocks = image_blocks_for_rows(
-        input_batch, num_reqs, seq_lens, block_size
-    )
-    if read_blocks is None:
-        return False
-    offer_restore_half(step, blocks=read_blocks)
-
-    # The write column. A failure here must not take the read column with
-    # it: a step that restores but does not store is a lost checkpoint, a
-    # step that does neither is a wrong answer.
-    _LAST_STORE_MARKS.clear()
-    try:
-        from vllm.model_executor.layers.mamba.checkpoint import (
-            MambaPrefillCheckpointBuilder,
-        )
-
-        spec = image_spec(vllm_config)
-        table = input_batch.block_table[_IMAGE_GROUP_INDEX].block_table
-        shim = SimpleNamespace(
-            **{
-                k: getattr(common_attn_metadata, k)
-                for k in dir(common_attn_metadata)
-                if not k.startswith("_")
-                and not callable(getattr(common_attn_metadata, k, None))
-            }
-        )
-        shim.block_table_tensor = table.get_device_tensor()[:num_reqs]
-        builder = _checkpoint_builder(vllm_config, spec)
-        meta = builder.build(shim, list(range(int(num_reqs))))
-        if meta is not None:
-            _LAST_STORE_MARKS.extend(int(b) for b in meta.state_indices.tolist())
-    except Exception:
-        logger.warning("V4.1 image write column failed", exc_info=True)
-        _MARK_FAILURES.append(1)
-    return True
 
 
 _CKPT_BUILDER = None
@@ -1110,6 +1125,55 @@ def _checkpoint_builder(vllm_config, spec):
 
         _CKPT_BUILDER = MambaPrefillCheckpointBuilder(vllm_config, spec)
     return _CKPT_BUILDER
+
+
+def publish_image_halves(vllm_config, common_attn_metadata, num_reqs: int) -> bool:
+    """Publish where this step's checkpoints are WRITTEN, for the store.
+
+    Only the write column. The read column does NOT belong here: a restore
+    performed at this point runs after the cache has already staged and
+    judged the batch, so it cannot help a hit, and performed for every row
+    it overwrites live state with an image nothing has written -- measured
+    as a request's second prefill chunk arriving at `computed=4096` with
+    `cursor=0`, its first chunk erased. Restores are driven from the cache
+    instead, through `restore_stale_rows`, for the rows that need one.
+
+    The column comes from vLLM's own `MambaPrefillCheckpointBuilder`, run
+    against the image group's table rather than re-derived: a column picked
+    differently here than the one the scheduler filled is a checkpoint
+    written where nobody will look for it.
+    """
+    _LAST_STORE_MARKS.clear()
+    try:
+        table = image_block_table()
+        if table is None:
+            raise ValueError("no image block table")
+        shim = SimpleNamespace(
+            **{
+                k: getattr(common_attn_metadata, k)
+                for k in dir(common_attn_metadata)
+                if not k.startswith("_")
+                and not callable(getattr(common_attn_metadata, k, None))
+            }
+        )
+        shim.block_table_tensor = table[:num_reqs]
+        builder = _checkpoint_builder(vllm_config, image_spec(vllm_config))
+        meta = builder.build(shim, list(range(int(num_reqs))))
+        if meta is not None:
+            _LAST_STORE_MARKS.extend(int(b) for b in meta.state_indices.tolist())
+        return True
+    except Exception:
+        logger.warning("V4.1 image write column failed", exc_info=True)
+        _MARK_FAILURES.append(1)
+        return False
+
+
+def restore_declines() -> dict:
+    return {
+        "image_restore_no_table": len(_RESTORE_NO_BATCH),
+        "image_restore_no_block": len(_RESTORE_NO_BLOCK),
+        "image_restore_off_table": len(_RESTORE_OUT_OF_TABLE),
+    }
 
 
 def group_lookup_failures() -> int:
@@ -1144,6 +1208,8 @@ def install_group_index_patch() -> bool:
             continue
 
         def patched(self, kv_cache_config, *a, _orig=original, **kw):
+            global _RUNNER
+            _RUNNER = self
             try:
                 image_group_index(kv_cache_config=kv_cache_config)
             except Exception:

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """PAGE-backed global keys and complete, relocatable CSA2 request state."""
 
+import logging
+
 import numpy as np
 import torch
 
@@ -33,6 +35,8 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_write,
 )
 from atom.utils import CpuGpuBuffer
+
+logger = logging.getLogger(__name__)
 
 from .indices import (
     build_indices,
@@ -424,6 +428,50 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
+
+    def _restore_stale_rows(self, cursors, starts, ids, step, count):
+        """Give a checkpoint-image restore a chance before the contract judges.
+
+        Here, and not anywhere the caller could put it, because this is the
+        only point between the slot being assigned and its cursor being
+        judged. Placed after the reset above, a restore cannot be undone by
+        it; placed before `_report_stale_state`, it is checked by it.
+
+        That checking is the whole safety argument. The restore picks a block
+        out of vLLM's table for this request's row, and a row-order mistake
+        would hand it somebody else's state -- which is exactly what the
+        contract catches, because the restored cursor then does not equal the
+        position wanted. A wrong restore is a loud death, not a wrong answer.
+
+        Only the rows that would otherwise raise are touched. Restoring every
+        row every step overwrites live state with an image nothing has
+        written yet: measured as a request's second prefill chunk arriving at
+        `computed=4096` with `cursor=0`, its first chunk erased.
+        """
+        hook = _IMAGE_RESTORE_HOOK
+        if hook is None:
+            return cursors
+        wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
+        if not wrong.size:
+            return cursors
+        rows = [
+            (int(step.requests[int(i)].slot), int(starts[int(i)]), int(i))
+            for i in wrong
+        ]
+        try:
+            restored = int(hook(rows))
+        except Exception:
+            logger.warning("DeepSeek-V4.1 image restore failed", exc_info=True)
+            _RESTORE_FAILURES.append(1)
+            return cursors
+        if not restored:
+            return cursors
+        # Re-read, so the contract judges what the restore produced rather
+        # than what it replaced.
+        return (
+            torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+        )
+
     def _report_stale_state(self, cursors, starts, requests):
         """Raise on the first request whose state is not where it is wanted.
 
@@ -524,6 +572,7 @@ class PagedAttentionCache:
             if step.tentative:
                 self.pending = TentativeState(self, step)
             return None
+        cursors = self._restore_stale_rows(cursors, starts, ids, step, count)
         self._report_stale_state(cursors, starts, ids)
         if step.tentative:
             self.pending = TentativeState(self, step, cursors[:, 1:])
@@ -885,3 +934,19 @@ def _is_vllm_warmup_request(req_id) -> bool:
     """vLLM's synthetic warmup request, by vLLM's own naming."""
     text = str(req_id)
     return text.startswith("_warmup_") and text.endswith("_")
+
+
+#: Set by the state-image runtime. `rows` is `[(slot, start_token, row)]`
+#: for exactly the rows whose cursor is not where the scheduler wants it;
+#: the hook returns how many it restored.
+_IMAGE_RESTORE_HOOK = None
+_RESTORE_FAILURES: list = []
+
+
+def install_image_restore_hook(hook) -> None:
+    global _IMAGE_RESTORE_HOOK
+    _IMAGE_RESTORE_HOOK = hook
+
+
+def restore_failures() -> int:
+    return len(_RESTORE_FAILURES)

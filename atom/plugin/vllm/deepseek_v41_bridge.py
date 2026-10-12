@@ -695,23 +695,13 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
         return
     step = id(getattr(common_attn_metadata, "query_start_loc", common_attn_metadata))
     offer_restore_half(step, slots=list(slots))
-    # The other half, from the runner's per-group block table rather than
-    # from the image group's builder: vLLM never asks that builder for
-    # metadata (`image_builds=0` on a live run), so everything read there
-    # ran zero times while every counter said zero and nothing said why.
-    from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+    # Where this step's checkpoints are written, for the store that runs
+    # after the forward. The read direction is not here: it is driven from
+    # the cache, which owns the one point between a slot being assigned and
+    # its cursor being judged.
     from atom.plugin.vllm.v41_state_image import publish_image_halves
 
-    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
-    if snapshot is not None:
-        publish_image_halves(
-            vllm_config,
-            common_attn_metadata,
-            get_current_input_batch(),
-            len(slots),
-            list(snapshot.ends),
-            ATOM_DEEPSEEK_V41_BLOCK_SIZE,
-        )
+    publish_image_halves(vllm_config, common_attn_metadata, len(slots))
     # Remembered for the store after the forward.
     prepared.image_slots = list(slots)
 
