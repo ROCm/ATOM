@@ -268,6 +268,13 @@ jobs:
             timeout 15s scontrol show job "${job_id}" \
               > "inspection/job-${job_id}.txt" 2>&1 || true
           done < inspection/squeue.txt
+          # Read-only queue diagnosis for the C48 cohort; never mutate allocations.
+          if [[ "${SOURCE_RUN_ID}" == "38218421252" ]]; then
+            for blocker_job in 4671 6392 7109 7265; do
+              timeout 15s scontrol show job "${blocker_job}" \
+                > "inspection/queue-blocker-${blocker_job}.txt" 2>&1 || true
+            done
+          fi
           if [[ "${INSPECT_PROCESSES}" == "true" ]]; then
             while read -r job_id job_state node_count _; do
               [[ "${job_id}" =~ ^[0-9]+$ ]] || continue
