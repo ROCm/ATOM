@@ -624,11 +624,11 @@ class PagedAttentionImpl(nn.Module):
             sinks=self.sinks,
             sliding_window=self.sliding_window,
             ps=True,
-            # The one site whose context lengths are the real per-request ones,
-            # so the only one a work plan can rebalance -- same boundary as the
-            # `dense_decode_splits` call above. Read off the context this call
+            # The capture-owned dense plan, read off the context this call
             # already holds, never the thread-local one: a TBO worker thread
-            # that never installed its own shares the other ubatch's.
+            # that never installed its own shares the other ubatch's. No
+            # max_context_length: the block-table bound is the same in graph
+            # and eager, so both pick the same kernel specialization.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
         )
 
@@ -1678,6 +1678,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=v_scale,
             sparse_bt=sparse_bt,
             sparse_ctx=sparse_ctx,
+            # Once per step only when the tail block is forced (see sparse_attn).
+            plan_step_owner=decode_md if self.local_blocks >= 1 else None,
         )
         self._index_q = None
         self._index_q_cache_key_info = None
