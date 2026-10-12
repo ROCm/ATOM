@@ -916,7 +916,7 @@ models:
               sha: 34735d6776b9c43086fdf5c6c6392d9de45f322f
         - &mori_prefix_read_a
           <<: *kimi_k3_vllm_dspark_dcp8
-          name: kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager
+          name: kimi-k3-mori-prefix-read-main-a-nospec-tp8-dcp8-eager
           isl: [122881]
           osl: 128
           concurrency: [1]
@@ -927,7 +927,7 @@ models:
               ATOMESH_PREFIX_VARIANT: "A"
               ATOMESH_PREFIX_DURATION: "300"
               ATOMESH_EVAL_ONLY: "0"
-              ATOMESH_STALE_CELL_IDS: ""
+              ATOMESH_STALE_CELL_IDS: "kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-b-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-main-a-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-main-b-nospec-tp8-dcp8-eager-vllm"
           server:
             common_args:
               extra_args: &mori_prefix_no_spec_args >-
@@ -941,28 +941,30 @@ models:
                 --quantization-config '{"targets":{"re:.*\\.routed_expert_down_proj$":"mxfp4","re:.*\\.self_attn\\.(in_proj_qkvgfab|f_b_proj|o_proj|fused_qkv_a_proj|q_b_proj|g_proj)$":"fp8_per_channel","re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.mlp\\.(gate_up_proj|down_proj)$":"fp8_per_channel"}}'
           vllm:
             source:
-              sha: 34735d6776b9c43086fdf5c6c6392d9de45f322f
+              repo: https://github.com/vllm-project/vllm
+              sha: bfa7e5b7afe40ebe48288801a2baf5c1135cd881
         - &mori_prefix_read_b
           <<: *mori_prefix_read_a
-          name: kimi-k3-mori-prefix-read-b-nospec-tp8-dcp8-eager
+          name: kimi-k3-mori-prefix-read-main-b-nospec-tp8-dcp8-eager
           env:
             common:
               ATOMESH_PREFIX_AB: "1"
               ATOMESH_PREFIX_VARIANT: "B"
               ATOMESH_PREFIX_DURATION: "300"
               ATOMESH_EVAL_ONLY: "0"
-              ATOMESH_STALE_CELL_IDS: ""
+              ATOMESH_STALE_CELL_IDS: "kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-b-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-main-a-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-main-b-nospec-tp8-dcp8-eager-vllm"
           vllm:
             source:
-              sha: d4a1acab353d2435221f2679e930b538a1bc686c
+              repo: https://github.com/whx-sjtu/vllm
+              sha: c44675d6a2309cdf21546ea4ac680030d322cfec
         - <<: *mori_prefix_read_b
-          name: kimi-k3-mori-prefix-read-b-gsm8k-nospec-tp8-dcp8-eager
+          name: kimi-k3-mori-prefix-read-main-b-gsm8k-nospec-tp8-dcp8-eager
           run_eval: true
           env:
             common:
               ATOMESH_PREFIX_AB: "0"
               ATOMESH_EVAL_ONLY: "1"
-              ATOMESH_STALE_CELL_IDS: ""
+              ATOMESH_STALE_CELL_IDS: "kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-a-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-b-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-main-a-nospec-tp8-dcp8-eager-vllm,kimi-k3-mxfp4-vllm-dspark-kimi-k3-mori-prefix-read-main-b-nospec-tp8-dcp8-eager-vllm"
           accuracy:
             threshold: 0.94
     accuracy:
