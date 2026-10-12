@@ -228,3 +228,123 @@ def check_registration(specs: dict, sizing: V41ImageSizing) -> None:
                 f"{name} holds {got} B, short of the {sizing.unit_bytes} a "
                 "PAGE unit needs; every image would be truncated"
             )
+
+
+# --- turning vLLM block ids into native checkpoint ops ------------------
+
+
+def _as_unit_ids(block_ids, sizing: V41ImageSizing) -> tuple[int, ...]:
+    """The ordered PAGE units an image occupies, from vLLM's block ids.
+
+    One block IS one unit here -- V4.1's block and its PAGE unit are both
+    739,840 B -- so this is a rename, and the work is refusing the shapes
+    that are not an image. Each of them otherwise reaches the copier, which
+    validates and raises in a worker, or worse does not: a duplicated id
+    passes every size check and writes two units over one, leaving the other
+    holding whatever was there.
+    """
+    ids = tuple(int(b) for b in block_ids)
+    if len(ids) != sizing.units:
+        raise ValueError(
+            f"a V4.1 image is {sizing.units} units; got {len(ids)} block ids"
+        )
+    if len(set(ids)) != len(ids):
+        raise ValueError(
+            f"image block ids repeat: {ids}. Two units would address one "
+            "block and a third would keep its previous contents"
+        )
+    if any(i < 0 for i in ids):
+        raise ValueError(f"image block ids must be non-negative: {ids}")
+    return ids
+
+
+def store_op(slot: int, block_ids, sizing: V41ImageSizing, layout_id: str):
+    """`CheckpointStoreOp` for one request's image, for native's copier.
+
+    Built here rather than in the caller so the store and the restore cannot
+    disagree about the unit order: they share `_as_unit_ids`, and the order
+    is the image's byte order.
+    """
+    from atom.model_engine.page_unit_checkpoint import CheckpointStoreOp
+
+    return CheckpointStoreOp(
+        src_slot=int(slot),
+        unit_ids=_as_unit_ids(block_ids, sizing),
+        total_bytes=sizing.image_bytes,
+        layout_id=layout_id,
+    )
+
+
+def restore_op(slot: int, block_ids, sizing: V41ImageSizing, layout_id: str):
+    from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
+
+    return CheckpointRestoreOp(
+        dst_slot=int(slot),
+        unit_ids=_as_unit_ids(block_ids, sizing),
+        total_bytes=sizing.image_bytes,
+        layout_id=layout_id,
+    )
+
+
+class V41ImageExporter:
+    """Write images at the boundaries vLLM picked. Implements vLLM's ABC.
+
+    vLLM decides WHERE: `MambaPrefillCheckpointBuilder` turns a step into
+    per-row checkpoint offsets and block-table columns, declining in lockstep
+    with the scheduler and the KV-cache manager -- which matters, because a
+    checkpoint block allocated and not written leaves the prefix cache
+    serving uninitialized state. This decides nothing about placement; it
+    moves the bytes vLLM asked for, through native's copier, so an image
+    written here is cut at the ranges a native checkpoint uses.
+
+    `NULL_BLOCK_ID` is how a row says it has no checkpoint this step, and it
+    is the common case rather than an error.
+    """
+
+    def __init__(self, sizing: V41ImageSizing, layout_id: str, copier):
+        self.sizing = sizing
+        self.layout_id = layout_id
+        self._copier = copier
+        self.stored = 0
+        self.declined_null = 0
+
+    def plan(self, rows) -> list:
+        """`[(slot, [block_ids...])]` -> store ops, skipping the null rows."""
+        ops = []
+        for slot, block_ids in rows:
+            ids = [int(b) for b in block_ids]
+            if not ids or any(b <= 0 for b in ids):
+                # vLLM's NULL_BLOCK_ID is 0 and a column of -1 is "no
+                # checkpoint": either way there is nothing to write, and
+                # writing anyway would scribble on block 0.
+                self.declined_null += 1
+                continue
+            ops.append(store_op(slot, ids, self.sizing, self.layout_id))
+        return ops
+
+    def export(self, checkpoint, *args, **kwargs) -> None:
+        rows = kwargs.get("rows")
+        if rows is None:
+            raise TypeError(
+                "V41ImageExporter.export needs `rows=[(slot, block_ids)]`; "
+                "the checkpoint metadata names block-table columns, not slots"
+            )
+        ops = self.plan(rows)
+        if not ops:
+            return
+        self._copier(ops, [])
+        self.stored += len(ops)
+
+    def restore(self, rows) -> int:
+        """The other direction, for a hit. Returns how many images were read."""
+        ops = []
+        for slot, block_ids in rows:
+            ids = [int(b) for b in block_ids]
+            if not ids or any(b <= 0 for b in ids):
+                self.declined_null += 1
+                continue
+            ops.append(restore_op(slot, ids, self.sizing, self.layout_id))
+        if not ops:
+            return 0
+        self._copier([], ops)
+        return len(ops)
