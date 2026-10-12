@@ -94,7 +94,7 @@
           "env_vars": "GPU_MAX_HW_QUEUES=5\nATOM_NUMA_BIND=1\nATOM_TBO_MIXED=1\nATOM_PROBE_TBO_MIXED=1",
           "bench_args": "--use-chat-template --metric-percentiles 50,99,99.9,100",
           "conc_min": 256,
-          "conc_max": 512
+          "conc_max": 2048
         }
       ]
     },
