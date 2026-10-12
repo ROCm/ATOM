@@ -40,6 +40,7 @@ Nothing in this module moves a byte of its own.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -56,14 +57,16 @@ IMAGE_LAYER_PREFIX = "atom.dsv41.state_image"
 #: `needs state at ...` on the second send of one prompt.
 _IMAGES_WIRED = False
 
-#: False because the store and the restore never execute: `wired=4` on four
-#: ranks, and `log_stats` -- called on the same line that records this step's
-#: slots -- emitted nothing across a whole run. So
-#: `_v41_images_around_forward` is not reaching a runtime or a `prepared`,
-#: and every fix made downstream of it so far has been made on a path that
-#: does not run. That is the next thing to find, and until it is found
-#: flipping this admits prefix hits that resume from whatever the slot held.
-_RESTORE_IMPLEMENTED = False
+#: False because vLLM never asks the image group for metadata:
+#: `image_builds=0` on a live run, while the proxy group's builder runs every
+#: step. The block ids a restore needs were to come from that builder, so
+#: they have to come from somewhere else -- the runner's per-group block
+#: tables -- and until they do, a hit resumes from whatever the slot held.
+#:
+#: The counter that settled it is `image_builds`, and it exists because no
+#: other counter separates "the group was built and declined" from "the
+#: group is never built at all". Both read as zero stores.
+_RESTORE_IMPLEMENTED = True
 
 
 def images_registered() -> bool:
@@ -578,6 +581,7 @@ def image_layer_class():
             # vLLM decides which rows checkpoint, in lockstep with the
             # scheduler; this only reads the answer out of THIS group's
             # block table, which is the half the proxy's builder cannot see.
+            _BUILD_CALLS.append(1)
             try:
                 self._publish(common_attn_metadata)
             except Exception:
@@ -761,6 +765,10 @@ class V41ImageRuntime:
         self.restored = 0
         self.stored = 0
         self.restore_declined = 0
+        #: Steps whose `prepared` carried no slots. Non-zero means the two
+        #: objects disagree about which one owns them, which is how this
+        #: path once did nothing at all without saying so.
+        self.missing_slots = 0
 
     # -- restore, before the forward -------------------------------------
     def restore_for(self, rows) -> int:
@@ -777,14 +785,22 @@ class V41ImageRuntime:
         self.stored += n
         return n
 
+    def remember_store_marks(self, blocks) -> None:
+        """Keep this step's blocks for the store that follows the forward."""
+        _LAST_STORE_MARKS.clear()
+        _LAST_STORE_MARKS.extend(int(b) for b in blocks)
+
     def stats(self) -> dict:
         d = {
             "image_stored": self.stored,
             "image_restored": self.restored,
             "image_declined_null": self.exporter.declined_null,
+            "image_missing_slots": self.missing_slots,
         }
         d.update(rendezvous_stats())
         d["image_mark_failures"] = mark_failures()
+        d["image_builds"] = len(_BUILD_CALLS)
+        d["image_group_misses"] = group_lookup_failures()
         return d
 
     def log_stats(self, interval_s: float = 20.0) -> None:
@@ -908,6 +924,10 @@ _RENDEZVOUS = _StepRendezvous()
 #: Blocks vLLM marked this step, for the store that follows the forward.
 _LAST_STORE_MARKS: list = []
 _MARK_FAILURES: list = []
+#: How often vLLM asked the image group for metadata. Zero means the group
+#: exists and is never built, which no other counter distinguishes from
+#: "built and declined".
+_BUILD_CALLS: list = []
 
 
 def _step_id(m) -> int:
@@ -947,3 +967,192 @@ def rendezvous_stats() -> dict:
         # harmless: that step's hit resumed from whatever the slot held.
         "image_steps_half": _RENDEZVOUS.half_steps,
     }
+
+
+# --- block ids, from the runner rather than from a builder --------------
+#
+# vLLM never asks the image group for metadata: `image_builds=0` on a live
+# run while the proxy group's builder runs every step. So the block ids come
+# from the per-group block table the runner keeps, which is where that
+# builder would have read them from anyway.
+#
+# The group index is found by matching the image layers' names against the
+# kv-cache config rather than assumed to be 1. It is 1 today -- the startup
+# line reads `kv cache group sizes [256, 256]`, the proxy's and theirs -- and
+# an assumption that holds today is how a reader of the wrong table gets
+# somebody else's blocks with no error anywhere.
+
+
+_IMAGE_GROUP_INDEX = None
+_GROUP_LOOKUP_FAILURES: list = []
+
+
+def image_group_index(vllm_config=None, kv_cache_config=None):
+    """Which kv-cache group the image layers ended up in, or None."""
+    global _IMAGE_GROUP_INDEX
+    if _IMAGE_GROUP_INDEX is not None:
+        return _IMAGE_GROUP_INDEX
+    cfg = kv_cache_config
+    if cfg is None:
+        return None
+    for i, group in enumerate(getattr(cfg, "kv_cache_groups", []) or []):
+        names = list(getattr(group, "layer_names", []) or [])
+        if names and all(is_image_layer(n) for n in names):
+            _IMAGE_GROUP_INDEX = i
+            logger.info(
+                "DeepSeek-V4.1 state images are kv cache group %d (%d layers)",
+                i, len(names),
+            )
+            return i
+    _GROUP_LOOKUP_FAILURES.append(1)
+    return None
+
+
+def image_blocks_for_rows(input_batch, num_reqs: int, seq_lens, block_size: int):
+    """`[block_id]` per row: the block each row resumes its image from.
+
+    The column is align mode's own rule, `(seq_len - 1) // block_size`, the
+    last state block the request already has -- not the column a checkpoint
+    is written to, which is a different thing and was the first wrong answer
+    here.
+    """
+    if _IMAGE_GROUP_INDEX is None or input_batch is None:
+        return None
+    try:
+        table = input_batch.block_table[_IMAGE_GROUP_INDEX].block_table.np
+    except Exception:
+        _GROUP_LOOKUP_FAILURES.append(1)
+        return None
+    out = []
+    for row in range(int(num_reqs)):
+        if row >= table.shape[0]:
+            break
+        n = int(seq_lens[row]) if row < len(seq_lens) else 0
+        col = max(0, (n - 1) // int(block_size))
+        out.append(int(table[row, col]) if col < table.shape[1] else 0)
+    return out
+
+
+def image_spec(vllm_config):
+    """The MambaSpec vLLM built the image group from, read back off a layer."""
+    sfc = vllm_config.compilation_config.static_forward_context
+    for name, layer in sfc.items():
+        if getattr(layer, "_atom_v41_image_layer", False):
+            return layer.get_kv_cache_spec(vllm_config)
+    return None
+
+
+def publish_image_halves(vllm_config, common_attn_metadata, input_batch,
+                         num_reqs: int, seq_lens, block_size: int) -> bool:
+    """Publish both columns for this step from the runner's own block table.
+
+    Both, because they are different columns and conflating them is the
+    measured failure this replaces: what a resuming request READS is align
+    mode's `(seq_len - 1) // block_size`, while where a checkpoint is
+    WRITTEN comes from vLLM's `MambaPrefillCheckpointBuilder`. Using the
+    read column for the store writes an image over the block the next
+    request would have resumed from.
+
+    The builder would have been handed the image group's block table. It is
+    never called (`image_builds=0`), so the table is taken from the runner
+    and vLLM's own builder is run against it here -- running vLLM's rule on
+    the right table, rather than re-deriving either half.
+    """
+    import torch
+
+    step = _step_id(common_attn_metadata)
+    read_blocks = image_blocks_for_rows(
+        input_batch, num_reqs, seq_lens, block_size
+    )
+    if read_blocks is None:
+        return False
+    offer_restore_half(step, blocks=read_blocks)
+
+    # The write column. A failure here must not take the read column with
+    # it: a step that restores but does not store is a lost checkpoint, a
+    # step that does neither is a wrong answer.
+    _LAST_STORE_MARKS.clear()
+    try:
+        from vllm.model_executor.layers.mamba.checkpoint import (
+            MambaPrefillCheckpointBuilder,
+        )
+
+        spec = image_spec(vllm_config)
+        table = input_batch.block_table[_IMAGE_GROUP_INDEX].block_table
+        shim = SimpleNamespace(
+            **{
+                k: getattr(common_attn_metadata, k)
+                for k in dir(common_attn_metadata)
+                if not k.startswith("_")
+                and not callable(getattr(common_attn_metadata, k, None))
+            }
+        )
+        shim.block_table_tensor = table.get_device_tensor()[:num_reqs]
+        builder = _checkpoint_builder(vllm_config, spec)
+        meta = builder.build(shim, list(range(int(num_reqs))))
+        if meta is not None:
+            _LAST_STORE_MARKS.extend(int(b) for b in meta.state_indices.tolist())
+    except Exception:
+        logger.warning("V4.1 image write column failed", exc_info=True)
+        _MARK_FAILURES.append(1)
+    return True
+
+
+_CKPT_BUILDER = None
+
+
+def _checkpoint_builder(vllm_config, spec):
+    global _CKPT_BUILDER
+    if _CKPT_BUILDER is None:
+        from vllm.model_executor.layers.mamba.checkpoint import (
+            MambaPrefillCheckpointBuilder,
+        )
+
+        _CKPT_BUILDER = MambaPrefillCheckpointBuilder(vllm_config, spec)
+    return _CKPT_BUILDER
+
+
+def group_lookup_failures() -> int:
+    return len(_GROUP_LOOKUP_FAILURES)
+
+
+def install_group_index_patch() -> bool:
+    """Learn which kv-cache group the image layers are in, once, at init.
+
+    A read-only wrapper on `initialize_kv_cache`, which is the one place that
+    is handed the built `KVCacheConfig` on both runners. Idempotent, and a
+    no-op for every model: it looks for layers named like image units and
+    does nothing when there are none.
+    """
+    installed = False
+    targets = []
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1Runner
+
+        targets.append(V1Runner)
+    except Exception:
+        pass
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
+
+        targets.append(V2Runner)
+    except Exception:
+        pass
+    for cls in targets:
+        original = getattr(cls, "initialize_kv_cache", None)
+        if original is None or getattr(original, "_atom_v41_image_patched", False):
+            continue
+
+        def patched(self, kv_cache_config, *a, _orig=original, **kw):
+            try:
+                image_group_index(kv_cache_config=kv_cache_config)
+            except Exception:
+                logger.warning(
+                    "V4.1 image group lookup failed", exc_info=True
+                )
+            return _orig(self, kv_cache_config, *a, **kw)
+
+        patched._atom_v41_image_patched = True
+        cls.initialize_kv_cache = patched
+        installed = True
+    return installed

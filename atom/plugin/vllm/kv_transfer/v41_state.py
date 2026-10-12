@@ -67,6 +67,21 @@ _LOCAL_PREFIX_HITS_ENABLED = os.environ.get("ATOM_V41_LOCAL_PREFIX_HITS") in (
     "True",
 )
 
+
+def _images_can_serve() -> bool:
+    """True when the state-image mechanism is wired and may back a local hit.
+
+    Imported lazily and guarded: this module is used on configurations where
+    the image module's vLLM imports are unavailable, and a local hit refused
+    for that reason is the old, safe behaviour.
+    """
+    try:
+        from atom.plugin.vllm.v41_state_image import images_can_serve
+
+        return bool(images_can_serve())
+    except Exception:
+        return False
+
 # How many intervals `cap_hit` walks back before giving up. The same bound K3
 # uses: a hit far past every stored boundary is a cold tier, and descending
 # further costs a lookup per step for a prefix that will be recomputed anyway.
@@ -426,6 +441,9 @@ class V41BoundaryPlanner:
             # measures what prefix caching costs on a model whose state the
             # block pool does not carry.
             "local_cap_declined": 0,
+            #: Local hits passed through whole because a checkpoint image
+            #: can restore the state at the hit. Zero while images are off.
+            "local_cap_image": 0,
             "local_cap_kept": 0,
             "local_cap_withdrawn": 0,
             "admission_refused": 0,
@@ -605,6 +623,20 @@ class V41BoundaryPlanner:
         req_id = str(getattr(request, "request_id", "") or "")
         self._local_caps.pop(req_id, None)
         if hit <= 0:
+            return hit
+        if _images_can_serve():
+            # With checkpoint images the refusal below loses its premise.
+            # That refusal exists because the only positions a request may
+            # legally resume from were stored boundaries, and the capped
+            # point is never one of them. An image is written at every block
+            # boundary vLLM checkpoints, so the hit IS such a position: the
+            # state is restored from the image in the same block vLLM served
+            # the pages from -- whichever level holds the hit restores it.
+            #
+            # Kept whole rather than capped: capping would push the request
+            # below the block its image sits in, which is the same invented
+            # position by a different route.
+            self._counters["local_cap_image"] += 1
             return hit
         if not _LOCAL_PREFIX_HITS_ENABLED:
             # Off, and the reason is structural rather than a race that is

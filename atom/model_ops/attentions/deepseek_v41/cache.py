@@ -434,6 +434,23 @@ class PagedAttentionCache:
         wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
         if not wrong.size:
             return
+        wrong = np.asarray(
+            [i for i in wrong if not _is_vllm_warmup_request(requests[int(i)])],
+            dtype=np.int64,
+        )
+        if not wrong.size:
+            # vLLM's own synthetic warmup only. It runs a decode step at a
+            # position no request ever reached, through slots nothing wrote,
+            # and discards the output -- so the state it reads is not state
+            # anyone will see. This exemption appeared when the state-image
+            # layers made the model hybrid: vLLM warms SSM groups with
+            # `_warmup_N_` at position 2, and without it the engine dies
+            # before serving its first request.
+            #
+            # Keyed on vLLM's own naming, so a rename does not silence the
+            # contract -- it brings it back.
+            _WARMUP_EXEMPTIONS.append(1)
+            return
         first = int(wrong[0])
 
         raise ValueError(
@@ -852,3 +869,19 @@ class PagedAttentionCache:
             layers,
             stride,
         )
+
+
+#: Warmup rows the stale-cursor contract let through, for reading rather than
+#: assuming: a non-zero count after the server is up would mean the exemption
+#: is catching live traffic, which it must never do.
+_WARMUP_EXEMPTIONS: list = []
+
+
+def warmup_exemptions() -> int:
+    return len(_WARMUP_EXEMPTIONS)
+
+
+def _is_vllm_warmup_request(req_id) -> bool:
+    """vLLM's synthetic warmup request, by vLLM's own naming."""
+    text = str(req_id)
+    return text.startswith("_warmup_") and text.endswith("_")

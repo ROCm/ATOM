@@ -385,6 +385,12 @@ def _maybe_register_v41_state_images(vllm_config) -> None:
     register_image_layers(
         vllm_config, sizing, ATOM_DEEPSEEK_V41_BLOCK_SIZE, alignment
     )
+    # Learn the group index from the config vLLM builds, rather than assume
+    # it: it is 1 today, and an assumption that holds today is how a reader
+    # of the wrong block table gets somebody else's blocks with no error.
+    from atom.plugin.vllm.v41_state_image import install_group_index_patch
+
+    install_group_index_patch()
 
 
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):

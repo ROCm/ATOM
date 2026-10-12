@@ -521,6 +521,13 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
         running_bs=running_bs,
         running_tokens=running_tokens,
         capturing=synthetic,
+        # The slots this step committed, carried out for the checkpoint
+        # images. They belong to `batch`, not to this object, and reading
+        # them off the wrong one is why the image path silently did nothing
+        # for three runs: `getattr(prepared, "state_slots_committed")` was
+        # None every step, so both directions returned before acting and
+        # before the counter that would have said so.
+        state_slots_committed=list(batch.state_slots_committed),
     )
 
 
@@ -665,8 +672,8 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     The slot half of a restore is here because this is where the batch is
     staged -- the same `slots` the forward will read state through. Taking
     them from anywhere else is how a checkpoint gets written from one request
-    and read into another. The block half comes from the image group's own
-    builder, and whichever arrives second performs the restore.
+    and read into another. The block half comes from the runner's per-group
+    block table, and whichever arrives second performs the restore.
 
     The store is the other direction and cannot happen here: this runs BEFORE
     the forward, and the bytes worth storing are the ones that forward
@@ -678,16 +685,35 @@ def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
     rt = runtime()
     if rt is None or prepared is None:
         return
+    # Before the early return below, not after: a step that declines still
+    # has to be able to say it declined. With the log after it, three runs
+    # produced not one line while doing nothing at all.
+    rt.log_stats()
     slots = getattr(prepared, "state_slots_committed", None)
     if slots is None:
+        rt.missing_slots += 1
         return
-    offer_restore_half(
-        id(getattr(common_attn_metadata, "query_start_loc", common_attn_metadata)),
-        slots=list(slots),
-    )
+    step = id(getattr(common_attn_metadata, "query_start_loc", common_attn_metadata))
+    offer_restore_half(step, slots=list(slots))
+    # The other half, from the runner's per-group block table rather than
+    # from the image group's builder: vLLM never asks that builder for
+    # metadata (`image_builds=0` on a live run), so everything read there
+    # ran zero times while every counter said zero and nothing said why.
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+    from atom.plugin.vllm.v41_state_image import publish_image_halves
+
+    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
+    if snapshot is not None:
+        publish_image_halves(
+            vllm_config,
+            common_attn_metadata,
+            get_current_input_batch(),
+            len(slots),
+            list(snapshot.ends),
+            ATOM_DEEPSEEK_V41_BLOCK_SIZE,
+        )
     # Remembered for the store after the forward.
     prepared.image_slots = list(slots)
-    rt.log_stats()
 
 
 def v41_store_images_after_forward(prepared) -> int:
