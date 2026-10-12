@@ -31,12 +31,59 @@ python -m atom.entrypoints.openai_server \
   --gpu-memory-utilization 0.93 \
   --block-size 128 \
   --no-enable_prefix_caching \
+  --cudagraph-mode FULL \
   --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}'
 ```
 
 Kimi full-attention layers use true MLA with a compressed latent KV cache. Aiter MLA is selected by default; `ATOM_USE_TRITON_MLA=1` selects the Triton MLA implementation when that configuration has been validated.
 
 Prefix caching remains disabled because the KDA recurrent state is maintained per request and cannot be reconstructed from the paged MLA cache alone. `-tp 8` is required for the model to fit. Use `gpu-memory-utilization 0.93` so the CUDA-graph pool fits alongside the KDA per-request state cache.
+
+### Mono decode
+
+Two fused kernels replace the KDA layers of a speculative verify step: K1, the
+attention seam through the KDA recurrence, and K2, `o_proj` plus the latent
+MoE. The MLA layers keep the production paged path.
+
+`ATOM_MONO_ENABLE` defaults to `1`, so a qualifying deployment gets mono
+without being asked. It needs TP8, DSpark, FP8 KV, DCP1,
+`--cudagraph-mode FULL` and `ATOM_ENABLE_REPLAYSSM=0`. Neither of the last two
+is a default:
+
+- `--level 3` (itself the default) sets `cudagraph_mode` to **PIECEWISE** for
+  every model except DeepSeek-V4.1, and K3 mono refuses PIECEWISE. Leave the
+  flag off and the server runs correctly on the production path, logging
+  `Kimi-K3 mono decode off: piecewise cudagraph` -- which is easy to miss, so
+  read that line rather than assuming the default armed it.
+- `ATOM_ENABLE_REPLAYSSM` defaults ON whenever spec decode is used, and K1
+  resumes a request from a per-token snapshot slot that ReplaySSM does not
+  keep live.
+
+```bash
+export ATOM_ENABLE_REPLAYSSM=0
+```
+
+The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
+`Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
+it before concluding anything about a run.
+
+**A step is served only if it is at most 8 rows** (batch x query length).
+bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the same
+width is 16, which every step declines back to the production path -- the
+server still answers, just without mono.
+
+The cap is a constant (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), not a
+switch. 16 rows is correct -- the kernels stride over their columns rather
+than assuming one pass covers them -- and measurably faster (-13.4 % target
+forward against stock). It stays at 8 because no task-level accuracy run
+exists at any width and K2's latent MoE carries a real, unsettled precision
+cost, so raising it is a decision to make on accuracy evidence rather than on
+speed.
+
+For a performance A/B, keep the launch command and the workload identical and
+change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin
+`--spec-decode-acceptance-length` on both arms, or the two runs do different
+amounts of work and the comparison means nothing.
 
 ---
 

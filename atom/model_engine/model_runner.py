@@ -153,6 +153,9 @@ mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),
+    "KimiK3ForConditionalGeneration": (
+        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
+    ),
 }
 
 

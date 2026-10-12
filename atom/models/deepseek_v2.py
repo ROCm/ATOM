@@ -3580,3 +3580,30 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
     }
+
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str = "",
+        layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
+    ):
+        super().__init__(atom_config, prefix, layer_type)
+
+        from atom.models.glm52.mono.dispatch import MonoDecode
+
+        self._mono = MonoDecode(self, atom_config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )

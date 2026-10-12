@@ -469,11 +469,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # occupancy in the block scorer, winning above ~1M batch*context tokens and
     # losing below. Unset leaves the config field alone.
     "ATOM_M3_INDEXER_CP": lambda: os.getenv("ATOM_M3_INDEXER_CP"),
-    # Fused per-layer decode of up to 16 tokens (MiniMax-M3 so far:
-    # atom/models/minimax_m3/mono), on by default. Only a configuration the mono
-    # path supports is ever routed to it; every other batch keeps the original
-    # model. 0 disables it.
+    # Fused decode for measured model/deployment/step geometries. Unsupported
+    # configurations and forwards keep the production path. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
+    # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
+    # with with_indexer=True), which does index Q/K/W projection, paged FP8
+    # index-cache update, scoring and top-k selection inside the kernel launch
+    # instead of ATOM's external Indexer module. Opt-in and off by default: the
+    # measured baseline (0.9674 +/- 0.0049 on full GSM8K) is the
+    # external-indexer path, and a deployment this build refuses (see
+    # atom.models.glm52.mono.config.fused_indexer_refusal) falls back to it
+    # unchanged. "Shared" layers (57 of 78) never use this kernel.
+    "ATOM_GLM52_FUSED_INDEXER": lambda: (
+        os.getenv("ATOM_GLM52_FUSED_INDEXER", "0") == "1"
+    ),
+    # GLM-5.2 mono: shard index scoring and selection across the TP ranks
+    # inside the fused indexer (FlyDSL PR #1256's indexer_cp, vendored at
+    # 42670fb5). Each rank scores a contiguous 64-token-aligned shard of the
+    # query's live context and the ranks exchange score shards through
+    # in-kernel peer mailboxes; selection stays exact and the index caches
+    # stay replicated -- CP distributes computation, not storage.
+    #
+    # Off by default, and strictly narrower than ATOM_GLM52_FUSED_INDEXER:
+    # CP is only ever considered for layers the fused indexer already serves,
+    # so this switch alone does nothing. What it cannot serve is refused by
+    # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
+    # leaves the fused indexer running exactly as it does with CP off.
+    "ATOM_GLM52_INDEXER_CP": lambda: (os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1"),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

@@ -23,8 +23,10 @@ class LazyRunner:
         self.runner = None
         self.enabled = True
 
-    def ready(self, rows: int) -> bool:
-        """Whether this ``rows``-row step runs on mono."""
+    def ready(self, rows: int, *shape) -> bool:
+        """Whether this ``rows``-row step runs on mono. ``shape``: anything else
+        that picks the build (a model whose kernels specialize on more than the
+        row count passes it through to its ``prepare``)."""
         if not self.enabled:
             return False
         if self.runner is None:
@@ -37,7 +39,7 @@ class LazyRunner:
                 self.enabled = False
                 return False
             logger.info("%s on", self.what)
-        if not self.runner.prepare(rows):
+        if not self.runner.prepare(rows, *shape):
             logger.warning("%s off: the %d-row kernel build", self.what, rows)
             self.enabled = False
             return False
