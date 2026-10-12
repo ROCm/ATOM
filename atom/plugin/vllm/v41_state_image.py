@@ -258,57 +258,165 @@ def check_registration(specs: dict, sizing: V41ImageSizing) -> None:
 # --- turning vLLM block ids into native checkpoint ops ------------------
 
 
-def _as_unit_ids(block_ids, sizing: V41ImageSizing) -> tuple[int, ...]:
-    """The ordered PAGE units an image occupies, from vLLM's block ids.
+def _as_block_id(block_ids, sizing: V41ImageSizing) -> int:
+    """The ONE vLLM block an image occupies, from what the caller was given.
 
-    One block IS one unit here -- V4.1's block and its PAGE unit are both
-    739,840 B -- so this is a rename, and the work is refusing the shapes
-    that are not an image. Each of them otherwise reaches the copier, which
-    validates and raises in a worker, or worse does not: a duplicated id
-    passes every size check and writes two units over one, leaving the other
-    holding whatever was there.
+    Measured, not assumed: the eight image layers carry identical specs, so
+    vLLM collects them into ONE kv cache group -- the startup line reads
+    `kv cache group sizes [256, 256]`, the proxy's and theirs. A single block
+    id therefore names one block in EACH of the eight layers,
+    8 x 739,840 B, which is exactly one image.
+
+    An earlier version of this file read the id list as eight separate blocks
+    and would have scattered one image across eight unrelated prefixes. The
+    shape is checked here because nothing downstream distinguishes the two
+    readings: eight ids and one id are both "a list of ints".
     """
-    ids = tuple(int(b) for b in block_ids)
-    if len(ids) != sizing.units:
+    ids = [int(b) for b in block_ids] if not isinstance(block_ids, int) else [int(block_ids)]
+    if len(ids) != 1:
         raise ValueError(
-            f"a V4.1 image is {sizing.units} units; got {len(ids)} block ids"
+            f"a V4.1 image is one vLLM block across {sizing.units} layers; "
+            f"got {len(ids)} block ids. Eight ids was the earlier, wrong "
+            "reading of the same list."
         )
-    if len(set(ids)) != len(ids):
-        raise ValueError(
-            f"image block ids repeat: {ids}. Two units would address one "
-            "block and a third would keep its previous contents"
-        )
-    if any(i < 0 for i in ids):
-        raise ValueError(f"image block ids must be non-negative: {ids}")
-    return ids
+    # A negative id is not an error: vLLM writes -1 into a checkpoint column
+    # that has none this step, and NULL_BLOCK_ID is 0. Both mean "nothing to
+    # copy" and the caller declines them. Only the SHAPE is an error here,
+    # because a wrong shape is a wrong image and a null row is no image.
+    return ids[0]
 
 
-def store_op(slot: int, block_ids, sizing: V41ImageSizing, layout_id: str):
-    """`CheckpointStoreOp` for one request's image, for native's copier.
+class V41ImageCopier:
+    """Move an image between a STATE slot and the image layers' blocks.
 
-    Built here rather than in the caller so the store and the restore cannot
-    disagree about the unit order: they share `_as_unit_ids`, and the order
-    is the image's byte order.
+    Native's `StateCopies` cannot be used unchanged: it addresses the
+    destination as `proxy_base + unit * unit_bytes`, and the image blocks are
+    not in the proxy arena -- vLLM allocated a tensor per image layer. What
+    IS reused is everything below that: `plan_segmented_copy` intersects the
+    two byte streams, `write_descriptor` fills the spans and
+    `launch_copy_descriptor` runs the same kernel a native checkpoint runs.
+    Only the destination addresses differ, which is the whole of the
+    difference between the two.
     """
-    from atom.model_engine.page_unit_checkpoint import CheckpointStoreOp
 
-    return CheckpointStoreOp(
-        src_slot=int(slot),
-        unit_ids=_as_unit_ids(block_ids, sizing),
-        total_bytes=sizing.image_bytes,
-        layout_id=layout_id,
-    )
+    def __init__(self, sizing: V41ImageSizing, state_bytes, layer_tensors,
+                 max_batch: int = 64):
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            DescriptorStaging,
+            plan_segmented_copy,
+        )
 
+        if len(layer_tensors) != sizing.units:
+            raise ValueError(
+                f"{len(layer_tensors)} image layers bound, {sizing.units} needed"
+            )
+        self.sizing = sizing
+        self._state = state_bytes
+        self._layers = list(layer_tensors)
+        for i, t in enumerate(self._layers):
+            per_block = t.numel() * t.element_size() // max(1, t.shape[0])
+            if per_block < sizing.unit_bytes:
+                raise ValueError(
+                    f"image layer {i} holds {per_block} B per block, short of "
+                    f"the {sizing.unit_bytes} a unit needs"
+                )
+        self.plan = plan_segmented_copy(
+            [sizing.slot_bytes],
+            [sizing.unit_bytes] * sizing.units,
+            sizing.image_bytes,
+        )
+        self.staging = DescriptorStaging(
+            2 * max(1, max_batch) * self.plan.num_spans, self._state.device
+        )
+        self.staging.reserve([0])
+        self.stored = 0
+        self.restored = 0
 
-def restore_op(slot: int, block_ids, sizing: V41ImageSizing, layout_id: str):
-    from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
+    def _slot_base(self, slot: int) -> int:
+        if not 0 <= slot < self._state.shape[0]:
+            raise IndexError(f"STATE slot {slot} is out of range")
+        return int(self._state[slot].data_ptr())
 
-    return CheckpointRestoreOp(
-        dst_slot=int(slot),
-        unit_ids=_as_unit_ids(block_ids, sizing),
-        total_bytes=sizing.image_bytes,
-        layout_id=layout_id,
-    )
+    def _image_bases(self, block_id: int) -> list[int]:
+        out = []
+        for t in self._layers:
+            if not 0 <= block_id < t.shape[0]:
+                raise IndexError(
+                    f"image block {block_id} is outside the {t.shape[0]} "
+                    "blocks vLLM allocated for an image layer"
+                )
+            out.append(int(t[block_id].data_ptr()))
+        return out
+
+    def _run_on_host(self, stores, restores) -> None:
+        for ops, storing in ((stores, True), (restores, False)):
+            for slot, block in ops:
+                if not 0 <= slot < self._state.shape[0]:
+                    raise IndexError(f"STATE slot {slot} is out of range")
+                entry = self._state[slot]
+                at = 0
+                for t in self._layers:
+                    if not 0 <= block < t.shape[0]:
+                        raise IndexError(
+                            f"image block {block} is outside the {t.shape[0]} "
+                            "blocks vLLM allocated for an image layer"
+                        )
+                    take = min(self.sizing.unit_bytes, entry.numel() - at)
+                    if take <= 0:
+                        break
+                    state_span, unit_span = entry[at : at + take], t[block][:take]
+                    (unit_span if storing else state_span).copy_(
+                        state_span if storing else unit_span
+                    )
+                    at += take
+        self.stored += len(stores)
+        self.restored += len(restores)
+
+    def run(self, stores, restores, descriptor_slot: int = 0) -> None:
+        """`stores`/`restores` are `[(slot, block_id)]`."""
+        import numpy as np
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            launch_copy_descriptor,
+        )
+
+        if not stores and not restores:
+            return
+        if not self._state.is_cuda:
+            # The descriptor kernel is Triton and refuses host pointers.
+            # Native's own copier carries the same fallback, and it is worth
+            # carrying here for the same reason: it is what lets the byte
+            # round trip -- the only check that distinguishes a working
+            # checkpoint from one moving plausible garbage -- run without a
+            # GPU.
+            self._run_on_host(stores, restores)
+            return
+        rows = self.staging.rows(descriptor_slot)
+        total = (len(stores) + len(restores)) * self.plan.num_spans
+        if total > rows.shape[0]:
+            raise ValueError("image copy batch exceeds descriptor capacity")
+        at = 0
+        for ops, storing in ((stores, True), (restores, False)):
+            if not ops:
+                continue
+            end = at + len(ops) * self.plan.num_spans
+            slot_bases = np.asarray(
+                [[self._slot_base(slot)] for slot, _ in ops], dtype=np.int64
+            )
+            image_bases = np.asarray(
+                [self._image_bases(b) for _, b in ops], dtype=np.int64
+            )
+            self.plan.write_descriptor(
+                rows[at:end], slot_bases, image_bases, forward=storing
+            )
+            at = end
+        descriptor = self.staging.upload(descriptor_slot, total)
+        cut = len(stores) * self.plan.num_spans
+        # A restore may read an image this same batch stored, so the two
+        # launches are ordered rather than merged.
+        launch_copy_descriptor(descriptor[:cut], self.plan)
+        launch_copy_descriptor(descriptor[cut:], self.plan)
+        self.stored += len(stores)
+        self.restored += len(restores)
 
 
 class V41ImageExporter:
@@ -326,25 +434,25 @@ class V41ImageExporter:
     is the common case rather than an error.
     """
 
-    def __init__(self, sizing: V41ImageSizing, layout_id: str, copier):
+    def __init__(self, sizing: V41ImageSizing, copier):
         self.sizing = sizing
-        self.layout_id = layout_id
         self._copier = copier
         self.stored = 0
+        self.restored = 0
         self.declined_null = 0
 
     def plan(self, rows) -> list:
-        """`[(slot, [block_ids...])]` -> store ops, skipping the null rows."""
+        """`[(slot, block_id)]` -> pairs to copy, skipping the null rows."""
         ops = []
-        for slot, block_ids in rows:
-            ids = [int(b) for b in block_ids]
-            if not ids or any(b <= 0 for b in ids):
+        for slot, block_id in rows:
+            b = _as_block_id(block_id, self.sizing)
+            if b <= 0:
                 # vLLM's NULL_BLOCK_ID is 0 and a column of -1 is "no
-                # checkpoint": either way there is nothing to write, and
-                # writing anyway would scribble on block 0.
+                # checkpoint this step": the common case. Writing anyway
+                # would scribble on block 0, which belongs to somebody.
                 self.declined_null += 1
                 continue
-            ops.append(store_op(slot, ids, self.sizing, self.layout_id))
+            ops.append((int(slot), b))
         return ops
 
     def export(self, checkpoint, *args, **kwargs) -> None:
@@ -357,21 +465,16 @@ class V41ImageExporter:
         ops = self.plan(rows)
         if not ops:
             return
-        self._copier(ops, [])
+        self._copier.run(ops, [])
         self.stored += len(ops)
 
     def restore(self, rows) -> int:
         """The other direction, for a hit. Returns how many images were read."""
-        ops = []
-        for slot, block_ids in rows:
-            ids = [int(b) for b in block_ids]
-            if not ids or any(b <= 0 for b in ids):
-                self.declined_null += 1
-                continue
-            ops.append(restore_op(slot, ids, self.sizing, self.layout_id))
+        ops = self.plan(rows)
         if not ops:
             return 0
-        self._copier([], ops)
+        self._copier.run([], ops)
+        self.restored += len(ops)
         return len(ops)
 
 
