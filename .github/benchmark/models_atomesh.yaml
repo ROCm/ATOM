@@ -871,6 +871,41 @@ models:
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
 
+        # PP8xTP1 counterpart to the aggregated C72 cell above, same workload and
+        # server knobs.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-agg-pp8-tp1-agentic-lmcache-1m-c72
+          topology: agg
+          display_topology: AGG-PP8-TP1
+          pd_worker_layout: single_node
+          concurrency: [72]
+          prefill: {}
+          # PP requires eager execution, so no graph capture and no compile level.
+          decode:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 8 --enforce-eager"
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              LMCACHE_LOCAL_CPU: "True"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              LMCACHE_CHUNK_SIZE: "1024"
+              LMCACHE_NUMA_MODE: auto
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72

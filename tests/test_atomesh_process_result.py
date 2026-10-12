@@ -90,6 +90,14 @@ class AggregatedResourcesTest(unittest.TestCase):
         self.assertIsNone(resources["prefill_workers"])
         self.assertIsNone(resources["decode_workers"])
 
+    def test_aggregated_pipeline_counts_every_stage(self):
+        payload = env_payload(
+            "agg", display_topology="AGG-PP8-TP1", prefill_tp="1", decode_tp="1"
+        )
+        resources = process_result.topology_resources(payload, {})
+        self.assertFalse(resources["disaggregated"])
+        self.assertEqual(resources["total_gpu"], 8)
+
     def test_split_topologies_still_sum_both_roles(self):
         for topology in ("1p1d", "1p1d_dpa", "2p1d"):
             with self.subTest(topology=topology):

@@ -353,8 +353,10 @@ def topology_resources(
         num_decode_gpu = decode_workers * decode_tp
     total_gpu = int_value(payload.get("total_gpu"))
     if total_gpu is None and aggregated:
-        # Both phases share one server's GPUs, so the cell is that server.
-        total_gpu = decode_tp or prefill_tp
+        # Both phases share one server's GPUs, so the cell is that server. Its
+        # PP comes from the name (AGG-PP8-TP1), which is what prefill_pp read.
+        server_tp = decode_tp or prefill_tp
+        total_gpu = server_tp * prefill_pp if server_tp else None
     if total_gpu is None and num_prefill_gpu is not None and num_decode_gpu is not None:
         total_gpu = num_prefill_gpu + num_decode_gpu
 
