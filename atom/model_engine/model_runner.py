@@ -3389,7 +3389,37 @@ class ModelRunner:
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    def _maybe_log_memstats(self) -> None:
+        # Debug-only (ATOM_MEMSTATS_INTERVAL_S > 0): host-side allocator counters, no device sync.
+        interval = float(os.environ.get("ATOM_MEMSTATS_INTERVAL_S", "0") or 0)
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_memstats_last", 0.0) < interval:
+            return
+        self._memstats_last = now
+        s = torch.cuda.memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        gib = 1 << 30
+        logger.info(
+            "[memstats] rank=%d reserved=%.2f allocated=%.2f inactive_split=%.2f "
+            "peak_reserved=%.2f peak_allocated=%.2f device_free=%.2f device_total=%.2f "
+            "alloc_retries=%d ooms=%d (GiB)",
+            self.rank,
+            s.get("reserved_bytes.all.current", 0) / gib,
+            s.get("allocated_bytes.all.current", 0) / gib,
+            s.get("inactive_split_bytes.all.current", 0) / gib,
+            s.get("reserved_bytes.all.peak", 0) / gib,
+            s.get("allocated_bytes.all.peak", 0) / gib,
+            free / gib,
+            total / gib,
+            s.get("num_alloc_retries", 0),
+            s.get("num_ooms", 0),
+        )
+        torch.cuda.reset_peak_memory_stats()
+
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        self._maybe_log_memstats()
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.

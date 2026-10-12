@@ -1527,6 +1527,10 @@ models:
           name: ds-v4-0813-1p1d-tp8-dspark3-agentic-no-offload-c32
           router:
             policy: round_robin
+          # Debug: per-rank allocator / device-free memory log every 30 s.
+          env:
+            common:
+              ATOM_MEMSTATS_INTERVAL_S: "30"
           topology: 1p1d
           display_topology: 1P1D-TP8-DSPARK3
           concurrency: [32]
