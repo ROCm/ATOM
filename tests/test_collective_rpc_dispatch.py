@@ -550,6 +550,41 @@ def test_a_new_sync_first_clears_what_an_abandoned_one_left():
     ]
 
 
+class _RacingQueue(queue.Queue):
+    """Delivers *late* the moment the drain first finds the queue empty, the
+    way the input thread can: enqueue, then set the flag."""
+
+    def __init__(self, engine, late):
+        super().__init__()
+        self._engine = engine
+        self._late = late
+
+    def get_nowait(self):
+        try:
+            return super().get_nowait()
+        except queue.Empty:
+            if self._late is not None:
+                late, self._late = self._late, None
+                self.put_nowait(late)
+                self._engine._has_pending_utility = True
+            raise
+
+
+def test_a_command_landing_as_the_queue_drains_is_not_stranded():
+    """The flag was cleared after the last empty get, erasing the input
+    thread's set, so the command waited for whatever came next. For a FINISH
+    that was the manager's timeout and a DISCARD of a sync that succeeded."""
+    h, _, out = _handler()
+    engine = _Engine()
+    engine._has_pending_utility = True
+    pending = _RacingQueue(engine, ("get_weight_sync_status", {"request_id": "late"}))
+
+    h.process_queue(pending, engine)  # empty, as the late command lands
+    h.process_queue(pending, engine)  # the busy loop's next pass
+
+    assert [reply.get("request_id") for reply in _responses(out)] == ["late"]
+
+
 def test_a_global_abort_fences_an_engine_whose_local_update_succeeded():
     h, _, out = _handler(replies=_counts(4, 4))
     engine = _Engine()

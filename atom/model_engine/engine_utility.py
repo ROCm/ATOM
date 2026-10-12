@@ -129,8 +129,10 @@ class EngineUtilityHandler:
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
 
-        When the queue is empty, ``engine._has_pending_utility`` is set to
-        ``False`` so that the next busy-loop iteration can skip the check.
+        ``engine._has_pending_utility`` is cleared before the drain, not after
+        it: the input thread enqueues and then sets it, so a command landing
+        between the last empty get and a later clear lost its flag and sat
+        unseen until another arrived. For a FINISH that cost a whole sync.
 
         Memory residency stays on ``engine._is_rl_weights_offloaded``; weight
         synchronization safety uses ``engine._weight_sync_fenced``. The busy
@@ -138,6 +140,7 @@ class EngineUtilityHandler:
         """
         if not engine._has_pending_utility:
             return
+        engine._has_pending_utility = False
 
         while True:
             try:
@@ -227,7 +230,6 @@ class EngineUtilityHandler:
                             f"committed; engine exited sleep mode"
                         )
             except queue.Empty:
-                engine._has_pending_utility = False
                 break
 
     def _execute_utility_command(self, cmd: str, args: dict) -> dict | None:
