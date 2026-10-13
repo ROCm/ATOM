@@ -1937,12 +1937,17 @@ def sparse_attn_indexer(
         # owns and compacts them, which is exactly what a gathered selection
         # needs. `emit_owned_slots` (the _LOCAL path's) cannot serve here -- it
         # reads LOCAL-plane columns and has no ownership test at all.
-        # shortcut: FP8 scorer only -- the FP4 ragged schedule is built per
-        # chunk against prefill_metadata and does not survive a row
-        # restriction. Upgrade when the FP4 indexer needs this path.
+        # FP4 included: `_prefill_mqa_logits_fp4` already REBUILDS the ragged
+        # schedule whenever it is handed less than the whole batch (its
+        # `whole_batch` arm), because cta_info encodes absolute row ids and a
+        # slice would drop rows. A rank restriction is just another such
+        # partial batch, and every index it reads -- batch_id_per_q_token,
+        # indexer_fp4_local_starts/ends -- is absolute. Under q_split
+        # _LOCAL is off, so those bounds are the GLOBAL window and the staged
+        # buffer is the whole key set, which is exactly what scoring a row
+        # against every key needs.
         q_split = (
-            not indexer_fp4
-            and not dcp_local_prefill
+            not dcp_local_prefill
             and get_dcp_world_size() > 1
             and envs.ATOM_DCP_INDEXER_PREFILL_QSPLIT
         )
@@ -1966,7 +1971,7 @@ def sparse_attn_indexer(
                 logits = _prefill_mqa_logits_fp4(
                     prefill_metadata,
                     chunk,
-                    chunk_tokens == num_rows,
+                    not q_split and chunk_tokens == num_rows,
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],

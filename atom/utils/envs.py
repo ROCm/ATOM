@@ -390,7 +390,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # superset -- and what crosses the wire afterwards is the [rows, topk]
     # selection, all-gathered back to full row coverage. Mutually exclusive with
     # ATOM_DCP_INDEXER_PREFILL_LOCAL (which shards the keys instead); _LOCAL
-    # wins if both are set. FP8 indexer only. Off by default.
+    # wins if both are set. Off by default.
+    #
+    # The FP4 indexer is included -- _prefill_mqa_logits_fp4 already rebuilds
+    # its ragged schedule for a partial batch and every index it reads is
+    # absolute -- but is UNVERIFIED: GLM-5.2-MXFP4 + index_cache_dtype fp4 +
+    # DCP decode asserts in aiter pa_mqa_logits_fp4_rowgroup before a prefill
+    # can be reached, with or without this flag, so no FP4 run has executed.
     "ATOM_DCP_INDEXER_PREFILL_QSPLIT": lambda: (
         os.getenv("ATOM_DCP_INDEXER_PREFILL_QSPLIT", "0") == "1"
     ),
