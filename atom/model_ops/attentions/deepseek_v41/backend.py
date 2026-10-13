@@ -710,6 +710,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             query_prefix_ready=query_prefix_ready,
             query_prefix_republish_reason=query_prefix_republish_reason,
         )
+        step.request_resumes = resumes
         metadata = self._assemble_metadata(
             cache,
             step,
@@ -915,6 +916,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         width = ts.stop - ts.start
         if parent.requests and sum(span.length for span in spans) != width:
             raise ValueError("V4.1 microbatch request and token slices disagree")
+        # A resumed prefill keeps its replay layout in each microbatch: the
+        # window floor, the ring rows it already holds exact (never rewritten),
+        # and the compressed rows below where it resumed (never recompressed).
+        # Per request, in absolute positions, so a request split across both
+        # microbatches carries the same values into each.
+        resumes = None if parent.request_resumes is None else parent.request_resumes[rs]
         buffers = self._ubatch_buffers(ubatch_idx)
         groups = getattr(self.model_runner, "h2d_groups", None)
         prefix = f"ub{ubatch_idx}_"
@@ -950,11 +957,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 },
                 publication_group=self._compress_publication_group(prefix),
                 extra_write=0,
+                write_from=resumes,
             )
+        step.request_floors = parent.request_floors[rs].copy()
+        step.request_cached_until = parent.request_cached_until[rs].copy()
+        step.request_resumes = None if resumes is None else resumes.copy()
         if step.positions.is_cuda:
-            # TBO runs every row; share the parent's fixed, read-only zeros
-            # instead of allocating a replay floor for each child forward.
-            step.swa_replay_start = parent.swa_replay_start
+            # Indexed by this microbatch's rows, not the parent's. Before the
+            # indptrs, which count each row's window from its floor.
+            metadata.cache.publish_replay_layout(step, running_bs)
             step.indptrs = fill_step_indptrs(
                 step, self.geometry, self._ubatch_indptrs[ubatch_idx]
             )

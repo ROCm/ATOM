@@ -329,15 +329,22 @@ class PagedAttentionCache:
             return step
         self._reserve_indptrs(step.width)
         # Before the indptrs, which count each row's window from its floor.
-        zeros = self._replay_start_zeros(count if running_bs is None else running_bs)
+        self.publish_replay_layout(step, count if running_bs is None else running_bs)
+        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
+        return step
+
+    def publish_replay_layout(self, step, running_bs):
+        """`step.swa_replay_start` and `swa_cached_until` from its host
+        `request_floors` and `request_cached_until`, indexed by the step's own
+        batch rows: the fixed zeros unless a request recomputes rows below
+        where it resumed."""
+        zeros = self._replay_start_zeros(running_bs)
         step.swa_replay_start = step.swa_cached_until = zeros
         if step.request_floors.any() and not step.decode:
             step.swa_replay_start, step.swa_cached_until = upload_numpy(
                 np.stack((step.request_floors, step.request_cached_until)),
                 step.positions.device,
             )
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
-        return step
 
     def _replay_start_zeros(self, running_bs):
         """Every request's window from position 0: what a step that is not a

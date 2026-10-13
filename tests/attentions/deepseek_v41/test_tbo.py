@@ -35,7 +35,7 @@ def attach_ubatch_buffers(builder, max_tokens):
     ]
 
 
-def make_parent(device, lengths=(10, 4), starts=(3, 8)):
+def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
     geo = V41PoolGeometry(
         4,
         ((0, 2), (2, 1)),
@@ -57,7 +57,7 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8)):
     batch = SimpleNamespace(
         is_dummy_run=False,
         is_final_chunk=None,
-        replaying={},
+        replaying=replaying or {},
         state_slots_committed=[3, 1][: len(lengths)],
         req_ids=tuple(range(len(lengths))),
         num_scheduled_tokens=lengths,
@@ -72,6 +72,7 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8)):
     for i, length in enumerate(lengths):
         cu.np[i + 1] = cu.np[i] + length
     cu.copy_to_gpu(len(lengths) + 1)
+    builder.engram = None
     parent, _ = builder.prepare_prefill(batch, len(lengths))
     parent.engram_embeddings = {
         layer: torch.arange(sum(lengths) * 4, device=device).view(1, -1, 4) + layer
@@ -457,6 +458,48 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
         assert _forward_context_local.ctx is ctx
     for table in staging.host.prefetcher._tables.values():
         table.disable_uva()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("rebuilds", [False, True])
+def test_resumed_prefill_keeps_its_replay_layout_in_each_microbatch(rebuilds):
+    """A prefill recomputing rows below where it resumed (encoder bounded
+    replay) carries its window floor, the ring rows it already holds, and the
+    compressed rows below the resume point into each microbatch, indexed by
+    the microbatch's own rows. Without them a child rewrote ring rows the
+    parent marked exact and recompressed rows the cache already held."""
+    from atom.model_engine.sequence import Replay
+
+    # Request 0 runs positions 3..12 and resumed at 8; request 1 does not
+    # replay. The cut at 7 splits request 0 across both microbatches.
+    builder, parent = make_parent(
+        "cuda", replaying={0: Replay(until=8, rebuilds=rebuilds, history_ids=())}
+    )
+    cached = 0 if rebuilds else 8
+    assert parent.step.request_floors.tolist() == [3, 0]
+    assert parent.step.request_cached_until.tolist() == [cached, 0]
+    for i, (start, end, rs) in enumerate(((0, 7, slice(0, 1)), (7, 14, slice(0, 2)))):
+        child = builder.build_ubatch_prefill_metadata(
+            parent, UBatchSlice(rs, slice(start, end)), rs.stop - rs.start, i
+        )
+        step = child.step
+        floors = parent.step.request_floors[rs].tolist()
+        until = parent.step.request_cached_until[rs].tolist()
+        assert step.request_floors.tolist() == floors
+        assert step.request_cached_until.tolist() == until
+        n = len(floors)
+        assert step.swa_replay_start[:n].tolist() == floors
+        assert step.swa_cached_until[:n].tolist() == until
+        resumes = [8, 0][:n]
+        for ratio, plan in step.plans.items():
+            expected = [
+                [span.offset + j, bid, span.position + j]
+                for bid, span in enumerate(step.requests)
+                for j in range(span.length)
+                if (span.position + j + 1) % ratio == 0
+                and span.position + j >= resumes[bid]
+            ]
+            assert plan.compress_plan_gpu[: plan.num_compress, :3].tolist() == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

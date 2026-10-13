@@ -118,6 +118,10 @@ class BatchStep:
         default_factory=lambda: np.empty(0, dtype=np.bool_)
     )
     start_histories: np.ndarray | None = None
+    # Host, per request: where a recomputing forward resumed, below which its
+    # compress plans write nothing (`make_compress_plans`' `write_from`); None
+    # when no request recomputes. A TBO child plans its slice from these.
+    request_resumes: np.ndarray | None = None
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
