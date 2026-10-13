@@ -1537,24 +1537,42 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
         return {"tentative": True, "max_q_len": width}
     lengths = [int(n) for n in batch.num_scheduled_tokens]
     ends = [int(n) for n in batch.context_lens]
-    rows = [(end - length, length) for end, length in zip(ends, lengths) if length]
+    drafts = _v41_scheduled_draft_counts(len(lengths))
+    if drafts is not None and not any(drafts):
+        # vLLM scheduled no drafts this step. Nothing to verify, whatever the
+        # rows look like.
+        return {}
+    rows = [
+        (end - length, length, 0 if drafts is None else int(drafts[i]))
+        for i, (end, length) in enumerate(zip(ends, lengths))
+        if length
+    ]
     if not rows:
         return {}
 
     # A tentative step is a verification step: every row is a draft block on
     # top of an existing prefix. A prefill row is neither -- it starts at
     # position 0 and is longer than a block -- and the cache refuses the mix.
-    # Such a step verifies nothing, so there is nothing to hold back from its
-    # cursor and the ordinary advance is right.
-    # A row carries a draft block only if it continues an existing prefix and
-    # is wider than the single token a plain decode runs. A one-token decode
-    # row verifies nothing, so its cursor can advance the ordinary way.
+    #
+    # Which rows carry drafts is read from the scheduler, not inferred from
+    # their shape. The inference was `position > 0 and 1 < length <= spec+1`,
+    # and an ordinary chunked prefill satisfies it: a 4099-token prompt whose
+    # first chunk took 4096 comes back as position=4096, length=3, which is
+    # indistinguishable by shape from a 3-wide draft block and carries no
+    # drafts at all. Sharing that step with a newly admitted request then
+    # raised the mixed-step error below for a step that was never verifying
+    # anything -- and clearing draft lists in the scheduler could not help,
+    # because the positions and lengths it keyed on do not change.
     def _is_draft(row):
-        position, length = row
+        position, length, draft_count = row
+        if drafts is not None:
+            return draft_count > 0
+        # No per-request counts from this runner: fall back to the shape,
+        # which is what this had before the counts were available.
         return position > 0 and 1 < length <= speculative_tokens + 1
 
     def _fits_tentative(row):
-        position, length = row
+        position, length, _draft_count = row
         return position > 0 and length <= speculative_tokens + 1
 
     if not any(_is_draft(row) for row in rows):
@@ -1566,12 +1584,38 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
         raise NotImplementedError(
             "DeepSeek-V4.1 on the vLLM plugin cannot verify a draft block in "
             "the same step as a prefill "
-            f"(rows position/length: {rows[:16]}, spec={speculative_tokens})"
+            f"(rows position/length/drafts: {rows[:16]}, "
+            f"spec={speculative_tokens})"
         )
     return {
         "tentative": True,
-        "max_q_len": max(length for _position, length in rows),
+        "max_q_len": max(length for _position, length, _drafts in rows),
     }
+
+
+def _v41_scheduled_draft_counts(num_rows):
+    """Per-request draft counts for this step, or None if unavailable.
+
+    vLLM's `InputBatch` carries `num_draft_tokens_per_req`, which is what the
+    scheduler actually scheduled rather than what the rows look like. None
+    when no batch is exposed, when this runner does not carry the field, or
+    when its length disagrees with the step -- in each case the caller falls
+    back to the shape rule rather than indexing into something that does not
+    describe these rows.
+    """
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+    batch = get_current_input_batch()
+    if batch is None:
+        return None
+    per_req = getattr(batch, "num_draft_tokens_per_req", None)
+    if per_req is None:
+        # The field exists but is unset exactly when nothing was drafted, so
+        # a batch that carries the attribute still answers the question.
+        return [0] * num_rows if hasattr(batch, "num_draft_tokens_per_req") else None
+    if len(per_req) != num_rows:
+        return None
+    return per_req
 
 
 def v41_commit_speculative_state(anchors) -> bool:

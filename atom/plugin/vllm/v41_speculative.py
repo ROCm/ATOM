@@ -218,14 +218,26 @@ def patch_v41_speculative_commit() -> int:
         def postprocess_sampled(
             self,
             idx_mapping,
-            sampled_token_ids,
+            sampled_tokens,
             num_sampled,
             num_rejected,
-            query_start_loc,
+            query_start_loc=None,
             *args,
             _original=original,
             **kwargs,
         ):
+            """Upstream's signature, exactly, plus the V4.1 commit.
+
+            The names and the default are the interface, not a style: a
+            non-last pipeline rank calls this as
+            `postprocess_sampled(**get_prev_sampled_outputs(...))`, whose dict
+            is `sampled_tokens`/`num_sampled`/`num_rejected`/`idx_mapping` and
+            carries no `query_start_loc`. Renaming the first or requiring the
+            last makes that call fail at argument binding -- before any of the
+            code below runs, and for every plugin model using the V2 runner
+            with pipeline parallelism, speculating or not, because this patch
+            is installed globally.
+            """
             from atom.plugin.vllm.deepseek_v41_bridge import (
                 v41_commit_speculative_state,
                 v41_speculative_step_is_pending,
@@ -243,7 +255,7 @@ def patch_v41_speculative_commit() -> int:
                     )
 
                     batch = get_current_input_batch()
-                    starts = None if batch is None else batch.query_start_loc
+                    starts = getattr(batch, "query_start_loc", None)
                 if starts is None:
                     raise RuntimeError(
                         "V4.1 speculative step cannot be committed: vLLM gave "
@@ -251,14 +263,21 @@ def patch_v41_speculative_commit() -> int:
                     )
                 count = int(num_rejected.shape[0])
                 v41_commit_speculative_state(_anchors(num_rejected, starts, count))
+            # Forwarded by keyword, so a caller that omitted the optional
+            # argument reaches the original having omitted it too rather than
+            # being given a None this wrapper invented.
             return _original(
                 self,
                 idx_mapping,
-                sampled_token_ids,
+                sampled_tokens,
                 num_sampled,
                 num_rejected,
-                query_start_loc,
                 *args,
+                **(
+                    {}
+                    if query_start_loc is None
+                    else {"query_start_loc": query_start_loc}
+                ),
                 **kwargs,
             )
 

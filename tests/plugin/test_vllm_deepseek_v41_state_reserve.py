@@ -102,9 +102,22 @@ class TestReserveArithmetic:
         assert "--max-num-seqs" in message
 
     def test_exactly_one_max_length_request_still_admits(self):
-        config = _kv_cache_config(64, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+        """32 PAGEs of history plus the null block vLLM keeps: 33.
+
+        This asserted 32 and passed, which is the off-by-one itself --
+        `BlockPool` pops one block as its null placeholder, so 32 block ids
+        allocate 31, and an 8191-token prompt needs 32.
+        """
+        config = _kv_cache_config(65, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
         _reserve_state_tail([config], 32, _vllm_config(max_model_len=8192))
-        assert config.num_blocks == 32
+        assert config.num_blocks == 33
+
+    def test_one_page_short_of_that_is_refused(self):
+        """The boundary from the other side: 32 left is one too few, and the
+        old check accepted exactly this."""
+        config = _kv_cache_config(64, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+        with pytest.raises(ValueError, match="null block"):
+            _reserve_state_tail([config], 32, _vllm_config(max_model_len=8192))
 
 
 def _recorder():

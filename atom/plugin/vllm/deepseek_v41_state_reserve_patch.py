@@ -71,6 +71,11 @@ _PATCH_TARGETS = (
 
 _ATTR = "get_kv_cache_configs"
 
+# `BlockPool.__init__` pops one block off the free queue to serve as its null
+# placeholder and never gives it back, so this many of any pool's block ids
+# are not allocatable.
+NULL_BLOCKS = 1
+
 
 def deepseek_v41_state_reserve_blocks(vllm_config) -> int:
     """Blocks to withhold from vLLM's pool so the CSA2 STATE tail fits.
@@ -95,7 +100,14 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
     # One request must still fit after the tail comes out, or the scheduler
     # can never admit anything -- a clearer failure here than a request that
     # is preempted forever.
-    min_usable = max(1, -(-max_model_len // ATOM_DEEPSEEK_V41_BLOCK_SIZE))
+    #
+    # `+ NULL_BLOCKS`: vLLM's `BlockPool` permanently pops one block off its
+    # free queue as the null placeholder, so a pool of N block ids has N-1
+    # allocatable. Counting totals made the boundary off by exactly one, and
+    # in the direction that passes: with max_model_len=8192 and 32 PAGEs left,
+    # this said yes while an 8191-token prompt -- which needs all 32 -- could
+    # only ever be given 31.
+    min_usable = max(1, -(-max_model_len // ATOM_DEEPSEEK_V41_BLOCK_SIZE)) + NULL_BLOCKS
     applied = False
     seen_groups = []
     for cfg in configs:
@@ -117,7 +129,9 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
                 f"{vllm_config.scheduler_config.max_num_seqs} concurrent requests, "
                 f"leaving {usable} for history -- below the "
                 f"{min_usable} a single max_model_len={max_model_len} request "
-                "needs. Raise --gpu-memory-utilization, or lower --max-num-seqs "
+                f"needs ({min_usable - NULL_BLOCKS} for its own PAGEs plus "
+                f"{NULL_BLOCKS} vLLM holds back as its null block). Raise "
+                "--gpu-memory-utilization, or lower --max-num-seqs "
                 "or --max-model-len."
             )
         logger.info(

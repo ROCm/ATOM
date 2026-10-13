@@ -216,12 +216,44 @@ def apply_v41_eager_break() -> bool:
     if getattr(original, _EAGER_BREAK_MARKER, False):
         return False
 
-    wrapped = eager_break_during_capture(original)
-    if wrapped is original:
+    def live_step_attend_block(
+        self, attn_out, hidden, hidden_scale, cache, step, rope, queries=None
+    ):
+        """`_attend_block`, reading the step the cache holds right now.
+
+        The decorator binds this call's arguments once, when the graph is
+        recorded, and reruns no host code to rebind them -- so the `step` a
+        replay receives is the one the capture saw: a warmup batch's lengths
+        and cursors, for the life of that graph. The cache outlives every
+        step and `begin_step` leaves the current one on it, so reading it
+        here -- inside the region, which does rerun -- is what makes a replay
+        see its own step.
+
+        Here and not in core, because core has callers that mean the step
+        they pass: bounded replay re-enters attention with a tail Step while
+        the cache still holds the whole forward's, and substituting there
+        gave the tail's rows the full forward's Step. This path refuses
+        bounded replay (`model_wrapper`), so the two cannot collide.
+        """
+        return original(
+            self,
+            attn_out,
+            hidden,
+            hidden_scale,
+            cache,
+            getattr(cache, "current_step", None) or step,
+            rope,
+            queries,
+        )
+
+    wrapped = eager_break_during_capture(live_step_attend_block)
+    if wrapped is live_step_attend_block:
         # The decorator reads `VLLM_USE_BREAKABLE_CUDAGRAPH` when it is
         # applied, and hands the function straight back when breaks are off.
         # Marking it then would brand the undecorated function as done and
-        # make a later call -- with the env set -- skip the work.
+        # make a later call -- with the env set -- skip the work. Core's own
+        # `_attend_block` stays installed, which is right: with no break
+        # there is no frozen argument to work around.
         return False
     setattr(wrapped, _EAGER_BREAK_MARKER, True)
     Attention._attend_block = wrapped

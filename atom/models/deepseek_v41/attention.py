@@ -394,19 +394,20 @@ class Attention(nn.Module):
         )
 
     def _attend_block(
-        self, attn_out, hidden, hidden_scale, cache, _step, rope, queries=None
+        self, attn_out, hidden, hidden_scale, cache, step, rope, queries=None
     ):
         """Everything from the compressor fork to the attention rows.
 
-        Takes the cache, not the step. A frontend that breaks a capture here
-        (`atom.plugin.vllm.v41_core_overrides`) binds the break's arguments at
-        capture time and reruns no host code to rebind them, so a `step`
-        parameter would hold the step the graph was recorded with on every
-        later replay -- the warmup batch's lengths and
-        cursors, for the life of that graph. The cache outlives every step and
-        `begin_step` leaves the current one on it, so `cache.current_step` is
-        this step's. `_step` is kept in the signature for the native callers
-        that still pass it positionally, and deliberately unused.
+        Uses the `step` it is handed, and nothing else. An earlier version
+        took it from `cache.current_step` instead, to survive a capture that
+        binds this call's arguments once -- but that is a fact about one
+        frontend, and here it silently overrode the caller. Bounded replay
+        re-enters with a *tail* Step while the cache still holds the whole
+        forward's, so a 1024-token prefill with a 128-token window handed
+        attention 128 rows and a Step describing 1024. The frontend that
+        needs the substitution now makes it in its own wrapper
+        (`atom.plugin.vllm.v41_core_overrides`), inside the eager region, so
+        native keeps the Step its caller chose.
 
         The wide eager region, and wide on purpose. Upstream keeps a narrower
         one for Model Runner V2 and a wide one for V1, because V1's piecewise
@@ -423,7 +424,6 @@ class Attention(nn.Module):
         find it. Without one -- ATOM's own path, where nothing is decorated --
         it returns the rows and nothing is allocated or copied.
         """
-        step = getattr(cache, "current_step", None) or _step
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)

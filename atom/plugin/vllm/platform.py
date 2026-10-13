@@ -176,32 +176,25 @@ _V41_EXPERIMENTAL_CUDAGRAPH_ENV = "ATOM_V41_EXPERIMENTAL_CUDAGRAPH"
 def _breakable_cudagraph_available() -> bool:
     """Whether to let V4.1 be captured. Off unless explicitly asked for.
 
-    Breakable capture removes the *stated* reason V4.1 ran eager: that reason
-    was that ATOM's plugin models are not fx-split, so vLLM's PIECEWISE mode
-    had nothing to split on, and breakable capture ends the stream capture at
-    runtime instead of splitting an fx graph. Everything that follows from
-    that is in place -- `v41_stage_step` carries the break, PIECEWISE passes
-    vLLM's three `AttentionCGSupport.NEVER` gates untouched (all three test
-    FULL), and the dummy-batch cache is reused rather than freed under the
-    recorded kernels.
+    Capture works, and this gate is about who turns it on rather than whether
+    it is correct. Three things make a V4.1 forward recordable, each needed:
+    the step's host work is staged outside the forward, attention runs in an
+    eager break writing through a caller-owned buffer (a fresh tensor would
+    change address on every replay), and Engram keeps its side stream with
+    the orderings in breaks. Measured on TP4, full GSM8K: 0.9303 +/- 0.0070
+    with DSpark and graphs, against 0.9295 +/- 0.0071 eager, 47 FULL and 110
+    PIECEWISE graphs captured.
 
-    It is still not enough, and this is measured, not assumed. With the above,
-    V4.1 captures and serves without raising -- and answers degenerate into
-    noise after the first few tokens. What stays behind is the attention
-    itself: its kernels are launched with per-step host values (the batch's
-    longest KV extent among them), which a capture freezes at the length it
-    happened to record while every decode step grows past it. The ordinary
-    remedy -- an eager break on the attention op, as vLLM does for
-    `unified_attention_with_output` -- does not apply as a decoration, because
-    V4.1's attention returns a fresh tensor and the decorator requires an
-    in-place output buffer; applying it anyway faults inside capture.
+    What this earlier said -- that the answers degenerate into noise and the
+    decorator cannot be applied because attention returns a fresh tensor --
+    described the branch before `_attn_out_buffer`, which is exactly the
+    buffer that was missing.
 
-    So capturing V4.1 needs attention-level work (a persistent per-layer
-    output buffer and a device-side length bound), not configuration. Until
-    then this returns False by default, so a vLLM that auto-enables
-    VLLM_USE_BREAKABLE_CUDAGRAPH cannot quietly turn V4.1's answers to noise.
-    Set ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 to pick that work back up; it is
-    wrong on purpose and is not a serving configuration.
+    Still default-off, and the reason is not doubt about the numbers: vLLM
+    auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH for some architectures, so
+    without a second condition of our own, a vLLM upgrade that adds V4.1 to
+    that list would change how this path runs with nothing in the log. Set
+    ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 to opt in.
     """
     if os.environ.get(_V41_EXPERIMENTAL_CUDAGRAPH_ENV, "") not in ("1", "true", "True"):
         return False
