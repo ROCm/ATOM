@@ -744,13 +744,18 @@ models:
             wait_server_timeout: 4500
           run_eval: false
 
-        - <<: *kimi_k3_standalone_state
+        - &kimi_k3_standalone_state_c72
+          <<: *kimi_k3_standalone_state
           name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72
           concurrency: [72]
           server:
             common_args:
               <<: *kimi_k3_standalone_state_args
               max_num_seqs: 144
+          env:
+            common: &kimi_k3_standalone_state_c72_env
+              <<: *kimi_k3_standalone_state_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: '192'
 
         # C48 control: keep PAGE checkpoints and LMCache STATE offload;
         # disable only checkpoints stored in spare STATE pool slots.
@@ -760,6 +765,16 @@ models:
           env:
             common:
               <<: *kimi_k3_standalone_state_env
+              ATOM_KDA_SPARE_STATE_CHECKPOINTS: '0'
+
+        # C72 control: inherit the 192 GiB shared CPU pool and 128 GiB STATE
+        # cap, changing only the spare STATE checkpoint switch.
+        - <<: *kimi_k3_standalone_state_c72
+          name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72
+          display_topology: STANDALONE-TP8-DCP8-NO-SPARE-STATE
+          env:
+            common:
+              <<: *kimi_k3_standalone_state_c72_env
               ATOM_KDA_SPARE_STATE_CHECKPOINTS: '0'
 
         # One concurrency per job keeps the prefix/state caches independent.

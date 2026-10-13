@@ -98,6 +98,7 @@ on:
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48,
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72,
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48,
+            kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
             kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,

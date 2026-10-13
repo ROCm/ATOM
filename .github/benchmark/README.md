@@ -46,6 +46,7 @@ set `suite=nightly`, and set `case_names` to one or more of these entries:
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48`
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72`
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48` (baseline)
+- `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72` (baseline)
 
 Select multiple cases with a comma-separated list. Leave `benchmark_concurrency` empty
 to use each case's concurrency. Each case runs for 3600 seconds with a fresh
@@ -55,14 +56,15 @@ C48 uses `max-num-seqs=96`; C72 uses `max-num-seqs=144`. The standalone launch
 path connects AIPerf directly to ATOM without starting Mesh or a separate decode
 worker.
 
-All three cases use TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
+All four cases use TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
 `max-num-batched-tokens=8192`, no speculative decoding,
 and FULL graph capture sizes 1 through 96. Each loads the K3 FP4
-weights, uses FP8 KV and LMCache DRAM offload with a shared 128 GiB pool per rank
-(`LMCACHE_MAX_LOCAL_CPU_SIZE=128`) and a 128 GiB STATE retention cap per rank
-(`OFFLOAD_STATE_CPU_SIZE=128`), block size 128, and LMCache chunk size 1024.
-The STATE cap does not reserve a separate allocation; STATE and KV share the
-128 GiB pool. The Agentic trace context cap is 1,048,576
+weights, uses FP8 KV and LMCache DRAM offload, block size 128, and LMCache chunk
+size 1024. Both C48 cases use a shared 128 GiB CPU pool per rank; both C72 cases
+use 192 GiB (`LMCACHE_MAX_LOCAL_CPU_SIZE`). All four retain a 128 GiB STATE cap
+per rank (`OFFLOAD_STATE_CPU_SIZE=128`). The STATE cap does not reserve a
+separate allocation; STATE and KV share the CPU pool.
+The Agentic trace context cap is 1,048,576
 tokens; request lengths come from the dataset rather than random ISL/OSL flags.
 
 The `lmcache-state` cases explicitly enable spare STATE checkpoints with:
@@ -82,12 +84,13 @@ configuration; deployment-specific Dynamo/ETCD addresses are not required by
 this direct single-server workflow. The checkpoint switch and reserve are
 captured in benchmark metadata and the recipe fingerprint for comparison runs.
 
-The C48 `lmcache-no-spare-state` baseline inherits the C48 configuration and
-changes only `ATOM_KDA_SPARE_STATE_CHECKPOINTS=0` (plus its case name and display
-label). PAGE checkpoints, LMCache STATE offload, and the 128/128 GiB budgets remain
-enabled. This compares the spare-slot feature on the current code with equal
-CPU budgets; it does not reproduce the historical implementation's uncapped
-STATE retention.
+Each `lmcache-no-spare-state` baseline inherits its matching C48 or C72 STATE
+configuration and changes only `ATOM_KDA_SPARE_STATE_CHECKPOINTS=0` (plus its
+case name and display label). PAGE checkpoints and LMCache STATE offload remain
+enabled. The CPU pool / STATE cap budgets are 128/128 GiB for C48 and 192/128 GiB
+for C72. This compares the spare-slot feature on the current code with equal
+CPU budgets within each pair; it does not reproduce the historical
+implementation's uncapped STATE retention.
 
 For a same-machine C48 comparison, select the same branch and image and use
 these **Atomesh Benchmark** workflow inputs:
@@ -97,6 +100,12 @@ suite=nightly
 case_names=kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48,kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48
 atomesh_slurm_submit_runner=atomesh-cicd
 atomesh_single_node=pit2-p03-g10
+```
+
+For the C72 comparison, use the same inputs with:
+
+```text
+case_names=kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72,kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72
 ```
 
 Leave `benchmark_concurrency` empty. `pit2-p03-g10` is the node used by the
