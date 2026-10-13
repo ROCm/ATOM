@@ -187,7 +187,9 @@ def patch_v41_speculative_scheduling() -> bool:
 
     @functools.wraps(original)
     def schedule(self, *args, **kwargs):
-        if _is_v41_speculating(self) and _would_mix_prefill_with_drafts(self):
+        if not _is_v41_speculating(self):
+            return original(self, *args, **kwargs)
+        if _would_mix_prefill_with_drafts(self):
             self._atom_v41_drafts_dropped = (
                 getattr(self, "_atom_v41_drafts_dropped", 0) + 1
             )
@@ -199,7 +201,20 @@ def patch_v41_speculative_scheduling() -> bool:
                 )
             for request in self.running:
                 request.spec_token_ids = []
-        return original(self, *args, **kwargs)
+        if not hasattr(self, "dynamic_sd_lookup") or self.dynamic_sd_lookup is not None:
+            return original(self, *args, **kwargs)
+        # vLLM 0.31 can create new admission padding AFTER the draft guard.
+        # Its static path may mix that padding with another new prefill. A
+        # constant-K lookup disables only this padding, keeping next-step K
+        # and async bonus-token accounting unchanged. These are the field's
+        # only two read sites in 0.31; the source-contract test pins them.
+        self.dynamic_sd_lookup = [self.num_spec_tokens] * (
+            self.max_num_running_reqs + 1
+        )
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            self.dynamic_sd_lookup = None
 
     schedule._atom_v41_no_mixed_step = True
     Scheduler.schedule = schedule
