@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 import traceback
 from collections import Counter
@@ -169,6 +170,16 @@ def _workers_per_engine(config) -> int:
     return int(getattr(config, "tp_world_size", 1) or 1) * int(
         getattr(config, "prefill_context_parallel_size", 1) or 1
     )
+
+
+def _has_mla_attention(model) -> bool:
+    """Whether *model* decodes through MLAAttention. Looked up, not imported:
+    importing it pulls in aiter, and no instance exists unless it was loaded."""
+    mla = getattr(sys.modules.get("atom.model_ops.attention_mla"), "MLAAttention", None)
+    modules = getattr(model, "modules", None)
+    if mla is None or not callable(modules):
+        return False
+    return any(isinstance(module, mla) for module in modules())
 
 
 def _alone(ready: bool, began: bool) -> tuple[bool, bool]:
@@ -408,44 +419,62 @@ class RDMAWeightReceiverMixin:
         """Join the trainer's weight-broadcast group as this rank.
 
         Rank 0 is the trainer, so every worker sits at ``base_rank`` or above.
-        The caller assigns one ``base_rank`` per replica; this rank's offset
-        within the replica accounts for any local DP, because a replica running
-        DP internally contributes one engine's worth of ranks per DP rank.
+        The caller assigns one ``base_rank`` per replica, whose workers follow
+        it in order. Refused before joining on an engine where a reload over
+        RDMA would be unsafe, so the trainer's rendezvous fails rather than a
+        later stream.
         """
         # Vendored, so a container with ATOM but no RL framework still works.
         from atom.utils.independent_process_group import (
             init_independent_process_group,
         )
 
+        refusal = self._rdma_reload_refusal()
+        if refusal:
+            raise RuntimeError(f"cannot receive weights over RDMA: {refusal}")
+
         groups = getattr(self, "_rdma_weight_groups", None)
         if groups is None:
             groups = {}
             self._rdma_weight_groups = groups
+        joins = getattr(self, "_rdma_weight_group_joins", None)
+        if joins is None:
+            joins = {}
+            self._rdma_weight_group_joins = joins
+
+        rank = int(base_rank) + int(self.rank)
+        if rank <= 0 or rank >= int(world_size):
+            workers = _workers_per_engine(getattr(self, "config", None))
+            raise ValueError(
+                f"invalid RDMA rank {rank} for world_size={world_size} "
+                f"(base_rank={base_rank}, worker={self.rank}, "
+                f"workers_per_engine={workers}); rank 0 is the trainer"
+            )
+
+        join = {
+            "master": f"{master_addr}:{int(master_port)}",
+            "world_size": int(world_size),
+            "rank": rank,
+        }
         if group_name in groups:
-            # Idempotent: the orchestrator may retry init after a partial
-            # failure elsewhere, and rejoining would deadlock the rendezvous.
+            # Idempotent only for the same join: the orchestrator may retry
+            # init after a partial failure elsewhere, and rejoining would
+            # deadlock the rendezvous. A changed one -- a restarted trainer, a
+            # new rank layout -- would leave this worker in the old group while
+            # its peers joined the new one.
+            if joins.get(group_name, join) != join:
+                raise RuntimeError(
+                    f"RDMA weight group {group_name!r} is already joined as "
+                    f"{joins[group_name]}, not {join}; call "
+                    f"destroy_rdma_weight_group({group_name!r}) on every rank "
+                    f"before joining it again"
+                )
             logger.warning(
                 "%s: RDMA weight group %s already joined, reusing",
                 getattr(self, "label", "runner"),
                 group_name,
             )
             return True
-
-        config = getattr(self, "config", None)
-        parallel = getattr(config, "parallel_config", None)
-        dp_rank_local = int(getattr(parallel, "data_parallel_rank_local", 0) or 0)
-        # Not the logical TP width: under PCP one DP replica would then take
-        # another's ranks.
-        workers = _workers_per_engine(config)
-        rank = int(base_rank) + dp_rank_local * workers + int(self.rank)
-
-        if rank <= 0 or rank >= int(world_size):
-            raise ValueError(
-                f"invalid RDMA rank {rank} for world_size={world_size} "
-                f"(base_rank={base_rank}, dp_local={dp_rank_local}, "
-                f"worker={self.rank}, workers_per_engine={workers}); "
-                f"rank 0 is the trainer"
-            )
 
         groups[group_name] = init_independent_process_group(
             backend="nccl",  # RCCL on ROCm
@@ -455,16 +484,39 @@ class RDMAWeightReceiverMixin:
             rank=rank,
             group_name=group_name,
         )
+        joins[group_name] = join
         logger.info(
-            "%s: joined RDMA weight group %s as rank %d/%d " "(dp_local=%d tp_rank=%d)",
+            "%s: joined RDMA weight group %s as rank %d/%d (worker %d)",
             getattr(self, "label", "runner"),
             group_name,
             rank,
             world_size,
-            dp_rank_local,
             self.rank,
         )
         return True
+
+    def _rdma_reload_refusal(self) -> str | None:
+        """Why a reload over RDMA would be unsafe on this engine, if it would."""
+        config = getattr(self, "config", None)
+        parallel = getattr(config, "parallel_config", None)
+        dp = int(getattr(parallel, "data_parallel_size", 1) or 1)
+        if dp > 1:
+            return (
+                f"data_parallel_size={dp}. One group would span {dp} "
+                f"EngineCores, which enter its broadcast independently -- one "
+                f"can block in it while another waits in the per-step DP "
+                f"all-reduce -- and each decides the stream for its own "
+                f"workers alone, so DP replicas could commit different "
+                f"versions. Run each DP replica as its own server."
+            )
+        if _has_mla_attention(getattr(self, "model", None)):
+            return (
+                "the model decodes through MLAAttention, which derives W_K and "
+                "W_V from kv_b_proj once, at load. A reload rewrites kv_b_proj "
+                "and leaves them as they were, so the engine would serve old "
+                "and new weights together."
+            )
+        return None
 
     def _vote_with_engine_peers(self, ready: bool, began: bool) -> tuple[bool, bool]:
         """The stream's decision across this engine's workers, every one of
@@ -473,6 +525,8 @@ class RDMAWeightReceiverMixin:
         Over aiter's world group, not its TP group. A runner's world is its
         engine's workers alone, DP being isolated per engine, and holds every
         prefill-context rank the stream reaches, where a TP group holds one.
+        With DP > 1 refused at init, those workers are every receiver in the
+        weight group, so no receiver commits a stream another rejected.
         """
         workers = _workers_per_engine(getattr(self, "config", None))
         if workers <= 1:
@@ -539,6 +593,7 @@ class RDMAWeightReceiverMixin:
         return stats
 
     def destroy_rdma_weight_group(self, group_name: str) -> bool:
+        getattr(self, "_rdma_weight_group_joins", {}).pop(group_name, None)
         groups = getattr(self, "_rdma_weight_groups", {})
         group = groups.pop(group_name, None)
         if group is None:

@@ -772,7 +772,7 @@ def test_a_broadcast_that_fails_puts_the_rank_out_of_step(monkeypatch):
 class _Worker(receiver.RDMAWeightReceiverMixin):
     """One engine worker, as init_rdma_weight_group sees it."""
 
-    def __init__(self, rank, dp_local, *, tp, tp_world, pcp):
+    def __init__(self, rank, dp_local, *, tp, tp_world, pcp, dp=1):
         self.rank = rank
         self.world_size = tp  # the logical TP width, as on ModelRunner
         self.label = f"worker{rank}"
@@ -780,21 +780,14 @@ class _Worker(receiver.RDMAWeightReceiverMixin):
             tensor_parallel_size=tp,
             tp_world_size=tp_world,
             prefill_context_parallel_size=pcp,
-            parallel_config=SimpleNamespace(data_parallel_rank_local=dp_local),
+            parallel_config=SimpleNamespace(
+                data_parallel_rank_local=dp_local, data_parallel_size=dp
+            ),
         )
 
 
-@pytest.mark.parametrize(
-    ("tp", "tp_world", "pcp"),
-    [(2, 2, 2), (4, 2, 1)],
-    ids=["prefill-context-parallel", "simulated-tp"],
-)
-def test_every_worker_of_every_dp_engine_gets_its_own_rank(
-    monkeypatch, tp, tp_world, pcp
-):
-    """The stride was the logical TP width, but an engine runs tp_world x pcp
-    workers: under PCP one DP engine's workers took the next one's ranks, and
-    under simulated TP ranks went unclaimed."""
+def _joins(monkeypatch):
+    """The ranks init_rdma_weight_group joins as, with no rendezvous behind."""
     import atom.utils.independent_process_group as ipg
 
     joined = []
@@ -803,20 +796,81 @@ def test_every_worker_of_every_dp_engine_gets_its_own_rank(
         "init_independent_process_group",
         lambda **kw: joined.append(kw["rank"]) or object(),
     )
-    dp, workers = 2, tp_world * pcp
-    for dp_local in range(dp):
-        for rank in range(workers):
-            _Worker(
-                rank, dp_local, tp=tp, tp_world=tp_world, pcp=pcp
-            ).init_rdma_weight_group(
-                "127.0.0.1",
-                29500,
-                base_rank=1,
-                world_size=1 + dp * workers,
-                group_name="g",
-            )
+    return joined
 
-    assert sorted(joined) == list(range(1, 1 + dp * workers))
+
+def _mla_attention(monkeypatch):
+    """MLAAttention as the receiver finds it, with no aiter to import it from."""
+    from torch import nn
+
+    mla = ModuleType("atom.model_ops.attention_mla")
+    mla.MLAAttention = type("MLAAttention", (nn.Module,), {})
+    monkeypatch.setitem(sys.modules, mla.__name__, mla)
+    return mla.MLAAttention
+
+
+def test_a_dp_engine_refuses_the_weight_group_before_joining(monkeypatch):
+    """One group spanned every DP engine, and each entered its broadcast and
+    decided the stream on its own: one could block in it while another waited
+    in the DP all-reduce, or commit a version another had rejected."""
+    joined = _joins(monkeypatch)
+    for dp_local in range(2):
+        worker = _Worker(0, dp_local, tp=1, tp_world=1, pcp=1, dp=2)
+        with pytest.raises(RuntimeError, match="data_parallel_size=2"):
+            worker.init_rdma_weight_group(
+                "127.0.0.1", 29500, base_rank=1, world_size=3, group_name="g"
+            )
+    assert joined == []
+
+
+def test_an_mla_model_refuses_the_weight_group_before_joining(monkeypatch):
+    """MLA decodes through W_K and W_V, derived from kv_b_proj once at load.
+    A reload rewrote kv_b_proj and left them, and the engine served old and
+    new weights together."""
+    from torch import nn
+
+    joined = _joins(monkeypatch)
+    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    worker.model = nn.Sequential(nn.Linear(2, 2), _mla_attention(monkeypatch)())
+
+    with pytest.raises(RuntimeError, match="MLAAttention"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+    assert joined == []
+
+    worker.model = nn.Sequential(nn.Linear(2, 2))
+    assert worker.init_rdma_weight_group(
+        "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+    )
+    assert joined == [1]
+
+
+def test_a_repeated_init_reuses_its_group_only_for_the_same_join(monkeypatch):
+    """Retried under the same name, init returned success whatever it was
+    asked: after a trainer restart on a new endpoint, a worker kept the old
+    group while its peers joined the new one, and the next broadcast hung."""
+    import atom.utils.independent_process_group as ipg
+
+    joined = []
+    monkeypatch.setattr(
+        ipg,
+        "init_independent_process_group",
+        lambda **kw: joined.append(kw["init_method"]) or object(),
+    )
+    monkeypatch.setattr(receiver.dist, "destroy_process_group", lambda group: None)
+    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    join = {"base_rank": 1, "world_size": 2, "group_name": "g"}
+
+    assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join)
+    assert worker.init_rdma_weight_group("10.0.0.1", 29500, **join)  # a retry
+    with pytest.raises(RuntimeError, match="already joined"):
+        worker.init_rdma_weight_group("10.0.0.2", 29500, **join)
+    assert joined == ["tcp://10.0.0.1:29500"]
+
+    worker.destroy_rdma_weight_group("g")
+    assert worker.init_rdma_weight_group("10.0.0.2", 29500, **join)
+    assert joined == ["tcp://10.0.0.1:29500", "tcp://10.0.0.2:29500"]
 
 
 def _world(monkeypatch, size):
@@ -898,6 +952,27 @@ def test_the_lifecycle_the_real_mixins_define_is_advertised():
         "get_weight_update_status",
     } <= set(report["methods"])
     assert "rdma_weight_receive" in report["features"]
+
+
+@pytest.mark.parametrize("unsafe", ["dp", "mla"])
+def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
+    """The methods are still there; the feature is what says they work here,
+    so an orchestrator can choose another path before a rendezvous that
+    cannot complete."""
+    from torch import nn
+
+    from atom.rollout.capabilities import CapabilityProviderMixin
+
+    class _Composed(_Worker, CapabilityProviderMixin):
+        pass
+
+    worker = _Composed(0, 0, tp=1, tp_world=1, pcp=1, dp=2 if unsafe == "dp" else 1)
+    if unsafe == "mla":
+        worker.model = nn.Sequential(_mla_attention(monkeypatch)())
+    report = worker.get_worker_capabilities()
+
+    assert "receive_weights_rdma" in report["methods"]
+    assert "rdma_weight_receive" not in report["features"]
 
 
 # ── against the sender's own source ────────────────────────────────────────
