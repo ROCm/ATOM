@@ -177,6 +177,22 @@ class SchedulerImages:
         # the first image group, applied to all k; they allocate in lockstep).
         self._release_keep: dict[str, tuple[int, set]] = {}
         self._release_step = 0
+        # Speculative decode (MTP): a step commits 1 + accepted tokens, known
+        # only from its output, so a decode keep is decided there (native:
+        # ``hash_decode_blocks`` at the committed end) and the worker stores it
+        # at the next build.
+        self.spec = int(getattr(scheduler, "num_spec_tokens", 0) or 0) > 0
+        # req_id -> spacing threshold of a decode row in this schedule().
+        self.decode_rows: dict[str, int] = {}
+        # schedule() count, and each step's requests that continue on their
+        # own slot (scheduled, neither new nor resumed).
+        self.step_id = 0
+        self.step_continuing: dict[int, frozenset] = {}
+        # Committed ends on an eligible boundary, from the output being
+        # processed / waiting for the next step's schedule: req_id ->
+        # (request, end, step id).
+        self.landing: dict[str, tuple] = {}
+        self.awaiting: dict[str, tuple] = {}
 
         self.check_blocks = envs.ATOM_STATE_IMAGE_CHECK_BLOCKS
         self.counters = {
@@ -191,6 +207,8 @@ class SchedulerImages:
             "duplicate_images_skipped": 0,
             "max_image_blocks_per_request": 0,
             "pending_hashes_dropped": 0,
+            "decode_keeps_truncated": 0,
+            "decode_keeps_not_continued": 0,
         }
 
     # -- admission (each get_computed_blocks call = native can_allocate) ------
@@ -231,6 +249,12 @@ class SchedulerImages:
         if start >= prefill_end:
             end = start + num_new_tokens
             last = self.last_ckpt.get(request.request_id, 0)
+            if self.spec:
+                if self.placement.interval > 0:
+                    self.decode_rows[request.request_id] = (
+                        last + self.placement.interval
+                    )
+                return num_new_tokens
             if self.placement.decode_keeps(end, last):
                 # Kept in take_store_plan once the step is scheduled: with async
                 # scheduling cache_blocks lags a decode step by a token.
@@ -348,6 +372,8 @@ class SchedulerImages:
             start = self._scan_from.get(request_id, 0)
             held = [i for i in range(start, len(blocks)) if not blocks[i].is_null]
             keep = {held[-1]} if held else set()
+            if self.spec:
+                keep |= self._undecided_blocks(request_id, held)
             self._release_keep[request_id] = (self._release_step, keep, held)
             if keep:
                 self._scan_from[request_id] = min(keep)
@@ -374,6 +400,12 @@ class SchedulerImages:
         drops it, and like native forgets its last checkpoint position.
         """
         rid = request.request_id
+        landed = self.landing.pop(rid, None)
+        if landed is not None and request.is_finished():
+            # Finished by the output being processed: decide its decode keep
+            # before the blocks go.
+            self._decide_committed(*landed)
+        self.awaiting.pop(rid, None)
         pend = self.pending_hash.pop(rid, None)
         self.decode_intents.pop(rid, None)
         if request.is_finished() and pend is not None:
@@ -452,7 +484,102 @@ class SchedulerImages:
                 continue
             plan[rid] = end
             self._keep_decode(req, end)
+        if self.spec:
+            self._take_decode_candidates(scheduler_output)
         return plan
+
+    # -- decode keeps under speculative decode ---------------------------------
+    def _take_decode_candidates(self, scheduler_output) -> None:
+        """This step's decode rows and their spacing thresholds go to the worker,
+        which records the image blocks of every boundary the step could commit
+        to. Decisions waiting for this step (it was not scheduled yet when the
+        previous step's output landed) are taken now."""
+        scheduled = scheduler_output.num_scheduled_tokens
+        rows, self.decode_rows = self.decode_rows, {}
+        scheduler_output.atom_image_decode_candidates = {
+            rid: thr for rid, thr in rows.items() if rid in scheduled
+        }
+        self.step_id += 1
+        scheduler_output.atom_image_step = self.step_id
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        resumed = set(getattr(cached, "resumed_req_ids", None) or ())
+        new = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        self.step_continuing[self.step_id] = frozenset(
+            rid for rid in scheduled if rid not in resumed and rid not in new
+        )
+        self.step_continuing.pop(self.step_id - 4, None)
+        for rid, entry in list(self.awaiting.items()):
+            if entry[2] < self.step_id:
+                del self.awaiting[rid]
+                self._decide_committed(*entry)
+
+    def on_outputs(self, scheduler_output, model_runner_output) -> None:
+        """Before vLLM processes a step's output: the committed end of each
+        decode row, as the worker sees it (its start plus the tokens the step
+        sampled, before any stop truncation). Native ``hash_decode_blocks``
+        keeps only there, and only on an eligible boundary."""
+        self.landing = {}
+        cands = getattr(scheduler_output, "atom_image_decode_candidates", None)
+        step = getattr(scheduler_output, "atom_image_step", None)
+        if not cands or step is None:
+            return
+        index = model_runner_output.req_id_to_index
+        sampled = model_runner_output.sampled_token_ids
+        block = self.placement.block
+        for rid, threshold in cands.items():
+            req = self.scheduler.requests.get(rid)
+            i = index.get(rid)
+            if req is None or i is None or not sampled or i >= len(sampled):
+                continue
+            if not sampled[i]:
+                continue
+            end = int(req.num_tokens) - 1 + len(sampled[i])
+            if end % block == 0 and end >= threshold:
+                self.landing[rid] = (req, end, step)
+
+    def after_outputs(self) -> None:
+        landing, self.landing = self.landing, {}
+        for entry in landing.values():
+            self._decide_committed(*entry)
+
+    def _decide_committed(self, request, end: int, step: int) -> None:
+        """Keep at a committed end iff the worker stores it: the request
+        continues on its own slot in the next step, whose build copies the
+        slot (exact start = this end), and vLLM did not truncate the output
+        (the worker cannot see that)."""
+        rid = request.request_id
+        if int(request.num_tokens) - 1 != end:
+            self.counters["decode_keeps_truncated"] += 1
+            return
+        continuing = self.step_continuing.get(step + 1)
+        if continuing is None:
+            if not request.is_finished():
+                self.awaiting[rid] = (request, end, step)
+                return
+            continuing = frozenset()
+        if rid not in continuing:
+            self.counters["decode_keeps_not_continued"] += 1
+            return
+        self._keep_decode(request, end)
+
+    def _undecided_blocks(self, request_id: str, held) -> set:
+        """Image blocks a decode keep may still be decided on or published in:
+        a pending hash, and boundaries at or past the committed position and
+        the spacing threshold (the next step's output decides them)."""
+        out = set()
+        pend = self.pending_hash.get(request_id)
+        if pend is not None:
+            out.add(pend)
+        req = self.scheduler.requests.get(request_id)
+        if req is None or self.placement.interval <= 0:
+            return out
+        floor = max(
+            int(req.num_tokens) - 1,
+            self.last_ckpt.get(request_id, 0) + self.placement.interval,
+        )
+        block = self.placement.block
+        out.update(i for i in held if (i + 1) * block >= floor)
+        return out
 
     def _keep_decode(self, request, end: int) -> None:
         """A scheduled decode step on which native's unaimed rule keeps an image
@@ -690,8 +817,25 @@ def apply_scheduler_patches() -> bool:
                 st.check_image_blocks()
         return out
 
+    orig_update = Scheduler.update_from_output
+
+    @functools.wraps(orig_update)
+    def update_from_output(self, scheduler_output, model_runner_output):
+        st = getattr(self, "_atom_state_images", None)
+        if st is None or not st.spec:
+            return orig_update(self, scheduler_output, model_runner_output)
+        st.on_outputs(scheduler_output, model_runner_output)
+        try:
+            out = orig_update(self, scheduler_output, model_runner_output)
+        except BaseException:
+            st.landing = {}
+            raise
+        st.after_outputs()
+        return out
+
     __init__._atom_state_image_patched = True
     Scheduler.__init__ = __init__
     Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
     Scheduler.schedule = schedule
+    Scheduler.update_from_output = update_from_output
     return True

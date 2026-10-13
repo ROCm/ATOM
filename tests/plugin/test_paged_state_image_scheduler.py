@@ -664,3 +664,391 @@ def test_with_mtp_the_hit_lands_on_the_anchor_as_native(
     for gid in st.image_gids:
         assert len(groups[gid]) * BLOCK == hit
         assert not groups[gid][-1].is_null and groups[gid][-1].block_hash is not None
+
+
+class _SpecWorld:
+    """vLLM's async loop under MTP k, with a model of the worker that runs each
+    step right after it is scheduled (as the worker does, in step order).
+
+    The worker uses the plugin's own decode-keep functions. A slot's content is
+    the committed position its last step left it at; an image block's content
+    is the position of the slot it was copied from. A step commits
+    ``1 + accept(rid, j)`` tokens on its ``j``-th decode step. Every image block
+    vLLM publishes must hold exactly its boundary's state by the next build,
+    before any reader can restore it."""
+
+    def __init__(self, s, accept, monkeypatch):
+        self.s, self.accept = s, accept
+        self.st = s._atom_state_images
+        self.q = deque()
+        self.tok = 0
+        self.pos, self.slot_of, self.slot_pos = {}, {}, {}
+        self.decode_steps = {}
+        self.content = {}
+        self.published = []
+        self.pending_prefill = []
+        self.copier = NS(execute_paged_state_copies=self._copies, checkpoint_spec=NS())
+        self.worker = G.ImageWorker(None, self.copier, self.st.image_gids)
+        self.req_ids = []
+        self.builds = 0
+        self.scheduling = False
+        self.checked = 0
+        self.restores = []
+        self.prefill_end = {}
+        monkeypatch.setattr(G, "image_unit_ids", self._unit_ids)
+        monkeypatch.setattr(
+            G, "_ops", lambda c, slots, units, store: list(zip(slots, units))
+        )
+        pool = s.kv_cache_manager.block_pool
+        orig = pool.cache_full_blocks
+
+        def cache_full_blocks(
+            request,
+            blocks,
+            num_cached_blocks,
+            num_full_blocks,
+            block_size,
+            kv_cache_group_id,
+            block_mask=None,
+        ):
+            if kv_cache_group_id in self.st.image_gids:
+                # The first build that can restore it: the next step's (one
+                # published by schedule() is read no earlier than the build
+                # after the one that step runs).
+                first_reader = self.builds + (2 if self.scheduling else 1)
+                for j, i in enumerate(range(num_cached_blocks, num_full_blocks)):
+                    if block_mask is None or block_mask[j]:
+                        self.published.append(
+                            (first_reader, blocks[i].block_id, (i + 1) * block_size)
+                        )
+            return orig(
+                request,
+                blocks,
+                num_cached_blocks,
+                num_full_blocks,
+                block_size,
+                kv_cache_group_id,
+                block_mask,
+            )
+
+        pool.cache_full_blocks = cache_full_blocks
+
+    def _unit_ids(self, group_ids, rows, cols, name="t"):
+        out = []
+        for r, c in zip(rows, cols):
+            rid = self.req_ids[r]
+            units = []
+            for gid in group_ids:
+                blk = self.st.coordinator.single_type_managers[gid].req_to_blocks[rid][
+                    c
+                ]
+                assert not blk.is_null, (rid, c)
+                units.append(blk.block_id)
+            out.append(tuple(units))
+        return out
+
+    def _copies(self, stores, restores, descriptor_slot=0):
+        for slot, units in stores:
+            for u in units:
+                self.content[u] = self.slot_pos[slot]
+
+    def _verify(self, build):
+        """Every image a reader could restore in ``build`` holds its boundary's
+        state once the build's own stores are issued."""
+        left = []
+        for first_reader, block_id, boundary in self.published:
+            if first_reader <= build:
+                assert self.content.get(block_id) == boundary, (block_id, boundary)
+                self.checked += 1
+            else:
+                left.append((first_reader, block_id, boundary))
+        self.published = left
+
+    def _build_and_forward(self, out):
+        self.builds += 1
+        sched = out.num_scheduled_tokens
+        self.req_ids = ids = list(sched)
+        new = {r.req_id: r.num_computed_tokens for r in out.scheduled_new_reqs}
+        cached = out.scheduled_cached_reqs
+        resumed = {
+            rid: cached.num_computed_tokens[i]
+            for i, rid in enumerate(cached.req_ids)
+            if rid in cached.resumed_req_ids
+        }
+        fresh = [i for i, rid in enumerate(ids) if rid in new or rid in resumed]
+        starts = [new.get(r, resumed.get(r, self.pos.get(r))) for r in ids]
+        for i in fresh:
+            # A fresh slot; a hit restores the image at its start. Up to
+            # vLLM's prefill end the request replays as prefill.
+            self.slot_of[ids[i]] = len(self.slot_of) + 100 * self.builds
+            req = self.s.requests[ids[i]]
+            self.prefill_end[ids[i]] = max(req.num_prompt_tokens, req.num_tokens - 1)
+        for rid in ids:
+            self.slot_of.setdefault(rid, len(self.slot_of))
+        slots = [self.slot_of[r] for r in ids]
+        # Native's site with a drafter: last step's stores, first in the build.
+        for slot, units in self.pending_prefill:
+            self._copies([(slot, units)], [])
+        self.pending_prefill = []
+        G._decode_plan.clear()
+        G._decode_plan.update(out.atom_image_decode_candidates)
+        G.store_decode_keeps(self.worker, ids, starts, fresh)
+        lens = [sched[r] for r in ids]
+        G.record_decode_candidates(self.worker, ids, slots, starts, lens, BLOCK, "t")
+        for i in fresh:
+            if starts[i] > 0:
+                (units,) = self._unit_ids(
+                    self.st.image_gids, [i], [starts[i] // BLOCK - 1]
+                )
+                assert [self.content.get(u) for u in units] == [starts[i]] * K, (
+                    ids[i],
+                    starts[i],
+                    [self.content.get(u) for u in units],
+                )
+                self.restores.append((ids[i], starts[i]))
+            self.slot_pos[slots[i]] = starts[i]
+        for rid, end in out.atom_image_stores.items():
+            i = ids.index(rid)
+            assert starts[i] + lens[i] == end, (rid, starts[i], lens[i], end)
+            (units,) = self._unit_ids(self.st.image_gids, [i], [end // BLOCK - 1])
+            self.pending_prefill.append((slots[i], units))
+        self._verify(self.builds)
+        # The forwards.
+        toks = []
+        for i, rid in enumerate(ids):
+            req = self.s.requests[rid]
+            spec = out.scheduled_spec_decode_tokens.get(rid, ())
+            if starts[i] >= self.prefill_end[rid] and i not in fresh:
+                j = self.decode_steps.get(rid, 0)
+                self.decode_steps[rid] = j + 1
+                gen = 1 + min(len(spec), self.accept(rid, j))
+            else:
+                gen = 1 if starts[i] + lens[i] >= req.num_tokens else 0
+                if gen:
+                    lens_done = starts[i] + lens[i]
+                    self.pos[rid] = lens_done
+                    self.slot_pos[slots[i]] = lens_done
+                    toks.append([self._t()])
+                    continue
+                self.pos[rid] = starts[i] + lens[i]
+                self.slot_pos[slots[i]] = self.pos[rid]
+                toks.append([])
+                continue
+            self.pos[rid] = starts[i] + gen
+            self.slot_pos[slots[i]] = self.pos[rid]
+            toks.append([self._t() for _ in range(gen)])
+        return toks
+
+    def _t(self):
+        self.tok += 1
+        return self.tok % 997 + 1
+
+    def schedule(self):
+        self.scheduling = True
+        try:
+            out = self.s.schedule()
+        finally:
+            self.scheduling = False
+        self.q.append((out, self._build_and_forward(out)))
+        return out
+
+    def land(self):
+        out, toks = self.q.popleft()
+        ids = list(out.num_scheduled_tokens)
+        self.s.update_from_output(
+            out,
+            ModelRunnerOutput(
+                req_ids=ids,
+                req_id_to_index={r: i for i, r in enumerate(ids)},
+                sampled_token_ids=toks,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    def drain(self, max_steps=20000):
+        for _ in range(max_steps):
+            if not self.s.requests and not self.q:
+                # A later reader's build issues what is left first.
+                for slot, units in self.pending_prefill:
+                    self._copies([(slot, units)], [])
+                self._verify(float("inf"))
+                return
+            if self.s.has_requests():
+                self.schedule()
+            if len(self.q) >= 2 or (self.q and not self.s.has_requests()):
+                self.land()
+        raise AssertionError("requests did not finish")
+
+
+def _native_mtp_keeps(prompt, gens):
+    """Native BlockManager on ``prompt``, whose decode steps commit
+    ``gens[j]`` tokens each (block 256, interval 512, a PAGE checkpoint):
+    postprocess as native's scheduler, ``hash_decode_blocks(seq, committed,
+    next_forward_tokens=1)`` with ``committed = num_tokens - 1`` (the KV the
+    step computed; undeferred output)."""
+    from conftest import MockConfig  # ATOM tests/conftest.py
+
+    from atom.model_engine.block_manager import BlockManager
+    from atom.model_engine.page_unit_checkpoint import (
+        PagedStateCheckpointCoordinator,
+        PagedStateCheckpointSpec,
+    )
+    from atom.model_engine.sequence import Sequence
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    spec = PagedStateCheckpointSpec(1000, 2600, "fake", image_bytes=2600)
+    cfg = MockConfig(
+        kv_cache_block_size=BLOCK,
+        num_kvcache_blocks=64,
+        enable_prefix_caching=True,
+        max_num_batched_tokens=2048,
+        max_model_len=4096,
+        pool_entries={"state": 4},
+        state_checkpoint_interval_tokens=512,
+        state_checkpoint_demand=True,
+    )
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    coord = bm.paged_state_checkpoints
+    keeps = []
+
+    def checkpoint(seq, boundary_blocks, h):
+        keeps.append(int(boundary_blocks) * BLOCK)
+        return PagedStateCheckpointCoordinator.checkpoint(
+            coord, seq, boundary_blocks, h
+        )
+
+    coord.checkpoint = checkpoint
+    seq = Sequence(list(prompt), BLOCK, has_per_req_cache=True)
+    bm.allocate(seq, bm.can_allocate(seq))
+    bm.hash_blocks(seq, len(prompt), start_tokens=0)
+    tok = 100
+    seq.append_token(tok)  # sampled by the prefill
+    bm.may_append(seq)
+    for gen in gens:
+        for _ in range(gen):
+            tok += 1
+            seq.append_token(tok)
+            bm.may_append(seq)
+        bm.hash_decode_blocks(seq, len(seq) - 1, next_forward_tokens=1)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+    bm.deallocate(seq)
+    return keeps
+
+
+_ACCEPT = {
+    "all_accepted": lambda j: 1,
+    "all_rejected": lambda j: 0,
+    "alternating": lambda j: j % 2,
+    "parity_lock_odd": lambda j: 0 if j == 0 else 1,
+    "parity_lock_even": lambda j: 0 if j in (0, 1) else 1,
+    "every_third_rejected": lambda j: 0 if j % 3 == 2 else 1,
+}
+
+
+# Native keeps per (prompt length, pattern); the parity lock leaves some empty.
+_KEPT = {}
+
+
+@pytest.mark.parametrize("prompt_len", [1, 2])
+@pytest.mark.parametrize("pattern", sorted(_ACCEPT))
+def test_mtp_decode_keeps_land_on_the_committed_end_as_native(
+    adapter, tmp_path, monkeypatch, pattern, prompt_len
+):
+    """Under MTP k=1 on vLLM's AsyncScheduler a step commits 1 + accepted, known
+    one step late. The plugin keeps exactly where native's hash_decode_blocks
+    does (committed end on a block boundary, one interval past the last keep;
+    a step that steps over a boundary keeps nothing), every published image
+    holds its boundary's state when the next build is done, and no step trips
+    the worker's ``hashed at … but this step ends at …`` check."""
+    accept = _ACCEPT[pattern]
+    s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=True, num_blocks=96)
+    st = s._atom_state_images
+    st.events = []
+    world = _SpecWorld(s, lambda rid, j: accept(j), monkeypatch)
+    n_answer = 2600
+    prompt = list(range(7, 7 + prompt_len))
+    _request(s, "d", prompt, max_tokens=n_answer)
+    world.drain()
+    gens = []
+    j = 0
+    total = 1  # the prefill's sampled token
+    while total < n_answer:
+        g = min(1 + accept(j), n_answer - total)
+        gens.append(g)
+        total += g
+        j += 1
+    native = [p for p in _native_mtp_keeps(prompt, gens) if p > prompt_len]
+    plugin = [end for kind, rid, end in st.events if kind == "hash"]
+    # The request's last step is never rescheduled, so it cannot keep there
+    # (DESIGN §3); none of these sequences ends on a keep.
+    assert native == plugin, (native, plugin)
+    assert st.counters["decode_keeps_truncated"] == 0
+    assert world.checked >= K * len(plugin) and not world.published
+    _KEPT[(prompt_len, pattern)] = plugin
+
+
+def test_mtp_decode_keep_scenarios_cover_both_parities():
+    """Some sequences keep (e.g. all accepted from an even end), some are
+    locked out by parity (all accepted from an odd end), as natively."""
+    if len(_KEPT) < 2 * len(_ACCEPT):
+        pytest.skip("run with the scenarios above")
+    assert _KEPT[(2, "all_accepted")] and not _KEPT[(1, "all_accepted")]
+    every_512 = [512, 1024, 1536, 2048, 2560]
+    assert _KEPT[(1, "all_rejected")] == _KEPT[(2, "all_rejected")] == every_512
+
+
+def test_mtp_follow_up_hits_a_decode_keep_and_a_preempted_request_resumes(
+    adapter, tmp_path, monkeypatch
+):
+    """The EngineCore crash the earlier experiment hit (``hashed at 8448 but
+    this step ends at 8447`` after a resume) at this test's scale: a request
+    resumed from a cached image under MTP keeps decoding, with acceptance
+    varying, past its next decode keep. A follow-up over the first request's
+    output resumes at its decode keep (restored state = that boundary), and a
+    preempted request resumes from its own images."""
+    s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=True, num_blocks=96)
+    st = s._atom_state_images
+    st.events = []
+    world = _SpecWorld(s, lambda rid, j: (j * 7 + len(rid)) % 3 != 0, monkeypatch)
+    prompt = list(range(1, 601))
+    a = _request(s, "a", prompt, max_tokens=1500)
+    world.drain()
+    kept_a = [end for kind, rid, end in st.events if kind == "hash" and rid == "a"]
+    decode_a = [p for p in kept_a if p > len(prompt)]
+    assert decode_a, kept_a
+    seen = prompt + list(a.output_token_ids[: decode_a[0] - len(prompt) + 37])
+    _request(s, "b", seen, max_tokens=1300)
+    for _ in range(40):
+        if s.has_requests():
+            world.schedule()
+        if len(world.q) >= 2:
+            world.land()
+        if world.restores:
+            break
+    assert world.restores[0] == ("b", decode_a[0])
+    # Preempt b mid-decode; it resumes from an image and keeps going.
+    for _ in range(400):
+        breq = s.requests.get("b")
+        if breq is not None and breq.num_computed_tokens > decode_a[0] + 700:
+            break
+        world.schedule()
+        if len(world.q) >= 2:
+            world.land()
+    while world.q:
+        world.land()
+    breq = s.requests["b"]
+    s.running.remove(breq)
+    s._preempt_request(breq, time.time())
+    world.drain()
+    assert [r for r in world.restores if r[0] == "b"][1:], world.restores
+    assert world.checked > 0 and not world.published
+    kept_b = [end for kind, rid, end in st.events if kind == "hash" and rid == "b"]
+    assert [p for p in kept_b if p > decode_a[0] + 512], kept_b
