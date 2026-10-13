@@ -82,8 +82,17 @@ class PublicationRegistry:
 
     def add(self, binding):
         for prior in self._bindings:
-            if prior.device == binding.device and _overlaps(
-                prior.destination_range, binding.destination_range
+            # Ring slots may share one device half per name (cudagraphs under
+            # PP); each slot's owner orders its uploads on the compute stream.
+            slot_twin = (
+                prior.name == binding.name
+                and prior.owner is not binding.owner
+                and prior.destination is binding.destination
+            )
+            if (
+                prior.device == binding.device
+                and not slot_twin
+                and _overlaps(prior.destination_range, binding.destination_range)
             ):
                 raise ValueError(
                     f"{binding.name}: destination overlaps registered {prior.name}"

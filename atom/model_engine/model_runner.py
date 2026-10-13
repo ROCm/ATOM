@@ -81,6 +81,7 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.models.utils import IntermediateTensors
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.utils import (
@@ -832,6 +833,12 @@ class ModelRunner:
         )
 
         self._pp_pending_send: list = []
+        # Per-row shape and dtype of each activation a non-first PP stage
+        # receives, noted on its first eager receive; capture sizes the graphs'
+        # receive buffers from it.
+        self._pp_recv_layout: dict[str, tuple[torch.Size, torch.dtype]] | None = None
+        self._pp_graph_inputs: dict[str, torch.Tensor] | None = None
+        self.graph_pp_outputs: dict[tuple[int, int], IntermediateTensors] = {}
         self.tokenID_processor = tokenIDProcessor(
             self,
             self.config.max_num_batched_tokens,
@@ -1514,20 +1521,25 @@ class ModelRunner:
             logger.info("forward_vars ring: 1 slot (staging reuse gated on its H2D)")
             return
 
-        assert self.enforce_eager, (
-            "pipeline_parallel_size > 1 requires eager execution "
-            "(--enforce-eager): the forward_vars ring swaps metadata "
-            "buffers per microbatch, which is incompatible with CUDAGraph replay."
-        )
+        if self._piecewise_cg_active():
+            raise NotImplementedError(
+                "pipeline_parallel_size > 1 runs eagerly or with FULL cudagraphs: "
+                "PIECEWISE replay has no pipeline send/receive path."
+            )
+        # A captured graph reads the device addresses it was recorded with, so
+        # under graphs the slots share each buffer's device half. Every upload
+        # is issued on the compute stream behind the previous forward, which
+        # orders it after that forward's readers just as for device-only state.
+        share_gpu = not self.enforce_eager
 
         def _clone_slot(src: dict) -> dict:
             # CpuGpuBuffers are the per-forward staging buffers, and only their
             # host half can be rewritten while an earlier microbatch's kernels
             # are still reading. Everything else is immutable, unused on the
-            # eager PP path, or device-only, where the stream orders the writing
+            # PP path, or device-only, where the stream orders the writing
             # kernel after those readers.
             return {
-                k: (v.clone() if isinstance(v, CpuGpuBuffer) else v)
+                k: (v.clone(share_gpu=share_gpu) if isinstance(v, CpuGpuBuffer) else v)
                 for k, v in src.items()
             }
 
@@ -3288,6 +3300,11 @@ class ModelRunner:
                     self._pp_recv_aux = intermediate_tensors.tensors.pop(
                         PP_AUX_KEY, None
                     )
+                    if self._pp_recv_layout is None:
+                        self._pp_recv_layout = {
+                            name: (t.shape[1:], t.dtype)
+                            for name, t in intermediate_tensors.tensors.items()
+                        }
                     if self.pp_aux_relay is not None and pp_group.is_last_rank:
                         self.pp_aux_relay.absorb(
                             self._pp_recv_aux, self.drafter._aux_buffers
@@ -3391,7 +3408,16 @@ class ModelRunner:
                     return logits, hidden_states
 
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
+                if self._pp_graph_inputs is not None:
+                    self._recv_pp_graph_inputs(running_tokens)
                 self.graphs[graph_key].replay()
+                if graph_key in self.graph_pp_outputs:
+                    if self._pp_pending_send:
+                        commit_pp_send_work(self._pp_pending_send)
+                    self._pp_pending_send = async_send_intermediate_tensors(
+                        self.graph_pp_outputs[graph_key]
+                    )
+                    return None, None
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -3401,6 +3427,37 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
 
         return logits, hidden_states
+
+    def _recv_pp_graph_inputs(self, rows: int) -> None:
+        """Land the previous stage's activations where this stage's graphs
+        read them. The sender ran the same padded decode, so `rows` match."""
+        received = recv_intermediate_tensors().tensors
+        if received.keys() != self._pp_graph_inputs.keys():
+            raise RuntimeError(
+                f"PP stage received {sorted(received)}, but its graphs were "
+                f"captured reading {sorted(self._pp_graph_inputs)}"
+            )
+        for name, tensor in received.items():
+            if tensor.shape[0] != rows:
+                raise RuntimeError(
+                    f"PP stage received {tensor.shape[0]} rows of {name} for a "
+                    f"graph that replays {rows}"
+                )
+            self._pp_graph_inputs[name][:rows].copy_(tensor)
+
+    def _alloc_pp_graph_inputs(self, max_tokens: int) -> dict[str, torch.Tensor]:
+        """Receive buffers for a non-first stage's graphs, shaped after what
+        the stage received while warming up: the layout depends on where the
+        stage boundary falls (Kimi-K3's AttnRes window is [T, k, H])."""
+        if self._pp_recv_layout is None:
+            raise RuntimeError(
+                "capturing a non-first PP stage needs the previous stage's "
+                "activation layout, which the warmup forward records"
+            )
+        return {
+            name: torch.zeros((max_tokens, *shape), dtype=dtype, device=self.device)
+            for name, (shape, dtype) in self._pp_recv_layout.items()
+        }
 
     def flush_pp_send(self) -> bool:
         """Flush pending PP isend. Returns True for call_func wait_out."""
@@ -4226,8 +4283,40 @@ class ModelRunner:
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = {}
         self.graph_pool = None
         is_tbo = self.config.enable_tbo and isinstance(self.model, UBatchWrapper)
+        pp_group = get_pp_group()
+        self.graph_pp_outputs = {}
+        self._pp_graph_inputs = None
+        if pp_group.world_size > 1:
+            self._setup_pp_shared_indexer()
+            unsupported = [
+                what
+                for what, present in (
+                    (
+                        "speculative decoding",
+                        self.config.speculative_config is not None,
+                    ),
+                    ("TBO", is_tbo),
+                    (
+                        "an IndexShare group split across stages",
+                        self._pp_send_needs_sparse or self._pp_recv_needs_sparse,
+                    ),
+                )
+                if present
+            ]
+            if unsupported:
+                raise NotImplementedError(
+                    "cudagraphs under pipeline parallelism do not carry "
+                    f"{', '.join(unsupported)} yet; run with --enforce-eager"
+                )
+            if not pp_group.is_first_rank:
+                self._pp_graph_inputs = self._alloc_pp_graph_inputs(
+                    max(self.capture_sizes) * full_q_len
+                )
         # TBO graphs don't capture compute_logits, so disable logits_in_graph.
-        self.logits_in_graph = self.world_size == 1 and not is_tbo
+        # Under PP only the last stage holds the LM head.
+        self.logits_in_graph = (
+            self.world_size == 1 and not is_tbo and pp_group.is_last_rank
+        )
 
         # start capture profiler
         self.start_capture_profiler()
@@ -4393,8 +4482,23 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
-                    model_output = self.model(input_ids[:num_tokens], model_positions)
-                    outputs[:num_tokens] = model_output
+                    pp_kwargs = (
+                        {}
+                        if self._pp_graph_inputs is None
+                        else {
+                            "intermediate_tensors": IntermediateTensors(
+                                {
+                                    name: t[:num_tokens]
+                                    for name, t in self._pp_graph_inputs.items()
+                                }
+                            )
+                        }
+                    )
+                    model_output = self.model(
+                        input_ids[:num_tokens], model_positions, **pp_kwargs
+                    )
+                    if pp_group.is_last_rank:
+                        outputs[:num_tokens] = model_output
                     if self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
 
@@ -4453,9 +4557,10 @@ class ModelRunner:
                                 graph, self.graph_pool, stream=capture_ctx.stream
                             ):
                                 model_output = self.model(
-                                    input_ids[:num_tokens], model_positions
+                                    input_ids[:num_tokens], model_positions, **pp_kwargs
                                 )
-                                outputs[:num_tokens] = model_output
+                                if pp_group.is_last_rank:
+                                    outputs[:num_tokens] = model_output
                                 if self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(
                                         outputs[:num_tokens]
@@ -4463,6 +4568,10 @@ class ModelRunner:
                     if self.graph_pool is None:
                         self.graph_pool = graph.pool()
                     self.graphs[(bs, max_q_len)] = graph
+                    if not pp_group.is_last_rank:
+                        # Held, so the pool never hands these rows to a later
+                        # graph; run_model sends them after each replay.
+                        self.graph_pp_outputs[(bs, max_q_len)] = model_output
                     if self.logits_in_graph and ubatch_slices is None:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
                     torch.cuda.synchronize()

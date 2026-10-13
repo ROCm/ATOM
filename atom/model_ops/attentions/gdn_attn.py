@@ -1159,6 +1159,13 @@ class GDNStateMixin(PoolRowsMixin):
             "runtime": mk(runtime),
         }
 
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """A forked decode runs eagerly: `has_state_fork` is read on the host,
+        so a graph captured without a fork would skip the fork's state copy.
+        Only pp>1 lets a fork reach decode."""
+        forks = getattr(batch, "state_fork_srcs", None) or ()
+        return super().step_needs_eager(batch) or any(s >= 0 for s in forks)
+
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         """Fill the index tensors the GDN kernels gather their state through.
 

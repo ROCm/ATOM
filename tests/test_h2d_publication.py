@@ -133,6 +133,25 @@ def test_aliases_rejected_across_owners_but_disjoint_regions_allowed():
     other.bind(d, "right")
 
 
+def test_ring_slots_may_share_a_device_half_under_one_name_only():
+    registry = PublicationRegistry()
+    slot0 = PublicationOwner("cpu", registry=registry)
+    slot1 = PublicationOwner("cpu", registry=registry)
+    a = buffer(16)
+    twin = a.clone(share_gpu=True)
+    assert twin.gpu is a.gpu and twin.cpu.data_ptr() != a.cpu.data_ptr()
+    slot0.bind(a, "a")
+    slot1.bind(twin, "a")
+    renamed = a.clone(share_gpu=True)
+    with pytest.raises(ValueError, match="destination overlaps"):
+        slot1.bind(renamed, "b")
+    narrowed = a.clone(share_gpu=True)
+    narrowed.gpu, narrowed.cpu = a.gpu[:8], narrowed.cpu[:8]
+    third = PublicationOwner("cpu", registry=registry)
+    with pytest.raises(ValueError, match="destination overlaps"):
+        third.bind(narrowed, "a")
+
+
 def test_shared_host_arena_cannot_be_registered_with_independent_reuse_state():
     registry = PublicationRegistry()
     one, two = PublicationOwner("cpu", registry=registry), PublicationOwner(
@@ -441,15 +460,19 @@ def test_wrong_stream_is_rejected_before_any_submission():
 
 
 @gpu
+@pytest.mark.parametrize("graphs", [False, True], ids=["eager", "graphs"])
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_real_runner_and_prefill_builder_share_reuse_and_publication(pp_size):
+def test_real_runner_and_prefill_builder_share_reuse_and_publication(pp_size, graphs):
     from atom.model_engine.model_runner import ModelRunner
     from atom.model_ops.attentions.backends import CommonAttentionBuilder
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
-    runner.config = SimpleNamespace(pipeline_parallel_size=pp_size)
-    runner.enforce_eager = True
+    runner.config = SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        compilation_config=SimpleNamespace(cudagraph_mode=None),
+    )
+    runner.enforce_eager = not graphs
     runner.forward_vars = {
         "input_ids": buffer(16, device="cuda"),
         "decode_src": buffer(16, device="cuda"),
@@ -473,6 +496,12 @@ def test_real_runner_and_prefill_builder_share_reuse_and_publication(pp_size):
     )
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
+    # Under graphs every slot uploads into the one device half a graph reads;
+    # the delayed loop below shows each forward still sees its own values.
+    for slot in runner._fv_ring[1:]:
+        for name, value in slot.items():
+            assert (value.gpu is runner._fv_ring[0][name].gpu) == graphs
+            assert value.cpu.data_ptr() != runner._fv_ring[0][name].cpu.data_ptr()
 
     # Avoid constructing a model, but exercise actual production methods and
     # tensors rather than checking their spelling or number of copy calls.

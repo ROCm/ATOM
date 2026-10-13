@@ -754,22 +754,23 @@ class CpuGpuBuffer:
             return self.cpu.copy_(self.gpu, non_blocking=True)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
 
-    def clone(self) -> "CpuGpuBuffer":
+    def clone(self, *, share_gpu: bool = False) -> "CpuGpuBuffer":
         """Allocate an independent buffer with the same shape/dtype/device and
         copy over the current cpu+gpu contents (preserves one-time inits like
         arange/zeros). Used to build per-in-flight-slot metadata rings so
-        concurrent pipeline microbatches never share a staging buffer."""
-        new = CpuGpuBuffer(
-            *self.cpu.shape,
-            dtype=self.cpu.dtype,
-            device=self.gpu.device,
-            pin_memory=self.cpu.is_pinned(),
-            with_numpy=hasattr(self, "np"),
-            publication_group=self.publication_group,
-            publication_unit=self.publication_unit,
-        )
+        concurrent pipeline microbatches never share a staging buffer.
+
+        `share_gpu` gives the clone its own host half over this buffer's
+        device half, for callers that need one device address per name."""
+        new = object.__new__(CpuGpuBuffer)
+        new._publication = None
+        new.publication_group = self.publication_group
+        new.publication_unit = self.publication_unit
+        new.cpu = torch.empty_like(self.cpu, pin_memory=self.cpu.is_pinned())
         new.cpu.copy_(self.cpu)
-        new.gpu.copy_(self.gpu)
+        new.gpu = self.gpu if share_gpu else self.gpu.clone()
+        if hasattr(self, "np"):
+            new.np = new.cpu.numpy()
         return new
 
 
