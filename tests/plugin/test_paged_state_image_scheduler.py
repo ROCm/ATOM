@@ -328,6 +328,123 @@ def test_auto_fit_max_model_len_leaves_room_for_the_slot_tail(adapter, tmp_path)
     eng.drain()
 
 
+def _native_keeps(n_answer, *, abort_after=None):
+    """Native BlockManager on the same request: a 1-token prompt, ``n_answer``
+    generated tokens (or an abort after ``abort_after`` were delivered), block 256,
+    interval 512, a PAGE (copy) checkpoint. Postprocess as native's scheduler with
+    deferred output (one step late, what vLLM's async scheduling compares to):
+    ``hash_decode_blocks(seq, num_tokens, next_forward_tokens=0 on the last step)``,
+    and an aborted seq skips it."""
+    from conftest import MockConfig  # ATOM tests/conftest.py
+
+    from atom.model_engine.block_manager import BlockManager
+    from atom.model_engine.page_unit_checkpoint import (
+        PagedStateCheckpointCoordinator,
+        PagedStateCheckpointSpec,
+    )
+    from atom.model_engine.sequence import Sequence
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+
+    spec = PagedStateCheckpointSpec(1000, 2600, "fake", image_bytes=2600)
+    cfg = MockConfig(
+        kv_cache_block_size=BLOCK,
+        num_kvcache_blocks=64,
+        enable_prefix_caching=True,
+        max_num_batched_tokens=2048,
+        max_model_len=4096,
+        pool_entries={"state": 4},
+        state_checkpoint_interval_tokens=512,
+        state_checkpoint_demand=True,
+    )
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    coord = bm.paged_state_checkpoints
+    assert isinstance(coord, PagedStateCheckpointCoordinator)
+    keeps = []
+
+    def checkpoint(seq, boundary_blocks, h):
+        keeps.append(int(boundary_blocks) * BLOCK)
+        return PagedStateCheckpointCoordinator.checkpoint(
+            coord, seq, boundary_blocks, h
+        )
+
+    coord.checkpoint = checkpoint
+    seq = Sequence([7], BLOCK, has_per_req_cache=True)
+    bm.allocate(seq, bm.can_allocate(seq))
+    bm.hash_blocks(seq, 1, start_tokens=0)
+    seq.num_cached_tokens = 1
+    for j in range(n_answer):
+        if j == abort_after:
+            break
+        seq.append_token(100 + j)
+        bm.may_append(seq)
+        last = j == n_answer - 1
+        bm.hash_decode_blocks(seq, len(seq), next_forward_tokens=0 if last else 1)
+        seq.num_cached_tokens = len(seq) - 1
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+    bm.deallocate(seq)
+    return keeps
+
+
+def _plugin_keeps_512(s, n_answer, *, abort_after=None, max_steps=3000):
+    """Drive vLLM's async loop; an abort is handled before the oldest in-flight
+    step's output lands, as EngineCore does. Whether 512's image ends up cached."""
+    from vllm.v1.request import RequestStatus
+
+    req = _request(s, "e", [7], max_tokens=n_answer)
+    eng = _Engine(s)
+    for _ in range(max_steps):
+        if "e" not in s.requests:
+            break
+        eng.schedule()
+        if len(eng.q) >= 2:
+            if abort_after is not None and len(req.output_token_ids) == abort_after:
+                s.finish_requests("e", RequestStatus.FINISHED_ABORTED)
+                break
+            eng.land()
+    while eng.q:
+        eng.land()
+    assert "e" not in s.requests
+    return _boundary_cached(s, req, 1)
+
+
+@pytest.mark.parametrize(
+    ("n_answer", "abort_after", "native", "plugin"),
+    [
+        # Natural end on the step whose forward reaches 512, or after it.
+        (512, None, True, True),
+        (520, None, True, True),
+        # Abort after k delivered tokens: the keep exists once the token closing
+        # its block (position 511) has landed, on both sides.
+        (2000, 509, False, False),
+        (2000, 510, False, False),
+        (2000, 511, True, True),
+        (2000, 512, True, True),
+        # Engine scheduling, not placement: max_tokens ends one token short of
+        # the forward that reaches 512. Native's deferred output forwards the
+        # last token once more and keeps 512 there; vLLM schedules no forward
+        # past max_tokens, so that state is never computed for the plugin.
+        (511, None, True, False),
+    ],
+)
+def test_request_end_around_the_decode_keep_matches_native(
+    adapter, tmp_path, n_answer, abort_after, native, plugin
+):
+    """Native keeps a decode checkpoint on a request's last step as well: a PAGE
+    (copy) checkpoint's successor_room is 0, and the scheduler passes
+    next_forward_tokens=0 there. An aborted seq skips the postprocess that would
+    hash and keep. The plugin publishes a pending decode keep exactly when its
+    boundary hash exists, which gives the same decisions."""
+    assert (512 in _native_keeps(n_answer, abort_after=abort_after)) is native
+    s = _scheduler(adapter, tmp_path)
+    assert _plugin_keeps_512(s, n_answer, abort_after=abort_after) is plugin
+
+
 @pytest.mark.parametrize("hash_block", [BLOCK, BLOCK // 2])
 def test_abort_with_a_deferred_decode_keep_frees_the_request(
     adapter, tmp_path, hash_block
