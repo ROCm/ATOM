@@ -11,6 +11,7 @@ the same object hierarchy and skips the vision tower/projector tensors.
 from typing import ClassVar
 
 import torch
+import torch.nn.functional as F
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
@@ -335,6 +336,11 @@ class KimiSparseMoeBlock(nn.Module):
         self.gate.e_score_correction_bias = atom_parameter(
             torch.empty(config.num_experts, dtype=torch.bfloat16)
         )
+        # The tuned bf16 kernel for this skinny GEMM costs ~70 us of host time
+        # per launch for a ~5 us kernel (hipBLASLt: ~11 us host, ~9 us kernel),
+        # and an eager decode step is host-bound, so eager runs take hipBLASLt.
+        # A captured graph replays without the host and keeps the tuned kernel.
+        self._gate_via_linear = get_current_atom_config().enforce_eager
         self.experts = FusedMoE(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_token,
@@ -534,11 +540,16 @@ class KimiSparseMoeBlock(nn.Module):
             return summed, None
         return self.split_moe_forward(hidden_states)
 
+    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._gate_via_linear:
+            return F.linear(hidden_states, self.gate.weight)
+        return self.gate(hidden_states)
+
     def routed_expert_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Routed-expert path only. For the latent MoE this includes the routed
         all-reduce (required before the nonlinear routed_expert_norm); the shared
         branch is handled by the caller."""
-        router_logits = self.gate(hidden_states)
+        router_logits = self.router_logits(hidden_states)
         routed_input = (
             self.routed_expert_down_proj(hidden_states)
             if self.use_latent_moe
@@ -656,7 +667,7 @@ class KimiSparseMoeBlock(nn.Module):
         alt.wait_stream(current)
 
         if self.use_latent_moe:
-            router_logits = self.gate(hidden_states)
+            router_logits = self.router_logits(hidden_states)
             routed_input = self.routed_expert_down_proj(hidden_states)
             routed_output = self.experts(routed_input, router_logits)
         else:
