@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 import struct
 import threading
 import time
@@ -530,6 +531,26 @@ class Scheduler:
     ):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # DP prefill cost balancing, on whenever DP attention runs more than
+        # one rank: every rank estimates the cost of its chunk at the whole
+        # batch budget; the ranks then aim at one cost target, a costlier rank
+        # shrinking its chunk. The costs ride the PrefillDelayer's all_reduce,
+        # so balancing needs the delayer (ATOM_ENABLE_PREFILL_DELAYER).
+        dp_size = getattr(
+            getattr(config, "parallel_config", None), "data_parallel_size", 1
+        )
+        self.cost_balance = (
+            getattr(config, "enable_dp_attention", False) and dp_size > 1
+        )
+        self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
+        self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK
+        self._balance_min_tokens = envs.ATOM_DP_PREFILL_BALANCE_MIN_TOKENS
+        # This tick's prefill cost limit and what admission has spent of it;
+        # see `_prefill_room`.
+        self._tick_cost_limit = math.inf
+        self._tick_cost = 0.0
+        # steps, tokens, own cost, target, steps shrunk
+        self._balance_stats = [0, 0, 0.0, 0.0, 0]
         self.long_prefill_token_threshold = config.long_prefill_token_threshold
         self.max_model_len = config.max_model_len
         self.bos_token_id = config.bos_token_id
@@ -913,6 +934,100 @@ class Scheduler:
         )
         seq.num_cached_tokens = start
 
+    def _chunk_cost(self, start: int, chunk: int) -> float:
+        """Estimated prefill cost of `chunk` new tokens after `start` cached
+        ones: a per-token term plus the context each new token attends."""
+        return chunk * (self._balance_token_weight + start + chunk / 2)
+
+    def _prefill_room(self, batched_tokens: int, start: int) -> int:
+        """New tokens a seq whose chunk starts at `start` may still add this
+        tick: the batch budget, and under cost balancing the cost left to the
+        step's target (largest k with `_chunk_cost(start, k)` <= what is left),
+        but never below the balancing floor of `_balance_min_tokens`."""
+        cap_room = self.max_num_batched_tokens - batched_tokens
+        if self._tick_cost_limit == math.inf:
+            return max(cap_room, 0)
+        left = self._tick_cost_limit - self._tick_cost
+        room = 0
+        if left > 0:
+            a = self._balance_token_weight + start
+            room = int(math.sqrt(a * a + 2.0 * left) - a)
+        room = max(room, self._balance_min_tokens - batched_tokens)
+        return max(min(room, cap_room), 0)
+
+    def _estimate_prefill_chunk_cost(self) -> float:
+        """Cost of the chunk this rank would prefill with the whole batch
+        budget: resumable partials first, then the head of `waiting`, probing
+        the prefix cache without recording (`can_allocate(record=False)`). An
+        estimate -- the real admission may park or skip some of these seqs."""
+        token_cap = self.max_num_batched_tokens
+        tokens, cost = 0, 0.0
+        if self._partial_prefill_count > 0:
+            for seq in self.running:
+                if not seq.is_partial_prefill:
+                    continue
+                remaining = seq.num_tokens - seq.num_cached_tokens
+                if 0 < self.long_prefill_token_threshold < remaining:
+                    remaining = self.long_prefill_token_threshold
+                k = min(remaining, token_cap - tokens)
+                if k <= 0:
+                    return cost
+                cost += self._chunk_cost(seq.num_cached_tokens, k)
+                tokens += k
+        for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
+            if tokens >= token_cap:
+                break
+            if self._is_offload_prefill_resume(seq):
+                start = seq.num_cached_tokens
+            else:
+                # Runs on every tick with prefill work, holds included: keep
+                # the head's prompt-block hashes instead of rehashing its
+                # cached prefix each time.
+                cached_blocks = self.block_manager.can_allocate(
+                    seq, record=False, reuse_hashes=True
+                )
+                if cached_blocks < 0:
+                    break
+                start = cached_blocks * self.block_manager.hash_block_size
+            k = min(self._new_prefill_tokens(seq, start), token_cap - tokens)
+            if k > 0:
+                cost += self._chunk_cost(start, k)
+                tokens += k
+        return cost
+
+    def _balance_prefill_step(self, own: float) -> None:
+        """Set this prefill step's cost target from every DP rank's chunk cost.
+
+        The costs rode the delayer's all_reduce this tick (`own` is this rank's,
+        0 when it estimated none), so every rank sees the same list. The target
+        is the costliest chunk, lowered to `1 + slack` times the mean over the
+        ranks that prefill: a rank above it shrinks its chunk. No rank
+        reporting a cost means no rank has prefill work: nothing to balance."""
+        costs = [c for c in self.prefill_delayer.rank_prefill_costs if c > 0]
+        if not costs:
+            return
+        target = min(max(costs), sum(costs) / len(costs) * (1 + self._balance_slack))
+        self._tick_cost_limit = target
+        st = self._balance_stats
+        st[0] += 1
+        st[2] += own
+        st[3] += target
+        st[4] += own > target
+
+    def _log_prefill_balance(self, tokens: int) -> None:
+        st = self._balance_stats
+        st[1] += tokens
+        if st[0] and st[0] % 50 == 0:
+            logger.info(
+                "prefill cost balance: steps=%d mean_tokens=%.0f "
+                "own/target cost=%.3f shrunk=%d (cap %d tokens)",
+                st[0],
+                st[1] / st[0],
+                st[2] / st[3] if st[3] else 0.0,
+                st[4],
+                self.max_num_batched_tokens,
+            )
+
     def _partial_prefill_chunk(
         self, seq: Sequence, start: int, resume: int, batched_tokens: int
     ) -> int:
@@ -924,7 +1039,7 @@ class Scheduler:
         if 0 < self.long_prefill_token_threshold < seq.num_tokens - resume:
             remaining = self.long_prefill_token_threshold + resume - start
         chunk = self._chunked_prefill_size(
-            remaining, self.max_num_batched_tokens - batched_tokens, batched_tokens
+            remaining, self._prefill_room(batched_tokens, start), batched_tokens
         )
         return chunk if start + chunk > resume else 0
 
@@ -1607,6 +1722,11 @@ class Scheduler:
         scheduled_seqs = {}
         num_seqs_prefill = 0
         num_batched_tokens = 0
+        # Before anything sizes a chunk this tick: the local coalescer's
+        # pending-work probe (`_partial_prefill_chunk`) runs ahead of the
+        # balancing decision and must not see the previous step's cost limit.
+        self._tick_cost_limit = math.inf
+        self._tick_cost = 0.0
         skipped_waiting_requests: deque[Sequence] = deque()
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
@@ -1652,6 +1772,16 @@ class Scheduler:
                     + self._partial_prefill_remaining_tokens(),
                     self.max_num_batched_tokens,
                 )
+            # DP prefill cost balancing: this rank's chunk cost rides the same
+            # all_reduce, estimated only when this rank has prefill work. Not
+            # skipped inside the decode-protection window: whether the delayer
+            # holds there depends on every rank's decode load, known only after
+            # the reduce (with no decode anywhere it fires through that window).
+            prefill_cost = (
+                self._estimate_prefill_chunk_cost()
+                if self.cost_balance and prefillable
+                else 0.0
+            )
             delayer_allows = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -1667,9 +1797,14 @@ class Scheduler:
                     and self.prefill_delayer.max_queue_ms is not None
                     else 0.0
                 ),
+                prefill_cost=prefill_cost,
             )
         else:
             delayer_allows = True
+            prefill_cost = 0.0
+
+        if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
+            self._balance_prefill_step(prefill_cost)
 
         # Rejections may still need an empty batch to dispatch connector cleanup.
         if not self.running and not self.waiting and not self._rejected:
@@ -1697,6 +1832,7 @@ class Scheduler:
                     chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 if chunk <= 0:
                     break
+                self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
                 num_batched_tokens += chunk
                 num_seqs_prefill += 1
                 seq.type = SequenceType.PREFILL
@@ -1712,6 +1848,7 @@ class Scheduler:
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
+            and self._tick_cost < self._tick_cost_limit
         ):
             if prefix_waiters:
                 if prefix_bypass_left == 0:
@@ -1817,7 +1954,7 @@ class Scheduler:
                     seq, seq.num_cached_tokens, hit=False
                 )
                 num_new_tokens = seq.num_tokens - start
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+                budget_remaining = self._prefill_room(num_batched_tokens, start)
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens, budget_remaining, num_batched_tokens
                 )
@@ -1898,7 +2035,7 @@ class Scheduler:
                 prefix_waiters.append(seq)
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
-            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            budget_remaining = self._prefill_room(num_batched_tokens, start)
             chunk = self._prefill_chunk_for_budget(
                 num_new_tokens, budget_remaining, num_batched_tokens
             )
@@ -2097,6 +2234,8 @@ class Scheduler:
                 )
 
         total_tokens_num_prefill = sum(num_scheduled_tokens)
+        if self._tick_cost_limit < math.inf:
+            self._log_prefill_balance(total_tokens_num_prefill)
 
         if num_seqs_prefill > 0:
             # A cursor, not a hit count: it starts at the prefix-cache hit and
@@ -2791,6 +2930,7 @@ class Scheduler:
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
         self._record_cache_reuse(seq)
+        self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
         num_batched_tokens += chunk
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.PREFILL
