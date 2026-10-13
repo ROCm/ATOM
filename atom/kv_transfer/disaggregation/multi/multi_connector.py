@@ -363,38 +363,27 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return True
         return False
 
-    def _subs_with(self, name: str) -> list:
-        return [
-            getattr(c, name)
-            for c in self._connectors
-            if callable(getattr(c, name, None))
-        ]
+    def _sub_methods(self, name: str) -> list:
+        """Bound `name` of every sub-connector that implements it."""
+        methods = (getattr(c, name, None) for c in self._connectors)
+        return [m for m in methods if callable(m)]
 
-    def tier_lookup_skippable(self, seq: Any, hbm_tokens: int) -> bool:
-        """True only if every sub with a tier lookup may skip it. Pure."""
-        checks = self._subs_with("tier_lookup_skippable")
-        return bool(checks) and all(fn(seq, hbm_tokens) for fn in checks)
+    def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """True only if every sub-connector with a tier lookup can detach it."""
+        checks = self._sub_methods("can_detach_lookup")
+        return bool(checks) and all(check(seq, num_hbm_tokens) for check in checks)
 
-    def commit_tier_lookup_skip(self, seq: Any, hbm_tokens: int) -> bool:
-        """Commit the skip on every sub, after `tier_lookup_skippable` agreed.
+    def detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        """Detach the lookup on every sub-connector.
 
-        Every sub is asked, not just until the first refusal: the decision
-        was already unanimous, and each sub that commits has sent and released
-        its own lookup.
+        Called after `can_detach_lookup` agreed, so every sub-connector is
+        asked rather than stopping at the first refusal.
         """
-        committed = True
-        for fn in self._subs_with("commit_tier_lookup_skip"):
-            committed = bool(fn(seq, hbm_tokens)) and committed
-        return committed
-
-    def tier_lookup_cannot_load(self, seq: Any, hbm_tokens: int) -> bool:
-        """True only if every sub with a tier lookup says it cannot load."""
-        checks = [
-            getattr(c, "tier_lookup_cannot_load", None)
-            for c in self._connectors
-            if callable(getattr(c, "tier_lookup_cannot_load", None))
+        results = [
+            bool(detach(seq, num_hbm_tokens))
+            for detach in self._sub_methods("detach_lookup")
         ]
-        return bool(checks) and all(bool(fn(seq, hbm_tokens)) for fn in checks)
+        return all(results)
 
     def prefetch_lookups(self, seqs: Any) -> None:
         """Let each sub send its external-tier lookups ahead of admission."""

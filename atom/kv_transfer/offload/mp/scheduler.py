@@ -229,15 +229,15 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self._end_finished_sessions()
 
     def has_pending_work(self) -> bool:
-        """Also keep polling while a session or a discarded lookup is due.
+        """Also report pending session ends and unreleased discarded lookups.
 
-        A fire-and-forget lookup can outlive its request; if that was the last
-        request, nothing else would step the connector, the lookup would never
-        be pumped and its session never ended. Both are bounded: an orphan is
-        given up after `_ORPHAN_TIMEOUT_S` (locks left to the read TTL), and a
-        session waits only on its saves and that lookup.
+        A detached lookup can outlive its request. If no other request is
+        running, nothing else steps the connector, so without this the lookup
+        is never pumped and its session never ends. Both are bounded: a
+        discarded lookup is given up after `_ORPHAN_TIMEOUT_S`, and a session
+        waits only for its saves and its lookup.
         """
-        orphans = getattr(self._lookup_client, "has_unreleased_orphans", None)
+        orphans = getattr(self._lookup_client, "has_orphans", None)
         return (
             super().has_pending_work()
             or bool(self._pending_session_ends())
@@ -253,26 +253,23 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self.__dict__.setdefault("_sessions_to_end", {})
 
     def _end_finished_sessions(self) -> None:
-        """End each finished request's session once nothing of it can follow.
+        """End each finished request's session once no save or lookup remains.
 
-        Nothing means no save, and no lookup still in flight. A lookup sent
-        without being waited on (`commit_tier_lookup_skip`) can outlive its request:
-        if `end_session` drops the server session first, the eventual
-        `free_lookup_locks` recreates an empty one, finds no prefetch record,
-        and releases only the full-attention groups -- the state groups'
-        read locks then pin their L1 objects until the read TTL, and L1 can
-        no longer evict. So pump the lookups first, and keep the session
-        until its lookup answered and released its locks.
+        A detached lookup (`detach_lookup`) can outlive its request. If
+        `end_session` ran first, the later `free_lookup_locks` would find no
+        prefetch record in a recreated session and release only the
+        full-attention groups; the state groups' read locks would pin their
+        L1 objects until the read TTL. So the session ends only after its
+        lookup has answered and released its locks.
         """
-        # Pumped every pass, not only when a session is due: an answered
-        # fire-and-forget lookup frees its read locks here, and the request
-        # that sent it may stay in flight for its whole transfer while the
-        # waiting queue -- which drives `prefetch_lookups` -- is empty.
+        # Pumped on every pass: a detached lookup must be released even while
+        # its request is still transferring and the waiting queue, which
+        # drives `prefetch_lookups`, is empty.
         client = self._lookup_client
         pump = getattr(client, "pump", None)
         if callable(pump):
             pump()
-        self.apply_discarded_lookup_hits()
+        self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
         in_flight = getattr(client, "is_pending", None)
         for sid, seq in list(pending.items()):

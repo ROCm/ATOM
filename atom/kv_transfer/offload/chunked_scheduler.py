@@ -160,6 +160,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._handoff_loads: set[str] = set()
         self._block_manager = None
         self._lookup_defer_since: dict[str, float] = {}
+        # Admitted requests whose detached lookup has not answered yet.
+        self._detached_lookups: dict[str, object] = {}
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -283,41 +285,35 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._perf_bump("lookup_prefetched")
         self._perf_bump("prefetch_us", int((time.perf_counter() - t0) * 1e6))
 
-    def tier_lookup_cannot_load(self, seq, hbm_tokens: int) -> bool:
-        """Whether no tier answer could make this request load anything.
+    def _load_ruled_out(self, seq, num_hbm_tokens: int) -> bool:
+        """Whether no tier answer could make `seq` load anything.
 
-        Every load path compares the tier hit against the post-allocation HBM
-        frontier and refuses below `_min_load_tokens`
-        (`_decide_load_after_alloc`: `need = lmc - hbm < min_load` is
-        "too_small"; the unaligned handoff demands as much again past its
-        boundary; subclasses only add refusals). A tier hit never exceeds the
-        prompt, so `num_tokens - hbm < min_load` bounds every possible `need`
-        below the threshold: whatever the lookup returns, nothing is loaded.
-
-        The threshold is this connector's own, so the skip and the load
-        decision cannot drift apart.
+        Every load path compares the tier hit with the post-allocation HBM
+        prefix and refuses a load shorter than `_min_load_tokens`
+        (`_decide_load_after_alloc`; the unaligned handoff only adds
+        refusals). A tier hit never exceeds the prompt, so when the uncached
+        tail is already below the threshold, no answer can produce a load.
+        Using the connector's own threshold keeps this check and the load
+        decision consistent.
         """
         if not self._do_load or self._lookup_client is None:
             return False
-        gap = int(seq.num_tokens) - max(0, int(hbm_tokens))
-        return gap < int(getattr(self, "_min_load_tokens", 8192))
+        uncached = int(seq.num_tokens) - max(0, int(num_hbm_tokens))
+        return uncached < int(getattr(self, "_min_load_tokens", 8192))
 
-    def tier_lookup_skippable(self, seq, hbm_tokens: int) -> bool:
-        """Whether admission may skip waiting for this request's tier lookup.
+    def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
+        """Whether admission may proceed without waiting for `seq`'s lookup.
 
-        Pure: nothing is sent, discarded or recorded, so the scheduler can ask
-        before its admission checks and commit only once the request is in
-        (`commit_tier_lookup_skip`).
-
-        Requires, besides `tier_lookup_cannot_load`:
-        - nothing armed this lifecycle -- a pending load or a consumed lookup
-          is finished by the ordinary path;
-        - an asynchronous lookup that is, or can be, tracked. The skip keeps
-          the lookup's side effects (L1 recency, the session `end_session`
-          touches) by sending it fire-and-forget; a client that can only look
-          up synchronously keeps the ordinary path instead.
+        Side-effect free, so the scheduler can ask before its admission checks
+        and call `detach_lookup` only once the request is admitted. Requires:
+        - `_load_ruled_out`: the answer cannot change what is loaded;
+        - no load or consumed lookup in this lifecycle, which the ordinary
+          path finishes;
+        - an asynchronous lookup that is in flight or can be sent. A detached
+          lookup is still sent, for its side effects (L1 recency and the MP
+          session); a client that only looks up synchronously cannot do that.
         """
-        if not self.tier_lookup_cannot_load(seq, hbm_tokens):
+        if not self._load_ruled_out(seq, num_hbm_tokens):
             return False
         sid = str(seq.id)
         if (
@@ -330,104 +326,106 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         pending_ids = getattr(client, "pending_ids", None)
         if callable(pending_ids) and sid in pending_ids():
             return True
-        can_submit = getattr(client, "can_submit", None)
-        return bool(callable(can_submit) and can_submit() and self._lookup_len(seq) > 0)
+        supports_async = getattr(client, "supports_async", None)
+        return (
+            callable(supports_async)
+            and bool(supports_async())
+            and self._lookup_len(seq) > 0
+        )
 
-    def commit_tier_lookup_skip(self, seq, hbm_tokens: int) -> bool:
-        """Admit `seq` past its lookup: keep the lookup, drop its answer.
+    def detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
+        """Admit `seq` without its lookup's answer; keep the lookup itself.
 
-        Called once the request is admitted, after `tier_lookup_skippable`.
-        Sends the lookup if no prefetch did; on LMCache MP it is what refreshes
-        the prefix's L1 recency and opens the session whose `end_session`
-        touches every chunk of the request. Its answer is discarded and its
-        read locks freed when it arrives. The save floor comes from the HBM
-        prefix, which an earlier request computed and saved.
+        Called after the request is admitted. Sends the lookup unless a
+        prefetch already did: on LMCache MP the lookup refreshes the prefix's
+        L1 recency and opens the session whose end touches every chunk of the
+        request. The client releases the answer's read locks when it arrives
+        and reports the hit to `reconcile_detached_lookups`.
 
-        False -- nothing changed -- if the lookup could not be tracked after
-        all; the caller then has a request with no tier lookup, which costs
-        only the LRU refresh, never a load (`tier_lookup_cannot_load`).
+        The save floor starts at the HBM prefix and is corrected by
+        `reconcile_detached_lookups`.
+
+        Returns False, changing nothing, when the lookup cannot be tracked;
+        the request then runs without a tier lookup, which loses only the LRU
+        refresh (`_load_ruled_out` already excludes a load).
         """
-        if not self.tier_lookup_skippable(seq, hbm_tokens):
+        if not self.can_detach_lookup(seq, num_hbm_tokens):
             return False
         sid = str(seq.id)
         client = self._lookup_client
         if sid not in client.pending_ids():
             if not client.submit(self._lookup_token_ids(seq), sid):
                 return False
-            self._perf_bump("lookup_fire_and_forget")
-        # Registered before `discard`, which may release an already-answered
-        # lookup at once.
-        self._skipped_lookup_seqs()[sid] = seq
+            self._perf_bump("lookup_detached_sent")
+        # Registered before `discard`, which releases an answered lookup at once.
+        self._detached_lookups[sid] = seq
         client.discard(sid)
         self._lookup_defer_since.pop(sid, None)
         self._forget_tier_hit(sid)
-        floor = self._chunk_floor(max(0, int(hbm_tokens)))
+        floor = self._chunk_floor(max(0, int(num_hbm_tokens)))
         if floor > 0:
             self._hit_save_floors[sid] = floor
-        self._perf_bump("lookup_skipped_hbm")
+        self._perf_bump("lookup_detached")
         return True
 
-    def _skipped_lookup_seqs(self) -> dict:
-        """Requests whose discarded lookup has not answered yet."""
-        return self.__dict__.setdefault("_skipped_lookups", {})
+    def reconcile_detached_lookups(self) -> None:
+        """Correct detached requests' save floors from their lookups' outcome.
 
-    def apply_discarded_lookup_hits(self) -> None:
-        """Lower a skipped request's save floor to what the tier holds.
+        HBM residency does not prove the tier still holds the prefix: LMCache
+        evicts independently, and because it matches contiguously from
+        position 0, one missing chunk hides every later one. So:
+        - an answered lookup lowers the floor to the tier's contiguous hit,
+          and the chunks above it are saved again;
+        - a lookup that ended without an answer (failed or timed out) gives
+          no information, so the floor drops to 0.
 
-        The skip seeds the floor from the HBM prefix, but HBM residency is no
-        proof the tier still holds that prefix: LMCache evicts on its own, and
-        a chunk it dropped while HBM kept it would never be stored again --
-        and the tier matches contiguously from position 0, so one hole hides
-        every later chunk once HBM evicts its copy too. When the discarded
-        lookup answers, its hit is the tier's real contiguous prefix; any
-        chunk between it and the floor is saved again on the next pass.
-
-        Best-effort: the answer normally lands long before the request ends
-        (~1.7 s lookup vs. prefill + transfer + save). If the request finishes
-        first, its tracker is gone and this request saves nothing more; the
-        next request reaching the prefix repairs the hole with its own answer.
+        Best-effort: if the request finishes before its lookup answers, it
+        saves nothing more, and the next request on the prefix repairs the
+        gap with its own lookup.
         """
-        take = getattr(self._lookup_client, "take_discarded_hits", None)
-        if not callable(take):
+        client = self._lookup_client
+        pop_hits = getattr(client, "pop_discarded_hits", None)
+        if not callable(pop_hits):
             return
-        pending = self._skipped_lookup_seqs()
         try:
-            hits = take()
+            hits = pop_hits()
         except Exception:
             logger.warning(
                 "LMCache: reading discarded lookup hits failed", exc_info=True
             )
             hits = {}
+        detached = self._detached_lookups
         for sid, hit in hits.items():
-            seq = pending.pop(sid, None)
-            if seq is None:
-                continue
-            tier = self._chunk_floor(max(0, int(hit)))
-            floor = self._hit_save_floors.get(sid)
-            if floor is not None and tier < floor:
-                self._hit_save_floors[sid] = tier
-            entry = self._save_tracker.get(sid)
-            if entry is not None and entry[0] is seq and tier < int(entry[1]):
-                entry[1] = tier
-                self._perf_bump("lookup_skip_floor_lowered")
-        # A lookup that left without an answer (failed, or given up after the
-        # orphan timeout) says nothing about what the tier holds, so the
-        # HBM-seeded floor is no longer trusted: drop it to 0 and save the
-        # prefix again. Answered lookups were handled above.
-        pending_ids = getattr(self._lookup_client, "pending_ids", None)
+            seq = detached.pop(sid, None)
+            if seq is not None and self._lower_save_floor(
+                sid, seq, self._chunk_floor(max(0, int(hit)))
+            ):
+                self._perf_bump("detached_floor_lowered")
+
+        pending_ids = getattr(client, "pending_ids", None)
         in_flight = pending_ids() if callable(pending_ids) else ()
-        for sid in list(pending):
-            seq = pending[sid]
-            entry = self._save_tracker.get(sid)
+        for sid, seq in list(detached.items()):
             if sid not in in_flight:
-                if sid in self._hit_save_floors:
-                    self._hit_save_floors[sid] = 0
-                if entry is not None and entry[0] is seq:
-                    entry[1] = 0
-                    self._perf_bump("lookup_skip_floor_reset")
-                del pending[sid]
-            elif entry is None or entry[0] is not seq:
-                del pending[sid]
+                del detached[sid]
+                if self._lower_save_floor(sid, seq, 0):
+                    self._perf_bump("detached_floor_reset")
+            elif not self._is_tracked(sid, seq):
+                # Finished while its lookup is in flight: nothing left to fix.
+                del detached[sid]
+
+    def _is_tracked(self, sid: str, seq) -> bool:
+        entry = self._save_tracker.get(sid)
+        return entry is not None and entry[0] is seq
+
+    def _lower_save_floor(self, sid: str, seq, tokens: int) -> bool:
+        """Lower `sid`'s save floor to `tokens`; True if its tracker moved."""
+        floor = self._hit_save_floors.get(sid)
+        if floor is not None and tokens < floor:
+            self._hit_save_floors[sid] = tokens
+        if self._is_tracked(sid, seq) and tokens < int(self._save_tracker[sid][1]):
+            self._save_tracker[sid][1] = tokens
+            return True
+        return False
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.

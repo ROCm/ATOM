@@ -75,7 +75,7 @@ class _MPLookupClient:
         self._status_retries: dict[str, int] = {}
         # When each discarded lookup became an orphan (monotonic seconds).
         self._orphan_since: dict[str, float] = {}
-        # Hits of discarded (fire-and-forget) lookups, drained by the scheduler.
+        # Hits of discarded lookups, drained by `pop_discarded_hits`.
         self._discarded_hits: dict[str, int] = {}
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter
@@ -131,7 +131,7 @@ class _MPLookupClient:
         self._async_tokens[lookup_id] = token_ids
         return True
 
-    def can_submit(self) -> bool:
+    def supports_async(self) -> bool:
         """Whether `submit` can send a lookup without waiting for it."""
         return self._async_supported
 
@@ -187,28 +187,21 @@ class _MPLookupClient:
             try:
                 answered = self._advance(lookup_id)
             except Exception:
-                if self._retry_orphan_status(lookup_id):
+                if self._requery_orphan_status(lookup_id):
                     continue
                 phase = self._drop_failed(lookup_id)
                 logger.warning(_ASYNC_LOOKUP_FAILED, lookup_id, phase, exc_info=True)
                 if lookup_id in self._orphans:
-                    # Nobody will consume or retry it: forget it entirely.
+                    # Nobody will consume or retry it.
                     self._forget_orphan(lookup_id)
                 continue
-            if answered and lookup_id in self._orphans:
-                self._status_retries.pop(lookup_id, None)
+            if lookup_id not in self._orphans:
+                continue
+            if answered:
                 self._orphans.discard(lookup_id)
-                self._release_unconsumed_guarded(lookup_id)
-            elif (
-                not answered
-                and lookup_id in self._orphans
-                # Stamped on first sight, whatever orphaned it: a `lookup()`
-                # timeout orphans without a stamp, and recomputing the default
-                # every pump would never let it expire.
-                and time.monotonic()
-                - self._orphan_since.setdefault(lookup_id, time.monotonic())
-                > _ORPHAN_TIMEOUT_S
-            ):
+                self._status_retries.pop(lookup_id, None)
+                self._try_release_unconsumed(lookup_id)
+            elif self._orphan_expired(lookup_id):
                 logger.warning(
                     "LMCache MP: discarded lookup %s unanswered after %.0fs; "
                     "leaving its read locks to the read TTL",
@@ -218,10 +211,19 @@ class _MPLookupClient:
                 self._drop_failed(lookup_id)
                 self._forget_orphan(lookup_id)
 
-    def _retry_orphan_status(self, lookup_id: str) -> bool:
+    def _orphan_expired(self, lookup_id: str) -> bool:
+        """Whether a discarded lookup has waited past `_ORPHAN_TIMEOUT_S`.
+
+        The clock starts on first sight when `discard` did not start it: a
+        `lookup()` timeout orphans a lookup without a timestamp.
+        """
+        now = time.monotonic()
+        return now - self._orphan_since.setdefault(lookup_id, now) > _ORPHAN_TIMEOUT_S
+
+    def _requery_orphan_status(self, lookup_id: str) -> bool:
         """Re-query a discarded lookup whose status query failed.
 
-        A fire-and-forget lookup has no consumer to ask again. Once the server
+        A discarded lookup has no consumer to ask again. Once the server
         acked it ("status" phase) it may hold read locks, and only an answered
         status lets them be released exactly -- releasing by range with the
         hit unknown could drop locks other requests hold on shared objects.
@@ -263,7 +265,7 @@ class _MPLookupClient:
         entry = self._async.pop(lookup_id, None)
         return entry[2] if entry is not None else None
 
-    def has_unreleased_orphans(self) -> bool:
+    def has_orphans(self) -> bool:
         """Whether a discarded lookup still has to answer and free its locks."""
         return bool(self._orphans)
 
@@ -274,7 +276,7 @@ class _MPLookupClient:
         self._async_tokens.pop(lookup_id, None)
         self._async_hits.pop(lookup_id, None)
 
-    def _release_unconsumed_guarded(self, lookup_id: str) -> None:
+    def _try_release_unconsumed(self, lookup_id: str) -> None:
         """`_release_unconsumed` that never raises into the scheduler loop.
 
         A failed release leaves the locks to the session end / read TTL, the
@@ -299,7 +301,7 @@ class _MPLookupClient:
         token_ids = self._async_tokens.pop(lookup_id, None)
         if hit is not None:
             # Its answer is not consumed as a hit, but the scheduler still
-            # needs it as a save floor (`take_discarded_hits`).
+            # needs it as a save floor (`pop_discarded_hits`).
             self._discarded_hits[lookup_id] = int(hit)
         if hit and token_ids is not None:
             self._adapter.free_lookup_locks(
@@ -307,7 +309,7 @@ class _MPLookupClient:
             )
         self._adapter.cleanup_lookup_result(request_id)
 
-    def take_discarded_hits(self) -> dict[str, int]:
+    def pop_discarded_hits(self) -> dict[str, int]:
         """Tier hits of discarded lookups answered since the last call."""
         hits, self._discarded_hits = self._discarded_hits, {}
         return hits
@@ -321,7 +323,7 @@ class _MPLookupClient:
             self._orphan_since.setdefault(lookup_id, time.monotonic())
             return
         if lookup_id in self._async_tokens:
-            self._release_unconsumed_guarded(lookup_id)
+            self._try_release_unconsumed(lookup_id)
 
     def lookup(self, token_ids: list[int], lookup_id: str) -> int | None:
         """Hit length for this prompt, or None if the tier never answered.

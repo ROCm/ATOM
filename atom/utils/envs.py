@@ -1035,10 +1035,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
-    # Do not hold a prefill out of admission for an external-tier lookup that
-    # cannot load anything: the HBM prefix leaves fewer than
-    # OFFLOAD_MIN_LOAD_TOKENS uncached, which every load path refuses. The
-    # lookup is still sent (it refreshes the tier's LRU) and its answer dropped.
+    # Admit a prefill without waiting for its external-tier lookup when the HBM
+    # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
+    # could be loaded. The lookup is still sent to refresh the tier's LRU.
     "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT": lambda: _flag_env(
         "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT"
     ),
