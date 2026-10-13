@@ -103,7 +103,7 @@ class StateOffloadTier:
             oldest = min(self._store_submitted_at.values())
         return max(0.0, monotonic() - oldest)
 
-    def submit_store(self, op, unit_ids) -> None:
+    def submit_store(self, op, unit_ids, producer_event=None) -> None:
         """Pack the checkpoint image in `unit_ids` for LMCache, under `op`.
 
         `op` is a `StateStoreOperationId`; the bytes are keyed by
@@ -111,14 +111,15 @@ class StateOffloadTier:
         two attempts at one prefix write the same entry but settle their own
         pins.
 
-        No `ready_event`: the units are reserved out of the KV pool and pinned
-        by the engine for the length of this transfer, so nothing on the compute
-        stream is writing them and the packer gathers straight from where they
-        sit.
+        `producer_event` orders the gather after the checkpoint copy that
+        filled the units; see `KimiK3OffloadConnector._start_state_stores`.
+        The engine's pin keeps anything *later* from writing them.
         """
         with self._lock:
             self._store_submitted_at[op] = monotonic()
-        self._register(self._store_executor.submit(self._do_store, op, unit_ids))
+        self._register(
+            self._store_executor.submit(self._do_store, op, unit_ids, producer_event)
+        )
 
     def submit_load(self, req_id: str, h: int, slot: int) -> None:
         """Fetch `h` into pool slot `slot` for the parked request `req_id`.
@@ -150,7 +151,7 @@ class StateOffloadTier:
         self._load_executor.shutdown(wait=True)
         self._store_executor.shutdown(wait=True)
 
-    def _do_store(self, op, unit_ids) -> None:
+    def _do_store(self, op, unit_ids, producer_event=None) -> None:
         stored = False
         released = False
 
@@ -175,6 +176,7 @@ class StateOffloadTier:
                         int(op.prefix_hash),
                         unit_ids,
                         on_source_released=_source_released,
+                        producer_event=producer_event,
                     )
                 )
         except Exception:  # deliberately blind
