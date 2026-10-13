@@ -270,11 +270,30 @@ class _MPLookupClient:
         return bool(self._orphans)
 
     def _forget_orphan(self, lookup_id: str) -> None:
+        """Drop every record of a discarded lookup that failed or timed out.
+
+        Includes the adapter's pending/result entry, which `submit` checks:
+        left behind, it would leak and block a reused request ID. The read
+        locks themselves are left to the read TTL, as in
+        `clear_lookup_status`.
+        """
         self._orphans.discard(lookup_id)
         self._orphan_since.pop(lookup_id, None)
         self._status_retries.pop(lookup_id, None)
         self._async_tokens.pop(lookup_id, None)
         self._async_hits.pop(lookup_id, None)
+        self._try_cleanup_lookup_result(lookup_id)
+
+    def _try_cleanup_lookup_result(self, lookup_id: str) -> None:
+        """Clear the adapter's entry for `lookup_id`; never raises."""
+        try:
+            self._adapter.cleanup_lookup_result(_mp_session_id(self._config, lookup_id))
+        except Exception:
+            logger.warning(
+                "LMCache MP: cleaning up discarded lookup %s failed",
+                lookup_id,
+                exc_info=True,
+            )
 
     def _try_release_unconsumed(self, lookup_id: str) -> None:
         """`_release_unconsumed` that never raises into the scheduler loop.
@@ -294,6 +313,8 @@ class _MPLookupClient:
             )
             self._async_tokens.pop(lookup_id, None)
             self._async_hits.pop(lookup_id, None)
+            # `free_lookup_locks` may have raised before the cleanup ran.
+            self._try_cleanup_lookup_result(lookup_id)
 
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)

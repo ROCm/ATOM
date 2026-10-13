@@ -396,8 +396,10 @@ def test_release_failure_does_not_escape_into_scheduling(monkeypatch):
         raise RuntimeError("adapter down")
 
     adapter.free_lookup_locks = broken
+    assert _adapter_holds(client, adapter)
     assert sched.detach_lookup(seq, 60)  # discard releases at once
     assert "7" not in client.pending_ids()
+    assert not _adapter_holds(client, adapter)  # cleaned despite the failure
 
 
 def test_engine_keeps_polling_until_a_discarded_lookup_is_released(monkeypatch):
@@ -413,13 +415,26 @@ def test_engine_keeps_polling_until_a_discarded_lookup_is_released(monkeypatch):
     assert not sched.has_pending_work()
 
 
+def _adapter_holds(client, adapter, lookup_id="7"):
+    rid = mp_lookup._mp_session_id(client._config, lookup_id)
+    return rid in adapter._pending_lookups or rid in adapter._lookup_results
+
+
 def test_an_unanswered_orphan_is_given_up_after_its_timeout(monkeypatch):
-    sched, client, _adapter = _scheduler(monkeypatch, lookup_done=False)
-    sched.detach_lookup(_seq(), 60)
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=True)
+    pending_future = type(adapter._client.lookup_future)
+    # Acked by the server, but the status never answers.
+    adapter._client.query_prefetch_status = lambda _rid: pending_future(None, False)
+    seq = _seq()
+    sched.detach_lookup(seq, 60)
+    client.pump()  # lookup phase done: the adapter now tracks the ID
+    assert _adapter_holds(client, adapter)
     client._orphan_since["7"] -= mp_lookup._ORPHAN_TIMEOUT_S + 1
     client.pump()
     assert not client.has_orphans()
     assert not client.is_pending("7")
+    assert not _adapter_holds(client, adapter)  # no leak
+    assert client.submit(list(range(seq.num_tokens)), "7")  # ID reusable
 
 
 def test_a_failing_requery_is_retried_up_to_the_bound(monkeypatch):
@@ -442,6 +457,7 @@ def test_a_failing_requery_is_retried_up_to_the_bound(monkeypatch):
     client.pump()  # bound reached
     assert not client.is_pending("7")
     assert not client.has_orphans()
+    assert not _adapter_holds(client, adapter)
 
 
 def test_an_unanswerable_lookup_resets_the_save_floor(monkeypatch):
