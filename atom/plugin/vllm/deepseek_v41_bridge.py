@@ -1038,53 +1038,6 @@ def snapshot_v41_batch(common_attn_metadata):
     # order the batch protocol documents.
     ends_preview = (num_computed + query_lens).astype(np.int64)
     if input_batch is not None:
-<<<<<<< HEAD
-        # Two acquisitions, two `try`s, because they fail independently and
-        # only one of them matters. `req_ids` is the slot key; losing it means
-        # slots are keyed on first-block ids, which works for everything inside
-        # the forward and for nothing outside it. `block_table_np` is only a
-        # faster path to rows that `common_attn_metadata` also carries, and it
-        # is read from a different attribute on every runner generation
-        # (`block_table` on V1, `block_tables` on V2).
-        #
-        # They shared one `try` until vLLM 0.31: V2's `InputBatch` has no
-        # `block_table`, so the AttributeError it raised discarded the
-        # perfectly good `req_ids` fetched on the line above, and the snapshot
-        # fell back. Nothing reported it -- the fallback key is a working slot
-        # key -- and the KV-transfer leg, which names requests the way vLLM
-        # does, then missed every lookup and stored nothing.
-        try:
-            req_ids = list(input_batch.req_ids)[:num_reqs]
-        except Exception as exc:  # noqa: BLE001
-            if not _V41_SNAPSHOT_FALLBACK_LOGGED:
-                globals()["_V41_SNAPSHOT_FALLBACK_LOGGED"] = True
-                logger.warning(
-                    "DeepSeek-V4.1: the batch carries no usable req_ids "
-                    "(%s: %s); slot keys fall back to first-block ids, which "
-                    "nothing outside the forward can match.",
-                    type(exc).__name__,
-                    exc,
-                )
-            req_ids = None
-        for attr in ("block_table", "block_tables"):
-            table = getattr(input_batch, attr, None)
-            if table is None:
-                continue
-            try:
-                block_table_np = table[0].block_table.np
-            except Exception:  # noqa: BLE001
-                block_table_np = None
-            if block_table_np is not None:
-                break
-        if req_ids is not None:
-            # Gated on the key, not on the block table, and outside any
-            # `except`: a row divergence is not a missing accessor. Falling
-            # back on it would key state slots on first-block ids -- `-1` for
-            # every block-less row, so two such requests share one slot --
-            # which is the wrong output this check exists to name. It has to
-            # reach the caller.
-            _check_row_alignment(input_batch, num_computed, query_lens, num_reqs)
-=======
         # Two separate acquisitions, because the two live on different
         # runners. The V2 `InputBatch` has `req_ids` and no block table at
         # all; reading both under one `try` meant its perfectly good request
@@ -1109,7 +1062,6 @@ def snapshot_v41_batch(common_attn_metadata):
             # slot by one request and the position by another, which is wrong
             # output rather than a crash, so it has to reach the caller.
             _check_row_alignment(input_batch, num_computed, num_reqs)
->>>>>>> origin/perzhang/dsv41-flash-vllm-plugin-nolmcache
     if block_table_np is None:
         # Only the columns this step reads. The whole table was being copied
         # and then sliced per request; its width is the pool's, not this

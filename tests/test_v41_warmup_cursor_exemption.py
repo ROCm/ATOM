@@ -15,9 +15,15 @@ class _Cache:
     _report_stale_state = v41_cache.PagedAttentionCache._report_stale_state
 
 
-def _check(ids, starts, cursors):
+def _check(ids, starts, cursors, fresh=None):
+    """`fresh` is the row filter the contract uses; all-False means every row
+    is a resuming one, which is what these cases are about."""
     arr = np.asarray([[c, 0] for c in cursors], dtype=np.int64)
-    _Cache()._report_stale_state(arr, np.asarray(starts, dtype=np.int64), ids)
+    if fresh is None:
+        fresh = np.zeros(len(ids), dtype=bool)
+    _Cache()._report_stale_state(
+        arr, np.asarray(starts, dtype=np.int64), ids, fresh
+    )
 
 
 def test_a_real_request_with_a_stale_cursor_still_raises():

@@ -424,31 +424,28 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
-<<<<<<< HEAD
 
-    def _restore_stale_rows(self, cursors, starts, ids, step, count):
+    def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
         """Give a checkpoint-image restore a chance before the contract judges.
 
-        Here, and not anywhere the caller could put it, because this is the
-        only point between the slot being assigned and its cursor being
-        judged. Placed after the reset above, a restore cannot be undone by
-        it; placed before `_report_stale_state`, it is checked by it.
+        The only point between a slot being assigned and its cursor being
+        judged. Placed after the reset, a restore cannot be undone by it;
+        placed before `_report_stale_state`, it is checked by it -- a
+        row-order mistake hands over somebody else's state, and the contract
+        catches exactly that, because the restored cursor then does not equal
+        the position wanted. A wrong restore is a loud death, not a wrong
+        answer.
 
-        That checking is the whole safety argument. The restore picks a block
-        out of vLLM's table for this request's row, and a row-order mistake
-        would hand it somebody else's state -- which is exactly what the
-        contract catches, because the restored cursor then does not equal the
-        position wanted. A wrong restore is a loud death, not a wrong answer.
-
-        Only the rows that would otherwise raise are touched. Restoring every
+        Only the rows that would otherwise raise are touched: restoring every
         row every step overwrites live state with an image nothing has
-        written yet: measured as a request's second prefill chunk arriving at
-        `computed=4096` with `cursor=0`, its first chunk erased.
+        written, measured as a prefill chunk arriving at `computed=4096` with
+        `cursor=0`. The filter is `~fresh`, the same one the contract uses,
+        so the two cannot drift apart.
         """
         hook = _IMAGE_RESTORE_HOOK
         if hook is None:
             return cursors
-        wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
             return cursors
         rows = [
@@ -469,10 +466,7 @@ class PagedAttentionCache:
             torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
         )
 
-    def _report_stale_state(self, cursors, starts, requests):
-=======
     def _report_stale_state(self, cursors, starts, requests, fresh):
->>>>>>> origin/perzhang/dsv41-flash-vllm-plugin-nolmcache
         """Raise on the first request whose state is not where it is wanted.
 
         Fresh requests are excluded: the slot they are about to reuse holds
@@ -557,6 +551,9 @@ class PagedAttentionCache:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
+            cursors = self._restore_stale_rows(
+                cursors, wanted, ids, fresh, step, count
+            )
             self._report_stale_state(cursors, wanted, ids, fresh)
         else:
             # Issued before the reset below, so a recycled slot is captured as
@@ -592,11 +589,6 @@ class PagedAttentionCache:
             if step.tentative:
                 self.pending = TentativeState(self, step)
             return None
-<<<<<<< HEAD
-        cursors = self._restore_stale_rows(cursors, starts, ids, step, count)
-        self._report_stale_state(cursors, starts, ids)
-=======
->>>>>>> origin/perzhang/dsv41-flash-vllm-plugin-nolmcache
         if step.tentative:
             self.pending = TentativeState(self, step, cursors[:, 1:])
         return cursors[:, 1:]

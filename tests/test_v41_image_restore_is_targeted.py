@@ -46,8 +46,10 @@ def test_only_the_stale_rows_are_offered():
     v41_cache.install_image_restore_hook(lambda rows: seen.append(rows) or 0)
     step = _Step([_Req("a", 7), _Req("b", 9), _Req("c", 11)])
     # row 0 is where it should be, row 1 is fresh, row 2 is stale.
+    # row 1 is fresh; rows 0 and 2 are resuming, and only row 2 is stale.
     _Cache()._restore_stale_rows(
-        _cursors(4096, 0, 0), np.asarray([4096, 0, 2048]), ["a", "b", "c"], step, 3
+        _cursors(4096, 0, 0), np.asarray([4096, 0, 2048]), ["a", "b", "c"],
+        np.asarray([False, True, False]), step, 3
     )
     assert seen == [[(11, 2048, 2)]]
 
@@ -57,7 +59,7 @@ def test_a_batch_with_nothing_stale_never_calls_the_hook():
     v41_cache.install_image_restore_hook(lambda rows: called.append(rows) or 1)
     step = _Step([_Req("a", 7)])
     _Cache()._restore_stale_rows(
-        _cursors(4096), np.asarray([4096]), ["a"], step, 1
+        _cursors(4096), np.asarray([4096]), ["a"], np.asarray([False]), step, 1
     )
     assert called == []
 
@@ -70,7 +72,7 @@ def test_a_hook_that_raises_leaves_the_cursors_alone_and_counts():
     before = v41_cache.restore_failures()
     step = _Step([_Req("a", 7)])
     out = _Cache()._restore_stale_rows(
-        _cursors(0), np.asarray([2048]), ["a"], step, 1
+        _cursors(0), np.asarray([2048]), ["a"], np.asarray([False]), step, 1
     )
     assert out[0, 0] == 0
     assert v41_cache.restore_failures() == before + 1
@@ -81,6 +83,6 @@ def test_a_hook_that_restores_nothing_does_not_trigger_a_reread():
     v41_cache.install_image_restore_hook(lambda rows: 0)
     step = _Step([_Req("a", 7)])
     out = _Cache()._restore_stale_rows(
-        _cursors(0), np.asarray([2048]), ["a"], step, 1
+        _cursors(0), np.asarray([2048]), ["a"], np.asarray([False]), step, 1
     )
     assert out[0, 0] == 0
