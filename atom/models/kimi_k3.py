@@ -45,6 +45,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
+    use_gfx1250_mxfp4_preshuffle_triton,
     use_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
@@ -406,7 +407,9 @@ class KimiSparseMoeBlock(nn.Module):
             # shuffled/non-shuffled scale layout, so keep those on their existing
             # standalone quant path until the fused kernel supports both layouts.
             fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
-                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
+                use_triton_gemm()
+                or use_fp4_non_shuffle_triton_gemm()
+                or use_gfx1250_mxfp4_preshuffle_triton(up_proj_quant_dtype)
             )
             self.fuse_routed_norm_quant = latent_moe_use_norm and (
                 (
