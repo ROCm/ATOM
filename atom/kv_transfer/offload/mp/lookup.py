@@ -202,8 +202,11 @@ class _MPLookupClient:
             elif (
                 not answered
                 and lookup_id in self._orphans
+                # Stamped on first sight, whatever orphaned it: a `lookup()`
+                # timeout orphans without a stamp, and recomputing the default
+                # every pump would never let it expire.
                 and time.monotonic()
-                - self._orphan_since.get(lookup_id, time.monotonic())
+                - self._orphan_since.setdefault(lookup_id, time.monotonic())
                 > _ORPHAN_TIMEOUT_S
             ):
                 logger.warning(

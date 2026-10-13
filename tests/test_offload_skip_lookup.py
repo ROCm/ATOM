@@ -453,3 +453,17 @@ def test_an_unanswerable_lookup_resets_the_save_floor(monkeypatch):
     sched._end_finished_sessions()  # pump gives it up, then the floor resets
     assert entry[1] == 0
     assert sched._skipped_lookup_seqs() == {}
+
+
+def test_an_unstamped_orphan_still_times_out(monkeypatch):
+    """`lookup()` timeouts orphan without a stamp; it must still expire."""
+    sched, client, _adapter = _scheduler(monkeypatch, lookup_done=False)
+    seq = _seq()
+    sched.prefetch_lookups([seq])
+    client._orphans.add("7")  # as lookup()'s timeout path does
+    assert "7" not in client._orphan_since
+    client.pump()  # first sight: stamped, not expired
+    assert client.has_unreleased_orphans()
+    client._orphan_since["7"] -= mp_lookup._ORPHAN_TIMEOUT_S + 1
+    client.pump()
+    assert not client.has_unreleased_orphans()
