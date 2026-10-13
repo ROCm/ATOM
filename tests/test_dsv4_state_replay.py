@@ -323,10 +323,10 @@ def test_a_readmission_decides_afresh():
     assert not seq.replays_hit
 
 
-def test_a_replay_demands_a_checkpoint_at_its_hit():
-    """The replay keeps this admission's reuse; a checkpoint at the hit, where
-    the replay has rebuilt the state whole, keeps the next branch there from
-    paying the replay again."""
+def test_a_replayed_hit_demands_no_checkpoint():
+    """The replay bounds what the missing checkpoint costs; a demand would cut
+    every replay admission at the hit for a branch there that may not come.
+    Such a branch replays again."""
     bm = _bm(state_checkpoint_demand=True)
     # A branch: 32 tokens shared, then a tail of its own, so the first prompt's
     # own end anchors nothing a later prompt reaches.
@@ -336,12 +336,12 @@ def test_a_replay_demands_a_checkpoint_at_its_hit():
     seq = _seq(40)
     assert bm.allocate(seq, bm.can_allocate(seq))
     assert seq.replays_hit
-    assert seq.checkpoint_demand_pos == 32
-    assert _prefill_with_cuts(bm, seq) == [32, 36]  # the demand, then the anchor
+    assert seq.checkpoint_demand_pos == 0 and bm.demands_recorded == 0
+    assert _prefill_with_cuts(bm, seq) == [36]  # the prompt-end anchor only
     bm.deallocate(seq)
     branch = Sequence(list(range(100, 132)) + [777] * 8, BLOCK, has_per_req_cache=True)
     assert bm.can_allocate(branch) == 8
-    assert not branch.replays_hit
+    assert branch.replays_hit
 
 
 def test_a_resent_prompt_replays_once():
@@ -464,3 +464,17 @@ def test_a_replay_past_the_prompt_demands_nothing():
     assert seq.replays_hit
     assert seq.checkpoint_demand_pos == 0
     assert bm.demands_recorded == 0
+
+
+def test_a_replay_reports_its_hit_from_where_its_forward_starts():
+    """The rows a replay recomputes are not served from the cache."""
+    engine, seq = _engine_with_a_replayed_head(budget=64)
+    stats = engine.engine_stats
+    cached, wanted = stats.total_cached_tokens, stats.total_wanted_tokens
+    engine.schedule()
+    assert seq.replays_hit
+    assert seq.prefix_cache_hit_tokens == 32 - REPLAY
+    # In the cache stats the replayed rows are reuse lost for want of a
+    # checkpoint: wanted (the hit) minus cached (where the forward starts).
+    assert stats.total_cached_tokens - cached == 32 - REPLAY
+    assert stats.total_wanted_tokens - wanted == 32

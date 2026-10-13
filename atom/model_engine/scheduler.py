@@ -2220,6 +2220,10 @@ class Scheduler:
                 self.block_manager.replay_start(seq, seq.num_cached_tokens, hit=True),
                 hit=True,
             )
+            if seq.replays_hit:
+                # A DeepSeek-V4 bounded replay recomputes the rows below its
+                # hit: they are not served from the cache.
+                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
@@ -2980,8 +2984,15 @@ class Scheduler:
             # making `wanted - cached` negative. `seq.num_cached_tokens` is
             # deliberately NOT clamped: the forward must skip what was loaded.
             wanted_tokens = seq.num_wanted_hit_blocks * hbs
-            # where it resumed, not where a replaying forward starts below it
-            cached_tokens = max(seq.num_cached_tokens, seq.replay_until)
+            # Where it resumed, not where a replaying forward starts below it
+            # -- unless it is a DeepSeek-V4 bounded replay, standing in for a
+            # checkpoint the gates found missing: the rows it recomputes are
+            # reuse lost for want of one (`wanted - cached`), not a hit.
+            cached_tokens = (
+                seq.num_cached_tokens
+                if seq.replays_hit
+                else max(seq.num_cached_tokens, seq.replay_until)
+            )
             hbm_cached_tokens = min(cached_tokens, wanted_tokens)
             offload_tokens = cached_tokens - hbm_cached_tokens
             self.engine_stats.update_cache(

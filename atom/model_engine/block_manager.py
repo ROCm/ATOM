@@ -902,9 +902,10 @@ class BlockManager:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
         `record=False` returns the same fit and HBM hit without committing
-        joint-load fields or joint-boundary counters. Checkpoint demand/end
-        and hit instrumentation still refresh; demand counters deduplicate per
-        request. An optional `block_hashes` output
+        joint-load fields or joint-boundary counters. Checkpoint demand/end,
+        hit instrumentation and `Sequence.replays_hit` (whether the hit it
+        returns replays, which `replay_start` reads for it) still refresh;
+        demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
 
@@ -1910,14 +1911,13 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
-        # A replayed hit (`_replay_hit`) reaches `wanted` already, and its
-        # forward may be cut at the hit but nowhere below it
-        # (`scheduler._cut_floor`): a demand below would be counted and never
-        # filled, and so would one at a hit past the prompt (a preempted seq
-        # re-prefilling what it generated), where prefill keeps nothing. One
-        # at the hit keeps the next branch there from replaying.
-        hit_tokens = compressed_hit * self.hash_block_size
-        if seq.replays_hit and (demand < hit_tokens or demand >= seq.num_prompt_tokens):
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
             demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
