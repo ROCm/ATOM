@@ -140,9 +140,28 @@ def test_generic_layer_imports_no_model_code():
             "atom.model_engine.page_unit_checkpoint",
             "atom.plugin.vllm.paged_state_image",
             "atom.plugin.vllm.req_id_passthrough_patch",
+            "atom.utils",
         )
         atom_mods = [m for m in mods if m.startswith("atom")]
         assert all(m.startswith(allowed) for m in atom_mods), (name, atom_mods)
+
+
+def test_image_env_vars_are_registered_and_documented():
+    from atom.utils import envs
+
+    doc = (Path(__file__).parents[2] / "docs/environment_variables.md").read_text()
+    names = (
+        "ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS",
+        "ATOM_STATE_CHECKPOINT_DEMAND",
+        "ATOM_STATE_IMAGE_CHECK_BLOCKS",
+        "ATOM_V4_CG_INSTR_DIR",
+    )
+    assert [n for n in names if n not in envs.environment_variables] == []
+    assert [n for n in names if f"**{n}**" not in doc] == []
+    # Every ATOM_* the image layer and the V4 cudagraph patch read is registered.
+    for name in ("paged_state_image.py", "paged_state_image_scheduler.py"):
+        src = (PLUGIN / name).read_text()
+        assert "os.environ" not in src and "os.getenv" not in src, name
 
 
 def test_registry_routes_by_config_and_by_kv_config(fake):

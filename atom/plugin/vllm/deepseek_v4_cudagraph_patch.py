@@ -40,6 +40,8 @@ import logging
 import os
 import threading
 
+from atom.utils import envs as _envs
+
 logger = logging.getLogger("atom")
 
 BREAKABLE_ENV = "VLLM_USE_BREAKABLE_CUDAGRAPH"
@@ -135,7 +137,7 @@ def apply_vllm_v4_breakable_cudagraph_opt_out() -> bool:
 
 # Test-only dispatch counters, one JSON file per process; off unless set.
 # Written on every step: an exit hook would not survive a killed worker.
-_INSTR_DIR = os.environ.get("ATOM_V4_CG_INSTR_DIR") or None
+_INSTR_DIR = _envs.ATOM_V4_CG_INSTR_DIR
 
 
 def _new_counters() -> dict:
