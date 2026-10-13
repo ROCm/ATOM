@@ -413,71 +413,74 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
-    # Qwen3.8 Flash-Next BF16 HyperConnection decode specialization. The
-    # model checks gfx950, exact geometry and token count before dispatch.
-    "ATOM_QWEN38_MONO_HC": lambda: os.getenv("ATOM_QWEN38_MONO_HC", "0") == "1",
+    # Qwen3.8 Flash-Next small-batch decode fusions below (all except
+    # ATOM_QWEN38_QSA_CP) default on; set one to 0 to fall back to the
+    # unfused path. Each checks its own arch/geometry/layout before dispatch.
+    # BF16 HyperConnection decode specialization. The model checks gfx950,
+    # exact geometry and token count before dispatch.
+    "ATOM_QWEN38_MONO_HC": lambda: os.getenv("ATOM_QWEN38_MONO_HC", "1") == "1",
     # Served HC mix at 3-48 decode rows in two MFMA launches (hc_mfma.py);
     # takes precedence over ATOM_QWEN38_MONO_HC's mix_fused at those rows.
-    "ATOM_QWEN38_HC_MFMA": lambda: os.getenv("ATOM_QWEN38_HC_MFMA", "0") == "1",
+    "ATOM_QWEN38_HC_MFMA": lambda: os.getenv("ATOM_QWEN38_HC_MFMA", "1") == "1",
     # Quantize the BF16 shared expert to the routed experts' block FP8 at load
     # and run it as expert 512 inside the fused MoE: one MoE launch instead of
     # MoE + gemm/act/gemm/sigmoid-mul. Lossy (the checkpoint ships it BF16).
     "ATOM_QWEN38_FP8_SHARED_EXPERT": lambda: os.getenv(
-        "ATOM_QWEN38_FP8_SHARED_EXPERT", "0"
+        "ATOM_QWEN38_FP8_SHARED_EXPERT", "1"
     )
     == "1",
     # ReplaySSM's serial verify loop computes the GDN gate (g, beta) from
     # A_log/a/b/dt_bias itself on pure speculative-decode steps, replacing the
     # separate fused_gdn_gating launch with the same arithmetic.
     "ATOM_GDN_REPLAYSSM_FUSED_GATE": lambda: os.getenv(
-        "ATOM_GDN_REPLAYSSM_FUSED_GATE", "0"
+        "ATOM_GDN_REPLAYSSM_FUSED_GATE", "1"
     )
     == "1",
     # Qwen MoE routing (renormalized softmax top-k, plus the fused shared
     # expert's sigmoid weight) in one Triton tl.topk launch instead of AITER's
     # topk_softmax. Same experts; weights differ by float rounding.
-    "ATOM_QWEN38_TRITON_ROUTER": lambda: os.getenv("ATOM_QWEN38_TRITON_ROUTER", "0")
+    "ATOM_QWEN38_TRITON_ROUTER": lambda: os.getenv("ATOM_QWEN38_TRITON_ROUTER", "1")
     == "1",
     # Decode MoE over at most 64 rows with fused shared expert and EP: Triton
     # kernels that group pairs by expert without a sort and stream the FP8
     # experts with BF16 activations, instead of AITER's sort + quant + asm MoE.
     "ATOM_QWEN38_SMALL_BATCH_MOE": lambda: (
-        os.getenv("ATOM_QWEN38_SMALL_BATCH_MOE", "0") == "1"
+        os.getenv("ATOM_QWEN38_SMALL_BATCH_MOE", "1") == "1"
     ),
     # With ATOM_QWEN38_SMALL_BATCH_MOE and ATOM_QWEN38_TRITON_ROUTER, the
     # router also files each local (token, slot) pair under its expert and
     # lists the expert blocks, replacing the small-batch MoE's plan launch.
     # Bitwise identical to the plan path.
     "ATOM_QWEN38_MOE_ROUTER_BUCKETS": lambda: (
-        os.getenv("ATOM_QWEN38_MOE_ROUTER_BUCKETS", "0") == "1"
+        os.getenv("ATOM_QWEN38_MOE_ROUTER_BUCKETS", "1") == "1"
     ),
     # One Triton launch for the QSA indexer's decode cache preparation: index
     # Q norm and mRoPE, raw K and position stores, group pooling, compressed
     # K norm, mRoPE and store (nine launches). Bitwise identical.
     "ATOM_QWEN38_QSA_FUSED_INDEX": lambda: (
-        os.getenv("ATOM_QWEN38_QSA_FUSED_INDEX", "0") == "1"
+        os.getenv("ATOM_QWEN38_QSA_FUSED_INDEX", "1") == "1"
     ),
     # One Triton launch for QSA attention's decode Q/K norm, mRoPE and KV
     # cache write (three launches). Bitwise identical.
     "ATOM_QWEN38_QSA_FUSED_QK": lambda: (
-        os.getenv("ATOM_QWEN38_QSA_FUSED_QK", "0") == "1"
+        os.getenv("ATOM_QWEN38_QSA_FUSED_QK", "1") == "1"
     ),
     # Build the MTP draft layer like a target layer: deferred (fused) HC
     # combines and, with ATOM_QWEN38_FP8_SHARED_EXPERT, its shared expert
     # quantized to block FP8 and fused into the MoE. Only the draft's numerics
     # change, so only the acceptance rate can move.
     "ATOM_QWEN38_FUSED_MTP_LAYER": lambda: (
-        os.getenv("ATOM_QWEN38_FUSED_MTP_LAYER", "0") == "1"
+        os.getenv("ATOM_QWEN38_FUSED_MTP_LAYER", "1") == "1"
     ),
     # Compute-only QSA index context partition over TP2/TP4. The K/V cache and
     # sparse attention remain TP-owned; only compressed-key scoring is split.
     "ATOM_QWEN38_QSA_CP": lambda: os.getenv("ATOM_QWEN38_QSA_CP", "0") == "1",
     # Gfx950 decode: when every visible QSA group fits the 2048-token budget,
     # emit all logical token ids directly in one FlyDSL launch.
-    "ATOM_QWEN38_QSA_SHORT": lambda: os.getenv("ATOM_QWEN38_QSA_SHORT", "0") == "1",
+    "ATOM_QWEN38_QSA_SHORT": lambda: os.getenv("ATOM_QWEN38_QSA_SHORT", "1") == "1",
     # Join the main QKV and index Q/K block-FP8 projections for 4/8/16-row
     # gfx950 decode. Both branches read the same activation and quantization.
-    "ATOM_QWEN38_QSA_FUSED_PROJ": lambda: os.getenv("ATOM_QWEN38_QSA_FUSED_PROJ", "0")
+    "ATOM_QWEN38_QSA_FUSED_PROJ": lambda: os.getenv("ATOM_QWEN38_QSA_FUSED_PROJ", "1")
     == "1",
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
@@ -766,7 +769,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens from the LM head instead of all-gathering [tokens, vocab] logits.
     # Token-identical; skipped whenever a step needs logprobs.
     "ATOM_GREEDY_ARGMAX_HEAD": lambda: (
-        os.getenv("ATOM_GREEDY_ARGMAX_HEAD", "0") == "1"
+        os.getenv("ATOM_GREEDY_ARGMAX_HEAD", "1") == "1"
     ),
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other

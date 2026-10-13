@@ -13,15 +13,10 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
-def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
-    quant_config,
-    shared_expert_prefix: Optional[str] = None,
-    routed_expert_prefix: Optional[str] = None,
-) -> bool:
+def shared_expert_fusion_parallel_ok() -> bool:
+    """Whether the parallel layout allows shared-expert fusion at all,
+    regardless of the shared and routed experts' quantization."""
     config = get_current_atom_config()
-    if quant_config is None:
-        quant_config = config.quant_config
-
     dp_size = config.parallel_config.data_parallel_size
     # Shared-expert fusion is incompatible with the flattened DP x TP MoE-EP
     # layout (set by the vLLM plugin under DP+EP); disable it there.
@@ -37,12 +32,23 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         and not envs.ATOM_DISABLE_MORI_EP
         and _has_module("mori")
     )
-    if (
+    return not (
         dp_size > 1
         and mori_selected
         and config.enable_dp_attention
         and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
-    ):
+    )
+
+
+def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+    quant_config,
+    shared_expert_prefix: Optional[str] = None,
+    routed_expert_prefix: Optional[str] = None,
+) -> bool:
+    config = get_current_atom_config()
+    if quant_config is None:
+        quant_config = config.quant_config
+    if not shared_expert_fusion_parallel_ok():
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:

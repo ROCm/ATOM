@@ -34,6 +34,7 @@ from atom.model_ops.qwen4_exp.qsa_attention import (
 )
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+    shared_expert_fusion_parallel_ok,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import Qwen3NextMLP, mamba_v2_sharded_weight_loader
@@ -90,12 +91,15 @@ class _Qwen4ExpQuantizationConfig:
         shared = _MAIN_SHARED_EXPERT
         if envs.ATOM_QWEN38_FUSED_MTP_LAYER and _MTP_SHARED_EXPERT.search(layer_name):
             shared = _MTP_SHARED_EXPERT
-        if envs.ATOM_QWEN38_FP8_SHARED_EXPERT and any(
-            shared.search(name) for name in names
+        if (
+            envs.ATOM_QWEN38_FP8_SHARED_EXPERT
+            and any(shared.search(name) for name in names)
+            and shared_expert_fusion_parallel_ok()
         ):
             # Quantized at load into the routed experts' format; MTP's own
             # `mtp.layers.*` shared expert keeps the checkpoint's BF16 unless
-            # ATOM_QWEN38_FUSED_MTP_LAYER fuses it too.
+            # ATOM_QWEN38_FUSED_MTP_LAYER fuses it too. A layout that cannot
+            # fuse keeps the BF16 shared expert as a standalone MLP.
             return self.get_layer_quant_config(
                 shared.sub(r"\1experts", layer_name),
                 use_online_quant,
@@ -337,12 +341,13 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             envs.ATOM_QWEN38_FP8_SHARED_EXPERT
             and fuse_shared_expert
             and not self.fuse_shared
+            and shared_expert_fusion_parallel_ok()
         ):
-            # The quant config now calls the shared expert FP8, so a standalone
-            # one would be an FP8 linear fed the checkpoint's BF16 weights.
+            # The quant config calls the shared expert FP8 wherever the layout
+            # can fuse, so a standalone one would be an FP8 linear fed the
+            # checkpoint's BF16 weights.
             raise ValueError(
-                "ATOM_QWEN38_FP8_SHARED_EXPERT needs shared-expert fusion, which "
-                "this parallel configuration disables"
+                "ATOM_QWEN38_FP8_SHARED_EXPERT expected shared-expert fusion"
             )
         if self.tp_size > self.n_routed_experts:
             raise ValueError(

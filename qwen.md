@@ -83,47 +83,21 @@ used the PR's model loader because the older checkout cannot recognize
 `qwen4_exp_text` at TP4 on this host. Request scheduling caused noticeable
 run-to-run variation.
 
-### TP4 MTP2 completed-answer follow-up
+### TP4 MTP2 decode launch reductions
 
 The same four MI355X GPUs (0–3) served the local FP8 checkpoint sequentially
 with TP4+EP4, CUDA graphs, `--method mtp --num-speculative-tokens 2`, an
-8,192-token maximum context, and 16 maximum sequences. The flags-off and
-flags-on servers both used this PR's loader: the pre-PR checkout fails at
-startup with `Unrecognized model identifier: qwen4_exp_text` at TP4. The
-flags-on server set `ATOM_QWEN38_MONO_HC=1`, `ATOM_QWEN38_QSA_SHORT=1`, and
-`ATOM_QWEN38_QSA_FUSED_PROJ=1`; QSA index CP was off on both sides. Each
-request generated the correct visible integer list 1–200, used 891 completion
-tokens, and ended with `stop`. The server reported 100% MTP2 draft acceptance
-on this predictable workload. Client-wall-time throughput includes prefill
-and HTTP response time:
+8,192-token maximum context, and 16 maximum sequences. Each request generated
+the visible integer list 1–200 (891 completion tokens, ending with `stop`),
+with 100% MTP2 draft acceptance on this predictable workload. Client-wall-time
+throughput includes prefill and HTTP response time.
 
-| Concurrent requests | PR flags off | PR flags on | Ratio |
-| ---: | ---: | ---: | ---: |
-| 4 | 920.48 | 937.81 | 1.019× |
-| 8 | 1,800.15 | 1,809.75 | 1.005× |
-| 16 | 3,242.45 | 3,254.49 | 1.004× |
-
-The four- and eight-request figures are five-run medians after one warmup.
-At 16 requests, the first flags-off five-run set was unstable: its run rates
-ranged from 364.83 to 3,084.84 tokens/s, with a 39-second stall in one run.
-The table therefore uses a second, seven-run set for **both** variants; their
-run ranges were 2,768.07–3,312.08 and 2,827.73–3,300.84 tokens/s. A
-separate synchronized 16-request arithmetic check with MTP2 and thinking
-disabled returned correct final answers on 16/16 requests with each server.
-These small throughput differences are within the observed run variation and
-do not establish a meaningful TP4 service gain. The prompt stays below the
-2,048-token short-QSA threshold; this probe does not measure 128k/256k
-checkpoint generation. Raw runs are in
-`/tmp/qwen38-tp4-mtp2-{off,on}-{completed,b16-repeat}.jsonl`.
-
-### TP4 MTP2 decode launch reductions
-
-The flags above barely moved this workload because its decode step is not
-bound by any one large kernel. A bs8 MTP2 step (24 rows) ran about 980
-launches on one stream with no idle gaps, and most of them were small kernels
-costing 4–6 µs each. The step was GPU-bound, and kernel count set its length.
-The follow-up work therefore removed launches. Every change is behind a flag
-and off by default:
+A bs8 MTP2 step (24 rows) ran about 980 launches on one stream with no idle
+gaps, and most of them were small kernels costing 4–6 µs each. The step was
+GPU-bound, and kernel count set its length, so this work removed launches.
+Together with `ATOM_QWEN38_MONO_HC`, `ATOM_QWEN38_QSA_SHORT` and
+`ATOM_QWEN38_QSA_FUSED_PROJ`, every flag below is on by default; set one to
+0 to fall back to the unfused path:
 
 | Flag | Replaces | Exact? |
 | :--- | :--- | :--- |
@@ -143,9 +117,8 @@ they replace in `tests/model_ops/test_qwen38_decode_fusions.py`. That covers
 12/24/48/64 rows, padded slots, offset mRoPE, and pooled groups that span
 cached and in-step tokens.
 
-The same GPUs (0–3) and server shape as above were used, with `MONO_HC`,
-short QSA, fused projection and every flag in the table on. These are
-five-run medians after one warmup:
+These are five-run medians after one warmup; the baseline sets every flag
+to 0:
 
 | Concurrent requests | PR flags off | All flags on | Ratio |
 | ---: | ---: | ---: | ---: |

@@ -219,3 +219,48 @@ def test_router_buckets_match_planned_moe(tokens):
         assert torch.equal(run(buckets), planned)
     finally:
         topK.aiter_topK_meta_data = saved
+
+
+@pytest.mark.parametrize("seqs,steps", [(4, 3), (8, 3), (16, 2)])
+def test_replayssm_fused_gate_matches_gdn_gating(seqs, steps):
+    from atom.model_ops.attention_gdn import fused_gdn_gating
+    from atom.model_ops.fla_ops.replayssm import (
+        fused_gate_supported,
+        replayssm_buffer_shapes,
+        replayssm_gated_delta_rule,
+    )
+
+    torch.manual_seed(seqs * 10 + steps)
+    heads, v_heads, dim, cache_len = 4, 8, 128, 16
+    tokens = seqs * steps
+    assert fused_gate_supported("auto", steps)
+    q = torch.randn(1, tokens, heads, dim, device=DEV).bfloat16()
+    k = torch.randn(1, tokens, heads, dim, device=DEV).bfloat16()
+    v = torch.randn(1, tokens, v_heads, dim, device=DEV).bfloat16()
+    a = torch.randn(tokens, v_heads, device=DEV).bfloat16()
+    b = torch.randn(tokens, v_heads, device=DEV).bfloat16()
+    A_log = torch.randn(v_heads, device=DEV)
+    dt_bias = torch.randn(v_heads, device=DEV)
+    shapes = replayssm_buffer_shapes(cache_len, v_heads, dim, dim, False)
+    state = (
+        torch.randn(seqs, v_heads, dim, dim, device=DEV) * 0.1,
+        *(torch.randn(seqs, *s, device=DEV) * 0.1 for s in shapes),
+    )
+    write_pos = torch.randint(0, cache_len - steps, (seqs,), device=DEV).int()
+    slots = torch.randperm(seqs, device=DEV).int()
+    cu = torch.arange(0, tokens + 1, steps, device=DEV).int()
+
+    def run(**gating):
+        ckpt, buf_k, buf_u, buf_g = (t.clone() for t in state)
+        out = replayssm_gated_delta_rule(
+            q, k, v, ckpt=ckpt, buf_k=buf_k, buf_u=buf_u, buf_g=buf_g,
+            write_pos=write_pos, slot_idx=slots, cu_seqlens=cu,
+            max_query_len=steps, use_qk_l2norm_in_kernel=True, **gating,
+        )  # fmt: skip
+        return out, ckpt, buf_k, buf_u, buf_g
+
+    g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+    ref = run(g=g, beta=beta)
+    new = run(g=None, beta=None, gate=(A_log, a, b, dt_bias))
+    for x, y in zip(ref, new):
+        assert torch.equal(x, y)

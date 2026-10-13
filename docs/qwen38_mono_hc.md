@@ -11,7 +11,7 @@ without partitioning the KV cache or GDN/PLE state.
 
 ## FlyDSL hyper-connection
 
-Set `ATOM_QWEN38_MONO_HC=1` before starting ATOM. The default is off. Dispatch
+`ATOM_QWEN38_MONO_HC` is on by default; set it to 0 to disable. Dispatch
 requires gfx950, contiguous BF16 data and weights, FP32 norm weights, and the
 Flash-Next geometry: HC=4, hidden=2560, low rank=320. The served decoder calls
 `mix_fused`, which uses three FlyDSL launches at 3/4/6/8/9/12 decode tokens:
@@ -123,9 +123,9 @@ rows; the fused combine remains enabled through 128.
 
 ## QSA when the context fits the sparse budget
 
-Set `ATOM_QWEN38_QSA_SHORT=1` to use a one-launch FlyDSL selection for gfx950
+`ATOM_QWEN38_QSA_SHORT` (default on) uses a one-launch FlyDSL selection for gfx950
 decode when `max_seq_len <= indexer_budget` (2,048 tokens in this checkpoint).
-The flag defaults off; the TP1 GSM8K run below exercised it. Every visible
+The TP1 GSM8K run below exercised it. Every visible
 complete group wins top-k in this case, and stable top-k returns them in group
 order. The kernel directly writes logical token IDs through the query position
 and `-1` padding. The indexer's cache update still runs, so later long-context
@@ -286,8 +286,8 @@ The new QSA projection path joins local QKV `[3584, 2560]` and replicated
 index Q/K `[640, 2560]` weights into one block-FP8 GEMM. Both branches use
 the same activation and dynamic quantization. A cached packed weight and
 scale are built after loading; the original parameters remain available for
-checkpoint semantics. Dispatch is opt-in with
-`ATOM_QWEN38_QSA_FUSED_PROJ=1`, limited to gfx950 BF16 decode at 4/8/16 rows,
+checkpoint semantics. Dispatch is gated by
+`ATOM_QWEN38_QSA_FUSED_PROJ` (default on) and limited to gfx950 BF16 decode at 4/8/16 rows,
 TP4's exact FP8 shapes, and preshuffled FP32 block scales. The index cache
 update remains in place. The two projection outputs matched the unfused
 outputs bit for bit in every complete-layer run. A separate graph microbench
@@ -470,8 +470,8 @@ expert kernel or reusing its selected IDs would be incorrect.
 
 At MTP2 serving widths (3–48 rows), a decode step is one GPU-busy stream of
 roughly 900–1,000 kernels, most of them 4–6 µs. Shortening it means cutting
-launches, not speeding up any single kernel. The flags below are all off by
-default. Those marked exact were compared with `torch.equal` in
+launches, not speeding up any single kernel. The flags below are on by default
+(set one to 0 to fall back). Those marked exact were compared with `torch.equal` in
 `tests/model_ops/test_qwen38_decode_fusions.py`.
 
 - `ATOM_QWEN38_SMALL_BATCH_MOE` (`ops/moe_small_batch.py`): EP MoE with the

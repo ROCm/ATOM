@@ -227,6 +227,8 @@ def test_mtp_verification_shape_dispatch(hc, monkeypatch, rows, uses_flydsl):
 
     monkeypatch.setattr(hc_flydsl, "mix_fused", trace)
     monkeypatch.setenv("ATOM_QWEN38_MONO_HC", "1")
+    # HC_MFMA (default on) takes 3-48 rows first; this checks the FlyDSL table.
+    monkeypatch.setenv("ATOM_QWEN38_HC_MFMA", "0")
     hc.mix_fused(x, pending)
     assert bool(calls) == uses_flydsl
 
