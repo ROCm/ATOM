@@ -74,14 +74,17 @@ above at zero. Stop the service before changing its editable source tree.
 
 ## Test method
 
-Against an otherwise idle server, run the short and long three-arm probes:
+Against an otherwise idle server, run the two long concurrency-4 probes:
 
 ```bash
-python3 tools/kv_offload_accuracy_arms.py 8021 16 64 96 DeepSeek-V4.1-Flash \
-  --out accuracy-short.json
 python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
-  --out accuracy-long.json
+  --concurrency 4 --seed 2026101301 --out accuracy-seed1.json
+python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
+  --concurrency 4 --seed 2026101302 --out accuracy-seed2.json
 ```
+
+The different seeds produce different warm documents. For a short smoke test,
+replace `900 640` with `64 96` and use another output filename.
 
 Use fresh output filenames. Each invocation primes one synthetic document, then
 runs blind (no document), cold (unique nonce at the document head), and warm
@@ -100,44 +103,39 @@ not CPU tier versus local HBM reuse.
 
 ## Test results
 
-2026-10-13: vLLM `0.31.1.dev0+gdb9527a46.d20261008`, LMCache
-`0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`; configuration above,
-synthetic recall, concurrency 1 unless specified. Supply is warm-tier tokens /
-warm prompt tokens.
+2026-10-13, source `f29878cab`: vLLM `0.31.1.dev0+gdb9527a46.d20261008`,
+LMCache `0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`; TP4,
+FULL graphs + DSpark 5, MP PAGE 32 GiB shared + STATE 4 GiB/rank.
+Supply below is warm-tier tokens / all actual warm-arm prompt tokens.
 
-| Backend / run | Blind | Cold | Warm | Tier supply | Verdict |
+| Long probe, concurrency 4 | Blind | Cold | Warm | Tier supply | Verdict |
 |---|---:|---:|---:|---:|---|
-| In-process, short 1 | 0/16 | 16/16 | 16/16 | 20,480 / 21,520 (95.2%) | Passed |
-| In-process, short 2 | 0/16 | 16/16 | 16/16 | 20,480 / 21,520 (95.2%) | Passed |
-| In-process, long (~17.5K prompt) | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) | Passed |
-| MP, short before namespace fix | 0/16 | 16/16 | 16/16 | 0 / 21,520 (0%) | Invalid: no recovery |
-| MP, short after namespace fix | 0/16 | 16/16 | 16/16 | 20,480 / 21,520 (95.2%) | Passed |
-| MP, long after namespace fix | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) | Passed |
-| MP, long, concurrency 4, before holding-queue fix | 0/16 | 16/16 | Incomplete | Not scored | Failed: mixed verify/prefill step |
-| MP, long, after holding-queue fix | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) | Passed |
-| MP, long, concurrency 4, after holding-queue fix, twice | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) each | Passed both runs |
+| Seed 2026101301 | 0/16 | 16/16 | 16/16 | 278,528 / 278,880 (99.874%) | Passed |
+| Seed 2026101302 | 0/16 | 16/16 | 16/16 | 278,528 / 279,488 (99.657%) | Passed |
 
-Completed arms had zero cold-tier and local-HBM supply. MP used a 32 GiB shared
-PAGE pool and a 4 GiB STATE pool per rank. The namespace fix aligns scheduler
-and worker PAGE blocks at 256 tokens while preserving draft blocks at 32.
-Before the holding-queue fix, concurrency 4 returned HTTP 500 on a mixed
-verify / restored tail-prefill batch. After the fix, one long single-client run
-and two concurrency-4 runs passed in the **same boot** at source `1e3ecb590`;
-all client/drain exits were zero. Only cold-arm nonces changed between runs;
-the warm document was the same fixed-seed prefix, not three independently
-primed documents. The 1,051 tracked ATOM
-source files were unchanged throughout those runs. This is not independent-boot
-or high-concurrency validation.
+The two warm documents were different, but shared one boot. Both client/drain
+exits were zero; cold-tier and local-HBM supply were zero. Four TP ranks
+completed graph capture. No workload error matched the recorded fault scan,
+all 12 logged `cursor_mismatch` counters were zero, and 1,051 tracked ATOM
+source files were unchanged through teardown. This service smoke covers the
+new source, not proof that each CPU regression's specific corner case occurred.
 
-Shutdown subsequently logged LMCache `LocalCPUBackend` close errors and AITER
-`free_meta_buffer` destructor errors. They did not occur during the probes;
-vLLM escalated its four workers to SIGKILL on shutdown. All seven recorded
-model/MP processes and their host KFD entries were confirmed absent afterward.
+Shutdown: four `LocalCPUBackend closed successfully` lines and zero
+`Error closing` lines; the prior STATE-shape close error did not recur.
+AITER `free_meta_buffer` destructor errors and vLLM's four-worker SIGKILL
+escalation **remain unresolved**. Model launcher exit was 0; the separately
+terminated MP launcher exited 143 (intentional SIGTERM). All seven recorded
+model/MP processes, their host KFD entries, and all four listening ports were
+gone afterward. This was not a clean graceful shutdown.
 
-CPU-focused receive/STATE/namespace/scheduling/probe/wait-script regression:
-**520 passed**, plus 69 subtests. This includes a subsequent CPU-only fix for
-running output-history replay beyond the original prompt; graph validation of
-that change is pending. These checks and the smoke runs do not establish full
-GSM8K accuracy, STATE byte equality, high-concurrency capacity safety, or local
-HBM restoration. Those validations remain pending. **No current performance
-result is claimed.**
+CPU-focused receive/STATE/namespace/scheduling/codec/probe/wait regression:
+**811 passed + 69 subtests**, with 90 deprecation warnings. Tests include real
+sync/async scheduler padding red/green cases and real LMCache token-accounting,
+flat-byte, `clear`/`close`, and full-pool cases.
+
+Earlier in-process short/long and MP short/long probes passed. The earlier MP
+namespace run with zero tier supply was invalid; the pre-holding-queue-fix
+concurrency-4 run failed with HTTP 500. Historical results remain in PR #2357.
+Full two-pass GSM8K, STATE byte equality, cancellation/failure-recompute,
+high-concurrency capacity safety, and local-HBM restoration remain pending.
+**No current performance result is claimed.**
