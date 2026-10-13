@@ -31,6 +31,7 @@ def test_runner_model_height_and_sampling_rows(
 ):
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
+    runner._greedy_argmax_head = False
     runner.config = SimpleNamespace(prefill_context_parallel_size=1)
     runner._detailed_label_suffix = lambda batch: ""
     runner._piecewise_cg_active = lambda: piecewise

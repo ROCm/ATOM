@@ -641,6 +641,459 @@ def qsa_compress_groups(
 
 
 @triton.jit
+def _interleaved_mrope(
+    x, y, dims, p0, p1, p2, cos_ptr, sin_ptr, ROTARY_DIM, SECTION_H, SECTION_W
+):
+    """`_qsa_mrope_kernel`'s interleaved rotation of BF16 `x`, given `y`, the
+    same values at the NeoX partner dimensions."""
+    half = ROTARY_DIM // 2
+    freq = dims % half
+    axis = tl.where((freq % 3 == 1) & (freq < 3 * SECTION_H), 1, 0)
+    axis = tl.where((freq % 3 == 2) & (freq < 3 * SECTION_W), 2, axis)
+    position = tl.where(axis == 0, p0, tl.where(axis == 1, p1, p2))
+    cos = tl.load(cos_ptr + position * half + freq).to(x.dtype).to(tl.float32)
+    sin = tl.load(sin_ptr + position * half + freq).to(x.dtype).to(tl.float32)
+    y = y.to(tl.float32)
+    y = tl.where(dims < half, -y, y)
+    xc = (x.to(tl.float32) * cos).to(x.dtype).to(tl.float32)
+    ys = (y * sin).to(x.dtype).to(tl.float32)
+    return tl.where(dims < ROTARY_DIM, (xc + ys).to(x.dtype), x)
+
+
+@triton.jit
+def _qsa_index_prep_kernel(
+    qk_ptr,
+    pos_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    slots_ptr,
+    compressed_slots_ptr,
+    token_to_request_ptr,
+    logical_positions_ptr,
+    page_table_ptr,
+    raw_cache_ptr,
+    position_cache_ptr,
+    compressed_cache_ptr,
+    q_out_ptr,
+    stride_qk,
+    stride_pos_axis,
+    stride_pos_token,
+    stride_table_request,
+    stride_raw_slot,
+    stride_position_slot,
+    stride_compressed_slot,
+    num_rows,
+    num_slots,
+    num_pages,
+    num_requests,
+    num_compressed_slots,
+    eps,
+    HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    SECTION_H: tl.constexpr,
+    SECTION_W: tl.constexpr,
+    LOAD_POSITIONS: tl.constexpr,
+    ROPE_POSITION_OFFSET: tl.constexpr,
+) -> None:
+    """One row of `Qwen4ExpAttention._select_tokens` up to the scoring.
+
+    Index Q: Gemma RMSNorm and mRoPE. Raw K and the row's positions go to
+    their caches. A row that closes a group pools it, normalizes and rotates
+    it at the group's first position and stores it compressed. Group members
+    written by this launch are read from `qk`, not from the cache.
+    """
+    row = tl.program_id(0)
+    dims = tl.arange(0, HEAD_DIM)
+    half = ROTARY_DIM // 2
+    paired = tl.where(
+        dims < ROTARY_DIM, tl.where(dims < half, dims + half, dims - half), dims
+    )
+    p0 = tl.load(pos_ptr + row * stride_pos_token)
+    p1 = tl.load(pos_ptr + stride_pos_axis + row * stride_pos_token)
+    p2 = tl.load(pos_ptr + 2 * stride_pos_axis + row * stride_pos_token)
+
+    heads = tl.arange(0, HEADS)[:, None]
+    src = qk_ptr + row * stride_qk + heads * HEAD_DIM
+    x = tl.load(src + dims[None, :]).to(tl.float32)
+    xp = tl.load(src + paired[None, :]).to(tl.float32)
+    rq = tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + eps)[:, None]
+    q = (x * rq * (1.0 + tl.load(q_weight_ptr + dims).to(tl.float32))).to(
+        q_out_ptr.dtype.element_ty
+    )
+    qp = (xp * rq * (1.0 + tl.load(q_weight_ptr + paired).to(tl.float32))).to(
+        q_out_ptr.dtype.element_ty
+    )
+    q = _interleaved_mrope(
+        q, qp, dims, p0, p1, p2, cos_ptr, sin_ptr, ROTARY_DIM, SECTION_H, SECTION_W
+    )
+    tl.store(q_out_ptr + (row * HEADS + heads) * HEAD_DIM + dims[None, :], q)
+
+    k_off = HEADS * HEAD_DIM
+    slot = tl.load(slots_ptr + row)
+    if (slot >= 0) & (slot < num_slots):
+        tl.store(
+            raw_cache_ptr + slot.to(tl.int64) * stride_raw_slot + dims,
+            tl.load(qk_ptr + row * stride_qk + k_off + dims),
+        )
+        if LOAD_POSITIONS:
+            axes = tl.arange(0, 4)
+            p = tl.where(axes == 0, p0, tl.where(axes == 1, p1, p2))
+            tl.store(
+                position_cache_ptr + slot.to(tl.int64) * stride_position_slot + axes,
+                p.to(tl.int64),
+                mask=axes < 3,
+            )
+
+    request = tl.load(token_to_request_ptr + row)
+    end_position = tl.load(logical_positions_ptr + row)
+    compressed_slot = tl.load(compressed_slots_ptr + row)
+    if (
+        (request >= 0)
+        & (request < num_requests)
+        & (end_position >= COMPRESS_RATIO - 1)
+        & (compressed_slot >= 0)
+        & (compressed_slot < num_compressed_slots)
+    ):
+        acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+        acc_p = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+        f0 = (end_position - COMPRESS_RATIO + 1 + ROPE_POSITION_OFFSET).to(tl.int64)
+        f1 = f0
+        f2 = f0
+        for offset in tl.static_range(COMPRESS_RATIO):
+            back = COMPRESS_RATIO - 1 - offset
+            position = end_position - back
+            j = tl.maximum(row - back, 0)
+            j_slot = tl.load(slots_ptr + j)
+            here = (
+                (row >= back)
+                & (tl.load(token_to_request_ptr + j) == request)
+                & (tl.load(logical_positions_ptr + j) == position)
+                & (j_slot >= 0)
+                & (j_slot < num_slots)
+            )
+            logical_page = position // PAGE_SIZE
+            physical_page = tl.load(
+                page_table_ptr
+                + request * stride_table_request
+                + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+                mask=(here == 0) & (logical_page < PAGE_TABLE_WIDTH),
+                other=-1,
+            )
+            # An unmapped page reads as zeros, as in `qsa_compress_groups`.
+            valid = here | ((physical_page >= 0) & (physical_page < num_pages))
+            cache_slot = (
+                tl.maximum(physical_page, 0).to(tl.int64) * PAGE_SIZE
+                + position % PAGE_SIZE
+            )
+            base = tl.where(
+                here,
+                qk_ptr + j * stride_qk + k_off,
+                raw_cache_ptr + cache_slot * stride_raw_slot,
+            )
+            acc += tl.load(base + dims, mask=valid, other=0.0).to(tl.float32)
+            acc_p += tl.load(base + paired, mask=valid, other=0.0).to(tl.float32)
+            if LOAD_POSITIONS and (offset == 0):
+                cached = position_cache_ptr + cache_slot * stride_position_slot
+                cached_valid = valid & (here == 0)
+                own = pos_ptr + j * stride_pos_token
+                f0 = tl.where(
+                    here,
+                    tl.load(own).to(tl.int64),
+                    tl.load(cached, mask=cached_valid, other=0).to(tl.int64),
+                )
+                f1 = tl.where(
+                    here,
+                    tl.load(own + stride_pos_axis).to(tl.int64),
+                    tl.load(cached + 1, mask=cached_valid, other=0).to(tl.int64),
+                )
+                f2 = tl.where(
+                    here,
+                    tl.load(own + 2 * stride_pos_axis).to(tl.int64),
+                    tl.load(cached + 2, mask=cached_valid, other=0).to(tl.int64),
+                )
+        dtype = compressed_cache_ptr.dtype.element_ty
+        pooled = (acc / COMPRESS_RATIO).to(dtype).to(tl.float32)
+        pooled_p = (acc_p / COMPRESS_RATIO).to(dtype).to(tl.float32)
+        r = tl.rsqrt(tl.sum(pooled * pooled, 0) / HEAD_DIM + eps)
+        k = (pooled * r * (1.0 + tl.load(k_weight_ptr + dims).to(tl.float32))).to(dtype)
+        kp = (pooled_p * r * (1.0 + tl.load(k_weight_ptr + paired).to(tl.float32))).to(
+            dtype
+        )
+        k = _interleaved_mrope(
+            k, kp, dims, f0, f1, f2, cos_ptr, sin_ptr, ROTARY_DIM, SECTION_H, SECTION_W
+        )
+        tl.store(
+            compressed_cache_ptr
+            + compressed_slot.to(tl.int64) * stride_compressed_slot
+            + dims,
+            k,
+        )
+
+
+def qsa_index_prep(
+    indexer,
+    qk: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    compressed_slots: torch.Tensor,
+    token_to_request: torch.Tensor,
+    logical_positions: torch.Tensor,
+    page_table: torch.Tensor,
+    raw_key_cache: torch.Tensor,
+    compressed_key_cache: torch.Tensor,
+    position_cache: torch.Tensor | None = None,
+    rope_position_offset: int = 0,
+) -> torch.Tensor:
+    """`Qwen4ExpIndexer.project_qk` after the projection, the raw K, position
+    and compressed K cache writes and `qsa_compress_groups` in one launch.
+
+    Returns the normalized, rotated index Q `[rows, heads, head_dim]`. Rows of
+    one request must be consecutive and in position order, as in decode.
+    """
+    rows = qk.shape[0]
+    heads, head_dim = indexer.index_n_heads, indexer.index_head_dim
+    rope = indexer.rotary_emb
+    sections = rope.mrope_section
+    q_out = torch.empty((rows, heads, head_dim), dtype=qk.dtype, device=qk.device)
+    if rows == 0:
+        return q_out
+    raw = raw_key_cache.view(-1, head_dim)
+    compressed = compressed_key_cache.view(-1, head_dim)
+    if position_cache is not None:
+        positions_flat = position_cache.view(-1, position_cache.shape[-1])
+    else:
+        positions_flat = raw
+    axis_stride = (
+        positions.stride(0) if positions.ndim == 2 and positions.shape[0] == 3 else 0
+    )
+    _qsa_index_prep_kernel[(rows,)](
+        qk,
+        positions,
+        indexer.q_layernorm.weight,
+        indexer.k_layernorm.weight,
+        rope.cos_cache,
+        rope.sin_cache,
+        slots,
+        compressed_slots,
+        token_to_request,
+        logical_positions,
+        page_table,
+        raw,
+        positions_flat,
+        compressed,
+        q_out,
+        qk.stride(0),
+        axis_stride,
+        positions.stride(-1),
+        page_table.stride(0),
+        raw.stride(0),
+        positions_flat.stride(0),
+        compressed.stride(0),
+        rows,
+        raw.shape[0],
+        raw_key_cache.shape[0],
+        page_table.shape[0],
+        compressed.shape[0],
+        indexer.q_layernorm.variance_epsilon,
+        HEADS=heads,
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=raw_key_cache.shape[1],
+        PAGE_TABLE_WIDTH=_table_width_bucket(page_table.shape[1]),
+        COMPRESS_RATIO=indexer.compress_ratio,
+        ROTARY_DIM=rope.rotary_dim,
+        SECTION_H=sections[1],
+        SECTION_W=sections[2],
+        LOAD_POSITIONS=position_cache is not None,
+        ROPE_POSITION_OFFSET=0 if position_cache is not None else rope_position_offset,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return q_out
+
+
+def qsa_index_prep_supported(indexer, qk: torch.Tensor, raw_key_cache) -> bool:
+    """Shapes and layouts `qsa_index_prep` is written for."""
+    rope = indexer.rotary_emb
+    heads, head_dim = indexer.index_n_heads, indexer.index_head_dim
+    return (
+        getattr(rope, "mrope_section", None) is not None
+        and getattr(rope, "mrope_interleaved", False)
+        and rope.is_neox_style
+        and heads & (heads - 1) == 0
+        and head_dim & (head_dim - 1) == 0
+        and rope.rotary_dim <= head_dim
+        and qk.stride(1) == 1
+        and qk.shape[1] == (heads + 1) * head_dim
+        and raw_key_cache.is_contiguous()
+        and raw_key_cache.dtype == qk.dtype
+    )
+
+
+@triton.jit
+def _qsa_qk_prep_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    slots_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    stride_q,
+    stride_k,
+    stride_v,
+    stride_pos_axis,
+    stride_pos_token,
+    stride_cache_block,
+    eps,
+    Q_HEADS: tl.constexpr,
+    K_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    SECTION_H: tl.constexpr,
+    SECTION_W: tl.constexpr,
+) -> None:
+    """One (token, head): Gemma RMSNorm and mRoPE of Q or K, as
+    `fused_qk_norm` then `_qsa_mrope_kernel`; a K head also writes its K and
+    V rows to the paged cache, as `reshape_and_cache_flash`."""
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dims = tl.arange(0, HEAD_DIM)
+    half = ROTARY_DIM // 2
+    paired = tl.where(
+        dims < ROTARY_DIM, tl.where(dims < half, dims + half, dims - half), dims
+    )
+    is_q = head < Q_HEADS
+    kv_head = tl.maximum(head - Q_HEADS, 0)
+    src = tl.where(
+        is_q, q_ptr + row * stride_q + head * HEAD_DIM, k_ptr + row * stride_k
+    )
+    src = tl.where(is_q, src, src + kv_head * HEAD_DIM)
+    weight_ptr = tl.where(is_q, q_weight_ptr, k_weight_ptr)
+    x = tl.load(src + dims).to(tl.float32)
+    xp = tl.load(src + paired).to(tl.float32)
+    rstd = tl.rsqrt(tl.sum(x * x, 0) / HEAD_DIM + eps)
+    dtype = q_out_ptr.dtype.element_ty
+    y = (x * rstd * (tl.load(weight_ptr + dims).to(tl.float32) + 1.0)).to(dtype)
+    yp = (xp * rstd * (tl.load(weight_ptr + paired).to(tl.float32) + 1.0)).to(dtype)
+    p0 = tl.load(pos_ptr + row * stride_pos_token)
+    p1 = tl.load(pos_ptr + stride_pos_axis + row * stride_pos_token)
+    p2 = tl.load(pos_ptr + 2 * stride_pos_axis + row * stride_pos_token)
+    y = _interleaved_mrope(
+        y, yp, dims, p0, p1, p2, cos_ptr, sin_ptr, ROTARY_DIM, SECTION_H, SECTION_W
+    )
+    if is_q:
+        tl.store(q_out_ptr + (row * Q_HEADS + head) * HEAD_DIM + dims, y)
+    else:
+        tl.store(k_out_ptr + (row * K_HEADS + kv_head) * HEAD_DIM + dims, y)
+        slot = tl.load(slots_ptr + row).to(tl.int64)
+        if slot >= 0:
+            dst = (
+                (slot // BLOCK_SIZE) * stride_cache_block
+                + (slot % BLOCK_SIZE) * (K_HEADS * HEAD_DIM)
+                + kv_head * HEAD_DIM
+                + dims
+            )
+            tl.store(k_cache_ptr + dst, y)
+            tl.store(
+                v_cache_ptr + dst,
+                tl.load(v_ptr + row * stride_v + kv_head * HEAD_DIM + dims),
+            )
+
+
+def qsa_qk_prep(
+    qk_norm,
+    rotary_emb,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slots: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`qk_norm` (a Gemma `DualRMSNorm`), `qsa_apply_mrope` and a BF16
+    `reshape_and_cache_flash` in one launch. `q`, `k`, `v` are `[tokens,
+    heads * head_dim]` rows; returns rotated Q and K `[tokens, heads, dim]`."""
+    tokens = q.shape[0]
+    q_heads, k_heads, head_dim = (
+        qk_norm.num_q_heads,
+        qk_norm.num_kv_heads,
+        qk_norm.head_dim,
+    )
+    q_out = torch.empty((tokens, q_heads, head_dim), dtype=q.dtype, device=q.device)
+    k_out = torch.empty((tokens, k_heads, head_dim), dtype=k.dtype, device=k.device)
+    if tokens == 0:
+        return q_out, k_out
+    sections = rotary_emb.mrope_section
+    axis_stride = (
+        positions.stride(0) if positions.ndim == 2 and positions.shape[0] == 3 else 0
+    )
+    _qsa_qk_prep_kernel[(tokens, q_heads + k_heads)](
+        q,
+        k,
+        v,
+        qk_norm.q_norm.weight,
+        qk_norm.k_norm.weight,
+        rotary_emb.cos_cache,
+        rotary_emb.sin_cache,
+        positions,
+        slots,
+        k_cache,
+        v_cache,
+        q_out,
+        k_out,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        axis_stride,
+        positions.stride(-1),
+        k_cache.stride(0),
+        qk_norm._eps,
+        Q_HEADS=q_heads,
+        K_HEADS=k_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=k_cache.shape[1],
+        ROTARY_DIM=rotary_emb.rotary_dim,
+        SECTION_H=sections[1],
+        SECTION_W=sections[2],
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
+    return q_out, k_out
+
+
+def qsa_qk_prep_supported(qk_norm, rotary_emb, q, k, v, k_cache, v_cache) -> bool:
+    """Shapes and layouts `qsa_qk_prep` is written for."""
+    head_dim = qk_norm.head_dim
+    return (
+        qk_norm.add_unit_offset
+        and getattr(rotary_emb, "mrope_section", None) is not None
+        and getattr(rotary_emb, "mrope_interleaved", False)
+        and rotary_emb.is_neox_style
+        and rotary_emb.rotary_dim <= head_dim
+        and head_dim & (head_dim - 1) == 0
+        and q.stride(1) == k.stride(1) == v.stride(1) == 1
+        and k_cache.dtype == v_cache.dtype == k.dtype == v.dtype
+        and k_cache.stride() == v_cache.stride()
+        and k_cache.shape[2:] == (qk_norm.num_kv_heads, head_dim)
+        and k_cache[0].is_contiguous()
+    )
+
+
+@triton.jit
 def _qsa_paged_mqa_logits_kernel(
     q_ptr,
     k_cache_ptr,

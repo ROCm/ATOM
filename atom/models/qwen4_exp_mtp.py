@@ -19,6 +19,7 @@ from atom.models.qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
     _Qwen4ExpQuantizationConfig,
 )
+from atom.utils import envs
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
@@ -71,6 +72,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.pre_fc_norm_hidden = Qwen4ExpGroupedRMSNorm(
             hc_dim, hc_dim, config.rms_norm_eps
         )
+        self.fused_layer = envs.ATOM_QWEN38_FUSED_MTP_LAYER
         self.layers = nn.ModuleList(
             [
                 Qwen4ExpDecoderLayer(
@@ -79,6 +81,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     prefix="mtp.layers.0",
                     layer_num=self.mtp_start_layer_idx,
                     quant_config=quant_config,
+                    fused_hc=self.fused_layer,
+                    fuse_shared_expert=self.fused_layer,
                 )
             ]
         )
@@ -105,7 +109,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden = self.pre_fc_norm_hidden(hidden_states.reshape(n, -1))
         hidden = self.fc_hidden(hidden.reshape(-1, self.hidden_size))
         hidden = hidden.view(n, self.hc_count, self.hidden_size) + embedding[:, None, :]
-        hidden = self.layers[0](positions, hidden.flatten(1), None)
+        if self.fused_layer:
+            hidden, pending = self.layers[0](positions, hidden.flatten(1), None)
+            hidden = self.hyper_connection_mixer.apply_pending(hidden, pending)
+        else:
+            hidden = self.layers[0](positions, hidden.flatten(1), None)
         return hidden.view(n, self.hc_count, self.hidden_size)
 
 
@@ -120,6 +128,8 @@ class Qwen4ExpMTP(nn.Module):
         super().__init__()
         self.config = atom_config.hf_config
         self.model = Qwen4ExpMultiTokenPredictor(atom_config)
+        # A fused draft layer takes its shared expert as expert 512.
+        self.disable_fused_shared_loading = not self.model.layers[0].mlp.fuse_shared
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -143,7 +153,11 @@ class Qwen4ExpMTP(nn.Module):
         return self.model(input_ids, positions, hidden_states, inputs_embeds)
 
     def _head_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.model.hyper_connection_mixer.mix(hidden_states.flatten(1))[0]
+        mixer = self.model.hyper_connection_mixer
+        if self.model.fused_layer:
+            # No pending combine: the MFMA mix alone, as the target layers run it.
+            return mixer.mix_fused(hidden_states.flatten(1))[0]
+        return mixer.mix(hidden_states.flatten(1))[0]
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

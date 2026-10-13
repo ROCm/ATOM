@@ -116,6 +116,55 @@ do not establish a meaningful TP4 service gain. The prompt stays below the
 checkpoint generation. Raw runs are in
 `/tmp/qwen38-tp4-mtp2-{off,on}-{completed,b16-repeat}.jsonl`.
 
+### TP4 MTP2 decode launch reductions
+
+The flags above barely moved this workload because its decode step is not
+bound by any one large kernel. A bs8 MTP2 step (24 rows) ran about 980
+launches on one stream with no idle gaps, and most of them were small kernels
+costing 4–6 µs each. The step was GPU-bound, and kernel count set its length.
+The follow-up work therefore removed launches. Every change is behind a flag
+and off by default:
+
+| Flag | Replaces | Exact? |
+| :--- | :--- | :--- |
+| `ATOM_QWEN38_HC_MFMA` | The served HC mix at 3–48 rows, done in two MFMA launches. | NRMSE-level |
+| `ATOM_QWEN38_FP8_SHARED_EXPERT` | The BF16 shared expert, quantized to block FP8 and run as expert 512 inside the MoE. | Lossy |
+| `ATOM_QWEN38_TRITON_ROUTER` | Softmax top-k plus the shared-expert weight, in one Triton launch. | Same experts; weight rounding differs |
+| `ATOM_QWEN38_SMALL_BATCH_MOE` | Sort, quant and asm MoE at ≤64 rows, replaced by Triton up/down/combine with BF16 activations. | FP8-GEMM-level |
+| `ATOM_QWEN38_MOE_ROUTER_BUCKETS` | The small-batch MoE's plan launch; the router files pairs by expert. | Bitwise |
+| `ATOM_QWEN38_QSA_FUSED_INDEX` | Nine indexer decode launches (Q norm/mRoPE, K/position stores, pooling, compressed K norm/mRoPE/store). | Bitwise |
+| `ATOM_QWEN38_QSA_FUSED_QK` | QSA Q/K norm, mRoPE and the KV cache write. | Bitwise |
+| `ATOM_QWEN38_FUSED_MTP_LAYER` | Builds the draft layer like a target layer, with fused HC and the FP8 shared expert. | Draft only |
+| `ATOM_GDN_REPLAYSSM_FUSED_GATE` | The separate GDN gating launch on speculative steps. | Same arithmetic |
+| `ATOM_GREEDY_ARGMAX_HEAD` | The all-greedy verify's [tokens, vocab] logits all-gather, replaced by a per-rank argmax. | Same tokens |
+
+The rows marked "Bitwise" were checked with `torch.equal` against the launches
+they replace in `tests/model_ops/test_qwen38_decode_fusions.py`. That covers
+12/24/48/64 rows, padded slots, offset mRoPE, and pooled groups that span
+cached and in-step tokens.
+
+The same GPUs (0–3) and server shape as above were used, with `MONO_HC`,
+short QSA, fused projection and every flag in the table on. These are
+five-run medians after one warmup:
+
+| Concurrent requests | PR flags off | All flags on | Ratio |
+| ---: | ---: | ---: | ---: |
+| 4 | 920.48 | 1,479.34 | 1.61× |
+| 8 | 1,800.15 | 2,725.62 | 1.51× |
+| 16 | 3,242.45 | 5,020.52 | 1.55× |
+
+All responses were the correct 1–200 list and ended with `stop`. One of the
+five bs8 runs measured 2,573 tokens/s and one of the bs16 runs 3,666, so a
+single run can fall below 1.5×. The bs8 median clears the target by only
+about 1%. Profiled bs8 decode steps took 12.59 ms with all flags off and
+7.63 ms with them on, and launches fell from about 980 to 860.
+
+Full GSM8K (1,319 questions, 5-shot, 4,096-token cap, `num_concurrent=8`)
+against the all-flags MTP2 server scored 97.65% flexible and 97.19% strict.
+The earlier pre-PR and PR runs scored 97.73/97.57% and 97.57/97.50%. All of
+these differences are within one standard error (about 0.42–0.45 pp). Output
+is in `/tmp/qwen38-gsm8k-allflags-prototype-all`.
+
 ### TP8 MTP2 serving check
 
 An eight-GPU idle window allowed the local checkpoint to start at TP8+EP8

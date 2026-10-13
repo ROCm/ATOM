@@ -42,6 +42,8 @@ from atom.model_ops.qwen4_exp.ops.hc_fused import (
 # Up to this many tokens the two fused kernels beat norm + GEMMs; each row
 # re-reads the (cache resident) weights, so the cost grows with the batch.
 HC_ROWS_MAX = 2
+# `ops/hc_mfma.MAX_ROWS`, kept here so dispatch need not import FlyDSL.
+HC_MFMA_MAX_ROWS = 48
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
@@ -108,8 +110,9 @@ class Qwen4ExpHyperConnection(nn.Module):
 
     def _mono_supported(self, x: torch.Tensor, max_rows: int) -> bool:
         """Only the measured Flash-Next decode geometry uses the fused path."""
-        if not envs.ATOM_QWEN38_MONO_HC:
-            return False
+        return envs.ATOM_QWEN38_MONO_HC and self._mono_geometry(x, max_rows)
+
+    def _mono_geometry(self, x: torch.Tensor, max_rows: int) -> bool:
         if (
             self.hidden_size != 2560
             or self.hc_count != 4
@@ -222,8 +225,15 @@ class Qwen4ExpHyperConnection(nn.Module):
         # winning sizes alongside the ordinary decode sizes. Native is faster
         # at 1, 2, 15 and 32 rows; 21 rows gains too little to dispatch.
         rows = hyper_input.shape[0]
-        if rows in (3, 4, 6, 8, 9, 12, 16, 18, 24) and self._mono_supported(
-            hyper_input, 24
+        # The two-launch MFMA mix covers every MTP verify size up to 48 rows.
+        use_mfma = (
+            envs.ATOM_QWEN38_HC_MFMA
+            and rows >= 3
+            and self._mono_geometry(hyper_input, HC_MFMA_MAX_ROWS)
+        )
+        if use_mfma or (
+            rows in (3, 4, 6, 8, 9, 12, 16, 18, 24)
+            and self._mono_supported(hyper_input, 24)
         ):
             fused_weight = getattr(self, "fused_w_cat", None)
             fused_rows = getattr(self, "fused_rank", 0) + (
@@ -249,6 +259,10 @@ class Qwen4ExpHyperConnection(nn.Module):
                 and fused_weight.is_contiguous()
                 and valid_pending
             ):
+                if use_mfma:
+                    from atom.model_ops.qwen4_exp.ops import hc_mfma
+
+                    return hc_mfma.mix_fused(self, hyper_input, pending)
                 from atom.model_ops.qwen4_exp.ops.hc_flydsl import mix_fused
 
                 return mix_fused(self, hyper_input, pending)

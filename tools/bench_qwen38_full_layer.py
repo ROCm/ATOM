@@ -150,7 +150,7 @@ def run(args: argparse.Namespace) -> dict:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
-    if world not in (1, 4) or args.rows not in (3, 4, 6, 8, 9, 12, 16, 18, 24):
+    if world not in (1, 4) or args.rows not in (3, 4, 6, 8, 9, 12, 16, 18, 24, 36, 48):
         raise ValueError(
             "This setup requires TP1 or TP4 and a supported decode row count"
         )
@@ -436,7 +436,10 @@ def main() -> None:
     parser.add_argument("--model", required=True, help="local config directory")
     parser.add_argument("--layer", choices=("qsa", "gdn"), required=True)
     parser.add_argument(
-        "--rows", type=int, choices=(3, 4, 6, 8, 9, 12, 16, 18, 24), required=True
+        "--rows",
+        type=int,
+        choices=(3, 4, 6, 8, 9, 12, 16, 18, 24, 36, 48),
+        required=True,
     )
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--repeats", type=int, default=100)

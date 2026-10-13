@@ -456,7 +456,7 @@ These M3 choices give concrete starting points for Qwen's own layer kernel:
 | :--- | :--- |
 | Skip scoring when every sparse block fits the budget | Added for Qwen contexts up to 2,048 tokens with exact IDs and sparse output. |
 | Fuse indexer, sparse attention, output projection, TP reduction, router, and MoE | The main QKV and index Q/K projections now share one quantization and GEMM at 4/8/16 rows. The QSA scorer/top-k workspace, sparse attention, collective, and MoE remain separate. |
-| Use a narrow MoE schedule for 1–4 rows and expert-grouped work from 5 rows | Open. Qwen has a single-token special case and AITER's general sorted MoE, but no persistent row-width schedule joining it to attention and HC. Its 512-expert top-10 block-FP8 format needs its own stage. |
+| Use a narrow MoE schedule for 1–4 rows and expert-grouped work from 5 rows | Partly done. `ATOM_QWEN38_SMALL_BATCH_MOE` groups pairs by expert without a sort for up to 64 rows. With `ATOM_QWEN38_MOE_ROUTER_BUCKETS`, the router builds that grouping itself. The MoE is still not joined to attention and HC. |
 | Change TP reduction from one-hop exchange to reduce-scatter/all-gather at wider batches | Open; M3 switches at 12 rows. Qwen's collective choice needs separate TP2/TP4 crossover measurements for its 2,560-wide output. |
 | Reuse an earlier layer's selected blocks | Not applicable to Qwen's checkpoint: each of its 12 QSA layers owns a different indexer and compressed-key cache. Reusing another layer's IDs would change the model. |
 | Give recurrent or special layers a seam | Qwen has 36 GDN layers and one PLE layer. Its existing GDN recurrent kernel is now enabled on gfx950; the convolution, projections, HC/MoE/TP stages still need a fused layer schedule. Like V4.1's two-part layer, a first implementation can keep the state update as a seam while fusing the HC/MoE/TP suffix; a true one-launch GDN layer must include its state transition. |
@@ -465,6 +465,34 @@ M3 also uses width-specific task placements, non-temporal loads for weights
 that stream once, and a rank-shared mailbox buffer. Those are useful tuning
 tools after the Qwen layer's math and state handoffs are bound; copying M3's
 expert kernel or reusing its selected IDs would be incorrect.
+
+## Small-batch decode launch reductions
+
+At MTP2 serving widths (3–48 rows), a decode step is one GPU-busy stream of
+roughly 900–1,000 kernels, most of them 4–6 µs. Shortening it means cutting
+launches, not speeding up any single kernel. The flags below are all off by
+default. Those marked exact were compared with `torch.equal` in
+`tests/model_ops/test_qwen38_decode_fusions.py`.
+
+- `ATOM_QWEN38_SMALL_BATCH_MOE` (`ops/moe_small_batch.py`): EP MoE with the
+  fused shared expert at up to 64 rows. A plan launch groups (token, slot)
+  pairs by local expert; up, down and combine then stream the FP8 experts
+  with BF16 activations.
+- `ATOM_QWEN38_MOE_ROUTER_BUCKETS` (needs the above and
+  `ATOM_QWEN38_TRITON_ROUTER`): the router files each local pair into its
+  expert's bucket with relaxed atomics. The last router program to finish
+  writes the block table and re-zeroes the counters for the next call, which
+  removes the plan launch. Each pair's output is independent of its bucket
+  position, so the result is exact.
+- `ATOM_QWEN38_QSA_FUSED_INDEX` (`qsa_index_prep`): one launch per row for
+  the indexer's decode cache work. It covers Q norm and mRoPE, raw K and
+  position stores, and pooling of the group the row closes. Pooled members
+  come from this step's rows when present and from the paged cache otherwise.
+  It also does the compressed-K norm, mRoPE and store. Exact.
+- `ATOM_QWEN38_QSA_FUSED_QK` (`qsa_qk_prep`): one launch for QSA attention's
+  Gemma Q/K norm, interleaved mRoPE and KV cache write. Exact.
+
+End-to-end TP4 MTP2 results and accuracy are in `qwen.md`.
 
 ## Validation scope
 

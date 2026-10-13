@@ -291,11 +291,14 @@ def load_model(
     def _fuse_shared_expert(
         shared_expert_prefix: str, routed_expert_prefix: str
     ) -> bool:
-        model_quant_config = getattr(
-            getattr(model, "atom_config", None), "quant_config", None
-        )
-        if model_quant_config is None:
-            model_quant_config = getattr(model, "quant_config", None)
+        # The model's own view first: a model may wrap the global config with
+        # its own per-layer policy (Qwen3.8 does), and the fusion decision has
+        # to agree with the one its MoE blocks made at construction.
+        model_quant_config = getattr(model, "quant_config", None)
+        if not hasattr(model_quant_config, "get_layer_quant_config"):
+            model_quant_config = getattr(
+                getattr(model, "atom_config", None), "quant_config", None
+            )
         if model_quant_config is not None and hasattr(
             model_quant_config, "get_layer_quant_config"
         ):

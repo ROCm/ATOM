@@ -368,6 +368,7 @@ def test_mtp_shared_projection_uses_full_width_hidden_norm():
     model = Qwen4ExpMultiTokenPredictor.__new__(Qwen4ExpMultiTokenPredictor)
     torch.nn.Module.__init__(model)
     model.hc_count, model.hidden_size = hc, width
+    model.fused_layer = False
     model.pre_fc_norm_hidden = Qwen4ExpGroupedRMSNorm(hc * width, hc * width, eps)
     model.pre_fc_norm_embedding = Qwen4ExpGroupedRMSNorm(width, width, eps)
     model.fc_hidden = torch.nn.Linear(width, width, bias=False)

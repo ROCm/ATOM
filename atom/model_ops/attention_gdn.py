@@ -13,7 +13,10 @@ from atom.model_ops.fla_ops import (
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
-from atom.model_ops.fla_ops.replayssm import replayssm_gated_delta_rule
+from atom.model_ops.fla_ops.replayssm import (
+    fused_gate_supported,
+    replayssm_gated_delta_rule,
+)
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -349,7 +352,21 @@ class GatedDeltaNet(nn.Module):
                 non_spec_state_indices_tensor,
             )
 
-        if use_lossy_gdn_decode or use_flydsl_decode:
+        pure_spec_step = (
+            gdn_metadata.num_prefills == 0 and gdn_metadata.num_decodes == 0
+        )
+        # ReplaySSM's serial verify loop can derive g and beta itself, which
+        # saves the gating launch on a step with only speculative decodes.
+        fuse_gate = (
+            envs.ATOM_GDN_REPLAYSSM_FUSED_GATE
+            and use_replayssm
+            and spec_sequence_masks is not None
+            and pure_spec_step
+            and fused_gate_supported(
+                gdn_metadata.replayssm_route, gdn_metadata.replayssm_max_query_len
+            )
+        )
+        if use_lossy_gdn_decode or use_flydsl_decode or fuse_gate:
             g_spec = None
             beta_spec = None
             g_non_spec = None
@@ -401,6 +418,16 @@ class GatedDeltaNet(nn.Module):
                     use_qk_l2norm_in_kernel=True,
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
+                    # A pure-spec step writes straight into the result; the
+                    # merge below then has nothing to copy.
+                    out=(
+                        core_attn_out[:num_tokens_spec].view(value_spec.shape)
+                        if pure_spec_step
+                        and core_attn_out.is_contiguous()
+                        and core_attn_out.dtype == query_spec.dtype
+                        else None
+                    ),
+                    gate=(self.A_log, a, b, self.dt_bias) if fuse_gate else None,
                 )
                 last_recurrent_state = None
             else:
@@ -623,7 +650,8 @@ class GatedDeltaNet(nn.Module):
             merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+            if core_attn_out_spec.data_ptr() != core_attn_out.data_ptr():
+                core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif core_attn_out_non_spec.data_ptr() != core_attn_out.data_ptr():
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 

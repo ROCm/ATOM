@@ -55,6 +55,10 @@ from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compress_groups,
+    qsa_index_prep,
+    qsa_index_prep_supported,
+    qsa_qk_prep,
+    qsa_qk_prep_supported,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_rows,
@@ -400,34 +404,17 @@ class Qwen4ExpAttention(nn.Module):
         projected_qk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Update both index caches, then return the per-token selection."""
-        index_q, raw_key = self.indexer.project_qk(
-            hidden_states, positions, projected_qk
-        )
-        qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
-        if self.rope_position_cache is not None:
-            qsa_store_rows(
-                self.rope_position_cache,
-                qsa.slot_mapping,
-                canonical_rope_positions(positions[..., : hidden_states.shape[0]]),
-            )
-
-        pooled, first_positions = qsa_compress_groups(
-            self.raw_key_cache,
-            qsa.block_tables,
-            qsa.token_to_req,
-            qsa.logical_positions,
-            qsa.compressed_slot_mapping,
-            self.indexer.compress_ratio,
-            position_cache=self.rope_position_cache,
-            # Draft RoPE is one ahead of its logical cache slots.
-            rope_position_offset=int(get_forward_context().context.is_draft),
-        )
-        normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
-        qsa_store_rows(
-            self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
-        )
-
         forward_context = get_forward_context()
+        index_q = None
+        if envs.ATOM_QWEN38_QSA_FUSED_INDEX and not forward_context.context.is_prefill:
+            if projected_qk is None:
+                projected_qk = self.indexer.index_qk_proj(
+                    hidden_states, otype=hidden_states.dtype
+                )
+            index_q = self._fused_index_prep(positions, qsa, projected_qk)
+        if index_q is None:
+            index_q = self._index_prep(hidden_states, positions, qsa, projected_qk)
+
         index_cp = None
         if self.qsa_index_cp and not forward_context.context.is_prefill:
             group = get_qsa_cp_decode_group(
@@ -459,6 +446,65 @@ class Qwen4ExpAttention(nn.Module):
             ),
         )
 
+    def _index_prep(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        qsa,
+        projected_qk: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Index Q; raw K, positions and closed groups into their caches."""
+        index_q, raw_key = self.indexer.project_qk(
+            hidden_states, positions, projected_qk
+        )
+        qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
+        if self.rope_position_cache is not None:
+            qsa_store_rows(
+                self.rope_position_cache,
+                qsa.slot_mapping,
+                canonical_rope_positions(positions[..., : hidden_states.shape[0]]),
+            )
+
+        pooled, first_positions = qsa_compress_groups(
+            self.raw_key_cache,
+            qsa.block_tables,
+            qsa.token_to_req,
+            qsa.logical_positions,
+            qsa.compressed_slot_mapping,
+            self.indexer.compress_ratio,
+            position_cache=self.rope_position_cache,
+            # Draft RoPE is one ahead of its logical cache slots.
+            rope_position_offset=int(get_forward_context().context.is_draft),
+        )
+        normalized = self.indexer.normalize_compressed_keys(pooled, first_positions)
+        qsa_store_rows(
+            self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
+        )
+        return index_q
+
+    def _fused_index_prep(
+        self, positions: torch.Tensor, qsa, projected_qk: torch.Tensor
+    ) -> torch.Tensor | None:
+        """`_index_prep` in one launch, bitwise identical; None where
+        `qsa_index_prep` does not apply."""
+        if not qsa_index_prep_supported(self.indexer, projected_qk, self.raw_key_cache):
+            return None
+        return qsa_index_prep(
+            self.indexer,
+            projected_qk,
+            positions,
+            qsa.slot_mapping,
+            qsa.compressed_slot_mapping,
+            qsa.token_to_req,
+            qsa.logical_positions,
+            qsa.block_tables,
+            self.raw_key_cache,
+            self.compressed_key_cache,
+            position_cache=self.rope_position_cache,
+            # Draft RoPE is one ahead of its logical cache slots.
+            rope_position_offset=int(get_forward_context().context.is_draft),
+        )
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -471,31 +517,56 @@ class Qwen4ExpAttention(nn.Module):
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
-        # Normalization and cache writes accept packed token strides without copies.
-        q, k = self.qk_norm(q, k)
-        query, key = qsa_apply_mrope(
-            self.rotary_emb,
-            positions,
-            q.view(num_tokens, self.num_heads, self.head_dim),
-            k.view(num_tokens, self.num_kv_heads, self.head_dim),
-        )
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        fused_qk = False
+        if qsa is not None:
+            qsa = qsa.for_tokens(num_tokens)
+            fused_qk = (
+                envs.ATOM_QWEN38_QSA_FUSED_QK
+                and not forward_context.context.is_prefill
+                and qsa_qk_prep_supported(
+                    self.qk_norm, self.rotary_emb, q, k, v, self.k_cache, self.v_cache
+                )
+            )
+        if fused_qk:
+            # Norm, mRoPE and the KV cache write in one launch, bitwise identical.
+            query, key = qsa_qk_prep(
+                self.qk_norm,
+                self.rotary_emb,
+                positions,
+                q,
+                k,
+                v,
+                qsa.slot_mapping,
+                self.k_cache,
+                self.v_cache,
+            )
+        else:
+            # Normalization and cache writes accept packed token strides
+            # without copies.
+            q, k = self.qk_norm(q, k)
+            query, key = qsa_apply_mrope(
+                self.rotary_emb,
+                positions,
+                q.view(num_tokens, self.num_heads, self.head_dim),
+                k.view(num_tokens, self.num_kv_heads, self.head_dim),
+            )
         if qsa is None:
             attn_out = self._profile_attention(
                 query, key, value, hidden_states, positions
             )
         else:
-            qsa = qsa.for_tokens(num_tokens)
-            aiter.reshape_and_cache_flash(
-                key,
-                value,
-                self.k_cache,
-                self.v_cache,
-                qsa.slot_mapping,
-                "auto",
-                self._unit_scale,
-                self._unit_scale,
-            )
+            if not fused_qk:
+                aiter.reshape_and_cache_flash(
+                    key,
+                    value,
+                    self.k_cache,
+                    self.v_cache,
+                    qsa.slot_mapping,
+                    "auto",
+                    self._unit_scale,
+                    self._unit_scale,
+                )
             selected = self._select_tokens(hidden_states, positions, qsa, projected_qk)
             attn_out = qsa_sparse_paged_gqa(
                 query,
