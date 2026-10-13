@@ -1,6 +1,6 @@
 import fnmatch
 import re
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -34,7 +34,6 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import Qwen3NextMLP, mamba_v2_sharded_weight_loader
-from atom.models.qwen4_exp_mapping import qwen4_exp_packed_modules_mapping
 from atom.models.utils import (
     IntermediateTensors,
     extract_layer_index,
@@ -44,6 +43,19 @@ from atom.models.utils import (
 )
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.forward_context import get_forward_context
+
+
+def qwen4_exp_packed_modules_mapping(
+    base_mapping: dict[str, Any], split_ngram_parts: int
+) -> dict[str, Any]:
+    """Add the checkpoint's n-gram shards to this model's packed mapping."""
+    return {
+        **base_mapping,
+        **{
+            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+            for shard in range(int(split_ngram_parts))
+        },
+    }
 
 
 class _Qwen4ExpQuantizationConfig:

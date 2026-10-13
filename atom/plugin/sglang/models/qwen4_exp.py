@@ -125,7 +125,7 @@ def apply_prepare_qwen4_exp_adaptations(atom_config: Any, model_arch: str) -> No
     # them onto ``in_proj_qkvzba`` here rewrites PTPC exclude ``in_proj_b/a``
     # onto the same name as quantized ``in_proj_qkv/z``, so the layer builds
     # unquantized ``qkvzba`` and drops ``weight_scale`` (72 tensors / 36 GDN).
-    from atom.models.qwen4_exp_mapping import qwen4_exp_packed_modules_mapping
+    from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
 
     packed = qwen4_exp_packed_modules_mapping(
         dict(getattr(native, "packed_modules_mapping", {})), ngram_parts

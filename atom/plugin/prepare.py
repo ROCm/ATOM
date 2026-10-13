@@ -112,7 +112,7 @@ def _prepare_model_atom_rtpllm(
 
     if model_arch == "Qwen4ExpForConditionalGeneration":
         from atom.model_loader.loader import WeightsMapper
-        from atom.models.qwen4_exp_mapping import qwen4_exp_packed_modules_mapping
+        from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
 
         # The RTP bridge below currently feeds token IDs only. Do not build a
         # vision tower that RTP never supplies pixel tensors or mRoPE grids to.

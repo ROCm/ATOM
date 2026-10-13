@@ -11,7 +11,7 @@ import triton
 from rtp_llm.model_factory_register import _model_factory
 from rtp_llm.ops import DataType, HybridAttentionType
 
-from atom.models.qwen4_exp_mapping import qwen4_exp_packed_modules_mapping
+from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
 from atom.plugin.rtpllm.models.qwen3_5 import _ATOMQwen35MoeRuntime
 from atom.plugin.rtpllm.models.qwen4_exp import (
     ATOMQwen4Exp,
