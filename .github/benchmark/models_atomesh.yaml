@@ -873,7 +873,8 @@ models:
 
         # PP8xTP1 counterpart to the aggregated C72 cell above, same workload and
         # server knobs.
-        - <<: *kimi_k3_agentic_no_dspark
+        - &kimi_k3_agentic_agg_pp8
+          <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-agg-pp8-tp1-agentic-lmcache-1m-c72
           topology: agg
           display_topology: AGG-PP8-TP1
@@ -917,6 +918,18 @@ models:
               ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        # The PP8 cell above at half the stages, each spanning two GPUs. MLA's
+        # latent KV is replicated across TP ranks, so this holds half the
+        # tokens per GPU that PP8 does.
+        - <<: *kimi_k3_agentic_agg_pp8
+          name: kimi-k3-mxfp4-agg-pp4-tp2-agentic-lmcache-1m-c72
+          display_topology: AGG-PP4-TP2
+          decode:
+            workers: 1
+            tp: 2
+            cudagraph: none
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager"
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
