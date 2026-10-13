@@ -16,11 +16,17 @@ from itertools import pairwise
 
 import torch
 
-from atom.model_ops.sp_mega_buffers import copy_tail
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 logger = logging.getLogger("atom")
+
+
+def copy_tail(source, source_scale, out, out_scale):
+    # Keep dispatch and settings importable without the GPU kernel dependencies.
+    from atom.model_ops.sp_mega_buffers import copy_tail as copy
+
+    copy(source, source_scale, out, out_scale)
 
 
 @dataclass(frozen=True)

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """CPU checks of the real SP dispatch, tiling and shared-runtime lifetime."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -319,6 +320,15 @@ def test_initialize_shares_prepared_runtime_across_layers(
     from importlib import import_module
 
     from conftest import atom_config_double
+
+    # This test supplies bare MoE layers. Decoder fusion is covered separately;
+    # importing its GPU attention stack would defeat this CPU runtime test.
+    class Decoder(torch.nn.Module):
+        pass
+
+    decoder_module = ModuleType("atom.models.minimax_m3.model")
+    decoder_module.MiniMaxM3DecoderLayer = Decoder
+    monkeypatch.setitem(sys.modules, decoder_module.__name__, decoder_module)
 
     state = import_module("aiter.dist.parallel_state")
     api = import_module("aiter.ops.flydsl.mega_moe_tp")

@@ -36,6 +36,7 @@ def sp_modules(request):
 def _layer(moe):
     method = object.__new__(moe.Mxfp4MoEMethod)
     method.quant_type = moe.QuantType.per_1x32
+    method.fp8_activations = False
     return SimpleNamespace(
         quant_method=method,
         moe_parallel_config=SimpleNamespace(
