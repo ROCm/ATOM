@@ -476,6 +476,15 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
+# Mooncake Store (WITH_STORE=ON) on top of the TransferEngine: the
+# `mooncake.store` client of the mooncake_store offload connector
+# (ATOM_KV_OFFLOAD=mooncake_store) and the `mooncake_master` /
+# `mooncake_client` processes the atomesh launcher starts (MOONCAKE_STORE=1).
+# On by default: nothing runs the Store unless one of those two asks for it, so
+# P->D KV through the TransferEngine moves as it does without the Store.
+# INSTALL_MOONCAKE_STORE=0 configures WITH_STORE=OFF, for a base on which a
+# Store dependency (cachelib) does not build.
+ARG INSTALL_MOONCAKE_STORE=1
 # Upstream Mooncake release tag with HIP dma-buf MR support.
 # Note: this tag does not include the Ionic QP atomic resource clamp.
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
@@ -533,14 +542,17 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # both protocols and excludes HIP IPC for cross-host transfers.
 # USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
 # hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
-# ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
-# and its Rust bindings stay off: they add build surface (cachelib, cargo) that
-# nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
+# ATOM consumes the TransferEngine (`mooncake.engine`) for P->D, and Mooncake
+# Store only with INSTALL_MOONCAKE_STORE=1. The Store's Rust bindings stay off:
+# nothing here loads them, and WITH_STORE_RUST=ON is a hard error without
+# WITH_STORE.
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON) =========="; \
+        MC_WITH_STORE=OFF; \
+        if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
         HSA_PREFIXS="/opt/rocm"; \
         for cfg in /opt/rocm/lib/cmake/hsa-runtime64/hsa-runtime64Config.cmake \
                    /opt/rocm/lib64/cmake/hsa-runtime64/hsa-runtime64Config.cmake; do \
@@ -549,7 +561,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
              -DENABLE_MULTI_PROTOCOL=ON \
-             -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+             -DWITH_TE=ON -DWITH_STORE=${MC_WITH_STORE} -DWITH_STORE_RUST=OFF \
              -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
@@ -557,6 +569,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && cat /tmp/mooncake-cmake.log \
         && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
              || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
+        && { grep -qx "WITH_STORE:BOOL=${MC_WITH_STORE}" CMakeCache.txt \
+             || { echo "ERROR: Mooncake was not configured WITH_STORE=${MC_WITH_STORE}"; exit 1; }; } \
         && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
              grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
                || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
@@ -574,6 +588,12 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && ldconfig \
         && ( grep -a -R -l "ibv_reg_dmabuf_mr" /usr/local/lib /opt/venv 2>/dev/null | head -n 1 \
              || { echo "ERROR: installed Mooncake libs have no ibv_reg_dmabuf_mr"; exit 1; } ) \
+        && if [ "${MC_WITH_STORE}" = "ON" ]; then \
+             { command -v mooncake_master && command -v mooncake_client \
+               || { echo "ERROR: Mooncake Store binaries mooncake_master / mooncake_client are missing"; exit 1; }; } \
+             && { "${VENV_PYTHON}" -c "from mooncake.store import MooncakeDistributedStore" \
+               || { echo "ERROR: the mooncake.store Python module does not import"; exit 1; }; }; \
+           fi \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi

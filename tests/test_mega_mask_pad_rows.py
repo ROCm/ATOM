@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """DP pad rows on the MegaMoE backend (ATOM_MEGA_MASK_PAD_ROWS): routed to -1,
 returned as zeros. The MegaMoEV2 op is a fake that records the ids it was handed
-and returns NaN, so a row that is not zeroed fails loudly. CPU only.
+and returns NaN, so a row that is not zeroed fails loudly. The GPU-only row
+zeroing helper is replaced with an in-place CPU test double.
 """
 
 import sys
@@ -10,6 +11,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
+pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
 
 import atom.utils.forward_context as fc
 from atom.model_ops.fused_moe import flydsl_mega_experts as mega
@@ -50,6 +53,13 @@ def run(monkeypatch):
     monkeypatch.setattr(fc, "_row_index_device", None)
     monkeypatch.setattr(fc, "_real_requests_device", None)
     fc.enable_pad_rows_device(256, torch.device("cpu"))
+
+    def zero_pad_rows_(out, pad_rows):
+        seen["zero_pad_calls"] = seen.get("zero_pad_calls", 0) + 1
+        out.masked_fill_(pad_rows, 0)
+        return out
+
+    monkeypatch.setattr(mega, "zero_pad_rows_", zero_pad_rows_)
     layer = SimpleNamespace(
         **{
             name: torch.zeros(48, 4, dtype=torch.uint8)
@@ -130,16 +140,18 @@ def test_disabled_is_identity(run):
     assert out.isnan().all()
 
 
-def test_switch_follows_the_env(monkeypatch):
+def test_switch_defaults_on_and_follows_the_env(monkeypatch):
     enabled = []
     monkeypatch.setattr(
         fc, "enable_pad_rows_device", lambda rows, device: enabled.append(rows)
     )
+    monkeypatch.delenv("ATOM_MEGA_MASK_PAD_ROWS", raising=False)
+    assert mega._enable_mega_pad_row_mask(128) is True
     monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
     assert mega._enable_mega_pad_row_mask(128) is False
     monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "1")
     assert mega._enable_mega_pad_row_mask(128) is True
-    assert enabled == [128]
+    assert enabled == [128, 128]
 
 
 def test_masking_combine_output_is_not_reselected(run, monkeypatch):

@@ -161,11 +161,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to rebuild every layer's window and compressor state exactly.
     "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
     in {"1", "true", "yes", "on"},
-    # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
-    # "lmcache_mp" (standalone `lmcache server`). Unset = off.
+    # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
+    # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
+    # Store, no LMCache). Unset = off.
     "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),
     # JSON object for that connector's kv_connector_extra_config, e.g.
-    # {"lmcache.chunk_size": 256} or {"lmcache.mp.port": 5556}.
+    # {"lmcache.chunk_size": 256}, {"lmcache.mp.port": 5556} or
+    # {"mooncake_store.master": "10.0.0.1:26051", ...}.
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
@@ -299,7 +301,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
     # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
     # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
-    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "0") == "1",
+    # Set to 0 to retain the unmasked path.
+    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "1") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
