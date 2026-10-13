@@ -25,14 +25,82 @@ half. The steps line up one for one and not one of them is the same computation
 -- which is why the seam is here, above the per-layer write, and not inside it.
 """
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
+
+
+@dataclass(frozen=True)
+class DraftSampling:
+    """Everything the block sampler needs to draw -- and publish -- a real q.
+
+    Bound ONCE, at drafter init, and never rebound: the block head is
+    cudagraph-captured (``DSparkProposer._declare_draft_graphs``,
+    ``capture_epilogue=True``), so every address here is baked into the
+    recording and a replay reads whatever the step before it wrote into these
+    exact buffers. That is also why the per-step seed is a one-element DEVICE
+    tensor rather than a python int: the value has to be refreshable from
+    outside the recording.
+
+    Sized at ``max_num_seqs``; the block runs at ``running_bs <= max_num_seqs``
+    and slices.
+    """
+
+    #: [max_bs, T, V] fp32 -- q, the distribution each draft token was drawn
+    #: from. Read a STEP LATER by the accept kernel, so it outlives the pass
+    #: and cannot live in the graph's private pool.
+    probs: torch.Tensor
+    #: [max_bs] fp32, pre-clamped away from 0 (``SAMPLER_EPS``).
+    temperatures: torch.Tensor
+    #: [max_bs] int32, nonzero where the draw is an argmax -- i.e. where the
+    #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
+    #: predicate ``Sampler`` itself tests.
+    greedy_mask: torch.Tensor
+    #: [1] int32, the Philox key. MUST hold the same value on every TP/PCP rank.
+    seed: torch.Tensor
 
 
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
     supports_block_graph = True
+
+    #: Does this flavor implement the SAMPLED block sampler -- i.e. does its
+    #: markov head provide ``sample_next_q`` and does ``_sample_block`` branch
+    #: on ``draft_sampling``? False here, and overridden to True only by the
+    #: flavors that have actually been ported and run on hardware.
+    #:
+    #: An EXPLICIT class flag rather than a ``hasattr(head, "sample_next_q")``
+    #: probe on purpose. The duck-typed version silently arms whichever flavor
+    #: happens to grow that method next -- and ``DSparkMarkovHead`` is a name
+    #: carried by two independent classes (``kimi_k3_dspark`` and
+    #: ``deepseek_v4_dspark``), so the day the V4 head grows one, DSv4 and
+    #: DSv4.1-Flash would flip on without anybody choosing it.
+    supports_lossless_draft = False
+
+    #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
+    #: None keeps the greedy block sampler, which is both the historical path
+    #: and the one a temperature-0 deployment should still take.
+    #: A CLASS default because every flavor's ``_sample_block`` reads it and
+    #: only the ported flavors implement the sampled branch.
+    draft_sampling: "DraftSampling | None" = None
+
+    def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
+        """Hand this model the buffers its block sampler draws into.
+
+        Called once from ``DSparkProposer.__init__``, before any warmup or
+        capture, so the sampled branch is the one that gets JITed and recorded.
+        Switching it per STEP would not work anyway: the branch is python, and
+        a captured graph holds whichever side was taken at capture.
+        """
+        if sampling is not None and not self.supports_lossless_draft:
+            raise ValueError(
+                f"{type(self).__name__} does not declare supports_lossless_draft; "
+                "binding draft sampling buffers to it would publish a q the "
+                "block sampler never draws from"
+            )
+        self.draft_sampling = sampling
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
@@ -122,3 +190,57 @@ class DSparkDraftModel(nn.Module):
         argument whose shape says how many requests there are.
         """
         raise NotImplementedError
+
+    def sample_block_lossless(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """Markov-biased left-to-right SAMPLING over the computed block.
+
+            logits_k <- U_k + B(x_{k-1}, .)
+            q_k      <- softmax(logits_k / T)        -- published
+            x_k      <- q_k                          -- drawn, not argmaxed
+
+        Lives here rather than in each flavor because the flavors carry
+        near-identical ``_sample_block``s that must stay in sync, and the thing
+        most likely to drift between them is the noise offset below -- a
+        position that reused another's Philox counter would correlate two draws
+        inside one block and quietly bias q.
+
+        See ``atom/model_ops/dspark_markov_sample.py`` for why this trades away
+        the fused op's "never materialize [B, V]" property, and
+        ``envs.ATOM_SPEC_LOSSLESS_SAMPLING`` for what it buys.
+        """
+        sampling = self.draft_sampling
+        assert sampling is not None, "sample_block_lossless needs bound buffers"
+        bs, num_draft, vocab = base_logits.shape
+        probs = sampling.probs
+        assert probs.shape[1] >= num_draft and probs.shape[2] == vocab, (
+            f"q buffer is {tuple(probs.shape[1:])} per request but the block is "
+            f"[{num_draft}, {vocab}]; the accept kernel indexes the two as one"
+        )
+        # The counter STRIDE is the buffer's max batch, not this step's, so the
+        # uniform a (position, row, id) draws does not move when the batch
+        # does. Rank consistency is about the seed; this is about the step
+        # before it not having drawn the same numbers for different tokens.
+        position_stride = probs.shape[0] * vocab
+        temperatures = sampling.temperatures[:bs]
+        greedy_mask = sampling.greedy_mask[:bs]
+
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            # `probs[:bs, k]` is [bs, V] with the vocab axis contiguous and a
+            # T*V row stride -- the op takes the stride, so no copy.
+            self.markov_head.sample_next_q(
+                out_ids[:, k],
+                base_logits[:, k],
+                out_ids[:, k + 1],
+                probs[:bs, k],
+                temperatures,
+                greedy_mask,
+                sampling.seed,
+                k * position_stride,
+            )
+        return out_ids[:, 1:]

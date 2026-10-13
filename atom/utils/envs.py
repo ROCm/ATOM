@@ -483,6 +483,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Lossless speculative sampling: draw the DSpark draft block from
+    # softmax(logits / T) and accept with the probability-ratio rule
+    # (`coin * q < p`) instead of proposing greedily and accepting only on exact
+    # equality with the target's own draw. BOTH halves or neither -- a ratio
+    # kernel over a greedy draft is an arithmetic no-op (for a delta q,
+    # sum_x min(p, q) = p(x*), which is what the exact-match kernel already
+    # computes), and a sampled draft under exact-match acceptance is strictly
+    # worse than today.
+    #
+    # DEFAULT OFF, and deliberately. It changes the EMITTED TOKEN DISTRIBUTION
+    # (both rules are target-exact, but they are not the same draw) and it
+    # REFUSES top-k/top-p batches with NotImplementedError rather than
+    # approximating them -- the draft's q is unfiltered, so a filtered target p
+    # would silently change the distribution. Defaulting it on would turn a
+    # working top-p deployment into an outage, and the house convention is that
+    # a behaviour-changing flag defaults off.
+    #
+    # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
+    # q is [bs, T, V] and has to cross the step boundary -- 200 MiB fp32 at
+    # --max-num-seqs 64, V=163840, T=5 -- and the de-fused draft step measures
+    # +68 us at bs=1 and +363 us at bs=64 under graph replay, against a ~3.76 ms
+    # step. Temperature-0 is unaffected either way: an all-greedy batch keeps
+    # the exact-match accept kernel, and a greedy ROW inside a mixed batch draws
+    # a delta q that makes the ratio rule degenerate to exact match.
+    #
+    # Only a draft model that declares `supports_lossless_draft` honours it;
+    # any other flavor keeps the greedy pair, silently -- "this flavor has not
+    # been ported" is not an operator error. Read at drafter construction, so it
+    # must be set before the server starts.
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
+        os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft

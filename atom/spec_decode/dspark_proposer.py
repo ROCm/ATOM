@@ -7,10 +7,13 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.distributed.pcp_utils import get_pcp_world_size
+from atom.model_ops.sampler import SAMPLER_EPS
+from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
-from atom.utils import envs
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.forward_context import get_forward_context
 
@@ -46,6 +49,20 @@ class DSparkProposer(Drafter):
     driven by a confidence schedule (variable-length, Level B) verification.
     """
 
+    #: Lossless speculative sampling, bound by `_init_lossless_sampling`. CLASS
+    #: defaults because `propose` reads these on every step and the proposer is
+    #: reachable in a half-built state (the metadata-build tests assemble one
+    #: via `__new__`). None is "greedy block sampler", which is the right answer
+    #: for a proposer that was never initialized.
+    draft_sampling = None
+    _draft_probs_flat = None
+    _draft_probs_row_base_buf = None
+    # None rather than `{}`: a mutable class default is shared by every
+    # instance, and `record_draft_probs_slots` writes to this one every step.
+    # `_init_lossless_sampling` installs the real per-instance dict.
+    _draft_probs_slots = None
+    _draft_sample_step = 0
+
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
         # Confidence-scheduled verification (Level B, variable-length verify) is
@@ -66,6 +83,180 @@ class DSparkProposer(Drafter):
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
             self._init_draft_block_buffers()
+        # Lossless speculative sampling. Must run BEFORE any warmup or capture
+        # (`warmup_draft_graphs` is called later, by the runner): the block
+        # sampler branches on the binding in python, so whichever side is bound
+        # here is the side that gets JITed and recorded.
+        self._init_lossless_sampling()
+
+    # ---- lossless speculative sampling --------------------------------------
+
+    def _init_lossless_sampling(self) -> None:
+        """Bind the draft's sampling buffers, or leave the greedy path in place.
+
+        See `envs.ATOM_SPEC_LOSSLESS_SAMPLING` for what this buys and costs, and
+        why it defaults OFF. The two halves -- draft-side sampling and the ratio
+        accept rule -- are armed by the same flag because either alone is a
+        regression: a ratio kernel over a greedy delta q is an arithmetic no-op
+        (`sum_x min(p, q) = p(x*)`), and a sampled draft under exact-match
+        acceptance matches the target's draw strictly less often than a greedy
+        one does.
+        """
+        self.draft_sampling = None
+        self._draft_probs_flat = None
+        self._draft_probs_row_base_buf = None
+        self._draft_probs_slots = {}
+        self._draft_sample_step = 0
+        if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
+            return
+        model = getattr(self, "model", None)
+        if model is None or not getattr(model, "supports_lossless_draft", False):
+            # This flavor's block sampler has not been given the sampled entry
+            # point, and claiming a flavor is lossless when its draft is still
+            # greedy is worse than running the greedy pair. An EXPLICIT class
+            # flag, not `hasattr(markov_head, "sample_next_q")`: two independent
+            # classes are named `DSparkMarkovHead`, so a duck-typed probe would
+            # arm DeepSeek-V4 the day its head grew that method. Silent, because
+            # "this flavor has not been ported" is not an operator error.
+            return
+        if get_pcp_world_size() > 1:
+            # PCP decodes redundantly and aligns by BROADCASTING the draft ids
+            # (`ModelRunner.propose_draft_token_ids`), because the ranks' kernels
+            # do NOT agree bit-for-bit -- hidden differs by ~1 bf16 ULP. q would
+            # have to be broadcast with them or rank>0 tests `q(x)` for an `x`
+            # it did not draw, and q is 200 MiB a step.
+            #
+            # Falls back rather than raising: the fallback is TODAY's behaviour,
+            # correct and merely lower-acceptance, so refusing to start would
+            # break a working deployment over a feature it cannot use. (The
+            # top-k/top-p refusal downstream DOES raise, because proceeding
+            # there would change the emitted distribution.)
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is not implemented under PCP "
+                "(pcp=%d): the draft ids are broadcast across PCP ranks but "
+                "the distribution they were drawn from is not. Falling back to "
+                "greedy proposal with exact-match acceptance.",
+                get_pcp_world_size(),
+            )
+            return
+        max_bs = self.config.max_num_seqs
+        t = self.draft_tokens_per_seq
+        vocab = int(self.model.vocab_size)
+        # [max_bs, T, V] fp32 -- 200 MiB at 64 / 5 / 163840. Allocated ONCE and
+        # never reallocated: a capture bakes the address, and the accept kernel
+        # reads it a step after the pass that wrote it, so it cannot come from
+        # the graph's private pool either.
+        probs = torch.empty((max_bs, t, vocab), dtype=torch.float32, device=self.device)
+        self.draft_sampling = DraftSampling(
+            probs=probs,
+            # Default 1.0 rather than 0: the tail rows between `scheduled_bs`
+            # and `running_bs` are fabricated and nothing reads their q, but a
+            # 0 here would divide by zero inside the kernel on every step.
+            temperatures=torch.ones(max_bs, dtype=torch.float32, device=self.device),
+            greedy_mask=torch.ones(max_bs, dtype=torch.int32, device=self.device),
+            seed=torch.zeros(1, dtype=torch.int32, device=self.device),
+        )
+        # Flat `[max_bs * T, V]` view, which is how the accept kernel addresses
+        # it: one row per (request slot, block position).
+        self._draft_probs_flat = probs.view(max_bs * t, vocab)
+        # req_id -> the batch slot that request's q was written at. Keyed by
+        # req_id and NOT by position because continuous batching reorders the
+        # batch between the propose that wrote q and the verify that reads it
+        # -- the same reason `VerifyScheduler` keys its ell map by req_id.
+        self._draft_probs_row_base_buf = CpuGpuBuffer(
+            max_bs,
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=torch.device(self.device).type != "cpu",
+        )
+        self.model.bind_draft_sampling(self.draft_sampling)
+        if self.runner.rank == 0:
+            logger.info(
+                "Lossless speculative sampling armed: draft q buffer "
+                "[%d, %d, %d] fp32 (%.0f MiB)",
+                max_bs,
+                t,
+                vocab,
+                probs.numel() * 4 / 2**20,
+            )
+
+    @property
+    def draft_probs(self) -> torch.Tensor | None:
+        """``[max_bs * T, V]`` fp32 q, or None when the greedy pair is running."""
+        return None if self.draft_sampling is None else self._draft_probs_flat
+
+    def stage_draft_sampling(self, scheduled_bs: int) -> None:
+        """Refresh this step's temperatures, greedy mask and Philox key.
+
+        OUTSIDE the recording, every step: the block head is captured, so the
+        only thing that can vary between replays is the CONTENT of the buffers
+        whose addresses it baked.
+
+        Reads the runner's own per-request sampling parameters rather than
+        taking them as arguments, so the temperature the draft divides by is
+        literally the same tensor the target's verify softmax will divide by
+        -- `rejection_sampler._ratio_target_probs` reads the same buffer.
+        """
+        if self.draft_sampling is None or scheduled_bs == 0:
+            return
+        temperatures = self.runner.forward_vars["temperatures"].gpu[:scheduled_bs]
+        dst = self.draft_sampling.temperatures[:scheduled_bs]
+        dst.copy_(temperatures)
+        # A greedy row is "temperature was 0 before `prepare_sample` clamped it
+        # to SAMPLER_EPS", and `Sampler` itself tests `temperatures <=
+        # SAMPLER_EPS` -- the same predicate, so a row cannot be greedy to the
+        # target and stochastic to the draft.
+        self.draft_sampling.greedy_mask[:scheduled_bs].copy_(
+            (dst <= SAMPLER_EPS).to(torch.int32)
+        )
+        # The Philox key. A plain SPMD counter, so every TP rank reaches the
+        # same number without exchanging it -- which is the whole requirement:
+        # ranks drawing different uniforms draft different blocks, and
+        # `num_bonus_tokens` (rank-local) then disagrees with `sampled_tokens`
+        # (broadcast from rank 0), the anchor gather reads a -1 column, and the
+        # draft embeds an invalid id.
+        self.draft_sampling.seed.fill_(self._draft_sample_step)
+        self._draft_sample_step = (self._draft_sample_step + 1) & 0x7FFFFFFF
+
+    def record_draft_probs_slots(self, req_ids) -> None:
+        """Remember which batch slot each request's q was just written at."""
+        if self.draft_sampling is None:
+            return
+        self._draft_probs_slots = {req_id: i for i, req_id in enumerate(req_ids)}
+
+    def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
+        """``[len(req_ids)]`` int32: each request's first q row, for the accept
+        kernel's indirection.
+
+        A request absent from the map has NO live q this step, and the kernel is
+        told so with the NEGATIVE SENTINEL -1.
+
+        It used to answer 0, on the premise that an absent request had just
+        prefilled and so carried `num_draft_tokens == 0`, leaving the base
+        loaded but never dereferenced. That premise is FALSE, and the bug it hid
+        cost 24.4% of inline accuracy. `_draft_probs_slots` is REPLACED WHOLESALE
+        on every propose, so it only ever describes the LAST propose batch: when
+        a propose covers 1-2 requests and the next verify covers ~32, the ~30
+        requests drafted at an earlier step are absent and every one of them read
+        row 0 -- request 0's distribution.
+
+        Row 0 is in range and holds q > 0, so it passes the kernel's probability
+        guard and `coin * q < p` then accepts UNCONDITIONALLY -- acceptance RISES
+        (measured 3.01) while the accepted tokens are unfiltered draft samples.
+        In-range was never the safety property; being the RIGHT row is. -1 is out
+        of range deliberately, so the kernel has to handle it explicitly instead
+        of silently reading somebody else's q.
+        """
+        if self.draft_sampling is None:
+            return None
+        t = self.draft_tokens_per_seq
+        slots = self._draft_probs_slots
+        buf = self._draft_probs_row_base_buf
+        n = len(req_ids)
+        buf.np[:n] = [
+            slots[req_id] * t if req_id in slots else -1 for req_id in req_ids
+        ]
+        return buf.copy_to_gpu(n)
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.
@@ -684,6 +875,14 @@ class DSparkProposer(Drafter):
         staged = self._stage_anchors(
             running_bs, next_token_ids, target_positions, last_token_indices
         )
+
+        # This step's temperatures / greedy mask / Philox key into the buffers
+        # the captured block head baked the addresses of. Here, above the flavor
+        # split, so neither path can forget it -- a stale seed would make two
+        # consecutive steps draft from the SAME uniform stream. Sized by the
+        # SCHEDULED batch: the pad rows up to `running_bs` are fabricated and
+        # nothing reads their q.
+        self.stage_draft_sampling(scheduled_bs)
 
         if self._with_draft:
             return self._propose_with_draft(

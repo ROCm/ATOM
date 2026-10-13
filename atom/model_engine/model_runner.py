@@ -3282,11 +3282,37 @@ class ModelRunner:
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
             )
+            # Lossless acceptance: compare against the q the draft actually drew
+            # from (`coin * q < p`) instead of requiring the draft token to
+            # equal the target's own draw. Published by the PREVIOUS step's
+            # propose, so it is keyed back onto this batch by req_id -- the
+            # scheduler reorders between the two. Every drafter but a DSpark one
+            # armed with ATOM_SPEC_LOSSLESS_SAMPLING inherits `Drafter`'s no-op
+            # hooks and answers None here, which keeps the exact-match path.
+            #
+            # `all_greedy` keeps the exact-match kernel, and not only to avoid
+            # the work: at temperature 0 the two rules COINCIDE (a greedy draft
+            # is a delta q, `sum_x min(p, q) = p(x*)`), so the ratio kernel
+            # would buy nothing and could only move the answer by an ulp.
+            draft_probs = None
+            draft_probs_row_base = None
+            drafter = getattr(self, "drafter", None)
+            if not all_greedy and drafter is not None:
+                draft_probs = drafter.draft_probs
+                if draft_probs is not None:
+                    draft_probs_row_base = drafter.draft_probs_row_base(
+                        batch.req_ids[:bs]
+                    )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
+                draft_probs=draft_probs,
+                draft_probs_row_base=draft_probs_row_base,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
             )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
@@ -3661,6 +3687,13 @@ class ModelRunner:
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
+        # Same stash, same reason, for the draft distribution q: it was written
+        # at THIS step's batch slots and the next step's verify has to find it
+        # after the scheduler has reordered the batch. Keyed by req_id, not by
+        # position. Positional, like `record_ell` above: the block was drafted
+        # from `next_token_ids`, which is in batch-slot order. A no-op on every
+        # drafter but a DSpark one with lossless sampling armed.
+        self.drafter.record_draft_probs_slots(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     def start_capture_profiler(self):

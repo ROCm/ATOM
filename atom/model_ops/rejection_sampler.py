@@ -463,6 +463,21 @@ def rejection_sample(
             "the probability-ratio path needs the target temperatures: p is "
             "softmax(target_logits / T), not softmax(target_logits)"
         )
+        # PRECEDENCE, stated rather than left to branch order. The ratio branch
+        # below sits ABOVE the relaxed one, so with ATOM_ENABLE_RELAXED_MTP=1
+        # the relaxed path would simply never run and nothing would say so.
+        # The two are not combinable: relaxed acceptance takes any draft inside
+        # a top-N probability band and is deliberately NOT distribution-
+        # preserving, while the ratio rule's entire claim is that it is. Silently
+        # dropping either one is the kind of thing that shows up as an accuracy
+        # number nobody can explain, so a config asking for both is refused.
+        if RELAXED_TOP_N > 1:
+            raise NotImplementedError(
+                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
+                "mutually exclusive: relaxed top-N acceptance is approximate by "
+                "construction and the probability-ratio rule is exact, so there "
+                "is no defensible way to apply both. Turn one off."
+            )
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
@@ -540,6 +555,10 @@ def rejection_sample(
         # q is a delta, sum_x min(p(x), q(x)) = p(x*), and the ratio rule
         # degenerates to exactly the exact-match kernel -- an arithmetic no-op
         # with a full-vocab softmax bolted on.
+        #
+        # Ordered above the relaxed branch, and that precedence is ENFORCED
+        # rather than implied: `RELAXED_TOP_N > 1` with q published is refused
+        # at the top of this function.
         #
         # `target_probs` is raw logits here (every caller passes
         # `target_logits`; only the relaxed path below ever softmaxed them), so
