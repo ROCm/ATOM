@@ -1273,7 +1273,9 @@ models:
               # Avoid the 32K warmup scatter_reduce fault in run 37867633847.
               # Pin the paired pre-scatter M3 kernels; see benchmark/aiter/README.md.
               AITER_CONFIG_FMOE: /workspace/ATOM/.github/benchmark/aiter/minimax_m3_fp4_reduce_tuned_fmoe.csv
-              ATOM_PA_FLYDSL: "1"
+              # Run 38236783820: a FlyDSL launch failed (hipErrorInvalidValue) on
+              # the first 1-row M3 sparse plan and wedged the prefill; use gluon.
+              ATOM_PA_FLYDSL: "0"
               ATOM_PA_FLYDSL_PLAN: "1"
               ATOM_M3_INDEXER_CP: "1"
               ATOM_MONO_ENABLE: "0"
