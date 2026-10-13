@@ -8,42 +8,45 @@ mega_transport_config holds these rules without aiter, so they run on CPU CI.
 import pytest
 
 from atom.model_ops.fused_moe.mega_transport_config import (
-    DISPATCH_KERNELS,
     compact_plan_vmm_bytes,
-    dispatch_kernel_warning,
     mega_dispatch_kwargs,
     resolve_dispatch_kernel,
 )
 
 QUANT_WIRES = ["fp8", "fp4"]
 
-
-@pytest.mark.parametrize("wire", QUANT_WIRES)
-@pytest.mark.parametrize("kernel", sorted(DISPATCH_KERNELS))
-def test_every_kernel_is_selectable_on_a_quant_wire(wire, kernel):
-    assert resolve_dispatch_kernel(wire, kernel, None) == kernel
-
-
-@pytest.mark.parametrize("kernel", ["mori", "flydsl_token_major"])
-def test_token_major_kernels_are_selectable_on_bf16(kernel):
-    assert resolve_dispatch_kernel("bf16", kernel, None) == kernel
+# Kimi-K3's routed MoE: 896 experts, top-16, hidden 3584.
+K3 = {"num_experts": 896, "topk": 16, "hidden_dim": 3584}
+# A MoE shape with no measurement (DeepSeek-R1's).
+UNMEASURED = {"num_experts": 256, "topk": 8, "hidden_dim": 7168}
 
 
-def test_compact_on_bf16_is_rejected():
-    with pytest.raises(ValueError, match="fp8 or fp4"):
-        resolve_dispatch_kernel("bf16", "flydsl_compact", None)
+def _resolve(
+    wire="fp4",
+    mega_dispatch=None,
+    needs_token_major=False,
+    max_tokens_per_rank=16384,
+    **shape,
+):
+    return resolve_dispatch_kernel(
+        dispatch_wire=wire,
+        mega_dispatch=mega_dispatch,
+        needs_token_major=needs_token_major,
+        max_tokens_per_rank=max_tokens_per_rank,
+        **{**K3, **shape},
+    )
 
 
 @pytest.mark.parametrize(
     ("wire", "expected"),
     [("fp8", "mori"), ("fp4", "mori"), ("bf16", "flydsl_token_major")],
 )
-def test_defaults_are_unchanged(wire, expected):
-    assert resolve_dispatch_kernel(wire, None, None) == expected
+def test_unmeasured_shapes_keep_the_defaults(wire, expected):
+    assert _resolve(wire, **UNMEASURED) == (expected, "default")
 
 
 @pytest.mark.parametrize(
-    ("wire", "legacy", "expected"),
+    ("wire", "mega_dispatch", "expected"),
     [
         ("fp4", "mori", "mori"),
         ("fp8", "mori", "mori"),
@@ -53,35 +56,66 @@ def test_defaults_are_unchanged(wire, expected):
         ("bf16", "flydsl", "flydsl_token_major"),
     ],
 )
-def test_legacy_mega_dispatch_keeps_its_meaning(wire, legacy, expected):
-    assert resolve_dispatch_kernel(wire, None, legacy) == expected
+def test_mega_dispatch_overrides_the_choice(wire, mega_dispatch, expected):
+    assert _resolve(wire, mega_dispatch) == (expected, "MEGA_DISPATCH")
 
 
-@pytest.mark.parametrize(
-    ("kernel", "legacy"),
-    [("flydsl_token_major", "flydsl"), ("flydsl_compact", "flydsl"), ("mori", "mori")],
-)
-def test_kernel_with_a_matching_legacy_backend_is_accepted(kernel, legacy):
-    assert resolve_dispatch_kernel("fp4", kernel, legacy) == kernel
-
-
-@pytest.mark.parametrize(
-    ("kernel", "legacy"),
-    [("mori", "flydsl"), ("flydsl_compact", "mori"), ("flydsl_token_major", "mori")],
-)
-def test_kernel_and_legacy_backend_disagreeing_is_rejected(kernel, legacy):
-    with pytest.raises(ValueError, match="disagrees"):
-        resolve_dispatch_kernel("fp4", kernel, legacy)
-
-
-def test_unknown_kernel_is_rejected():
-    with pytest.raises(ValueError, match="ATOM_MEGA_DISPATCH_KERNEL"):
-        resolve_dispatch_kernel("fp4", "deepep", None)
-
-
-def test_unknown_legacy_backend_is_rejected():
+def test_unknown_mega_dispatch_is_rejected():
     with pytest.raises(ValueError, match="MEGA_DISPATCH"):
-        resolve_dispatch_kernel("fp4", None, "deepep")
+        _resolve(mega_dispatch="deepep")
+
+
+@pytest.mark.parametrize("wire", QUANT_WIRES)
+def test_mega_dispatch_flydsl_is_rejected_under_triton_decode(wire):
+    with pytest.raises(ValueError, match="ATOM_USE_TRITON_MOE_DECODE"):
+        _resolve(wire, "flydsl", needs_token_major=True)
+
+
+def test_mega_dispatch_mori_is_accepted_under_triton_decode():
+    assert _resolve(mega_dispatch="mori", needs_token_major=True) == (
+        "mori",
+        "MEGA_DISPATCH",
+    )
+
+
+@pytest.mark.parametrize("max_tokens_per_rank", [1, 2048, 16384])
+def test_k3_on_an_fp4_wire_runs_the_compact_plan(max_tokens_per_rank):
+    assert _resolve(max_tokens_per_rank=max_tokens_per_rank) == (
+        "flydsl_compact",
+        "measured",
+    )
+
+
+def test_k3_past_the_measured_capacity_keeps_the_default():
+    assert _resolve(max_tokens_per_rank=16385) == ("mori", "default")
+
+
+@pytest.mark.parametrize(
+    ("wire", "expected"), [("fp8", "mori"), ("bf16", "flydsl_token_major")]
+)
+def test_k3_on_an_unmeasured_wire_keeps_the_default(wire, expected):
+    assert _resolve(wire) == (expected, "default")
+
+
+@pytest.mark.parametrize(
+    "shape", [{"num_experts": 384}, {"topk": 8}, {"hidden_dim": 7168}]
+)
+def test_a_shape_close_to_k3_keeps_the_default(shape):
+    assert _resolve(**shape) == ("mori", "default")
+
+
+def test_triton_decode_keeps_k3_off_the_compact_plan():
+    assert _resolve(needs_token_major=True) == ("mori", "default")
+
+
+def test_mega_dispatch_beats_the_measurement():
+    assert _resolve(mega_dispatch="mori") == ("mori", "MEGA_DISPATCH")
+
+
+def test_the_kernel_env_var_is_gone():
+    from atom.utils import envs
+
+    assert not hasattr(envs, "ATOM_MEGA_DISPATCH_KERNEL")
 
 
 @pytest.mark.parametrize(
@@ -94,37 +128,6 @@ def test_unknown_legacy_backend_is_rejected():
 )
 def test_kwargs_name_the_kernel(kernel, kwargs):
     assert mega_dispatch_kwargs(kernel) == kwargs
-
-
-@pytest.mark.parametrize("wire", QUANT_WIRES)
-def test_token_major_flydsl_on_a_quant_wire_warns(wire):
-    assert "wrong" in dispatch_kernel_warning("flydsl_token_major", wire)
-
-
-@pytest.mark.parametrize(
-    ("kernel", "wire"),
-    [
-        ("mori", "fp4"),
-        ("flydsl_compact", "fp4"),
-        ("flydsl_token_major", "bf16"),
-        ("mori", "bf16"),
-    ],
-)
-def test_other_combinations_do_not_warn(kernel, wire):
-    assert dispatch_kernel_warning(kernel, wire) is None
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"), [(None, None), ("", None), ("mori", "mori")]
-)
-def test_kernel_env_var(monkeypatch, value, expected):
-    from atom.utils import envs
-
-    if value is None:
-        monkeypatch.delenv("ATOM_MEGA_DISPATCH_KERNEL", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_MEGA_DISPATCH_KERNEL", value)
-    assert envs.ATOM_MEGA_DISPATCH_KERNEL == expected
 
 
 def _compact_row_capacity(*, max_recv, topk, experts_per_rank, tile_m):

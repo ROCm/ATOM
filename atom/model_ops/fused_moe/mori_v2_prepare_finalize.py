@@ -49,7 +49,6 @@ import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.mega_transport_config import (
     compact_plan_vmm_bytes,
-    dispatch_kernel_warning,
     mega_dispatch_kwargs,
     resolve_dispatch_kernel,
 )
@@ -255,15 +254,17 @@ def init_mega_transport(
     situ_beta: torch.Tensor | None = None,
     situ_linear_beta: torch.Tensor | None = None,
     combine_quant: str = "none",
+    needs_token_major: bool = False,
 ) -> Any:
     """Create (and share) the MegaMoE that runs every MoE layer of this model.
 
     Everything here is per-model: the EP geometry, the cco arena, and the expert
     GEMM recipe. Only the weights differ per layer and those are forward()
-    arguments, so one instance covers the whole model. Its dispatch kernel is
-    $ATOM_MEGA_DISPATCH_KERNEL=mori|flydsl_token_major|flydsl_compact, with aiter's
-    older $MEGA_DISPATCH still honoured when that is unset; ATOM passes the choice
-    to aiter on every wire. See resolve_dispatch_kernel.
+    arguments, so one instance covers the whole model. Its dispatch kernel is the
+    measured fastest for this shape, else the wire's default, unless aiter's
+    $MEGA_DISPATCH overrides it; ATOM passes the choice to aiter on every wire.
+    ``needs_token_major`` keeps the compact plan away from Triton decode experts.
+    See resolve_dispatch_kernel.
 
     ``combine_quant`` names the quantized return-trip format this transport is
     to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
@@ -271,10 +272,14 @@ def init_mega_transport(
     every forward then names the one it wants -- bf16 unless it says otherwise.
     See combine_quant_for_step.
     """
-    kernel = resolve_dispatch_kernel(
-        _MEGA_DISPATCH_WIRE,
-        envs.ATOM_MEGA_DISPATCH_KERNEL,
-        os.environ.get("MEGA_DISPATCH"),
+    kernel, kernel_source = resolve_dispatch_kernel(
+        dispatch_wire=_MEGA_DISPATCH_WIRE,
+        mega_dispatch=os.environ.get("MEGA_DISPATCH"),
+        needs_token_major=needs_token_major,
+        num_experts=num_experts,
+        topk=num_experts_per_token,
+        hidden_dim=hidden_dim,
+        max_tokens_per_rank=max_num_inp_token_per_rank,
     )
     dispatch_kwargs = mega_dispatch_kwargs(kernel)
     key = (
@@ -302,10 +307,6 @@ def init_mega_transport(
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
         return cached
-
-    warning = dispatch_kernel_warning(kernel, _MEGA_DISPATCH_WIRE)
-    if warning is not None:
-        logger.warning("[MORI-V2] ATOM_MEGA_DISPATCH_KERNEL: %s", warning)
 
     MegaMoEGfx1250 = _import_mega()
     per_rank_vmm = _cco_per_rank_vmm(
@@ -360,8 +361,8 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s kernel=%s dispatch=%s stage1_fused=%s wire=%s "
-        "combine_quant=%s force_a8w4=%s",
+        "swiglu_limit=%s kernel=%s (%s) dispatch=%s stage1_fused=%s wire=%s "
+        "combine_quant=%s force_a8w4=%s cco_vmm_per_rank=%dMiB",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -376,6 +377,7 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         kernel,
+        kernel_source,
         mega._config.dispatch_backend,
         # Absent from an aiter without the compact plan, which then never runs it.
         getattr(mega._config, "stage1_fused", False),
@@ -383,6 +385,8 @@ def init_mega_transport(
         combine_quant,
         # The other half of the pair: logged together so a mismatch is readable.
         os.environ.get("AITER_FORCE_A8W4", "0"),
+        # Before cco's 4 GiB rounding; the compact plan's per-route rows are in it.
+        per_rank_vmm >> 20,
     )
     return mega
 
@@ -500,6 +504,9 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             situ_beta=getattr(layer, "activation_situ_beta", None),
             situ_linear_beta=getattr(layer, "activation_situ_linear_beta", None),
             combine_quant=_MEGA_COMBINE_QUANT,
+            # Triton decode experts (triton_mega_moe) read the dispatch output
+            # token-major; final by now, set in the quant method's __init__.
+            needs_token_major=bool(getattr(quant_method, "use_triton_decode", False)),
         )
 
     @staticmethod

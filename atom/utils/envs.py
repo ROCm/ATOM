@@ -259,17 +259,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine only barriers + sums. Requires the a8w4 (fp8 act + mxfp4 weight)
     # path; ignored unless ATOM_MORI_V2 is on.
     # This also selects the transport: 1 binds aiter's MegaMoEGfx1250, which owns
-    # the fused dispatch/combine pair (its dispatch kernel is
-    # ATOM_MEGA_DISPATCH_KERNEL below), 0 binds mori's v2 op-layer running plain
-    # gather, i.e. the untouched upstream baseline.
+    # the fused dispatch/combine pair (its dispatch kernel is chosen by
+    # mega_transport_config.resolve_dispatch_kernel; aiter's MEGA_DISPATCH
+    # overrides it), 0 binds mori's v2 op-layer running plain gather, i.e. the
+    # untouched upstream baseline.
     "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
-    # MegaMoE dispatch kernel: mori | flydsl_token_major | flydsl_compact
-    # (flydsl_compact needs an fp8/fp4 MEGA_DISPATCH_WIRE). Unset, aiter's older
-    # MEGA_DISPATCH=mori|flydsl still picks it (flydsl -> flydsl_compact on an
-    # fp8/fp4 wire, flydsl_token_major on bf16); with neither set an fp8/fp4 wire
-    # runs mori and a bf16 wire flydsl_token_major. Ignored unless
-    # ATOM_MORI_V2_FUSED is on.
-    "ATOM_MEGA_DISPATCH_KERNEL": lambda: os.getenv("ATOM_MEGA_DISPATCH_KERNEL") or None,
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
     # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),

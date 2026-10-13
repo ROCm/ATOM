@@ -9,8 +9,8 @@ of aiter and mori imports so the rules are testable on CPU-only CI.
 _QUANT_WIRES = ("fp8", "fp4")
 _DISPATCH_BACKENDS = ("mori", "flydsl")
 
-# Every dispatch kernel MegaMoEGfx1250 can run, by the name
-# $ATOM_MEGA_DISPATCH_KERNEL takes: (aiter's dispatch_backend, stage1_fused).
+# Every dispatch kernel MegaMoEGfx1250 can run: (aiter's dispatch_backend,
+# stage1_fused).
 #   mori                mori's HIP/JIT dispatch, token-major
 #   flydsl_token_major  aiter's FlyDSL TDM dispatch, token-major
 #   flydsl_compact      the same dispatch fed by aiter's compact plan: each route
@@ -19,6 +19,26 @@ DISPATCH_KERNELS = {
     "mori": ("mori", False),
     "flydsl_token_major": ("flydsl", False),
     "flydsl_compact": ("flydsl", True),
+}
+
+# The fastest dispatch kernel per measured gfx1250 MoE shape, keyed by
+# (num_experts, topk, hidden_dim, dispatch_wire), at any EP size. Each value is
+# (the largest max_tokens_per_rank measured, kernel): a transport built for more
+# tokens per rank than that, or a shape or wire not listed here, keeps the
+# defaults.
+#
+# Kimi-K3 (896 experts, top-16, hidden 3584, fp4 wire): measured 2026-10-12 on
+# MI455 (gfx1250 B0), EP8 over two trays, aiter e965ebfe, mori 066fd10e, FlyDSL
+# 0.3.4.1. aiter's bench_mega_moe drove an 8-layer MegaMoE chain in one CUDA
+# graph, built for 16384 tokens per rank and called with 1 to 16384, uniform
+# and skewed routing. Per MoE layer the compact plan beat mori by 40-60 us at 1
+# to 512 tokens per rank and trailed it by at most 0.6% at 8192-16384; serving
+# TPOT was 92.5 ms against mori's 95.5 ms. flydsl_token_major was fastest from
+# 1024 tokens per rank up but gave wrong answers in ATOM serving, so it is not a
+# candidate. mori was measured before aiter #6115, which speeds up its expert
+# table at 896 experts.
+_MEASURED_FASTEST: dict[tuple[int, int, int, str], tuple[int, str]] = {
+    (896, 16, 3584, "fp4"): (16384, "flydsl_compact"),
 }
 
 # Upper bound on the expert GEMM's tile_m, which pads each local expert's slice
@@ -33,52 +53,76 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _measured_fastest(
+    *,
+    num_experts: int,
+    topk: int,
+    hidden_dim: int,
+    dispatch_wire: str,
+    max_tokens_per_rank: int,
+) -> str | None:
+    measured = _MEASURED_FASTEST.get((num_experts, topk, hidden_dim, dispatch_wire))
+    if measured is None or max_tokens_per_rank > measured[0]:
+        return None
+    return measured[1]
+
+
 def resolve_dispatch_kernel(
-    dispatch_wire: str, kernel: str | None, legacy_backend: str | None
-) -> str:
-    """The dispatch kernel a transport on ``dispatch_wire`` runs.
+    *,
+    dispatch_wire: str,
+    mega_dispatch: str | None,
+    needs_token_major: bool,
+    num_experts: int,
+    topk: int,
+    hidden_dim: int,
+    max_tokens_per_rank: int,
+) -> tuple[str, str]:
+    """The dispatch kernel a transport runs, and what chose it.
 
-    ``kernel`` ($ATOM_MEGA_DISPATCH_KERNEL) names it outright, on any wire. Unset,
-    aiter's older backend knob ``legacy_backend`` ($MEGA_DISPATCH) still selects
-    what it did before: mori -> mori; flydsl -> the compact plan on an fp8/fp4
-    wire, token-major on bf16. With neither set, an fp8/fp4 wire runs mori and a
-    bf16 wire flydsl token-major, the previous defaults.
+    ``mega_dispatch`` ($MEGA_DISPATCH, aiter's backend knob) overrides the choice:
+    mori -> mori; flydsl -> the compact plan on an fp8/fp4 wire, token-major on
+    bf16. Unset, a shape in _MEASURED_FASTEST runs its measured fastest kernel,
+    and anything else the defaults: mori on an fp8/fp4 wire, flydsl token-major on
+    bf16.
 
-    Set together, the two must name the same backend: a launch script carrying an
-    old MEGA_DISPATCH next to a new kernel name would otherwise run one of them
-    without saying which.
+    ``needs_token_major`` is set when Triton decode experts
+    ($ATOM_USE_TRITON_MOE_DECODE) read the dispatch output: they read it
+    token-major, so the compact plan is never picked for them and asking for it
+    is an error.
+
+    Returns (kernel, source), source being "MEGA_DISPATCH", "measured" or
+    "default".
     """
     quant = dispatch_wire in _QUANT_WIRES
-    if legacy_backend is not None and legacy_backend not in _DISPATCH_BACKENDS:
-        raise ValueError(
-            f"MEGA_DISPATCH must be one of {_DISPATCH_BACKENDS}, "
-            f"got {legacy_backend!r}"
-        )
-    if kernel is None:
-        if legacy_backend is None:
-            kernel = "mori" if quant else "flydsl_token_major"
-        elif legacy_backend == "mori":
+    if mega_dispatch is not None:
+        if mega_dispatch not in _DISPATCH_BACKENDS:
+            raise ValueError(
+                f"MEGA_DISPATCH must be one of {_DISPATCH_BACKENDS}, "
+                f"got {mega_dispatch!r}"
+            )
+        if mega_dispatch == "mori":
             kernel = "mori"
         else:
             kernel = "flydsl_compact" if quant else "flydsl_token_major"
-    elif kernel not in DISPATCH_KERNELS:
-        raise ValueError(
-            f"ATOM_MEGA_DISPATCH_KERNEL must be one of {tuple(DISPATCH_KERNELS)}, "
-            f"got {kernel!r}"
-        )
-    elif legacy_backend is not None and legacy_backend != DISPATCH_KERNELS[kernel][0]:
-        raise ValueError(
-            f"MEGA_DISPATCH={legacy_backend} disagrees with "
-            f"ATOM_MEGA_DISPATCH_KERNEL={kernel}; unset MEGA_DISPATCH, which "
-            "ATOM_MEGA_DISPATCH_KERNEL replaces"
-        )
-    if DISPATCH_KERNELS[kernel][1] and not quant:
-        raise ValueError(
-            f"ATOM_MEGA_DISPATCH_KERNEL={kernel} needs an fp8 or fp4 "
-            f"MEGA_DISPATCH_WIRE, got {dispatch_wire!r}: the compact plan carries "
-            "each row's e8m0 scales inside the row"
-        )
-    return kernel
+        if needs_token_major and DISPATCH_KERNELS[kernel][1]:
+            raise ValueError(
+                f"MEGA_DISPATCH={mega_dispatch} runs {kernel} on a {dispatch_wire} "
+                "wire, whose per-route rows the Triton decode experts "
+                "(ATOM_USE_TRITON_MOE_DECODE=1) cannot read; set MEGA_DISPATCH=mori "
+                "or unset it"
+            )
+        return kernel, "MEGA_DISPATCH"
+
+    kernel = _measured_fastest(
+        num_experts=num_experts,
+        topk=topk,
+        hidden_dim=hidden_dim,
+        dispatch_wire=dispatch_wire,
+        max_tokens_per_rank=max_tokens_per_rank,
+    )
+    if kernel is not None and not (needs_token_major and DISPATCH_KERNELS[kernel][1]):
+        return kernel, "measured"
+    return ("mori" if quant else "flydsl_token_major"), "default"
 
 
 def mega_dispatch_kwargs(kernel: str) -> dict:
@@ -94,21 +138,6 @@ def mega_dispatch_kwargs(kernel: str) -> dict:
     if compact:
         kwargs["stage1_fused"] = True
     return kwargs
-
-
-def dispatch_kernel_warning(kernel: str, dispatch_wire: str) -> str | None:
-    """Why ``kernel`` on ``dispatch_wire`` is not to be trusted yet, else None.
-
-    Selectable all the same: an A/B between the two FlyDSL layouts, and a fix to
-    the token-major path, both need to reach it.
-    """
-    if kernel == "flydsl_token_major" and dispatch_wire in _QUANT_WIRES:
-        return (
-            "flydsl_token_major on an fp8/fp4 MEGA_DISPATCH_WIRE gave wrong, "
-            "nondeterministic output on Kimi-K3 dp8ep8 (aiter e965ebfe), where "
-            "flydsl_compact and mori matched; use it for A/B and debugging"
-        )
-    return None
 
 
 def compact_plan_vmm_bytes(

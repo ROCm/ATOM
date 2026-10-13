@@ -1049,12 +1049,13 @@ def triton_mega_moe(
             )
     # Everything below reads the dispatch output token-major. The compact plan
     # lands one row per route, grouped per expert, which would be misread.
+    # init_mega_transport already keeps it from Triton decode layers; this is the
+    # backstop.
     if getattr(mega._config, "stage1_fused", False):
         raise RuntimeError(
             "triton_mega_moe needs a token-major dispatch, and flydsl_compact "
-            "lands one row per route grouped per expert; set "
-            "ATOM_MEGA_DISPATCH_KERNEL=mori (or flydsl_token_major) to run Triton "
-            "experts on MegaMoE"
+            "lands one row per route grouped per expert; set MEGA_DISPATCH=mori "
+            "to run Triton experts on MegaMoE"
         )
 
     recv_x, recv_w, recv_idx, total_recv, routing = mega._dispatch(
