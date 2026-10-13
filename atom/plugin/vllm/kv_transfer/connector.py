@@ -282,15 +282,21 @@ def _refuse_v41_speculation_with_offload(vllm_config) -> None:
     if n <= 0:
         return
     raise ValueError(
-        "DeepSeek-V4.1: AtomLMCacheOffloadConnector with speculative decoding "
-        f"({n} draft tokens) runs, answers correctly, and reuses nothing. "
-        "Measured: the engine boots, gsm8k-style arms score 16/16 with zero "
-        "stale-cursor refusals, and the tier stores 32 objects and retrieves "
-        "none -- external prefix cache hit rate 0.0%, against 44.1% for the "
-        "same configuration without drafts. The lookups happen and miss: a "
-        "draft moves the frontier a store is keyed on, so nothing later asks "
-        "for the key that was written. Fixing it means making the boundary "
-        "keys speculation-aware. Drop --speculative-config, drop the "
+        "DeepSeek-V4.1: AtomLMCacheOffloadConnector has not been run with "
+        f"speculative decoding ({n} draft tokens) to any useful end. It "
+        "boots, answers correctly and reuses nothing: measured, blind 0/16, "
+        "cold 16/16, warm 16/16 with zero stale-cursor refusals, and 0.0% of "
+        "the prompt supplied by the tier against 95.2% without drafts.\n\n"
+        "The reason is the store side, not the load side. A STATE boundary "
+        "may only sit on a whole PAGE block, and the sweep stores one when "
+        "the frontier LANDS on that grid exactly. Without drafts a decode "
+        "step advances by one token, so the frontier takes every value and "
+        "cannot miss a boundary; with them it advances by one to six and "
+        "steps over it. The tier is then empty at every position a later "
+        "request asks about.\n\n"
+        "Fixing it means storing at a boundary the frontier CROSSED rather "
+        "than one it landed on, which needs the state at that boundary and "
+        "not at the step's end. Drop --speculative-config, drop the "
         "connector, or set ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1 to run it "
         "knowing the tier is dead weight."
     )
@@ -806,8 +812,24 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         interval = int(
             extra.get("atom.offload.v41.state_interval", DEFAULT_STATE_INTERVAL)
         )
+        logger.info(
+            "ATOM LMCache offload: V4.1 planner hash_block_size=%d, "
+            "boundary grid=%d (the hash unit indexes "
+            "request.block_hashes and is engine-wide; the grid is where a "
+            "STATE boundary may sit and is the PAGE block)",
+            int(hash_block_size),
+            int(getattr(self, "_attn_block_size", 0) or 0) or int(hash_block_size),
+        )
+        # The grid a STATE boundary may sit on is V4.1's PAGE block, which
+        # is the attention group's. `hash_block_size` is engine-wide and
+        # becomes the smallest group's, so with a draft group the two part
+        # company and a boundary chosen on the hash grid is not a PAGE edge.
+        grid = int(getattr(self, "_attn_block_size", 0) or 0) or int(
+            hash_block_size
+        )
         self._v41_planner = V41BoundaryPlanner(
             hash_block_size=int(hash_block_size),
+            boundary_grid=grid,
             chunk_size=int(self._scheduler.chunk_size),
             state_interval=interval,
             max_num_batched_tokens=int(

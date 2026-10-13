@@ -390,6 +390,7 @@ class V41BoundaryPlanner:
         self,
         *,
         hash_block_size: int,
+        boundary_grid: int | None = None,
         chunk_size: int,
         state_interval: int,
         max_num_batched_tokens: int,
@@ -398,6 +399,26 @@ class V41BoundaryPlanner:
         can_load: bool = True,
     ) -> None:
         self.hash_block_size = int(hash_block_size)
+        # Two different things that used to be one.
+        #
+        # `hash_block_size` is the unit vLLM's `request.block_hashes` are in;
+        # indexing that list with anything else reads the wrong entry.
+        # `boundary_grid` is the grid a STATE boundary may sit on, which for
+        # V4.1 is its PAGE block: state is only restorable at a whole PAGE
+        # edge. They coincide while there is one kv cache group and diverge
+        # the moment there are two, because the hash unit is engine-wide and
+        # becomes the smallest group's -- with DSpark, 32 against the proxy's
+        # 256. Measured: `cap_hit` then accepted a boundary at 96 tokens,
+        # which is a legal 32-grid point, is not a PAGE edge, and floors to
+        # zero chunks at the caller. The hit it capped was 1280.
+        self.boundary_grid = int(boundary_grid or hash_block_size)
+        if self.boundary_grid % self.hash_block_size:
+            raise ValueError(
+                f"DeepSeek-V4.1 state boundary grid {self.boundary_grid} is "
+                f"not a multiple of the hash block size "
+                f"{self.hash_block_size}; a boundary on that grid could not "
+                "be hashed"
+            )
         self.chunk_size = int(chunk_size)
         self.state_interval = int(state_interval)
         self._world_size = max(1, int(world_size))
@@ -483,10 +504,10 @@ class V41BoundaryPlanner:
                 "a boundary would then fall inside a chunk and the PAGE prefix "
                 "could not end where the state does"
             )
-        if self.state_interval % self.hash_block_size:
+        if self.state_interval % self.boundary_grid:
             raise ValueError(
                 f"V4.1 state offload: state interval {self.state_interval} is "
-                f"not a multiple of the hash block size {self.hash_block_size}; "
+                f"not a multiple of the boundary grid {self.boundary_grid}; "
                 "a boundary would have no block hash to be keyed by"
             )
         budget = int(max_num_batched_tokens)
@@ -582,6 +603,15 @@ class V41BoundaryPlanner:
         # for the rest of the budget. Near-field precision at the old reach,
         # and at most `2 * _MAX_CAP_DESCENT` index lookups.
         boundary = self._claimed_boundary_at_or_below(block_hashes, hit)
+        if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
+            # The boundary the index claims, against the hit being capped to
+            # it. A kept cap that lands below one chunk is floored to zero by
+            # the caller and reads, from outside, exactly like a decline.
+            logger.info(
+                "V4.1 cap_hit: req=%s hit=%d boundary=%d hashes=%d -> %d",
+                req_id, hit, boundary, len(block_hashes),
+                0 if boundary <= 0 else min(hit, boundary),
+            )
         if boundary <= 0:
             self._counters["cap_declined"] += 1
             return 0
@@ -595,7 +625,7 @@ class V41BoundaryPlanner:
         boundaries exist: a local hit capped by a different rule than the
         external one is a local hit whose state nobody stored.
         """
-        block = self.hash_block_size
+        block = self.boundary_grid
         boundary = (hit // block) * block
         near = min(_MAX_CAP_DESCENT, max(1, self.state_interval // block))
         for phase_step, phase_len in (
@@ -705,14 +735,14 @@ class V41BoundaryPlanner:
             return 0
         block_hashes = getattr(request, "block_hashes", None) or ()
         boundary = self._claimed_boundary_at_or_below(block_hashes, hit)
-        if boundary <= self.hash_block_size:
+        if boundary <= self.boundary_grid:
             # Nothing claimed, or the only boundary is the first block and
             # capping below it would leave nothing local to keep.
             self._counters["local_cap_declined"] += 1
             return 0
         self._local_caps[req_id] = boundary
         self._counters["local_cap_kept"] += 1
-        return min(hit, boundary - self.hash_block_size)
+        return min(hit, boundary - self.boundary_grid)
 
     def withdraw_local_cap(self, request) -> bool:
         """Give up on a local cap the tier did not back. True if there was one.
@@ -748,7 +778,7 @@ class V41BoundaryPlanner:
         is what the scheduler patch arranges.
         """
         total = int(getattr(request, "num_prompt_tokens", 0) or 0)
-        return (total // self.hash_block_size) * self.hash_block_size
+        return (total // self.boundary_grid) * self.boundary_grid
 
     def boundary_hash(self, block_hashes, boundary_tokens: int) -> int | None:
         """The prefix-hash key for the state committed at *boundary_tokens*."""
@@ -814,7 +844,7 @@ class V41BoundaryPlanner:
                     self._counters["boundary_passed"] += max(0, crossed - 1)
             self._swept[req_id] = frontier
             request = requests_by_id.get(req_id)
-            if frontier <= 0 or frontier % self.hash_block_size:
+            if frontier <= 0 or frontier % self.boundary_grid:
                 # Not a block boundary, so `boundary_hash` has no key for it
                 # whatever else is true. Nothing to count: these are most of
                 # the frontiers a decode produces.

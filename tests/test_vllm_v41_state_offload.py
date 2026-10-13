@@ -101,8 +101,12 @@ def test_an_interval_that_does_not_divide_the_chunk_is_refused(interval):
         make_planner(state_interval=interval)
 
 
-def test_an_interval_without_a_block_hash_is_refused():
-    with pytest.raises(ValueError, match="hash block size"):
+def test_an_interval_that_is_not_a_whole_number_of_boundaries_is_refused():
+    """The interval is measured in boundaries, so it has to be a multiple of
+    the grid they sit on. The message names the grid rather than the hash
+    unit: those were one number until a second kv cache group made the hash
+    unit engine-wide and the grid the PAGE block."""
+    with pytest.raises(ValueError, match="boundary grid"):
         make_planner(hash_block_size=384, chunk_size=128, state_interval=256)
 
 
