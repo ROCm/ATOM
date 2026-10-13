@@ -1619,6 +1619,9 @@ class Scheduler:
         if self.kv_connector is not None and self.waiting:
             prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
             if prefetch is not None:
+                # HBM-covered requests are prefetched too: the lookup is still
+                # what refreshes their prefix in the tier's LRU; admission just
+                # does not wait for it (see `_skip_tier_lookup_on_hbm_hit`).
                 prefetch(
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
@@ -1765,9 +1768,15 @@ class Scheduler:
                 continue
 
             offload_resume = self._is_offload_prefill_resume(seq)
+            tier_lookup_skipped = (
+                not remote_ready_for_decode
+                and not offload_resume
+                and self._skip_tier_lookup_on_hbm_hit(seq)
+            )
             if (
                 not remote_ready_for_decode
                 and not offload_resume
+                and not tier_lookup_skipped
                 and self.kv_connector is not None
                 and self._offload_lookup_pending(seq)
             ):
@@ -1775,7 +1784,7 @@ class Scheduler:
                 continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
-                skip=remote_ready_for_decode or offload_resume,
+                skip=remote_ready_for_decode or offload_resume or tier_lookup_skipped,
             )
 
             if remote_ready_for_decode:
@@ -2554,6 +2563,51 @@ class Scheduler:
         allocated before it parked for the LMCache load.
         """
         return self._connector_flag("is_offload") and resumes_offload_prefill(seq)
+
+    def _hbm_covers_tier_lookup(self, seq: Sequence) -> int:
+        """HBM-resident prefix tokens if no tier answer could make `seq` load.
+
+        Returns 0 -- wait for the lookup as usual -- when the feature is off,
+        the connector has no offload tier, the joint KV/state path is on (it is
+        the one place a tier hit can move where HBM resumes, so it keeps the
+        lookup), the pool refused the probe, or the connector says the gap
+        could still be loaded (`tier_lookup_cannot_load`, which owns the
+        `OFFLOAD_MIN_LOAD_TOKENS` threshold).
+
+        A `record=False` probe in the same pass as the real admission, so the
+        frontier it sees is the one `_decide_load_after_alloc` will see.
+        """
+        conn = self.kv_connector
+        if (
+            not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT
+            or conn is None
+            or not self._connector_flag("is_offload")
+            or getattr(conn, "skip_tier_lookup", None) is None
+            or getattr(conn, "tier_lookup_cannot_load", None) is None
+            or getattr(self.block_manager, "state_offload", None) is not None
+            or seq.kv_transfer_params
+            and seq.kv_transfer_params.get("do_remote_prefill")
+        ):
+            return 0
+        hit_blocks = self.block_manager.can_allocate(
+            seq,
+            record=False,
+            block_hashes=[],
+            reuse_hashes=self._local_prefill_coalescing,
+        )
+        if hit_blocks <= 0:
+            return 0
+        hbm_tokens = hit_blocks * self.block_manager.hash_block_size
+        if not conn.tier_lookup_cannot_load(seq, hbm_tokens):
+            return 0
+        return hbm_tokens
+
+    def _skip_tier_lookup_on_hbm_hit(self, seq: Sequence) -> bool:
+        """Admit without waiting on a tier lookup that cannot load anything."""
+        hbm_tokens = self._hbm_covers_tier_lookup(seq)
+        if not hbm_tokens:
+            return False
+        return bool(self.kv_connector.skip_tier_lookup(seq, hbm_tokens))
 
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""
