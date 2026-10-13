@@ -1,3 +1,4 @@
+import logging
 from typing import ClassVar
 
 import numpy as np
@@ -19,6 +20,7 @@ from atom.model_config.qwen3_5_moe import (
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from atom.model_ops.layernorm import fused_ar_gemma_per_group_supported
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
 )
@@ -44,18 +46,27 @@ from atom.models.utils import (
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils.decorators import support_torch_compile
 
+logger = logging.getLogger("atom")
+
 
 def allreduce_norm_fusion_enabled() -> bool:
     """Whether row-parallel outputs skip their all-reduce and the following
     Gemma RMSNorm folds it in. Off under PP (stage-boundary activations must
-    be reduced) and in plugin mode (the host framework owns the post-load
-    hooks that fill the fused norm's Gemma weight)."""
-    return (
+    be reduced), in plugin mode (not validated there), and on an aiter whose
+    per-group fused kernel cannot do the Gemma norm."""
+    enabled = (
         ENABLE_ALLREDUCE_RMSNORM_FUSION
         and get_tensor_model_parallel_world_size() > 1
         and get_pp_group().world_size == 1
         and not is_plugin_mode()
     )
+    if enabled and not fused_ar_gemma_per_group_supported():
+        logger.warning(
+            "Qwen3.5 all-reduce + RMSNorm fusion is off: this aiter's fused "
+            "AR + RMSNorm + per-group quant does not take gemma_norm"
+        )
+        return False
+    return enabled
 
 
 def get_qwen3_5_text_config(atom_config: Config):

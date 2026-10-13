@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+import inspect
 
 import aiter
 import torch
@@ -747,6 +749,21 @@ class RMSNormGated(nn.Module):
         return self.forward_native(x, z)
 
 
+@functools.lru_cache(maxsize=1)
+def fused_ar_gemma_per_group_supported() -> bool:
+    """Whether aiter's fused AR + RMSNorm + per-group FP8 quant takes `gemma_norm`.
+
+    Older aiter accepts `gemma_norm` on the public
+    `tensor_model_parallel_fused_allreduce_rmsnorm_quant` but drops it on the
+    per-group branch and returns a plain `x * w` norm with no error, so support
+    is read off the group method that has to forward it.
+    """
+    from aiter.dist.parallel_state import GroupCoordinator
+
+    method = GroupCoordinator.fused_allreduce_rmsnorm_quant_per_group
+    return "gemma_norm" in inspect.signature(method).parameters
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -778,18 +795,16 @@ class GemmaRMSNorm(nn.Module):
         self.fused_allreduce = (
             fused_allreduce and get_tensor_model_parallel_world_size() > 1
         )
-        if self.fused_allreduce:
-            # aiter's fused AR + RMSNorm + per-group quant kernels only do
-            # x * w, so feed them the precomputed Gemma weight (1 + w) and run
-            # the plain-RMSNorm epilogue. Filled in process_weights_after_loading;
-            # a fixed buffer keeps the storage stable for CUDA graphs.
-            self.register_buffer(
-                "gemma_weight", torch.ones_like(self.weight.data), persistent=False
+        if (
+            self.fused_allreduce
+            and self.use_fused_quant
+            and not fused_ar_gemma_per_group_supported()
+        ):
+            raise ValueError(
+                "GemmaRMSNorm(fused_allreduce=True) with per-group FP8 quant needs "
+                "an aiter whose fused AR + RMSNorm + per-group quant takes "
+                "gemma_norm; this one would silently normalize with x * w"
             )
-
-    def process_weights_after_loading(self):
-        if self.fused_allreduce:
-            self.gemma_weight.copy_(self.weight.data.float() + 1.0)
 
     @staticmethod
     def forward_static(
@@ -908,17 +923,20 @@ class GemmaRMSNorm(nn.Module):
         return out_fp8, out_scale, out_bf16
 
     def _forward_fused_allreduce(self, x, residual):
-        # Same return contracts as _forward_fused_fp8 / forward_cuda.
+        # Same return contracts as _forward_fused_fp8 / forward_cuda. The kernel
+        # reads the raw weight and applies (1 + w) itself (gemma_norm), so an
+        # in-place weight update (rollout sync) is seen on the next call.
         if self.use_fused_quant:
             outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                 x.contiguous(),
                 residual,
-                self.gemma_weight,
+                self.weight,
                 self.variance_epsilon,
                 quant_type="per_group",
                 group_size=128,
                 emit_bf16=self.write_bf16,
                 transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                gemma_norm=True,
             )
             out_fp8, res_out, out_scale = outs[:3]
             out_bf16 = outs[3] if self.write_bf16 else None
@@ -926,8 +944,9 @@ class GemmaRMSNorm(nn.Module):
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             x.contiguous(),
             residual,
-            self.gemma_weight,
+            self.weight,
             self.variance_epsilon,
+            gemma_norm=True,
         )
 
     def forward(
