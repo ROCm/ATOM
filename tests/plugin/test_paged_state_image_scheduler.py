@@ -89,7 +89,23 @@ def _model_dir(tmp_path, max_pos=65536):
     return str(tmp_path)
 
 
-def _vllm_config(tmp_path, *, max_model_len=4096, num_blocks=64):
+def _mtp_spec(k):
+    """vLLM's own SpeculativeConfig as an EAGLE-class (MTP) drafter would have
+    it, without a draft checkpoint: built as ngram, then marked ``mtp``."""
+    from vllm.config import SpeculativeConfig
+
+    spec = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=k,
+        prompt_lookup_max=2,
+        prompt_lookup_min=1,
+    )
+    object.__setattr__(spec, "method", "mtp")
+    assert spec.use_eagle() and spec.use_eagle_block_drop()
+    return spec
+
+
+def _vllm_config(tmp_path, *, max_model_len=4096, num_blocks=64, spec_k=0):
     mc = ModelConfig(
         model=_model_dir(tmp_path),
         skip_tokenizer_init=True,
@@ -109,7 +125,10 @@ def _vllm_config(tmp_path, *, max_model_len=4096, num_blocks=64):
     )
     cc.num_gpu_blocks = num_blocks
     cc.kv_cache_layout = "LBHNC"  # resolved by EngineCore in a server
-    return VllmConfig(model_config=mc, scheduler_config=sc, cache_config=cc)
+    vc = VllmConfig(model_config=mc, scheduler_config=sc, cache_config=cc)
+    if spec_k:
+        vc.speculative_config = _mtp_spec(spec_k)
+    return vc
 
 
 def _specs(adapter):
@@ -128,8 +147,12 @@ def _specs(adapter):
     return specs
 
 
-def _scheduler(adapter, tmp_path, *, num_blocks=64, hash_block=BLOCK, **kw):
+def _scheduler(
+    adapter, tmp_path, *, num_blocks=64, hash_block=BLOCK, native_hits=False, **kw
+):
     vc = _vllm_config(tmp_path, num_blocks=num_blocks, **kw)
+    if native_hits:
+        assert G.follow_native_hit_rule(vc)
     groups = [KVCacheGroupSpec([n], s) for n, s in _specs(adapter).items()]
     kvc = KVCacheConfig(
         num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
@@ -592,3 +615,52 @@ def test_preemption_drops_the_deferred_decode_keep_and_resumes(adapter, tmp_path
     assert not _boundary_cached(s, req, idx)
     eng.drain()
     assert "p" not in s.requests
+
+
+def _hit(s, rid, prompt):
+    """vLLM's prefix hit for a new request, and each group's hit blocks."""
+    probe = Request(
+        request_id=rid,
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=s._test_hasher,
+    )
+    blocks, hit, _spb = s.kv_cache_manager.get_computed_blocks(probe)
+    return hit, [list(g) for g in blocks.blocks]
+
+
+@pytest.mark.parametrize("native_hits", [False, True])
+@pytest.mark.parametrize("extra", [0, 300])
+def test_with_mtp_the_hit_lands_on_the_anchor_as_native(
+    adapter, tmp_path, native_hits, extra
+):
+    """A 1,000-token prompt keeps images at the 512 rung and the 768 anchor. An
+    EAGLE-class drafter makes vLLM drop one more matched block, so a re-send (or
+    an extension) of the prompt hits 512 and recomputes 488+ tokens. Native's
+    can_allocate only withholds the last block (always recomputed for logits),
+    so it resumes at 768; with the draft's state in the image the plugin follows
+    it. The proxy group and every image group report the same hit."""
+    s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=native_hits)
+    assert s.use_eagle and s.use_eagle_block_drop is not native_hits
+    st = s._atom_state_images
+    eng = _Engine(s)
+    prompt = list(range(1, 1001))
+    _request(s, "w", prompt, max_tokens=1)
+    eng.drain()
+    req = Request(
+        request_id="w2",
+        prompt_token_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=s._test_hasher,
+    )
+    assert _boundary_cached(s, req, 1) and _boundary_cached(s, req, 2)
+    hit, groups = _hit(s, "r", prompt + list(range(2001, 2001 + extra)))
+    assert hit == (768 if native_hits else 512)
+    assert len(groups[st.proxy_gid]) * BLOCK == hit
+    for gid in st.image_gids:
+        assert len(groups[gid]) * BLOCK == hit
+        assert not groups[gid][-1].is_null and groups[gid][-1].block_hash is not None
