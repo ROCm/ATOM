@@ -120,7 +120,7 @@ class KVConnectorSchedulerBase(ABC):
         """Preserve completions unless the backend consumes chunked P/D metadata."""
         return output
 
-    def admission_blocked(self) -> None:
+    def admission_blocked(self, seq: Any) -> None:
         """Notify the connector that KV capacity prevented prefill admission."""
 
     def abort_send(self, seq: Any) -> None:

@@ -166,6 +166,9 @@ impl BackendAdapter for AtomAdapter {
         }
         if let Some(template) = self.prefill_info.chunked_transfer.get(&pair.prefill_url) {
             let mut kv = template.clone();
+            kv["chunked_transfer"] = json!(true);
+            kv["do_remote_prefill"] = json!(true);
+            kv["do_remote_decode"] = json!(false);
             kv["transfer_id"] = json!(pair.transfer_id);
             self.enrich_decode_kv(&mut kv, ctx)?;
             body.as_object_mut()

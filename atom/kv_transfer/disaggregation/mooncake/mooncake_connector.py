@@ -41,6 +41,10 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     ChunkedPrefill,
     PrefillHandoff,
 )
+from atom.kv_transfer.disaggregation.mooncake.endpoint import (
+    DEFAULT_HANDSHAKE_PORT,
+    producer_endpoint,
+)
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MLA_LANDING_CREDIT_WAIT_S,
     MLA_LANDING_MIN_SLOTS,
@@ -94,6 +98,8 @@ logger = logging.getLogger("atom")
 # Remember terminal IDs without retaining source blocks. This bounds memory
 # even when a consumer disappears, while rejecting delayed requests promptly.
 CHUNKED_RETIRED_TRANSFER_LIMIT = 65536
+# Avoid sacrificing prefills during ordinary, short-lived P/D scheduling skew.
+CHUNKED_RECLAIM_STALL_SECONDS = 1.0
 
 # ---------------------------------------------------------------------------
 # Mooncake availability check
@@ -422,7 +428,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.handshake_port = get_open_port()
-        self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
+        self.base_handshake_port = kv_transfer_config.get(
+            "handshake_port", DEFAULT_HANDSHAKE_PORT
+        )
         self.engine_id = "None"
         self.tp_size = config.tensor_parallel_size
         self.dp_size = config.parallel_config.data_parallel_size
@@ -435,7 +443,11 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "enable_chunked_transfer", False
         )
         self._chunked_receiving: dict[ReqId, Sequence] = {}
-        self._reclaim_unclaimed_prefills = False
+        self._reclaim_unclaimed_prefills: dict[ReqId, TransferId] = {}
+        self._reclaim_candidates: OrderedDict[ReqId, TransferId] = OrderedDict()
+        self._reclaim_inflight: ReqId | None = None
+        self._admission_waiter: ReqId | None = None
+        self._admission_blocked_since = time.monotonic()
         self.host_ip = get_ip()
 
         # Pending requests: req_id -> (Sequence, block_table)
@@ -494,10 +506,8 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
     def build_connector_meta(self) -> ConnectorMetadata:
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
-        meta.reclaim_unclaimed_prefills = getattr(
-            self, "_reclaim_unclaimed_prefills", False
-        )
-        self._reclaim_unclaimed_prefills = False
+        meta.reclaim_unclaimed_prefills = self._reclaim_unclaimed_prefills
+        self._reclaim_unclaimed_prefills = {}
 
         for req_id, (req, block_ids, slot_idx) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
@@ -522,7 +532,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
         if self._reqs_need_recv or self._reqs_need_save:
             logger.debug(
-                "[SCHEDULER] build_connector_meta: %d recv, %d save, id_map=%s",
+                "[SCHEDULER] build_connector_meta: %d recv, %d save, " "id_map=%s",
                 len(self._reqs_need_recv),
                 len(self._reqs_need_save),
                 meta.request_id_to_transfer_id,
@@ -532,6 +542,9 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         return meta
 
     def update_state_after_alloc(self, seq: Sequence) -> None:
+        if self.is_producer:
+            self._admission_waiter = None
+            self._admission_blocked_since = time.monotonic()
         params = seq.kv_transfer_params or {}
         if params.get("chunked_transfer") and (
             self.is_producer or params.get("do_remote_prefill")
@@ -630,6 +643,13 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         params = getattr(seq, "kv_transfer_params", None) or {}
         if self.is_producer and params.get("chunked_transfer"):
             aborted = getattr(seq, "leave_reason", None) == "aborted"
+            if aborted:
+                self._reclaim_candidates.pop(seq.id, None)
+            elif str(seq.id) in self._awaiting_send:
+                # Insertion order is prefill completion order, shared by every
+                # worker. Do not let rank-local claims choose different victims.
+                self._reclaim_candidates[seq.id] = params["transfer_id"]
+                self._admission_blocked_since = time.monotonic()
             params["prefill_aborted"] = aborted
             if not aborted:
                 drafts = getattr(seq, "spec_token_ids", None)
@@ -679,15 +699,17 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             # transfer by it. Empty for backends with no SWA state.
             "remote_swa_block_ids": _swa_ring_ids(seq),
             "remote_engine_id": self.engine_id,
-            "remote_host": self.host_ip,
+            **producer_endpoint(
+                host=self.host_ip,
+                handshake_port=self.base_handshake_port,
+                pp_size=self.pp_size,
+                block_size=self.block_size,
+                dcp_size=self.dcp_size,
+            ),
             "remote_port": self.handshake_port,
-            "remote_handshake_port": self.base_handshake_port,
             "tp_size": self.tp_size,
             "dp_rank": self.dp_rank,
-            "remote_pp_size": self.pp_size,
             "hash_block_size": self.hash_block_size,
-            "block_size": self.block_size,
-            "dcp_size": self.dcp_size,
             "transfer_id": seq.id,
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
@@ -713,6 +735,10 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     def send_finished(self, req_id) -> None:
         self._awaiting_send.discard(str(req_id))
+        self._reclaim_candidates.pop(req_id, None)
+        if self._reclaim_inflight == req_id:
+            self._reclaim_inflight = None
+        self._admission_blocked_since = time.monotonic()
 
     def abort_send(self, seq: Sequence) -> None:
         # request_finished queued cancellation; only the aggregated
@@ -722,9 +748,29 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         ):
             self.send_finished(seq.id)
 
-    def admission_blocked(self) -> None:
-        if self.is_producer and self.enable_chunked_transfer and self._awaiting_send:
-            self._reclaim_unclaimed_prefills = True
+    def admission_blocked(self, seq: Sequence) -> None:
+        """Escape sustained capacity stalls one oldest finished source at a time.
+
+        The scheduler calls this only after the head waiting request fails its
+        real allocation check. Admission, prefill completion, or source release
+        resets the grace period. Wait for the TP/PP result before trying another
+        source, so the next allocation check observes the previous release.
+        """
+        if not (self.is_producer and self.enable_chunked_transfer):
+            return
+        now = time.monotonic()
+        if self._admission_waiter != seq.id:
+            self._admission_waiter = seq.id
+            self._admission_blocked_since = now
+        if (
+            self._reclaim_inflight is not None
+            or not self._reclaim_candidates
+            or now - self._admission_blocked_since < CHUNKED_RECLAIM_STALL_SECONDS
+        ):
+            return
+        req_id, transfer_id = self._reclaim_candidates.popitem(last=False)
+        self._reclaim_inflight = req_id
+        self._reclaim_unclaimed_prefills = {req_id: transfer_id}
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
@@ -733,6 +779,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         for completion in list(output.connector_completions):
             if completion.channel == "pd_source_safe":
                 output.finished_sending.add(completion.operation_id)
+                output.connector_completions.discard(completion)
+            elif completion.channel == "pd_reclaim_done":
+                # A claimed/missing source cannot be reclaimed. Try the next
+                # candidate only after all ranks acknowledged this attempt and
+                # another grace period has elapsed. Successful reclaim waits
+                # for pd_source_safe/send_finished before dropping the claim.
+                if (
+                    not completion.succeeded
+                    and self._reclaim_inflight == completion.operation_id
+                ):
+                    self._reclaim_inflight = None
+                    self._admission_blocked_since = time.monotonic()
                 output.connector_completions.discard(completion)
         for req_id, handoff in output.received_handoffs.items():
             seq = self._chunked_receiving.pop(req_id, None)
@@ -808,7 +866,9 @@ class MooncakeConnector(KVConnectorBase):
         self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
 
         # Side channel port (ZMQ) — deterministic from config for proxy relay
-        self.base_handshake_port = kv_transfer_config.get("handshake_port", 6301)
+        self.base_handshake_port = kv_transfer_config.get(
+            "handshake_port", DEFAULT_HANDSHAKE_PORT
+        )
         self._side_channel_port = self.base_handshake_port + _port_offset(
             self.dp_rank,
             self.tp_rank,
@@ -1003,6 +1063,7 @@ class MooncakeConnector(KVConnectorBase):
         self._pending_chunked_requests: list[tuple[dict, float]] = []
         self._received_handoffs: dict[ReqId, PrefillHandoff] = {}
         self._pending_handoffs: dict[ReqId, dict] = {}
+        self._reclaim_results: set[ConnectorCompletion] = set()
         self._transfer_refcount: dict[ReqId, int] = {}
         self._transfer_refcount_lock = threading.Lock()
 
@@ -1167,11 +1228,7 @@ class MooncakeConnector(KVConnectorBase):
 
         tt: KVTransferTensors = transfer_tensors
 
-        # Full SWA/SLOT pools also need the state-transfer path when no
-        # separate slot regions or compressor staging buffer are present.
-        self._has_slot_regions = bool(
-            tt.slot_regions or tt.swa_block_regions or tt.staging_region is not None
-        )
+        self._has_slot_regions = bool(tt.slot_regions or tt.staging_region is not None)
         self.num_blocks = tt.num_blocks
         self._gather_slot = tt.gather_slot
         self._scatter_slot = tt.scatter_slot
@@ -1635,19 +1692,19 @@ class MooncakeConnector(KVConnectorBase):
                     req_id,
                 )
             self._dispatch_ready_chunked_requests()
-            if metadata.reclaim_unclaimed_prefills:
-                # P and D may fill their pools with different requests. Once
-                # P cannot admit more, relinquish finished sources D has not
-                # claimed, allowing P to serve D's reservations. Active readers
-                # and partially served fan-outs keep their source allocations.
-                with self._completed_prefills_lock:
-                    for transfer_id, state in self._chunked_prefills.items():
-                        if state.cancel_if_unclaimed():
-                            logger.info(
-                                "Reclaiming unclaimed chunked prefill %s under "
-                                "KV capacity pressure; D will prefill locally",
-                                transfer_id,
-                            )
+            with self._completed_prefills_lock:
+                for req_id, transfer_id in metadata.reclaim_unclaimed_prefills.items():
+                    state = self._chunked_prefills.get(transfer_id)
+                    reclaimed = state is not None and state.cancel_if_unclaimed()
+                    self._reclaim_results.add(
+                        ConnectorCompletion("pd_reclaim_done", req_id, reclaimed)
+                    )
+                    if reclaimed:
+                        logger.info(
+                            "Reclaiming unclaimed chunked prefill %s under "
+                            "sustained KV capacity pressure; D will prefill locally",
+                            transfer_id,
+                        )
             return
 
         # Consumer: send write requests to producer
@@ -1730,7 +1787,11 @@ class MooncakeConnector(KVConnectorBase):
             }
 
             consumer_staging_pool_idx = -1
-            if self._has_slot_regions:
+            if self._has_slot_regions or (
+                meta.chunked_transfer and self._swa_block_regions
+            ):
+                # Chunked SWA-only requests also transfer final window state.
+                # Keep the legacy registration/dispatch contract unchanged.
                 # Acquire one staging pool slot for this request's state RDMA.
                 consumer_staging_addr = 0
                 if self._staging_pool_size > 0:
@@ -1886,8 +1947,9 @@ class MooncakeConnector(KVConnectorBase):
             with self._completed_prefills_lock:
                 self._drop_stale_kv_ready_events(time.monotonic())
         self._dispatch_ready_chunked_requests()
-        source_completions = set()
         with self._completed_prefills_lock:
+            source_completions = self._reclaim_results
+            self._reclaim_results = set()
             for transfer_id, state in list(self._chunked_prefills.items()):
                 if state.source_safe():
                     # Connector channels receive both TP and PP quorum before
@@ -2127,9 +2189,6 @@ class MooncakeConnector(KVConnectorBase):
 
     def _execute_transfer(self, request_data: dict) -> None:
         """Compute offsets and perform RDMA write for a single request."""
-        if request_data.get("chunked_transfer"):
-            self._execute_chunked_transfer(request_data)
-            return
         try:
             req_id = request_data["request_id"]
             transfer_id = request_data.get("transfer_id", req_id)
@@ -2390,63 +2449,40 @@ class MooncakeConnector(KVConnectorBase):
         their pinned pages prevent P from admitting the pool's waiters.
         """
         submissions = []
+        failures = []
         with self._completed_prefills_lock:
             pending = []
             for data, queued_at in self._pending_chunked_requests:
                 if data["transfer_id"] in self._retired_chunked_transfers:
-                    submissions.append((data, None))
+                    failures.append(data)
                     continue
                 state = self._chunked_prefills.get(data["transfer_id"])
                 if state is None or not (state.num_ready_blocks or state.cancelled):
                     if time.monotonic() - queued_at < PREFILL_LOOKUP_TIMEOUT:
                         pending.append((data, queued_at))
                     else:
-                        submissions.append((data, None))
+                        failures.append(data)
                     continue
                 try:
                     acquired = self._acquire_chunked_reader(state, data)
                 except (RuntimeError, ValueError):
-                    submissions.append((data, None))
+                    failures.append(data)
                 else:
                     if acquired:
                         submissions.append((data, state))
             self._pending_chunked_requests = pending
+        for data in failures:
+            self._send_executor.submit(
+                self._notify_transfer_result, data, success=False
+            )
         for data, state in submissions:
-            if state is None:
-                self._send_executor.submit(
-                    self._notify_transfer_result, data, success=False
-                )
-            else:
-                self._send_executor.submit(
-                    self._execute_chunked_transfer, data, state, True
-                )
+            self._send_executor.submit(self._execute_chunked_transfer, data, state)
 
     def _execute_chunked_transfer(
-        self,
-        request_data: dict,
-        state: ChunkedPrefill | None = None,
-        acquired: bool = False,
+        self, request_data: dict, state: ChunkedPrefill
     ) -> None:
+        """Send an already-claimed source; only the dispatcher admits readers."""
         try:
-            transfer_id = request_data["transfer_id"]
-            if state is None:
-                with self._completed_prefills_cv:
-                    if not self._completed_prefills_cv.wait_for(
-                        lambda: (
-                            transfer_id in self._chunked_prefills
-                            or transfer_id in self._retired_chunked_transfers
-                        ),
-                        timeout=PREFILL_LOOKUP_TIMEOUT,
-                    ):
-                        raise RuntimeError(
-                            "timed out waiting for chunked prefill allocation"
-                        )
-                    if transfer_id in self._retired_chunked_transfers:
-                        raise RuntimeError("chunked prefill source was retired")
-                    state = self._chunked_prefills[transfer_id]
-                    acquired = self._acquire_chunked_reader(state, request_data)
-            if not acquired:
-                return  # The original task owns completion of this duplicate.
             req_id = request_data["request_id"]
             if request_data.get("prompt_digest") != state.prompt_digest:
                 raise ValueError("P/D prompt token IDs differ")
@@ -2549,8 +2585,7 @@ class MooncakeConnector(KVConnectorBase):
             )
             self._notify_transfer_result(request_data, success=False)
         finally:
-            if acquired:
-                state.release()
+            state.release()
 
     def _consumer_region_map(
         self,
@@ -3398,7 +3433,7 @@ class MooncakeConnector(KVConnectorBase):
                 block_sizes.append(src_region.unit_bytes)
 
         logger.debug(
-            "[PRODUCER] block RDMA: req=%s, %d regions × %d blocks, total_bytes=%d",
+            "[PRODUCER] block RDMA: req=%s, %d regions × %d blocks, " "total_bytes=%d",
             req_id,
             len(self._block_regions),
             len(src_block_ids),
@@ -3640,11 +3675,7 @@ class MooncakeConnector(KVConnectorBase):
                 and self._mla_staging is not None
                 else None
             ),
-            **(
-                {"handoff": request_data.get("prefill_handoff")}
-                if request_data.get("chunked_transfer")
-                else {}
-            ),
+            handoff=request_data.get("prefill_handoff"),
         )
 
     def _send_write_done(
@@ -3811,7 +3842,7 @@ class MooncakeConnector(KVConnectorBase):
                     write_nonce,
                 )
                 return False
-            pending_handoff = getattr(self, "_pending_handoffs", {}).get(req_id)
+            pending_handoff = self._pending_handoffs.get(req_id)
             if pending_handoff is not None:
                 if success:
                     try:

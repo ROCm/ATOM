@@ -37,6 +37,10 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
+from atom.kv_transfer.disaggregation.mooncake.endpoint import (
+    DEFAULT_HANDSHAKE_PORT,
+    producer_endpoint,
+)
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
@@ -2761,7 +2765,7 @@ async def get_gc_census(top: int = 30, types_per_owner: int = 2):
 
 def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     kv_role = kv_cfg.get("kv_role")
-    handshake_port = kv_cfg.get("handshake_port", 6301)
+    handshake_port = kv_cfg.get("handshake_port", DEFAULT_HANDSHAKE_PORT)
     if kv_role is not None or kv_cfg.get("kv_connector") != "multi":
         return kv_role, handshake_port
 
@@ -2802,18 +2806,13 @@ async def kv_transfer_info():
             and sub.get("kv_role", "kv_producer") == "kv_producer"
             and sub.get("enable_chunked_transfer", False)
         ):
-            info["chunked_transfer"] = {
-                "chunked_transfer": True,
-                "do_remote_prefill": True,
-                "do_remote_decode": False,
-                "remote_host": get_ip(),
-                "remote_handshake_port": sub.get("handshake_port", 6301),
-                "remote_pp_size": cfg.pipeline_parallel_size,
-                "block_size": cfg.kv_cache_block_size,
-                "dcp_size": cfg.decode_context_parallel_size,
-                "hash_block_size": cfg.kv_cache_block_size
-                * cfg.decode_context_parallel_size,
-            }
+            info["chunked_transfer"] = producer_endpoint(
+                host=get_ip(),
+                handshake_port=sub.get("handshake_port", DEFAULT_HANDSHAKE_PORT),
+                pp_size=cfg.pipeline_parallel_size,
+                block_size=cfg.kv_cache_block_size,
+                dcp_size=cfg.decode_context_parallel_size,
+            )
             break
     return info
 

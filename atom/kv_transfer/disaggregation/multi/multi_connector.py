@@ -305,9 +305,7 @@ class MultiConnector(KVConnectorBase):
 
     def publish_prefill_chunks(self, batch) -> None:
         for connector in self._connectors:
-            callback = getattr(connector, "publish_prefill_chunks", None)
-            if callable(callback):
-                callback(batch)
+            connector.publish_prefill_chunks(batch)
 
     def record_kv_cache_ready(self, req_ids: list) -> None:
         """Forward a prefill-ready event hook to connector implementations."""
@@ -408,6 +406,10 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         # Opt into the scheduler's offload suffix-prefill path if any sub is the
         # offload backend (Scheduler._is_offload_connector reads this).
         self.is_offload = any(getattr(c, "is_offload", False) for c in self._connectors)
+        self.enable_chunked_transfer = any(
+            getattr(c, "enable_chunked_transfer", False) and c.is_producer
+            for c in self._connectors
+        )
         # The sub that won `get_num_new_matched_tokens` for each in-flight
         # request, keyed by `seq.id`. The load-side decisions
         # (`should_park_for_load_after_alloc` and the two chunk/partial-prefill
@@ -771,25 +773,17 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "has_pending_work")
         )
 
-    def admission_blocked(self) -> None:
+    def admission_blocked(self, seq: Any) -> None:
         for connector in self._connectors:
-            callback = getattr(connector, "admission_blocked", None)
-            if callable(callback):
-                callback()
+            connector.admission_blocked(seq)
 
     def abort_send(self, seq: Any) -> None:
         for connector in self._connectors:
-            callback = getattr(connector, "abort_send", None)
-            if callable(callback):
-                callback(seq)
-            elif hasattr(connector, "send_finished"):
-                connector.send_finished(seq.id)
+            connector.abort_send(seq)
 
     def process_pd_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         for connector in self._connectors:
-            callback = getattr(connector, "process_pd_completions", None)
-            if callable(callback):
-                output = callback(output)
+            output = connector.process_pd_completions(output)
         return output
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
