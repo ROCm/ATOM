@@ -2124,8 +2124,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             : attn_metadata.cu_seqlens_q.shape[0]
         ]
         max_qlen = min(rows, 1 + self.max_spec_steps)
-        if cu.size > capacity + 1 or cu[-1] > rows:
+        # `running_bs` can outrun the rows: when a DP peer is prefilling, the
+        # batch stays the group's while this rank runs only its own tokens (a
+        # non-unified `ForwardMode.running_tokens`; an idle rank's dummy is one
+        # row). Those trailing sequences are padding, published empty, and every
+        # nonempty one holds a row, so they all fit; drop the empty tail. A
+        # nonempty sequence at or past `capacity` would be dropped with it.
+        if cu[-1] > rows or np.any(cu[capacity:] != cu[-1]):
             raise ValueError("FP4 sequence boundaries exceed the decode bucket")
+        cu = cu[: capacity + 1]
         if np.any(np.diff(cu) < 0) or np.any(np.diff(cu) > max_qlen):
             raise ValueError("FP4 query lengths exceed the configured decode span")
         # Refresh the WHOLE captured view, including slots left over from a
