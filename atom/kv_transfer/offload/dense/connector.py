@@ -214,7 +214,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 if save_ready_event is None:
                     # Metadata is dispatched before this step's forward, but the
                     # scheduler's save frontier (`build_connector_meta`) covers
-                    # only chunks whose forward already ran, so an event
+                    # only chunks scheduled in earlier steps, whose forwards
+                    # this worker has already enqueued -- under PP too, since a
+                    # stage receives metadata in schedule order. So an event
                     # recorded on the current stream now is ordered after the
                     # kernels that produced every token in this step's saves.
                     # Create the shared step fence lazily so a HIP error here

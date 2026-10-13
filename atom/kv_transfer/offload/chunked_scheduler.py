@@ -72,18 +72,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        if self._do_save and int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
-            # `Scheduler.advance_on_schedule` bumps num_cached_tokens inside
-            # schedule(), before that chunk's forward. The save frontier below
-            # reads the same field, so under PP a save can cover an in-flight
-            # chunk that the dense producer fence (recorded at dispatch) does
-            # not order after. Named here rather than asserted because PP
-            # offload has no supported configuration yet.
-            logger.warning(
-                "LMCache offload scheduler: pipeline parallelism advances the "
-                "prefill frontier before the forward runs; dense saves may "
-                "include a chunk the producer fence does not cover"
-            )
         self.block_size = offcfg._strict_integer(
             "Offload block size",
             config.kv_cache_block_size,
