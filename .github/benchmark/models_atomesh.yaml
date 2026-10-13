@@ -338,7 +338,7 @@ models:
             # 50 s pool idle timeout; a request sent on a socket the server just
             # closed makes the router retry P+D and orphans the first KV.
             extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192 --timeout-keep-alive 900"
-          decode:
+          decode: &glm52_agentic_cpp4_dcp4_decode
             workers: 1
             tp: 4
             cudagraph: >-
@@ -522,7 +522,7 @@ models:
               --dp-load-balance least_requests
               --cudagraph-mode FULL
           env:
-            common: &glm52_agentic_cpp4_dpa4_1p2d_env_common
+            common:
               MC_DISABLE_HIP: "1"
               ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB: "2047"
               PYTHONHASHSEED: "0"
@@ -538,7 +538,7 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: &glm52_agentic_cpp4_dpa4_1p2d_env_decode
+            decode:
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
           benchmark:
@@ -615,6 +615,41 @@ models:
             <<: *glm52_agentic_tp4_mtp5_decode
             workers: 3
             cudagraph: "[1,2,4,8,12,16,20,24,28,32,36,40,44,48]"
+
+        # 1P2D: CPP4 prefill on the first node, two TP4+DCP4 decodes on the
+        # second; the launcher gives them GPUs 0-3 and 4-7, so the decode env
+        # names none. MTP4 at the golden AL 3.33, the standalone DCP recipe's
+        # depth below C48: each decode sees about C28. Otherwise the 1P1D
+        # CPP4/DCP4 cell. cache_aware sends a session's turns back to the
+        # decode that kept its prefix, as for the 1P3D decodes.
+        - &glm52_agentic_lmcache_cpp4_dcp4_1p2d
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p2d-cpp4-dcp4-agentic-lmcache-1m-c56
+          topology: 1p2d_cpp4_dcp4
+          display_topology: 1P2D-CPP4-DCP4-MTP4
+          pd_worker_layout: decode_single_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [56]
+          router:
+            policy: cache_aware
+            balance_abs_threshold: 2
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+              extra_args: "--level 3 --method mtp --num-speculative-tokens 4 --spec-decode-acceptance-length 3.33"
+          decode:
+            <<: *glm52_agentic_cpp4_dcp4_decode
+            workers: 2
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+            decode: &glm52_agentic_cpp4_dcp4_1p2d_env_decode
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
 
         # 1P1D with a full node per role (multi_node, 2 nodes) and a TP8+DCP8
         # decode. MTP3 with fixed acceptance length 2.99, the standalone DCP
@@ -804,17 +839,16 @@ models:
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c128
           concurrency: [128]
 
-        # The nightly 1P2D cell (CPP4 prefill on the first node, two DPA4
-        # decodes on the second, MTP4) with its prefix tier in the Store. The
-        # prefill node runs nothing else, so the owners above fit it unchanged.
-        - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p2d
-          name: glm-52-mxfp4-1p2d-cpp4-dpa4-agentic-mcstore-1m-c56
-          display_topology: 1P2D-CPP4-DPA4-MTP4-MCSTORE
-          concurrency: [56]
+        # The 1P2D TP4+DCP4 cell with its prefix tier in the Store. The prefill
+        # node runs nothing else (decode_single_node), so the owners above fit
+        # it unchanged.
+        - <<: *glm52_agentic_lmcache_cpp4_dcp4_1p2d
+          name: glm-52-mxfp4-1p2d-cpp4-dcp4-agentic-mcstore-1m-c56
+          display_topology: 1P2D-CPP4-DCP4-MTP4-MCSTORE
           env:
-            common: *glm52_agentic_cpp4_dpa4_1p2d_env_common
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
             prefill: *glm52_agentic_mcstore_cpp4_dcp4_env_prefill
-            decode: *glm52_agentic_cpp4_dpa4_1p2d_env_decode
+            decode: *glm52_agentic_cpp4_dcp4_1p2d_env_decode
 
         # The same cells on two nodes that each give the job only GPUs 0-3
         # with their NUMA node's memory and NICs (rdma0-3): the other half of
