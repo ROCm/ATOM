@@ -318,14 +318,70 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
-        y = batched_gemm_a8w8_mxscale_bpreshuffle(
-            x_fp8,
-            self.wo_a.weight.view(self.groups, self.o_rank, -1),
-            x_scale,
-            self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1),
-            dtype=output.dtype,
-        )
+        w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+        w_scale = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            use_aiter_bmm = get_gfx() == "gfx950"
+        except Exception:
+            use_aiter_bmm = False
+        if use_aiter_bmm:
+            y = batched_gemm_a8w8_mxscale_bpreshuffle(
+                x_fp8, w, x_scale, w_scale, dtype=output.dtype
+            )
+        else:
+            # aiter has no 32x32 mxscale BMM on gfx942; run each group through
+            # the same local group32 GEMM wqkv_a already uses on MI308.
+            y = self._wo_a_group32_local(x_fp8, x_scale, w, w_scale, output.dtype)
         return self.wo_b(y.view(*output.shape[:-2], -1))
+
+    def _wo_a_group32_local(self, x_fp8, x_scale, weight, weight_scale, dtype):
+        from atom.model_ops.blockscale import (
+            _activations_for_ocp_group32,
+            _group32_bf16_gemm,
+            _units,
+            _use_group32_bf16_fallback,
+        )
+        from atom.model_ops.blockscale_kernels.fp8 import gemm_fp8_local
+
+        outs = []
+        cu_num = _units(x_fp8.device.index)
+        bf16_fallback = _use_group32_bf16_fallback()
+        for group in range(x_fp8.shape[1]):
+            x_g, xs_g = _activations_for_ocp_group32(
+                x_fp8[:, group].contiguous(), x_scale[:, group].contiguous()
+            )
+            w_g = weight[group]
+            if w_g.dtype == torch.float8_e4m3fnuz:
+                w_g = w_g.view(torch.float8_e4m3fn)
+            w_g = w_g.contiguous()
+            ws_g = weight_scale[group].contiguous()
+            if bf16_fallback:
+                outs.append(
+                    _group32_bf16_gemm(
+                        x_g,
+                        w_g,
+                        xs_g,
+                        ws_g,
+                        weight_group_rows=32,
+                        dtype=dtype,
+                    )
+                )
+            else:
+                outs.append(
+                    gemm_fp8_local(
+                        x_g,
+                        w_g,
+                        xs_g,
+                        ws_g,
+                        dtype=dtype,
+                        weight_group_rows=32,
+                        split_k=None,
+                        cu_num=cu_num,
+                    )
+                )
+        return torch.stack(outs, dim=1)
 
     def _fork_compress(self, hidden, cache, step, rope):
         """The compressor, issued before the projections, beside them.

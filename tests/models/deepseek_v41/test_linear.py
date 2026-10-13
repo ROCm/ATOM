@@ -57,6 +57,41 @@ def _online_quant_config(block_rows=1):
     )
 
 
+def test_native_fp8_group32_accepts_e4m3fnuz(linear_modules):
+    """gfx942 maps aiter dtypes.fp8 to e4m3fnuz; scale geometry must stay 32-row.
+
+    Without this, V4.1 shared-expert MergedColumn scales allocate one row per
+    weight row (576 on TP4) while the checkpoint still ships 2304/32/TP=18.
+    """
+    from aiter import QuantType
+
+    linear, group = linear_modules
+    group.world_size = 4
+    group.rank_in_group = 3
+    spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=torch.float8_e4m3fnuz,
+        weight_block_size=(32, 32),
+        is_dynamic=True,
+    )
+    qc = SimpleNamespace(get_layer_quant_config=lambda _: spec, online_quant=False)
+    module = linear.MergedColumnParallelLinear(
+        5120, [2304, 2304], quant_config=qc, prefix="layers.0.ffn.shared_experts.gate_up_proj"
+    )
+    assert module.native_a8_group_rows == 32
+    assert module.weight.shape == (1152, 5120)
+    assert module.weight_scale.shape == (36, 160)
+    # One disk shard (w1) is 72 scale rows; TP4 rank 3 keeps rows 54:72.
+    scales = torch.arange(72 * 160, dtype=torch.int32).remainder(120).to(
+        torch.float8_e8m0fnu
+    ).reshape(72, 160)
+    module.weight_loader(module.weight_scale, scales, 0)
+    assert torch.equal(
+        module.weight_scale[:18].view(torch.uint8),
+        scales[54:72].view(torch.uint8),
+    )
+
+
 def test_online_requantized_source_drops_the_native_layout(linear_modules):
     """MiniMax-M3-MXFP8's attention linears, which online quant overwrites.
 
