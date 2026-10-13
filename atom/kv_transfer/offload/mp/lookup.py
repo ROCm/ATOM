@@ -22,6 +22,9 @@ _ASYNC_ADAPTER_ATTRS = (
     "_lookup_results",
 )
 
+# Status re-queries for a discarded lookup before its locks are left to the TTL.
+_ORPHAN_STATUS_RETRIES = 8
+
 _ASYNC_LOOKUP_FAILED = (
     "LMCache MP async lookup failed for request %s in phase %s; "
     "read locks it may hold are left to the read TTL"
@@ -64,6 +67,8 @@ class _MPLookupClient:
         # cache, which `cleanup_lookup_result` clears by request ID.
         self._async_hits: dict[str, int] = {}
         self._orphans: set[str] = set()
+        # Failed status queries retried per discarded lookup.
+        self._status_retries: dict[str, int] = {}
         # Hits of discarded (fire-and-forget) lookups, drained by the scheduler.
         self._discarded_hits: dict[str, int] = {}
         # The non-blocking path drives LMCache's ATOM adapter through its
@@ -176,12 +181,52 @@ class _MPLookupClient:
             try:
                 answered = self._advance(lookup_id)
             except Exception:
+                if self._retry_orphan_status(lookup_id):
+                    continue
                 phase = self._drop_failed(lookup_id)
                 logger.warning(_ASYNC_LOOKUP_FAILED, lookup_id, phase, exc_info=True)
+                if lookup_id in self._orphans:
+                    # Nobody will consume or retry it: forget it entirely.
+                    self._orphans.discard(lookup_id)
+                    self._async_tokens.pop(lookup_id, None)
+                    self._async_hits.pop(lookup_id, None)
                 continue
             if answered and lookup_id in self._orphans:
+                self._status_retries.pop(lookup_id, None)
                 self._orphans.discard(lookup_id)
                 self._release_unconsumed(lookup_id)
+
+    def _retry_orphan_status(self, lookup_id: str) -> bool:
+        """Re-query a discarded lookup whose status query failed.
+
+        A fire-and-forget lookup has no consumer to ask again. Once the server
+        acked it ("status" phase) it may hold read locks, and only an answered
+        status lets them be released exactly -- releasing by range with the
+        hit unknown could drop locks other requests hold on shared objects.
+        So keep it in flight (which also keeps its MP session alive) and ask
+        again, a bounded number of times; past that, leave the locks to the
+        read TTL. A failure in the "lookup" phase never reached the server and
+        holds nothing, so it is not retried.
+        """
+        entry = self._async.get(lookup_id)
+        if entry is None or lookup_id not in self._orphans or entry[2] != "status":
+            return False
+        tries = self._status_retries.get(lookup_id, 0)
+        if tries >= _ORPHAN_STATUS_RETRIES:
+            self._status_retries.pop(lookup_id, None)
+            return False
+        try:
+            entry[3] = self._adapter._client.query_prefetch_status(entry[0])
+        except Exception:
+            logger.warning(
+                "LMCache MP: could not re-query discarded lookup %s",
+                lookup_id,
+                exc_info=True,
+            )
+            return False
+        self._status_retries[lookup_id] = tries + 1
+        logger.debug("LMCache MP: retrying status of discarded lookup %s", lookup_id)
+        return True
 
     def _drop_failed(self, lookup_id: str) -> str | None:
         """Forget an async lookup that raised; return the phase it failed in.

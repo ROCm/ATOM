@@ -319,3 +319,65 @@ def test_floor_stays_when_the_tier_holds_the_whole_hbm_prefix(monkeypatch):
     sched._end_finished_sessions()
     assert entry[1] == 60
     assert sched._skipped_lookup_seqs() == {}
+
+
+# ── a failed status query keeps the session (#2547 review) ───────────────
+
+
+class _FailingStatusOnce:
+    """`query_prefetch_status` whose first answer raises, then succeeds."""
+
+    def __init__(self, client, failures=1):
+        self.client = client
+        self.failures = failures
+
+    def __call__(self, request_id):
+        fut = _Future_cls(self.client.chunks)
+        if self.failures:
+            self.failures -= 1
+            fut.raise_on_result = True
+        return fut
+
+
+class _Future_cls:
+    def __init__(self, value):
+        self.value = value
+        self.raise_on_result = False
+
+    def query(self):
+        return True
+
+    def result(self, timeout=None):
+        if self.raise_on_result:
+            raise RuntimeError("status query failed")
+        return self.value
+
+
+def test_failed_status_keeps_the_session_until_locks_are_freed(monkeypatch):
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=True)
+    events = _with_session_log(adapter)
+    adapter._client.query_prefetch_status = _FailingStatusOnce(adapter._client)
+    seq = _seq()
+    sched.commit_tier_lookup_skip(seq, 60)
+    sched._pending_session_ends()["7"] = seq
+
+    sched._end_finished_sessions()  # status fails once: retried, still in flight
+    assert client.is_pending("7")
+    assert events == []
+
+    sched._end_finished_sessions()  # retry answers: free, then end
+    assert [k for k, _ in events] == ["free", "end"]
+
+
+def test_lookup_phase_failure_is_dropped_without_retry(monkeypatch):
+    """Never reached the server, so it holds no locks to wait for."""
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=True)
+
+    def boom(_rid):
+        raise RuntimeError("send failed")
+
+    adapter._client.lookup_future.result = lambda timeout=None: boom(None)
+    sched.commit_tier_lookup_skip(_seq(), 60)
+    client.pump()
+    assert not client.is_pending("7")
+    assert "7" not in client._orphans
