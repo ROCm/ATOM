@@ -79,9 +79,8 @@ class Trace:
                 completed = {
                     (r["rank"], r["kind"]) for r in completions if r["success"]
                 }
-                expected = {
-                    (rank, kind) for rank in range(8) for kind in ("attention", "kda")
-                }
+                kinds = ("attention", "kda") if plan["external_tokens"] else ("kda",)
+                expected = {(rank, kind) for rank in range(8) for kind in kinds}
                 if admissions and completed == expected:
                     return plan, admissions[-1], completions
             await asyncio.sleep(0.5)
@@ -191,6 +190,7 @@ async def run(args):
                 local = admission["local_tokens"]
                 remote_end = plan["prompt_tokens"] - 1
                 external = admission["external_tokens"]
+                assert external == plan["external_tokens"], (name, plan, admission)
                 if external:
                     assert local + external == remote_end, (name, admission)
                     source = plan["attention_full"]
@@ -205,6 +205,10 @@ async def run(args):
                         )
                     elif local >= page:
                         assert duplicate, (name, "A did not reproduce redundant READ")
+                else:
+                    assert not plan["local"][0], (name, "Unexpected attention READ")
+                    assert all(r["kind"] == "kda" for r in completions), name
+                    record["zero_external_control"] = True
             with requests_file.open("a") as stream:
                 stream.write(json.dumps(record) + "\n")
             records.append(record)
@@ -301,6 +305,16 @@ async def run(args):
             assert same_output(repeated, reference), (
                 length,
                 "repeat output mismatch",
+            )
+            correctness.append(
+                {
+                    "length": length,
+                    "condition": "repeat",
+                    "passed": True,
+                    "zero_external_control": repeated.get(
+                        "zero_external_control", False
+                    ),
+                }
             )
         (args.output / "mechanism.json").write_text(json.dumps(correctness, indent=2))
 

@@ -44,7 +44,11 @@ def test_trace_reads_only_complete_lines_and_requires_all_kinds(tmp_path):
     module = load_script("pd_prefix_workload")
     path = tmp_path / "rank.jsonl"
     records = [
-        {"event": "plan", "request_id": "cmpl-prefix-probe"},
+        {
+            "event": "plan",
+            "request_id": "cmpl-prefix-probe",
+            "external_tokens": 128,
+        },
         {"event": "admission", "request_id": "cmpl-prefix-probe"},
     ]
     records += [
@@ -69,6 +73,54 @@ def test_trace_reads_only_complete_lines_and_requires_all_kinds(tmp_path):
     assert plan["request_id"] == admission["request_id"]
     trace.poll()
     assert len(trace.records) == len(records)
+
+
+def test_trace_accepts_full_attention_hit_only_after_all_kda_reads(
+    tmp_path, monkeypatch
+):
+    """A full attention hit still transfers KDA, with no attention READs."""
+    module = load_script("pd_prefix_workload")
+    request_id = "cmpl-prefix-repeat"
+    plan = {
+        "event": "plan",
+        "request_id": request_id,
+        "local": [[], [200]],
+        "external_tokens": 0,
+    }
+    admission = {
+        "event": "admission",
+        "request_id": request_id,
+        "external_tokens": 0,
+    }
+    records = [plan, admission] + [
+        {
+            "event": "read_complete",
+            "request_id": request_id,
+            "rank": rank,
+            "kind": "kda",
+            "success": True,
+        }
+        for rank in range(8)
+    ]
+    path = tmp_path / "rank.jsonl"
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr(module.asyncio, "sleep", no_sleep)
+    path.write_text("".join(json.dumps(row) + "\n" for row in records[:-1]))
+    trace = module.Trace(tmp_path)
+    with pytest.raises(AssertionError, match="eight-rank READ completion"):
+        asyncio.run(trace.request(["prefix-repeat"]))
+    with path.open("a") as stream:
+        stream.write(json.dumps(records[-1]) + "\n")
+    actual_plan, actual_admission, completed = asyncio.run(
+        trace.request(["prefix-repeat"])
+    )
+    assert actual_plan == plan
+    assert actual_admission == admission
+    assert len(completed) == 8
+    assert {row["kind"] for row in completed} == {"kda"}
 
 
 @pytest.mark.parametrize("success", [False, True])
