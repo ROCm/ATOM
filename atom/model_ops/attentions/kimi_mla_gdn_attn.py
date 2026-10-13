@@ -82,7 +82,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         TP-replicated even though the MLA KV beside it is.
         """
         transfer = super().get_kv_transfer_tensors()
-        if transfer is None or not self._uses_paged_checkpoints():
+        # Under PP an op names every stage's image at once, which a per-stage
+        # LMCache MP worker cannot store; it keeps refusing K3 there.
+        if (
+            transfer is None
+            or not self._uses_paged_checkpoints()
+            or self.model_runner.config.pipeline_parallel_size > 1
+        ):
             return self._with_kda_disagg_regions(transfer)
         spec = self.model_runner.state_runtime.checkpoint_spec
         if spec is None:
@@ -166,21 +172,21 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
         return tensors
 
+    # Every PP stage scatters its own layers' state into the unit ids the head
+    # names; `ModelRunner._agree_pipeline_checkpoint_spec` sizes them.
+    paged_checkpoints_span_pipeline = True
+
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
 
-        Off under pipeline parallelism and RapidServe, which `get_num_blocks`
-        *raises* on when the transfer copies. Answering yes there would turn
-        "K3 under PP keeps no state cache" into "K3 under PP does not start".
+        Off under RapidServe, which `get_num_blocks` *raises* on when the
+        transfer copies. Answering yes there would turn "K3 under RapidServe
+        keeps no state cache" into "K3 under RapidServe does not start".
 
         One predicate for both `state_transfer` and `state_spec`, because the
         two disagreeing would size a pool for one mechanism and run the other.
         """
-        config = self.model_runner.config
-        return not (
-            config.pipeline_parallel_size > 1
-            or getattr(config, "enable_rapidserve", False)
-        )
+        return not getattr(self.model_runner.config, "enable_rapidserve", False)
 
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
