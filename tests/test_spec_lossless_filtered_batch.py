@@ -26,6 +26,7 @@ Two halves, one test file:
   `softmax(logits/T)`, which for `T = 1` is nothing like a delta. That matters
   because propose and verify are a step apart -- this batch's drafts are tested
   against the NEXT batch's filters -- and a delta `q` is sound under either rule.
+  `tests/test_spec_lossless_no_op_at_t0.py` is where that delta is pinned.
 
 CPU-only, and lifted out of the shipped sources with `ast` for the reason
 `tests/test_dspark_q_slots.py` states at length: `atom.model_engine.model_runner`

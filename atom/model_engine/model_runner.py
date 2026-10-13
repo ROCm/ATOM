@@ -724,7 +724,7 @@ def _lossless_verify_inputs(drafter, req_ids, *, all_greedy, top_ks, top_ps):
       is a delta q and `sum_x min(p, q) = p(x*)` -- so the ratio kernel would buy
       nothing and could only move the answer by an ulp. Keeping the exact-match
       kernel is what makes the flag a bit-for-bit no-op on a greedy batch, which
-      is most deployments.
+      is most deployments; `tests/test_spec_lossless_no_op_at_t0.py` pins it.
     * **Any row carries top-k or top-p.** `rejection_sampler._ratio_target_probs`
       builds p as a plain temperature softmax and does NOT filter it, so a
       filtered row verified by the ratio rule would accept against -- and draw
