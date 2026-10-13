@@ -240,7 +240,13 @@ def _ratio_target_probs(
 
 
 def _assert_unfiltered(top_ks, top_ps) -> None:
-    """Refuse a top-k/top-p batch on the probability-ratio path.
+    """Internal invariant: no caller reaches the ratio path with a filter on.
+
+    ``ModelRunner.postprocess`` drops ``draft_probs`` for a filtered batch, so
+    this should be unreachable -- it is kept because the thing it guards is
+    silent: the draft drew from an UNFILTERED ``softmax(logits / T)``, and a
+    ratio test against a filtered target ``p`` would bias the emitted
+    distribution with nothing in the output to show for it.
 
     ``top_ks`` is ATOM's ``-1 means disabled`` convention and ``top_ps`` its
     ``1.0 means disabled`` one (see ``Sampler.forward``); either may also arrive
@@ -262,13 +268,13 @@ def _assert_unfiltered(top_ks, top_ps) -> None:
         return value < 1.0
 
     if _active_k(top_ks) or _active_p(top_ps):
-        raise NotImplementedError(
-            "probability-ratio speculative acceptance does not implement "
-            "top-k/top-p yet: the draft drew from an UNFILTERED "
-            "softmax(logits / T), so comparing it against a filtered target p "
-            "would change the emitted distribution without saying so. Either "
-            "run with top_p=1.0 and top_k disabled, or stop passing "
-            "draft_probs to fall back to exact-match acceptance."
+        raise ValueError(
+            "probability-ratio speculative acceptance was handed a top-k/top-p "
+            "batch: the draft drew from an UNFILTERED softmax(logits / T), so "
+            "the ratio test against a filtered target p would change the "
+            "emitted distribution without saying so. The caller must pass "
+            "draft_probs=None for a filtered batch, which falls back to "
+            "exact-match acceptance and is still lossless."
         )
 
 
@@ -358,18 +364,21 @@ class RejectionSampler(nn.Module):
         draft_probs_row_base: torch.Tensor | None = None,
         # [batch_size] fp32, pre-clamped. Required with draft_probs.
         temperatures: torch.Tensor | None = None,
-        # Refused rather than approximated when the ratio path is on; see below.
+        # The caller drops draft_probs for a filtered batch, so these are
+        # disabled whenever the ratio path is live; see below.
         top_ks: torch.Tensor | int | None = None,
         top_ps: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if draft_probs is not None:
-            # SILENTLY changing the output distribution is a submittability bug,
-            # so a filter the draft did not apply is a hard error rather than a
-            # quiet fallback. Handling it properly means applying the SAME
-            # top-k/top-p mask to the target before the ratio rule sees it AND
-            # having the draft's own q carry the mask too; that is unexercised
-            # and unimplemented, and claiming it works untested is worse than
-            # refusing it.
+            # Unreachable: `ModelRunner.postprocess` answers a filtered batch
+            # with draft_probs=None, which falls back to exact-match acceptance
+            # -- still lossless, because the draft token does not depend on the
+            # target's fresh noise and the emitted token is the target's own
+            # filtered sample. Kept because the failure it guards is SILENT:
+            # the draft's q is unfiltered, so a ratio test against a filtered p
+            # would bias the output with nothing to show for it. Doing better
+            # means masking and renormalising the draft's own q before the
+            # race, which is unimplemented.
             _assert_unfiltered(top_ks, top_ps)
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we

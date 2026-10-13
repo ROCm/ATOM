@@ -3299,6 +3299,25 @@ class ModelRunner:
             drafter = getattr(self, "drafter", None)
             if not all_greedy and drafter is not None:
                 draft_probs = drafter.draft_probs
+                if draft_probs is not None and (
+                    top_ks is not None or top_ps is not None
+                ):
+                    # A filtered batch drops to exact-match acceptance for this
+                    # step. The draft drew from an UNFILTERED softmax(logits/T),
+                    # so the ratio rule against a filtered target p would be
+                    # biased -- but exact match against the target's FILTERED
+                    # draw stays lossless, because the draft token does not
+                    # depend on the target's fresh noise and the emitted token
+                    # is the target's own sample. It accepts less often; it
+                    # never changes what is emitted.
+                    #
+                    # This used to be a NotImplementedError raised inside the
+                    # kernel wrapper, i.e. inside every TP worker, so one
+                    # request with top_p < 1 killed the engine for good while
+                    # /health went on answering 200. `prepare_sample` sets
+                    # these to None exactly when no row filters, so the test is
+                    # host-side and costs no sync.
+                    draft_probs = None
                 if draft_probs is not None:
                     draft_probs_row_base = drafter.draft_probs_row_base(
                         batch.req_ids[:bs]

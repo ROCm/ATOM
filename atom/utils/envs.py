@@ -492,13 +492,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # computes), and a sampled draft under exact-match acceptance is strictly
     # worse than today.
     #
-    # DEFAULT OFF, and deliberately. It changes the EMITTED TOKEN DISTRIBUTION
-    # (both rules are target-exact, but they are not the same draw) and it
-    # REFUSES top-k/top-p batches with NotImplementedError rather than
-    # approximating them -- the draft's q is unfiltered, so a filtered target p
-    # would silently change the distribution. Defaulting it on would turn a
-    # working top-p deployment into an outage, and the house convention is that
-    # a behaviour-changing flag defaults off.
+    # DEFAULT OFF, and deliberately: it changes the EMITTED TOKEN DISTRIBUTION
+    # (both rules are target-exact, but they are not the same draw), and the
+    # house convention is that a behaviour-changing flag defaults off. A
+    # top-k/top-p batch is not refused -- the draft's q is unfiltered, so that
+    # step drops back to exact-match acceptance against the target's filtered
+    # draw, which is still lossless and only accepts less often.
     #
     # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
     # q is [bs, T, V] and has to cross the step boundary. Twice over: the block
