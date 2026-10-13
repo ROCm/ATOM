@@ -381,6 +381,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         every later chunk once HBM evicts its copy too. When the discarded
         lookup answers, its hit is the tier's real contiguous prefix; any
         chunk between it and the floor is saved again on the next pass.
+
+        Best-effort: the answer normally lands long before the request ends
+        (~1.7 s lookup vs. prefill + transfer + save). If the request finishes
+        first, its tracker is gone and this request saves nothing more; the
+        next request reaching the prefix repairs the hole with its own answer.
         """
         take = getattr(self._lookup_client, "take_discarded_hits", None)
         if not callable(take):
