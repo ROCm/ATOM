@@ -206,9 +206,10 @@ class EngineCore:
                     "prefill_token_graphs", wait_out=True
                 ),
             )
+            # Under PP only the head (stage 0) schedules.
             if (
                 config.parallel_config.data_parallel_size == 1
-                and config.pipeline_parallel_size == 1
+                and config.parallel_config.pipeline_parallel_rank == 0
                 and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
             ):
                 self._init_prefill_delayer(config)

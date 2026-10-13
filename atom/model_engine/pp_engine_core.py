@@ -148,6 +148,11 @@ class PPEngineCoreProc(EngineCore):
             tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
             self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
+            if (
+                self.scheduler.prefill_delayer is not None
+                and scheduled_batch.total_seqs_num_prefill > 0
+            ):
+                self.scheduler.prefill_delayer.notify_prefill_executed()
             self.scheduler.mark_pp_inflight(scheduled_batch)
             self._in_flight.append((scheduled_batch, seqs, needs_output))
             launched += 1

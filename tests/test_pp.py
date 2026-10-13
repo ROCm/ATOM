@@ -666,6 +666,110 @@ def test_decode_inflight_block():
     assert seq.id in batch3.req_ids
 
 
+def _pp_decode_sched(num_seqs, **overrides):
+    """A PP scheduler whose `num_seqs` seqs have all finished prefill."""
+    cfg = _pp_config(max_num_batched_tokens=1024, **overrides)
+    sched = Scheduler(cfg)
+    seqs = [_make_seq(32, block_size=cfg.kv_cache_block_size) for _ in range(num_seqs)]
+    for seq in seqs:
+        sched.add(seq)
+    batch, _ = sched.schedule()
+    assert sorted(batch.req_ids) == sorted(s.id for s in seqs)
+    for seq in seqs:
+        seq.token_ids.append(42)
+        seq.num_tokens += 1
+        seq.type = SequenceType.DECODE
+    return sched, seqs
+
+
+def test_decode_split_into_pp_microbatches():
+    """Each decode pass takes 1/pp_size of the seqs, so a round fills the pipe."""
+    sched, seqs = _pp_decode_sched(8)
+    launched = []
+    for _ in range(4):
+        batch, _ = sched.schedule()
+        assert len(batch.req_ids) == 2
+        sched.mark_pp_inflight(batch)
+        launched.extend(batch.req_ids)
+    assert sorted(launched) == sorted(s.id for s in seqs)
+
+    batch, _ = sched.schedule()
+    assert len(batch.req_ids) == 0
+
+
+def test_decode_microbatch_rounds_up():
+    """An uneven split rounds the share up rather than leaving a straggler."""
+    sched, _ = _pp_decode_sched(7)
+    sizes = []
+    for _ in range(4):
+        batch, _ = sched.schedule()
+        sched.mark_pp_inflight(batch)
+        sizes.append(len(batch.req_ids))
+    assert sizes == [2, 2, 2, 1]
+
+
+def test_decode_microbatches_env_one_keeps_single_batch(monkeypatch):
+    monkeypatch.setenv("ATOM_PP_DECODE_MICROBATCHES", "1")
+    sched, seqs = _pp_decode_sched(8)
+    batch, _ = sched.schedule()
+    assert len(batch.req_ids) == len(seqs)
+
+
+def test_decode_microbatches_env_overrides_pp_size(monkeypatch):
+    monkeypatch.setenv("ATOM_PP_DECODE_MICROBATCHES", "2")
+    sched, _ = _pp_decode_sched(8)
+    batch, _ = sched.schedule()
+    assert len(batch.req_ids) == 4
+
+
+def test_decode_microbatches_ignored_without_pp(monkeypatch):
+    monkeypatch.setenv("ATOM_PP_DECODE_MICROBATCHES", "4")
+    assert Scheduler(_pp_config(pipeline_parallel_size=1))._pp_decode_microbatches == 1
+
+
+def test_decode_microbatches_rejects_negative(monkeypatch):
+    monkeypatch.setenv("ATOM_PP_DECODE_MICROBATCHES", "-1")
+    with pytest.raises(ValueError, match="ATOM_PP_DECODE_MICROBATCHES"):
+        Scheduler(_pp_config())
+
+
+def test_decode_window_not_spent_while_all_decode_in_flight():
+    """A protection pass with every decode token in flight keeps the window."""
+    from atom.model_engine.prefill_delayer import PrefillDelayer
+
+    sched, _ = _pp_decode_sched(4)
+    delayer = PrefillDelayer(
+        dp_size=1,
+        cpu_group=None,
+        max_num_batched_tokens=1024,
+        prefill_decode_interval=2,
+    )
+    sched.set_prefill_delayer(delayer)
+    delayer._first = False
+    delayer._decode_interval_remaining = 2
+    sched.add(_make_seq(32))
+
+    batches = []
+    for _ in range(4):
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 0
+        sched.mark_pp_inflight(batch)
+        batches.append(batch)
+    assert delayer._decode_interval_remaining == 0
+
+    # Every decode token is in flight: a pass here must not touch the window.
+    delayer._decode_interval_remaining = 1
+    batch, _ = sched.schedule()
+    assert len(batch.req_ids) == 0
+    assert delayer._decode_interval_remaining == 1
+
+    # Once a token returns, the pass decodes and spends the window.
+    sched.release_pp_inflight(batches[0])
+    batch, _ = sched.schedule()
+    assert batch.total_seqs_num_decode == 1
+    assert delayer._decode_interval_remaining == 0
+
+
 def test_multiple_seqs_partial_and_final():
     cfg = _pp_config(max_num_batched_tokens=200)
     sched = Scheduler(cfg)

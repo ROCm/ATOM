@@ -809,6 +809,17 @@ class Scheduler:
         # them until the head releases the id after postprocess, so a seq is
         # never decoded against a token not yet appended.
         self._pp_inflight_token_block: set[int] = set()
+        # Decode passes split ready seqs into this many batches so the pipeline
+        # is not left with a single decode batch in flight. 1 disables the cap.
+        pp_microbatches = envs.ATOM_PP_DECODE_MICROBATCHES
+        if pp_microbatches < 0:
+            raise ValueError(
+                "ATOM_PP_DECODE_MICROBATCHES must be non-negative; "
+                f"got {pp_microbatches}"
+            )
+        self._pp_decode_microbatches: int = (
+            (pp_microbatches or pp_size) if pp_size > 1 else 1
+        )
         # Seqs whose last chunk ended on a state-checkpoint rung not yet filed;
         # prefill skips them. Under PP the next chunk would otherwise overwrite
         # the state slot before it is filed under the rung's hash.
@@ -2011,7 +2022,10 @@ class Scheduler:
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
-        if self.prefill_delayer is not None:
+        if self.prefill_delayer is not None and self._pp_decode_window_stalled():
+            decision = PrefillDecision(allow=False, prefillable_ranks=0)
+            prefill_cost = 0.0
+        elif self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
             running_decode_batch = max(
@@ -2724,7 +2738,16 @@ class Scheduler:
         # they are reconsidered once the head releases them post-postprocess.
         skipped_pp_inflight: list[Sequence] = []
         _pp_block = self._pp_inflight_token_block
-        while self.running and num_seqs_decode < self.max_num_seqs:
+        max_decode_seqs = self.max_num_seqs
+        if self._pp_decode_microbatches > 1:
+            # Sized from every decode seq, in flight or not, so each pass of a
+            # round takes the same share instead of the first taking them all.
+            running_decode = len(self.running) - self._partial_prefill_count
+            max_decode_seqs = min(
+                max_decode_seqs,
+                max(1, -(-running_decode // self._pp_decode_microbatches)),
+            )
+        while self.running and num_seqs_decode < max_decode_seqs:
             if num_decode_tokens + tokens_per_decode_seq > self.max_num_batched_tokens:
                 break
             seq = self.running.popleft()
@@ -3958,6 +3981,23 @@ class Scheduler:
             for i, req_id in enumerate(batch.req_ids):
                 if final[i]:
                     yield req_id
+
+    def _pp_decode_window_stalled(self) -> bool:
+        """Whether a decode-protection pass would find no decode to launch.
+
+        The delayer counts its post-prefill window in scheduler passes. The PP
+        head keeps polling while every decode seq's token is in flight, and
+        those empty passes would spend the window before any decode ran. Only
+        a local delayer protects decode, so skipping its call breaks no
+        cross-rank lockstep.
+        """
+        block = self._pp_inflight_token_block
+        if not block:
+            return False
+        running_decode = len(self.running) - self._partial_prefill_count
+        if not self.prefill_delayer.protects_decode(running_decode):
+            return False
+        return all(seq.is_partial_prefill or seq.id in block for seq in self.running)
 
     def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
         """Head: block re-scheduling of seqs whose token is now in flight.

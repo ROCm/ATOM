@@ -1137,7 +1137,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After a prefill forward, protect this many scheduler passes for decode
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
-    # A nonzero interval also enables local coalescing on TP without PP.
+    # A nonzero interval also enables local coalescing on TP and on the PP head.
+    # Under PP a pass that finds every decode seq in flight is not counted, so
+    # the window is measured in launched decode microbatches.
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
@@ -1197,6 +1199,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Decode microbatches the PP head splits running decode seqs into, so the
+    # pipeline holds that many decode batches at once instead of one batch
+    # walking the stages while the rest idle. 0 means pipeline_parallel_size;
+    # 1 keeps every ready decode seq in a single batch.
+    "ATOM_PP_DECODE_MICROBATCHES": lambda: int(
+        os.getenv("ATOM_PP_DECODE_MICROBATCHES", "0")
+    ),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
