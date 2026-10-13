@@ -761,6 +761,7 @@ class LinearBase(nn.Module):
             and quant_config.blockscale_e8m0_scale
         )
         self.native_a8_group_rows = None
+        self.online_e8m0_blockscale = False  # set by online_quantize_weight
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
             (1, 32),
@@ -1099,6 +1100,11 @@ class LinearBase(nn.Module):
         )
         weight = self.weight.data
         weight_scale = getattr(self, "weight_scale", None)
+        # __init__ decided this from the checkpoint scheme; follow the online target.
+        online_e8m0_scale = (
+            online_quant_type.value == QuantType.per_1x128.value
+            and self.quant_config.blockscale_e8m0_scale
+        )
         if (
             self.tp_size > 1
             and self.tp_dim is not None
@@ -1187,7 +1193,10 @@ class LinearBase(nn.Module):
                 self.output_partition_sizes,
             )
             q_weight, weight_scale = quant_weight_online(
-                weight, online_quant_type, online_quant_dtype
+                weight,
+                online_quant_type,
+                online_quant_dtype,
+                blockscale_e8m0_scale=online_e8m0_scale,
             )
         if need_gather:
             q_weight, weight_scale = self._shard_quantized_weight(
@@ -1205,6 +1214,8 @@ class LinearBase(nn.Module):
         # Update quant state
         self.quant_type = online_quant_type
         self.params_dtype = online_quant_dtype
+        self.blockscale_e8m0_scale = online_e8m0_scale
+        self.online_e8m0_blockscale = online_e8m0_scale
         self.layer_quant_config = online_layer_quant_config
         self._stream_online_quant = False
         self.quant_func = get_hip_quant(online_quant_type)
@@ -1367,7 +1378,13 @@ class LinearBase(nn.Module):
         # The other half of the shuffle decision `process_weights_after_loading`
         # takes, so it answers on the same terms `weight_is_stored_preshuffled`
         # does -- by value.
-        if not (
+        # The gfx1250 E8M0 (mxfp8_128) GEMM needs N % 128 == 0; the block scale
+        # already has ceil(N/128) rows, so only the weight is padded.
+        is_e8m0_blockscale = (
+            self.quant_type.value == QuantType.per_1x128.value
+            and self.online_e8m0_blockscale
+        )
+        if not is_e8m0_blockscale and not (
             self.quant_type.value == QuantType.per_Token.value
             and self.params_dtype == dtypes.fp8
         ):
@@ -1392,9 +1409,10 @@ class LinearBase(nn.Module):
             self.weight.data, (0, 0, 0, padding_size)
         )
         ws = self.weight_scale.data
-        self.weight_scale.data = torch.cat(
-            [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
-        )
+        if not is_e8m0_blockscale:
+            self.weight_scale.data = torch.cat(
+                [ws, ws.new_ones((padding_size, *ws.shape[1:]))], dim=0
+            )
         # Bias is also per-output-channel
         if self.bias is not None:
             b = self.bias.data
@@ -1434,8 +1452,10 @@ class LinearBase(nn.Module):
             return False
         if self.quant_type.value == QuantType.No.value:
             return True
-        return self.quant_type.value == QuantType.per_1x128.value and bool(
-            envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        return (
+            self.quant_type.value == QuantType.per_1x128.value
+            and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
+            and not self.is_output_padded  # a padded N overruns `out`
         )
 
     @mark_trace
@@ -1685,8 +1705,8 @@ class LinearBase(nn.Module):
         view.output_size = length
         # `forward` trims padded rows via `_output_size_before_padding`. A row
         # view lives entirely inside the real rows, so it must not re-trim; the
-        # caller is expected to slice below the padding (only per_Token fp8 pads
-        # at all, and it appends at the end).
+        # caller is expected to slice below the padding (per_Token fp8 and E8M0
+        # per_1x128 pad, both by appending at the end).
         if getattr(self, "is_output_padded", False):
             assert (
                 start + length <= self._output_size_before_padding
