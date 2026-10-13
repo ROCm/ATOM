@@ -495,6 +495,57 @@ def test_a_deferred_decode_keep_is_published_while_the_request_runs(
     eng.drain()
 
 
+class _NoAdd(set):
+    def add(self, item):
+        pass
+
+
+@pytest.mark.parametrize("guard", [True, False])
+def test_a_co_scheduled_reader_restores_only_after_the_writers_store(
+    adapter, tmp_path, guard
+):
+    """Two requests with the same 600-token prompt arrive together. The writer
+    cuts its prefill at the 512 anchor, and its image there is hashed when that
+    chunk is scheduled, before the forward that produces it. A reader admitted
+    in the same schedule() would restore in that step's metadata build, before
+    the writer's forward and store. vLLM's Mamba manager refuses a hit whose
+    last block was cached in the current step (``cached_blocks_this_step``,
+    which the image groups fill), so the reader is admitted on a later step,
+    still with the 512 hit. Without that set (``guard=False``) the reader is
+    co-scheduled with the writer, which is the hazard."""
+    s = _scheduler(adapter, tmp_path)
+    st = s._atom_state_images
+    if not guard:
+        for gid in st.image_gids:
+            st.coordinator.single_type_managers[gid].cached_blocks_this_step = _NoAdd()
+    eng = _Engine(s)
+    prompt = list(range(1, 601))
+    _request(s, "w", prompt, max_tokens=2)
+    _request(s, "r", prompt, max_tokens=2)
+    store_step = first_r = None
+    for step in range(20):
+        if len(eng.q) >= 2:
+            eng.land()
+        out = eng.schedule()
+        if store_step is None and out.atom_image_stores.get("w") == 512:
+            store_step = step
+        for new in out.scheduled_new_reqs:
+            if new.req_id == "r":
+                first_r = (step, new.num_computed_tokens)
+        if first_r is not None:
+            break
+    assert store_step is not None and first_r is not None
+    step_r, hit_r = first_r
+    assert hit_r == 512
+    if guard:
+        assert step_r > store_step
+    else:
+        assert step_r == store_step
+    while eng.q:
+        eng.land()
+    eng.drain()
+
+
 @pytest.mark.parametrize("hash_block", [BLOCK, BLOCK // 2])
 def test_abort_with_a_deferred_decode_keep_frees_the_request(
     adapter, tmp_path, hash_block
