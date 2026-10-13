@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
+import dataclasses
 import gc
+import hashlib
 import inspect
 import logging
 import math
@@ -1870,6 +1872,47 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def _agree_pipeline_checkpoint_spec(
+        self, spec: PagedStateCheckpointSpec
+    ) -> PagedStateCheckpointSpec:
+        """Put every PP stage's checkpoint images on one set of unit ids.
+
+        Only the head schedules, so a store or restore op it builds names the
+        same unit ids on every stage. Each stage holds its own layers' state in
+        its own unit size, so the stages need different counts; all take the
+        largest, and a stage needing fewer leaves its tail units unwritten. An
+        op is checked against the joint layout id and the summed image bytes,
+        which change whenever any stage's geometry does. Collective: every
+        rank calls it.
+        """
+        world = torch.distributed.get_world_size()
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(
+            gathered,
+            (
+                spec.layout_id,
+                spec.image_bytes,
+                spec.page_unit_bytes,
+                spec.units_per_checkpoint,
+            ),
+        )
+        stage_span = world // self.config.pipeline_parallel_size
+        stages = gathered[::stage_span]
+        units = max(entry[3] for entry in stages)
+        op_bytes = sum(entry[1] for entry in stages)
+        digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
+        layout_id = f"pp{len(stages)}-joint:{digest}"
+        logger.info(
+            "PAGE-backed state checkpoints span %d PP stages: units=%d "
+            "(per stage %s), op_bytes=%d, layout=%s",
+            len(stages),
+            units,
+            [entry[3] for entry in stages],
+            op_bytes,
+            layout_id,
+        )
+        return spec.for_pipeline(layout_id, units, op_bytes)
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -2005,7 +2048,13 @@ class ModelRunner:
         # Keep runtime state metadata out of Config.
         transfer = self.attn_metadata_builder.state_transfer()
         uses_paged_state = transfer.copies
-        if uses_paged_state and config.pipeline_parallel_size > 1:
+        if (
+            uses_paged_state
+            and config.pipeline_parallel_size > 1
+            and not getattr(
+                self.attn_metadata_builder, "paged_checkpoints_span_pipeline", False
+            )
+        ):
             raise RuntimeError(
                 "PAGE-backed state checkpoints do not yet support pipeline "
                 "parallelism: every stage must first agree on one atomic "
@@ -2049,6 +2098,11 @@ class ModelRunner:
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,
             )
+            if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+                checkpoint_spec = self._agree_pipeline_checkpoint_spec(checkpoint_spec)
+                transfer = dataclasses.replace(
+                    transfer, paged_layout_id=checkpoint_spec.layout_id
+                )
             logger.info(
                 "PAGE-backed state checkpoints enabled: unit_bytes=%d, "
                 "slot_bytes=%d, image_bytes=%d (%.1f%% of a slot), "
