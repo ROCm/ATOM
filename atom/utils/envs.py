@@ -303,9 +303,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
     "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
-    # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
-    # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
-    # flash_attn_varlen_func fallback.
+    # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
+    # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
+    # Set to 0 for the BF16 flash_attn_varlen_func fallback.
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
@@ -335,6 +335,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
+    ),
+    # With that fusion on, batches above this token count run the Gemma q/k
+    # norm, RoPE and cache write as separate kernels: the one-kernel version
+    # loses at prefill sizes while saving launches at decode sizes (crossover
+    # between 8192 and 16384 tokens for Qwen3.5 TP4 on MI355X).
+    "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
     ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
