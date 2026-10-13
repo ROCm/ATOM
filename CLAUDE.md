@@ -68,8 +68,8 @@ Key entry points:
   mailbox and its `publish`, the TP group's peer bases and all-reduce sum
   (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`) and wave
   / math primitives), a model's
-  kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
-  Kimi-K3, both wrapped after load through
+  kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4,
+  DeepSeek-V4.1 and Kimi-K3, all wrapped after load through
   `model_runner.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
   kernel and its CPU I3 test. Kimi-K3 runs only its KDA layers — K1 (the
