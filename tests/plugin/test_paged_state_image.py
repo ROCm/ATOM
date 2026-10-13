@@ -351,6 +351,134 @@ def test_stores_run_once_right_after_the_runner_forward(fake):
         G._workers.pop(fake.name, None)
 
 
+class _DraftRunner:
+    """A runner with a drafter: the draft forward writes the slot after the
+    target's (vLLM: ``sample_tokens`` -> ``propose_draft_token_ids``)."""
+
+    speculative_config = object()
+
+    def __init__(self, copier, slot):
+        self.copier, self.slot = copier, slot
+
+    def model(self, **kw):
+        self.copier.slots[self.slot, :UNIT] = 1
+        return "hidden"
+
+    def draft(self):
+        self.copier.slots[self.slot, UNIT:] = 2
+
+
+def test_with_a_drafter_stores_run_at_the_next_build_after_both_forwards(fake):
+    """Native drains a step's stores into the next batch's build, after the
+    target and the draft forward; without a drafter they stay right after the
+    target forward (``test_stores_run_once_right_after_the_runner_forward``)."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    G._apply_runner_patches()
+    copier = _Copier()
+    worker = G.ImageWorker(fake, copier, [1, 2, 3])
+    runner = _DraftRunner(copier, 3)
+    before = G.store_counts()
+    G.register_image_worker(worker)
+    try:
+        md = NS(
+            reset_slots=set(), image_store_slots=[3], image_store_units=[(10, 11, 12)]
+        )
+        G.run_image_step(
+            worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
+        )
+        GPUModelRunner._model_forward(runner, input_ids=None, positions=None)
+        assert copier.calls == [] and worker.forward_ran
+        runner.draft()
+        expected = copier.slots[3].clone()
+        events = []
+        G.run_image_step(
+            worker,
+            NS(reset_slots={3}),
+            capturing=False,
+            plan=lambda: events.append(("plan", len(copier.calls))),
+            reset_fn=lambda s: events.append(("reset", len(copier.calls))),
+            name="Fake",
+        )
+        # Issued first in the next build, before its plan, resets and restores,
+        # with both forwards' rows.
+        assert copier.calls == [("copies", [(3, (10, 11, 12))], [], 1)]
+        assert events == [("plan", 1), ("reset", 1)]
+        assert torch.equal(
+            torch.cat([copier.units[u] for u in (10, 11)]), expected[: 2 * UNIT]
+        )
+        assert torch.equal(copier.units[12, : SLOT - 2 * UNIT], expected[2 * UNIT :])
+        assert worker.pending_stores is None and not worker.forward_ran
+        after = G.store_counts()
+        assert after["next_build"] - before["next_build"] == 1
+        assert after["after_forward"] == before["after_forward"]
+        assert after["at_next_build"] == before["at_next_build"]
+    finally:
+        G._workers.pop(fake.name, None)
+
+
+def test_with_a_drafter_a_store_whose_forward_never_ran_is_still_refused(fake):
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    G._apply_runner_patches()
+    copier = _Copier()
+    worker = G.ImageWorker(fake, copier, [1, 2, 3])
+    runner = _DraftRunner(copier, 2)
+    G.register_image_worker(worker)
+    try:
+        md = NS(reset_slots=set(), image_store_slots=[2], image_store_units=[(7, 8, 9)])
+        G.run_image_step(
+            worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
+        )
+        # A forward from before this build (or a dummy run) marks nothing.
+        assert not worker.forward_ran
+        before = G.store_counts()
+        with pytest.raises(RuntimeError, match="never ran"):
+            G.run_image_step(
+                worker,
+                NS(reset_slots=set()),
+                capturing=False,
+                plan=lambda: None,
+                reset_fn=None,
+                name="Fake",
+            )
+        assert copier.calls == []
+        assert G.store_counts()["at_next_build"] - before["at_next_build"] == 1
+        # A capture build never issues one, even after the forward ran.
+        worker.pending_stores = ([2], [(7, 8, 9)])
+        GPUModelRunner._model_forward(runner, input_ids=None, positions=None)
+        G.run_image_step(
+            worker,
+            NS(reset_slots=set()),
+            capturing=True,
+            plan=lambda: 1 / 0,
+            reset_fn=None,
+            name="Fake",
+        )
+        assert copier.calls == [] and worker.pending_stores is not None
+    finally:
+        G._workers.pop(fake.name, None)
+
+
+def test_vllm_runs_the_drafter_between_the_target_forward_and_the_next_build():
+    """What the next-build site relies on in vLLM's V1 runner: the target
+    forward runs in ``execute_model`` after the step's metadata build, and the
+    drafter in ``sample_tokens``, which the engine calls before the next
+    ``execute_model``."""
+    import inspect
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    execute = inspect.getsource(GPUModelRunner.execute_model)
+    assert execute.index("self._build_attention_metadata(") < execute.index(
+        "self._model_forward("
+    )
+    assert "self.propose_draft_token_ids(" not in execute
+    assert "self.propose_draft_token_ids(" in inspect.getsource(
+        GPUModelRunner.sample_tokens
+    )
+
+
 def test_a_store_never_runs_inside_a_capture(fake, monkeypatch):
     worker = G.ImageWorker(fake, _Copier(), [1, 2, 3])
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
