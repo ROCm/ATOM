@@ -18,6 +18,20 @@ from atom.model_ops.sp_mega_moe import (
 )
 
 
+@pytest.fixture(autouse=True)
+def mock_mega_buffer_ops(monkeypatch):
+    from atom.model_ops import sp_mega_moe
+
+    # Replace only the GPU copy boundary for CPU orchestration tests. The real
+    # copies and launch counts are covered on GPU.
+    def copy(source, source_scale, out, out_scale):
+        out.view(torch.uint8).copy_(source.view(torch.uint8))
+        if source_scale is not None:
+            out_scale.view(-1).copy_(source_scale)
+
+    monkeypatch.setattr(sp_mega_moe, "copy_tail", copy)
+
+
 @pytest.fixture
 def sp_modules(request):
     return _sp_modules.__wrapped__(request)
@@ -69,7 +83,6 @@ def test_tiles_preserve_token_routing_and_output_ownership(rows):
         max_local_tokens=64,
         set_weights=Mock(),
         forward=launch,
-        error_flag=lambda: torch.zeros(1, dtype=torch.int32),
     )
     backend = SPMegaMoE(runtime)
     first = backend.forward(layer, x, object())
