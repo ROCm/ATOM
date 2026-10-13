@@ -17,13 +17,13 @@ The contract has two halves:
 from types import SimpleNamespace
 
 import pytest
+from test_lmcache_mp import _config
+from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client
 
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
-from test_lmcache_mp import _config
-from test_lmcache_mp_async_lookup import CHUNK, _Adapter, _Client
 
 MIN_LOAD = 32
 
@@ -208,7 +208,7 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
     """`end_session` before the orphan answers would leave its state-group
     read locks pinned until the L1 read TTL (the server recreates an empty
     session for the late `free_lookup_locks`)."""
-    sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
+    sched, _client, adapter = _scheduler(monkeypatch, lookup_done=False)
     events = _with_session_log(adapter)
     seq = _seq()
     sched.skip_tier_lookup(seq, 60)

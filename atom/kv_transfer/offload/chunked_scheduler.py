@@ -331,10 +331,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._begin_load_lifecycle(seq)
         client = self._lookup_client
         submit = getattr(client, "submit", None)
-        if callable(submit) and self._lookup_len(seq) > 0:
-            # No-op when a prefetch already sent it; otherwise send it now.
-            if submit(self._lookup_token_ids(seq), sid):
-                self._perf_bump("lookup_fire_and_forget")
+        # No-op when a prefetch already sent it; otherwise send it now.
+        if (
+            callable(submit)
+            and self._lookup_len(seq) > 0
+            and submit(self._lookup_token_ids(seq), sid)
+        ):
+            self._perf_bump("lookup_fire_and_forget")
         discard = getattr(client, "discard", None)
         if callable(discard):
             discard(sid)

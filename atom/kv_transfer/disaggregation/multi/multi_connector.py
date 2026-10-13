@@ -376,7 +376,12 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         ]
         if not subs:
             return False
-        return all([bool(fn(seq, hbm_tokens)) for fn in subs])
+        # Ask every sub, not just until the first refusal: each one that
+        # agrees has already sent and released its lookup.
+        skipped = True
+        for fn in subs:
+            skipped = bool(fn(seq, hbm_tokens)) and skipped
+        return skipped
 
     def tier_lookup_cannot_load(self, seq: Any, hbm_tokens: int) -> bool:
         """True only if every sub with a tier lookup says it cannot load."""
