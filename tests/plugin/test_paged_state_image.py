@@ -249,8 +249,23 @@ def test_kv_config_hook_aligns_and_withholds_slots(fake):
     assert vc.cache_config.mamba_cache_mode == "align"
     assert cfg.num_blocks == 100 - 11
     vc.speculative_config = object()
-    with pytest.raises(ValueError, match="Fake prefix caching"):
+    with pytest.raises(ValueError, match="Fake prefix caching .* drafter's state"):
         G._kv_cache_configs_hook(original, vc, specs, 0)
+
+
+@pytest.mark.parametrize("eagle", [True, False])
+def test_a_family_whose_draft_is_in_the_slot_runs_images_with_a_drafter(
+    fake, monkeypatch, eagle
+):
+    monkeypatch.setattr(fake, "draft_state_in_image", True, raising=False)
+    vc = _vcfg()
+    vc.speculative_config = NS(use_eagle=lambda: eagle, disable_eagle_block_drop=False)
+    specs = [{fake.proxy_layer_name: object()}]
+    (cfg,) = G._kv_cache_configs_hook(lambda *a: [_groups(fake, 3)], vc, specs, 0)
+    assert vc.cache_config.mamba_cache_mode == "align"
+    assert cfg.num_blocks == 100 - 11
+    # An EAGLE-class drafter: native's hit rule, through vLLM's own switch.
+    assert vc.speculative_config.disable_eagle_block_drop is eagle
 
 
 def test_a_matching_model_without_the_proxy_layer_passes_through(fake):

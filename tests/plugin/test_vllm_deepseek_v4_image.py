@@ -118,11 +118,23 @@ def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
     vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=NS(num_speculative_tokens=1))
     out, sentinel, _ = _through_hook(vc, [{"model.layers.0.attn": object()}])
     assert out is sentinel and vc.cache_config.mamba_cache_mode == "none"
-    # With the proxy: images on, MTP with prefix caching refused as before.
+    # With the proxy: images on, and with MTP too, since the draft's ring is in
+    # the target's slot: native's hit rule (vLLM's own drop switch) and align.
+    from atom.plugin.vllm import paged_state_image as G
     from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    from atom.plugin.vllm.deepseek_v4_image import register_v4_image_adapter
 
-    with pytest.raises(ValueError, match="does not drive the MTP draft proxy"):
-        _through_hook(vc, [{ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME: object()}])
+    register_v4_image_adapter()
+    vc.speculative_config = NS(
+        num_speculative_tokens=1,
+        use_eagle=lambda: True,
+        disable_eagle_block_drop=False,
+    )
+    out = G._kv_cache_configs_hook(
+        lambda *a: [], vc, [{ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME: object()}], [0]
+    )
+    assert out == [] and vc.cache_config.mamba_cache_mode == "align"
+    assert vc.speculative_config.disable_eagle_block_drop is True
 
 
 def test_event_driven_slots_never_take_a_live_requests_slot():

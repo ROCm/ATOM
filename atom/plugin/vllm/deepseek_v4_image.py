@@ -465,6 +465,8 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
     layer_suffix = ATOM_DEEPSEEK_V4_IMAGE_LAYER_SUFFIX
     block_size = _V4_IMAGE_BLOCK_SIZE
     backend_cls = AtomDeepseekV4ImageBackend
+    # The MTP draft's ring is layer n_layers of the target's slot carve.
+    draft_state_in_image = True
 
     @property
     def proxy_layer_name(self) -> str:
