@@ -860,9 +860,9 @@ class GDNStateMixin(PoolRowsMixin):
                 f"state checkpoint layout mismatch: op {op.layout_id!r} "
                 f"against this worker's {spec.layout_id!r}"
             )
-        if op.total_bytes != spec.image_bytes:
+        if op.total_bytes != spec.op_bytes:
             raise RuntimeError(
-                f"a checkpoint image is {spec.image_bytes} B but the op names "
+                f"a checkpoint image is {spec.op_bytes} B but the op names "
                 f"{op.total_bytes}"
             )
         if len(op.unit_ids) != spec.units_per_checkpoint:
