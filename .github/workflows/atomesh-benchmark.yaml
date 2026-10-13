@@ -1773,8 +1773,8 @@ jobs:
         if: ${{ always() && matrix.name == 'kimi-k3-mooncake-inferencex-c48' }}
         uses: actions/upload-artifact@v4
         with:
-          name: atomesh-prior-slurm-7477-${{ github.run_id }}
-          path: atomesh-results/prior-slurm-7477.json
+          name: atomesh-prior-slurm-7970-${{ github.run_id }}
+          path: atomesh-results/prior-slurm-7970.json
           if-no-files-found: error
 
       - name: Run Slurm benchmark cell
