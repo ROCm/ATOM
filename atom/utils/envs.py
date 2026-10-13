@@ -277,6 +277,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Experimental AITER #5937 all-gather + MoE + reduce-scatter, native M3 SP4.
+    "ATOM_SP_MOE_MEGA": lambda: os.getenv("ATOM_SP_MOE_MEGA", "0") == "1",
+    "ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS": lambda: int(
+        os.getenv("ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS", "1024")
+    ),
+    "ATOM_SP_MOE_MEGA_ACT_DTYPE": lambda: os.getenv(
+        "ATOM_SP_MOE_MEGA_ACT_DTYPE", "fp4"
+    ),
+    "ATOM_SP_MOE_MEGA_COMM_DTYPE": lambda: os.getenv(
+        "ATOM_SP_MOE_MEGA_COMM_DTYPE", "fp8"
+    ),
+    # Diagnostic override: by default, preserve native activation precision
+    # (notably BF16 on small M3 batches) by falling back to the native SP MoE.
+    "ATOM_SP_MOE_MEGA_ALLOW_ACTIVATION_CHANGE": lambda: os.getenv(
+        "ATOM_SP_MOE_MEGA_ALLOW_ACTIVATION_CHANGE", "0"
+    )
+    == "1",
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1

@@ -343,3 +343,41 @@ def test_moe_capacity_includes_dummy_rows_for_odd_token_budget():
         enable_dp_attention=False,
     )
     assert moe_kernel_token_capacity(config, dp_size=1, use_all2all=False) == 32772
+
+
+def test_decoder_calls_real_moe_with_unquantized_input(monkeypatch):
+    hidden = torch.ones(3, 8)
+    expected = hidden + 5
+    moe = object.__new__(model.MiniMaxM3MoE)
+    torch.nn.Module.__init__(moe)
+    moe._tp_replicated_o_proj = False
+    moe.gate = torch.nn.Identity()
+    moe.experts = Mock(return_value=expected)
+    moe.fuse_shared_experts = True
+    moe.routed_scaling_factor = 2.0
+    moe.shared_experts = None
+    decoder = SimpleNamespace(
+        _tp_replicated_o_proj=False,
+        _m3_fused_gemma_fp8=False,
+        is_moe_layer=True,
+        self_attn=Mock(return_value=hidden),
+        input_layernorm=torch.nn.Identity(),
+        post_attention_layernorm=object(),
+        block_sparse_moe=moe,
+    )
+    monkeypatch.setattr(model, "_linear_consumes_per_token_fp8", lambda _: False)
+    monkeypatch.setattr(
+        model, "fused_allreduce_gemma_rms_norm", lambda x, residual, norm: (x, residual)
+    )
+
+    output, residual = model.MiniMaxM3DecoderLayer.forward(
+        decoder, torch.arange(3), hidden, None
+    )
+
+    torch.testing.assert_close(output, expected)
+    assert residual is hidden
+    moe.experts.assert_called_once()
+    torch.testing.assert_close(moe.experts.call_args.kwargs["hidden_states"], hidden)
+    torch.testing.assert_close(moe.experts.call_args.kwargs["router_logits"], hidden)
+    with pytest.raises(ValueError, match="prequantized input"):
+        moe(hidden, x_scale=torch.ones(3, 1))

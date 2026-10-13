@@ -977,6 +977,9 @@ class ModelRunner:
             load_fused_expert_weights_fn=fused_shared_expert_load_fn,
         )
         load_elapsed = time.perf_counter() - load_start
+        from atom.model_ops.sp_mega_moe import initialize_sp_mega_moe
+
+        initialize_sp_mega_moe(self.model, config)
         logger.info(
             f"[{self.rank_name}] Model load done: {config.model} "
             f"(weights loaded in {load_elapsed:.2f}s)"
