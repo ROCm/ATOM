@@ -107,6 +107,44 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
 
+def _require_v41_draft_kv_cache_dtype(vllm_config) -> None:
+    """DSpark must name its own KV dtype, or it rewrites the target's.
+
+    vLLM drives the DSpark draft with its own DeepSeek-V4.1 attention, which
+    only accepts a packed `*_ds_mla` layout. Given `auto` it resolves to
+    `fp8_ds_mla` and *writes that back onto the `cache_config` it was handed*
+    (`vllm/models/deepseek_v41/attention.py`). Without a draft-level override
+    that config is the target's, so ATOM's own pool dtype silently becomes a
+    spelling it has no pool for, and the run dies later naming an
+    `fp8_ds_mla` the operator never typed.
+
+    `--speculative-config`'s `kv_cache_dtype` is applied to the draft's own
+    copy of the config (`_DRAFT_VLLM_CONFIG_OVERRIDES`), which is exactly the
+    separation this needs: the draft gets its packed layout, ATOM's target
+    pool stays bf16 or fp4.
+
+    Refused here, where the flag to add can be named, rather than left to
+    surface as a dtype mismatch two layers down.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return
+    if (getattr(spec, "method", None) or "").lower() != "dspark":
+        return
+    if getattr(spec, "kv_cache_dtype", None):
+        return
+    msg = (
+        "DeepSeek-V4.1 DSpark on the vLLM plugin needs its draft's KV dtype "
+        'named explicitly: add "kv_cache_dtype": "fp8_ds_mla" to '
+        "--speculative-config. vLLM's V4.1 draft attention takes only a "
+        "packed *_ds_mla layout, and without a draft-level override it "
+        "rewrites the target's cache_dtype to it -- which ATOM has no pool "
+        "for. The target's own --kv-cache-dtype stays auto/bfloat16/nvfp4."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
 def _refuse_v41_hf_overrides(vllm_config) -> None:
     """Refuse `--hf-overrides`, which this path cannot honour.
 
@@ -295,6 +333,7 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
 
     _refuse_v41_hf_overrides(vllm_config)
     _refuse_unsupported_v41_speculation(vllm_config)
+    _require_v41_draft_kv_cache_dtype(vllm_config)
 
     from vllm.config import CUDAGraphMode
 

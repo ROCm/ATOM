@@ -319,6 +319,13 @@ def validate_speculative_config(config):
             raise ValueError("DeepSeek-V4.1 DSpark must use the target checkpoint")
     if config.kv_cache_dtype != "bf16":
         raise ValueError("DeepSeek-V4.1 DSpark requires a BF16 KV cache")
+    # ATOM's *target* pool, and not in conflict with vLLM's V4.1 draft
+    # attention requiring a packed `fp8_ds_mla` layout: those are two
+    # different caches. On the plugin path the draft names its own dtype
+    # through `--speculative-config`, which vLLM applies to the draft's copy
+    # of the config alone, so the target pool stays bf16 while the draft is
+    # packed. Reads like a contradiction otherwise, and has been read that
+    # way.
     from atom.utils import envs
 
     if envs.ATOM_ENABLE_RELAXED_MTP:

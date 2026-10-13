@@ -288,3 +288,52 @@ class TestHfOverridesAreRefused:
 
         for empty in (None, {}, ()):
             _refuse_v41_hf_overrides(self._config(empty))
+
+
+class TestDsparkDraftKvDtype:
+    """DSpark must name its draft's KV dtype, and is told so by name.
+
+    vLLM's V4.1 draft attention takes only a packed `*_ds_mla` layout. Given
+    `auto` it resolves to `fp8_ds_mla` and writes that back onto whatever
+    `cache_config` it was handed -- the target's, unless the speculative
+    config overrode it for the draft alone. ATOM has no fp8 V4.1 pool, so the
+    run then died naming a dtype the operator never typed, two layers from
+    the flag that fixes it. Reported by a sibling session that hit exactly
+    this while trying to measure something else.
+    """
+
+    @staticmethod
+    def _config(spec_kv):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV41ForCausalLM"], hf_overrides=None
+            ),
+            speculative_config=SimpleNamespace(method="dspark", kv_cache_dtype=spec_kv),
+        )
+
+    def test_a_dspark_config_without_one_is_refused_by_flag_name(self):
+        from atom.plugin.vllm.platform import _require_v41_draft_kv_cache_dtype
+
+        with pytest.raises(ValueError, match="kv_cache_dtype") as excinfo:
+            _require_v41_draft_kv_cache_dtype(self._config(None))
+        message = str(excinfo.value)
+        # Actionable: the flag, the value, and that the target's is separate.
+        assert "--speculative-config" in message
+        assert "fp8_ds_mla" in message
+        assert "--kv-cache-dtype" in message
+
+    def test_naming_it_passes(self):
+        from atom.plugin.vllm.platform import _require_v41_draft_kv_cache_dtype
+
+        _require_v41_draft_kv_cache_dtype(self._config("fp8_ds_mla"))
+
+    def test_no_speculation_is_unaffected(self):
+        from types import SimpleNamespace
+
+        from atom.plugin.vllm.platform import _require_v41_draft_kv_cache_dtype
+
+        _require_v41_draft_kv_cache_dtype(
+            SimpleNamespace(speculative_config=None, model_config=None)
+        )
