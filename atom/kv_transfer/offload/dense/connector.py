@@ -186,6 +186,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
     def start_load_kv(self, metadata) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
+        # Ahead of the submits below: this runs on the forward thread, and
+        # `submit()` is evaluated before the `_track_job()` wrapping it, so a
+        # worker can reach the staging pipeline before a recording made there.
+        self._note_compute_stream()
         load_requests = [
             req
             for req in metadata.requests

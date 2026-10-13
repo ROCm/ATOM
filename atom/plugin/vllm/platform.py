@@ -277,6 +277,17 @@ def _breakable_cudagraph_available() -> bool:
     return bool(is_breakable_cudagraph_enabled())
 
 
+def _v41_state_tier_configured(vllm_config) -> bool:
+    """Whether this run has a connector that owns V4.1's per-request state."""
+    kv = getattr(vllm_config, "kv_transfer_config", None)
+    if kv is None:
+        return False
+    name = getattr(kv, "kv_connector", None)
+    if name is None and isinstance(kv, dict):
+        name = kv.get("kv_connector")
+    return name == "AtomLMCacheOffloadConnector"
+
+
 def enforce_deepseek_v41_constraints(vllm_config) -> None:
     """Apply V4.1-specific plugin constraints to one config. Idempotent.
 
@@ -317,16 +328,21 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         return
 
     cache_config = getattr(vllm_config, "cache_config", None)
-    if cache_config is not None and getattr(
-        cache_config, "enable_prefix_caching", False
+    if (
+        cache_config is not None
+        and getattr(cache_config, "enable_prefix_caching", False)
+        and not _v41_state_tier_configured(vllm_config)
     ):
         msg = (
-            "DeepSeek-V4.1 on the vLLM plugin does not support prefix caching: a "
-            "block-table hit restores the compressed pages but not the "
-            "per-request window ring, compressor rings or Engram cursor that "
-            "CSA2 attention reads alongside them, and a V4.1 forward cannot "
-            "leave them at the interior block boundary vLLM's cache assumes. "
-            "Pass --no-enable-prefix-caching."
+            "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "
+            "alongside AtomLMCacheOffloadConnector. A block-table hit "
+            "restores the compressed pages but not the per-request window "
+            "ring, compressor rings or Engram cursor that CSA2 attention "
+            "reads alongside them, and a V4.1 forward cannot leave them at "
+            "the interior block boundary vLLM's cache assumes. The "
+            "connector owns a tier for exactly that state and caps every "
+            "hit, local or external, to a boundary whose state it stored. "
+            "Pass --no-enable-prefix-caching, or configure the connector."
         )
         logger.error(msg)
         raise ValueError(msg)

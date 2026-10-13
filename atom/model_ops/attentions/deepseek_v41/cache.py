@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """PAGE-backed global keys and complete, relocatable CSA2 request state."""
 
+import logging
+
 import numpy as np
 import torch
 
@@ -33,6 +35,8 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_write,
 )
 from atom.utils import CpuGpuBuffer, upload_numpy
+
+logger = logging.getLogger(__name__)
 
 from .indices import (
     build_indices,
@@ -420,6 +424,48 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
+
+    def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
+        """Give a checkpoint-image restore a chance before the contract judges.
+
+        The only point between a slot being assigned and its cursor being
+        judged. Placed after the reset, a restore cannot be undone by it;
+        placed before `_report_stale_state`, it is checked by it -- a
+        row-order mistake hands over somebody else's state, and the contract
+        catches exactly that, because the restored cursor then does not equal
+        the position wanted. A wrong restore is a loud death, not a wrong
+        answer.
+
+        Only the rows that would otherwise raise are touched: restoring every
+        row every step overwrites live state with an image nothing has
+        written, measured as a prefill chunk arriving at `computed=4096` with
+        `cursor=0`. The filter is `~fresh`, the same one the contract uses,
+        so the two cannot drift apart.
+        """
+        hook = _IMAGE_RESTORE_HOOK
+        if hook is None:
+            return cursors
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
+        if not wrong.size:
+            return cursors
+        rows = [
+            (int(step.requests[int(i)].slot), int(starts[int(i)]), int(i))
+            for i in wrong
+        ]
+        try:
+            restored = int(hook(rows))
+        except Exception:
+            logger.warning("DeepSeek-V4.1 image restore failed", exc_info=True)
+            _RESTORE_FAILURES.append(1)
+            return cursors
+        if not restored:
+            return cursors
+        # Re-read, so the contract judges what the restore produced rather
+        # than what it replaced.
+        return (
+            torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+        )
+
     def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
 
@@ -429,6 +475,23 @@ class PagedAttentionCache:
         """
         wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
+            return
+        wrong = np.asarray(
+            [i for i in wrong if not _is_vllm_warmup_request(requests[int(i)])],
+            dtype=np.int64,
+        )
+        if not wrong.size:
+            # vLLM's own synthetic warmup only. It runs a decode step at a
+            # position no request ever reached, through slots nothing wrote,
+            # and discards the output -- so the state it reads is not state
+            # anyone will see. This exemption appeared when the state-image
+            # layers made the model hybrid: vLLM warms SSM groups with
+            # `_warmup_N_` at position 2, and without it the engine dies
+            # before serving its first request.
+            #
+            # Keyed on vLLM's own naming, so a rename does not silence the
+            # contract -- it brings it back.
+            _WARMUP_EXEMPTIONS.append(1)
             return
         first = int(wrong[0])
 
@@ -487,6 +550,9 @@ class PagedAttentionCache:
         if histories:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+            )
+            cursors = self._restore_stale_rows(
+                cursors, wanted, ids, fresh, step, count
             )
             self._report_stale_state(cursors, wanted, ids, fresh)
         else:
@@ -888,3 +954,35 @@ class PagedAttentionCache:
             layers,
             stride,
         )
+
+
+#: Warmup rows the stale-cursor contract let through, for reading rather than
+#: assuming: a non-zero count after the server is up would mean the exemption
+#: is catching live traffic, which it must never do.
+_WARMUP_EXEMPTIONS: list = []
+
+
+def warmup_exemptions() -> int:
+    return len(_WARMUP_EXEMPTIONS)
+
+
+def _is_vllm_warmup_request(req_id) -> bool:
+    """vLLM's synthetic warmup request, by vLLM's own naming."""
+    text = str(req_id)
+    return text.startswith("_warmup_") and text.endswith("_")
+
+
+#: Set by the state-image runtime. `rows` is `[(slot, start_token, row)]`
+#: for exactly the rows whose cursor is not where the scheduler wants it;
+#: the hook returns how many it restored.
+_IMAGE_RESTORE_HOOK = None
+_RESTORE_FAILURES: list = []
+
+
+def install_image_restore_hook(hook) -> None:
+    global _IMAGE_RESTORE_HOOK
+    _IMAGE_RESTORE_HOOK = hook
+
+
+def restore_failures() -> int:
+    return len(_RESTORE_FAILURES)

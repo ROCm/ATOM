@@ -212,6 +212,33 @@ def test_other_plugin_backends_are_still_refused_outright():
         )
 
 
+def test_vllm_plugin_kv_transfer_is_gated_on_its_own_allow_list():
+    """The plugin's transport is vLLM's `kv_connector`, not an ATOM name.
+
+    Resolving it through `KVConnectorFactory` is a category error, so the gate
+    forks on the mode. This also pins that the gate is *reachable* at all: it
+    reads `Config.kv_transfer_config`, which the plugin path populates in
+    `atom.plugin.config`. Before that plumbing existed the dict was always
+    empty here and every connector was admitted without the question being
+    asked -- a check that passes because it was never run.
+
+    The allow-list is one entry on this branch, not empty: this is the branch
+    that carries the connector owning V4.1's STATE. What the gate still has to
+    refuse is everything else, `lmcache_mp` included -- it is admitted on the
+    native path and means nothing here, and a PAGE prefix restored without its
+    CSA2 STATE kills the engine rather than degrading an answer.
+    """
+    validate_runtime_config(vllm_plugin_config(kv_transfer_config=None))
+    validate_runtime_config(
+        vllm_plugin_config(
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
+        )
+    )
+    for refused in ("lmcache_mp", "LMCacheConnectorV1", "NixlConnector"):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                vllm_plugin_config(kv_transfer_config={"kv_connector": refused})
+            )
 def _attach_uncompiled_backbone(model):
     """The runtime model's one compiled graph, built bare and run uncompiled,
     for a model assembled without its constructor."""
@@ -479,6 +506,27 @@ def test_the_scorer_plane_fits_the_candidate_list_at_short_contexts():
     narrow = ScoreWorkspace(geo, 8192, columns, "cpu")
     with pytest.raises(ValueError, match="exceeds its workspace"):
         narrow.logits(8192, candidate_width)
+
+
+def test_prefix_caching_is_admitted_with_the_offload_connector():
+    """The connector is what makes reuse admissible, not a separate feature.
+
+    It stores the CSA2 state at the boundaries vLLM's hashes name and caps
+    every hit -- the block pool's own included -- to one it holds. Without it
+    there is nothing to cap against, so caching stays refused; with it the
+    refusal would be refusing the thing that makes it safe.
+    """
+    validate_runtime_config(
+        vllm_plugin_config(
+            enable_prefix_caching=True,
+            kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"},
+        )
+    )
+
+
+def test_prefix_caching_without_the_connector_is_still_refused():
+    with pytest.raises(ValueError, match="prefix caching"):
+        validate_runtime_config(vllm_plugin_config(enable_prefix_caching=True))
 
 
 def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():

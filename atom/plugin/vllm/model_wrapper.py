@@ -356,6 +356,52 @@ def _patch_required_act_dtype_post_load_hooks(
     return patched
 
 
+def _maybe_register_v41_state_images(vllm_config) -> None:
+    """Register the checkpoint-image layers, behind a switch, off by default.
+
+    On until the binding question is settled by measurement rather than by a
+    model of it: the layers change how vLLM sizes and splits the pool, so a
+    run with them registered is not the run every other measurement on this
+    branch was taken on. `ATOM_V41_STATE_IMAGES=1` turns them on.
+    """
+    import os
+
+    if os.environ.get("ATOM_V41_STATE_IMAGES") not in ("1", "true", "True"):
+        return
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_BLOCK_SIZE,
+        v41_proxy_geometry,
+    )
+    from atom.plugin.vllm.v41_state_image import (
+        register_image_layers,
+        sizing_from_geometry,
+    )
+
+    geometry = v41_proxy_geometry(vllm_config)
+    sizing = sizing_from_geometry(geometry)
+    # The grid vLLM's own validity test measures against, not the tier's
+    # state interval. `is_mamba_prefill_checkpoint_valid` requires
+    # `(checkpoint_position - query_start) % alignment == 0`, and the
+    # position it checks is `(seq_len - 1) // hash_block_size *
+    # hash_block_size` -- a multiple of the block size, almost never of
+    # 4096. With 4096 the test failed on every step of every run: measured
+    # as `image_write_col_calls=4, image_write_col_null=4`, no image ever
+    # written, and restores reading blocks nothing had filled.
+    alignment = int(
+        os.environ.get("ATOM_V41_IMAGE_ALIGNMENT", "")
+        or ATOM_DEEPSEEK_V41_BLOCK_SIZE
+    )
+    register_image_layers(
+        vllm_config, sizing, ATOM_DEEPSEEK_V41_BLOCK_SIZE, alignment
+    )
+    # Learn the group index from the config vLLM builds, rather than assume
+    # it: it is 1 today, and an assumption that holds today is how a reader
+    # of the wrong block table gets somebody else's blocks with no error.
+    from atom.plugin.vllm.v41_state_image import install_group_index_patch
+
+    install_group_index_patch()
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -705,11 +751,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # capture and the first forward.
             enforce_deepseek_v41_constraints(vllm_config)
             register_deepseek_v41_proxy_layer(vllm_config)
+            _maybe_register_v41_state_images(vllm_config)
             self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
                 self.atom_config,
                 vllm_config,
                 self.device_config.device,
             )
+
             # The proxy layer is how the vLLM-facing metadata builder reaches
             # back: it runs inside `ModelState.prepare_attn`, with no handle on
             # the wrapper, and it has to bind the pool and stage the step from
@@ -725,6 +773,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             if proxy is not None:
                 proxy._atom_v41_model = self.model
                 proxy._atom_v41_builder = self._deepseek_v41_builder
+                # The KV-transfer connector's only handle on this wrapper. The
+                # builder handle above is what the metadata builder needs; the
+                # connector needs the wrapper itself, at `register_kv_caches`
+                # time, which is before any forward has run. See
+                # `ensure_v41_proxy_bound`.
+                proxy.atom_v41_owner = self
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.

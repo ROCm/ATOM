@@ -445,6 +445,41 @@ def register_model() -> None:
 
     apply_vllm_v41_state_reserve_patch()
 
+    # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
+    # before EngineCore sizes the KV cache. This hook is the only one that is
+    # reliably reached: vLLM resolves the platform class from inside its own
+    # ``import vllm``, so ``register_platform`` -- and with it
+    # ``ATOMPlatform.check_and_update_config`` -- can fail on a partially
+    # initialized ``vllm`` package and be swallowed, leaving the stock ROCm
+    # platform in place. Installing is a no-op for every other model:
+    # ``deepseek_v41_state_reserve_blocks`` returns 0 unless the config it is
+    # handed is V4.1's.
+    from atom.plugin.vllm.deepseek_v41_state_reserve_patch import (
+        apply_vllm_v41_state_reserve_patch,
+    )
+
+    apply_vllm_v41_state_reserve_patch()
+    # Same install site and the same reason: the platform hook this would
+    # naturally live in is not always activated for V4.1.
+    from atom.plugin.vllm.scheduler import (
+        apply_vllm_v41_local_hit_cap_patch,
+        apply_vllm_v41_prefill_alignment_patch,
+    )
+
+    apply_vllm_v41_local_hit_cap_patch()
+    # Diagnostic, env-gated and log-only: which kv-cache group offers what
+    # as a prefix hit, and what the coordinator reconciles them to.
+    #
+    # Installed HERE and not from the model wrapper, which runs in the
+    # workers: the coordinator lives in the EngineCore process, and from
+    # there the probe printed "installed" four times and not one hit line.
+    # Same shape as the planner counters I tried to read from a worker's
+    # refusal dump, which printed nothing at all.
+    from atom.plugin.vllm.v41_hit_probe import install as _install_hit_probe
+
+    _install_hit_probe()
+    apply_vllm_v41_prefill_alignment_patch()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()

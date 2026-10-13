@@ -600,6 +600,13 @@ def _v41_stage_outside_forward(builder, model, vllm_config, snapshot, *, capturi
         running_bs=running_bs,
         running_tokens=running_tokens,
         capturing=synthetic,
+        # The slots this step committed, carried out for the checkpoint
+        # images. They belong to `batch`, not to this object, and reading
+        # them off the wrong one is why the image path silently did nothing
+        # for three runs: `getattr(prepared, "state_slots_committed")` was
+        # None every step, so both directions returned before acting and
+        # before the counter that would have said so.
+        state_slots_committed=list(batch.state_slots_committed),
     )
 
 
@@ -727,7 +734,113 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
         )
         if prepared is not None:
             common_attn_metadata.atom_v41_prepared = prepared
+        if not capturing:
+            # Checkpoint images, both directions, around the forward this
+            # builder is staging for. Here because this runs once per step,
+            # before `set_forward_context` and outside anything a graph
+            # captures -- the same reason the rest of the staging is here.
+            _v41_images_around_forward(
+                self.vllm_config, common_attn_metadata, prepared
+            )
         return common_attn_metadata
+
+
+def _v41_images_around_forward(vllm_config, common_attn_metadata, prepared):
+    """Publish this step's slots; store what the last forward produced.
+
+    The slot half of a restore is here because this is where the batch is
+    staged -- the same `slots` the forward will read state through. Taking
+    them from anywhere else is how a checkpoint gets written from one request
+    and read into another. The block half comes from the runner's per-group
+    block table, and whichever arrives second performs the restore.
+
+    The store is the other direction and cannot happen here: this runs BEFORE
+    the forward, and the bytes worth storing are the ones that forward
+    produces. So the marks vLLM set are carried to `wait_for_save`, which runs
+    after it.
+    """
+    from atom.plugin.vllm.v41_state_image import images_can_serve, runtime
+
+    rt = runtime()
+    if rt is None or prepared is None:
+        return
+    if not images_can_serve():
+        # Registered but not serving: nothing will ever read these, so
+        # writing them is pure cost on the critical path. The gate is shut
+        # because vLLM's align-mode prefix caching wants state at a block
+        # boundary this backend cannot leave it at -- see
+        # `_RESTORE_IMPLEMENTED`. When that changes, this starts again with
+        # it rather than needing its own switch.
+        rt.store_skipped += 1
+        return
+    # Before the early return below, not after: a step that declines still
+    # has to be able to say it declined. With the log after it, three runs
+    # produced not one line while doing nothing at all.
+    rt.log_stats()
+    slots = getattr(prepared, "state_slots_committed", None)
+    if slots is None:
+        rt.missing_slots += 1
+        return
+    # Where this step's checkpoints are written, for the store that runs
+    # after the forward. The read direction is not here: it is driven from
+    # the cache, which owns the one point between a slot being assigned and
+    # its cursor being judged.
+    from atom.plugin.vllm.v41_state_image import publish_image_halves
+
+    publish_image_halves(vllm_config, common_attn_metadata, len(slots))
+    # Remembered for the store after the forward. The ends go with them:
+    # vLLM marks one column per prefill and it is not the one a repeat of
+    # the same prompt resumes at, so the store also writes this step's own
+    # end boundary -- see `boundary_marks_for_ends`.
+    prepared.image_slots = list(slots)
+    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
+    prepared.image_ends = (
+        [int(e) for e in snapshot.ends] if snapshot is not None else []
+    )
+
+
+def v41_store_images_after_forward(prepared) -> int:
+    """Write the images this step's forward just produced. Returns rows stored.
+
+    Called after the forward rather than from the builder, because a
+    checkpoint taken before it would hold the state of the step before --
+    which is a real image of the wrong boundary, and nothing downstream could
+    tell.
+    """
+    from atom.plugin.vllm.v41_state_image import (
+        boundary_marks_for_ends,
+        images_can_serve,
+        note_store_decline,
+        runtime,
+        take_store_marks,
+    )
+
+    rt = runtime()
+    if rt is None or prepared is None or not images_can_serve():
+        return 0
+    slots = getattr(prepared, "image_slots", None)
+    marks = take_store_marks()
+    if not slots:
+        note_store_decline("slots")
+        return 0
+    rows = []
+    # vLLM's own column, when it marked one this step.
+    for i in range(min(len(slots), len(marks))):
+        if int(marks[i]) > 0:
+            rows.append((int(slots[i]), int(marks[i])))
+    # This step's own end boundary, which vLLM never marks and which is the
+    # position a repeat of the same prompt resumes at. vLLM writes exactly
+    # one image per prefill, one block BELOW the end, so without this the
+    # images could not carry a hit at all -- measured, 33 stored and 0 ever
+    # restored. The state being written is the one the forward just
+    # produced, the same provenance as vLLM's own checkpoint.
+    rows.extend(
+        boundary_marks_for_ends(slots, getattr(prepared, "image_ends", None))
+    )
+    if not rows:
+        note_store_decline("marks")
+        return 0
+    return rt.store_for(rows)
 
 
 class AtomDeepseekV41ProxyBackend(AttentionBackend):
@@ -830,6 +943,11 @@ def register_deepseek_v41_proxy_layer(
     return proxy
 
 
+_V41_SNAPSHOT_FALLBACK_LOGGED = False
+_V41_ROW_CHECK_INERT_LOGGED = False
+_V41_ROW_CHECK_NOISY = False
+
+
 def _v41_scheduled_request_count(common_attn_metadata) -> int:
     """How many rows of this batch are requests, padding excluded.
 
@@ -885,6 +1003,13 @@ def snapshot_v41_batch(common_attn_metadata):
         from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
 
         input_batch = get_current_input_batch()
+        if input_batch is None and not _V41_SNAPSHOT_FALLBACK_LOGGED:
+            globals()["_V41_SNAPSHOT_FALLBACK_LOGGED"] = True
+            logger.warning(
+                "DeepSeek-V4.1: no batch on the req-id pass-through, so slot "
+                "keys fall back to first-block ids. The pass-through reports "
+                "whether it installed; this says whether it is delivering."
+            )
     # The accessor is an ATOM patch over another engine's internals; absent is
     # the caller's ordinary "fall back to the device tensors" case.
     except Exception:  # noqa: BLE001
@@ -1154,7 +1279,105 @@ def bind_deepseek_v41_proxy_cache(
         raw.numel(),
         v41_kv_cache_dtype(vllm_config),
     )
+    _v41_install_image_runtime(vllm_config, builder.cache, num_slots)
     return True
+
+
+def _v41_install_image_runtime(vllm_config, cache, num_slots) -> None:
+    """Stand up the image runtime now the pool exists, and open the gates.
+
+    Here because this is the first moment both halves exist: the state arena
+    to copy out of, and the tensors vLLM gave the image layers. A failure is
+    loud rather than silent -- with images registered the pool was already
+    sized for them and prefix caching was admitted on the promise that
+    something would fill them, so carrying on without a runtime is the one
+    outcome that must not happen quietly.
+    """
+    from atom.plugin.vllm.v41_state_image import (
+        build_runtime,
+        images_registered,
+        install_runtime,
+        runtime,
+    )
+
+    if not images_registered() or runtime() is not None:
+        return
+    try:
+        rt = build_runtime(vllm_config, cache, cache.state_bytes, max_batch=num_slots)
+    except Exception as exc:
+        raise RuntimeError(
+            "DeepSeek-V4.1 state images are registered but their runtime "
+            f"could not be built: {exc}. Prefix caching was admitted on the "
+            "promise that something fills the image blocks, and the pool was "
+            "sized for them, so starting without it would serve hits from "
+            "blocks nothing wrote."
+        ) from exc
+    if rt is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 state images are registered but no runtime was "
+            "built. See the sentence above: this cannot be a no-op."
+        )
+    install_runtime(rt)
+
+
+def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
+    """The PAGE-indexed planes of a bound V4.1 pool, in key-space order.
+
+    One main page plus that page's rows in each index plane -- the same
+    decomposition, in the same order, that ``PagedAttentionCache.unit_regions``
+    reports and that the native backend publishes to ``lmcache_mp``. The order
+    *is* the key space: an object stored under one plane order is unreadable
+    under another, so it is derived here from ``index_planes`` rather than
+    rebuilt by any caller.
+
+    The STATE region is not here and must never be: ``page_bytes`` and the
+    index planes are views of the arena's head, while the per-request state is
+    a disjoint view of its tail. STATE is addressed by request slot, not by
+    page, so a positional mover would hand one request another's rings.
+    """
+    names = [name for name, _ in cache.geometry.index_planes]
+    return [("dsv41.page", cache.page_bytes)] + [
+        (f"dsv41.{name}_plane.{owner}", plane)
+        for owner, owned in cache.index_planes.items()
+        for name, plane in zip(names, owned)
+    ]
+
+
+def ensure_v41_proxy_bound(
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+):
+    """Bind the proxy pool from outside a forward, and return `(cache, slots)`.
+
+    ``bind_deepseek_v41_proxy_cache`` normally runs on the first real forward.
+    The KV-transfer connector needs the carved planes earlier than that --
+    ``register_kv_caches`` runs during ``initialize_kv_cache`` -- and a
+    connector that registered nothing on the first request would silently
+    offload nothing until the second. Binding is idempotent (it compares the
+    proxy storage pointer), so the forward re-enters it as a no-op.
+
+    Raises rather than returning None: by this point vLLM has decided a block
+    count and allocated the proxy tensor, so a failure here is a wiring fault
+    -- the wrong model, or the state-reserve patch never installed -- and
+    returning "not yet" would turn it into an offload that quietly does
+    nothing.
+    """
+    sfc = vllm_config.compilation_config.static_forward_context
+    proxy = sfc.get(layer_name)
+    owner = getattr(proxy, "atom_v41_owner", None)
+    if owner is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy layer has no model wrapper attached; the KV "
+            "transfer connector cannot reach the carved pool. The wrapper sets "
+            "`proxy.atom_v41_owner` when it registers the layer."
+        )
+    builder = owner._deepseek_v41_builder
+    if not bind_deepseek_v41_proxy_cache(owner.model, builder, vllm_config, layer_name):
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy pool is not allocated yet; the KV transfer "
+            "connector must register after vLLM has sized the KV cache."
+        )
+    return builder.cache, owner.model._atom_v41_slot_allocator
 
 
 def get_deepseek_v41_proxy_metadata_from_vllm_context(
@@ -1191,6 +1414,39 @@ def _dump_v41_state_rows(snapshot, batch, builder, exc) -> None:
         if cache is not None:
             cursors = cache.cursor[:, 0].tolist()
         logger.error("DeepSeek-V4.1 stale-cursor refusal: %s", exc)
+        # The image counters belong in THIS dump and not only in the
+        # periodic line: that line is rate-limited to 20 s, so the three
+        # runs that died on a refusal each printed their last counters
+        # before the first request and said nothing about the step that
+        # failed. A refusal is exactly when they are worth reading.
+        try:
+            from atom.plugin.vllm.v41_state_image import runtime as _img_rt
+
+            rt = _img_rt()
+            if rt is not None:
+                logger.error(
+                    "  images: %s",
+                    ", ".join(f"{k}={v}" for k, v in sorted(rt.stats().items())),
+                )
+        except Exception:
+            logger.error("  images: counters unavailable")
+        # The planner's counters have the same gap: read at a refusal, they
+        # say whether vLLM's local hit was capped, declined, or never
+        # offered -- three states that a start-up line of zeros cannot tell
+        # apart, and I read one as the third.
+        try:
+            from atom.plugin.vllm.kv_transfer.v41_state import last_planner
+
+            planner = last_planner()
+            if planner is not None:
+                logger.error(
+                    "  planner: %s",
+                    ", ".join(
+                        f"{k}={v}" for k, v in sorted(planner.counters().items())
+                    ),
+                )
+        except Exception:
+            logger.error("  planner: counters unavailable")
         logger.error(
             "  %-4s %-44s %10s %9s %6s %10s",
             "row",
@@ -1266,6 +1522,22 @@ def _v41_scheduled_batch(snapshot, slot_allocator, slots=None):
     """
     if slots is None:
         slots, _reset = slot_allocator.assign(snapshot.req_ids, snapshot.num_computed)
+        # Once per allocator, and a warning rather than info: an integer key
+        # here means `snapshot_v41_batch` fell back to the request's first
+        # block id, which is a working slot key and a broken one for anything
+        # outside the forward. The offload leg names requests the way vLLM
+        # does, so a fallback key makes its every lookup miss -- a tier that
+        # registers, is queried, answers correctly and stores nothing.
+        if not getattr(slot_allocator, "_atom_key_kind_logged", False):
+            slot_allocator._atom_key_kind_logged = True
+            first = snapshot.req_ids[0] if len(snapshot.req_ids) else None
+            logger.warning(
+                "V4.1 STATE slot keys are %s (e.g. %r). Anything that names a "
+                "request from outside the forward -- the KV-transfer leg -- "
+                "can only match these when they are vLLM's own request ids.",
+                type(first).__name__ if first is not None else "unknown",
+                first,
+            )
     return SimpleNamespace(
         is_dummy_run=False,
         req_ids=snapshot.req_ids,
@@ -1776,4 +2048,16 @@ def atom_deepseek_v41_forward_context(
     try:
         yield step_positions
     finally:
+        # After the forward, which is the only moment the bytes worth
+        # checkpointing exist: a store taken before it would hold the state
+        # of the step before, a real image of the wrong boundary that nothing
+        # downstream could tell apart. In `finally` because a step that
+        # raised has no image to take and must still release the context.
+        if prepared is not None:
+            try:
+                v41_store_images_after_forward(prepared)
+            except Exception:
+                logger.warning(
+                    "V4.1 image store failed after a forward", exc_info=True
+                )
         reset_forward_context()

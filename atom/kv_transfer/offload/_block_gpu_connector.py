@@ -203,6 +203,9 @@ class BlockGPUConnector:
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
     ) -> None:
         self.codec = codec
+        # Recorded from the forward thread by `note_compute_stream`; see
+        # `_compute_stream_for`.  None until the first save/load submit.
+        self._compute_stream = None
         self.physical_block_size = int(block_size)
         if self.physical_block_size <= 0:
             raise ValueError("ATOM LMCache connector: block_size must be > 0")
@@ -419,6 +422,18 @@ class BlockGPUConnector:
     def _use_cuda(self) -> bool:
         return self.device.type == "cuda"
 
+    def note_compute_stream(self) -> None:
+        """Record the stream the model's forward runs on.
+
+        Must be called from the forward thread: `torch.cuda.current_stream` is
+        thread-local, and the save/load workers that drive the staging
+        pipeline would read the default stream there instead.  Recorded once;
+        vLLM's dedicated stream lives for the process.
+        """
+        if self._compute_stream is not None or not self._use_cuda():
+            return
+        self._compute_stream = torch.cuda.current_stream(device=self.device)
+
     def _thread_state(self) -> _ThreadTransferState:
         states = getattr(self._tls, "states", None)
         if states is None:
@@ -430,8 +445,12 @@ class BlockGPUConnector:
             state = _ThreadTransferState(
                 self.device,
                 self._use_cuda(),
+                self._compute_stream,
             )
             states[key] = state
+        # Refreshed, not just seeded at construction: a worker thread can build
+        # its state before the forward thread has recorded the stream.
+        state.compute_stream = self._compute_stream
         return state
 
     @staticmethod

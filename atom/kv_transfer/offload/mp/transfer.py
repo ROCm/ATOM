@@ -37,6 +37,9 @@ class _PendingLoad:
     completion: LoadCompletionId
     future: Any | None
     started_at: float = field(default_factory=lambda: time.monotonic())
+    # The step's shared interprocess event, returned to the worker's pool once
+    # every transfer that named it is terminal.
+    event: Any | None = None
 
 
 @dataclass
@@ -46,6 +49,8 @@ class _PendingSave:
     start: int
     end: int
     started_at: float = field(default_factory=lambda: time.monotonic())
+    # See `_PendingLoad.event`.
+    event: Any | None = None
 
 
 _DEFAULT_TRANSFER_DEADLINE_S = 1200.0
