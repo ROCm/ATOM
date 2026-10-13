@@ -17,33 +17,35 @@ Enabled by ``ATOM_COMPASS_DIR``. Each model-runner rank writes, under
   launched GPU work inside a step: op name, input shapes/dtypes, CPU and
   GPU start/end (wall-clock ns) and its kernels. ``gpu_kernel_ns`` sums the
   kernels' durations; ``gpu_busy_ns`` is the union of their intervals, so
-  kernels overlapping on several streams count once. Kernels replayed from a
-  CUDA graph are attributed through that graph's template (below): matched
-  ones get the op, shapes and dtypes of the template kernel at the same place
-  (``shapes_from: "graph_template"``; their CPU times are the graph launch's;
-  ``kernels_renamed`` counts those paired with a template kernel of another
-  name). Unmatched replay kernels stay grouped under the graph launch with no
-  shapes.
+  kernels overlapping on several streams count once. A CUDA graph replay
+  launches its kernels without ops, so each replayed kernel is named after
+  the op that launched a kernel of the same name in eager runs (the kernel
+  map, below); consecutive kernels of one op form one row, with the graph
+  launch's CPU times and no shapes. ``op_from`` says where the name came
+  from: ``kernel_map``, ``kernel_rule`` (graph-only kernels such as the
+  custom all-reduce) or ``kernel`` (unknown: the kernel's own name);
+  ``op_alternatives`` lists the other ops seen launching that kernel.
 - ``windows.<pid>.jsonl``: one row per op window -- why it opened, the batch
-  bucket, the steps it holds ops for, and how many replayed graph kernels the
-  templates matched.
-- ``graphs.<pid>.jsonl``: one row per captured CUDA graph template: the
-  graph's ``(bs, max_q_len)`` name and its kernel and op counts; and, the
-  first time an op window replays a graph, a row with ``sample_step`` holding
-  the template's and that replay's kernel names and streams.
+  bucket, the steps it holds ops for, and how many replayed graph kernels got
+  an op name.
+- ``graphs.<pid>.jsonl``: one row per graph whose eager warmup fed the
+  kernel map: the graph's ``(bs, max_q_len)`` name and its kernel counts.
 - ``meta.<pid>.json``: rank identity and collection settings.
 
 Op windows are scheduled per batch bucket (prefill/decode, power-of-two batch
 size, prefill tokens and max context length): a bucket gets a window once it
 has been seen more than ``ATOM_COMPASS_OP_MIN_SEEN`` times (so first-call JIT
 and warmup stay out), until it has ``ATOM_COMPASS_OP_PER_BUCKET`` windows;
-every ``ATOM_COMPASS_OP_EVERY``-th step also opens one. A window profiles one
-step more than ``ATOM_COMPASS_OP_STEPS`` and drops that tail step's ops: the
-profiler loses most of the last step's kernels when it stops.
+every ``ATOM_COMPASS_OP_EVERY``-th step also opens one. No window opens
+within ``ATOM_COMPASS_OP_MIN_GAP_S`` seconds of the previous one closing. A
+window profiles one step more than ``ATOM_COMPASS_OP_STEPS`` and drops that
+tail step's ops: the profiler loses most of the last step's kernels when it
+stops.
 
-A graph template is the kernel sequence of the eager warmup forward that runs
-right before each graph capture, with the op that launched each kernel. Replay
-kernels are aligned to it in GPU start order by kernel name.
+The kernel map counts, per kernel name, the ops that launched it: in the
+eager warmup forward before a few graph captures (power-of-two batch sizes
+and the largest of each ``max_q_len``; GEMM tile choice follows the batch
+size) and in every eager op of an op window.
 
 Forward rows never synchronize the device except for re-anchoring the GPU
 clock every ``ATOM_COMPASS_ANCHOR_S`` seconds. Op windows run the torch
@@ -68,11 +70,11 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _STEP_PREFIX = "compass_step:"
 _GRAPH_PREFIX = "compass_graph:"
-_TEMPLATE_MARK = "compass_graph_template"
+_WARMUP_MARK = "compass_graph_warmup"
 _RUNTIME_PREFIXES = ("hip", "cuda", "rocprof")
 _MAX_PENDING = 1024
 _FLUSH_INTERVAL_S = 1.0
@@ -81,14 +83,13 @@ _FLUSH_INTERVAL_S = 1.0
 # graceful shutdown.
 _WINDOW_IDLE_CLOSE_S = 2.0
 # The profiler drops the trailing GPU activity it has not received when it
-# stops; a template's capture idles this long after its last kernel first.
-_TEMPLATE_DRAIN_S = 0.05
-# Replay-to-template kernel alignment: scores, band half-width, and how many
-# distinct replay sequences per graph keep their alignment cached.
-_ALIGN_MATCH, _ALIGN_RENAME, _ALIGN_GAP = 2, -1, -1
-_ALIGN_BAND = 32
-_ALIGN_CACHE = 8
-_DIAG, _UP, _LEFT = 0, 1, 2
+# stops; a warmup profile idles this long after its last kernel first.
+_WARMUP_DRAIN_S = 0.05
+# Ops for kernels that only graph replays launch, so no eager run maps them.
+_KERNEL_RULES = (
+    ("all_reduce", ("all_reduce", "allreduce", "ar_ll", "cross_device_reduce")),
+    ("memcpy", ("copyBuffer", "Memcpy", "Memset")),
+)
 
 
 def _pow2(n):
@@ -161,6 +162,7 @@ class CompassRecorder:
         op_max_windows=None,
         op_min_seen=None,
         op_per_bucket=None,
+        op_min_gap_s=None,
         graph_ops=None,
         anchor_interval_s=None,
     ):
@@ -182,6 +184,9 @@ class CompassRecorder:
         )
         self.op_per_bucket = (
             envs.ATOM_COMPASS_OP_PER_BUCKET if op_per_bucket is None else op_per_bucket
+        )
+        self.op_min_gap_s = (
+            envs.ATOM_COMPASS_OP_MIN_GAP_S if op_min_gap_s is None else op_min_gap_s
         )
         self.graph_ops = envs.ATOM_COMPASS_GRAPH_OPS if graph_ops is None else graph_ops
         self.anchor_interval_s = (
@@ -217,6 +222,7 @@ class CompassRecorder:
                 "op_max_windows": self.op_max_windows,
                 "op_min_seen": self.op_min_seen,
                 "op_per_bucket": self.op_per_bucket,
+                "op_min_gap_s": self.op_min_gap_s,
                 "graph_ops": self.graph_ops,
                 "anchor_interval_s": self.anchor_interval_s,
             }
@@ -239,16 +245,18 @@ class CompassRecorder:
         self.windows_done = 0
         self.bucket_seen = {}
         self.bucket_windows = {}
-        self.graph_templates = {}  # graph name -> kernel/op template
-        self.graph_samples = set()  # graphs whose names went to graphs.jsonl
+        self.window_closed_at = float("-inf")
+        self.kernel_ops = {}  # kernel name -> {op name: kernels seen}
+        self.warmup_q_lens = set()  # max_q_len whose largest graph was profiled
         logger.info(
             "Compass recording to %s (op window %d steps every %d, "
-            "%d per bucket after %d sightings, max %s)",
+            "%d per bucket after %d sightings, %.0fs apart, max %s)",
             rank_dir,
             self.op_steps,
             self.op_every,
             self.op_per_bucket,
             self.op_min_seen,
+            self.op_min_gap_s,
             self.op_max_windows or "unlimited",
         )
 
@@ -433,6 +441,7 @@ class CompassRecorder:
             or self.op_steps <= 0
             or seen <= self.op_min_seen
             or (self.op_max_windows and self.windows_done >= self.op_max_windows)
+            or time.monotonic() - self.window_closed_at < self.op_min_gap_s
             or self.is_profiler_busy()
         ):
             return None
@@ -468,14 +477,13 @@ class CompassRecorder:
         rows = [
             r
             for r in window_op_rows(
-                window.profiler.kineto_results.events(), self.graph_templates
+                window.profiler.kineto_results.events(), self.kernel_ops
             )
             if r["step"] != tail
         ]
         for row in rows:
             self.ops_file.write(json.dumps({**self.rank, **row}) + "\n")
         graph_rows = [r for r in rows if r["graph_replay"]]
-        self._write_graph_samples(graph_rows)
         summary = {
             **self.rank,
             "window": self.windows_done,
@@ -485,91 +493,76 @@ class CompassRecorder:
             "tail_step": tail,
             "op_rows": len(rows),
             "graph_kernels": sum(len(r["kernels"]) for r in graph_rows),
-            "graph_kernels_matched": sum(
-                len(r["kernels"])
-                for r in graph_rows
-                if r.get("shapes_from") == "graph_template"
+            "graph_kernels_named": sum(
+                len(r["kernels"]) for r in graph_rows if r["op_from"] != "kernel"
             ),
-            "graph_kernels_renamed": sum(r.get("kernels_renamed", 0) for r in rows),
             "close_s": time.perf_counter() - began,
         }
         self.windows_file.write(json.dumps(summary) + "\n")
         self.windows_done += 1
+        self.window_closed_at = time.monotonic()
         self.flush()
         logger.info(
             "Compass op window %d (%s %s, steps %s): %d op rows, "
-            "%d/%d graph kernels matched, in %.2fs",
+            "%d/%d graph kernels named, in %.2fs",
             summary["window"],
             summary["reason"],
             summary["bucket"],
             summary["steps"][:1],
             len(rows),
-            summary["graph_kernels_matched"],
+            summary["graph_kernels_named"],
             summary["graph_kernels"],
             summary["close_s"],
         )
 
-    def _write_graph_samples(self, graph_rows):
-        """Once per graph, its template and one replay's kernel names, so the
-        alignment can be checked offline."""
-        replays = {}
-        for r in graph_rows:
-            if r["graph"] in self.graph_templates:
-                replays.setdefault((r["graph"], r["step"]), []).extend(r["kernels"])
-        for (graph, step), kernels in sorted(replays.items()):
-            if graph in self.graph_samples:
-                continue
-            self.graph_samples.add(graph)
-            kernels.sort(key=lambda k: k["start_ns"])
-            sample = {
-                **self.rank,
-                "graph": graph,
-                "sample_step": step,
-                "template_kernels": self.graph_templates[graph]["kernels"],
-                "template_streams": self.graph_templates[graph]["streams"],
-                "replay_kernels": [k["name"] for k in kernels],
-                "replay_streams": [k["stream"] for k in kernels],
-            }
-            self.graphs_file.write(json.dumps(sample) + "\n")
-
-    # -- CUDA graph templates -------------------------------------------------
+    # -- CUDA graph kernel map ----------------------------------------------
 
     @contextmanager
-    def graph_template(self, key):
-        """Profile the eager warmup forward before ``key``'s graph capture."""
+    def graph_warmup(self, key):
+        """Profile the eager warmup forward before ``key``'s graph capture into
+        the kernel map, for power-of-two batch sizes and the first (largest)
+        graph of each ``max_q_len``."""
+        bs, max_q_len = key
         if (
             not self.graph_ops
             or self.op_steps <= 0
+            or (bs & (bs - 1) and max_q_len in self.warmup_q_lens)
             or self.window is not None
             or self.is_profiler_busy()
             or torch.cuda.is_current_stream_capturing()
         ):
             yield
             return
-        name = graph_name(key)
+        self.warmup_q_lens.add(max_q_len)
         torch.cuda.synchronize()
-        prof = profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=True,
-        )
+        prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
         prof.__enter__()
         try:
-            with record_function(_TEMPLATE_MARK):
+            with record_function(_WARMUP_MARK):
                 yield
             torch.cuda.synchronize()
-            time.sleep(_TEMPLATE_DRAIN_S)
+            time.sleep(_WARMUP_DRAIN_S)
         finally:
             prof.__exit__(None, None, None)
-        template = graph_template_entries(prof.profiler.kineto_results.events())
-        self.graph_templates[name] = template
+        known = len(self.kernel_ops)
+        kernels = with_op = 0
+        for k, _launch, op, marks in _attributed_kernels(
+            prof.profiler.kineto_results.events(), (_WARMUP_MARK,)
+        ):
+            if marks[_WARMUP_MARK] is None:
+                continue
+            kernels += 1
+            if op is not None:
+                with_op += 1
+                learn_kernel_op(self.kernel_ops, k.name(), op.name())
         self.graphs_file.write(
             json.dumps(
                 {
                     **self.rank,
-                    "graph": name,
-                    "kernels": len(template["kernels"]),
-                    "ops": len(template["ops"]),
-                    "kernels_without_op": template["op_index"].count(None),
+                    "graph": graph_name(key),
+                    "kernels": kernels,
+                    "kernels_with_op": with_op,
+                    "new_kernel_names": len(self.kernel_ops) - known,
                 }
             )
             + "\n"
@@ -577,9 +570,8 @@ class CompassRecorder:
         self.graphs_file.flush()
 
     def graph_replay(self, key):
-        """Mark a graph replay inside an op window so its kernels can be
-        matched to the graph's template."""
-        if self.window is None or graph_name(key) not in self.graph_templates:
+        """Mark a graph replay inside an op window with the graph's name."""
+        if self.window is None:
             return nullcontext()
         return record_function(f"{_GRAPH_PREFIX}{graph_name(key)}")
 
@@ -647,86 +639,22 @@ def _attributed_kernels(events, prefixes):
     return out
 
 
-def graph_template_entries(events):
-    """The kernel sequence of a graph's eager warmup forward, in GPU start
-    order, each with the index of its launching op (None if no op)."""
-    kernels, streams, op_index, ops, index_of = [], [], [], [], {}
-    for k, _launch, op, marks in _attributed_kernels(events, (_TEMPLATE_MARK,)):
-        if marks[_TEMPLATE_MARK] is None:
-            continue
-        kernels.append(k.name())
-        streams.append(k.device_resource_id())
-        if op is None:
-            op_index.append(None)
-            continue
-        i = index_of.get(op.correlation_id())
-        if i is None:
-            i = index_of[op.correlation_id()] = len(ops)
-            ops.append({"op": op.name(), "shapes": op.shapes(), "dtypes": op.dtypes()})
-        op_index.append(i)
-    return {"kernels": kernels, "streams": streams, "op_index": op_index, "ops": ops}
+def learn_kernel_op(kernel_ops, kernel, op):
+    ops = kernel_ops.setdefault(kernel, {})
+    ops[op] = ops.get(op, 0) + 1
 
 
-def _align(names, template_names, band=_ALIGN_BAND):
-    """For each replay kernel, the index of its template kernel or None.
-
-    A global alignment restricted to a band around the diagonal: layers repeat
-    the same kernel names, so an unbanded longest-match pairs layer i of the
-    replay with layer j of the template and loses everything after. Pairing
-    two different names beats leaving both unmatched: a graph replays some ops
-    with other kernels than their eager run (custom all-reduce).
-    """
-    n, m = len(names), len(template_names)
-    if names == template_names:
-        return list(range(n))
-    if not n or not m:
-        return [None] * n
-    ids = {}
-    a = [ids.setdefault(x, len(ids)) for x in names]
-    b = [ids.setdefault(x, len(ids)) for x in template_names]
-    neg = float("-inf")
-    band = max(band, m // n + 2)
-
-    def span(i):
-        c = i * m // n
-        return max(0, c - band), min(m, c + band)
-
-    lo, hi = span(0)
-    prev = [neg] * (m + 1)
-    for j in range(hi + 1):
-        prev[j] = j * _ALIGN_GAP
-    trace = [(0, bytearray([_LEFT] * (hi + 1)))]
-    for i in range(1, n + 1):
-        lo, hi = span(i)
-        cur = [neg] * (m + 1)
-        moves = bytearray(hi - lo + 1)
-        ai = a[i - 1]
-        for j in range(lo, hi + 1):
-            best, move = prev[j] + _ALIGN_GAP, _UP
-            if j:
-                diag = prev[j - 1] + (_ALIGN_MATCH if ai == b[j - 1] else _ALIGN_RENAME)
-                if diag > best:
-                    best, move = diag, _DIAG
-                left = cur[j - 1] + _ALIGN_GAP
-                if left > best:
-                    best, move = left, _LEFT
-            cur[j] = best
-            moves[j - lo] = move
-        trace.append((lo, moves))
-        prev = cur
-    match = [None] * n
-    i, j = n, m
-    while i or j:
-        lo, moves = trace[i]
-        move = moves[j - lo]
-        if move == _DIAG:
-            match[i - 1] = j - 1
-            i, j = i - 1, j - 1
-        elif move == _UP:
-            i -= 1
-        else:
-            j -= 1
-    return match
+def kernel_op(kernel_ops, kernel):
+    """``(op, op_from, alternatives)`` for a kernel replayed without its op:
+    the op most often seen launching it, else a rule, else its own name."""
+    ops = kernel_ops.get(kernel)
+    if ops:
+        ranked = sorted(ops, key=lambda o: (-ops[o], o))
+        return ranked[0], "kernel_map", ranked[1:]
+    for op, needles in _KERNEL_RULES:
+        if any(n in kernel for n in needles):
+            return op, "kernel_rule", []
+    return kernel, "kernel", []
 
 
 def _busy_ns(kernels):
@@ -766,59 +694,39 @@ def _op_row(step, op, shapes, dtypes, cpu, kernels, **extra):
     }
 
 
-def _graph_rows(step, launch, kernels, graph, template):
-    """Split one graph launch's replayed kernels into rows per template op."""
-    extra = {"graph_replay": True, "graph": graph}
-    if template is None:
-        return [_op_row(step, launch.name(), [], [], launch, kernels, **extra)]
-    names = tuple(k.name() for k in kernels)
-    # Every replay of a graph launches the same kernels: align once.
-    cache = template.setdefault("aligned", {})
-    match = cache.get(names)
-    if match is None:
-        match = _align(list(names), template["kernels"])
-        if len(cache) < _ALIGN_CACHE:
-            cache[names] = match
-    by_op, renamed, rest = {}, {}, []
-    for k, m in zip(kernels, match):
-        i = None if m is None else template["op_index"][m]
-        if i is None:
-            rest.append(k)
-            continue
-        by_op.setdefault(i, []).append(k)
-        if k.name() != template["kernels"][m]:
-            renamed[i] = renamed.get(i, 0) + 1
-    rows = []
-    for i, ks in by_op.items():
-        op = template["ops"][i]
-        rows.append(
-            _op_row(
-                step,
-                op["op"],
-                op["shapes"],
-                op["dtypes"],
-                launch,
-                ks,
-                **extra,
-                shapes_from="graph_template",
-                kernels_renamed=renamed.get(i, 0),
-            )
-        )
-    if rest:
-        rows.append(_op_row(step, launch.name(), [], [], launch, rest, **extra))
+def _graph_rows(step, launch, kernels, graph, kernel_ops):
+    """Split one graph launch's replayed kernels, in GPU start order, into
+    rows of consecutive kernels mapped to the same op."""
+    rows, run, key = [], [], None
+    for k in sorted(kernels, key=lambda k: k.start_ns()):
+        op, op_from, alternatives = kernel_op(kernel_ops, k.name())
+        if run and (op, op_from) != key[:2]:
+            rows.append(_named_graph_row(step, launch, run, graph, *key))
+            run = []
+        key = (op, op_from, alternatives)
+        run.append(k)
+    if run:
+        rows.append(_named_graph_row(step, launch, run, graph, *key))
     return rows
 
 
-def window_op_rows(events, graph_templates=None):
+def _named_graph_row(step, launch, kernels, graph, op, op_from, alternatives):
+    extra = {"graph_replay": True, "graph": graph, "op_from": op_from}
+    if alternatives:
+        extra["op_alternatives"] = alternatives
+    return _op_row(step, op, [], [], launch, kernels, **extra)
+
+
+def window_op_rows(events, kernel_ops=None):
     """Group a profiler window's kernels by the op that launched them.
 
     The launch's CPU time places a kernel inside a ``compass_step:<n>``
     annotation, which spans the whole forward (input preparation and sampling
-    included); kernels outside any step are dropped. A graph launch inside a
-    ``compass_graph:<name>`` annotation has its kernels matched to that
-    graph's template.
+    included); kernels outside any step are dropped. Eager kernels with an op
+    are added to ``kernel_ops`` (updated in place) before graph replay kernels
+    are named from it.
     """
-    graph_templates = graph_templates or {}
+    kernel_ops = {} if kernel_ops is None else kernel_ops
     eager, graphs = {}, {}
     for k, launch, op, marks in _attributed_kernels(
         events, (_STEP_PREFIX, _GRAPH_PREFIX)
@@ -841,6 +749,9 @@ def window_op_rows(events, graph_templates=None):
     rows = []
     for (step, key), (src, ks) in eager.items():
         has_op = not isinstance(key, tuple)
+        if has_op:
+            for k in ks:
+                learn_kernel_op(kernel_ops, k.name(), src.name())
         rows.append(
             _op_row(
                 step,
@@ -853,7 +764,7 @@ def window_op_rows(events, graph_templates=None):
             )
         )
     for (step, _), (launch, graph, ks) in graphs.items():
-        rows.extend(_graph_rows(step, launch, ks, graph, graph_templates.get(graph)))
+        rows.extend(_graph_rows(step, launch, ks, graph, kernel_ops))
     return sorted(rows, key=lambda r: (r["step"], r["gpu_start_ns"]))
 
 

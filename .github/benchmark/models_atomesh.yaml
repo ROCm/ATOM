@@ -886,12 +886,14 @@ models:
               ATOMESH_COMPASS: "1"
               # One window per batch bucket (prefill/decode x batch size x
               # context length), so every concurrency and context range of
-              # the run gets ops, plus a sparse periodic one.
+              # the run gets ops, plus a sparse periodic one; at least a
+              # minute apart and 60 in all.
               ATOM_COMPASS_OP_STEPS: "6"
               ATOM_COMPASS_OP_EVERY: "20000"
               ATOM_COMPASS_OP_MIN_SEEN: "3"
               ATOM_COMPASS_OP_PER_BUCKET: "1"
-              ATOM_COMPASS_OP_MAX_WINDOWS: "200"
+              ATOM_COMPASS_OP_MIN_GAP_S: "60"
+              ATOM_COMPASS_OP_MAX_WINDOWS: "60"
             decode: *kimi_k3_agentic_agg_env_decode
 
         - &kimi_k3_agentic_2p1d

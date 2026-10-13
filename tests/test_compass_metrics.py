@@ -72,16 +72,16 @@ def test_kernels_group_by_op_and_step():
         Ev("argmax_k", CUDA, 400, 410, 13, linked=9),
     ]
     rows = window_op_rows(events)
-    assert [r["op"] for r in rows] == ["aten::mm", "hipGraphLaunch"]
-    mm, graph = rows
-    assert mm["step"] == 4 and graph["step"] == 4
+    assert [r["op"] for r in rows] == ["aten::mm", "graph_k0", "graph_k1"]
+    mm, k0, k1 = rows
+    assert mm["step"] == k0["step"] == k1["step"] == 4
     assert mm["shapes"] == [[8, 16], [16, 32]]
     assert (mm["gpu_start_ns"], mm["gpu_end_ns"], mm["gpu_kernel_ns"]) == (150, 180, 28)
     assert [k["name"] for k in mm["kernels"]] == ["gemm_a", "gemm_b"]
     assert not mm["graph_replay"]
-    assert graph["graph_replay"] and graph["shapes"] == []
-    assert (graph["gpu_start_ns"], graph["gpu_end_ns"]) == (190, 260)
-    assert len(graph["kernels"]) == 2
+    # No eager run launched these kernels: they keep their own names.
+    assert k0["graph_replay"] and k0["shapes"] == [] and k0["op_from"] == "kernel"
+    assert (k0["gpu_start_ns"], k1["gpu_end_ns"]) == (190, 260)
 
 
 def test_busy_time_counts_overlapping_kernels_once():
@@ -100,59 +100,45 @@ def test_busy_time_counts_overlapping_kernels_once():
     assert row["gpu_busy_ns"] == 80
 
 
-def _template_events():
-    """The eager warmup of graph bs1_q1: op A launches k0 and k1, op B k2."""
-    return [
-        Ev(compass._TEMPLATE_MARK, CPU, 0, 100, 1, ua=True),
-        Ev("op::A", CPU, 10, 20, 3, shapes=[[1, 64]]),
-        Ev("hipLaunchKernel", CPU, 11, 12, 10, linked=3),
-        Ev("hipLaunchKernel", CPU, 13, 14, 11, linked=3),
-        Ev("op::B", CPU, 30, 40, 4, shapes=[[1, 128]]),
-        Ev("hipLaunchKernel", CPU, 31, 32, 12, linked=4),
-        Ev("k0", CUDA, 50, 60, 10, linked=3),
-        Ev("k1", CUDA, 61, 70, 11, linked=3),
-        Ev("k2", CUDA, 71, 80, 12, linked=4),
-        # After the warmup forward: not part of the template.
-        Ev("aten::zero_", CPU, 200, 210, 5, shapes=[[1]]),
-        Ev("hipLaunchKernel", CPU, 201, 202, 13, linked=5),
-        Ev("zero_k", CUDA, 300, 301, 13, linked=5),
-    ]
-
-
-def test_graph_template_lists_warmup_kernels_with_their_ops():
-    template = compass.graph_template_entries(_template_events())
-    assert template["kernels"] == ["k0", "k1", "k2"]
-    assert template["op_index"] == [0, 0, 1]
-    assert [o["op"] for o in template["ops"]] == ["op::A", "op::B"]
-    assert template["ops"][1]["shapes"] == [[1, 128]]
-
-
-def test_graph_replay_kernels_take_their_template_ops():
-    templates = {"bs1_q1": compass.graph_template_entries(_template_events())}
+def test_graph_replay_kernels_are_named_after_their_eager_ops():
+    kernel_ops = {"k1": {"op::B": 1}}
     events = [
         Ev("compass_step:7", CPU, 0, 500, 1, ua=True),
+        # Eager op::A launches k0: learned in this window.
+        Ev("op::A", CPU, 2, 8, 3, shapes=[[1, 64]]),
+        Ev("hipLaunchKernel", CPU, 3, 4, 10, linked=3),
+        Ev("k0", CUDA, 50, 60, 10, linked=3),
         Ev("compass_graph:bs1_q1", CPU, 10, 30, 2, ua=True),
         Ev("hipGraphLaunch", CPU, 12, 20, 20),
         Ev("k0", CUDA, 100, 110, 20),
-        Ev("k1", CUDA, 111, 120, 20),
-        Ev("extra", CUDA, 121, 125, 20),  # not in the template
-        Ev("k2", CUDA, 126, 140, 20),
-        # A graph launch outside a compass_graph mark keeps one row.
-        Ev("hipGraphLaunch", CPU, 40, 45, 21),
-        Ev("d0", CUDA, 200, 210, 21),
+        Ev("k0", CUDA, 111, 120, 20),
+        Ev("void aiter::ar_ll_gfx9<bf16>", CUDA, 121, 125, 20),
+        Ev("k1", CUDA, 126, 140, 20),
+        Ev("unknown_k", CUDA, 141, 150, 20),
     ]
-    rows = window_op_rows(events, templates)
-    by_op = {r["op"]: r for r in rows}
-    assert sorted(by_op) == ["hipGraphLaunch", "op::A", "op::B"]
-    a, b = by_op["op::A"], by_op["op::B"]
-    assert a["shapes"] == [[1, 64]] and a["shapes_from"] == "graph_template"
-    assert [k["name"] for k in a["kernels"]] == ["k0", "k1"]
+    rows = window_op_rows(events, kernel_ops)
+    eager, *graph = rows
+    assert (eager["op"], eager["graph_replay"]) == ("op::A", False)
+    assert kernel_ops["k0"] == {"op::A": 1}
+    assert [(r["op"], r["op_from"], len(r["kernels"])) for r in graph] == [
+        ("op::A", "kernel_map", 2),
+        ("all_reduce", "kernel_rule", 1),
+        ("op::B", "kernel_map", 1),
+        ("unknown_k", "kernel", 1),
+    ]
+    a = graph[0]
+    assert a["shapes"] == [] and a["graph"] == "bs1_q1"
     assert (a["cpu_start_ns"], a["cpu_end_ns"]) == (12, 20)  # the graph launch
-    assert [k["name"] for k in b["kernels"]] == ["k2"]
-    assert a["graph"] == b["graph"] == "bs1_q1" and a["graph_replay"]
-    rest = [r for r in rows if r["op"] == "hipGraphLaunch"]
-    assert sorted(k["name"] for r in rest for k in r["kernels"]) == ["d0", "extra"]
-    assert all(r["shapes"] == [] and "shapes_from" not in r for r in rest)
+    assert (a["gpu_start_ns"], a["gpu_end_ns"]) == (100, 120)
+
+
+def test_shared_kernels_name_the_most_seen_op():
+    kernel_ops = {"attn_res": {"op::add": 3, "op::plain": 5, "op::quant": 5}}
+    assert compass.kernel_op(kernel_ops, "attn_res") == (
+        "op::plain",
+        "kernel_map",
+        ["op::quant", "op::add"],
+    )
 
 
 class FakeEvent:
@@ -246,42 +232,6 @@ def test_failed_forward_leaves_no_row(recorder):
     assert row["step"] == 1
 
 
-def test_alignment_keeps_repeated_layers_in_place():
-    # A graph replays the all-reduce with another kernel than the eager run,
-    # and the eager run has an extra copy in layer 3 of 20 identical layers.
-    replay = ["ar_graph", "gemm", "norm", "attn"] * 20
-    template = ["ar_eager", "gemm", "norm", "attn"] * 20
-    template.insert(14, "copy")
-    match = compass._align(replay, template)
-    expected = [j if j < 14 else j + 1 for j in range(len(replay))]
-    assert match == expected
-
-
-def test_alignment_leaves_unpairable_kernels_unmatched():
-    match = compass._align(["a", "x", "y", "b"], ["a", "b"])
-    assert match[0] == 0 and match[3] == 1
-    assert match[1:3] == [None, None]
-
-
-def test_renamed_replay_kernels_take_the_template_op():
-    template = {
-        "kernels": ["ar_eager", "gemm"],
-        "streams": [7, 7],
-        "op_index": [0, 1],
-        "ops": [
-            {"op": "aiter::all_reduce", "shapes": [[1, 8]], "dtypes": ["bf16"]},
-            {"op": "aiter::gemm", "shapes": [[1, 8], [8, 8]], "dtypes": ["bf16"]},
-        ],
-    }
-    launch = Ev("hipGraphLaunch", CPU, 0, 5, 20)
-    kernels = [Ev("ar_graph", CUDA, 10, 20, 20), Ev("gemm", CUDA, 21, 30, 20)]
-    for _ in range(2):  # the second replay reuses the cached alignment
-        ar, gemm = compass._graph_rows(3, launch, kernels, "bs1_q1", template)
-        assert (ar["op"], ar["kernels_renamed"]) == ("aiter::all_reduce", 1)
-        assert (gemm["op"], gemm["kernels_renamed"]) == ("aiter::gemm", 0)
-    assert len(template["aligned"]) == 1
-
-
 class FakeProfile:
     opened = 0
 
@@ -338,6 +288,50 @@ def test_windows_open_per_bucket_after_warmup_and_drop_the_tail(tmp_path, monkey
     ]
     assert all(w["reason"] == "bucket" for w in windows)
     assert FakeProfile.opened == 3
+
+
+@pytest.fixture
+def fake_profiler(monkeypatch):
+    FakeEvent.clock = 0
+    FakeProfile.opened = 0
+    monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "fake")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(compass, "profile", FakeProfile)
+    monkeypatch.setattr(compass, "_WARMUP_DRAIN_S", 0)
+
+
+def test_windows_keep_their_minimum_gap(tmp_path, fake_profiler):
+    rec = CompassRecorder(
+        str(tmp_path),
+        op_steps=1,
+        op_every=10**9,
+        op_min_seen=0,
+        op_per_bucket=1,
+        op_min_gap_s=1e9,
+        anchor_interval_s=1e9,
+    )
+    for bs in (1, 2, 4, 8):
+        for _ in range(3):
+            with rec.measure_forward(_batch(bs=bs)):
+                pass
+    rec.close()
+    assert FakeProfile.opened == 1
+
+
+def test_graph_warmups_profile_pow2_and_largest_batch_sizes(tmp_path, fake_profiler):
+    rec = CompassRecorder(
+        str(tmp_path), op_steps=1, graph_ops=True, anchor_interval_s=1e9
+    )
+    keys = [(144, 1), (143, 1), (128, 1), (3, 1), (2, 1), (1, 1), (100, 2), (64, 2)]
+    for key in keys:
+        with rec.graph_warmup(key):
+            pass
+    rec.close()
+    (path,) = (tmp_path / "dp0_pp0_tp0").glob("graphs.*.jsonl")
+    graphs = [json.loads(line)["graph"] for line in path.read_text().splitlines()]
+    assert graphs == ["bs144_q1", "bs128_q1", "bs2_q1", "bs1_q1", "bs100_q2", "bs64_q2"]
 
 
 def test_spool_reads_whole_lines_and_refuses_escapes(tmp_path):

@@ -72,11 +72,11 @@ def summarize(root, top):
             for w in windows:
                 reasons[w["reason"]] += 1
             graph = sum(w["graph_kernels"] for w in windows)
-            matched = sum(w["graph_kernels_matched"] for w in windows)
+            named = sum(w["graph_kernels_named"] for w in windows)
             print(
                 f"  {len(windows)} op windows {dict(reasons)}, "
                 f"{len({json.dumps(w['bucket']) for w in windows})} buckets; "
-                f"graph kernels matched to a template: {matched}/{graph}"
+                f"graph kernels named after an op: {named}/{graph}"
             )
 
         if not ops:

@@ -964,11 +964,11 @@ class ModelRunner:
         recorder = getattr(self, "compass_recorder", None)
         return nullcontext() if recorder is None else recorder.graph_replay(graph_key)
 
-    def _compass_graph_template(self, graph_key, enabled):
+    def _compass_graph_warmup(self, graph_key, enabled):
         recorder = getattr(self, "compass_recorder", None)
         if recorder is None or not enabled:
             return nullcontext()
-        return recorder.graph_template(graph_key)
+        return recorder.graph_warmup(graph_key)
 
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
@@ -4213,10 +4213,10 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
-                    # Compass reads this forward's kernels as the template of
-                    # the graph captured next (not with the capture profiler,
-                    # which owns the profiler, nor for PIECEWISE graphs).
-                    with self._compass_graph_template(
+                    # Compass learns which op launches each kernel from this
+                    # forward (not with the capture profiler, which owns the
+                    # profiler, nor for PIECEWISE graphs).
+                    with self._compass_graph_warmup(
                         (bs, max_q_len), enabled=prof is None and not _piecewise
                     ):
                         model_output = self.model(
