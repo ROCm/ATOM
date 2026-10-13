@@ -670,6 +670,20 @@ def _chunk_cu_seqlens(
     return out
 
 
+# The narrowest decode indexer logits plane; below this the width buckets would
+# only add sizes for the caching allocator to keep apart.
+DECODE_LOGITS_MIN_WIDTH = 1024
+
+
+def decode_logits_width(n_committed_csa_per_seq: np.ndarray) -> int:
+    """Columns an eager decode step's indexer logits need: the longest
+    sequence's committed CSA count, which bounds every one of its rows
+    (`(pos + 1) // 4` with `pos < context_len`), rounded up to a power of two
+    so the steps share a handful of sizes rather than one per context."""
+    longest = int(n_committed_csa_per_seq.max()) if n_committed_csa_per_seq.size else 0
+    return max(DECODE_LOGITS_MIN_WIDTH, 1 << max(longest - 1, 0).bit_length())
+
+
 class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     """Per-request cache owner for V4's state-cache buffers.
 
@@ -2479,9 +2493,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Reuses `attn_metadata.batch_id_per_q_token` ([padded_T] int32), also set
         by `_attach_v4_per_fwd_meta`.
 
-        DECODE fast path: publishes the FP4 graph metadata (fixed-capacity
-        sequence boundaries on gfx950, an OPUS plan on gfx1250), or an empty
-        dict for FP8. Everything else here is prefill-only —
+        DECODE fast path: publishes `decode_logits_width` and the FP4 graph
+        metadata (fixed-capacity sequence boundaries on gfx950, an OPUS plan on
+        gfx1250). Everything else here is prefill-only —
         `deepgemm_fp8_paged_mqa_logits` and `top_k_per_row_decode` read paged KV
         through `attn_metadata.csa_n_committed_per_token`, never the
         packed-cumsum / per-token `cu_starts/cu_ends` layout this builds.
@@ -2496,7 +2510,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # prepare_*/CG-capture path).
         bs = scheduled_bs
 
-        # DECODE short-circuit: only the gfx1250 OPUS plan is needed here.
+        # DECODE short-circuit: only the logits width and the gfx1250 OPUS plan
+        # are needed here.
         # The prefill-only derivations
         # further down (CPU cumsum + H2D for `cu_committed_gpu`; GPU launches
         # for `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill`
@@ -2504,6 +2519,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
         if attn_metadata.state is AttnState.DECODE:
             meta = {}
+            # The whole array, not `[:bs]`: a TBO ubatch may carry its parent's
+            # wider per-seq counts, and a bound too wide is only wasted columns.
+            n_committed = attn_metadata.n_committed_csa_per_seq_cpu
+            if n_committed is not None:
+                meta["decode_logits_width"] = decode_logits_width(
+                    np.asarray(n_committed)
+                )
             # The OPUS decode plan, once per fwd rather than per CSA layer.
             if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
                 self._refresh_fp4_opus_decode_plan(
@@ -2619,8 +2641,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # 16k ctx -> W~4096 -> ~268MB, vs ~17GB at the fixed 262144 width),
             # so `_score_topk_prefill_fp4`'s budget-chunking rarely triggers and
             # the schedule is used as a single precomputed launch in the common
-            # case. Decode keeps the fixed `max_model_len_idx` (CG needs a
-            # static shape); prefill is eager so a per-fwd width is fine.
+            # case. Decode right-sizes too, via `decode_logits_width`, except
+            # while a CUDA graph is captured (it needs the fixed
+            # `max_model_len_idx`); prefill is never captured.
             fp4_prefill_max_seq_len = max(int(n_committed_per_seq.max()), 1)
 
             local_starts = torch.zeros_like(visible_end_gpu)
@@ -5338,7 +5361,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 # grid past 4096 decode rows, which has not been measured.
                 self._fp4_parallel_unit_num = max(FP4_MQA_PARALLEL_UNIT_NUM, T_dec)
                 self._fp4_block_k = FP4_MQA_BLOCK_K
-        # NOTE: decode-path `logits` ([T, max_model_len_idx] fp32) and
+        # NOTE: decode-path `logits` ([T, W] fp32, W = `max_model_len_idx`
+        # under capture, else `decode_logits_width`) and
         # `topk_indices` ([T, index_topk] int32) are NOT pre-allocated —
         # they are write-once GPU scratch with no CPU mirror, allocated
         # per-fwd inside `Indexer._score_topk_decode` via `torch.empty`.
