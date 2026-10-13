@@ -139,13 +139,16 @@ class Replay(NamedTuple):
     """A prefill forward starting below the point its seq resumed at: that
     point -- the cache holds every row below it --, whether the rows below are
     the seq's state (a `replay` state transfer brought none; otherwise the
-    state is the one at `until`), and the tokens just before the forward, for
+    state is the one at `until`), the tokens just before the forward, for
     state a backend derives from the preceding tokens (V4.1's Engram n-gram
-    history, `Config.replay_history_tokens` of them)."""
+    history, `Config.replay_history_tokens` of them), and where the replay's
+    first forward started: a DeepSeek-V4 bounded replay may span forwards, and
+    no row below that start is in the state it rebuilds."""
 
     until: int
     rebuilds: bool
     history_ids: tuple[int, ...]
+    start: int
 
 
 class SequenceStatus(Enum):

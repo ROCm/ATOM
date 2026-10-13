@@ -1660,6 +1660,7 @@ class BlockManager:
         start_tokens: int | None = None,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        replay_until: int | None = None,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -1678,13 +1679,21 @@ class BlockManager:
 
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
+
+        `replay_until`: where the forward resumed if it started below that
+        point, as the batch was scheduled (`ScheduledBatch.replaying`). Nothing
+        below it is published or checkpointed: those blocks are the hit's, and
+        a forward ending there leaves a replay's state still inexact. Left
+        unset it reads `seq.replay_until`, which under pipeline parallelism a
+        later chunk's scheduling may already have moved.
         """
         if not self.enable_prefix_caching:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         # A replaying forward's rows below where it resumed are published.
-        start = max(base, seq.replay_until) // hbs
+        until = seq.replay_until if replay_until is None else replay_until
+        start = max(base, until) // hbs
         end = (base + num_new_tokens) // hbs
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
@@ -2361,10 +2370,6 @@ class BlockManager:
         interval = self.state_checkpoint_interval_tokens
         if interval == 0 or pos <= 0:
             return []
-        # A forward ending inside a bounded replay that spans chunks: the upper
-        # layers' windows are exact only from where the replay resumed on.
-        if pos < seq.replay_until:
-            return []
         # -1: no grid, so `pos % interval` has nothing to say and asking it
         # would be a ZeroDivisionError's less honest cousin — -1 divides
         # everything, admitting every position as a rung. The demand and the
@@ -2687,6 +2692,7 @@ class BlockManager:
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
         seq.replay = None
+        seq.replays_hit = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.

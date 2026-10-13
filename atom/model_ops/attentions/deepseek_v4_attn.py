@@ -3049,20 +3049,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Bounded replay: a forward of a seq replaying below where it resumed
         # (`ScheduledBatch.replaying`, read as V4.1's `_replay_layout` reads
         # it) writes no compressed KV below that point, which the cache holds,
-        # and reads no window row below where the replay started, which its
-        # fresh ring does not hold: the forward's own start, or for a later
-        # chunk of the replay `state_replay_tokens` below that point. Only set
+        # and reads no window row below where the replay started
+        # (`Replay.start`, this forward's own start unless an earlier chunk of
+        # the replay began it), which its fresh ring does not hold. Only set
         # when some seq replays: the common prefill pays nothing.
         replaying = getattr(batch, "replaying", None)
         if replaying:
-            field = self.model_runner.config.state_replay_tokens
             starts = np.zeros(scheduled_bs, dtype=np.int32)
             ends = np.zeros(scheduled_bs, dtype=np.int32)
             for i, replay in replaying.items():
                 if i < scheduled_bs:
-                    starts[i] = min(
-                        start_pos_per_seq_np[i], max(0, replay.until - field)
-                    )
+                    starts[i] = replay.start
                     ends[i] = replay.until
             attn_metadata.replay_start_cpu = starts
             attn_metadata.replay_end_cpu = ends

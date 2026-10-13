@@ -82,6 +82,11 @@ def _identity_decorator(*_args, **_kwargs):
     return lambda function: function
 
 
+def _triton_jit(function=None, **_options):
+    """`triton.jit`, bare or with options (`@triton.jit(do_not_specialize=...)`)."""
+    return function if function is not None else (lambda function: function)
+
+
 def _external_module_attributes(name: str) -> dict[str, object]:
     dtypes = SimpleNamespace(
         bf16=torch.bfloat16,
@@ -104,7 +109,7 @@ def _external_module_attributes(name: str) -> dict[str, object]:
         },
         "aiter.ops.flydsl.moe_common": {"GateMode": _GateMode},
         "triton": {
-            "jit": lambda function: function,
+            "jit": _triton_jit,
             "heuristics": _identity_decorator,
         },
         "triton.language": {"constexpr": object},

@@ -21,7 +21,7 @@ from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.model_engine.scheduler import Scheduler
+from atom.model_engine.scheduler import Scheduler, _scheduled_replay_until
 from atom.model_engine.sequence import Replay, Sequence
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
@@ -86,6 +86,33 @@ def _resume(bm, seq, hit):
     scheduler = SimpleNamespace(block_manager=bm, replay_history_tokens=0)
     start = bm.replay_start(seq, seq.num_cached_tokens, hit=hit)
     Scheduler._resume_prefill(scheduler, seq, start, hit=hit)
+
+
+def _engine_with_a_replayed_head(budget):
+    """A scheduler whose cache holds a 32-token prefix with no checkpoint, and
+    a waiting 40-token prompt that replays it."""
+    spec = PagedStateCheckpointSpec(10, 25, "replay-test", image_bytes=25)
+    engine = Scheduler(
+        MockConfig(
+            kv_cache_block_size=BLOCK,
+            num_kvcache_blocks=64,
+            enable_prefix_caching=True,
+            pool_entries={"state": 8},
+            pool_entries_per_req={"state": 1},
+            state_checkpoint_interval_tokens=-1,
+            state_checkpoint_demand=False,
+            hf_config=_hf(),
+            state_replay_tokens=REPLAY,
+            max_num_batched_tokens=budget,
+        ),
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
+        ),
+    )
+    _prefill_and_finish(engine.block_manager, _seq(32))
+    seq = _seq(40)
+    engine.add(seq)
+    return engine, seq
 
 
 def _forward(bm, seq, end):
@@ -179,7 +206,7 @@ def test_a_far_hit_without_a_checkpoint_replays():
     assert not bm.paged_state_checkpoints.restore_queued_for(seq.state_slot)
     _resume(bm, seq, hit=True)
     assert seq.num_cached_tokens == 32 - REPLAY
-    assert seq.replay == Replay(32, True, ())
+    assert seq.replay == Replay(32, True, (), 32 - REPLAY)
 
 
 def test_the_replay_publishes_only_from_the_hit_on():
@@ -199,19 +226,20 @@ def test_the_replay_publishes_only_from_the_hit_on():
 
 def test_a_replay_spans_chunks():
     """A forward ending inside the replay publishes and keeps nothing, and the
-    next one continues the replay: still nothing written below the hit."""
+    next one continues the replay: nothing written below the hit, no window
+    row read below where the replay started."""
     bm = _bm()
     _prefill_and_finish(bm, _seq(32))
     seq = _seq(40)
     assert bm.allocate(seq, bm.can_allocate(seq))
     _resume(bm, seq, hit=True)
     seq.checkpoint_end_pos = 28  # pretend an anchor fell inside the replay
-    assert bm.checkpointers_at(seq, 28) == []
     _forward(bm, seq, 28)
     assert seq.num_hashed_tokens == 0
+    assert seq.last_checkpoint_pos == 0
     _resume(bm, seq, hit=False)
     assert seq.num_cached_tokens == 28
-    assert seq.replay == Replay(32, True, ())
+    assert seq.replay == Replay(32, True, (), 32 - REPLAY)
     _forward(bm, seq, 40)
     assert seq.num_hashed_tokens == 40
     # Past the hit the replay is over.
@@ -262,7 +290,6 @@ def test_a_readmission_decides_afresh():
     assert bm.allocate(seq, bm.can_allocate(seq))
     _resume(bm, seq, hit=True)
     bm.deallocate(seq)  # preempted
-    assert seq.replay is None
     bm2 = _bm()
     assert bm2.can_allocate(seq) == 0
     assert not seq.replays_hit
@@ -305,31 +332,56 @@ def test_a_replay_wider_than_the_step_budget_is_admitted_and_spans_chunks():
     """A 7-token replay under a 4-token budget: admitted at once, its first
     forward ends inside the replay, and it continues from there. Waiting for a
     step wide enough to pass the hit would wait forever."""
-    spec = PagedStateCheckpointSpec(10, 25, "replay-test", image_bytes=25)
-    engine = Scheduler(
-        MockConfig(
-            kv_cache_block_size=BLOCK,
-            num_kvcache_blocks=64,
-            enable_prefix_caching=True,
-            pool_entries={"state": 8},
-            pool_entries_per_req={"state": 1},
-            state_checkpoint_interval_tokens=-1,
-            state_checkpoint_demand=False,
-            hf_config=_hf(),
-            state_replay_tokens=REPLAY,
-            max_num_batched_tokens=4,
-        ),
-        state_runtime=StateRuntime(
-            transfer=StateTransfer.copy(spec.layout_id), checkpoint_spec=spec
-        ),
-    )
-    _prefill_and_finish(engine.block_manager, _seq(32))
-    seq = _seq(40)
-    engine.add(seq)
+    engine, seq = _engine_with_a_replayed_head(budget=4)
     batch, scheduled = engine.schedule()
     assert scheduled == {seq.id: seq}
     assert seq.replays_hit
     assert seq.num_cached_tokens == 32 - REPLAY
-    assert seq.replay == Replay(32, True, ())
+    assert seq.replay == Replay(32, True, (), 32 - REPLAY)
     assert batch.replaying == {0: seq.replay}
     assert list(batch.num_scheduled_tokens) == [4]
+
+
+def test_the_pending_work_probe_counts_a_replay_wider_than_the_budget():
+    """The local prefill probe asks admission's question; a replay that cannot
+    pass its hit this step is still work, not the end of the queue."""
+    engine, _ = _engine_with_a_replayed_head(budget=4)
+    assert engine._local_prefill_pending_work() == (True, 4)
+
+
+def test_the_cost_estimate_starts_a_replayed_head_where_admission_does():
+    engine, _ = _engine_with_a_replayed_head(budget=64)
+    # 15 rows from the replay's start (25), not 8 from the hit (32).
+    assert engine._estimate_prefill_chunk_cost() == engine._chunk_cost(32 - REPLAY, 15)
+
+
+def test_a_late_publish_keeps_to_the_replay_it_was_scheduled_with():
+    """Pipeline parallelism publishes a chunk after later chunks were scheduled,
+    which may have ended the replay on the seq: the batch's `until` holds."""
+    bm = _bm()
+    _prefill_and_finish(bm, _seq(32))
+    seq = _seq(40)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    _resume(bm, seq, hit=True)  # chunk 1: [25, 28)
+    batch = SimpleNamespace(replaying={0: seq.replay})
+    seq.num_cached_tokens = 28  # advanced at schedule time
+    _resume(bm, seq, hit=False)  # chunk 2: [28, 36)
+    seq.num_cached_tokens = 36
+    _resume(bm, seq, hit=False)  # chunk 3: the replay is over on the seq
+    assert seq.replay is None and seq.replay_until == 0
+    seq.checkpoint_end_pos = 28  # an anchor inside the replay
+    until = _scheduled_replay_until(batch, 0)
+    assert until == 32 and _scheduled_replay_until(batch, 1) == 0
+    bm.hash_blocks(seq, 3, start_tokens=32 - REPLAY, replay_until=until)
+    assert seq.num_hashed_tokens == 0
+    assert seq.last_checkpoint_pos == 0
+
+
+def test_deallocate_clears_the_replay():
+    bm = _bm()
+    _prefill_and_finish(bm, _seq(32))
+    seq = _seq(40)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    _resume(bm, seq, hit=True)
+    bm.deallocate(seq)
+    assert seq.replay is None and not seq.replays_hit

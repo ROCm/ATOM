@@ -117,7 +117,7 @@ def test_resuming_records_where_the_forward_resumed():
     s = seq(16584, 16384)
     Scheduler._resume_prefill(scheduler, s, 16256, hit=True)
     assert s.num_cached_tokens == 16256
-    assert s.replay == Replay(16384, True, (16253, 16254, 16255))
+    assert s.replay == Replay(16384, True, (16253, 16254, 16255), 16256)
     # a chunk boundary keeps its state: the rows below are not the state
     s = seq(16584, 16384)
     Scheduler._resume_prefill(scheduler, s, 16256, hit=False)
@@ -182,7 +182,7 @@ def test_a_batch_carries_only_the_forwards_starting_below_their_resume():
         seq.num_cached_tokens, seq.replay = cached, replay
         return seq
 
-    replay = Replay(256, True, (126, 127, 128))
+    replay = Replay(256, True, (126, 127, 128), 128)
     # a rebuilt hit, a cold prefill, and one whose resume was already passed
     seqs = [prefill(128, replay), prefill(0), prefill(256, replay._replace())]
     batch = ScheduledBatch(

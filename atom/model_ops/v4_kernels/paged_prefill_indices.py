@@ -32,8 +32,8 @@ Caller responsibilities (no copies done here):
   - Compute and stage the four indptr buffers and the per-seq scalar inputs.
 
 ``swa_floor[bid]`` is 0 except for a seq replaying a prefix whose window was
-not restored (`Sequence.replay_start`): its ring holds nothing below that
-position, so no token may read the ring there.
+not restored (`Replay.start`): its ring holds nothing below that position, so
+no token may read the ring there.
 
 Per-token quantities (kernel-computed from inputs; mirror the formulas in
 ``_build_paged_prefill_meta``):
@@ -68,7 +68,9 @@ from atom.model_ops.v4_kernels.pool_index import (
 from atom.utils.decorators import mark_trace
 
 
-@triton.jit
+# `has_swa_floor` is a runtime switch, unspecialized: as a constexpr (or a
+# specialized int) the floored variant compiled on the first replay, mid-serving.
+@triton.jit(do_not_specialize=["has_swa_floor"])
 def _v4_paged_prefill_indices_kernel(
     # Per-token inputs.
     positions_ptr,  # [T] int — global token position
@@ -78,6 +80,7 @@ def _v4_paged_prefill_indices_kernel(
     cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq prefix sum start in per-fwd kv tensor
     state_slot_per_seq_ptr,  # [bs] int — per-seq SWA ring slot
     swa_floor_per_seq_ptr,  # [bs] int — lowest ring position a seq may read
+    has_swa_floor,  # 1 when some seq replays; 0 leaves the pointer unread
     block_tables_ptr,  # [bs, MAX_BLOCKS] int — compressed pool block ids (HCA)
     bt_stride_bs,  # row stride of block_tables
     # Indptrs (already cumsum'd by caller, all length [T+1]).
@@ -100,7 +103,6 @@ def _v4_paged_prefill_indices_kernel(
     ENVELOPE_ROWS: tl.constexpr,  # rows one block occupies across all layers
     BLOCK_N: tl.constexpr,  # next_pow2(win) — covers SWA prefix and extend segments
     HAS_DENSE: tl.constexpr,  # geometry has layers of this class to serve
-    HAS_SWA_FLOOR: tl.constexpr,  # some seq replays; read swa_floor_per_seq
     DENSE_RING_SLOTS: tl.constexpr,
     DENSE_SLOT_ROWS: tl.constexpr,
     DENSE_RING_STRIDE: tl.constexpr,
@@ -143,7 +145,7 @@ def _v4_paged_prefill_indices_kernel(
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
     swa_low = tl.maximum(pos - win + 1, 0)
-    if HAS_SWA_FLOOR:
+    if has_swa_floor != 0:
         swa_low = tl.maximum(swa_low, tl.load(swa_floor_per_seq_ptr + bid))
     extend_count = tl.minimum(token_pos_in_chunk + 1, win)
     prefix_swa_count = tl.maximum(chunk_start - swa_low, 0)
@@ -366,8 +368,9 @@ def write_v4_paged_prefill_indices(
         chunk_start_per_seq,
         cu_seqlens_q_per_seq,
         state_slot_per_seq,
-        # Any int pointer will do when no seq replays: HAS_SWA_FLOOR drops the load.
+        # Any int pointer will do when no seq replays: the load is skipped.
         swa_floor_per_seq if swa_floor_per_seq is not None else state_slot_per_seq,
+        int(swa_floor_per_seq is not None),
         block_tables,
         block_tables.stride(0),
         extend_indptr,
@@ -387,7 +390,6 @@ def write_v4_paged_prefill_indices(
         ENVELOPE_ROWS=geometry.envelope_rows,
         BLOCK_N=BLOCK_N,
         HAS_DENSE=has_dense,
-        HAS_SWA_FLOOR=swa_floor_per_seq is not None,
         **window_constexprs(dense, "DENSE_"),
         **window_constexprs(csa, "CSA_"),
         **window_constexprs(hca, "HCA_"),
