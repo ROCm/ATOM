@@ -36,23 +36,34 @@ from types import SimpleNamespace
 
 import aiter
 import torch
+from aiter import QuantType, dtypes
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.distributed.qwen_qsa_cp import (
+    get_qsa_cp_decode_group,
+    qsa_cp_enabled,
+)
 from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm
 from atom.model_ops.linear import (
     QKVGParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    gemm_a8w8_blockscale_preshuffle_impl,
 )
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compress_groups,
+    qsa_index_prep,
+    qsa_index_prep_supported,
+    qsa_qk_prep,
+    qsa_qk_prep_supported,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_rows,
 )
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -141,10 +152,15 @@ class Qwen4ExpIndexer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        projected_qk: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Normalized+rotated index Q, and RAW index K for later pooling."""
         otype = hidden_states.dtype
-        qk = self.index_qk_proj(hidden_states, otype=otype)
+        qk = (
+            self.index_qk_proj(hidden_states, otype=otype)
+            if projected_qk is None
+            else projected_qk
+        )
         q_raw, token_k = qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -217,6 +233,20 @@ class Qwen4ExpAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.tp_size = tp_size
+        self.qsa_index_cp = qsa_cp_enabled()
+        if self.qsa_index_cp and (
+            tp_size not in (2, 4)
+            or self.total_num_kv_heads != 2
+            or int(config.indexer_n_heads) != 4
+            or int(config.indexer_compress_ratio) != 4
+            or getattr(atom_config, "enable_tbo", False)
+            or getattr(atom_config, "enable_tbo_decode", False)
+        ):
+            raise ValueError(
+                "Qwen QSA index CP currently requires TP2/TP4, two KV heads, "
+                "four index heads, ratio four and no TBO"
+            )
 
         # The checkpoint's q_proj is [24 heads x 2*head_dim] with q and the
         # sigmoid output gate INTERLEAVED per head. QKVGParallelLinear
@@ -280,6 +310,77 @@ class Qwen4ExpAttention(nn.Module):
         # hold the linear position (i.e. text).
         self.rope_position_cache: torch.Tensor | None = None
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
+        self.register_buffer("_fused_projection_weight", None, persistent=False)
+        self.register_buffer("_fused_projection_scale", None, persistent=False)
+
+    def _project_qkv_index(
+        self, hidden_states: torch.Tensor, is_decode: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Use one quantization and GEMM for the QKV and index Q/K branches."""
+        qkv = self.qkv_proj
+        index = self.indexer.index_qk_proj
+        if not (
+            envs.ATOM_QWEN38_QSA_FUSED_PROJ
+            and is_decode
+            and hidden_states.shape in ((4, 2560), (8, 2560), (16, 2560))
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+            and hidden_states.is_contiguous()
+            and torch.cuda.get_device_properties(
+                hidden_states.device
+            ).gcnArchName.split(":")[0]
+            == "gfx950"
+            and qkv.quant_type.value == QuantType.per_1x128.value
+            and index.quant_type.value == QuantType.per_1x128.value
+            and qkv.params_dtype == dtypes.fp8
+            and index.params_dtype == dtypes.fp8
+            and not qkv.blockscale_e8m0_scale
+            and not index.blockscale_e8m0_scale
+            and qkv.weight.shape == (3584, 2560)
+            and index.weight.shape == (640, 2560)
+            and qkv.weight.dtype == dtypes.fp8
+            and index.weight.dtype == dtypes.fp8
+            and qkv.weight_scale.shape == (28, 20)
+            and index.weight_scale.shape == (5, 20)
+            and qkv.weight_scale.dtype == torch.float32
+            and index.weight_scale.dtype == torch.float32
+            and getattr(qkv.weight, "is_shuffled", False)
+            and getattr(index.weight, "is_shuffled", False)
+            and qkv.bias is None
+            and index.bias is None
+            and getattr(qkv, "input_scale", None) is None
+            and getattr(index, "input_scale", None) is None
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        ):
+            return qkv(hidden_states), None
+
+        if self._fused_projection_weight is None:
+            # Built after both child linears have completed post-load shuffling.
+            # Keep the original parameters for checkpoint/state_dict semantics.
+            self._fused_projection_weight = torch.cat((qkv.weight, index.weight), dim=0)
+            self._fused_projection_scale = torch.cat(
+                (qkv.weight_scale, index.weight_scale), dim=0
+            )
+        quantized, x_scale = qkv.quant_func(
+            hidden_states,
+            quant_dtype=qkv.params_dtype,
+            scale=None,
+            transpose_scale=True,
+        )
+        output = gemm_a8w8_blockscale_preshuffle_impl(
+            quantized,
+            self._fused_projection_weight,
+            x_scale,
+            self._fused_projection_scale,
+            dtype=hidden_states.dtype,
+            prefix=f"{self.prefix}.qkv_index_proj",
+        )
+        return output[:, :3584], output[:, 3584:]
+
+    def process_weights_after_loading(self) -> None:
+        # A later checkpoint reload must rebuild the packed projection.
+        self._fused_projection_weight = None
+        self._fused_projection_scale = None
 
     def bind_caches(
         self,
@@ -300,9 +401,62 @@ class Qwen4ExpAttention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         qsa,
+        projected_qk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Update both index caches, then return the per-token selection."""
-        index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
+        forward_context = get_forward_context()
+        index_q = None
+        if envs.ATOM_QWEN38_QSA_FUSED_INDEX and not forward_context.context.is_prefill:
+            if projected_qk is None:
+                projected_qk = self.indexer.index_qk_proj(
+                    hidden_states, otype=hidden_states.dtype
+                )
+            index_q = self._fused_index_prep(positions, qsa, projected_qk)
+        if index_q is None:
+            index_q = self._index_prep(hidden_states, positions, qsa, projected_qk)
+
+        index_cp = None
+        if self.qsa_index_cp and not forward_context.context.is_prefill:
+            group = get_qsa_cp_decode_group(
+                rows=index_q.shape[0],
+                max_seq_len=qsa.max_seq_len,
+                tp_size=self.tp_size,
+            )
+            if group is not None:
+                index_cp = (
+                    group.rank_in_group,
+                    group.world_size,
+                    group,
+                )
+
+        return qsa_select_paged_tokens(
+            index_q,
+            self.compressed_key_cache,
+            qsa.block_tables,
+            qsa.token_to_req,
+            qsa.logical_positions,
+            qsa.seq_lens,
+            self.indexer.token_topk,
+            self.indexer.compress_ratio,
+            max_seq_len=qsa.max_seq_len,
+            allow_flydsl=forward_context.context.is_prefill,
+            index_cp=index_cp,
+            allow_shortcut=(
+                envs.ATOM_QWEN38_QSA_SHORT and not forward_context.context.is_prefill
+            ),
+        )
+
+    def _index_prep(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        qsa,
+        projected_qk: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Index Q; raw K, positions and closed groups into their caches."""
+        index_q, raw_key = self.indexer.project_qk(
+            hidden_states, positions, projected_qk
+        )
         qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
         if self.rope_position_cache is not None:
             qsa_store_rows(
@@ -326,56 +480,94 @@ class Qwen4ExpAttention(nn.Module):
         qsa_store_rows(
             self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
         )
+        return index_q
 
-        return qsa_select_paged_tokens(
-            index_q,
-            self.compressed_key_cache,
-            qsa.block_tables,
+    def _fused_index_prep(
+        self, positions: torch.Tensor, qsa, projected_qk: torch.Tensor
+    ) -> torch.Tensor | None:
+        """`_index_prep` in one launch, bitwise identical; None where
+        `qsa_index_prep` does not apply."""
+        if not qsa_index_prep_supported(self.indexer, projected_qk, self.raw_key_cache):
+            return None
+        return qsa_index_prep(
+            self.indexer,
+            projected_qk,
+            positions,
+            qsa.slot_mapping,
+            qsa.compressed_slot_mapping,
             qsa.token_to_req,
             qsa.logical_positions,
-            qsa.seq_lens,
-            self.indexer.token_topk,
-            self.indexer.compress_ratio,
-            max_seq_len=qsa.max_seq_len,
-            allow_flydsl=get_forward_context().context.is_prefill,
+            qsa.block_tables,
+            self.raw_key_cache,
+            self.compressed_key_cache,
+            position_cache=self.rope_position_cache,
+            # Draft RoPE is one ahead of its logical cache slots.
+            rope_position_offset=int(get_forward_context().context.is_draft),
         )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
+        forward_context = get_forward_context()
+        qsa = forward_context.attn_metadata.qsa_metadata
+        qkv, projected_qk = self._project_qkv_index(
+            hidden_states, qsa is not None and not forward_context.context.is_prefill
+        )
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
-        # Normalization and cache writes accept packed token strides without copies.
-        q, k = self.qk_norm(q, k)
-        query, key = qsa_apply_mrope(
-            self.rotary_emb,
-            positions,
-            q.view(num_tokens, self.num_heads, self.head_dim),
-            k.view(num_tokens, self.num_kv_heads, self.head_dim),
-        )
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        forward_context = get_forward_context()
-        qsa = forward_context.attn_metadata.qsa_metadata
+        fused_qk = False
+        if qsa is not None:
+            qsa = qsa.for_tokens(num_tokens)
+            fused_qk = (
+                envs.ATOM_QWEN38_QSA_FUSED_QK
+                and not forward_context.context.is_prefill
+                and qsa_qk_prep_supported(
+                    self.qk_norm, self.rotary_emb, q, k, v, self.k_cache, self.v_cache
+                )
+            )
+        if fused_qk:
+            # Norm, mRoPE and the KV cache write in one launch, bitwise identical.
+            query, key = qsa_qk_prep(
+                self.qk_norm,
+                self.rotary_emb,
+                positions,
+                q,
+                k,
+                v,
+                qsa.slot_mapping,
+                self.k_cache,
+                self.v_cache,
+            )
+        else:
+            # Normalization and cache writes accept packed token strides
+            # without copies.
+            q, k = self.qk_norm(q, k)
+            query, key = qsa_apply_mrope(
+                self.rotary_emb,
+                positions,
+                q.view(num_tokens, self.num_heads, self.head_dim),
+                k.view(num_tokens, self.num_kv_heads, self.head_dim),
+            )
         if qsa is None:
             attn_out = self._profile_attention(
                 query, key, value, hidden_states, positions
             )
         else:
-            qsa = qsa.for_tokens(num_tokens)
-            aiter.reshape_and_cache_flash(
-                key,
-                value,
-                self.k_cache,
-                self.v_cache,
-                qsa.slot_mapping,
-                "auto",
-                self._unit_scale,
-                self._unit_scale,
-            )
-            selected = self._select_tokens(hidden_states, positions, qsa)
+            if not fused_qk:
+                aiter.reshape_and_cache_flash(
+                    key,
+                    value,
+                    self.k_cache,
+                    self.v_cache,
+                    qsa.slot_mapping,
+                    "auto",
+                    self._unit_scale,
+                    self._unit_scale,
+                )
+            selected = self._select_tokens(hidden_states, positions, qsa, projected_qk)
             attn_out = qsa_sparse_paged_gqa(
                 query,
                 self.k_cache,

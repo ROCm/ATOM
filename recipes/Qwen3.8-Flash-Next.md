@@ -50,6 +50,14 @@ Draft depths 1, 2, and 3 are supported. The checkpoint contains one draft
 layer, reused at each step; no separate draft model is needed. The target
 and draft share the embedding and output head.
 
+On MI355X, prefix this MTP command with
+`ATOM_QWEN38_MONO_HC=1 ATOM_QWEN38_QSA_SHORT=1` to enable the measured HC and
+short-context QSA decode paths. Both flags default off. The HC path includes
+the MTP2 verification widths of 3/6/9/12/18/24 rows; the short-QSA path
+applies while all visible groups fit the 2,048-token sparse budget. See
+[the Qwen3.8 decode measurements](../docs/qwen38_mono_hc.md) for accuracy,
+performance, and long-context limits.
+
 ## Usage notes and limitations
 
 - For image requests, use `--no-enable_prefix_caching` and sufficient cache

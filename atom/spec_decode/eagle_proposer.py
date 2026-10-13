@@ -26,6 +26,10 @@ logger = logging.getLogger("atom")
 
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
+    # Qwen MTP has no PCP path; avoid importing unrelated DeepSeek kernels.
+    if draft_model.__class__.__name__ == "Qwen4ExpMTP":
+        return False
+
     # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
     from atom.models.deepseek_v2 import _pcp_active
 

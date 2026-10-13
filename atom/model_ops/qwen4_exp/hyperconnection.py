@@ -42,8 +42,11 @@ from atom.model_ops.qwen4_exp.ops.hc_fused import (
 # Up to this many tokens the two fused kernels beat norm + GEMMs; each row
 # re-reads the (cache resident) weights, so the cost grows with the batch.
 HC_ROWS_MAX = 2
+# `ops/hc_mfma.MAX_ROWS`, kept here so dispatch need not import FlyDSL.
+HC_MFMA_MAX_ROWS = 48
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
 
 
 class Qwen4ExpGroupedRMSNorm(nn.Module):
@@ -53,7 +56,11 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
         super().__init__()
         if group_size <= 0 or hidden_size % group_size:
             raise ValueError("group_size must divide hidden_size")
-        self.weight = atom_parameter(torch.zeros(hidden_size))
+        # ModelRunner constructs under the checkpoint's BF16 default dtype.
+        # Keep the norm parameter FP32: both the native norm and the gfx950
+        # FlyDSL HC path use FP32 scaling, and BF16 checkpoint values load
+        # exactly into this parameter.
+        self.weight = atom_parameter(torch.zeros(hidden_size, dtype=torch.float32))
         self.group_size = group_size
         self.variance_epsilon = eps
 
@@ -101,6 +108,39 @@ class Qwen4ExpHyperConnection(nn.Module):
             else None
         )
 
+    def _mono_supported(self, x: torch.Tensor, max_rows: int) -> bool:
+        """Only the measured Flash-Next decode geometry uses the fused path."""
+        return envs.ATOM_QWEN38_MONO_HC and self._mono_geometry(x, max_rows)
+
+    def _mono_geometry(self, x: torch.Tensor, max_rows: int) -> bool:
+        if (
+            self.hidden_size != 2560
+            or self.hc_count != 4
+            or self.hc_norm.weight.shape != (10240,)
+            or self.hc_norm.weight.dtype != torch.float32
+            or self.hc_norm.weight.device != x.device
+            or not self.hc_norm.weight.is_contiguous()
+            or self.input_mix_weight_down.weight.shape != (320, 10240)
+            or self.input_mix_weight_up.weight.shape != (10240, 320)
+            or x.ndim != 2
+            or not 1 <= x.shape[0] <= max_rows
+            or x.shape[1] != 10240
+            or x.dtype != torch.bfloat16
+            or not x.is_cuda
+            or not x.is_contiguous()
+        ):
+            return False
+        arch = getattr(torch.cuda.get_device_properties(x.device), "gcnArchName", "")
+        if arch.split(":")[0] != "gfx950":
+            return False
+        weights = (self.input_mix_weight_down.weight, self.input_mix_weight_up.weight)
+        return all(
+            weight.dtype == torch.bfloat16
+            and weight.device == x.device
+            and weight.is_contiguous()
+            for weight in weights
+        )
+
     def mix(
         self, hyper_input: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -109,6 +149,10 @@ class Qwen4ExpHyperConnection(nn.Module):
         Only the two low-rank projections are GEMMs; the sigmoid, the
         broadcast multiply and the mean over streams are one fused pass.
         """
+        if self._mono_supported(hyper_input, 16):
+            from atom.model_ops.qwen4_exp.ops.hc_flydsl import mix
+
+            return mix(self, hyper_input)
         normed = self.hc_norm(hyper_input)
         gate = scaled_silu(
             self.input_mix_weight_down(normed, otype=normed.dtype), self.hc_count
@@ -126,6 +170,24 @@ class Qwen4ExpHyperConnection(nn.Module):
         if self.block_inject_weight is None:
             raise RuntimeError("combine was disabled for this hyper-connection")
         hyper_input, normed = residuals
+        if (
+            self._mono_supported(hyper_input, 128)
+            and block_output.shape == (hyper_input.shape[0], self.hidden_size)
+            and block_output.dtype == torch.bfloat16
+            and block_output.device == hyper_input.device
+            and block_output.is_contiguous()
+            and normed.shape == hyper_input.shape
+            and normed.dtype == torch.bfloat16
+            and normed.device == hyper_input.device
+            and normed.is_contiguous()
+            and self.block_inject_weight.weight.shape == (4, 10240)
+            and self.block_inject_weight.weight.dtype == torch.bfloat16
+            and self.block_inject_weight.weight.device == hyper_input.device
+            and self.block_inject_weight.weight.is_contiguous()
+        ):
+            from atom.model_ops.qwen4_exp.ops.hc_flydsl import combine
+
+            return combine(self, block_output, residuals)
         raw = self.block_inject_weight(normed, otype=normed.dtype)
         return combine_inject(hyper_input, block_output, raw, self.hc_count).to(
             hyper_input.dtype
@@ -159,6 +221,51 @@ class Qwen4ExpHyperConnection(nn.Module):
         hyper-connection. Returns the mixed activation and `(streams,
         inject_logits)`; the logits are None when there is no block injection.
         """
+        # MTP-2 verification runs three rows per request. Keep its measured
+        # winning sizes alongside the ordinary decode sizes. Native is faster
+        # at 1, 2, 15 and 32 rows; 21 rows gains too little to dispatch.
+        rows = hyper_input.shape[0]
+        # The two-launch MFMA mix covers every MTP verify size up to 48 rows.
+        use_mfma = (
+            envs.ATOM_QWEN38_HC_MFMA
+            and rows >= 3
+            and self._mono_geometry(hyper_input, HC_MFMA_MAX_ROWS)
+        )
+        if use_mfma or (
+            rows in (3, 4, 6, 8, 9, 12, 16, 18, 24)
+            and self._mono_supported(hyper_input, 24)
+        ):
+            fused_weight = getattr(self, "fused_w_cat", None)
+            fused_rows = getattr(self, "fused_rank", 0) + (
+                self.hc_count if self.block_inject_weight is not None else 0
+            )
+            valid_pending = pending is None or (
+                len(pending) == 2
+                and all(isinstance(tensor, torch.Tensor) for tensor in pending)
+                and pending[0].shape == (hyper_input.shape[0], self.hidden_size)
+                and pending[1].shape == (hyper_input.shape[0], self.hc_count)
+                and all(
+                    tensor.dtype == torch.bfloat16
+                    and tensor.device == hyper_input.device
+                    and tensor.is_contiguous()
+                    for tensor in pending
+                )
+            )
+            if (
+                isinstance(fused_weight, torch.Tensor)
+                and fused_weight.shape == (fused_rows, self.hc_dim)
+                and fused_weight.dtype == torch.bfloat16
+                and fused_weight.device == hyper_input.device
+                and fused_weight.is_contiguous()
+                and valid_pending
+            ):
+                if use_mfma:
+                    from atom.model_ops.qwen4_exp.ops import hc_mfma
+
+                    return hc_mfma.mix_fused(self, hyper_input, pending)
+                from atom.model_ops.qwen4_exp.ops.hc_flydsl import mix_fused
+
+                return mix_fused(self, hyper_input, pending)
         block_out, raw_prev = pending if pending is not None else (None, None)
         has_inject = self.block_inject_weight is not None
         w_up = self.input_mix_weight_up.weight

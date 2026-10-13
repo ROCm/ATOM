@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Qwen MTP history recovery must equal execution of accepted tokens only."""
 
+import builtins
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,21 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+
+
+def test_qwen_mtp_pcp_gate_does_not_import_deepseek(monkeypatch):
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+    from atom.spec_decode.eagle_proposer import _pcp_active_for_draft_model
+
+    original_import = builtins.__import__
+
+    def checked_import(name, *args, **kwargs):
+        if name == "atom.models.deepseek_v2":
+            raise AssertionError("Qwen MTP must not load DeepSeek PCP kernels")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", checked_import)
+    assert not _pcp_active_for_draft_model(Qwen4ExpMTP.__new__(Qwen4ExpMTP))
 
 
 @pytest.fixture
@@ -352,6 +368,7 @@ def test_mtp_shared_projection_uses_full_width_hidden_norm():
     model = Qwen4ExpMultiTokenPredictor.__new__(Qwen4ExpMultiTokenPredictor)
     torch.nn.Module.__init__(model)
     model.hc_count, model.hidden_size = hc, width
+    model.fused_layer = False
     model.pre_fc_norm_hidden = Qwen4ExpGroupedRMSNorm(hc * width, hc * width, eps)
     model.pre_fc_norm_embedding = Qwen4ExpGroupedRMSNorm(width, width, eps)
     model.fc_hidden = torch.nn.Linear(width, width, bias=False)

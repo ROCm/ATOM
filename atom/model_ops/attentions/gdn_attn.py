@@ -289,6 +289,13 @@ class GDNStateMixin(PoolRowsMixin):
             dtype=torch.int32,
             device=self.device,
         )
+        # Host staging for one upload per step. A per-request item store
+        # would issue one tiny copy each on the prepare critical path.
+        on_device = torch.device(self.device).type != "cpu"
+        self._num_accepted_staging = torch.ones(
+            (self.max_bs,), dtype=torch.int32, device="cpu", pin_memory=on_device
+        )
+        self._num_accepted_uploaded = torch.cuda.Event() if on_device else None
 
         gdn_metadata = {
             "spec_sequence_masks": self.spec_sequence_masks,
@@ -1179,12 +1186,20 @@ class GDNStateMixin(PoolRowsMixin):
                     non_spec_state_indices[idx] = committed
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
-
-        if self.model_runner.tokenID_processor.num_bonus is None:
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        if num_bonus is None:
+            self.num_accepted_tokens.fill_(1)
             return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        uploaded = self._num_accepted_uploaded
+        if uploaded is not None:
+            # The previous upload must have read the pinned rows first.
+            uploaded.synchronize()
+        staging = self._num_accepted_staging.numpy()
+        staging.fill(1)
+        staging[: len(num_bonus)] = np.asarray(num_bonus) + 1
+        self.num_accepted_tokens.copy_(self._num_accepted_staging, non_blocking=True)
+        if uploaded is not None:
+            uploaded.record()
 
     def prepare_gdn_metadata(
         self,

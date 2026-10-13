@@ -71,6 +71,7 @@ from atom.model_ops.decode_input_ids import (
     NEW_SEQUENCE,
     fill_deferred_decode_ids,
 )
+from atom.model_ops.embed_head import empty_token_ids
 from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
@@ -832,6 +833,8 @@ class ModelRunner:
             logger.info(f"[ATOM_FWD_DUMP] {_n_fwd_hooks} Block forward hooks installed")
         maybe_dump_weights_and_exit(self.model)
 
+        # Set per forward by `_use_greedy_argmax_head`; read by `run_model`.
+        self._greedy_argmax_head = False
         if self.config.speculative_config and get_pp_group().is_last_rank:
             from atom.utils.backends import set_model_tag
 
@@ -3197,8 +3200,7 @@ class ModelRunner:
                             else scheduled_tokens
                         )
                     ]
-                    logits = self.model.compute_logits(hidden_states)
-                    return logits, hidden_states
+                    return self._decode_logits(hidden_states), hidden_states
 
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
                 self.graphs[graph_key].replay()
@@ -3208,9 +3210,32 @@ class ModelRunner:
                 if self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:scheduled_tokens]
                 else:
-                    logits = self.model.compute_logits(hidden_states)
+                    logits = self._decode_logits(hidden_states)
 
         return logits, hidden_states
+
+    def _decode_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Decode LM head; None leaves it to `postprocess`'s argmax head."""
+        if self._greedy_argmax_head:
+            return None
+        return self.model.compute_logits(hidden_states)
+
+    def _use_greedy_argmax_head(self, batch: ScheduledBatch, all_greedy: bool) -> bool:
+        """Whether this step's verification needs only target argmax ids.
+
+        At TP > 1 the full logits cost an all-gather of [tokens, vocab]; the
+        head's per-rank argmax gathers [tokens, 2] and picks the same tokens.
+        """
+        return (
+            envs.ATOM_GREEDY_ARGMAX_HEAD
+            and all_greedy
+            and get_tp_group().world_size > 1
+            and not self.logits_in_graph
+            and get_forward_context().spec_decode_metadata is not None
+            and self.rejection_sampler.takes_target_token_ids
+            and hasattr(self.model, "compute_argmax_token")
+            and not any(batch.return_logprobs)
+        )
 
     def flush_pp_send(self) -> bool:
         """Flush pending PP isend. Returns True for call_func wait_out."""
@@ -3257,31 +3282,43 @@ class ModelRunner:
             # segment's last row.
             anchors = None
         else:
-            assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
-            target_logits = torch.index_select(logits, 0, target_logits_indices)
-            target_token_ids = None
-            if not all_greedy:
-                target_token_ids = self.sampler.sample_verification_tokens(
-                    target_logits,
-                    spec_decode_metadata.cu_num_draft_tokens,
-                    temperatures,
-                    top_ks,
-                    top_ps,
+            if logits is None:
+                # `_use_greedy_argmax_head` deferred the head: only ids needed.
+                token_ids = self.model.compute_argmax_token(
+                    hidden_states, out=empty_token_ids(hidden_states)
                 )
-                if target_token_ids.numel() and get_tp_group().world_size > 1:
-                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+                bonus_token_ids = torch.index_select(token_ids, 0, bonus_logits_indices)
+                target_token_ids = torch.index_select(
+                    token_ids, 0, target_logits_indices
+                )
+                target_logits = None
+            else:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                target_logits = torch.index_select(logits, 0, target_logits_indices)
+                target_token_ids = None
+                if not all_greedy:
+                    target_token_ids = self.sampler.sample_verification_tokens(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                        top_ks,
+                        top_ps,
+                    )
+                    if target_token_ids.numel() and get_tp_group().world_size > 1:
+                        target_token_ids = get_tp_group().broadcast(
+                            target_token_ids, src=0
+                        )
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
@@ -3443,7 +3480,9 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        self._greedy_argmax_head = self._use_greedy_argmax_head(batch, all_greedy)
         logits, hidden_states = self.run_model(input_ids, batch)
+        self._greedy_argmax_head = False
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3941,8 +3980,10 @@ class ModelRunner:
         # dummy batch is prefill-only, and prefill stays on the TP path with no
         # all-to-all. No-op unless the flag is on.
         from atom.distributed.indexer_cp import warmup_exchange
+        from atom.distributed.qwen_qsa_cp import warmup_qsa_cp_exchange
 
         warmup_exchange(self.device)
+        warmup_qsa_cp_exchange(self.device)
 
         _piecewise = self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)

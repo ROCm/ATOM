@@ -78,6 +78,17 @@ def rsrc(addr, nbytes=None):
     return bo.create_buffer_resource_from_addr(addr, num_records_bytes=nbytes)
 
 
+def dot2_bf16(a, b, acc):
+    """Accumulate a packed BF16 pair with the public FlyDSL math API."""
+    lhs = fx.Vector.from_elements([fx.Int32(a)], fx.Int32).bitcast(fx.BFloat16)
+    rhs = fx.Vector.from_elements([fx.Int32(b)], fx.Int32).bitcast(fx.BFloat16)
+    return fmath.fma(
+        fx.Float32(lhs[1]),
+        fx.Float32(rhs[1]),
+        fmath.fma(fx.Float32(lhs[0]), fx.Float32(rhs[0]), fx.Float32(acc)),
+    )
+
+
 def permlane_swap(off, x, y):
     """v_permlane{32,16}_swap on registers (x, y): off 32 trades x's upper-half
     lanes with y's lower-half lanes; off 16 trades x's odd 16-lane rows with y's

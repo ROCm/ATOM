@@ -1,4 +1,5 @@
 import fnmatch
+import functools
 import re
 from typing import ClassVar
 
@@ -23,6 +24,8 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
+from atom.model_ops.qwen4_exp.ops import moe_small_batch
+from atom.model_ops.qwen4_exp.ops import router as triton_router
 from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul, sigmoid_rmsnorm
 from atom.model_ops.qwen4_exp.ops.moe_decode import moe_decode_single_token
 from atom.model_ops.qwen4_exp.ple_layer import Qwen4ExpPLELayer
@@ -31,6 +34,7 @@ from atom.model_ops.qwen4_exp.qsa_attention import (
 )
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
+    shared_expert_fusion_parallel_ok,
 )
 from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import Qwen3NextMLP, mamba_v2_sharded_weight_loader
@@ -42,7 +46,15 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.quant_spec import LayerQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+
+# The main model's shared experts, under either checkpoint naming.
+_MAIN_SHARED_EXPERT = re.compile(
+    r"^((?:model\.(?:language_model\.)?)?layers\.\d+\.mlp\.)shared_expert(?=\.|$)"
+)
+# The MTP drafter's, as its modules name it (ATOM_QWEN38_FUSED_MTP_LAYER).
+_MTP_SHARED_EXPERT = re.compile(r"^(mtp\.layers\.\d+\.mlp\.)shared_expert(?=\.|$)")
 
 
 class _Qwen4ExpQuantizationConfig:
@@ -76,6 +88,23 @@ class _Qwen4ExpQuantizationConfig:
             elif name.startswith("visual."):
                 names.append("model." + name)
         field = "online_" if use_online_quant else ""
+        shared = _MAIN_SHARED_EXPERT
+        if envs.ATOM_QWEN38_FUSED_MTP_LAYER and _MTP_SHARED_EXPERT.search(layer_name):
+            shared = _MTP_SHARED_EXPERT
+        if (
+            envs.ATOM_QWEN38_FP8_SHARED_EXPERT
+            and any(shared.search(name) for name in names)
+            and shared_expert_fusion_parallel_ok()
+        ):
+            # Quantized at load into the routed experts' format; MTP's own
+            # `mtp.layers.*` shared expert keeps the checkpoint's BF16 unless
+            # ATOM_QWEN38_FUSED_MTP_LAYER fuses it too. A layout that cannot
+            # fuse keeps the BF16 shared expert as a standalone MLP.
+            return self.get_layer_quant_config(
+                shared.sub(r"\1experts", layer_name),
+                use_online_quant,
+                check_children=check_children,
+            )
         excludes = getattr(self._config, field + "exclude_layers")
         if self.quant_method == "compressed-tensors" and not use_online_quant:
             # Exact module targets do not exclude their children in this format.
@@ -128,6 +157,10 @@ class Qwen4ExpRMSNormGated(nn.Module):
         return sigmoid_rmsnorm(x, z, self.weight, self.eps)
 
 
+# The stock expert weight loader's positional arguments after the tensor.
+_LOADER_KEYS = ("weight_name", "shard_id", "expert_id")
+
+
 def install_stacked_expert_loaders(experts: FusedMoE) -> None:
     """Let `FusedMoE` accept whole-layer `[E, ...]` expert tensors as well.
 
@@ -160,7 +193,10 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
         # A fused shared expert occupies slots past the routed ones.
         expert_slice = slice(0, experts.expert_layout.num_routed)
     else:
-        local = torch.nonzero(expert_map >= 0).flatten()
+        # Past the routed ids sit the fused shared expert's slot and the
+        # non-local sentinel; neither belongs to the stacked range.
+        routed_map = expert_map[: experts.expert_layout.num_routed]
+        local = torch.nonzero(routed_map >= 0).flatten()
         first, last = int(local[0]), int(local[-1])
         if last - first + 1 != local.numel():
             raise NotImplementedError(
@@ -186,7 +222,7 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
         )
         param.data.copy_(source.to(device=param.device, dtype=param.dtype))
 
-    def wrap(param: nn.Parameter, stacked_loader):
+    def wrap(param: nn.Parameter, stacked_loader, scale: nn.Parameter | None):
         stock = param.weight_loader
 
         def loader(param, loaded_weight, *args, **kwargs):
@@ -195,13 +231,58 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
             shard_id = kwargs.get("shard_id", args[1] if len(args) > 1 else "")
             if loaded_weight.dim() == 3 and not shard_id:
                 stacked_loader(param, loaded_weight)
+            elif (
+                scale is not None
+                and loaded_weight.dim() == 2
+                and loaded_weight.dtype in (torch.bfloat16, torch.float16)
+                and param.dtype == dtypes.fp8
+            ):
+                # The BF16 shared expert landing in a block-FP8 slot
+                # (ATOM_QWEN38_FP8_SHARED_EXPERT): quantize, then load the
+                # weight and its scale exactly as a checkpoint FP8 expert.
+                weight_name, shard_id, expert_id = (
+                    list(args) + [kwargs.get(k) for k in _LOADER_KEYS]
+                )[: len(_LOADER_KEYS)]
+                weight_name = kwargs.get("weight_name", weight_name)
+                shard_id = kwargs.get("shard_id", shard_id)
+                expert_id = kwargs.get("expert_id", expert_id)
+                q, s = _quantize_block_fp8(loaded_weight)
+                stock(param, q, weight_name, shard_id, expert_id)
+                scale.weight_loader(
+                    scale, s, weight_name + "_scale", shard_id, expert_id
+                )
             else:
                 stock(param, loaded_weight, *args, **kwargs)
 
         return loader
 
-    experts.w13_weight.weight_loader = wrap(experts.w13_weight, stacked_w13)
-    experts.w2_weight.weight_loader = wrap(experts.w2_weight, stacked_w2)
+    block_fp8 = experts.w13_weight.dtype == dtypes.fp8 and (
+        experts.layer_quant_config.quant_type == QuantType.per_1x128
+    )
+    experts.w13_weight.weight_loader = wrap(
+        experts.w13_weight,
+        stacked_w13,
+        getattr(experts, "w13_weight_scale", None) if block_fp8 else None,
+    )
+    experts.w2_weight.weight_loader = wrap(
+        experts.w2_weight,
+        stacked_w2,
+        getattr(experts, "w2_weight_scale", None) if block_fp8 else None,
+    )
+
+
+def _quantize_block_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[N, K]` -> (e4m3fn weight, `[N/128, K/128]` float32 dequant scale).
+
+    The checkpoint's own routed-expert format, so the slot is indistinguishable
+    from one loaded from disk.
+    """
+    n, k = weight.shape
+    blocks = weight.float().view(n // 128, 128, k // 128, 128)
+    amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-12)
+    scale = amax / torch.finfo(torch.float8_e4m3fn).max
+    q = (blocks / scale).to(torch.float8_e4m3fn).view(n, k)
+    return q, scale.view(n // 128, k // 128)
 
 
 class _UnfusedSharedExpertConfig:
@@ -256,6 +337,18 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 routed_expert_prefix=f"{prefix}.experts",
             )
         )
+        if (
+            envs.ATOM_QWEN38_FP8_SHARED_EXPERT
+            and fuse_shared_expert
+            and not self.fuse_shared
+            and shared_expert_fusion_parallel_ok()
+        ):
+            # The quant config calls the shared expert FP8 wherever the layout
+            # can fuse, so a standalone one would be an FP8 linear fed the
+            # checkpoint's BF16 weights.
+            raise ValueError(
+                "ATOM_QWEN38_FP8_SHARED_EXPERT expected shared-expert fusion"
+            )
         if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"TP {self.tp_size} exceeds the expert count {self.n_routed_experts}"
@@ -298,9 +391,22 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             ),
             shared_expert_scoring_func="sigmoid" if self.fuse_shared else None,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            custom_routing_function=(
+                functools.partial(
+                    triton_router.softmax_topk, num_experts=self.n_routed_experts
+                )
+                if envs.ATOM_QWEN38_TRITON_ROUTER
+                and triton_router.supports(
+                    self.n_routed_experts,
+                    int(config.num_experts_per_tok),
+                    getattr(config, "norm_topk_prob", True),
+                )
+                else None
+            ),
         )
         install_stacked_expert_loaders(self.experts)
         self._single_token_ok: bool | None = None
+        self._small_batch_ok: bool | None = None
 
     def _single_token_supported(self) -> bool:
         """Whether `moe_decode_single_token` can read these experts.
@@ -330,8 +436,15 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         logits = self.gate(hidden_states)
         if self.fuse_shared:
             # The tail logit is the shared expert's sigmoid gate.
-            if hidden_states.shape[0] == 1 and self._single_token_supported():
+            tokens = hidden_states.shape[0]
+            if tokens == 1 and self._single_token_supported():
                 out = self._single_token_experts(hidden_states, logits)
+            elif (
+                tokens <= moe_small_batch.MAX_TOKENS
+                and envs.ATOM_QWEN38_SMALL_BATCH_MOE
+                and self._small_batch_supported(hidden_states)
+            ):
+                out = self._small_batch_experts(hidden_states, logits)
             else:
                 out = self.experts(hidden_states=hidden_states, router_logits=logits)
             if self.tp_size > 1:
@@ -346,6 +459,75 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         if self.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         return out.view(orig_shape)
+
+    def _small_batch_supported(self, hidden_states: torch.Tensor) -> bool:
+        if self._small_batch_ok is None:
+            ex = self.experts
+            self._small_batch_ok = (
+                ex.expert_map is not None
+                and ex.expert_map.dtype == torch.int32
+                and moe_small_batch.supports(
+                    hidden_states,
+                    ex.w13_weight,
+                    ex.w2_weight,
+                    getattr(ex, "w13_weight_scale", None),
+                    getattr(ex, "w2_weight_scale", None),
+                )
+            )
+        return self._small_batch_ok
+
+    def _small_batch_experts(self, hidden_states, logits):
+        ex = self.experts
+        route = ex.custom_routing_function
+        buckets = None
+        if (
+            envs.ATOM_QWEN38_MOE_ROUTER_BUCKETS
+            and isinstance(route, functools.partial)
+            and route.func is triton_router.softmax_topk
+        ):
+            # The router lists each expert's pairs, so the MoE needs no plan.
+            buckets = moe_small_batch.route_buckets(
+                hidden_states.device, ex.w13_weight.shape[0]
+            )
+            topk_weights, topk_ids = route(
+                hidden_states=hidden_states,
+                gating_output=logits,
+                topk=ex.top_k,
+                renormalize=ex.renormalize,
+                buckets=(ex.expert_map, buckets),
+            )
+        else:
+            topk_weights, topk_ids = self._select_experts(hidden_states, logits)
+        return moe_small_batch.moe_small_batch(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            ex.expert_map,
+            ex.w13_weight,
+            ex.w13_weight_scale,
+            ex.w2_weight,
+            ex.w2_weight_scale,
+            buckets=buckets,
+        )
+
+    def _select_experts(self, hidden_states, logits):
+        ex = self.experts
+        return FusedMoE.select_experts(
+            hidden_states=hidden_states,
+            router_logits=logits,
+            use_grouped_topk=ex.use_grouped_topk,
+            top_k=ex.top_k,
+            renormalize=ex.renormalize,
+            topk_group=ex.topk_group,
+            num_expert_group=ex.num_expert_group,
+            custom_routing_function=ex.custom_routing_function,
+            scoring_func=ex.scoring_func,
+            e_score_correction_bias=ex.e_score_correction_bias,
+            fused_shared_experts_scoring_func=ex.shared_expert_scoring_func,
+            num_routing_experts=ex.global_num_experts,
+            num_fused_shared_experts=ex.num_fused_shared_experts,
+            routed_scaling_factor=ex.routed_scaling_factor,
+        )
 
     def _single_token_experts(self, hidden_states, logits):
         ex = self.experts
@@ -373,22 +555,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 router_logits=logits,
                 top_k=ex.top_k,
             )
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=hidden_states,
-            router_logits=logits,
-            use_grouped_topk=ex.use_grouped_topk,
-            top_k=ex.top_k,
-            renormalize=ex.renormalize,
-            topk_group=ex.topk_group,
-            num_expert_group=ex.num_expert_group,
-            custom_routing_function=ex.custom_routing_function,
-            scoring_func=ex.scoring_func,
-            e_score_correction_bias=ex.e_score_correction_bias,
-            fused_shared_experts_scoring_func=ex.shared_expert_scoring_func,
-            num_routing_experts=ex.global_num_experts,
-            num_fused_shared_experts=ex.num_fused_shared_experts,
-            routed_scaling_factor=ex.routed_scaling_factor,
-        )
+        topk_weights, topk_ids = self._select_experts(hidden_states, logits)
         return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
 
 
@@ -1054,6 +1221,16 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 hidden_states.flatten(1)
             )
         return self.lm_head(hidden_states)
+
+    def compute_argmax_token(
+        self, hidden_states: torch.Tensor, *, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Greedy ids for `compute_logits` rows without gathering the vocab."""
+        if self.extra_output_dims:
+            hidden_states, _ = self.model.hyper_connection_mixer.mix(
+                hidden_states.flatten(1)
+            )
+        return self.lm_head.compute_argmax_token(hidden_states, out=out)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Route `experts.N.{gate,up,down}_proj.*` onto the fused parameters.

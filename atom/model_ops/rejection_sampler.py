@@ -112,11 +112,17 @@ class RejectionSampler(nn.Module):
         # identical on every rank while still varying step to step.
         self._synthetic_step = 0
 
+    @property
+    def takes_target_token_ids(self) -> bool:
+        """Whether verification can run on target token ids without logits."""
+        return self.synthetic_acceptance_rates is None and RELAXED_TOP_N <= 1
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
-        # [num_tokens, vocab_size]
-        target_logits: torch.Tensor,
+        # [num_tokens, vocab_size]; None when `target_token_ids` are the
+        # greedy picks (see `takes_target_token_ids`)
+        target_logits: torch.Tensor | None,
         # [batch_size, 1]
         bonus_token_ids: torch.Tensor,
         *,
@@ -125,7 +131,10 @@ class RejectionSampler(nn.Module):
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
-        target_logits = target_logits.contiguous()
+        if target_logits is not None:
+            target_logits = target_logits.contiguous()
+        else:
+            assert target_token_ids is not None and self.takes_target_token_ids
 
         output_token_ids = rejection_sample(
             metadata.input_ids,
@@ -158,8 +167,9 @@ def rejection_sample(
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
     draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
+    # [num_tokens, vocab_size]; None only with `target_token_ids` on the
+    # greedy path
+    target_probs: torch.Tensor | None,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     # [batch_size] -- each request's last row, the one its bonus is sampled at
@@ -174,17 +184,17 @@ def rejection_sample(
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    assert target_probs is not None or target_token_ids is not None
 
     batch_size = len(cu_num_draft_tokens)
     num_tokens = target_logits_indices.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
+    device = input_ids.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
     assert draft_probs is None or draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+    if target_probs is not None:
+        assert target_probs.ndim == 2 and target_probs.is_contiguous()
+        assert target_probs.shape[0] == num_tokens
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
