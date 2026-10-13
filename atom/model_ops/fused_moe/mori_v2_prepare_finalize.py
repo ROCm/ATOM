@@ -49,7 +49,9 @@ import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
 from atom.model_ops.fused_moe.mega_transport_config import (
     compact_plan_vmm_bytes,
+    dispatch_kernel_warning,
     mega_dispatch_kwargs,
+    resolve_dispatch_kernel,
 )
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -231,10 +233,6 @@ if os.environ.get("MEGA_WIRE") not in (None, os.environ.get("MEGA_DISPATCH_WIRE"
         "the old name is no longer read"
     )
 _MEGA_DISPATCH_WIRE = os.environ.get("MEGA_DISPATCH_WIRE", "bf16")
-# aiter's own knob, read here because ATOM names the backend of a quantizing wire
-# itself (mega_dispatch_kwargs). Its default there is mori, which is what such a
-# wire always ran on; aiter's own default, flydsl, still governs a bf16 wire.
-_MEGA_DISPATCH_BACKEND = os.environ.get("MEGA_DISPATCH", "mori")
 
 
 def init_mega_transport(
@@ -263,8 +261,9 @@ def init_mega_transport(
     Everything here is per-model: the EP geometry, the cco arena, and the expert
     GEMM recipe. Only the weights differ per layer and those are forward()
     arguments, so one instance covers the whole model. Its dispatch kernel is
-    $MEGA_DISPATCH=flydsl|mori; on an fp8/fp4 wire ATOM passes it (default mori),
-    and flydsl there runs aiter's compact plan. See mega_dispatch_kwargs.
+    $ATOM_MEGA_DISPATCH_KERNEL=mori|flydsl_token_major|flydsl_compact, with aiter's
+    older $MEGA_DISPATCH still honoured when that is unset; ATOM passes the choice
+    to aiter on every wire. See resolve_dispatch_kernel.
 
     ``combine_quant`` names the quantized return-trip format this transport is
     to BUILD ($ATOM_MEGA_COMBINE_WIRE, in aiter's spelling). It is a capability, not
@@ -272,7 +271,12 @@ def init_mega_transport(
     every forward then names the one it wants -- bf16 unless it says otherwise.
     See combine_quant_for_step.
     """
-    dispatch_kwargs = mega_dispatch_kwargs(_MEGA_DISPATCH_WIRE, _MEGA_DISPATCH_BACKEND)
+    kernel = resolve_dispatch_kernel(
+        _MEGA_DISPATCH_WIRE,
+        envs.ATOM_MEGA_DISPATCH_KERNEL,
+        os.environ.get("MEGA_DISPATCH"),
+    )
+    dispatch_kwargs = mega_dispatch_kwargs(kernel)
     key = (
         ep_rank,
         ep_size,
@@ -288,16 +292,20 @@ def init_mega_transport(
         intermediate_pad,
         swiglu_limit,
         # Keyed on: the wire sets the payload width and whether the scale
-        # region exists, the dispatch kwargs pick the kernel and (stage1_fused)
-        # a per-route arena, and combine_quant sets which combine reduces are
+        # region exists, the dispatch kernel names what runs (and, compact, a
+        # per-route arena), and combine_quant sets which combine reduces are
         # built (the staging layout itself no longer depends on it).
         _MEGA_DISPATCH_WIRE,
-        tuple(sorted(dispatch_kwargs.items())),
+        kernel,
         combine_quant,
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
         return cached
+
+    warning = dispatch_kernel_warning(kernel, _MEGA_DISPATCH_WIRE)
+    if warning is not None:
+        logger.warning("[MORI-V2] ATOM_MEGA_DISPATCH_KERNEL: %s", warning)
 
     MegaMoEGfx1250 = _import_mega()
     per_rank_vmm = _cco_per_rank_vmm(
@@ -352,8 +360,8 @@ def init_mega_transport(
     logger.info(
         "[MORI-V2] Created MegaMoE: ep_rank=%d ep_size=%d hidden=%d inter=%d "
         "experts=%d topk=%d M=%d act=%s gate=%s quant=%s pad=(%d,%d) "
-        "swiglu_limit=%s dispatch=%s stage1_fused=%s wire=%s combine_quant=%s "
-        "force_a8w4=%s",
+        "swiglu_limit=%s kernel=%s dispatch=%s stage1_fused=%s wire=%s "
+        "combine_quant=%s force_a8w4=%s",
         ep_rank,
         ep_size,
         hidden_dim,
@@ -367,6 +375,7 @@ def init_mega_transport(
         hidden_pad,
         intermediate_pad,
         swiglu_limit,
+        kernel,
         mega._config.dispatch_backend,
         # Absent from an aiter without the compact plan, which then never runs it.
         getattr(mega._config, "stage1_fused", False),

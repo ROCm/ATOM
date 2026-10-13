@@ -1051,9 +1051,10 @@ def triton_mega_moe(
     # lands one row per route, grouped per expert, which would be misread.
     if getattr(mega._config, "stage1_fused", False):
         raise RuntimeError(
-            "triton_mega_moe needs a token-major dispatch, and flydsl on an "
-            "fp8/fp4 MEGA_DISPATCH_WIRE runs the compact plan; use MEGA_DISPATCH=mori "
-            "to run Triton experts on MegaMoE"
+            "triton_mega_moe needs a token-major dispatch, and flydsl_compact "
+            "lands one row per route grouped per expert; set "
+            "ATOM_MEGA_DISPATCH_KERNEL=mori (or flydsl_token_major) to run Triton "
+            "experts on MegaMoE"
         )
 
     recv_x, recv_w, recv_idx, total_recv, routing = mega._dispatch(
