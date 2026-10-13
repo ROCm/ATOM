@@ -7486,21 +7486,24 @@ def test_pack_reads_what_a_still_queued_producer_writes():
     """The race itself: the write that fills the units is queued behind a long
     kernel on the compute stream when the store thread gathers. Without the
     fence the private `pack_stream` reads the units' old bytes."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
 
     device = torch.device("cuda", torch.cuda.current_device())
     src = torch.zeros(1 << 20, dtype=torch.uint8, device=device)
     staged = StagedTransfer(device, staging_buffer_bytes=src.numel())
     dst = SimpleNamespace(tensor=torch.empty(src.numel(), dtype=torch.uint8))
-    torch.cuda.synchronize()
-    torch.cuda._sleep(1 << 28)
-    src.fill_(7)
-    fence = torch.cuda.Event()
-    fence.record(torch.cuda.current_stream())
-
-    from concurrent.futures import ThreadPoolExecutor
-
     with ThreadPoolExecutor(max_workers=1) as store_thread:
+        # The thread's streams and the packer's JIT build come up on its first
+        # pack; done inside the race below they would outlast the producer's
+        # queued work and hide it.
+        store_thread.submit(staged.pack, [src], dst).result(timeout=300)
+        torch.cuda.synchronize()
+        torch.cuda._sleep(1 << 28)
+        src.fill_(7)
+        fence = torch.cuda.Event()
+        fence.record(torch.cuda.current_stream())
         store_thread.submit(staged.pack, [src], dst, producer_event=fence).result(
             timeout=60
         )
