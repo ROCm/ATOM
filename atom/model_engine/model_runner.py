@@ -3678,6 +3678,24 @@ class ModelRunner:
         # same count.
         if draft_token is not None and get_pcp_world_size() > 1:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
+        # The draft distribution q: the block head wrote it at THIS step's
+        # batch slots, and the verify that tests it runs after other batches
+        # have reused those same slots -- ATOM never mixes prefill and decode,
+        # so a prefill-only step in between overwrites every decode request's
+        # q. This copies each request's rows out into the persistent block it
+        # owns, keyed by req_id, not by position. Positional, like `record_ell`
+        # below: the block was drafted from `next_token_ids`, which is in
+        # batch-slot order. A no-op on every drafter but a DSpark one with
+        # lossless sampling armed.
+        #
+        # ABOVE the align_only return, and that order is the point: an
+        # align-only propose runs purely for its DP collectives but still
+        # writes the q scratch at rows `[0, running_bs)`, so skipping the
+        # copy-out would strand its q where the next propose overwrites it --
+        # the same failure mode the prefill steps have. Every propose in the
+        # engine reaches this one call, so it is the only place that covers
+        # all of them.
+        self.drafter.record_draft_probs_slots(batch.req_ids[: batch.total_seqs_num])
         if align_only:
             return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
@@ -3687,16 +3705,6 @@ class ModelRunner:
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
-        # Same stash, same reason, for the draft distribution q: the block head
-        # wrote it at THIS step's batch slots, and the verify that tests it runs
-        # after other batches have reused those same slots -- ATOM never mixes
-        # prefill and decode, so a prefill-only step in between overwrites every
-        # decode request's q. This copies each request's rows out into the
-        # persistent block it owns, keyed by req_id, not by position.
-        # Positional, like `record_ell` above: the block was drafted from
-        # `next_token_ids`, which is in batch-slot order. A no-op on every
-        # drafter but a DSpark one with lossless sampling armed.
-        self.drafter.record_draft_probs_slots(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
 
     def start_capture_profiler(self):
