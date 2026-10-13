@@ -446,6 +446,56 @@ def test_request_end_around_the_decode_keep_matches_native(
 
 
 @pytest.mark.parametrize("hash_block", [BLOCK, BLOCK // 2])
+def test_a_deferred_decode_keep_is_published_while_the_request_runs(
+    adapter, tmp_path, hash_block
+):
+    """Async decode defers the keep at 512 (its closing token is in flight). It
+    is published as soon as that hash exists, while the request keeps running,
+    and a later keep (1024) does not replace it; a second request over the same
+    prefix hits the image while the first one is still generating.
+
+    vLLM caps both ``cache_blocks`` call sites at the finalized tokens, so the
+    image groups' cached-block count passes the keep's block only once its hash
+    exists: the deferred branch fires on the very next schedule."""
+    s = _scheduler(adapter, tmp_path, hash_block=hash_block)
+    st = s._atom_state_images
+    eng = _Engine(s)
+    req = _request(s, "long", [7], max_tokens=3000)
+    assert _until_pending(eng, "long") == 1
+
+    def run_to(computed):
+        for _ in range(4 * computed):
+            if req.num_computed_tokens >= computed:
+                return
+            if len(eng.q) >= 2:
+                eng.land()
+            eng.schedule()
+        raise AssertionError(f"did not reach {computed}")
+
+    run_to(512 + 2 * BLOCK)
+    assert "long" in s.requests and _boundary_cached(s, req, 1)
+    run_to(1024 + 2 * BLOCK)
+    assert "long" in s.requests
+    assert _boundary_cached(s, req, 1) and _boundary_cached(s, req, 3)
+    assert st.counters["decode_keeps"] >= 2
+    # A follow-up over the first request's prompt and part of its output.
+    seen = [7] + list(req.output_token_ids[:700])
+    _request(s, "next", seen, max_tokens=1)
+    for _ in range(50):
+        if len(eng.q) >= 2:
+            eng.land()
+        out = eng.schedule()
+        new = [r for r in out.scheduled_new_reqs if r.req_id == "next"]
+        if new:
+            break
+    assert new and new[0].num_computed_tokens == 512
+    assert "long" in s.requests
+    while eng.q:
+        eng.land()
+    eng.drain()
+
+
+@pytest.mark.parametrize("hash_block", [BLOCK, BLOCK // 2])
 def test_abort_with_a_deferred_decode_keep_frees_the_request(
     adapter, tmp_path, hash_block
 ):
