@@ -228,8 +228,21 @@ def test_an_fp8_weight_requantisation_did_not_write_is_not_credited(monkeypatch)
     runner = _Runner(_fp8_model())
     incoming = {"layer.weight": torch.ones(4, HIDDEN, dtype=torch.bfloat16)}
 
-    with pytest.raises(RuntimeError, match=r"skipped=\['layer\.weight'\]"):
+    with pytest.raises(RuntimeError, match=r"unwritten=\['layer\.weight'\]"):
         _reload(runner, [incoming])
+
+
+def test_a_full_reload_commits_past_a_name_the_model_has_no_parameter_for():
+    """A trainer sends layers a rollout may not build -- an MTP head, a vision
+    tower. Every resident parameter was rewritten, yet the commit refused,
+    where a direct, SHM or IPC reload of the same checkpoint succeeds."""
+    runner = _Runner(_dense_model())
+    ckpt = _dense_checkpoint() | {"mtp.head.weight": torch.ones(2, 2)}
+
+    manifest = _reload(runner, [ckpt])
+
+    assert manifest["skipped"] == ["mtp.head.weight"]
+    runner.assert_weight_update_ready()
 
 
 def test_a_requantised_fp8_weight_credits_its_scale_too(monkeypatch):

@@ -1235,6 +1235,7 @@ class WeightUpdaterMixin:
         self._reset_reload_coverage()
         self._weight_update_sources: set[str] = set()
         self._weight_update_skipped: set[str] = set()
+        self._weight_update_unwritten: set[str] = set()
         self._weight_update_buckets = 0
         self._weight_update_bytes = 0
         stale = len(self._pending_expert_relayout)
@@ -1274,6 +1275,7 @@ class WeightUpdaterMixin:
             raise
 
         self._weight_update_skipped |= counts["skipped_names"]
+        self._weight_update_unwritten |= counts["unwritten_names"]
         self._weight_update_buckets += 1
         self._weight_update_bytes += int(payload_bytes)
         return {
@@ -1329,12 +1331,23 @@ class WeightUpdaterMixin:
             missing = sorted(
                 name for name, param in params.items() if id(param) not in covered
             )
-            if missing or self._weight_update_skipped:
+            # Only a name that resolved here and was not written leaves a
+            # parameter stale. One this model has no parameter for -- an MTP
+            # head, a vision tower the rollout does not build -- leaves nothing
+            # behind, and coverage catches whatever was not sent.
+            if missing or self._weight_update_unwritten:
                 raise RuntimeError(
                     "incomplete weight reload: wrote "
                     f"{len(params) - len(missing)}/{len(params)} "
                     f"parameters; missing={missing[:20]} "
-                    f"skipped={sorted(self._weight_update_skipped)[:20]}"
+                    f"unwritten={sorted(self._weight_update_unwritten)[:20]}"
+                )
+            if self._weight_update_skipped:
+                logger.warning(
+                    f"{self.label}: v{version} ignored "
+                    f"{len(self._weight_update_skipped)} weight(s) this model "
+                    f"has no parameter for: "
+                    f"{sorted(self._weight_update_skipped)[:20]}"
                 )
 
             self.clear_kv_cache()
