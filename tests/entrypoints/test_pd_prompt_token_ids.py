@@ -382,13 +382,9 @@ def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
     assert ("chunked_transfer" in info) is enabled
     if enabled:
         assert info["chunked_transfer"] == {
-            "chunked_transfer": True,
-            "do_remote_prefill": True,
-            "do_remote_decode": False,
             "remote_host": "127.0.0.1",
             "remote_handshake_port": 6401,
             "remote_pp_size": 3,
             "block_size": 64,
             "dcp_size": 2,
-            "hash_block_size": 128,
         }

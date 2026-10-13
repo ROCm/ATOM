@@ -80,11 +80,15 @@ class ChunkedPrefill:
         self.event: Any = None
         self.handoff: dict | None = None
         self.cancelled = False
-        self.readers = 0  # Claimed send tasks still active or queued.
         self.expected_readers = 0  # Total consumers served by this P rank.
         self.completed_readers = 0  # Exited send tasks, including failures.
         self.claims: set[tuple] = set()  # Retain identities to deduplicate sends.
         self.updated = time.monotonic()
+
+    @property
+    def readers(self):
+        """Claimed send tasks still active or queued (read under ``cv``)."""
+        return len(self.claims) - self.completed_readers
 
     def publish(self, end_tokens, event):
         """Publish a forward boundary and event; only the final block may be partial."""
@@ -157,13 +161,11 @@ class ChunkedPrefill:
                 raise ValueError("too many consumers for one prefill")
             self.expected_readers = expected_readers
             self.claims.add(consumer_identity)
-            self.readers += 1
             return True
 
     def release(self):
         """Release a reader when its send task exits, on success or failure."""
         with self.cv:
-            self.readers -= 1
             self.completed_readers += 1
             self.cv.notify_all()
 

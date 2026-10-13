@@ -2303,7 +2303,7 @@ class Scheduler:
             if num_cached_blocks < 0:
                 callback = getattr(self.kv_connector, "admission_blocked", None)
                 if callable(callback):
-                    callback()
+                    callback(seq)
                 self.waiting.appendleft(seq)
                 break
             if (
@@ -2874,12 +2874,15 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
-            # P/D failure is terminal only after every remote writer drained.
-            # Re-admission allocates afresh; never retain the failed suffix or
-            # a first token/draft whose KV did not arrive.
-            self.block_manager.deallocate(seq)
-            seq.num_cached_tokens = 0
-            if seq.kv_transfer_params:
+            if (seq.kv_transfer_params or {}).get("chunked_transfer"):
+                # All TP/PP writers have drained. Discard the failed receive
+                # allocation and remote generation state before local prefill.
+                logger.info(
+                    "Chunked P/D receive failed for %s; falling back to local prefill",
+                    seq.id,
+                )
+                self.block_manager.deallocate(seq)
+                seq.num_cached_tokens = 0
                 for key in ("first_token_id", "draft_token_ids", "chunked_transfer"):
                     seq.kv_transfer_params.pop(key, None)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:

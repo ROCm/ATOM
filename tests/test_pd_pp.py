@@ -270,6 +270,7 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
     sched._reqs_need_save = {}
+    sched._reclaim_unclaimed_prefills = {}
     return sched
 
 
@@ -1045,6 +1046,7 @@ def _make_connector(**overrides):
     conn._completion_lock = threading.Lock()
     conn._fence_lock = threading.Lock()
     conn._pending_recv_expected = {}
+    conn._pending_handoffs = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}

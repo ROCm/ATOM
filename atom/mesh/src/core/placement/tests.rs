@@ -1360,7 +1360,6 @@ mod f_atom_adapter {
         info.chunked_transfer.insert(
             "http://p:8000".into(),
             json!({
-                "chunked_transfer": true, "do_remote_prefill": true,
                 "remote_host": "10.0.0.1", "remote_handshake_port": 6301,
                 "remote_pp_size": 3,
             }),
@@ -1379,6 +1378,10 @@ mod f_atom_adapter {
         adapter.inject_decode_fields(&mut d, &ctx).unwrap();
         assert_eq!(p["kv_transfer_params"]["transfer_id"], "chunked-id");
         assert_eq!(d["kv_transfer_params"]["transfer_id"], "chunked-id");
+        assert_eq!(p["kv_transfer_params"]["chunked_transfer"], true);
+        assert_eq!(d["kv_transfer_params"]["chunked_transfer"], true);
+        assert_eq!(d["kv_transfer_params"]["do_remote_prefill"], true);
+        assert_eq!(d["kv_transfer_params"]["do_remote_decode"], false);
         assert_eq!(d["kv_transfer_params"]["remote_pp_size"], 3);
         assert_eq!(d["kv_transfer_params"]["remote_dp_rank"], 1);
         assert_eq!(d["kv_transfer_params"]["remote_tp_size"], 4);

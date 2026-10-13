@@ -70,6 +70,9 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._completed_prefills_lock = threading.Lock()
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
     c._chunked_prefills = {}
+    c._reclaim_results = set()
+    c._swa_block_regions = []
+    c._send_executor = SimpleNamespace(submit=lambda fn, *a, **kw: fn(*a, **kw))
     c._chunked_local_ids = {}
     c._retired_chunked_transfers = OrderedDict()
     c._kv_cache_ready_events = {}
@@ -114,6 +117,13 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     return c, c._chunked_prefills["xfer-a"], request, src, dst
 
 
+def dispatch(connector, request):
+    """Use the listener's real queue/claim path, with sends run inline."""
+    with connector._completed_prefills_lock:
+        connector._pending_chunked_requests.append((request, mc.time.monotonic()))
+    connector._dispatch_ready_chunked_requests()
+
+
 def publish(state, end):
     event = Event()
     event.ready.set()
@@ -126,9 +136,9 @@ def test_transfers_only_ready_pages_once_and_waits_for_handoff(pp_size):
     for rank in range(pp_size):
         c, state, req, src, dest = producer(rank, pp_size)
         with ThreadPoolExecutor(1) as pool:
-            future = pool.submit(c._execute_transfer, req)
             event = Event()
             state.publish(6, event)  # token 4..5 live in an incomplete page
+            future = pool.submit(dispatch, c, req)
             assert event.waiting.wait(5)
             assert c.transfer_engine.writes.empty()
             event.ready.set()
@@ -166,7 +176,7 @@ def test_decode_prefix_is_skipped_even_before_source_blocks_are_available():
     req.update(num_computed_blocks=1, dst_block_ids=[9, 4])
     publish(state, 10)
     state.finish({"first_token_id": 42})
-    c._execute_transfer(req)
+    dispatch(c, req)
     sources, _, sizes = c.transfer_engine.writes.get_nowait()
     assert sources == [ctypes.addressof(src) + 4, ctypes.addressof(src) + 32]
     assert sizes == [4, 4]
@@ -197,7 +207,7 @@ def test_abort_does_not_release_a_source_while_rdma_is_reading():
     c.transfer_engine.batch_transfer_sync_write = blocked_write
     publish(state, 4)
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(c._execute_transfer, req)
+        future = pool.submit(dispatch, c, req)
         assert entered.wait(5)
         state.cancel()
         assert c.get_finished().is_empty()
@@ -216,11 +226,11 @@ def test_fanout_and_duplicate_write_request_keep_independent_cursors():
     req["consumer_tp_size"] = 2
     publish(state, 10)
     state.finish({"first_token_id": 42})
-    c._execute_transfer(req)
-    c._execute_transfer(req.copy())
+    dispatch(c, req)
+    dispatch(c, req.copy())
     assert c.transfer_engine.writes.qsize() == 1
     assert c.get_finished().is_empty()
-    c._execute_transfer(dict(req, request_id=22, notify_port=3))
+    dispatch(c, dict(req, request_id=22, notify_port=3))
     assert c.transfer_engine.writes.qsize() == 2
     assert c.get_finished().connector_completions
 
@@ -231,7 +241,7 @@ def test_bad_prompt_or_block_geometry_fails_before_writing():
         req.update(override)
         publish(state, 10)
         state.finish({"first_token_id": 42})
-        c._execute_transfer(req)
+        dispatch(c, req)
         assert c.transfer_engine.writes.empty()
         c._notify_transfer_result.assert_called_once_with(req, success=False)
 
@@ -246,6 +256,7 @@ def consumer(expected=2):
     c._pending_recv = {21}
     c._pending_recv_blocks = {21: [2, 9, 4]}
     c._pending_recv_slots = {}
+    c._swa_block_regions = []
     c._pending_handoffs = {21: {"failed": False, "metadata": None}}
     c._dispatch_in_flight = set()
     c._deferred_failures = {}
@@ -488,8 +499,8 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
         consumer_slot_bps=[4],
     )
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(c._execute_transfer, req)
         publish(state, 4)
+        future = pool.submit(dispatch, c, req)
         c.transfer_engine.writes.get(timeout=5)
         assert not any(slot_dst)
         publish(state, 10)
@@ -577,8 +588,8 @@ def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
     state.slot_index = 0
     state.swa_block_ids = [0]
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(p._execute_transfer, request)
         publish(state, 4)
+        future = pool.submit(dispatch, p, request)
         p.transfer_engine.writes.get(timeout=5)
         assert not any(swa_dst)
         publish(state, 10)
@@ -634,7 +645,10 @@ def test_idle_engine_dispatches_terminal_metadata_to_all_stages(pp_size):
     core.kv_transfer_enabled = True
     core.scheduler = SimpleNamespace(
         kv_connector=SimpleNamespace(
-            is_producer=True, is_offload=False, build_connector_meta=lambda: meta
+            is_producer=True,
+            is_offload=False,
+            enable_chunked_transfer=True,
+            build_connector_meta=lambda: meta,
         )
     )
     core.runner_mgr = MagicMock()
@@ -738,8 +752,8 @@ def test_dcp_chunked_descriptors_relayout_each_destination_page_once():
         dst_block_ids=[2, 9],
     )
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(c._execute_transfer, req)
         publish(state, 8)
+        future = pool.submit(dispatch, c, req)
         c.transfer_engine.writes.get(timeout=5)
         assert bytes(dst[0][8:12]) == bytes([src[21], src[23], src[5], src[7]])
         assert not any(dst[0][36:40])
@@ -790,11 +804,11 @@ def test_duplicate_cancelled_request_waits_for_original_rdma():
     p._notify_transfer_result.side_effect = notify
     publish(state, 4)
     with ThreadPoolExecutor(1) as pool:
-        original = pool.submit(p._execute_transfer, request)
+        original = pool.submit(dispatch, p, request)
         try:
             assert entered.wait(5)
             state.cancel()
-            p._execute_transfer(request.copy())
+            dispatch(p, request.copy())
             # A duplicate must not report failure while the original still
             # writes into D's reservation, even after P has been cancelled.
             assert not d.failed_recving
@@ -816,7 +830,7 @@ def test_chunk_source_retirement_releases_legacy_ready_event(aborted):
         state.cancel()
     else:
         state.finish({"first_token_id": 42})
-        p._execute_transfer(request)
+        dispatch(p, request)
     assert p.get_finished().connector_completions
     assert set(p._kv_cache_ready_events) == {"legacy"}
 
@@ -947,7 +961,7 @@ def test_scheduler_abort_keeps_source_until_readers_and_tp_pp_drain(
     deallocate = MagicMock(wraps=sched.block_manager.deallocate)
     monkeypatch.setattr(sched.block_manager, "deallocate", deallocate)
     with ThreadPoolExecutor(1) as pool:
-        transfer = pool.submit(worker._execute_transfer, request)
+        transfer = pool.submit(dispatch, worker, request)
         try:
             assert entered.wait(5)
             if waiting_cleanup:
@@ -1116,6 +1130,11 @@ def test_opposite_admission_order_with_exhausted_kv_pools(monkeypatch, seq_facto
     worker.start_load_kv(p.kv_connector.build_connector_meta())
     # P cannot allocate B. Even a snapshot containing ONLY the capacity signal
     # must count as work, or the idle engine will never dispatch it.
+    now = [mc.time.monotonic()]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    pressure, seqs = p.schedule()
+    assert not seqs and not pressure.connector_meta_output.has_work()
+    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS
     pressure, seqs = p.schedule()
     assert not seqs and pressure.connector_meta_output.has_work()
     assert pressure.connector_meta_output.reclaim_unclaimed_prefills
@@ -1124,7 +1143,7 @@ def test_opposite_admission_order_with_exhausted_kv_pools(monkeypatch, seq_facto
     p._update_from_kv_xfer_finished(worker.get_finished())
     assert not pa.block_table and p.block_manager.kv.num_free == 3
 
-    # P can now finish B and satisfy D's existing reservation, without a timer.
+    # P can now finish B, well before the 60-second transfer timeout.
     pbatch, pseqs = p.schedule()
     assert list(pseqs) == [pb.id]
     worker.start_load_kv(pbatch.connector_meta_output)
@@ -1193,10 +1212,12 @@ def test_capacity_reclaim_preserves_active_and_partially_served_sources(reader_d
     if reader_done:
         state.release()
     pressure = ConnectorMetadata()
-    pressure.reclaim_unclaimed_prefills = True
+    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
     worker.start_load_kv(pressure)
     assert not state.cancelled and not state.source_safe()
-    assert worker.get_finished().is_empty()
+    assert worker.get_finished().connector_completions == {
+        ConnectorCompletion("pd_reclaim_done", 7, False)
+    }
 
 
 def test_late_metadata_cannot_resurrect_retired_source():
@@ -1216,7 +1237,7 @@ def test_late_metadata_cannot_resurrect_retired_source():
     )
     worker.start_load_kv(meta)
     assert not worker._chunked_prefills and worker.get_finished().is_empty()
-    worker._execute_transfer(wire)
+    dispatch(worker, wire)
     worker._notify_transfer_result.assert_called_once_with(wire, success=False)
     assert worker.transfer_engine.writes.empty()
 
@@ -1240,7 +1261,14 @@ def test_capacity_signal_survives_composite_metadata(monkeypatch, seq_factory):
     connector.build_connector_meta()
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [connector]
-    multi.admission_blocked()
+    seq.output_tokens = [42]
+    connector.request_finished(seq)
+    connector.build_connector_meta()
+    now = [mc.time.monotonic()]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    multi.admission_blocked(seq)
+    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS
+    multi.admission_blocked(seq)
     meta = multi.build_connector_meta()
     assert meta.has_work() and meta.metas[0].reclaim_unclaimed_prefills
     assert not multi.build_connector_meta().has_work()
@@ -1250,7 +1278,7 @@ def test_capacity_reclaim_waits_for_final_prefill():
     worker, state, _, _, _ = producer()
     publish(state, 4)
     pressure = ConnectorMetadata()
-    pressure.reclaim_unclaimed_prefills = True
+    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
     worker.start_load_kv(pressure)
     assert not state.cancelled and not state.source_safe()
 
@@ -1276,3 +1304,192 @@ def test_terminal_transfer_history_is_bounded_without_retaining_sources(monkeypa
         worker.get_finished()
     assert list(worker._retired_chunked_transfers) == ["xfer-b", "xfer-c"]
     assert not worker._chunked_prefills and not worker._chunked_local_ids
+
+
+@pytest.mark.parametrize("pp_size", [1, 3])
+@pytest.mark.parametrize(
+    "is_offload,enabled,is_producer,dispatches",
+    [
+        (False, False, True, False),
+        (False, False, False, False),
+        (False, True, False, False),
+        (False, True, True, True),
+        (True, False, False, True),
+    ],
+)
+def test_idle_dispatch_remains_opt_in(
+    pp_size, is_offload, enabled, is_producer, dispatches
+):
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import EngineCore
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    cls = EngineCore if pp_size == 1 else PPEngineCoreProc
+    core = cls.__new__(cls)
+    core.kv_transfer_enabled = True
+    meta = ConnectorMetadata()
+    meta.reqs_to_send[7] = 1.0
+    connector = SimpleNamespace(
+        is_producer=is_producer,
+        is_offload=is_offload,
+        enable_chunked_transfer=enabled,
+        build_connector_meta=MagicMock(return_value=meta),
+    )
+    core.scheduler = SimpleNamespace(kv_connector=connector)
+    core.runner_mgr = MagicMock()
+    core.pp_transport = MagicMock()
+    core._dispatch_idle_offload_work()
+    assert connector.build_connector_meta.call_count == int(dispatches)
+    assert core.runner_mgr.call_func.call_count == int(dispatches)
+    assert core.pp_transport.send_metadata.call_count == int(dispatches and pp_size > 1)
+
+
+def test_reclaim_is_gated_ordered_and_waits_for_tp_pp_ack(monkeypatch, seq_factory):
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    connector = scheduler_connector(monkeypatch, True)
+    sources = []
+    for transfer_id in ("oldest", "next", "newest"):
+        seq = seq_factory(
+            list(range(10)),
+            kv_transfer_params={
+                "chunked_transfer": True,
+                "transfer_id": transfer_id,
+                "do_remote_decode": True,
+            },
+        )
+        seq.block_table = [1, 2, 3]
+        connector.update_state_after_alloc(seq)
+        seq.output_tokens = [42]
+        connector.request_finished(seq)
+        sources.append(seq)
+    connector.build_connector_meta()
+    head = seq_factory(list(range(10)))
+    connector.admission_blocked(head)
+    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS / 2
+    connector.admission_blocked(head)
+    assert not connector.build_connector_meta().has_work()
+    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS / 2
+    connector.admission_blocked(head)
+    meta = connector.build_connector_meta()
+    assert meta.reclaim_unclaimed_prefills == {sources[0].id: "oldest"}
+    assert meta.has_work()
+    now[0] += 5
+    connector.admission_blocked(head)
+    assert not connector.build_connector_meta().has_work()
+
+    # A reader raced the oldest candidate. Only the complete TP/PP rejection
+    # permits trying the next source; partial reports cannot authorize it.
+    tp = [KVOutputAggregator(2), KVOutputAggregator(2)]
+    pp = PPKVAggregator(2)
+    done = KVConnectorOutput(
+        connector_completions={
+            ConnectorCompletion("pd_reclaim_done", sources[0].id, False)
+        }
+    )
+    for rank in range(2):
+        assert tp[rank].aggregate([done, KVConnectorOutput()]).is_empty()
+        out = pp.ingest(rank, tp[rank].aggregate([KVConnectorOutput(), done]))
+        connector.process_pd_completions(out)
+        connector.admission_blocked(head)
+        assert not connector.build_connector_meta().has_work()
+    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS
+    connector.admission_blocked(head)
+    assert connector.build_connector_meta().reclaim_unclaimed_prefills == {
+        sources[1].id: "next"
+    }
+
+    # A successful cancellation acknowledgement alone does not release HBM.
+    connector.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_reclaim_done", sources[1].id, True)
+            }
+        )
+    )
+    now[0] += 5
+    connector.admission_blocked(head)
+    assert not connector.build_connector_meta().has_work()
+    terminal = connector.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_source_safe", sources[1].id, True)
+            }
+        )
+    )
+    assert terminal.finished_sending == {sources[1].id}
+    connector.send_finished(sources[1].id)
+    connector.admission_blocked(head)
+    assert not connector.build_connector_meta().has_work()
+    # Allocation succeeds after release: it resets pressure, so ordinary
+    # progress cannot immediately sacrifice the last completed prefill.
+    connector.update_state_after_alloc(head)
+    now[0] += 5
+    connector.admission_blocked(head)
+    assert not connector.build_connector_meta().has_work()
+
+
+def test_reclaim_targets_same_source_on_pp_ranks_with_different_claims():
+    workers = [producer(rank, 2)[0] for rank in range(2)]
+    states = [worker._chunked_prefills["xfer-a"] for worker in workers]
+    for state in states:
+        publish(state, 10)
+        state.finish({"first_token_id": 42})
+    states[0].acquire(("reader",), 1)
+    pressure = ConnectorMetadata()
+    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
+    pp = PPKVAggregator(2)
+    for rank, worker in enumerate(workers):
+        worker.start_load_kv(pressure)
+        result = pp.ingest(rank, worker.get_finished())
+    assert states[1].cancelled and not states[0].cancelled
+    assert result.connector_completions == {
+        ConnectorCompletion("pd_reclaim_done", 7, False)
+    }
+    states[0].release()
+    result = pp.ingest(0, workers[0].get_finished())
+    assert result.connector_completions == {
+        ConnectorCompletion("pd_source_safe", 7, True)
+    }
+
+
+def test_reclaim_does_not_cancel_other_finished_sources():
+    worker, state, _, _, _ = producer()
+    other = ChunkedPrefill(8, [1], 4, 4)
+    publish(state, 10)
+    state.finish({"first_token_id": 42})
+    publish(other, 4)
+    other.finish({"first_token_id": 43})
+    worker._chunked_prefills["xfer-b"] = other
+    pressure = ConnectorMetadata()
+    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
+    worker.start_load_kv(pressure)
+    assert state.cancelled and not other.cancelled
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_failed_receive_cleanup_is_limited_to_chunked_requests(chunked, seq_factory):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    sched = Scheduler(MockConfig(num_kvcache_blocks=8))
+    seq = seq_factory(
+        list(range(8)),
+        kv_transfer_params={
+            "chunked_transfer": chunked,
+            "first_token_id": 42,
+            "draft_token_ids": [43],
+        },
+    )
+    assert sched.block_manager.allocate(seq)
+    blocks = list(seq.block_table)
+    sched.failed_recving_kv_req_ids.append(seq.id)
+    assert sched._consume_failed_remote_kv(seq)
+    if chunked:
+        assert not seq.block_table
+        assert not seq.kv_transfer_params
+    else:
+        assert list(seq.block_table) == blocks
+        assert seq.kv_transfer_params["first_token_id"] == 42
+        assert seq.kv_transfer_params["draft_token_ids"] == [43]

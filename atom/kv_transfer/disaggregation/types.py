@@ -524,8 +524,9 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
-        # Capacity escape for chunked P/D: only completed sends with no reader.
-        self.reclaim_unclaimed_prefills = False
+        # One scheduler-selected source per capacity escape. All TP/PP ranks
+        # attempt the same request; workers still reject sources with any claim.
+        self.reclaim_unclaimed_prefills: dict[ReqId, TransferId] = {}
 
     def has_work(self) -> bool:
         """Whether the worker has anything to do with this snapshot."""
