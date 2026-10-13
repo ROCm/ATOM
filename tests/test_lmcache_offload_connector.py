@@ -6259,7 +6259,7 @@ def test_state_budget_evicts_cold_state_without_removing_kv(lmcache_key, monkeyp
     codec._staged = SimpleNamespace(unpack=lambda obj, views: None)
     storage.objects["KV"] = object()
 
-    def put(h, units, callback):
+    def put(h, units, callback, producer_event=None):
         storage.objects[codec.key(h)] = SimpleNamespace(
             get_size=lambda: 1024, ref_count_down=lambda: None
         )
@@ -7184,7 +7184,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             self.gate = threading.Event()
             self.loaded = threading.Event()
 
-        def put(self, h, unit_ids, on_source_released=None):
+        def put(self, h, unit_ids, on_source_released=None, producer_event=None):
             self.gate.wait(timeout=5)
             if on_source_released is not None:
                 on_source_released()
@@ -7261,7 +7261,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             self.released = threading.Event()
             self.gate = threading.Event()
 
-        def put(self, h, unit_ids, on_source_released=None):
+        def put(self, h, unit_ids, on_source_released=None, producer_event=None):
             if on_source_released is not None:
                 on_source_released()  # D2H is done here, CPU put is not
             self.released.set()
@@ -7298,7 +7298,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         image out of the KV pool until the stale reclaimer noticed."""
 
         class _RefuseCodec:
-            def put(self, h, unit_ids, on_source_released=None):
+            def put(self, h, unit_ids, on_source_released=None, producer_event=None):
                 return False  # allocation refused; callback never reached
 
             def get(self, h, slot):
@@ -7320,7 +7320,7 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
         releases them and the store is reported failed, not lost."""
 
         class _ThrowCodec:
-            def put(self, h, unit_ids, on_source_released=None):
+            def put(self, h, unit_ids, on_source_released=None, producer_event=None):
                 raise RuntimeError("pack blew up")
 
             def get(self, h, slot):
@@ -7335,3 +7335,275 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+# ── kimi_k3: state stores are fenced, and every PP stage hosts a tier ─────
+#
+# The engine marks a checkpoint READY once the batch whose `build()` copies the
+# Active Slot into its PAGE units has been issued, not run. On a PP stage that
+# copy can sit a pipeline depth behind in the compute stream when the store is
+# dispatched, so the gather has to wait for it.
+
+
+class _RecordingEvent:
+    def __init__(self, log=None):
+        self.log = log if log is not None else []
+        self.recorded_on = None
+
+    def record(self, stream=None):
+        self.recorded_on = stream
+        self.log.append("record")
+
+    def synchronize(self):
+        self.log.append("synchronize")
+
+
+class _StoreRecordingTier:
+    def __init__(self):
+        self.stores = []
+
+    def submit_store(self, op, unit_ids, producer_event=None):
+        self.stores.append((op, unit_ids, producer_event))
+
+
+def _k3_store_worker(tier) -> KimiK3OffloadConnector:
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = tier
+    c._store_failed_no_tier = set()
+    return c
+
+
+def test_a_steps_state_stores_share_one_fence_on_the_compute_stream(monkeypatch):
+    events = []
+
+    class _Event(_RecordingEvent):
+        def __init__(self):
+            super().__init__()
+            events.append(self)
+
+    compute = object()
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute)
+    tier = _StoreRecordingTier()
+    worker = _k3_store_worker(tier)
+    a, b = StateStoreOperationId(11, 1), StateStoreOperationId(12, 1)
+
+    worker._start_state_stores(SimpleNamespace(state_stores=[(a, [1, 2]), (b, [3])]))
+
+    assert len(events) == 1
+    assert events[0].recorded_on is compute
+    assert tier.stores == [(a, (1, 2), events[0]), (b, (3,), events[0])]
+    assert worker._store_failed_no_tier == set()
+
+
+def test_a_fence_that_cannot_be_recorded_fails_the_steps_stores(monkeypatch):
+    """Unfenced, the gather could store the units' previous image under a
+    valid hash. Nothing has read them yet, so failing releases them safely."""
+
+    class _BrokenEvent:
+        def record(self, stream=None):
+            raise RuntimeError("hipEventRecord failed")
+
+    monkeypatch.setattr(torch.cuda, "Event", _BrokenEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+    tier = _StoreRecordingTier()
+    worker = _k3_store_worker(tier)
+    a, b = StateStoreOperationId(11, 1), StateStoreOperationId(12, 1)
+
+    worker._start_state_stores(SimpleNamespace(state_stores=[(a, [1]), (b, [2])]))
+
+    assert tier.stores == []
+    assert worker._store_failed_no_tier == {a, b}
+
+
+def test_the_tier_hands_the_fence_to_the_codec():
+    from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import StateOffloadTier
+
+    seen = []
+
+    class _Codec:
+        def put(self, h, unit_ids, on_source_released=None, producer_event=None):
+            seen.append((h, unit_ids, producer_event))
+            on_source_released()
+            return True
+
+    tier = StateOffloadTier(_Codec())
+    fence = object()
+    op = StateStoreOperationId(5, 1)
+    try:
+        tier.submit_store(op, (4, 5), producer_event=fence)
+        tier.drain()
+    finally:
+        tier.shutdown()
+    assert seen == [(5, (4, 5), fence)]
+    assert tier.take_store_reports() == ({op}, set())
+
+
+def test_the_codec_hands_the_fence_to_pack(lmcache_key):
+    storage = _FakeStorage()
+    codec = _codec("L", storage)
+    obj = SimpleNamespace(ref_count_down=lambda: None)
+    codec._allocate = lambda nbytes: obj
+    views = [object()]
+    codec._backend = SimpleNamespace(page_unit_views=lambda units: views)
+    packed = []
+    codec._staged = SimpleNamespace(
+        pack=lambda segs, dst, producer_event=None: packed.append(
+            (segs, dst, producer_event)
+        )
+    )
+    fence = object()
+
+    assert codec.put(7, (1,), producer_event=fence)
+    assert packed == [(views, obj, fence)]
+    assert storage.objects[codec.key(7)] is obj
+
+
+def test_pack_waits_for_the_producer_before_it_gathers(monkeypatch):
+    from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
+
+    log = []
+
+    def gather(segments, seg_bytes, counts, ids, out):
+        log.append("gather")
+        out.copy_(torch.cat([s.reshape(-1).view(torch.uint8) for s in segments]))
+
+    kernels = types.ModuleType("atom.kv_transfer.offload.dense.triton_kv_staging")
+    kernels.fused_pack_chunk_major = gather
+    monkeypatch.setitem(sys.modules, kernels.__name__, kernels)
+    staged = StagedTransfer(torch.device("cpu"), staging_buffer_bytes=64)
+    src = torch.arange(16, dtype=torch.uint8)
+    dst = SimpleNamespace(tensor=torch.zeros(16, dtype=torch.uint8))
+
+    staged.pack([src], dst, producer_event=_RecordingEvent(log))
+
+    assert log == ["synchronize", "gather"]
+    assert torch.equal(dst.tensor, src)
+
+
+@pytest.mark.skipif(
+    not (hasattr(torch, "cuda") and torch.cuda.is_available()), reason="needs a GPU"
+)
+def test_pack_reads_what_a_still_queued_producer_writes():
+    """The race itself: the write that fills the units is queued behind a long
+    kernel on the compute stream when the store thread gathers. Without the
+    fence the private `pack_stream` reads the units' old bytes."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    src = torch.zeros(1 << 20, dtype=torch.uint8, device=device)
+    staged = StagedTransfer(device, staging_buffer_bytes=src.numel())
+    dst = SimpleNamespace(tensor=torch.empty(src.numel(), dtype=torch.uint8))
+    with ThreadPoolExecutor(max_workers=1) as store_thread:
+        # The thread's streams and the packer's JIT build come up on its first
+        # pack; done inside the race below they would outlast the producer's
+        # queued work and hide it.
+        store_thread.submit(staged.pack, [src], dst).result(timeout=300)
+        torch.cuda.synchronize()
+        torch.cuda._sleep(1 << 28)
+        src.fill_(7)
+        fence = torch.cuda.Event()
+        fence.record(torch.cuda.current_stream())
+        store_thread.submit(staged.pack, [src], dst, producer_event=fence).result(
+            timeout=60
+        )
+    assert bool((dst.tensor == 7).all())
+
+
+def _stub_tp_group(monkeypatch, rank: int, world: int) -> None:
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(
+        rank_in_group=rank, world_size=world
+    )
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    dist.parallel_state = parallel_state
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    aiter.dist = dist
+    for module in (aiter, dist, parallel_state):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+
+def _k3_pp_stage(pp_rank: int, pp_size: int) -> KimiK3OffloadConnector:
+    c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    c._state_tier = None
+    c._config = SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        parallel_config=SimpleNamespace(pipeline_parallel_rank=pp_rank),
+        kv_transfer_config={},
+    )
+    c._engine = SimpleNamespace(
+        gpu_connector=SimpleNamespace(
+            device=torch.device("cpu"), release_gpu_staging_after_transfer=False
+        ),
+        storage_manager=_FakeStorage(),
+    )
+    return c
+
+
+def _k3_pp_transfer(image_bytes: int = 64):
+    spec = SimpleNamespace(layout_id="pp2-joint:abc", image_bytes=image_bytes)
+    backend = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            state_runtime=SimpleNamespace(checkpoint_spec=spec)
+        ),
+        state_entry_views=lambda slot: [torch.zeros(image_bytes, dtype=torch.uint8)],
+        page_unit_views=lambda units: [],
+    )
+    return SimpleNamespace(state_backend=backend)
+
+
+def test_each_pp_stage_builds_a_tier_keyed_apart_from_the_others(
+    monkeypatch, lmcache_key
+):
+    """Stages at one TP rank hold different layers' state under the same
+    prefix hash; the PP-aware worker id is what keeps their entries apart."""
+    monkeypatch.setattr(offcfg, "build_lmcache_config", lambda kvc: SimpleNamespace())
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_metadata",
+        lambda config, cfg, world, rank: SimpleNamespace(model_name="k3"),
+    )
+    _stub_tp_group(monkeypatch, rank=1, world=2)
+    tiers = []
+    try:
+        for pp_rank in range(2):
+            stage = _k3_pp_stage(pp_rank, pp_size=2)
+            stage._build_state_tier(_k3_pp_transfer())
+            assert stage._state_tier is not None, f"stage {pp_rank} built no tier"
+            tiers.append(stage._state_tier)
+        keys = [tier.codec.key(42) for tier in tiers]
+        assert [key.worker_id for key in keys] == [1, 3]
+        assert {key.world_size for key in keys} == {4}
+        assert keys[0] != keys[1]
+    finally:
+        for tier in tiers:
+            tier.shutdown()
+
+
+def test_pp_idle_dispatch_publishes_state_work_to_every_stage():
+    """A request parked only on its state load has nothing else to schedule
+    it; the PP head must publish on idle like the base engine does, and must
+    not on the shutdown drain."""
+    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    meta = LMCacheOffloadMetadata()
+    meta.state_stores = [(StateStoreOperationId(1, 0), (3,))]
+    engine = _idle_engine(meta)
+    published = []
+    engine.scheduler._publish_state_loads = lambda: published.append("loads")
+    engine.scheduler._publish_state_stores = lambda: published.append("stores")
+    engine._dispatch_connector_only_batch = (
+        lambda batch: PPEngineCoreProc._dispatch_connector_only_batch(engine, batch)
+    )
+
+    PPEngineCoreProc._dispatch_idle_offload_work(engine)
+    assert published == ["loads", "stores"]
+    assert [b.connector_meta_output for b in engine.pp_transport.sent] == [meta]
+
+    published.clear()
+    PPEngineCoreProc._dispatch_idle_offload_work(engine, dispatch_new=False)
+    assert published == []

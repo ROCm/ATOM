@@ -1007,10 +1007,10 @@ def test_a_dense_layout_hosts_no_state_tier_however_it_is_configured(monkeypatch
         assert layout in bm.state_tier_capability.reason
 
 
-def test_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
-    """The worker refuses PP outright -- `CacheEngineKey` has no PP component,
-    so two stages at one TP rank would overwrite each other. The engine used to
-    build an index anyway and emit stores with nowhere to go."""
+def test_pipeline_parallelism_hosts_the_state_tier(monkeypatch):
+    """Every PP stage builds its own tier, keyed by its PP-aware worker id, and
+    `PPKVAggregator` takes each operation's verdict across the stages. Refusing
+    PP here left K3 under PP with no CPU state and so no joint LMCache hit."""
     cfg = MockConfig(
         enable_prefix_caching=True,
         kv_transfer_config=_OFFLOAD_KVC,
@@ -1019,8 +1019,9 @@ def test_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
     )
     cfg.pipeline_parallel_size = 2
     bm = BlockManager(cfg)
-    assert bm.state_offload is None
-    assert "pipeline_parallel_size=2" in bm.state_tier_capability.reason
+    assert bm.state_offload is not None
+    assert bm.state_offload.can_store and bm.state_offload.can_load
+    assert bm.state_tier_capability.reason == ""
 
 
 def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):
