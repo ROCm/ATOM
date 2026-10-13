@@ -460,6 +460,55 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_microbatch_failing_on_the_comm_stream_still_fences_buffer_reuse(
+    monkeypatch,
+):
+    """A microbatch that raises inside a comm section never runs its
+    `switch_to_compute_sync`. The wrapper still orders the comm stream before
+    later compute-stream work, which is where the next forward republishes
+    the microbatch buffers."""
+    from atom.utils.tbo.ubatching import tbo_yield_and_switch_from_compute_to_comm
+
+    builder, parent = make_parent("cuda", lengths=(9, 5))
+
+    class Model(torch.nn.Module):
+        def forward(self, ids, positions, inputs_embeds=None):
+            tbo_yield_and_switch_from_compute_to_comm()
+            raise RuntimeError("collective failed")
+
+    wrapper = UBatchWrapper(Model(), builder)
+    ids = torch.arange(14, device="cuda", dtype=torch.int32)
+    ctx = ForwardContext(
+        attn_metadata=parent,
+        no_compile_layers={},
+        kv_cache_data={},
+        context=Context(
+            positions=parent.step.positions,
+            is_prefill=True,
+            scheduled_bs=2,
+            running_bs=2,
+            scheduled_tokens=14,
+            running_tokens=14,
+        ),
+        ubatch_slices=_split_prefill_token_midpoint(2, [9, 5], 2, None),
+    )
+    monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
+    waits = []
+    real_wait = torch.cuda.Stream.wait_stream
+    monkeypatch.setattr(
+        torch.cuda.Stream,
+        "wait_stream",
+        lambda self, other: (waits.append((self, other)), real_wait(self, other))[-1],
+    )
+    main = torch.cuda.current_stream()
+    with pytest.raises(RuntimeError, match="collective failed"):
+        wrapper(ids, parent.step.positions)
+    assert (main, wrapper.comm_stream) in waits
+    assert _forward_context_local.ctx is ctx
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 @pytest.mark.parametrize("cut", [1, 7, 10, 11, 13])
 def test_split_attention_reads_preceding_microbatch_window(cut, monkeypatch):
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src

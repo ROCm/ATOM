@@ -170,8 +170,12 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.add_step_planner(score_planner)
         # Prefill TBO microbatches publish their steps into `ub{i}_` copies of
         # the step buffers, owned by the runner like every other builder's
-        # (V4, MLA, MHA): one set per microbatch, reuse gated by the runner's
-        # forward_vars event and its H2D publication owner. These fixed
+        # (V4, MLA, MHA): one set per microbatch. Reuse is fenced twice. The
+        # pinned host sources wait for the H2D publication owner's completion
+        # event. The device copies, and the indptr fills below, are issued on
+        # the compute stream, after every reader: the workers' side streams
+        # rejoin it inside attention, and `UBatchWrapper._run_ubatches` orders
+        # the comm stream before it however the microbatches exit. These fixed
         # allocations precede the memory profile: get_num_blocks accounts
         # for them in peak/current PyTorch bytes, outside the KV pool. They
         # remain resident across KV release, like the parent forward buffers.

@@ -229,6 +229,11 @@ class UBatchWrapper(nn.Module):
                 for i in range(N):
                     self._worker_job_done[i].wait()
         finally:
+            # Order everything the workers left on the comm stream before any
+            # later work on the compute stream. A comm section normally rejoins
+            # (`switch_to_compute_sync`), but one that raised did not, and the
+            # next forward republishes the microbatch buffers on this stream.
+            compute_stream.wait_stream(self.comm_stream)
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
 
