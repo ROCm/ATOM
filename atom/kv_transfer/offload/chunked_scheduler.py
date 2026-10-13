@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import logging
 import time
 
@@ -186,6 +187,38 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """The prompt extent this layout can safely ask the tier to resume."""
         return list(seq.token_ids[: seq.num_prompt_tokens])
 
+
+    #: Which exit of `_get_num_new_matched_tokens` a lookup took, counted
+    #: per reason. A lookup that returns nothing has half a dozen ways to do
+    #: it and they are not interchangeable: "the tier had nothing" and "we
+    #: never asked" lead to opposite fixes, and the aggregate hit rate shows
+    #: the same 0.0% for both. Logged on a count schedule rather than an
+    #: interval so a short workload cannot print only its start-up state.
+    _LOOKUP_EXITS: dict = {}
+
+    def _lookup_exit(self, seq, reason: str, value: int) -> tuple[int, bool]:
+        self._LOOKUP_EXITS[reason] = self._LOOKUP_EXITS.get(reason, 0) + 1
+        total = sum(self._LOOKUP_EXITS.values())
+        # `ATOM_OFFLOAD_LOOKUP_PROBE=1` logs every lookup. The sparse
+        # schedule below covers the first few and then one in sixty-four,
+        # which is the shape that has now missed three measurement windows
+        # in a row: a workload of fifty lookups prints lines 1-8 and
+        # nothing else, and two runs that diverge at lookup forty look
+        # identical.
+        if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
+            pass
+        elif not (total <= 8 or total % 64 == 0):
+            return value, False
+        logger.info(
+            "ATOM offload lookup #%d: %s (prompt=%s) -> %s; totals %s",
+            total, reason, getattr(seq, "num_prompt_tokens", "?"), value,
+            ", ".join(f"{k}={v}" for k, v in sorted(self._LOOKUP_EXITS.items())),
+        )
+        # Always the declining shape. The hit path calls this to be counted
+        # and returns its own answer, so a return value here that sometimes
+        # meant "admitted" would be a second way to say it.
+        return value, False
+
     def _lookup_len(self, seq) -> int:
         """`len(self._lookup_token_ids(seq))` without copying the prompt."""
         return int(seq.num_prompt_tokens)
@@ -219,18 +252,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
 
         if not self._do_load or self._lookup_client is None:
-            return 0, False
+            return self._lookup_exit(seq, "no_client", 0)
         self._begin_load_lifecycle(seq)
         sid = str(seq.id)
         if self._repeat_load_suppressed(seq, sid):
-            return 0, False
+            return self._lookup_exit(seq, "repeat_suppressed", 0)
         if self._lookup_len(seq) <= 0:
-            return 0, False
+            return self._lookup_exit(seq, "empty_prompt", 0)
         pending = self._lookup_results.get(sid)
         if pending is not None and pending[0] is not seq:
             # An older lifecycle still owns this worker-side pin. Its cleanup
             # must be dispatched before the ID can acquire a new lease.
-            return 0, False
+            return self._lookup_exit(seq, "pin_owned_by_older", 0)
         if pending is not None:
             hit = pending[1]
         else:
@@ -238,8 +271,17 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not remembered:
                 hit = self._fresh_tier_lookup(seq, sid)
         if hit is None:
-            return 0, False
-        return self._answer_from_tier_hit(seq, sid, hit)
+            return self._lookup_exit(seq, "tier_none", 0)
+        if not hit:
+            # Distinct from `tier_none`: the tier answered and holds nothing
+            # for this prefix. Labelling both of them "hit" is how a run in
+            # which the tier was empty read as a run in which it was full --
+            # `_answer_from_tier_hit` returns at its own `if not hit` and
+            # every probe inside it stays silent.
+            return self._lookup_exit(seq, "tier_empty", 0)
+        answer = self._answer_from_tier_hit(seq, sid, hit)
+        self._lookup_exit(seq, "served" if answer[0] else "declined", answer[0])
+        return answer
 
     def prefetch_lookups(self, seqs) -> None:
         """Send lookups for waiting requests before they reach admission.
@@ -372,7 +414,17 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return 0, False
         num_prompt = seq.num_prompt_tokens
         frontier = int(seq.num_cached_tokens)
+        raw_hit = int(hit)
         hit = self._loadable_hit(hit, num_prompt)
+        if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
+            # Before and after the chunk floor. A floor to zero and a tier
+            # that holds nothing both end at `hit=0`, and only the raw value
+            # tells them apart.
+            logger.info(
+                "ATOM offload lookup raw: seq=%s prompt=%s raw_hit=%d "
+                "floored=%d",
+                seq.id, num_prompt, raw_hit, hit,
+            )
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will
             # actually be requested; before the save floor is recorded, so a
@@ -396,6 +448,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 return 0, False
         self._hit_save_floors[sid] = hit
         need = hit - frontier
+        if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
+            # `hit` and `frontier` separately, because `need <= 0` has two
+            # very different causes: the tier holding nothing past what HBM
+            # already has, and the tier holding nothing at all. The answer
+            # is 0 either way.
+            logger.info(
+                "ATOM offload lookup detail: seq=%s prompt=%s hit=%d "
+                "frontier=%d need=%d",
+                seq.id, seq.num_prompt_tokens, hit, frontier, need,
+            )
         if need <= 0:
             self._clear_pending_load(sid)
             self._hit_save_floors[sid] = self._chunk_floor(hit)
@@ -595,6 +657,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         self._retire_recurrent_rides(self._live_transfers())
 
+    #: Saves dropped because the per-request state leg had nothing to offer
+    #: at the boundary. Per request id, so one request failing repeatedly is
+    #: visibly different from many failing once.
+    _SAVE_DROPPED: dict = {}
+
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
         return True
@@ -622,7 +689,35 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             end = (int(aligned) // int(self.chunk_size)) * int(self.chunk_size)
             recurrent = self._recurrent_state_for(seq, end, operation=operation)
             if recurrent is None:
+                # The whole save is dropped, not just its state leg. Counted,
+                # because the tier then holds nothing for this prefix and the
+                # lookup that misses it later is indistinguishable from a
+                # tier that was never asked to hold it.
+                self._SAVE_DROPPED[str(seq.id)] = (
+                    self._SAVE_DROPPED.get(str(seq.id), 0) + 1
+                )
+                n = sum(self._SAVE_DROPPED.values())
+                if n <= 8 or n % 32 == 0 or os.environ.get(
+                    "ATOM_OFFLOAD_LOOKUP_PROBE"
+                ) in ("1", "true", "True"):
+                    logger.info(
+                        "ATOM offload save dropped #%d: seq=%s prompt=%s "
+                        "aligned=%d end=%d (no recurrent state)",
+                        n, seq.id, getattr(seq, "num_prompt_tokens", "?"),
+                        int(aligned), int(end),
+                    )
                 return None
+        if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
+            # What the save actually covers. A save that is built, not
+            # dropped, and completes can still leave the tier unable to
+            # answer: it is the token range that decides, and `aligned`
+            # is the only place it is visible.
+            logger.info(
+                "ATOM offload save built: seq=%s prompt=%s saved=%d "
+                "aligned=%d last_prefill=%s blocks=%d",
+                seq.id, getattr(seq, "num_prompt_tokens", "?"), int(saved),
+                int(aligned), bool(is_last_prefill), len(block_ids or ()),
+            )
         return LMCacheReqMeta(
             req_id=seq.id,
             token_ids=list(seq.token_ids[:aligned]),
@@ -840,6 +935,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             )
             is_last_prefill = computed >= int(seq.num_prompt_tokens)
             aligned = self._save_frontier(seq)
+            if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
+                # BEFORE the `continue`. The existing debug line is after it,
+                # so the requests that never save -- the ones in question --
+                # are exactly the ones it cannot describe.
+                logger.info(
+                    "ATOM offload save frontier: seq=%s prompt=%s computed=%s "
+                    "finished_cached=%s aligned=%d saved=%d emit=%s",
+                    seq.id, getattr(seq, "num_prompt_tokens", "?"),
+                    getattr(seq, "num_cached_tokens", "?"),
+                    getattr(seq, "_offload_finished_cached_tokens", "unset"),
+                    int(aligned), int(saved), aligned > saved,
+                )
             if aligned <= saved:
                 continue
             logger.debug(

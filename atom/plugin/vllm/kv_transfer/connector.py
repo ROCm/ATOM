@@ -312,14 +312,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # -- takes the non-V4.1 path rather than raising AttributeError from a
     # branch that has nothing to do with what is under test.
     _is_deepseek_v41 = False
-    _v41_cache = None
-    _v41_slots = None
-    _v41_planner = None
-    _v41_views = None
-    _v41_leg = None
-    # Immutable on the class so a borrowed instance reads an empty one rather
-    # than sharing a list; the V4.1 path always has `__init__`'s own.
-    _v41_refusals = ()
+    #: Block size of the group this connector's codec owns, 0 when unknown.
+    #: Distinct from the engine-wide `cache_config.block_size`, which is the
+    #: smallest across groups once a second group exists.
+    _attn_block_size = 0
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
         # kv_cache_config is required of out-of-tree v1 connectors: the factory
@@ -493,6 +489,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
                 self._scheduler = DenseOffloadScheduler(self._config)
+            # Before the planners: they read the scheduler's chunk and block
+            # arithmetic when they arm their boundaries.
+            self._reconcile_scheduler_block_size()
             self._init_kda_planner(vllm_config, kv_cache_config)
             self._init_v41_planner(vllm_config, kv_cache_config)
 
@@ -682,6 +681,44 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return 1
         return int(getattr(self._config, "tensor_parallel_size", 1) or 1)
 
+    def _reconcile_scheduler_block_size(self) -> None:
+        """Tell the scheduler how big the blocks it strides actually are.
+
+        Called AFTER the scheduler exists. Called before it, the early
+        return on `_scheduler is None` made this a no-op that logged
+        nothing -- the same shape as `_is_deepseek_v41` being assigned
+        after the resolution that reads it, one bug earlier in this file.
+
+        `cache_config.block_size` is engine-wide and becomes the SMALLEST
+        group's once a second group exists, but every block table this
+        scheduler indexes belongs to the attention group. With DSpark the
+        draft's 32 replaced the proxy's 256 and the two arithmetics that
+        read it both went wrong in the same direction: a 1345-token prompt's
+        six blocks were priced at 192 tokens, so the save frontier floored
+        to zero chunks, and the backing check then declared six blocks too
+        few to cover [0, 1280).
+
+        Fixed at the source rather than at each site, because the next site
+        to read it would be wrong in the same way and would say so just as
+        quietly -- neither of those two raised anything.
+        """
+        attn = int(getattr(self, "_attn_block_size", 0) or 0)
+        sched = getattr(self, "_scheduler", None)
+        if attn <= 0 or sched is None:
+            return
+        current = int(getattr(sched, "block_size", 0) or 0)
+        if current == attn:
+            return
+        virtual = int(getattr(sched, "virtual_block_size", current) or current)
+        dcp = max(1, virtual // current) if current > 0 else 1
+        sched.block_size = attn
+        sched.virtual_block_size = attn * dcp
+        logger.info(
+            "ATOM LMCache offload: block size for the strided group is %d, "
+            "not the engine-wide %d (dcp=%d); scheduler updated",
+            attn, current, dcp,
+        )
+
     def _resolve_attention_group(self, kv_cache_config) -> int:
         """Which group the existing byte-codec path owns.
 
@@ -707,12 +744,20 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             for gid, group in enumerate(groups):
                 names = list(getattr(group, "layer_names", []) or [])
                 if ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME in names:
-                    if len(groups) > 1:
-                        logger.info(
-                            "ATOM LMCache offload: V4.1 proxy is kv cache "
-                            "group %d of %d; the others are not offloaded",
-                            gid, len(groups),
+                    self._attn_block_size = int(
+                        getattr(
+                            getattr(group, "kv_cache_spec", None),
+                            "block_size",
+                            0,
                         )
+                        or 0
+                    )
+                    logger.info(
+                        "ATOM LMCache offload: V4.1 proxy is kv cache group "
+                        "%d of %d, block_size=%d (engine-wide block size is "
+                        "the smallest group's, so coverage is priced here)",
+                        gid, len(groups), self._attn_block_size,
+                    )
                     return gid
             raise ValueError(
                 "ATOM offload connector: DeepSeek-V4.1 is configured but no "
@@ -731,6 +776,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             for gid in range(len(groups))
             if gid not in mamba_ids and gid not in image_ids
         ]
+        if len(others) == 1:
+            self._attn_block_size = int(
+                getattr(
+                    getattr(groups[others[0]], "kv_cache_spec", None),
+                    "block_size",
+                    0,
+                )
+                or 0
+            )
         if len(others) != 1:
             raise ValueError(
                 "ATOM offload connector: expected exactly one non-recurrent KV "
@@ -2087,6 +2141,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             frontiers[str(req_id)] = int(num_tokens)
             seq = self._seqs.get(req_id)
             if seq is not None:
+                # Priced with the ATTENTION group's block size, not the
+                # engine-wide one. `cache_config.block_size` is a single
+                # value and becomes the smallest group's: with DSpark the
+                # draft's 32 replaced the proxy's 256, so six proxy blocks
+                # were priced at 192 tokens, every save frontier floored to
+                # zero chunks, and the tier was never written. Measured as
+                # `computed=192` stuck for the life of every request while
+                # the same prompts reached 1280 without drafts.
                 covered = len(seq.block_table) * block_size
                 seq.set_num_cached_tokens(min(int(num_tokens), covered))
         inner = self._scheduler.build_connector_meta()

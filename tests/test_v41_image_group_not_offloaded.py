@@ -110,3 +110,80 @@ def test_a_v41_run_with_no_proxy_group_says_so():
         assert "proxy layer" in str(exc)
     else:
         raise AssertionError("a V4.1 run with no proxy group was accepted")
+
+
+def test_the_scheduler_is_told_the_block_size_of_the_group_it_strides():
+    """`cache_config.block_size` is engine-wide and becomes the SMALLEST
+    group's once a second group exists, but every block table this
+    scheduler indexes belongs to the attention group.
+
+    With DSpark the draft's 32 replaced the proxy's 256 and both arithmetics
+    that read it went wrong the same way: a 1345-token prompt's six blocks
+    priced at 192 tokens, so the save frontier floored to zero chunks, and
+    the backing check then called six blocks too few to cover [0, 1280).
+    Neither raised anything; the tier was simply never written.
+    """
+    from types import SimpleNamespace
+
+    from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._attn_block_size = 256
+    c._scheduler = SimpleNamespace(block_size=32, virtual_block_size=32)
+    c._reconcile_scheduler_block_size()
+    assert c._scheduler.block_size == 256
+    assert c._scheduler.virtual_block_size == 256
+
+    # The arithmetic that was wrong, as arithmetic.
+    blocks, chunk = 6, 256
+    covered = blocks * c._scheduler.block_size
+    assert covered == 1536
+    assert (min(1345, covered) // chunk) * chunk == 1280    # was 0
+    assert blocks >= -(-1280 // c._scheduler.virtual_block_size)  # was False
+
+
+def test_the_dcp_factor_is_carried_not_dropped():
+    from types import SimpleNamespace
+
+    from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._attn_block_size = 256
+    c._scheduler = SimpleNamespace(block_size=32, virtual_block_size=64)
+    c._reconcile_scheduler_block_size()
+    assert c._scheduler.virtual_block_size == 512
+
+
+def test_a_single_group_run_is_left_alone():
+    """No second group, so the engine-wide value is already the right one
+    and this must not touch it."""
+    from types import SimpleNamespace
+
+    from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._attn_block_size = 256
+    c._scheduler = SimpleNamespace(block_size=256, virtual_block_size=256)
+    c._reconcile_scheduler_block_size()
+    assert c._scheduler.block_size == 256
+
+
+
+
+def test_the_reconcile_runs_after_the_scheduler_exists():
+    """It early-returns when there is no scheduler, so calling it before one
+    is built makes it a no-op that logs nothing. That is the second bug of
+    this exact shape in this file -- `_is_deepseek_v41` was read by a
+    resolution that ran before its assignment -- so the ordering is pinned
+    here rather than left to the next reader to notice."""
+    import inspect
+
+    from atom.plugin.vllm.kv_transfer import connector as mod
+
+    src = inspect.getsource(mod.AtomLMCacheOffloadConnector.__init__)
+    build = src.index("self._scheduler = ")
+    call = src.index("self._reconcile_scheduler_block_size()")
+    assert call > build, (
+        "_reconcile_scheduler_block_size must run after a scheduler exists; "
+        "before it, it returns silently and changes nothing"
+    )
