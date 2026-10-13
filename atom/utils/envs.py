@@ -502,9 +502,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #
     # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
     # q is [bs, T, V] and has to cross the step boundary -- 200 MiB fp32 at
-    # --max-num-seqs 64, V=163840, T=5 -- and the de-fused draft step measures
-    # +68 us at bs=1 and +363 us at bs=64 under graph replay, against a ~3.76 ms
-    # step. Temperature-0 is unaffected either way: an all-greedy batch keeps
+    # --max-num-seqs 64, V=163840, T=5 -- and the draft step de-fuses, trading
+    # step latency for acceptance. Measured in isolation on MI355X, the sampling
+    # op costs about +36 us per call over the greedy one, at both bs=1 and
+    # bs=64; the end-to-end step cost under graph replay has NOT been measured
+    # on this revision. Temperature-0 is unaffected either way: an all-greedy
+    # batch keeps
     # the exact-match accept kernel, and a greedy ROW inside a mixed batch draws
     # a delta q that makes the ratio rule degenerate to exact match.
     #
