@@ -256,6 +256,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         pump = getattr(client, "pump", None)
         if callable(pump):
             pump()
+        self.apply_discarded_lookup_hits()
         pending = self._pending_session_ends()
         in_flight = getattr(client, "is_pending", None)
         for sid, seq in list(pending.items()):

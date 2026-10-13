@@ -64,6 +64,8 @@ class _MPLookupClient:
         # cache, which `cleanup_lookup_result` clears by request ID.
         self._async_hits: dict[str, int] = {}
         self._orphans: set[str] = set()
+        # Hits of discarded (fire-and-forget) lookups, drained by the scheduler.
+        self._discarded_hits: dict[str, int] = {}
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter
         # without them falls back to the synchronous lookup.
@@ -194,11 +196,20 @@ class _MPLookupClient:
         request_id = _mp_session_id(self._config, lookup_id)
         hit = self._async_hits.pop(lookup_id, None)
         token_ids = self._async_tokens.pop(lookup_id, None)
+        if hit is not None:
+            # Its answer is not consumed as a hit, but the scheduler still
+            # needs it as a save floor (`take_discarded_hits`).
+            self._discarded_hits[lookup_id] = int(hit)
         if hit and token_ids is not None:
             self._adapter.free_lookup_locks(
                 token_ids=token_ids, start=0, end=hit, request_id=request_id
             )
         self._adapter.cleanup_lookup_result(request_id)
+
+    def take_discarded_hits(self) -> dict[str, int]:
+        """Tier hits of discarded lookups answered since the last call."""
+        hits, self._discarded_hits = self._discarded_hits, {}
+        return hits
 
     def discard(self, lookup_id: str) -> None:
         """Forget an async lookup its request will never consume."""

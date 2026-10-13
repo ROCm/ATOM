@@ -355,6 +355,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not client.submit(self._lookup_token_ids(seq), sid):
                 return False
             self._perf_bump("lookup_fire_and_forget")
+        # Registered before `discard`, which may release an already-answered
+        # lookup at once.
+        self._skipped_lookup_seqs()[sid] = seq
         client.discard(sid)
         self._lookup_defer_since.pop(sid, None)
         self._forget_tier_hit(sid)
@@ -363,6 +366,46 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             self._hit_save_floors[sid] = floor
         self._perf_bump("lookup_skipped_hbm")
         return True
+
+    def _skipped_lookup_seqs(self) -> dict:
+        """Requests whose discarded lookup has not answered yet."""
+        return self.__dict__.setdefault("_skipped_lookups", {})
+
+    def apply_discarded_lookup_hits(self) -> None:
+        """Lower a skipped request's save floor to what the tier holds.
+
+        The skip seeds the floor from the HBM prefix, but HBM residency is no
+        proof the tier still holds that prefix: LMCache evicts on its own, and
+        a chunk it dropped while HBM kept it would never be stored again --
+        and the tier matches contiguously from position 0, so one hole hides
+        every later chunk once HBM evicts its copy too. When the discarded
+        lookup answers, its hit is the tier's real contiguous prefix; any
+        chunk between it and the floor is saved again on the next pass.
+        """
+        take = getattr(self._lookup_client, "take_discarded_hits", None)
+        if not callable(take):
+            return
+        pending = self._skipped_lookup_seqs()
+        for sid, hit in take().items():
+            seq = pending.pop(sid, None)
+            if seq is None:
+                continue
+            tier = self._chunk_floor(max(0, int(hit)))
+            floor = self._hit_save_floors.get(sid)
+            if floor is not None and tier < floor:
+                self._hit_save_floors[sid] = tier
+            entry = self._save_tracker.get(sid)
+            if entry is not None and entry[0] is seq and tier < int(entry[1]):
+                entry[1] = tier
+                self._perf_bump("lookup_skip_floor_lowered")
+        # Forget a request whose lookup can no longer answer with a hit (it
+        # failed, or answered empty) or that can no longer save.
+        pending_ids = getattr(self._lookup_client, "pending_ids", None)
+        in_flight = pending_ids() if callable(pending_ids) else ()
+        for sid in list(pending):
+            entry = self._save_tracker.get(sid)
+            if sid not in in_flight or entry is None or entry[0] is not pending[sid]:
+                del pending[sid]
 
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.

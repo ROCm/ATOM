@@ -288,3 +288,34 @@ def test_composite_probe_is_unanimous_and_side_effect_free():
     assert multi.tier_lookup_skippable(None, 60) is True
     assert multi.commit_tier_lookup_skip(None, 60) is True
     assert a.committed == b.committed == 1
+
+
+# ── save floor follows the tier, not HBM (#2547 review) ──────────────────
+
+
+def _admit_and_track(sched, seq, hbm):
+    sched._do_save = True
+    assert sched.commit_tier_lookup_skip(seq, hbm)
+    seq.num_cached_tokens = hbm
+    sched.update_state_after_alloc(seq)
+    return sched._save_tracker["7"]
+
+
+def test_floor_drops_to_the_tier_hit_when_the_tier_holds_less(monkeypatch):
+    # Tier answers 8 chunks = 32 tokens, HBM holds 60: chunks [32, 60) must be
+    # saved again, or the tier keeps a hole that hides every later chunk.
+    sched, _client, adapter = _scheduler(monkeypatch, chunks=8, lookup_done=False)
+    entry = _admit_and_track(sched, _seq(), 60)
+    assert entry[1] == 60
+    adapter._client.lookup_future.done = True
+    sched._end_finished_sessions()
+    assert entry[1] == 32
+
+
+def test_floor_stays_when_the_tier_holds_the_whole_hbm_prefix(monkeypatch):
+    sched, _client, adapter = _scheduler(monkeypatch, chunks=16, lookup_done=False)
+    entry = _admit_and_track(sched, _seq(), 60)
+    adapter._client.lookup_future.done = True
+    sched._end_finished_sessions()
+    assert entry[1] == 60
+    assert sched._skipped_lookup_seqs() == {}
