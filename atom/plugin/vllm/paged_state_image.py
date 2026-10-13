@@ -301,6 +301,35 @@ def check_image_groups(cfg, adapter, sizing) -> None:
         )
 
 
+def _refit_max_model_len(vllm_config, configs, proxy_name, sizing) -> None:
+    """``--max-model-len -1``: vLLM fitted the length to every physical block;
+    fit it again to the blocks left once the slot tail is withheld (minus the
+    null block), with vLLM's own estimate. The allocation itself is unchanged:
+    the slots live in the withheld tail. EngineCore passes a lowered length on
+    to the workers and the frontend."""
+    from vllm.v1.core.kv_cache_utils import (
+        _auto_fit_max_model_len,
+        _pool_bytes_per_block,
+    )
+
+    mine = [
+        c
+        for c in configs
+        if any(proxy_name in g.layer_names for g in c.kv_cache_groups)
+    ]
+    if not mine:
+        return
+    _auto_fit_max_model_len(
+        vllm_config,
+        [c.kv_cache_groups for c in mine],
+        [
+            (sizing.usable_blocks(int(c.num_blocks)) - 1)
+            * _pool_bytes_per_block(c.kv_cache_groups)
+            for c in mine
+        ],
+    )
+
+
 def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memory):
     adapter = adapter_for_config(vllm_config)
     proxy_name = None if adapter is None else adapter.proxy_layer_name
@@ -326,6 +355,8 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
             )
         vllm_config.cache_config.mamba_cache_mode = "align"
     configs = original(vllm_config, kv_cache_specs, available_memory)
+    if getattr(vllm_config.model_config, "original_max_model_len", None) == -1:
+        _refit_max_model_len(vllm_config, configs, proxy_name, sizing)
     max_model_len = int(vllm_config.model_config.max_model_len)
     per_req = -(-max_model_len // bs)
     placement = (
