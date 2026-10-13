@@ -2,11 +2,11 @@
 
 交接日期：2026-10-13。用户已在另一台机器确认 MegaMoE 有性能提升，本机后续只做接入问题排查与 profiling。以下同配置性能 A/B 步骤保留供后续换机复测使用；AITER 继续使用**不打任何本地补丁的 main**。
 
-当前分支已按用户要求删除 ATOM 前端和 MegaMoE 输出端的运行时 watchdog 检查，tail 的数据与 scale 用一次 `copy_tail` 搬运。受支持的完整 prefill 区域为 `sp_rs_norm → MegaMoE → copy_tail`，不增加替代检查；AITER kernel 内部的数据同步保持原样。当前源码在纯 main 上通过 142 项 CPU 回归、9 项 GPU 拷贝/graph 检查、整模型 2K/4K 四卡 trace 和短 decode。每个 rank 各有 57 个前端、56 个 FP8 tail、1 个 BF16 final tail、57 个 copy kernel，watchdog 检查 kernel 为 0。这些是正确性和 profiling 结果，未重新测量端到端吞吐或 GSM8K。
+当前分支已按用户要求删除 ATOM 前端和 MegaMoE 输出端的运行时 watchdog 检查，tail 的数据与 scale 用一次 `copy_tail` 搬运。受支持的完整 prefill 区域为 `sp_rs_norm → MegaMoE → copy_tail`，不增加替代检查；AITER kernel 内部的数据同步保持原样。接入已整合至 PR #2364 的 `hexwang/atom_sp`，并 rebase 到 ATOM main `2c948339`。rebase 后在纯 AITER main 上通过 209 项定向回归、81 项无 AITER/Triton 的 CPU 检查、9 项 GPU 拷贝/graph 检查、整模型 level 3 / FULL graph 捕获、2K/4K 四卡 trace 和短 decode。每个 rank 各有 57 个前端、56 个 FP8 tail、1 个 BF16 final tail、57 个 copy kernel，watchdog 检查 kernel 为 0。这些是正确性和 profiling 结果，未重新测量端到端吞吐或 GSM8K。 完整 CPU CI suite 也已重跑：8,453 passed、883 skipped、3 xfailed、0 failed；原版 ATOM main `2c948339` 对照为 8,290 passed、871 skipped、3 xfailed、0 failed。
 
 ## 1. 拉取版本和依赖
 
-ATOM 远程分支：[`experiment/sp4-mega-moe-5937`](https://github.com/ROCm/ATOM/tree/experiment/sp4-mega-moe-5937)。原始全融合接入提交：[`410884bfb9d0cbe1e03ed22609bc6e18b8df97f7`](https://github.com/ROCm/ATOM/commit/410884bfb9d0cbe1e03ed22609bc6e18b8df97f7)。当前实现还包含上述 watchdog 删除与 tail 拷贝合并，使用随分支更新的 [experiment-source.json](../../scripts/experiments/sp_mega_moe/experiment-source.json) 校验实现树。
+ATOM 远程分支：[`hexwang/atom_sp`](https://github.com/ROCm/ATOM/tree/hexwang/atom_sp)。rebase 后的全融合接入提交：[`7b231f15ee4981c1efacb3cc1acd65c65bc257db`](https://github.com/ROCm/ATOM/commit/7b231f15ee4981c1efacb3cc1acd65c65bc257db)。当前实现还包含上述 watchdog 删除与 tail 拷贝合并，使用随分支更新的 [experiment-source.json](../../scripts/experiments/sp_mega_moe/experiment-source.json) 校验实现树。
 
 AITER 使用已合入 MegaMoE 的 main 提交 [`cc709933512a056e04c596877086f92be9067df8`](https://github.com/ROCm/aiter/commit/cc709933512a056e04c596877086f92be9067df8)，两组都使用干净源码。遵照用户最后确认，**不安装 tiled sorting 或其他本地补丁**。ATOM 会根据 AITER API 自动关闭 tiled sorting 扩展，native 和小 batch 回退走 main 自带的路径。
 
@@ -16,12 +16,12 @@ AITER 使用已合入 MegaMoE 的 main 提交 [`cc709933512a056e04c596877086f92b
 export SP_WORK=/app/sp-mega-retest
 export SP_MODEL=/home/models/MiniMax-M3-MXFP4
 mkdir -p "$SP_WORK"
-git clone --single-branch --branch experiment/sp4-mega-moe-5937 \
+git clone --single-branch --branch hexwang/atom_sp \
   https://github.com/ROCm/ATOM.git "$SP_WORK/ATOM"
 export SP_ATOM="$SP_WORK/ATOM"
 export SP_TOOLS="$SP_ATOM/scripts/experiments/sp_mega_moe"
 git -C "$SP_ATOM" merge-base --is-ancestor \
-  410884bfb9d0cbe1e03ed22609bc6e18b8df97f7 HEAD
+  7b231f15ee4981c1efacb3cc1acd65c65bc257db HEAD
 
 git clone https://github.com/ROCm/aiter.git "$SP_WORK/aiter"
 export SP_AITER="$SP_WORK/aiter"
