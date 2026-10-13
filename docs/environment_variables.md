@@ -34,14 +34,24 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
 
+## Pipeline parallelism
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PP_DECODE_MICROBATCHES** | int | 0 | Number of batches the PP head splits running decode sequences into, so that many decode batches occupy the pipeline at once. A batch holds at most `ceil(running decode / N)` sequences. `0` uses `pipeline_parallel_size`; `1` puts every ready decode sequence in one batch. Ignored when PP=1. |
+
 ## Prefill delayer (TP/DCP and DP attention)
 
 Coalesces waiting prefills while decode continues. DP attention enables it by
-default through `ATOM_ENABLE_PREFILL_DELAYER`. For a single scheduler (DP=1,
-PP=1), including TP/DCP, it is opt-in: set `ATOM_PREFILL_DECODE_INTERVAL` above
-zero and keep the master switch enabled. Interval 0 leaves TP scheduling
-unchanged; setting only the master switch does not enable TP coalescing.
-On TP, the interval and coalescer are enabled together.
+default through `ATOM_ENABLE_PREFILL_DELAYER`. For a single scheduler (DP=1),
+including TP/DCP and the PP head stage, it is opt-in: set
+`ATOM_PREFILL_DECODE_INTERVAL` above zero and keep the master switch enabled.
+Interval 0 leaves TP scheduling unchanged; setting only the master switch does
+not enable TP coalescing. On TP, the interval and coalescer are enabled together.
+Under PP each scheduler pass builds one microbatch, and a pass that finds every
+decode sequence in flight does not count toward the interval, so the interval is
+measured in launched decode microbatches: protecting N full decode rounds takes
+N times `ATOM_PP_DECODE_MICROBATCHES`.
 This applies to the standard scheduler, including connector-based P/D roles.
 RapidServe's dedicated `PrefillScheduler`/`DecodeScheduler` do not use the delayer.
 
@@ -86,7 +96,7 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
-| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
+| **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1 (TP, or the PP head), a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. Under PP a pass with every decode sequence in flight is not counted. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
