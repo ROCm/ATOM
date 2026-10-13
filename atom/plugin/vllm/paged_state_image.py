@@ -513,6 +513,9 @@ _slot_allocators: list = []
 _event_counts = {"finished": 0, "preempted": 0, "resumed": 0}
 # This step's image stores as the scheduler hashed them: req_id -> boundary.
 _store_plan: dict[str, int] = {}
+# Speculative decode: this step's decode rows -> the spacing threshold a
+# committed end must reach to keep an image (decided after the step).
+_decode_plan: dict[str, int] = {}
 
 
 # The image worker of each registered family's target model in this process.
@@ -525,6 +528,7 @@ _store_counts = {
     "after_forward": 0,
     "next_build": 0,
     "at_next_build": 0,
+    "decode_keep": 0,
 }
 
 
@@ -569,6 +573,10 @@ def _apply_runner_patches() -> bool:
         _event_counts["resumed"] += len(resumed)
         _store_plan.clear()
         _store_plan.update(getattr(scheduler_output, "atom_image_stores", None) or {})
+        _decode_plan.clear()
+        _decode_plan.update(
+            getattr(scheduler_output, "atom_image_decode_candidates", None) or {}
+        )
         copies = getattr(scheduler_output, "kv_cache_block_copies", None)
         if copies and _config_has_proxy(getattr(self, "kv_cache_config", None)):
             raise RuntimeError(
@@ -661,6 +669,10 @@ class ImageWorker:
         # With a drafter: the target forward after the build that planned
         # ``pending_stores`` ran (they are issued at the next build).
         self.forward_ran = False
+        # Speculative decode: req_id -> (slot, {boundary: image unit ids}) for
+        # every boundary the last step could commit to; the next build stores
+        # the one it did commit to, if any.
+        self.decode_candidates: dict[str, tuple[int, dict]] = {}
 
 
 def image_unit_ids(
@@ -779,6 +791,13 @@ def plan_image_ops(
                 "unrestored"
             )
         return
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_req_ids
+
+    req_ids = list(get_current_req_ids() or [])[:rows]
+    if worker.decode_candidates or _decode_plan:
+        starts = _exact_starts(rows, name)
+        store_decode_keeps(worker, req_ids, starts, fresh_rows)
+        record_decode_candidates(worker, req_ids, slots, starts, lens, block, name)
     for i in resumed:
         if int(chunk_start[i]) % block:
             raise RuntimeError(
@@ -799,9 +818,6 @@ def plan_image_ops(
     current_image_store_plan().clear()
     if not plan:
         return
-    from atom.plugin.vllm.req_id_passthrough_patch import get_current_req_ids
-
-    req_ids = list(get_current_req_ids() or [])[:rows]
     ends = chunk_start[:rows].astype(np.int64) + lens[:rows].astype(np.int64)
     row_of = {rid: i for i, rid in enumerate(req_ids)}
     stores = []
@@ -821,6 +837,74 @@ def plan_image_ops(
         md.image_store_units = image_unit_ids(
             worker.group_ids, stores, [int(ends[i]) // block - 1 for i in stores], name
         )
+
+
+def _exact_starts(rows: int, name: str):
+    """Each row's first position this step. Under async speculative decode the
+    builder's ``seq_lens_cpu_upper_bound`` assumes every in-flight draft was
+    accepted; in align mode (images on) vLLM applies the correction to the
+    input batch before the metadata build, so this is exact."""
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+    batch = get_current_input_batch()
+    if batch is None:
+        raise RuntimeError(
+            f"{name} decode keeps under speculative decode need the vLLM input "
+            "batch; the runner patches did not run"
+        )
+    return np.asarray(batch.num_computed_tokens_cpu[:rows], dtype=np.int64)
+
+
+def store_decode_keeps(worker, req_ids, starts, fresh_rows) -> None:
+    """Native ``hash_decode_blocks`` keeps at the committed end of a step, out
+    of the slot that step left. That end is this step's exact start; the last
+    step's forwards (target and draft) are done and this one's have not run.
+    A row on a fresh slot (resumed) is not the slot the last step wrote."""
+    cands, worker.decode_candidates = worker.decode_candidates, {}
+    if not cands:
+        return
+    fresh = {int(i) for i in fresh_rows}
+    row_of = {rid: i for i, rid in enumerate(req_ids)}
+    slots, units = [], []
+    for rid, (slot, by_end) in cands.items():
+        i = row_of.get(rid)
+        if i is None or i in fresh:
+            continue
+        unit_ids = by_end.get(int(starts[i]))
+        if unit_ids is not None:
+            slots.append(slot)
+            units.append(unit_ids)
+    if slots:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("decode keep image stores reached a CUDA graph capture")
+        execute_image_stores(worker.copier, slots, units)
+        _store_counts["decode_keep"] += len(slots)
+
+
+def record_decode_candidates(worker, req_ids, slots, starts, lens, block, name):
+    """The image blocks of every boundary this step's decode rows could commit
+    to, at or past their spacing threshold (vLLM allocates image blocks up to
+    the scheduled end, so each is there)."""
+    plan = dict(_decode_plan)
+    _decode_plan.clear()
+    out = {}
+    for i, rid in enumerate(req_ids):
+        threshold = plan.get(rid)
+        if threshold is None:
+            continue
+        start = int(starts[i])
+        end = start + int(lens[i])
+        ends = [
+            b
+            for b in range((start // block + 1) * block, end + 1, block)
+            if b >= threshold
+        ]
+        if ends:
+            unit_ids = image_unit_ids(
+                worker.group_ids, [i] * len(ends), [b // block - 1 for b in ends], name
+            )
+            out[rid] = (int(slots[i]), dict(zip(ends, unit_ids)))
+    worker.decode_candidates = out
 
 
 def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) -> None:
