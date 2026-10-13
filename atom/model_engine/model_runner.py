@@ -2534,7 +2534,15 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
+        # A P/D producer keeps the drafter only to write its context KV; the
+        # scheduler never pads drafts for it, so its decodes (the step that
+        # surfaces a deferred T0) are q=1 and have nothing to verify.
+        if (
+            not is_prefill
+            and hasattr(self, "drafter")
+            and not self.tokenID_processor.is_pd_producer
+            and not batch.is_dummy_run
+        ):
             _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
             # Inside the staging window: without the token group it publishes
             # the indices itself. Packed indices already share the token upload.
