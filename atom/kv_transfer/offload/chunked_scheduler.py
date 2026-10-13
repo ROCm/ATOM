@@ -386,7 +386,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if not callable(take):
             return
         pending = self._skipped_lookup_seqs()
-        for sid, hit in take().items():
+        try:
+            hits = take()
+        except Exception:
+            logger.warning(
+                "LMCache: reading discarded lookup hits failed", exc_info=True
+            )
+            hits = {}
+        for sid, hit in hits.items():
             seq = pending.pop(sid, None)
             if seq is None:
                 continue

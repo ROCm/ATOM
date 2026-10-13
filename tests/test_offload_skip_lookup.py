@@ -381,3 +381,42 @@ def test_lookup_phase_failure_is_dropped_without_retry(monkeypatch):
     client.pump()
     assert not client.is_pending("7")
     assert "7" not in client._orphans
+
+
+# ── robustness (#2547 review) ────────────────────────────────────────────
+
+
+def test_release_failure_does_not_escape_into_scheduling(monkeypatch):
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=True)
+    seq = _seq()
+    sched.prefetch_lookups([seq])
+    client.pump()  # answered, not yet consumed
+
+    def broken(**_kw):
+        raise RuntimeError("adapter down")
+
+    adapter.free_lookup_locks = broken
+    assert sched.commit_tier_lookup_skip(seq, 60)  # discard releases at once
+    assert "7" not in client.pending_ids()
+
+
+def test_engine_keeps_polling_until_a_discarded_lookup_is_released(monkeypatch):
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
+    seq = _seq()
+    sched.commit_tier_lookup_skip(seq, 60)
+    sched._pending_session_ends()["7"] = seq  # request already finished
+    assert sched.has_pending_work()
+    adapter._client.lookup_future.done = True
+    adapter.end_session = lambda rid: None
+    sched._end_finished_sessions()
+    assert not client.has_unreleased_orphans()
+    assert not sched.has_pending_work()
+
+
+def test_an_unanswered_orphan_is_given_up_after_its_timeout(monkeypatch):
+    sched, client, _adapter = _scheduler(monkeypatch, lookup_done=False)
+    sched.commit_tier_lookup_skip(_seq(), 60)
+    client._orphan_since["7"] -= mp_lookup._ORPHAN_TIMEOUT_S + 1
+    client.pump()
+    assert not client.has_unreleased_orphans()
+    assert not client.is_pending("7")

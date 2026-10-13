@@ -228,6 +228,22 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         super()._finish_retired_request(sid)
         self._end_finished_sessions()
 
+    def has_pending_work(self) -> bool:
+        """Also keep polling while a session or a discarded lookup is due.
+
+        A fire-and-forget lookup can outlive its request; if that was the last
+        request, nothing else would step the connector, the lookup would never
+        be pumped and its session never ended. Both are bounded: an orphan is
+        given up after `_ORPHAN_TIMEOUT_S` (locks left to the read TTL), and a
+        session waits only on its saves and that lookup.
+        """
+        orphans = getattr(self._lookup_client, "has_unreleased_orphans", None)
+        return (
+            super().has_pending_work()
+            or bool(self._pending_session_ends())
+            or bool(callable(orphans) and orphans())
+        )
+
     def _pending_session_ends(self) -> dict[str, Any]:
         """Finished requests whose MP session must outlive their last save.
 
