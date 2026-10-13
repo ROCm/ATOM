@@ -197,9 +197,13 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
 
-    def skip_tier_lookup(self, seq: Any, hbm_tokens: int) -> bool:
-        skip = getattr(self._require_impl(), "skip_tier_lookup", None)
-        return bool(skip(seq, hbm_tokens)) if callable(skip) else False
+    def tier_lookup_skippable(self, seq: Any, hbm_tokens: int) -> bool:
+        check = getattr(self._require_impl(), "tier_lookup_skippable", None)
+        return bool(check(seq, hbm_tokens)) if callable(check) else False
+
+    def commit_tier_lookup_skip(self, seq: Any, hbm_tokens: int) -> bool:
+        commit = getattr(self._require_impl(), "commit_tier_lookup_skip", None)
+        return bool(commit(seq, hbm_tokens)) if callable(commit) else False
 
     def tier_lookup_cannot_load(self, seq: Any, hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "tier_lookup_cannot_load", None)

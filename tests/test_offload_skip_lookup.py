@@ -82,7 +82,7 @@ def test_any_tier_hit_inside_the_skip_window_is_refused_as_a_load(monkeypatch, h
 
 def test_a_gap_the_tier_could_fill_is_not_skipped(monkeypatch):
     sched, _, adapter = _scheduler(monkeypatch)
-    assert sched.skip_tier_lookup(_seq(), 64 - MIN_LOAD) is False
+    assert sched.commit_tier_lookup_skip(_seq(), 64 - MIN_LOAD) is False
     assert adapter._client.lookups == []
 
 
@@ -93,7 +93,7 @@ def test_skip_sends_the_lookup_without_waiting_and_orphans_it(monkeypatch):
     sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
     seq = _seq()
 
-    assert sched.skip_tier_lookup(seq, 60) is True
+    assert sched.commit_tier_lookup_skip(seq, 60) is True
     # Sent: the server refreshes L1 recency and opens the session.
     assert len(adapter._client.lookups) == 1
     # Not waited on, not consumed: no load is armed for it.
@@ -105,7 +105,7 @@ def test_skip_sends_the_lookup_without_waiting_and_orphans_it(monkeypatch):
 
 def test_orphaned_lookup_releases_its_locks_when_it_answers(monkeypatch):
     sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
-    sched.skip_tier_lookup(_seq(), 60)
+    sched.commit_tier_lookup_skip(_seq(), 60)
     adapter._client.lookup_future.done = True
     client.pump()
     assert adapter.freed, "read locks taken by the answered lookup must be freed"
@@ -117,7 +117,7 @@ def test_a_prefetched_lookup_is_not_sent_twice(monkeypatch):
     seq = _seq()
     sched.prefetch_lookups([seq])
     assert len(adapter._client.lookups) == 1
-    assert sched.skip_tier_lookup(seq, 60) is True
+    assert sched.commit_tier_lookup_skip(seq, 60) is True
     assert len(adapter._client.lookups) == 1
     assert "7" in client._orphans
 
@@ -128,7 +128,7 @@ def test_an_armed_load_is_finished_by_the_ordinary_path(monkeypatch):
     sched._load_specs["7"] = LoadSpec(
         hbm_cached_tokens=0, lmcache_cached_tokens=48, can_load=False
     )
-    assert sched.skip_tier_lookup(seq, 60) is False
+    assert sched.commit_tier_lookup_skip(seq, 60) is False
 
 
 # ── scheduler gate ───────────────────────────────────────────────────────
@@ -139,13 +139,15 @@ class _Conn:
 
     def __init__(self, cannot=True):
         self.cannot = cannot
-        self.skipped = []
+        self.probed = []
+        self.committed = []
 
-    def tier_lookup_cannot_load(self, seq, hbm):
+    def tier_lookup_skippable(self, seq, hbm):
+        self.probed.append(hbm)
         return self.cannot
 
-    def skip_tier_lookup(self, seq, hbm):
-        self.skipped.append(hbm)
+    def commit_tier_lookup_skip(self, seq, hbm):
+        self.committed.append(hbm)
         return True
 
 
@@ -164,28 +166,29 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
         can_allocate=lambda seq, **kw: hit_blocks,
     )
     seq = SimpleNamespace(kv_transfer_params=None)
-    return s._skip_tier_lookup_on_hbm_hit(seq), conn
+    return s._tier_lookup_skippable(seq), conn
 
 
-def test_scheduler_skips_with_the_probed_hbm_frontier(monkeypatch):
+def test_scheduler_probe_is_pure_and_uses_the_hbm_frontier(monkeypatch):
     skipped, conn = _gate(monkeypatch, conn=_Conn())
-    assert skipped and conn.skipped == [40]
+    assert skipped and conn.probed == [40]
+    assert conn.committed == []  # committed only after admission
 
 
 def test_scheduler_keeps_the_lookup_when_the_connector_could_load(monkeypatch):
     skipped, conn = _gate(monkeypatch, conn=_Conn(cannot=False))
-    assert not skipped and conn.skipped == []
+    assert not skipped and conn.committed == []
 
 
 def test_scheduler_keeps_the_lookup_when_joint_state_offload_is_on(monkeypatch):
     # The joint path is where a tier hit can move the HBM resume point.
     skipped, conn = _gate(monkeypatch, conn=_Conn(), state_offload=object())
-    assert not skipped and conn.skipped == []
+    assert not skipped and conn.probed == []
 
 
 def test_scheduler_keeps_the_lookup_on_a_refused_probe(monkeypatch):
     skipped, conn = _gate(monkeypatch, conn=_Conn(), hit_blocks=-1)
-    assert not skipped and conn.skipped == []
+    assert not skipped and conn.probed == []
 
 
 # ── session ordering: free the locks, then end the session ───────────────
@@ -211,7 +214,7 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
     sched, _client, adapter = _scheduler(monkeypatch, lookup_done=False)
     events = _with_session_log(adapter)
     seq = _seq()
-    sched.skip_tier_lookup(seq, 60)
+    sched.commit_tier_lookup_skip(seq, 60)
 
     sched._pending_session_ends()["7"] = seq
     sched._end_finished_sessions()
@@ -222,3 +225,66 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
     kinds = [k for k, _ in events]
     assert kinds == ["free", "end"], events
     assert "7" not in sched._pending_session_ends()
+
+
+# ── review findings (#2547) ──────────────────────────────────────────────
+
+
+def test_probe_has_no_side_effects(monkeypatch):
+    """A request held back after the probe must keep its prefetched lookup."""
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
+    seq = _seq()
+    sched.prefetch_lookups([seq])
+    for _ in range(3):  # three passes, never admitted
+        assert sched.tier_lookup_skippable(seq, 60)
+    assert len(adapter._client.lookups) == 1
+    assert "7" not in client._orphans
+    assert "7" not in sched._hit_save_floors
+
+
+def test_no_skip_without_an_async_lookup_to_keep(monkeypatch):
+    """A synchronous-only client keeps the ordinary path (LRU side effects)."""
+    sched, client, _ = _scheduler(monkeypatch)
+    client._async_supported = False
+    assert sched.tier_lookup_skippable(_seq(), 60) is False
+    assert sched.commit_tier_lookup_skip(_seq(), 60) is False
+
+
+def test_answered_orphan_frees_locks_while_its_request_is_still_running(monkeypatch):
+    """Pumped every pass, not only when a session is due to end."""
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=False)
+    sched.commit_tier_lookup_skip(_seq(), 60)
+    adapter._client.lookup_future.done = True
+    assert sched._pending_session_ends() == {}  # request not finished
+    sched._end_finished_sessions()  # the per-step call from build_connector_meta
+    assert adapter.freed
+    assert "7" not in client._orphans
+
+
+class _Sub:
+    def __init__(self, ok):
+        self.ok = ok
+        self.committed = 0
+
+    def tier_lookup_skippable(self, seq, hbm):
+        return self.ok
+
+    def commit_tier_lookup_skip(self, seq, hbm):
+        self.committed += 1
+        return True
+
+
+def test_composite_probe_is_unanimous_and_side_effect_free():
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    a, b = _Sub(True), _Sub(False)
+    multi._connectors = [a, b]
+    assert multi.tier_lookup_skippable(None, 60) is False
+    assert a.committed == b.committed == 0  # nothing mutated by the probe
+    b.ok = True
+    assert multi.tier_lookup_skippable(None, 60) is True
+    assert multi.commit_tier_lookup_skip(None, 60) is True
+    assert a.committed == b.committed == 1

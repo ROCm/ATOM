@@ -302,45 +302,60 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         gap = int(seq.num_tokens) - max(0, int(hbm_tokens))
         return gap < int(getattr(self, "_min_load_tokens", 8192))
 
-    def skip_tier_lookup(self, seq, hbm_tokens: int) -> bool:
-        """Admit `seq` without waiting for a tier lookup that cannot load.
+    def tier_lookup_skippable(self, seq, hbm_tokens: int) -> bool:
+        """Whether admission may skip waiting for this request's tier lookup.
 
-        Only for `tier_lookup_cannot_load`. The lookup is still SENT, without
-        being waited on: on the LMCache MP server a lookup is what refreshes
-        the prefix's L1 recency (prefetch hit -> touch) and what opens the
-        session whose `end_session` later touches every chunk of the request.
-        Dropping it would let a conversation's oldest chunks -- the ones every
-        later lookup must match first -- age out of L1 ahead of their turn.
-        The answer is discarded; `discard` releases its read locks when it
-        arrives.
+        Pure: nothing is sent, discarded or recorded, so the scheduler can ask
+        before its admission checks and commit only once the request is in
+        (`commit_tier_lookup_skip`).
 
-        The lookup's one consumed side effect, the save floor, comes from the
-        HBM prefix instead: it was computed, and saved, by an earlier request.
-        At worst a chunk the tier already holds is stored again.
-
-        False leaves the ordinary path in charge: the gap is too large, or a
-        load or lookup this lifecycle already armed must be finished there.
+        Requires, besides `tier_lookup_cannot_load`:
+        - nothing armed this lifecycle -- a pending load or a consumed lookup
+          is finished by the ordinary path;
+        - an asynchronous lookup that is, or can be, tracked. The skip keeps
+          the lookup's side effects (L1 recency, the session `end_session`
+          touches) by sending it fire-and-forget; a client that can only look
+          up synchronously keeps the ordinary path instead.
         """
         if not self.tier_lookup_cannot_load(seq, hbm_tokens):
             return False
         sid = str(seq.id)
-        if sid in self._load_specs or sid in self._lookup_results:
-            return False
-        if sid in self._active_load_operations:
-            return False
-        self._begin_load_lifecycle(seq)
-        client = self._lookup_client
-        submit = getattr(client, "submit", None)
-        # No-op when a prefetch already sent it; otherwise send it now.
         if (
-            callable(submit)
-            and self._lookup_len(seq) > 0
-            and submit(self._lookup_token_ids(seq), sid)
+            sid in self._load_specs
+            or sid in self._lookup_results
+            or sid in self._active_load_operations
         ):
+            return False
+        client = self._lookup_client
+        pending_ids = getattr(client, "pending_ids", None)
+        if callable(pending_ids) and sid in pending_ids():
+            return True
+        can_submit = getattr(client, "can_submit", None)
+        return bool(callable(can_submit) and can_submit() and self._lookup_len(seq) > 0)
+
+    def commit_tier_lookup_skip(self, seq, hbm_tokens: int) -> bool:
+        """Admit `seq` past its lookup: keep the lookup, drop its answer.
+
+        Called once the request is admitted, after `tier_lookup_skippable`.
+        Sends the lookup if no prefetch did; on LMCache MP it is what refreshes
+        the prefix's L1 recency and opens the session whose `end_session`
+        touches every chunk of the request. Its answer is discarded and its
+        read locks freed when it arrives. The save floor comes from the HBM
+        prefix, which an earlier request computed and saved.
+
+        False -- nothing changed -- if the lookup could not be tracked after
+        all; the caller then has a request with no tier lookup, which costs
+        only the LRU refresh, never a load (`tier_lookup_cannot_load`).
+        """
+        if not self.tier_lookup_skippable(seq, hbm_tokens):
+            return False
+        sid = str(seq.id)
+        client = self._lookup_client
+        if sid not in client.pending_ids():
+            if not client.submit(self._lookup_token_ids(seq), sid):
+                return False
             self._perf_bump("lookup_fire_and_forget")
-        discard = getattr(client, "discard", None)
-        if callable(discard):
-            discard(sid)
+        client.discard(sid)
         self._lookup_defer_since.pop(sid, None)
         self._forget_tier_hit(sid)
         floor = self._chunk_floor(max(0, int(hbm_tokens)))

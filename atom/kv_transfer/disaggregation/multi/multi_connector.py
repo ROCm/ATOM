@@ -363,25 +363,29 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
                 return True
         return False
 
-    def skip_tier_lookup(self, seq: Any, hbm_tokens: int) -> bool:
-        """Skip every sub's external-tier lookup; True only if all that have one agree.
-
-        A sub that refuses (a load it already armed) keeps its lookup, and the
-        scheduler then runs the ordinary path for the whole composite.
-        """
-        subs = [
-            getattr(c, "skip_tier_lookup", None)
+    def _subs_with(self, name: str) -> list:
+        return [
+            getattr(c, name)
             for c in self._connectors
-            if callable(getattr(c, "skip_tier_lookup", None))
+            if callable(getattr(c, name, None))
         ]
-        if not subs:
-            return False
-        # Ask every sub, not just until the first refusal: each one that
-        # agrees has already sent and released its lookup.
-        skipped = True
-        for fn in subs:
-            skipped = bool(fn(seq, hbm_tokens)) and skipped
-        return skipped
+
+    def tier_lookup_skippable(self, seq: Any, hbm_tokens: int) -> bool:
+        """True only if every sub with a tier lookup may skip it. Pure."""
+        checks = self._subs_with("tier_lookup_skippable")
+        return bool(checks) and all(fn(seq, hbm_tokens) for fn in checks)
+
+    def commit_tier_lookup_skip(self, seq: Any, hbm_tokens: int) -> bool:
+        """Commit the skip on every sub, after `tier_lookup_skippable` agreed.
+
+        Every sub is asked, not just until the first refusal: the decision
+        was already unanimous, and each sub that commits has sent and released
+        its own lookup.
+        """
+        committed = True
+        for fn in self._subs_with("commit_tier_lookup_skip"):
+            committed = bool(fn(seq, hbm_tokens)) and committed
+        return committed
 
     def tier_lookup_cannot_load(self, seq: Any, hbm_tokens: int) -> bool:
         """True only if every sub with a tier lookup says it cannot load."""

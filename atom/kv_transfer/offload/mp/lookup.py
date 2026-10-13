@@ -118,6 +118,10 @@ class _MPLookupClient:
         self._async_tokens[lookup_id] = token_ids
         return True
 
+    def can_submit(self) -> bool:
+        """Whether `submit` can send a lookup without waiting for it."""
+        return self._async_supported
+
     def is_pending(self, lookup_id: str) -> bool:
         """Submitted and not answered yet."""
         return lookup_id in self._async

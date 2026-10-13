@@ -240,7 +240,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         """End each finished request's session once nothing of it can follow.
 
         Nothing means no save, and no lookup still in flight. A lookup sent
-        without being waited on (`skip_tier_lookup`) can outlive its request:
+        without being waited on (`commit_tier_lookup_skip`) can outlive its request:
         if `end_session` drops the server session first, the eventual
         `free_lookup_locks` recreates an empty one, finds no prefetch record,
         and releases only the full-attention groups -- the state groups'
@@ -248,11 +248,15 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         no longer evict. So pump the lookups first, and keep the session
         until its lookup answered and released its locks.
         """
-        pending = self._pending_session_ends()
+        # Pumped every pass, not only when a session is due: an answered
+        # fire-and-forget lookup frees its read locks here, and the request
+        # that sent it may stay in flight for its whole transfer while the
+        # waiting queue -- which drives `prefetch_lookups` -- is empty.
         client = self._lookup_client
         pump = getattr(client, "pump", None)
-        if pending and callable(pump):
+        if callable(pump):
             pump()
+        pending = self._pending_session_ends()
         in_flight = getattr(client, "is_pending", None)
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
