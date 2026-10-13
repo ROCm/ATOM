@@ -2830,7 +2830,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # that padded nothing reaches here with the two equal, and then this
             # is a no-op -- but eager no longer implies that, since a DP-unified
             # batch pads off the graph path too.
-            meta_bs = scheduled_bs if cp_round_robin else running_bs
+            # Otherwise plan the sequences q/o have rows for: running_tokens is
+            # running_bs * max_seqlen_q on a DP-unified step, which pads the
+            # activations as well, but only this rank's own count while a peer
+            # is prefilling. The persistent kernel loads q[qo_start] and stores
+            # o[qo_start] for every work item, and the planner hands a zero-KV
+            # sequence one whenever its CU has payload left.
+            q_rows_bs = min(running_bs, running_tokens // max_seqlen_q)
+            meta_bs = scheduled_bs if cp_round_robin else q_rows_bs
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
             )
