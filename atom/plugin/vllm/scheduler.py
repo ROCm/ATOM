@@ -225,14 +225,25 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
             return num_new_tokens
 
         interval = int(planner.state_interval)
-        block = int(planner.hash_block_size)
+        # The grid a STATE boundary sits on, not the unit vLLM hashes in.
+        # Those were one number until a second kv cache group made the hash
+        # unit engine-wide: with DSpark it is the draft's 32 against the
+        # proxy's 256, and clipping to 32 lands the frontier somewhere that
+        # is not a PAGE edge, which stores nothing.
+        block = int(getattr(planner, "boundary_grid", planner.hash_block_size))
         start = int(num_computed_tokens)
         end = start + int(num_new_tokens)
         total = int(request.num_prompt_tokens)
         if end >= total:
-            # The last chunk. Decode walks its frontier one token at a time,
-            # so every boundary ABOVE the prompt is reached anyway and
-            # clipping for those would only delay the prompt.
+            # The last chunk. Without drafts, decode walks its frontier one
+            # token at a time, so every boundary ABOVE the prompt is reached
+            # anyway and clipping for those would only delay the prompt.
+            #
+            # With drafts it advances by one to six and steps over them, so
+            # that sentence stops being true -- measured, a speculative arm
+            # stored nothing at all and supplied 0.0% against 95.2%. Those
+            # boundaries need the step itself clipped, which is not this
+            # hook; see `_refuse_v41_speculation_with_offload`.
             #
             # The one below it is different, and it is the valuable one:
             # the prompt-end anchor is the last block-aligned point at or

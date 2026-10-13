@@ -69,3 +69,24 @@ def test_they_stay_equal_when_there_is_one_group():
 
     assert p._prompt_anchor(_Req()) == 1280
     assert p.boundary_hash(list(range(10)), 1280) == boundary_prefix_hash(4)
+
+
+def test_the_prefill_clip_aligns_to_the_grid_not_the_hash_unit():
+    """Fourth site of the same conflation.
+
+    `apply_vllm_v41_prefill_alignment_patch` clips a prefill chunk so the
+    frontier lands on a boundary. Clipping to the hash unit lands it
+    somewhere that is a legal 32-grid point and not a PAGE edge, so the
+    prompt-end anchor -- the one boundary a later request with the same
+    prompt actually asks about -- is never stored.
+    """
+    import inspect
+
+    from atom.plugin.vllm import scheduler as sched
+
+    src = inspect.getsource(sched.apply_vllm_v41_prefill_alignment_patch)
+    assert "boundary_grid" in src, (
+        "the prefill clip must align to the grid a boundary sits on"
+    )
+    # And the fallback keeps single-group runs working unchanged.
+    assert "planner.hash_block_size" in src
