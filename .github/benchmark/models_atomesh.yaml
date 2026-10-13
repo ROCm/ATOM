@@ -898,7 +898,7 @@ models:
             common:
               ATOM_ENABLE_REPLAYSSM: "0"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
-            decode:
+            decode: &kimi_k3_agentic_agg_pp8_decode_env
               # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
               LMCACHE_LOCAL_CPU: "True"
@@ -991,6 +991,22 @@ models:
             prefill:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+
+        # The PP8 C72 cell under the same window, to show where each stage's
+        # launch goes between GPU forwards. Every stage's workers trace.
+        - <<: *kimi_k3_agentic_agg_pp8
+          name: kimi-k3-mxfp4-agg-pp8-tp1-agentic-lmcache-1m-c72-torch-profile
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOMESH_TORCH_PROFILE_START: "900"
+              # Eight stages trace at once; 10 s still spans tens of decode rounds.
+              ATOMESH_TORCH_PROFILE_DURATION: "10"
+              ATOMESH_TORCH_PROFILE_ROLES: decode
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            decode: *kimi_k3_agentic_agg_pp8_decode_env
 
     accuracy:
       task: gsm8k

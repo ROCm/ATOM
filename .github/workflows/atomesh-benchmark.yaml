@@ -116,7 +116,8 @@ on:
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
 
           Kimi-K3 (profile suite, torch trace in minutes 5-6):
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile,
+            kimi-k3-mxfp4-agg-pp8-tp1-agentic-lmcache-1m-c72-torch-profile
 
           Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
