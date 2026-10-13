@@ -80,7 +80,8 @@
     "model-00059-of-00059.safetensors": 5370979136
   },
   "model_identity_note": "Metadata hashes and shard sizes only; full weight-content hashes were not collected.",
-  "atom_tree_sha": "35e605fb7a304addc85f14847538ac1081d00f18",
+  "atom_tree_sha": "08e654074085acfcfd3eea4be43065213a35496c",
   "aiter_policy": "Clean upstream main at the pinned SHA; no local patch in either arm.",
-  "historical_validation_scope": "Existing GPU, full-model trace and GSM8K results used this AITER SHA plus the former tiled-sort extension. They do not validate the new pure-main comparison."
+  "historical_validation_scope": "Existing GPU, full-model trace and GSM8K results used this AITER SHA plus the former tiled-sort extension. They do not validate the new pure-main comparison.",
+  "current_validation_scope": "Current ATOM tree on clean pinned AITER main: 142 CPU tests, 9 GPU copy/graph tests, full-model 2K/4K four-rank traces and short decode passed. ATOM runtime watchdog checks are removed; full fused prefill uses sp_rs_norm, MegaMoE and copy_tail. No new end-to-end throughput or GSM8K result."
 }
