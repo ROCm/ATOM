@@ -108,6 +108,7 @@ def _vllm_config(tmp_path, *, max_model_len=4096, num_blocks=64):
         block_size=BLOCK, enable_prefix_caching=True, mamba_cache_mode="align"
     )
     cc.num_gpu_blocks = num_blocks
+    cc.kv_cache_layout = "LBHNC"  # resolved by EngineCore in a server
     return VllmConfig(model_config=mc, scheduler_config=sc, cache_config=cc)
 
 
@@ -231,6 +232,83 @@ def _until_pending(eng, rid, max_steps=2000):
 def _boundary_cached(s, req, idx):
     st = s._atom_state_images
     return st._image_cached(req, idx)
+
+
+def _upstream_configs(adapter, tmp_path, physical_blocks, *, max_model_len=4096):
+    """vLLM's real get_kv_cache_configs (auto-fit, null-block reserve, memory
+    check, tensor placement) under the image hook, for ``physical_blocks``."""
+    from vllm.v1.core import kv_cache_utils as U
+
+    vc = _vllm_config(tmp_path, max_model_len=max_model_len)
+    original = getattr(U.get_kv_cache_configs, "__wrapped__", U.get_kv_cache_configs)
+    (cfg,) = G._kv_cache_configs_hook(
+        original, vc, [_specs(adapter)], [physical_blocks * PAGE]
+    )
+    return vc, cfg
+
+
+# max_model_len 4096 = 16 blocks; a running request also holds 2 blocks in each
+# of the K image groups, and vLLM's block pool keeps one null block for good.
+MIN_SCHEDULABLE = 16 + 2 * K + 1
+
+
+def test_min_pool_check_counts_the_null_block(adapter, tmp_path):
+    # The fake sizing withholds 11 blocks for the slots.
+    _vc, cfg = _upstream_configs(adapter, tmp_path, MIN_SCHEDULABLE + 11)
+    assert cfg.num_blocks == MIN_SCHEDULABLE
+    with pytest.raises(ValueError, match="pool too small"):
+        _upstream_configs(adapter, tmp_path, MIN_SCHEDULABLE + 10)
+
+
+def _serve_max_len(s, *, preempt=False, max_steps=400):
+    eng = _Engine(s)
+    req = _request(s, "m", range(1, 4096), max_tokens=1)
+    preempted = False
+    for _ in range(max_steps):
+        if not s.requests and not eng.q:
+            return True
+        if preempt and not preempted and req.num_computed_tokens >= 3840 and not eng.q:
+            # The prompt-end anchor (3840) is stored and hashed; resume hits it.
+            s.running.remove(req)
+            s._preempt_request(req, time.time())
+            preempted = True
+        if s.has_requests():
+            eng.schedule()
+        if eng.q:
+            eng.land()
+    return False
+
+
+@pytest.mark.parametrize("preempt", [False, True])
+def test_smallest_accepted_pool_serves_a_max_length_request(adapter, tmp_path, preempt):
+    ok = _scheduler(adapter, tmp_path, num_blocks=MIN_SCHEDULABLE)
+    assert _serve_max_len(ok, preempt=preempt)
+    short = _scheduler(adapter, tmp_path, num_blocks=MIN_SCHEDULABLE - 1)
+    assert not _serve_max_len(short, preempt=preempt)
+
+
+def test_interval_zero_still_counts_working_blocks_and_never_hits(
+    adapter, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS", "0")
+    monkeypatch.setenv("ATOM_STATE_IMAGE_CHECK_BLOCKS", "1")
+    # Interval 0 publishes no image, but the image groups still allocate.
+    with pytest.raises(ValueError, match="pool too small"):
+        _upstream_configs(adapter, tmp_path, 16 + 1 + 11)
+    s = _scheduler(adapter, tmp_path)
+    st = s._atom_state_images
+    eng = _Engine(s)
+    prompt = list(range(1, 1001))
+    _request(s, "z1", prompt, max_tokens=8)
+    eng.drain()
+    assert 0 < st.counters["max_image_blocks_per_request"] <= 2 * K
+    assert st.counters["images_hashed"] == 0
+    # No image, so no prefix hit: never a proxy-only (zero-state) resume.
+    again = _request(s, "z2", prompt, max_tokens=1)
+    eng.schedule()
+    assert again.num_computed_tokens == len(prompt)  # scheduled from 0 in one go
+    assert eng.q[0][0].scheduled_new_reqs[0].num_computed_tokens == 0
+    eng.drain()
 
 
 @pytest.mark.parametrize("hash_block", [BLOCK, BLOCK // 2])

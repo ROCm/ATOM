@@ -25,6 +25,11 @@ from atom.plugin.vllm.paged_state_image import adapter_for_kv_cache_config
 
 logger = logging.getLogger("atom")
 
+# Blocks a running request holds in each image group at its peak: the running
+# block and the previous step's (whose store may still be in flight). vLLM's
+# align mode allocates them whether or not an image is ever published there.
+IMAGE_BLOCKS_PER_GROUP = 2
+
 
 @dataclass(frozen=True)
 class ImagePlacement:
@@ -36,8 +41,10 @@ class ImagePlacement:
     readable mid-step), at the family's block size; generation uses the
     unaimed spacing rule (``decode_keeps``).
 
-    ``interval``: >0 a rung every N tokens, 0 no images at all, -1 no rungs but the
-    anchor and the demand rung still place images (native semantics).
+    ``interval``: >0 a rung every N tokens, 0 no image is published (so no prefix
+    hit: vLLM reports one only with every image group cached; the groups still
+    allocate working blocks), -1 no rungs but the anchor and the demand rung still
+    place images (native semantics).
     """
 
     interval: int
@@ -395,8 +402,9 @@ class SchedulerImages:
         return n
 
     def check_image_blocks(self) -> None:
-        """Instrumented runs: no request may hold more than two images' blocks."""
-        limit = self.placement.images_per_request() * self.k
+        """Instrumented runs: no request may hold more than two blocks per image
+        group (also with checkpointing off, where none is published)."""
+        limit = IMAGE_BLOCKS_PER_GROUP * self.k
         for req in self.scheduler.running:
             n = self.image_blocks_held(req.request_id)
             self.counters["max_image_blocks_per_request"] = max(
@@ -405,7 +413,7 @@ class SchedulerImages:
             if n > limit:
                 raise RuntimeError(
                     f"{self.name} request {req.request_id} holds {n} image blocks, "
-                    f"more than {limit} (2 images x k={self.k})"
+                    f"more than {limit} ({IMAGE_BLOCKS_PER_GROUP} x k={self.k})"
                 )
 
     # -- the worker's store plan ----------------------------------------------
