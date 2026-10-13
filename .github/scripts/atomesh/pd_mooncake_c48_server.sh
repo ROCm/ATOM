@@ -18,6 +18,11 @@ prepare_mooncake_c48_runtime() {
     "${RUNTIME_LOG_DIR}/mooncake-runtime-rank-${NODE_RANK}.json"
   export PYTHONPATH="/tmp/mooncake-c48-site:${PYTHONPATH:-}"
   export PYTHONDONTWRITEBYTECODE=1
+  cc -shared -fPIC -O2 -Wall -Wextra -Werror -I/opt/rocm/include \
+    "${ATOMESH_SCRIPT_DIR}/mooncake-c48/hsa_error_trace.c" -ldl -pthread \
+    -o /tmp/mooncake-c48-hsa-error-trace.so
+  sha256sum /tmp/mooncake-c48-hsa-error-trace.so \
+    > "${RUNTIME_LOG_DIR}/hsa-error-trace-rank-${NODE_RANK}.sha256"
   /tmp/mooncake-c48-venv/bin/python "${ATOMESH_SCRIPT_DIR}/mooncake-dist/verify_rocm_wheel.py" \
     > "${RUNTIME_LOG_DIR}/mooncake-package-rank-${NODE_RANK}.log" 2>&1
   /tmp/mooncake-c48-venv/bin/python - <<'PY'
@@ -78,6 +83,7 @@ start_vllm_server() {
   build_server_cache_env "${role}" "${port}" cache_env
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" \
     env "${cache_env[@]}" MOONCAKE_KERNEL_EVIDENCE_DIR="${RUNTIME_LOG_DIR}/kernel-warmup-${role}" \
+    LD_PRELOAD="/tmp/mooncake-c48-hsa-error-trace.so${LD_PRELOAD:+:${LD_PRELOAD}}" \
     /tmp/mooncake-c48-venv/bin/python "${ATOMESH_SCRIPT_DIR}/pd_mooncake_c48_launch.py" \
     --config "${ATOMESH_SCRIPT_DIR}/../../benchmark/mooncake-c48.json" \
     --role "${role}" --model "${MODEL_PATH}" --host "${host_ip}" --port "${port}" \

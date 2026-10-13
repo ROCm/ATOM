@@ -34,6 +34,7 @@ def trace_warmup(function):
             return function(device)
         import torch
         import triton
+        from vllm._mooncake_startup_state import snapshot
 
         root = Path(directory) / f"{socket.gethostname()}-{os.getpid()}"
         root.mkdir(parents=True, exist_ok=True)
@@ -74,15 +75,20 @@ def trace_warmup(function):
                 "sha256": hashlib.sha256(binary).hexdigest(),
             }
             record["loads"].append(item)
+            (root / "result.json").write_text(json.dumps(record, indent=2) + "\n")
             try:
                 result = original(name, binary, shared, index)
             except Exception as error:
                 item["error"] = repr(error)
+                (root / "result.json").write_text(json.dumps(record, indent=2) + "\n")
                 raise
             item["loaded"] = True
             return result
 
         utils.load_binary = capture
+        previous_trace = os.environ.get("MOONCAKE_TRACE_HSA_ERRORS")
+        os.environ["MOONCAKE_TRACE_HSA_ERRORS"] = "1"
+        snapshot("batch_memcpy_warmup:before")
         try:
             result = function(device)
             torch.cuda.synchronize(device)
@@ -92,6 +98,11 @@ def trace_warmup(function):
             record.update(status="failed", error=repr(error), traceback=traceback.format_exc())
             raise
         finally:
+            snapshot("batch_memcpy_warmup:" + record.get("status", "unknown"))
+            if previous_trace is None:
+                os.environ.pop("MOONCAKE_TRACE_HSA_ERRORS", None)
+            else:
+                os.environ["MOONCAKE_TRACE_HSA_ERRORS"] = previous_trace
             utils.load_binary = original
             try:
                 record["memory_after"] = list(torch.cuda.mem_get_info(device))
