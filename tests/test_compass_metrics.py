@@ -246,6 +246,42 @@ def test_failed_forward_leaves_no_row(recorder):
     assert row["step"] == 1
 
 
+def test_alignment_keeps_repeated_layers_in_place():
+    # A graph replays the all-reduce with another kernel than the eager run,
+    # and the eager run has an extra copy in layer 3 of 20 identical layers.
+    replay = ["ar_graph", "gemm", "norm", "attn"] * 20
+    template = ["ar_eager", "gemm", "norm", "attn"] * 20
+    template.insert(14, "copy")
+    match = compass._align(replay, template)
+    expected = [j if j < 14 else j + 1 for j in range(len(replay))]
+    assert match == expected
+
+
+def test_alignment_leaves_unpairable_kernels_unmatched():
+    match = compass._align(["a", "x", "y", "b"], ["a", "b"])
+    assert match[0] == 0 and match[3] == 1
+    assert match[1:3] == [None, None]
+
+
+def test_renamed_replay_kernels_take_the_template_op():
+    template = {
+        "kernels": ["ar_eager", "gemm"],
+        "streams": [7, 7],
+        "op_index": [0, 1],
+        "ops": [
+            {"op": "aiter::all_reduce", "shapes": [[1, 8]], "dtypes": ["bf16"]},
+            {"op": "aiter::gemm", "shapes": [[1, 8], [8, 8]], "dtypes": ["bf16"]},
+        ],
+    }
+    launch = Ev("hipGraphLaunch", CPU, 0, 5, 20)
+    kernels = [Ev("ar_graph", CUDA, 10, 20, 20), Ev("gemm", CUDA, 21, 30, 20)]
+    for _ in range(2):  # the second replay reuses the cached alignment
+        ar, gemm = compass._graph_rows(3, launch, kernels, "bs1_q1", template)
+        assert (ar["op"], ar["kernels_renamed"]) == ("aiter::all_reduce", 1)
+        assert (gemm["op"], gemm["kernels_renamed"]) == ("aiter::gemm", 0)
+    assert len(template["aligned"]) == 1
+
+
 class FakeProfile:
     opened = 0
 

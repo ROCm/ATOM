@@ -20,13 +20,17 @@ Enabled by ``ATOM_COMPASS_DIR``. Each model-runner rank writes, under
   kernels overlapping on several streams count once. Kernels replayed from a
   CUDA graph are attributed through that graph's template (below): matched
   ones get the op, shapes and dtypes of the template kernel at the same place
-  (``shapes_from: "graph_template"``; their CPU times are the graph launch's).
-  Unmatched replay kernels stay grouped under the graph launch with no shapes.
+  (``shapes_from: "graph_template"``; their CPU times are the graph launch's;
+  ``kernels_renamed`` counts those paired with a template kernel of another
+  name). Unmatched replay kernels stay grouped under the graph launch with no
+  shapes.
 - ``windows.<pid>.jsonl``: one row per op window -- why it opened, the batch
   bucket, the steps it holds ops for, and how many replayed graph kernels the
   templates matched.
 - ``graphs.<pid>.jsonl``: one row per captured CUDA graph template: the
-  graph's ``(bs, max_q_len)`` name and its kernel and op counts.
+  graph's ``(bs, max_q_len)`` name and its kernel and op counts; and, the
+  first time an op window replays a graph, a row with ``sample_step`` holding
+  the template's and that replay's kernel names and streams.
 - ``meta.<pid>.json``: rank identity and collection settings.
 
 Op windows are scheduled per batch bucket (prefill/decode, power-of-two batch
@@ -39,7 +43,7 @@ profiler loses most of the last step's kernels when it stops.
 
 A graph template is the kernel sequence of the eager warmup forward that runs
 right before each graph capture, with the op that launched each kernel. Replay
-kernels are matched to it in GPU start order by kernel name.
+kernels are aligned to it in GPU start order by kernel name.
 
 Forward rows never synchronize the device except for re-anchoring the GPU
 clock every ``ATOM_COMPASS_ANCHOR_S`` seconds. Op windows run the torch
@@ -47,7 +51,6 @@ profiler with ``record_shapes`` and synchronize once when each window closes.
 """
 
 import bisect
-import difflib
 import json
 import logging
 import os
@@ -80,6 +83,12 @@ _WINDOW_IDLE_CLOSE_S = 2.0
 # The profiler drops the trailing GPU activity it has not received when it
 # stops; a template's capture idles this long after its last kernel first.
 _TEMPLATE_DRAIN_S = 0.05
+# Replay-to-template kernel alignment: scores, band half-width, and how many
+# distinct replay sequences per graph keep their alignment cached.
+_ALIGN_MATCH, _ALIGN_RENAME, _ALIGN_GAP = 2, -1, -1
+_ALIGN_BAND = 32
+_ALIGN_CACHE = 8
+_DIAG, _UP, _LEFT = 0, 1, 2
 
 
 def _pow2(n):
@@ -231,6 +240,7 @@ class CompassRecorder:
         self.bucket_seen = {}
         self.bucket_windows = {}
         self.graph_templates = {}  # graph name -> kernel/op template
+        self.graph_samples = set()  # graphs whose names went to graphs.jsonl
         logger.info(
             "Compass recording to %s (op window %d steps every %d, "
             "%d per bucket after %d sightings, max %s)",
@@ -465,6 +475,7 @@ class CompassRecorder:
         for row in rows:
             self.ops_file.write(json.dumps({**self.rank, **row}) + "\n")
         graph_rows = [r for r in rows if r["graph_replay"]]
+        self._write_graph_samples(graph_rows)
         summary = {
             **self.rank,
             "window": self.windows_done,
@@ -479,6 +490,7 @@ class CompassRecorder:
                 for r in graph_rows
                 if r.get("shapes_from") == "graph_template"
             ),
+            "graph_kernels_renamed": sum(r.get("kernels_renamed", 0) for r in rows),
             "close_s": time.perf_counter() - began,
         }
         self.windows_file.write(json.dumps(summary) + "\n")
@@ -496,6 +508,29 @@ class CompassRecorder:
             summary["graph_kernels"],
             summary["close_s"],
         )
+
+    def _write_graph_samples(self, graph_rows):
+        """Once per graph, its template and one replay's kernel names, so the
+        alignment can be checked offline."""
+        replays = {}
+        for r in graph_rows:
+            if r["graph"] in self.graph_templates:
+                replays.setdefault((r["graph"], r["step"]), []).extend(r["kernels"])
+        for (graph, step), kernels in sorted(replays.items()):
+            if graph in self.graph_samples:
+                continue
+            self.graph_samples.add(graph)
+            kernels.sort(key=lambda k: k["start_ns"])
+            sample = {
+                **self.rank,
+                "graph": graph,
+                "sample_step": step,
+                "template_kernels": self.graph_templates[graph]["kernels"],
+                "template_streams": self.graph_templates[graph]["streams"],
+                "replay_kernels": [k["name"] for k in kernels],
+                "replay_streams": [k["stream"] for k in kernels],
+            }
+            self.graphs_file.write(json.dumps(sample) + "\n")
 
     # -- CUDA graph templates -------------------------------------------------
 
@@ -615,11 +650,12 @@ def _attributed_kernels(events, prefixes):
 def graph_template_entries(events):
     """The kernel sequence of a graph's eager warmup forward, in GPU start
     order, each with the index of its launching op (None if no op)."""
-    kernels, op_index, ops, index_of = [], [], [], {}
+    kernels, streams, op_index, ops, index_of = [], [], [], [], {}
     for k, _launch, op, marks in _attributed_kernels(events, (_TEMPLATE_MARK,)):
         if marks[_TEMPLATE_MARK] is None:
             continue
         kernels.append(k.name())
+        streams.append(k.device_resource_id())
         if op is None:
             op_index.append(None)
             continue
@@ -628,18 +664,68 @@ def graph_template_entries(events):
             i = index_of[op.correlation_id()] = len(ops)
             ops.append({"op": op.name(), "shapes": op.shapes(), "dtypes": op.dtypes()})
         op_index.append(i)
-    return {"kernels": kernels, "op_index": op_index, "ops": ops}
+    return {"kernels": kernels, "streams": streams, "op_index": op_index, "ops": ops}
 
 
-def _align(names, template_names):
-    """For each replay kernel, the index of its template kernel or None."""
+def _align(names, template_names, band=_ALIGN_BAND):
+    """For each replay kernel, the index of its template kernel or None.
+
+    A global alignment restricted to a band around the diagonal: layers repeat
+    the same kernel names, so an unbanded longest-match pairs layer i of the
+    replay with layer j of the template and loses everything after. Pairing
+    two different names beats leaving both unmatched: a graph replays some ops
+    with other kernels than their eager run (custom all-reduce).
+    """
+    n, m = len(names), len(template_names)
     if names == template_names:
-        return list(range(len(names)))
-    match = [None] * len(names)
-    matcher = difflib.SequenceMatcher(None, names, template_names, autojunk=False)
-    for a, b, n in matcher.get_matching_blocks():
-        for i in range(n):
-            match[a + i] = b + i
+        return list(range(n))
+    if not n or not m:
+        return [None] * n
+    ids = {}
+    a = [ids.setdefault(x, len(ids)) for x in names]
+    b = [ids.setdefault(x, len(ids)) for x in template_names]
+    neg = float("-inf")
+    band = max(band, m // n + 2)
+
+    def span(i):
+        c = i * m // n
+        return max(0, c - band), min(m, c + band)
+
+    lo, hi = span(0)
+    prev = [neg] * (m + 1)
+    for j in range(hi + 1):
+        prev[j] = j * _ALIGN_GAP
+    trace = [(0, bytearray([_LEFT] * (hi + 1)))]
+    for i in range(1, n + 1):
+        lo, hi = span(i)
+        cur = [neg] * (m + 1)
+        moves = bytearray(hi - lo + 1)
+        ai = a[i - 1]
+        for j in range(lo, hi + 1):
+            best, move = prev[j] + _ALIGN_GAP, _UP
+            if j:
+                diag = prev[j - 1] + (_ALIGN_MATCH if ai == b[j - 1] else _ALIGN_RENAME)
+                if diag > best:
+                    best, move = diag, _DIAG
+                left = cur[j - 1] + _ALIGN_GAP
+                if left > best:
+                    best, move = left, _LEFT
+            cur[j] = best
+            moves[j - lo] = move
+        trace.append((lo, moves))
+        prev = cur
+    match = [None] * n
+    i, j = n, m
+    while i or j:
+        lo, moves = trace[i]
+        move = moves[j - lo]
+        if move == _DIAG:
+            match[i - 1] = j - 1
+            i, j = i - 1, j - 1
+        elif move == _UP:
+            i -= 1
+        else:
+            j -= 1
     return match
 
 
@@ -685,14 +771,23 @@ def _graph_rows(step, launch, kernels, graph, template):
     extra = {"graph_replay": True, "graph": graph}
     if template is None:
         return [_op_row(step, launch.name(), [], [], launch, kernels, **extra)]
-    match = _align([k.name() for k in kernels], template["kernels"])
-    by_op, rest = {}, []
+    names = tuple(k.name() for k in kernels)
+    # Every replay of a graph launches the same kernels: align once.
+    cache = template.setdefault("aligned", {})
+    match = cache.get(names)
+    if match is None:
+        match = _align(list(names), template["kernels"])
+        if len(cache) < _ALIGN_CACHE:
+            cache[names] = match
+    by_op, renamed, rest = {}, {}, []
     for k, m in zip(kernels, match):
         i = None if m is None else template["op_index"][m]
         if i is None:
             rest.append(k)
-        else:
-            by_op.setdefault(i, []).append(k)
+            continue
+        by_op.setdefault(i, []).append(k)
+        if k.name() != template["kernels"][m]:
+            renamed[i] = renamed.get(i, 0) + 1
     rows = []
     for i, ks in by_op.items():
         op = template["ops"][i]
@@ -706,6 +801,7 @@ def _graph_rows(step, launch, kernels, graph, template):
                 ks,
                 **extra,
                 shapes_from="graph_template",
+                kernels_renamed=renamed.get(i, 0),
             )
         )
     if rest:
