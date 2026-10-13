@@ -134,8 +134,8 @@ def apply_vllm_v4_breakable_cudagraph_opt_out() -> bool:
 
 
 # Test-only dispatch counters, one JSON file per process; off unless set.
+# Written on every step: an exit hook would not survive a killed worker.
 _INSTR_DIR = os.environ.get("ATOM_V4_CG_INSTR_DIR") or None
-_INSTR_WRITE_EVERY = 64
 
 
 def _new_counters() -> dict:
@@ -171,8 +171,7 @@ def _instr_step(mode, prefilling: bool, flipped: bool) -> None:
     if flipped:
         _INSTR["flipped"] += 1
         _INSTR["flipped_modes"][name] = _INSTR["flipped_modes"].get(name, 0) + 1
-    if flipped or _INSTR["steps"] % _INSTR_WRITE_EVERY == 0:
-        _instr_write()
+    _instr_write()
 
 
 _dispatch_local = threading.local()
