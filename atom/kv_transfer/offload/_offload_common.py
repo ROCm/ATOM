@@ -608,6 +608,11 @@ class OffloadSchedulerMixin(ABC):
         # external-tier attempt per request; see `_repeat_load_suppressed`.
         self._load_failed_seqs: dict[str, object] = {}
         self.total_suppressed_load_retries = 0
+        #: Load completions discarded because they did not match the active
+        #: operation. The only place a performed load can vanish, and it was
+        #: silent: a dropped completion and a load that was never performed
+        #: produce the same absence downstream.
+        self._dropped_load_completions = 0
         # Repeats of `get_num_new_matched_tokens` served from the remembered
         # tier hit instead of a fresh external-tier lookup.
         self.total_lookups_skipped_by_memo = 0

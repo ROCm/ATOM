@@ -1530,9 +1530,27 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         active = self._active_load_operations.get(sid)
         if isinstance(req_id, LoadOperationId):
             if active is None or active[1] != req_id:
+                # A completion for a load this scheduler no longer considers
+                # active. Dropping it is right -- it belongs to a lifecycle
+                # that has been cancelled or replaced -- but it is the only
+                # place a performed load can vanish, and silence here reads
+                # exactly like a load that was never performed.
+                self._dropped_load_completions += 1
+                logger.warning(
+                    "ATOM offload: completion for %s does not match the "
+                    "active load (%s); dropping it. Total %d",
+                    req_id, active[1] if active else None,
+                    self._dropped_load_completions,
+                )
                 return False
             self._active_load_operations.pop(sid, None)
         elif active is not None:
+            self._dropped_load_completions += 1
+            logger.warning(
+                "ATOM offload: plain-id completion for %s while a load "
+                "operation is active; dropping it. Total %d",
+                sid, self._dropped_load_completions,
+            )
             return False
         self._finish_load_statistics(req_id, succeeded=True)
         self._load_save_floors.pop(sid, None)
