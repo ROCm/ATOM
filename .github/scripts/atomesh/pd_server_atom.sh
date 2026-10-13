@@ -1065,8 +1065,12 @@ start_router() {
   elif is_agentic_multi_prefill; then
     # Pin the session to one prefill. Decode keeps ROUTER_POLICY: a single
     # decode has nothing to stick, and --dp-aware is only for ranks that share
-    # one endpoint.
-    router_prefill_policy_args=(--prefill-policy dp_sticky)
+    # one endpoint. An explicit cache_aware already sets --prefill-policy below
+    # (prefix match keeps a later turn on the prefill holding its prefix), so a
+    # second --prefill-policy here would contradict it.
+    if [[ "${router_policy}" != "cache_aware" ]]; then
+      router_prefill_policy_args=(--prefill-policy dp_sticky)
+    fi
   elif [[ "${#router_rank_mapping_args[@]}" -gt 0 ]]; then
     router_dp_aware_args=(--dp-aware)
   fi
