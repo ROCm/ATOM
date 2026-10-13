@@ -292,6 +292,33 @@ def test_only_a_producer_with_a_drafter_may_miss_a_recording():
     assert ModelRunner._producer_graph_shapes(producer) is None
 
 
+@pytest.mark.parametrize(
+    ("is_pd_producer", "drafter", "is_prefill", "is_dummy_run", "expected"),
+    [
+        (False, True, False, False, True),
+        # The producer's decode surfaces a deferred T0 at q=1: no drafts, so a
+        # rejection pass would select over zero target rows.
+        (True, True, False, False, False),
+        (False, True, True, False, False),
+        (False, True, False, True, False),
+        (True, True, False, True, False),
+        (False, False, False, False, False),
+    ],
+)
+def test_only_a_drafting_decode_verifies(
+    is_pd_producer, drafter, is_prefill, is_dummy_run, expected
+):
+    """Both the spec-decode metadata and its packed indices follow this
+    predicate, so a producer step neither scores nor publishes drafts."""
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
+    if drafter:
+        runner.drafter = SimpleNamespace(mtp_k=3)
+    batch = SimpleNamespace(is_dummy_run=is_dummy_run)
+
+    assert ModelRunner._verifies_drafts(runner, batch, is_prefill) is expected
+
+
 def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
 
