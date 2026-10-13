@@ -492,9 +492,15 @@ _store_plan: dict[str, int] = {}
 
 # The image worker of each registered family's target model in this process.
 _workers: dict[str, ImageWorker] = {}
-# Stores registered by builds: planned, issued right after the step's model
-# forward (the only site), and found still pending at the next build (refused).
-_store_counts = {"planned": 0, "after_forward": 0, "at_next_build": 0}
+# Stores registered by builds: planned; issued right after the step's model
+# forward (no drafter) or, with a drafter, at the next build once the forward
+# ran; found still pending at the next build with no forward run (refused).
+_store_counts = {
+    "planned": 0,
+    "after_forward": 0,
+    "next_build": 0,
+    "at_next_build": 0,
+}
 
 
 def current_image_store_plan() -> dict[str, int]:
@@ -564,22 +570,37 @@ def _apply_runner_patches() -> bool:
 
     wrapped_initialize_kv_cache._atom_state_image_patched = True
     GPUModelRunner.initialize_kv_cache = wrapped_initialize_kv_cache
+    install_store_sites(GPUModelRunner)
+    return True
 
-    original_forward = GPUModelRunner._model_forward
 
-    @functools.wraps(original_forward)
+def install_store_sites(runner_cls) -> None:
+    """Where a step's stores run, on vLLM's V1 runner: after the step's last
+    forward into the slot, on the same stream, outside any capture, before the
+    next step's restores.
+
+    A FULL cudagraph replay never enters the model's Python, so without a
+    drafter that is right after ``_model_forward``. With one, the draft's layers
+    live in the same slot and write it later in the step (``sample_tokens``
+    runs the drafter), so the stores go where native ATOM drains them: into the
+    next batch's build (``run_image_step``), once both forwards ran. The target
+    forward only marks them as run, so a build whose forward never ran is still
+    refused rather than copied.
+    """
+    original = runner_cls._model_forward
+
+    @functools.wraps(original)
     def wrapped_model_forward(self, *args, **kwargs):
-        # A FULL cudagraph replay never enters the model's Python, so the step's
-        # stores run here: after the replay or the forward is enqueued, on the
-        # same stream, outside any capture, before the next step's build.
-        output = original_forward(self, *args, **kwargs)
+        output = original(self, *args, **kwargs)
         for worker in list(_workers.values()):
-            flush_worker(worker)
+            if getattr(self, "speculative_config", None) is None:
+                flush_worker(worker)
+            elif worker.pending_stores:
+                worker.forward_ran = True
         return output
 
     wrapped_model_forward._atom_state_image_patched = True
-    GPUModelRunner._model_forward = wrapped_model_forward
-    return True
+    runner_cls._model_forward = wrapped_model_forward
 
 
 def install() -> tuple[bool, bool, bool, bool]:
@@ -612,6 +633,9 @@ class ImageWorker:
         self.copier = copier
         self.group_ids = list(group_ids)
         self.pending_stores = None
+        # With a drafter: the target forward after the build that planned
+        # ``pending_stores`` ran (they are issued at the next build).
+        self.forward_ran = False
 
 
 def image_unit_ids(
@@ -680,6 +704,7 @@ def flush_worker(worker, site: str = "after_forward") -> None:
         )
     pending = worker.pending_stores
     worker.pending_stores = None
+    worker.forward_ran = False
     slots, units = pending
     execute_image_stores(worker.copier, slots, units)
     _store_counts[site] += len(slots)
@@ -706,7 +731,8 @@ def plan_image_ops(
     forward. A row the scheduler's store plan names (native placement: an
     interval rung, the prompt-end anchor or a demand rung, which prefill was cut
     to end on, or a decode keep) leaves its slot as that boundary's image, stored
-    right after the forward into the block vLLM allocated for it (align mode
+    after the step's forwards (``run_image_step``) into the block vLLM allocated
+    for it (align mode
     keeps the running state block at column ``end // block - 1``) and hashed.
     Results go on ``md`` as ``image_restore_*`` / ``image_store_*``.
     """
@@ -775,13 +801,17 @@ def plan_image_ops(
 def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) -> None:
     """One step's slot work, outside any captured graph, in this order:
 
-    1. refuse stores the last build left behind (its forward never ran);
+    1. the stores the last build left behind: with a drafter, issued here once
+       its forward ran (native drains them into the next batch's build, after
+       the target and the draft forward); refused if it never ran;
     2. ``plan()`` (``plan_image_ops`` with the bridge's row data);
     3. ``reset_fn(md.reset_slots)``: fresh slots back to the reset state;
     4. restores of this step's prefix hits;
-    5. stores registered for right after the forward, where the runner runs
-       them (``GPUModelRunner._model_forward``).
+    5. stores registered for after the step's forwards
+       (``install_store_sites``).
     """
+    if not capturing and worker is not None and worker.forward_ran:
+        flush_worker(worker, "next_build")
     if not capturing and worker is not None and worker.pending_stores:
         # The last build planned stores that its forward never issued, so the
         # slots still hold an earlier position's state while the scheduler has
@@ -814,4 +844,5 @@ def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) ->
         )
     if getattr(md, "image_store_slots", None):
         worker.pending_stores = (md.image_store_slots, md.image_store_units)
+        worker.forward_ran = False
         _store_counts["planned"] += len(md.image_store_slots)
