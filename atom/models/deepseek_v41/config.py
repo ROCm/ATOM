@@ -383,7 +383,6 @@ def validate_runtime_config(config):
             not in (None, "lmcache_mp"),
         ),
         ("RapidServe", config.enable_rapidserve),
-        ("plugin mode", config.plugin_config is not None),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (
