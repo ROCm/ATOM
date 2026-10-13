@@ -165,7 +165,7 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
         hash_block_size=4,
         can_allocate=lambda seq, **kw: hit_blocks,
     )
-    seq = SimpleNamespace(kv_transfer_params=None)
+    seq = SimpleNamespace(id=7, kv_transfer_params=None)
     if not s._lookup_detach_enabled(seq):
         return False, conn
     return s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq)), conn
@@ -487,51 +487,24 @@ def test_an_unstamped_orphan_still_times_out(monkeypatch):
     assert not client.has_orphans()
 
 
-class _FallbackConn:
-    """Declines the detach (the kept prefix is shorter than the probe's)."""
-
-    def __init__(self, detach_ok):
-        self.detach_ok = detach_ok
-        self.detach_calls = []
-        self.matched = []
-
-    def detach_lookup(self, seq, hbm):
-        self.detach_calls.append(hbm)
-        return self.detach_ok
-
-    def get_num_new_matched_tokens(self, seq):
-        self.matched.append(seq)
-        return 32, True
-
-
-def _admitted_seq(num_cached_tokens):
-    return SimpleNamespace(
-        num_cached_tokens=num_cached_tokens,
-        offload_joint=SimpleNamespace(kv_prefix_tokens=0),
-    )
-
-
-def test_declined_detach_after_allocate_runs_the_ordinary_lookup():
-    """`allocate` disowned the probed prefix: the tier must still be asked."""
+def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypatch):
+    """`allocate` disowned the probed prefix, so the detach was declined: the
+    request is requeued and its next pass waits for the lookup as usual,
+    where the remote-load capacity check applies."""
+    from atom.model_engine import scheduler as sched_mod
     from atom.model_engine.scheduler import Scheduler
 
+    monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
-    s.kv_connector = conn = _FallbackConn(detach_ok=False)
-    seq = _admitted_seq(0)
-    assert s._detach_or_query_lookup(seq) is True
-    assert conn.detach_calls == [0]  # re-checked on the kept prefix
-    assert conn.matched == [seq]
-    assert seq.offload_joint.kv_prefix_tokens == 32
-
-
-def test_accepted_detach_after_allocate_skips_the_ordinary_lookup():
-    from atom.model_engine.scheduler import Scheduler
-
-    s = Scheduler.__new__(Scheduler)
-    s.kv_connector = conn = _FallbackConn(detach_ok=True)
-    assert s._detach_or_query_lookup(_admitted_seq(60)) is False
-    assert conn.detach_calls == [60]
-    assert conn.matched == []
+    s.kv_connector = conn = _Conn()
+    s._connector_flag = lambda name: getattr(conn, name, False)
+    s.block_manager = SimpleNamespace(state_offload=None)
+    seq = SimpleNamespace(id=7, kv_transfer_params=None)
+    assert s._lookup_detach_enabled(seq)
+    s._decline_lookup_detach(seq)
+    assert not s._lookup_detach_enabled(seq)
+    s._lookup_detach_declined.discard(seq.id)  # as admission does
+    assert s._lookup_detach_enabled(seq)
 
 
 def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):

@@ -1931,6 +1931,21 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
+            # Detached before the alloc notification, which reads the save
+            # floor `detach_lookup` sets.
+            if lookup_detachable and not self.kv_connector.detach_lookup(
+                seq, int(seq.num_cached_tokens)
+            ):
+                # `allocate` kept less HBM prefix than the probe offered (e.g.
+                # it disowned a boundary whose state checkpoint was lost), so
+                # a tier load may now be worth it. Undo the admission and let
+                # the next pass take the ordinary path, whose lookup and
+                # remote-load capacity check run before `allocate`.
+                self._decline_lookup_detach(seq)
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
+
             # The hit the request kept, not the one `can_allocate` offered:
             # `allocate` may disown the boundary, and `num_cached_blocks` is the
             # pre-disown count. `seq.num_cached_tokens` also gets the unit right
@@ -1942,10 +1957,7 @@ class Scheduler:
             if not seq.prefix_cache_hit_tokens:
                 seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
-            if lookup_detachable:
-                # Before the alloc notification, which reads the save floor.
-                needs_remote_load = self._detach_or_query_lookup(seq)
-
+            self._lookup_detach_declined.discard(seq.id)
             self._notify_connector_after_prefill_alloc(seq)
 
             needs_remote_load = self._confirm_remote_load_after_alloc(
@@ -2422,6 +2434,7 @@ class Scheduler:
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
+        self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
@@ -2574,13 +2587,15 @@ class Scheduler:
     def _lookup_detach_enabled(self, seq: Sequence) -> bool:
         """Whether `seq`'s tier lookup is a candidate for detaching at all.
 
-        False when the feature is off, the connector has no offload tier or
-        no detach support, joint KV/state offload is active (a tier hit can
+        False when the feature is off, an earlier detach of this request was
+        invalidated by `allocate`, the connector has no offload tier or no
+        detach support, joint KV/state offload is active (a tier hit can
         change where it resumes), or the request loads remotely.
         """
         conn = self.kv_connector
         return not (
             not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT
+            or seq.id in self._lookup_detach_declined
             or conn is None
             or not self._connector_flag("is_offload")
             or getattr(conn, "can_detach_lookup", None) is None
@@ -2622,19 +2637,15 @@ class Scheduler:
         num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
         return bool(self.kv_connector.can_detach_lookup(seq, num_hbm_tokens))
 
-    def _detach_or_query_lookup(self, seq: Sequence) -> bool:
-        """Detach `seq`'s lookup after `allocate`, or fall back to the ordinary one.
+    @property
+    def _lookup_detach_declined(self) -> set:
+        """Requests whose detach `allocate` invalidated; they take the
+        ordinary lookup path until admitted or aborted. Created on first use,
+        so schedulers built without `__init__` (test doubles) work."""
+        return self.__dict__.setdefault("_lookup_detach_declined_ids", set())
 
-        The detach decision was taken on the HBM prefix `can_allocate`
-        offered, but `allocate` may disown part of it (for example when the
-        state checkpoint behind the boundary is lost), leaving a gap a tier
-        load could fill. `detach_lookup` re-checks against the prefix the
-        request kept; if it declines, query the tier now so the ordinary
-        load decision still runs. Returns whether the request needs a load.
-        """
-        if self.kv_connector.detach_lookup(seq, int(seq.num_cached_tokens)):
-            return False
-        return self._query_connector_prefill_match(seq, skip=False)
+    def _decline_lookup_detach(self, seq: Sequence) -> None:
+        self._lookup_detach_declined.add(seq.id)
 
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""
