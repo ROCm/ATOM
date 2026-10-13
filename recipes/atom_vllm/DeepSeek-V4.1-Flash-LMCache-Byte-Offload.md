@@ -122,8 +122,10 @@ PAGE pool and a 4 GiB STATE pool per rank. The namespace fix aligns scheduler
 and worker PAGE blocks at 256 tokens while preserving draft blocks at 32.
 Before the holding-queue fix, concurrency 4 returned HTTP 500 on a mixed
 verify / restored tail-prefill batch. After the fix, one long single-client run
-and two concurrency-4 runs passed with new prefix nonces in the **same boot**
-at source `1e3ecb590`; all client/drain exits were zero. The 1,051 tracked ATOM
+and two concurrency-4 runs passed in the **same boot** at source `1e3ecb590`;
+all client/drain exits were zero. Only cold-arm nonces changed between runs;
+the warm document was the same fixed-seed prefix, not three independently
+primed documents. The 1,051 tracked ATOM
 source files were unchanged throughout those runs. This is not independent-boot
 or high-concurrency validation.
 
