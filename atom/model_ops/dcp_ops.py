@@ -1144,6 +1144,32 @@ def dcp_local_context_lens(
 # ---------------------------------------------------------------------------
 
 
+def _dense_rows(weights: torch.Tensor) -> torch.Tensor:
+    """`[rows, heads]` with the row stride the FP4 scorer addresses it by.
+
+    GLM-5.2 takes the fused wk+weights_proj GEMM path, so `weights` reaches us
+    as a COLUMN slice of that GEMM's `[N, index_head_dim + index_n_heads]`
+    output (`torch.split` in DeepseekV32Indexer.forward) -- row stride 160, not
+    32. `flydsl_pa_mqa_logits_fp4` indexes weights as densely packed and
+    asserts `stride(0) == heads`, so the slice trips it.
+
+    `.contiguous()` is NOT a fix here and that is the trap: decode usually has
+    ONE query row per rank, and at `shape[0] == 1` a tensor is contiguous
+    whatever its row stride, so `is_contiguous()` is already True and the call
+    returns the same strided view. The stride is what the kernel reads, so the
+    stride is what has to be checked.
+
+    The copy is `rows * heads` bf16 -- 64 bytes at one decode row -- and is
+    skipped entirely when the layout already matches, which is every caller
+    that does not go through the fused GEMM.
+    """
+    if weights.dim() == 2 and (
+        weights.stride(0) != weights.shape[1] or weights.stride(1) != 1
+    ):
+        return weights.clone(memory_format=torch.contiguous_format)
+    return weights
+
+
 def dcp_decode_candidate_exchange_fused(
     attn_metadata,
     padded_q_fp8_decode_tokens: torch.Tensor,
@@ -1236,7 +1262,7 @@ def dcp_decode_candidate_exchange_fused(
             q_scale[:num_decode_tokens].unsqueeze(1),
             kv_cache,
             kv_scale,
-            weights=weights[:num_decode_tokens],
+            weights=_dense_rows(weights[:num_decode_tokens]),
             max_seq_len=l_max,
             weight_scale=weights_scale,
             kv_block_size=runner_block_size,
