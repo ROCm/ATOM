@@ -331,6 +331,15 @@ class Sequence:
         # the reuse a checkpoint would have delivered — what the EngineStats
         # cache section reports as recoverable.
         self.num_wanted_hit_blocks = 0
+        # Bounded replay (DeepSeek-V4): a hit on the compressed history whose
+        # window state was not restored. `replay_end` is the hit — compressed
+        # KV and indexer K below it are cached and never rewritten — and the
+        # prefill starts at `replay_start`, far enough back that every layer's
+        # window and compressor state at `replay_end` come out exact. The ring
+        # holds nothing below `replay_start`. Both 0 for an ordinary admission;
+        # written by `BlockManager.can_allocate`, cleared by `deallocate`.
+        self.replay_start = 0
+        self.replay_end = 0
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
         # checkpoint can be kept. 0 = nowhere. Both written by

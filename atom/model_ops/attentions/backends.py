@@ -326,6 +326,18 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return None
 
+    def state_replay_tokens(self) -> int:
+        """Tokens below a prefix hit whose recompute rebuilds the state there.
+
+        A state that is a function of only the last few positions of a cached
+        history can be rebuilt with no checkpoint: recompute that many tokens
+        below the hit, reading the cached blocks and writing none of them.
+        `BlockManager` calls it a bounded replay and weighs it against resuming
+        from the nearest checkpoint. 0, the default, says this backend's state
+        cannot be rebuilt that way.
+        """
+        return 0
+
     def state_entry_views(self, slot: int) -> list["torch.Tensor"]:
         """Contiguous views covering the whole of `slot`'s per-request state.
 

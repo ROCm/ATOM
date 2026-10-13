@@ -297,6 +297,11 @@ class BlockManager:
         # Kept plural because GDN's recurrent state is a second member the
         # moment it stops forking (see the state-cache protocol).
         self.state_caches: tuple[StateCache, ...] = (self._state_checkpoint_cache,)
+        # Bounded replay: tokens to recompute below a compressed-history hit so
+        # every layer's window state there comes out exact. 0 = off.
+        self.state_replay_tokens = self._state_replay_tokens(
+            config, state_runtime.replay_tokens
+        )
 
         # Class names already warned about in `state_checkpoint_fates`. See
         # there for why the warning latches.
@@ -513,6 +518,8 @@ class BlockManager:
         are reserved up front. ``ref_count == 1`` blocks recycle their own unit
         and never fail.
         """
+        # The recompute fills the private blocks itself, so nothing is replayed.
+        seq.replay_start = seq.replay_end = 0
         if not self.enable_prefix_caching:
             return True
         table = seq.block_table
@@ -637,6 +644,56 @@ class BlockManager:
     def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
+
+    def _state_replay_tokens(self, config: Config, tokens: int) -> int:
+        """`tokens`, the backend's replay field, or 0 where this manager can't.
+
+        How far below a hit the state rebuilds is the backend's answer
+        (`AttentionMetadataBuilder.state_replay_tokens`, carried here on
+        `StateRuntime`), and 0 when it does not; DeepSeek-V4's is the window's
+        receptive field, see `deepseek_v4_replay`. What is left to ask here is
+        whether the manager can keep a hit with no checkpoint behind it: it
+        needs the prefix index and the PAGE-backed checkpoints a replay stands
+        in for, and no KV connector, whose loads have not learned to replay
+        (yet).
+        """
+        if not tokens:
+            return 0
+        reason = None
+        if self.paged_state_checkpoints is None or not self.enable_prefix_caching:
+            reason = "no PAGE-backed state checkpoints"
+        elif getattr(config, "kv_transfer_config", None):
+            # Every connector load starts at `num_cached_tokens` and raises it
+            # when the load lands, and a replay moves exactly that field below
+            # blocks it has claimed: an LMCache MP load would write those
+            # shared blocks and resume past the replay. Not wired up yet.
+            reason = "a KV connector (connector loads do not replay yet)"
+        if reason is not None:
+            logger.warning("[State Cache] bounded replay off: %s.", reason)
+            return 0
+        logger.info(
+            "[State Cache] bounded replay on: a hit past the nearest checkpoint "
+            "by more than %d tokens replays that many.",
+            tokens,
+        )
+        return tokens
+
+    def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
+        """`hit` widened to `compressed_hit` when replaying is cheaper.
+
+        Resuming from the checkpoint at `hit` recomputes `compressed_hit - hit`
+        blocks; replaying recomputes `state_replay_tokens`. Records the replay
+        window on `seq` when it wins, clears it otherwise.
+        """
+        seq.replay_start = seq.replay_end = 0
+        if not self.state_replay_tokens or not seq.has_per_req_cache:
+            return hit
+        end = compressed_hit * self.hash_block_size
+        if end - hit * self.hash_block_size <= self.state_replay_tokens:
+            return hit
+        seq.replay_end = end
+        seq.replay_start = end - self.state_replay_tokens
+        return compressed_hit
 
     def _gated_hit(
         self,
@@ -955,7 +1012,10 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+        # A checkpoint far below the compressed hit loses to a bounded replay,
+        # which keeps the whole hit and rebuilds the state at its end.
+        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -972,9 +1032,14 @@ class BlockManager:
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
+        #
+        # `resumable`, not the replayed hit: a replay keeps the reuse, but every
+        # later admission that finds no checkpoint at its end pays the replay
+        # again. The gap the gates left is still worth a rung, and the replay's
+        # end, where the state is exact again, is where it lands.
         self._record_checkpoint_demand(
             seq,
-            hit=num_cached_blocks,
+            hit=resumable,
             compressed_hit=compressed_hit,
             block_hashes=block_hashes,
             live_blocks=num_new_blocks,
@@ -1088,6 +1153,14 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
+        if seq.replay_end:
+            # A replay starts from a fresh state slot, never a checkpoint. If
+            # the claim above stopped short of the hit, replay to where it
+            # stopped instead: the floors below it still hold, and the blocks
+            # that were claimed must not be rewritten either way.
+            seq.replay_end = min(seq.replay_end, num_cached_blocks * hbs)
+            seq.replay_start = max(0, seq.replay_end - self.state_replay_tokens)
+            hit_hash = -1
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1110,6 +1183,11 @@ class BlockManager:
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
         seq.num_cached_tokens = num_cached_blocks * hbs
+        if seq.replay_end:
+            # The claimed blocks are already published; the forward starts at
+            # the replay and `hash_blocks` publishes from the hit onward.
+            seq.num_cached_tokens = seq.replay_start
+            seq.num_hashed_tokens = max(seq.num_hashed_tokens, seq.replay_end)
 
         # Per-request cache: claim this seq's slot indices from the
         # pre-allocated state tensor (e.g. GDN mamba_k_cache, the V4 compressor
@@ -1175,9 +1253,12 @@ class BlockManager:
         and at a `hit`, the state (one hash block); and in a forward finishing
         the prompt, `min_final_prefill_rows` rows before its end (decoder
         bounded replay), on the hash-block grid. `start` itself everywhere
-        else."""
+        else. A DeepSeek-V4 bounded replay that `can_allocate` chose for this
+        hit (`_replay_hit`) starts at its replay start instead."""
         if not (seq.has_per_req_cache and start):
             return start
+        if hit and seq.replay_end and start == seq.replay_end:
+            return seq.replay_start
         hbs = self.hash_block_size
         if hit and self.state.transfer.replays:
             start -= hbs
@@ -1661,6 +1742,11 @@ class BlockManager:
         end = min(end, len(seq.block_table))
         if start >= end:
             return
+        if seq.replay_end > start * hbs:
+            # A replayed chunk: below the replay end sits the hit itself, whose
+            # blocks are claimed, already published and shared. Publish from
+            # the hit on, and nothing at all for a chunk that ends inside it.
+            start = min(end, seq.replay_end // hbs)
         h = self._chain_parent_hash(seq, start)
         if h is None:
             return
@@ -1867,6 +1953,11 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # Below a replay's end the state is not exact yet, so neither the cut
+        # nor the keep lands there (`checkpoint_cut`, `checkpointers_at`): a
+        # demand inside the replay would be counted and never filled.
+        if demand < seq.replay_end:
+            demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -2173,7 +2264,11 @@ class BlockManager:
         # request: reuse falls to zero and stays there while the demand counter
         # climbs. Pinned by
         # `test_reuse_another_class_declines_is_not_charged_to_the_ladder`.
-        candidates = [p for p in (rung, demand, anchor) if p and start < p <= end]
+        # A replay's state is exact only from its end on (`checkpointers_at`
+        # keeps nothing below it), so a cut there would buy a forward and no
+        # checkpoint.
+        lowest = max(start, seq.replay_end - 1)
+        candidates = [p for p in (rung, demand, anchor) if p and lowest < p <= end]
         if not candidates:
             return 0
         target = min(candidates)
@@ -2325,6 +2420,10 @@ class BlockManager:
         """
         interval = self.state_checkpoint_interval_tokens
         if interval == 0 or pos <= 0:
+            return []
+        # Inside a bounded replay the upper layers' windows are not exact yet;
+        # they are from `replay_end` on. `checkpoint_cut` skips these too.
+        if pos < seq.replay_end:
             return []
         # -1: no grid, so `pos % interval` has nothing to say and asking it
         # would be a ZeroDivisionError's less honest cousin — -1 divides
@@ -2654,6 +2753,9 @@ class BlockManager:
         seq.checkpoint_demand_pos = 0
         seq.checkpoint_demand_counted = False
         seq.checkpoint_demand_declined = False
+        # A replay floors this admission's forwards; a re-prefill from 0 must
+        # rewrite every block it computes.
+        seq.replay_start = seq.replay_end = 0
         # The anchor is derived from `num_prompt_tokens` alone, so it would
         # still be correct on re-admission — but `_record_checkpoint_end` runs
         # unconditionally in `can_allocate`, and leaving a stale value here

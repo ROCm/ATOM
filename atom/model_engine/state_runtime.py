@@ -130,10 +130,14 @@ class StateTransfer:
 
 @dataclass(frozen=True)
 class StateRuntime:
-    """Validated state transfer and optional checkpoint geometry."""
+    """Validated state transfer, optional checkpoint geometry and replay field."""
 
     transfer: StateTransfer = field(default_factory=StateTransfer.none)
     checkpoint_spec: PagedStateCheckpointSpec | None = None
+    # Tokens below a prefix hit whose recompute rebuilds the state there with
+    # no checkpoint (`AttentionMetadataBuilder.state_replay_tokens`). 0 = the
+    # backend cannot, and a hit resumes only from a checkpoint.
+    replay_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.transfer, StateTransfer):
@@ -143,6 +147,15 @@ class StateRuntime:
         ):
             raise TypeError(
                 "state runtime checkpoint_spec must be a PagedStateCheckpointSpec"
+            )
+        if (
+            not isinstance(self.replay_tokens, int)
+            or isinstance(self.replay_tokens, bool)
+            or self.replay_tokens < 0
+        ):
+            raise ValueError(
+                "state runtime replay_tokens must be a non-negative int, got "
+                f"{self.replay_tokens!r}"
             )
         if self.transfer.copies:
             if self.checkpoint_spec is None:
@@ -166,13 +179,14 @@ class StateRuntime:
             "checkpoint_spec": (
                 None if self.checkpoint_spec is None else self.checkpoint_spec.to_wire()
             ),
+            "replay_tokens": self.replay_tokens,
         }
 
     @classmethod
     def from_wire(cls, wire: object) -> "StateRuntime":
         if not isinstance(wire, Mapping):
             raise TypeError("state runtime must be a mapping")
-        expected = {"transfer", "checkpoint_spec"}
+        expected = {"transfer", "checkpoint_spec", "replay_tokens"}
         if set(wire) != expected:
             raise ValueError(
                 "invalid state runtime fields: "
@@ -187,6 +201,7 @@ class StateRuntime:
         return cls(
             transfer=StateTransfer.from_wire(wire["transfer"]),
             checkpoint_spec=checkpoint_spec,
+            replay_tokens=wire["replay_tokens"],
         )
 
 
