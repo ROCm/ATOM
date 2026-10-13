@@ -4,6 +4,7 @@ checkpoint and accepts any hit, and a prefill resuming somewhere starts early
 enough to rebuild what its forward reads below that point
 (`BlockManager.replay_start`, `Scheduler._resume_prefill`)."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -120,10 +121,12 @@ def test_a_backed_off_chunk_has_to_pass_where_it_resumed():
         long_prefill_token_threshold=128,
         max_num_batched_tokens=16384,
         block_manager=SimpleNamespace(block_size=128),
+        _tick_cost_limit=math.inf,  # no DP prefill cost balancing
     )
     scheduler._chunked_prefill_size = lambda *a: Scheduler._chunked_prefill_size(
         scheduler, *a
     )
+    scheduler._prefill_room = lambda *a: Scheduler._prefill_room(scheduler, *a)
     seq = SimpleNamespace(num_tokens=16484)
     chunk = Scheduler._partial_prefill_chunk
     # backed off one block: 128 recomputed rows plus the 100 left
