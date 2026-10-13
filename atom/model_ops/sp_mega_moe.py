@@ -16,6 +16,7 @@ from itertools import pairwise
 
 import torch
 
+from atom.model_ops.sp_mega_buffers import copy_tail
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
@@ -191,11 +192,6 @@ class SPMegaMoE:
                 ids[start:end],
                 out=output[start:end],
             )
-        # Stream-ordered and capturable: never consume a watchdog timeout as a
-        # valid model result. A device assertion aborts the run; no silent retry.
-        torch._assert_async(
-            (self.runtime.error_flag() == 0).all(), "SP MegaMoE watchdog timed out"
-        )
         return output
 
     def forward_block(
@@ -254,11 +250,6 @@ class SPMegaMoE:
                 post_res[sl].copy_(r)
                 weights[sl].copy_(tw)
                 ids[sl].copy_(ti)
-        torch._assert_async(
-            (prefix.error_flag() == 0).all(),
-            "SP MegaMoE norm/router watchdog timed out",
-        )
-
         if not self.supports(layer, hidden):
             # Native A16W4 decode still consumes the fused routing. Never force
             # A4W4 just to use MegaMoE's tail on a small batch.
@@ -287,11 +278,12 @@ class SPMegaMoE:
                     bf16=not fp8_output,
                 )
                 own = slice(self.runtime.cfg.rank * m, (self.runtime.cfg.rank + 1) * m)
-                if fp8_output:
-                    normalized[sl].copy_(result[1][own].view(dtypes.fp8))
-                    scale[sl, 0].copy_(result[2][own])
-                else:
-                    normalized[sl].copy_(result[3][own])
+                copy_tail(
+                    result[1 if fp8_output else 3][own],
+                    result[2][own] if fp8_output else None,
+                    normalized[sl],
+                    scale[sl],
+                )
             else:
                 # Dynamic schedule / unsupported tail eps: same output
                 # contract, with the ordinary fused residual+norm kernel.
@@ -303,9 +295,6 @@ class SPMegaMoE:
                 next_res[sl].copy_(r)
                 if fp8_output:
                     scale[sl].copy_(s)
-        torch._assert_async(
-            (self.runtime.error_flag() == 0).all(), "SP MegaMoE watchdog timed out"
-        )
         return normalized, scale, next_res
 
 

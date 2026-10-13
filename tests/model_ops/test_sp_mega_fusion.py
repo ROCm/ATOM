@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from test_sp_mega_moe import mock_mega_buffer_ops  # noqa: F401
 
 pytest.importorskip("aiter")
 
@@ -155,7 +156,6 @@ def test_full_op_preserves_rank_rows_residual_and_output_ownership(
             set_weights=Mock(),
             forward=launch,
             tail_ok=lambda m: m >= 16,
-            error_flag=lambda: torch.zeros(1, dtype=torch.int32),
         ),
         allow_activation_change=True,
     )
@@ -164,7 +164,6 @@ def test_full_op_preserves_rank_rows_residual_and_output_ownership(
         eps=1e-6,
         routes=lambda m: m % 16 == 0,
         forward=prefix_forward,
-        error_flag=lambda: torch.zeros(1, dtype=torch.int32),
     )
     backend._route = route
     layer = SimpleNamespace(
