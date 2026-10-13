@@ -1928,11 +1928,36 @@ def sparse_attn_indexer(
         # single chunk fits, the loop runs exactly once and matches the original
         # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
         # column count: the FP4 scorer emits into a padded max-seq-len space.
-        chunk_tokens = sparse_indexer_row_chunk(
-            num_rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        # D'-allgather: split the QUERY rows across the DCP group rather than
+        # the keys. Every rank still holds the whole gathered index cache, so
+        # the rows it scores get the EXACT global top-k, and what crosses the
+        # wire afterwards is the [rows, topk] selection itself. The receiver is
+        # the UNCHANGED `triton_filter_and_convert_dcp_index_prefill` below:
+        # it already takes global flat indices, keeps the positions this rank
+        # owns and compacts them, which is exactly what a gathered selection
+        # needs. `emit_owned_slots` (the _LOCAL path's) cannot serve here -- it
+        # reads LOCAL-plane columns and has no ownership test at all.
+        # shortcut: FP8 scorer only -- the FP4 ragged schedule is built per
+        # chunk against prefill_metadata and does not survive a row
+        # restriction. Upgrade when the FP4 indexer needs this path.
+        q_split = (
+            not indexer_fp4
+            and not dcp_local_prefill
+            and get_dcp_world_size() > 1
+            and envs.ATOM_DCP_INDEXER_PREFILL_QSPLIT
         )
-        for chunk_start in range(0, num_rows, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+        if q_split:
+            rows_per_rank = -(-num_rows // get_dcp_world_size())
+            row_lo = min(get_dcp_rank() * rows_per_rank, num_rows)
+            row_hi = min(row_lo + rows_per_rank, num_rows)
+        else:
+            rows_per_rank = num_rows
+            row_lo, row_hi = 0, num_rows
+        chunk_tokens = sparse_indexer_row_chunk(
+            max(row_hi - row_lo, 1), row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
+        for chunk_start in range(row_lo, row_hi, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, row_hi)
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
@@ -2015,6 +2040,21 @@ def sparse_attn_indexer(
             # virtual-block layout, and COMPACT them to the front -- the same
             # treatment the decode path gets, with the row unit being a query token
             # instead of a request.
+            if q_split:
+                # Rank-major concatenation lands back in ROW order because the
+                # split is contiguous with a uniform stride: rank r scored
+                # [r*rows_per_rank, (r+1)*rows_per_rank), so gathered row i IS
+                # row i. The last rank's send tail is uninitialised and never
+                # read back -- it sits at gathered indices >= num_rows.
+                # Inside this branch rather than beside it: the filter below is
+                # exactly the receiver a gathered selection needs, so the gather
+                # is a step of this path, not an alternative to it.
+                send = topk_indices_prefill.new_empty(
+                    (rows_per_rank, topk_tokens)
+                )
+                send[: row_hi - row_lo] = topk_indices_prefill[row_lo:row_hi]
+                gathered = get_dcp_group().all_gather(send, dim=0)
+                topk_indices_prefill.copy_(gathered[:num_rows])
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.batch_id_per_q_token,

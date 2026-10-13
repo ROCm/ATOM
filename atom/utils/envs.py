@@ -383,6 +383,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_INDEXER_PREFILL_SELECT": lambda: os.getenv(
         "ATOM_DCP_INDEXER_PREFILL_SELECT", "histogram"
     ),
+    # DCP sparse PREFILL, the other way round: keep the whole-index-cache
+    # all-gather this rank already pays for and split the QUERY ROWS across the
+    # group instead of the keys. Each rank then scores rows it holds every key
+    # for, so its top-k is the EXACT global one -- no bracket, no histogram, no
+    # superset -- and what crosses the wire afterwards is the [rows, topk]
+    # selection, all-gathered back to full row coverage. Mutually exclusive with
+    # ATOM_DCP_INDEXER_PREFILL_LOCAL (which shards the keys instead); _LOCAL
+    # wins if both are set. FP8 indexer only. Off by default.
+    "ATOM_DCP_INDEXER_PREFILL_QSPLIT": lambda: (
+        os.getenv("ATOM_DCP_INDEXER_PREFILL_QSPLIT", "0") == "1"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
