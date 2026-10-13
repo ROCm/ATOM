@@ -160,8 +160,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._handoff_loads: set[str] = set()
         self._block_manager = None
         self._lookup_defer_since: dict[str, float] = {}
-        # Admitted requests whose detached lookup has not answered yet.
-        self._detached_lookups: dict[str, object] = {}
         # Unaligned handoff is always on: when the HBM prefix-cache hit is not
         # chunk-aligned, recompute the misaligned head up to the next chunk
         # boundary, then load the aligned remainder from CPU. (Previously gated
@@ -412,6 +410,15 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             elif not self._is_tracked(sid, seq):
                 # Finished while its lookup is in flight: nothing left to fix.
                 del detached[sid]
+
+    @property
+    def _detached_lookups(self) -> dict[str, object]:
+        """Admitted requests whose detached lookup has not answered yet.
+
+        Created on first use, like the MP scheduler's `_pending_session_ends`,
+        so schedulers assembled without this base's `__init__` still work.
+        """
+        return self.__dict__.setdefault("_detached_lookups_by_sid", {})
 
     def _is_tracked(self, sid: str, seq) -> bool:
         entry = self._save_tracker.get(sid)
