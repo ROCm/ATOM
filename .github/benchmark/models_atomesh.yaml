@@ -1018,6 +1018,147 @@ models:
               max_num_seqs: 176
           env: *kimi_k3_agentic_hc_dspark3_reuse_env
 
+        # Smaller blocks on the DSpark3 cells. Under DCP8 the prefix-cache hash
+        # block is block_size x 8, so 128 recomputes on average half of a
+        # 1024-token block after every continuation's prefix; 32 and 16 make it
+        # 256 and 128. Prefill and decode share `block_size`, as the Mooncake
+        # transfer needs. The LMCache chunk follows the virtual block, or a
+        # CPU-tier resume would still round to 1024, and the GPU staging buffer
+        # keeps its bytes (32 chunks of 1024 tokens).
+        - &kimi_k3_agentic_hc_dspark3_bs32
+          <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-bs32-agentic-lmcache-1m-c72
+          display_topology: 1P1D-TP8-DCP8-DSPARK3-BS32
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+              block_size: 32
+          env: &kimi_k3_agentic_hc_dspark3_bs32_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_hc_dspark3_prefill_env
+              LMCACHE_CHUNK_SIZE: "256"
+              OFFLOAD_GPU_STAGING_CHUNKS: "128"
+
+        - <<: *kimi_k3_agentic_hc_dspark3_bs32
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-bs32-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 176
+              block_size: 32
+
+        - &kimi_k3_agentic_hc_dspark3_bs16
+          <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-bs16-agentic-lmcache-1m-c72
+          display_topology: 1P1D-TP8-DCP8-DSPARK3-BS16
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+              block_size: 16
+          env: &kimi_k3_agentic_hc_dspark3_bs16_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_hc_dspark3_prefill_env
+              LMCACHE_CHUNK_SIZE: "128"
+              OFFLOAD_GPU_STAGING_CHUNKS: "256"
+
+        - <<: *kimi_k3_agentic_hc_dspark3_bs16
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-bs16-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 176
+              block_size: 16
+
+        # Prefill context-chunk budget 131072 (default 16384) on the DSpark3
+        # cells. On a prefill-only C72 replay it computed 19% more tokens/s by
+        # cutting the DCP chunk loop's gather / all-gather / merge iterations;
+        # the earlier no-draft CI cells lost 2% (C72) and 32% (C88) to prefill
+        # steps that froze for minutes. Rerun with #2449's warmup.
+        - &kimi_k3_agentic_hc_dspark3_apc131k
+          <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-apc131k-agentic-lmcache-1m-c72
+          display_topology: 1P1D-TP8-DCP8-DSPARK3-APC131K
+          concurrency: [72]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--attn-prefill-chunk-size 131072"
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+
+        - <<: *kimi_k3_agentic_hc_dspark3_apc131k
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-apc131k-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 176
+
+        # Two DCP8 prefills behind the same DSpark3 decode: twice the prefill
+        # capacity, the ceiling for any single-node prefill speedup (CPP8,
+        # chunking, block size). Both prefills carry the 1P1D DSpark3 prefill
+        # env. cache_aware sends a turn to the prefill whose radix tree holds
+        # its prefix, which also catches prefixes shared across sessions;
+        # dp_sticky, the multi-prefill default, pins by session id only.
+        - &kimi_k3_agentic_2p1d_dspark3
+          <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72
+          topology: 2p1d
+          display_topology: 2P1D-TP8-DCP8-DSPARK3
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [72]
+          prefill:
+            workers: 2
+            tp: 8
+            dcp: 8
+          router:
+            policy: cache_aware
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+
+        - <<: *kimi_k3_agentic_2p1d_dspark3
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 176
+
+        - <<: *kimi_k3_agentic_2p1d_dspark3
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c104
+          concurrency: [104]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 208
+
+        - <<: *kimi_k3_agentic_2p1d_dspark3
+          name: kimi-k3-mxfp4-2p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c128
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 256
+
         # Non-disaggregated counterpart to the C72 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
