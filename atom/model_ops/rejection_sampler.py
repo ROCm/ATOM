@@ -351,8 +351,9 @@ class RejectionSampler(nn.Module):
         # [num_draft_rows, vocab_size] fp32: the q each draft token was actually
         # drawn from. None => today's exact-match acceptance.
         draft_probs: torch.Tensor | None = None,
-        # [batch_size] int32: first q row of each request (the draft wrote them
-        # at ITS batch slot, which the scheduler may since have reordered).
+        # [batch_size] int32: first q row of each request, resolved from the
+        # drafter's req_id -> persistent-slot map (the batch has been reordered
+        # since the propose that drew q, and other batches have run in between).
         # A NEGATIVE entry means "no live q for this request"; see the kernel.
         draft_probs_row_base: torch.Tensor | None = None,
         # [batch_size] fp32, pre-clamped. Required with draft_probs.
@@ -881,9 +882,9 @@ def rejection_ratio_sample_kernel(
     q_base = tl.load(draft_row_base_ptr + req_idx)
 
     # A NEGATIVE base means this request has NO live q: it was drafted at an
-    # earlier step and the slot map, which the proposer rebuilds wholesale on
-    # every propose, no longer describes it. Its rows have since been recycled
-    # by other requests. Answering 0 instead reads request 0's distribution --
+    # earlier step and its persistent q slot has since been expired and handed
+    # to another request (`DSparkProposer._claim_q_slot`), so the rows it used
+    # to own are someone else's. Answering 0 reads request 0's distribution --
     # a row that is in range and carries q > 0, so it passes `q_is_prob` and
     # `coin * q < p` then accepts UNCONDITIONALLY. Acceptance RISES while the
     # accepted tokens are unfiltered draft samples; measured, that cost 24.4%

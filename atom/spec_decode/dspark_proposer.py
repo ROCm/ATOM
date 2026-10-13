@@ -19,6 +19,15 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
+#: Persistent q slots, as a multiple of `max_num_seqs`. One slot holds one
+#: LIVE request's block of T rows, and nothing tells this seam when a request
+#: finishes, aborts or is preempted -- a slot is reclaimed only once it becomes
+#: the least recently drafted one (`DSparkProposer._claim_q_slot`). The headroom
+#: above the live set is what keeps that victim a dead request rather than a
+#: running one: with K x max_num_seqs slots, a request is only evicted after
+#: (K - 1) x max_num_seqs OTHER requests drafted since it last did.
+_Q_SLOT_OVERSUBSCRIBE = 2
+
 
 @triton.jit(do_not_specialize=["scheduled_bs", "vocab_max"])
 def _stage_anchors_kernel(
@@ -57,10 +66,13 @@ class DSparkProposer(Drafter):
     draft_sampling = None
     _draft_probs_flat = None
     _draft_probs_row_base_buf = None
-    # None rather than `{}`: a mutable class default is shared by every
-    # instance, and `record_draft_probs_slots` writes to this one every step.
-    # `_init_lossless_sampling` installs the real per-instance dict.
-    _draft_probs_slots = None
+    _q_store = None
+    _q_rows_buf = None
+    # None rather than `{}` / `[]`: a mutable class default is shared by every
+    # instance, and `record_draft_probs_slots` writes to these every step.
+    # `_init_lossless_sampling` installs the real per-instance containers.
+    _q_slot_of = None
+    _q_free = None
     _draft_sample_step = 0
 
     def __init__(self, atom_config, device: torch.device, runner):
@@ -105,7 +117,10 @@ class DSparkProposer(Drafter):
         self.draft_sampling = None
         self._draft_probs_flat = None
         self._draft_probs_row_base_buf = None
-        self._draft_probs_slots = {}
+        self._q_store = None
+        self._q_rows_buf = None
+        self._q_slot_of = {}
+        self._q_free = []
         self._draft_sample_step = 0
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return
@@ -156,34 +171,70 @@ class DSparkProposer(Drafter):
             greedy_mask=torch.ones(max_bs, dtype=torch.int32, device=self.device),
             seed=torch.zeros(1, dtype=torch.int32, device=self.device),
         )
-        # Flat `[max_bs * T, V]` view, which is how the accept kernel addresses
-        # it: one row per (request slot, block position).
+        # Flat `[max_bs * T, V]` view, which is how the block head addresses the
+        # SCRATCH it writes: one row per (batch slot, block position).
         self._draft_probs_flat = probs.view(max_bs * t, vocab)
-        # req_id -> the batch slot that request's q was written at. Keyed by
-        # req_id and NOT by position because continuous batching reorders the
-        # batch between the propose that wrote q and the verify that reads it
-        # -- the same reason `VerifyScheduler` keys its ell map by req_id.
+        # The PERSISTENT q, one row block per LIVE REQUEST rather than per batch
+        # slot. The scratch above is addressed by batch slot because that is
+        # what the captured head can write, and a batch slot is only this
+        # step's: ATOM never mixes prefill and decode in one batch
+        # (`Scheduler.schedule`), so a prefill-only step re-runs propose over
+        # rows `[0, running_bs)` that belong to the DECODE requests whose q has
+        # not been tested yet. Leaving q in the scratch therefore loses it for
+        # every request that was not in the last propose -- measured at ~8-11%
+        # of verify rows at concurrency 16, each forced to reject at position 1.
+        # `record_draft_probs_slots` copies out of the scratch into here after
+        # every propose, so a q survives the steps between the propose that drew
+        # it and the verify that tests it.
+        q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
+        self._q_store = torch.empty(
+            (q_slots * t, vocab), dtype=torch.float32, device=self.device
+        )
+        # req_id -> its persistent slot, in LEAST-RECENTLY-DRAFTED order (a
+        # plain dict is insertion-ordered and `record_draft_probs_slots`
+        # re-inserts). Keyed by req_id and NOT by position because continuous
+        # batching reorders the batch between the propose that wrote q and the
+        # verify that reads it -- the same reason `VerifyScheduler` keys its ell
+        # map by req_id.
+        self._q_slot_of = {}
+        self._q_free = list(range(q_slots - 1, -1, -1))
         self._draft_probs_row_base_buf = CpuGpuBuffer(
             max_bs,
             dtype=torch.int32,
             device=self.device,
             pin_memory=torch.device(self.device).type != "cpu",
         )
+        # Destination rows of the copy-out, int64 because that is what
+        # `Tensor.index_copy_` takes.
+        self._q_rows_buf = CpuGpuBuffer(
+            max_bs * t,
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=torch.device(self.device).type != "cpu",
+        )
         self.model.bind_draft_sampling(self.draft_sampling)
         if self.runner.rank == 0:
             logger.info(
-                "Lossless speculative sampling armed: draft q buffer "
-                "[%d, %d, %d] fp32 (%.0f MiB)",
+                "Lossless speculative sampling armed: draft q scratch "
+                "[%d, %d, %d] fp32 (%.0f MiB) + %d persistent slots (%.0f MiB)",
                 max_bs,
                 t,
                 vocab,
                 probs.numel() * 4 / 2**20,
+                q_slots,
+                self._q_store.numel() * 4 / 2**20,
             )
 
     @property
     def draft_probs(self) -> torch.Tensor | None:
-        """``[max_bs * T, V]`` fp32 q, or None when the greedy pair is running."""
-        return None if self.draft_sampling is None else self._draft_probs_flat
+        """``[slots * T, V]`` fp32 q, or None when the greedy pair is running.
+
+        The PERSISTENT store, not the block head's scratch: a row here belongs
+        to a request for as long as that request lives, which is what lets a
+        verify find the q its drafts were drawn from across the prefill steps
+        that ran in between. `draft_probs_row_base` resolves req_id -> row.
+        """
+        return None if self.draft_sampling is None else self._q_store
 
     def stage_draft_sampling(self, scheduled_bs: int) -> None:
         """Refresh this step's temperatures, greedy mask and Philox key.
@@ -218,27 +269,75 @@ class DSparkProposer(Drafter):
         self.draft_sampling.seed.fill_(self._draft_sample_step)
         self._draft_sample_step = (self._draft_sample_step + 1) & 0x7FFFFFFF
 
+    def _claim_q_slot(self) -> int:
+        """A free persistent q slot, recycling the stalest live one if need be.
+
+        This is the release path. Nothing tells a worker that a request
+        finished, was aborted or was preempted -- `ModelRunner` is handed a
+        `ScheduledBatch`, never a departure -- so a slot is reclaimed by
+        EXPIRY: `_q_slot_of` is in least-recently-drafted order, and the
+        stalest entry is dropped when the free list runs out.
+
+        Dropping it from the map is the safety half. A returning request is
+        then simply absent, so `draft_probs_row_base` answers the -1 sentinel
+        and the kernel rejects at position 1 -- it can never reach the row its
+        old slot now holds for somebody else, which is the 24.4%-accuracy bug.
+
+        The victim is a dead request, not a running one: at most
+        `max_num_seqs` requests are running, each refreshed by the propose that
+        drafted its live block, so with `_Q_SLOT_OVERSUBSCRIBE x max_num_seqs`
+        slots the stalest entry has sat out at least `max_num_seqs` proposes.
+        Expiring rather than raising for the same reason the PCP guard warns:
+        the sentinel costs one request one step's speculation, an exception
+        costs the engine.
+        """
+        if self._q_free:
+            return self._q_free.pop()
+        return self._q_slot_of.pop(next(iter(self._q_slot_of)))
+
     def record_draft_probs_slots(self, req_ids) -> None:
-        """Remember which batch slot each request's q was just written at."""
+        """Park the q just drafted into each request's own persistent rows.
+
+        Must run after EVERY propose that wrote q, align-only ones included:
+        the captured head always writes the scratch at BATCH SLOT rows
+        `[0, running_bs)`, so a propose that does not copy out leaves its q
+        where the next propose will overwrite it.
+
+        One `index_copy_` of `len(req_ids) * T` rows -- ~50 MiB at bs=16,
+        ~25us on MI355X. OUTSIDE the recording, like `stage_draft_sampling`:
+        the destination rows are this step's, so they cannot be baked.
+        """
         if self.draft_sampling is None:
             return
-        self._draft_probs_slots = {req_id: i for i, req_id in enumerate(req_ids)}
+        t = self.draft_tokens_per_seq
+        rows = self._q_rows_buf.np
+        for i, req_id in enumerate(req_ids):
+            # pop-then-insert, so a request that already owns a slot keeps it
+            # AND moves to the fresh end of the eviction order.
+            slot = self._q_slot_of.pop(req_id, None)
+            if slot is None:
+                slot = self._claim_q_slot()
+            self._q_slot_of[req_id] = slot
+            rows[i * t : (i + 1) * t] = range(slot * t, (slot + 1) * t)
+        n = len(req_ids) * t
+        self._q_store.index_copy_(
+            0, self._q_rows_buf.copy_to_gpu(n), self._draft_probs_flat[:n]
+        )
 
     def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
         """``[len(req_ids)]`` int32: each request's first q row, for the accept
         kernel's indirection.
 
         A request absent from the map has NO live q this step, and the kernel is
-        told so with the NEGATIVE SENTINEL -1.
+        told so with the NEGATIVE SENTINEL -1. With persistent slots the only
+        way to be absent is to have never drafted, or to have been expired by
+        `_claim_q_slot` -- not merely to have sat out the last propose.
 
         It used to answer 0, on the premise that an absent request had just
         prefilled and so carried `num_draft_tokens == 0`, leaving the base
         loaded but never dereferenced. That premise is FALSE, and the bug it hid
-        cost 24.4% of inline accuracy. `_draft_probs_slots` is REPLACED WHOLESALE
-        on every propose, so it only ever describes the LAST propose batch: when
-        a propose covers 1-2 requests and the next verify covers ~32, the ~30
-        requests drafted at an earlier step are absent and every one of them read
-        row 0 -- request 0's distribution.
+        cost 24.4% of inline accuracy: those requests all read row 0 -- request
+        0's distribution.
 
         Row 0 is in range and holds q > 0, so it passes the kernel's probability
         guard and `coin * q < p` then accepts UNCONDITIONALLY -- acceptance RISES
@@ -250,7 +349,7 @@ class DSparkProposer(Drafter):
         if self.draft_sampling is None:
             return None
         t = self.draft_tokens_per_seq
-        slots = self._draft_probs_slots
+        slots = self._q_slot_of
         buf = self._draft_probs_row_base_buf
         n = len(req_ids)
         buf.np[:n] = [

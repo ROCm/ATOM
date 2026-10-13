@@ -501,8 +501,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a behaviour-changing flag defaults off.
     #
     # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
-    # q is [bs, T, V] and has to cross the step boundary -- 200 MiB fp32 at
-    # --max-num-seqs 64, V=163840, T=5 -- and the draft step de-fuses, trading
+    # q is [bs, T, V] and has to cross the step boundary. Twice over: the block
+    # head's scratch, plus a persistent store of 2 x max_num_seqs per-request
+    # row blocks, because an intervening prefill-only step would otherwise
+    # overwrite the scratch rows a decode request's pending verify reads --
+    # 200 MiB + 400 MiB fp32 at --max-num-seqs 64, V=163840, T=5, plus one
+    # ~50 MiB index_copy_ per propose. The draft step also de-fuses, trading
     # step latency for acceptance. Measured in isolation on MI355X, the sampling
     # op costs about +36 us per call over the greedy one, at both bs=1 and
     # bs=64; the end-to-end step cost under graph replay has NOT been measured

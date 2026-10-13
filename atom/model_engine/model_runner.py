@@ -3687,11 +3687,14 @@ class ModelRunner:
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
-        # Same stash, same reason, for the draft distribution q: it was written
-        # at THIS step's batch slots and the next step's verify has to find it
-        # after the scheduler has reordered the batch. Keyed by req_id, not by
-        # position. Positional, like `record_ell` above: the block was drafted
-        # from `next_token_ids`, which is in batch-slot order. A no-op on every
+        # Same stash, same reason, for the draft distribution q: the block head
+        # wrote it at THIS step's batch slots, and the verify that tests it runs
+        # after other batches have reused those same slots -- ATOM never mixes
+        # prefill and decode, so a prefill-only step in between overwrites every
+        # decode request's q. This copies each request's rows out into the
+        # persistent block it owns, keyed by req_id, not by position.
+        # Positional, like `record_ell` above: the block was drafted from
+        # `next_token_ids`, which is in batch-slot order. A no-op on every
         # drafter but a DSpark one with lossless sampling armed.
         self.drafter.record_draft_probs_slots(batch.req_ids[: batch.total_seqs_num])
         return self.tokenID_processor.prepare_draft_ids(batch, draft_token)

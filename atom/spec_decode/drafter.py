@@ -358,9 +358,9 @@ class Drafter(abc.ABC):
 
     @property
     def draft_probs(self) -> torch.Tensor | None:
-        """``[max_bs * T, V]`` fp32 q from the LAST propose, or None when this
-        drafter proposes greedily -- every flavor but DSpark, and DSpark with
-        ``ATOM_SPEC_LOSSLESS_SAMPLING=0``, which is the default."""
+        """``[slots * T, V]`` fp32 q, one row block per live request, or None
+        when this drafter proposes greedily -- every flavor but DSpark, and
+        DSpark with ``ATOM_SPEC_LOSSLESS_SAMPLING=0``, which is the default."""
         return None
 
     def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
@@ -372,7 +372,7 @@ class Drafter(abc.ABC):
         return
 
     def record_draft_probs_slots(self, req_ids) -> None:
-        """Remember which batch slot each request's q was just written at."""
+        """Park the q just drafted into each request's own persistent rows."""
         return
 
     @property
