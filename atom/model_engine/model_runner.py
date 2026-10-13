@@ -620,7 +620,9 @@ class tokenIDProcessor:
         # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
         # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
         # being few.
-        if self.use_spec and num_new_seqs > 0:
+        # A P/D producer's decodes and DP dummies carry no drafts
+        # (`num_spec_step == 0`), and such a batch has no draft table.
+        if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
