@@ -39,6 +39,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
 
 from .op import exp
 
@@ -1144,8 +1145,12 @@ def _serial_launch_config(
     cache, us at BV=64 -> 16): bs1 19.9->9.3, bs6 20.2->12.2, bs16 23.3->19.2,
     bs32 33.3->28.7, bs48 38.5->36.4, bs64 even. T=1 takes the T1_* paths,
     where BV=64 stays best; num_stages is flat either way.
+
+    The small-batch rule is gated to gfx950, the only architecture it was
+    measured on. Other targets (gfx942, gfx1250) keep the large-batch config
+    until tests/bench_replayssm_decode.py shows BV=16 winning there too.
     """
-    if not is_kda and max_query_len > 1 and N * HV <= 768:
+    if not is_kda and max_query_len > 1 and N * HV <= 768 and get_gfx() == "gfx950":
         return min(triton.next_power_of_2(V), 16), 1, 3
     return min(triton.next_power_of_2(V), 64), 1, 3
 
