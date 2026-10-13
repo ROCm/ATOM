@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -43,6 +45,117 @@ class _LookupState:
     retrieve_end: int | None = None
 
 
+class _LookupProgress:
+    """Network progress of one async lookup, driven off the scheduler thread.
+
+    Only the message-queue futures are touched here (the MQ client's submit
+    is thread-safe); every piece of ATOM and adapter bookkeeping is still
+    updated by the scheduler thread in `_MPLookupClient._advance`, which
+    reads `phase` and `future` once `done` is set.
+    """
+
+    __slots__ = (
+        "backoff",
+        "cancelled",
+        "done",
+        "future",
+        "next_query",
+        "phase",
+        "request_id",
+    )
+
+    def __init__(self, request_id: str, future: Any) -> None:
+        self.request_id = request_id
+        self.phase = "lookup"
+        self.future = future
+        self.next_query = 0.0
+        self.backoff = 0.0
+        self.done = threading.Event()
+        self.cancelled = False
+
+    def step(self, client: Any, now: float, interval: float) -> None:
+        """Advance without blocking; set `done` on an answer or an error.
+
+        Errors are not handled here: `done` hands the failed future back to
+        the scheduler thread, whose `_advance` raises it as before.
+        """
+        if not self.future.query():
+            return
+        try:
+            result = self.future.result(timeout=0)
+        except Exception:  # noqa: BLE001 -- re-raised by `_advance`
+            self.done.set()
+            return
+        if self.phase == "lookup":
+            self.phase = "status"
+            self.future = client.query_prefetch_status(self.request_id)
+            self.backoff = interval
+        elif result is not None:
+            self.done.set()
+        elif now >= self.next_query:
+            # Still prefetching: ask again, backing off so a slow prefetch
+            # does not flood the server's request thread.
+            self.future = client.query_prefetch_status(self.request_id)
+            self.next_query = now + self.backoff
+            self.backoff = min(self.backoff * 2, interval * _PROGRESS_MAX_BACKOFF)
+
+
+# Upper bound of the status re-query backoff, in progress-thread intervals.
+_PROGRESS_MAX_BACKOFF = 16
+
+
+class _LookupProgressThread:
+    """Advances async lookups while the scheduler thread is in a forward.
+
+    Without it a lookup moves one protocol phase per scheduling pass, so an
+    answer the server has ready is only seen about two forward steps after it
+    was sent. One daemon thread per client; it sleeps while nothing is in
+    flight.
+    """
+
+    def __init__(self, client: Any, interval: float) -> None:
+        self._client = client
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._active: list[_LookupProgress] = []
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="lmcache-lookup-progress", daemon=True
+        )
+        self._thread.start()
+
+    def track(self, progress: _LookupProgress) -> None:
+        with self._lock:
+            self._active.append(progress)
+        self._wake.set()
+
+    def _run(self) -> None:
+        while True:
+            with self._lock:
+                self._active = [
+                    p for p in self._active if not p.cancelled and not p.done.is_set()
+                ]
+                active = list(self._active)
+            if not active:
+                self._wake.wait()
+                self._wake.clear()
+                continue
+            now = time.monotonic()
+            for progress in active:
+                try:
+                    progress.step(self._client, now, self._interval)
+                except Exception:
+                    # A submit failure: leave the phase as is and let the
+                    # scheduler thread's legacy path surface it.
+                    logger.warning(
+                        "LMCache MP lookup progress for %s failed",
+                        progress.request_id,
+                        exc_info=True,
+                    )
+                    progress.done.set()
+            time.sleep(self._interval)
+
+
 class _MPLookupClient:
     """Synchronous lookup facade used by ATOM's existing scheduler policy."""
 
@@ -63,7 +176,7 @@ class _MPLookupClient:
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._lookups: dict[str, _LookupState] = {}
-        # lookup_id -> [request_id, prompt length, phase, future]
+        # lookup_id -> [request_id, prompt length, phase, future, progress]
         self._async: dict[str, list] = {}
         # Prompts of submitted lookups not yet consumed, to free their locks.
         self._async_tokens: dict[str, list[int]] = {}
@@ -82,6 +195,12 @@ class _MPLookupClient:
         # without them falls back to the synchronous lookup.
         missing = [name for name in _ASYNC_ADAPTER_ATTRS if not hasattr(adapter, name)]
         self._async_supported = not missing
+        interval_ms = envs.OFFLOAD_MP_LOOKUP_PROGRESS_MS
+        self._progress = (
+            _LookupProgressThread(adapter._client, interval_ms / 1000.0)
+            if self._async_supported and interval_ms > 0
+            else None
+        )
         if missing:
             logger.warning(
                 "LMCache MP adapter %s lacks %s; tier lookups stay synchronous",
@@ -127,7 +246,17 @@ class _MPLookupClient:
             worker_id=None,
         )
         future = adapter._client.lookup(key, adapter._parallel.tp_size)
-        self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
+        progress = None
+        if self._progress is not None:
+            progress = _LookupProgress(request_id, future)
+            self._progress.track(progress)
+        self._async[lookup_id] = [
+            request_id,
+            len(token_ids),
+            "lookup",
+            future,
+            progress,
+        ]
         self._async_tokens[lookup_id] = token_ids
         return True
 
@@ -159,8 +288,18 @@ class _MPLookupClient:
         """One non-blocking step of an async lookup. True once answered."""
 
         entry = self._async[lookup_id]
-        request_id, _, phase, future = entry
         adapter = self._adapter
+        progress = entry[4]
+        if progress is not None:
+            # The progress thread owns the futures until it is done; then
+            # take over its phase and future and finish below as usual.
+            if not progress.done.is_set():
+                return False
+            entry[4] = None
+            entry[2], entry[3] = progress.phase, progress.future
+            if progress.phase == "status":
+                adapter._pending_lookups.add(entry[0])
+        request_id, _, phase, future, _ = entry
         if phase == "lookup":
             if not future.query():
                 return False
@@ -263,7 +402,11 @@ class _MPLookupClient:
         cannot be freed here and expire only with the L1 read TTL.
         """
         entry = self._async.pop(lookup_id, None)
-        return entry[2] if entry is not None else None
+        if entry is None:
+            return None
+        if entry[4] is not None:
+            entry[4].cancelled = True
+        return entry[2]
 
     def has_orphans(self) -> bool:
         """Whether a discarded lookup still has to answer and free its locks."""

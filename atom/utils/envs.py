@@ -1030,6 +1030,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_ASYNC_LOOKUP_DEPTH": lambda: _nonnegative_int_env(
         "OFFLOAD_ASYNC_LOOKUP_DEPTH", 16
     ),
+    # Poll interval (ms) of the LMCache MP lookup progress thread, which
+    # advances async lookups while the scheduler thread runs a forward. 0
+    # advances them only once per scheduling pass.
+    "OFFLOAD_MP_LOOKUP_PROGRESS_MS": lambda: _finite_float_env(
+        "OFFLOAD_MP_LOOKUP_PROGRESS_MS", 0.0, allow_zero=True
+    ),
     # How long admission may pass over a request whose async lookup has not
     # answered before it waits for the answer instead.
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
