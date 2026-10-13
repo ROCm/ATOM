@@ -279,3 +279,21 @@ def test_counters_are_written(patched, tmp_path):
 
     data = json.loads(files[0].read_text())
     assert data["flipped"] == 1 and data["steps"] == 1
+
+
+def test_counters_hold_every_step_when_the_process_exits(tmp_path):
+    """A normally exiting process with 127 plain (non-flipped) steps."""
+    import json
+    import os
+    import subprocess
+
+    code = (
+        "from atom.plugin.vllm import deepseek_v4_cudagraph_patch as cg\n"
+        "for _ in range(127):\n"
+        "    cg._instr_step(type('M', (), {'name': 'FULL'})(), False, False)\n"
+    )
+    env = dict(os.environ, ATOM_V4_CG_INSTR_DIR=str(tmp_path))
+    subprocess.run([sys.executable, "-c", code], env=env, check=True)
+    (path,) = tmp_path.glob("cg_*.json")
+    data = json.loads(path.read_text())
+    assert data["steps"] == 127 and data["modes"] == {"FULL": 127}
