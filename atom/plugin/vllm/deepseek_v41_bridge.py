@@ -71,7 +71,7 @@ _V41_MODEL_TYPE = "deepseek_v41"
 # Model path -> normalized text config. `atom.config.get_hf_config` reads and
 # normalizes the checkpoint's config.json; doing that once per process keeps
 # the sizing helpers below cheap enough to call from a patch.
-_V41_TEXT_CONFIG_CACHE: dict[int, object] = {}
+_V41_TEXT_CONFIG_CACHE: dict[str, object] = {}
 
 
 def is_deepseek_v41_vllm_config(vllm_config) -> bool:
@@ -93,58 +93,33 @@ def is_deepseek_v41_vllm_config(vllm_config) -> bool:
 
 
 def v41_text_config(vllm_config):
-    """The normalized V4.1 text config, from the config vLLM resolved.
+    """The normalized V4.1 text config, from the checkpoint.
 
-    From vLLM's, not from the checkpoint on disk, because the two differ
-    exactly where it matters: `--hf-overrides` is applied to vLLM's and never
-    reaches the file. Reading the file gave the runtime model, the pool
-    geometry and the attention topology a config the operator had asked to
-    change, with nothing to say so.
+    Not ``vllm_config.model_config.hf_config``, and this was measured rather
+    than assumed. Going through vLLM's own ``ModelConfig`` -- which is what a
+    worker gets -- leaves the shim carrying ``text_config=None`` and no
+    ``vision_config`` at all: vLLM rebuilds it for the fields it reads and
+    does not preserve the nested blocks. ``normalize_hf_config`` needs both,
+    so the resolved object cannot be normalized, whatever is done to the
+    shim's serialization. (Direct ``AutoConfig.from_pretrained`` does keep
+    them, which is why this looks workable until a worker starts.)
 
-    `normalize_hf_config` is still the single authority for the flat field
-    set those three are written against; what changes is only which raw dict
-    it is handed. Cached by the resolved config's identity rather than by
-    model path, since two runs of the same checkpoint with different
-    overrides are different configs.
+    The consequence is that ``--hf-overrides`` cannot reach ATOM's schema on
+    this path. It is refused at startup rather than dropped --
+    ``enforce_deepseek_v41_constraints`` -- so an operator who passes one is
+    told, instead of being served a model that quietly ignores it.
+
+    ``atom.config.get_hf_config`` is the single authority for the
+    normalization, and the runtime model is constructed from the same object.
     """
-    from atom.models.deepseek_v41.config import normalize_hf_config
+    from atom.config import get_hf_config
 
-    resolved = getattr(vllm_config.model_config, "hf_config", None)
-    if resolved is None:
-        raise ValueError(
-            "DeepSeek-V4.1 plugin mode needs vLLM's resolved HF config; "
-            "model_config carries none"
-        )
-    key = id(resolved)
-    config = _V41_TEXT_CONFIG_CACHE.get(key)
+    model = str(vllm_config.model_config.model)
+    config = _V41_TEXT_CONFIG_CACHE.get(model)
     if config is None:
-        config = normalize_hf_config(_v41_resolved_raw(resolved))
-        _V41_TEXT_CONFIG_CACHE[key] = config
+        config = get_hf_config(model)
+        _V41_TEXT_CONFIG_CACHE[model] = config
     return config
-
-
-def _v41_resolved_raw(resolved) -> dict:
-    """vLLM's resolved config as the dict `normalize_hf_config` reads.
-
-    Two things `transformers` does on the way out have to be undone, and
-    both are its doing rather than this checkpoint's:
-
-    * `to_dict` writes `output["model_type"] = self.__class__.model_type`,
-      so a sub-config's type has to come from its class. The shim in
-      `atom.plugin.vllm.register` declares it; this asserts it arrived,
-      because the failure is silent -- an empty `model_type` reads as "not
-      a V4.1 text config" and the override is lost rather than refused.
-    * RoPE standardization renames `rope_scaling` to `rope_parameters`.
-      Restored under the name ATOM's schema uses.
-    """
-    raw = resolved.to_dict()
-    text = raw.get("text_config")
-    if isinstance(text, dict) and "rope_scaling" not in text:
-        rope = text.get("rope_parameters")
-        if rope is not None:
-            text = dict(text, rope_scaling=rope)
-            raw = dict(raw, text_config=text)
-    return raw
 
 
 def v41_kv_cache_dtype(vllm_config) -> str:

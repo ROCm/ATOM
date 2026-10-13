@@ -107,6 +107,38 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
 
+def _refuse_v41_hf_overrides(vllm_config) -> None:
+    """Refuse `--hf-overrides`, which this path cannot honour.
+
+    ATOM's V4.1 schema comes from `normalize_hf_config`, which needs the
+    checkpoint's nested `text_config` and `vision_config`. vLLM's resolved
+    config does not carry them by the time a worker sees it -- measured
+    through `ModelConfig`: `text_config` is None and there is no
+    `vision_config` -- so there is nothing to normalize and the bridge reads
+    the file instead. An override applied to vLLM's object therefore never
+    reaches the model, the pool geometry or the attention topology.
+
+    Loud rather than silent, because the alternative is a server that starts,
+    serves, and answers as though the flag had not been passed. Lifting this
+    means getting the nested blocks through vLLM's own config path, not
+    changing anything here.
+    """
+    mc = getattr(vllm_config, "model_config", None)
+    overrides = getattr(mc, "hf_overrides", None)
+    if not overrides:
+        return
+    msg = (
+        "DeepSeek-V4.1 on the vLLM plugin does not support --hf-overrides "
+        f"({sorted(overrides) if isinstance(overrides, dict) else overrides}): "
+        "ATOM reads this model's config from the checkpoint, because vLLM's "
+        "resolved config does not carry the nested text_config/vision_config "
+        "its schema is built from. The override would be ignored rather than "
+        "applied. Edit the checkpoint's config.json instead."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
 def _refuse_unsupported_v41_speculation(vllm_config) -> None:
     """Admit DSpark, refuse every other speculative method.
 
@@ -261,6 +293,7 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         logger.error(msg)
         raise ValueError(msg)
 
+    _refuse_v41_hf_overrides(vllm_config)
     _refuse_unsupported_v41_speculation(vllm_config)
 
     from vllm.config import CUDAGraphMode

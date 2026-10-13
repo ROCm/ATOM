@@ -457,19 +457,15 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
             if model_arch in _DEEPSEEK_V41_ARCHES:
-                # V4.1 needs the flat schema `normalize_hf_config` produces --
-                # the runtime model, the pool geometry and the attention
-                # topology are all written against it, and the root config is
-                # the AutoConfig shim, which carries none of it. So normalize,
-                # but normalize *vLLM's resolved config* rather than the file:
-                # `--hf-overrides` is applied to the former and never reaches
-                # the latter, and reading the file silently discarded it.
-                # `v41_text_config` caches by the resolved config's identity,
-                # so the bridge's geometry and this model are built from one
-                # object rather than two reads that can disagree.
-                from atom.plugin.vllm.deepseek_v41_bridge import v41_text_config
-
-                self.atom_config.hf_config = v41_text_config(vllm_config)
+                # V4.1 keeps the hf_config it was built with: the runtime
+                # model, the pool geometry and the attention topology are all
+                # written against `normalize_hf_config`'s flat schema, and
+                # vLLM's root config here is the AutoConfig shim, which by the
+                # time a worker sees it carries `text_config=None` and no
+                # `vision_config` -- so it cannot be normalized at all. See
+                # `v41_text_config`. `--hf-overrides` is refused at startup
+                # rather than silently dropped.
+                pass
             else:
                 # root HF config so --hf-overrides survive without losing
                 # multimodal sub-configs such as Kimi-K2.5's

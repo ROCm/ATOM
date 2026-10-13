@@ -247,3 +247,44 @@ class TestInstallSite:
             "register_model must install the V4.1 STATE-tail patch; the "
             "platform hook is not guaranteed to run"
         )
+
+
+class TestHfOverridesAreRefused:
+    """`--hf-overrides` cannot reach ATOM's V4.1 schema, so it is refused.
+
+    Measured through vLLM's own `ModelConfig`, which is what a worker gets:
+    the resolved config carries `text_config=None` and no `vision_config`,
+    and `normalize_hf_config` is built from exactly those two. So the bridge
+    reads the checkpoint, and an override applied to vLLM's object is not in
+    that file. Refusing says so; the alternative is a server that starts and
+    answers as though the flag had not been passed.
+    """
+
+    @staticmethod
+    def _config(overrides):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV41ForCausalLM"],
+                hf_overrides=overrides,
+                model="/models/DeepSeek-V4.1-Flash",
+            ),
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            speculative_config=None,
+            kv_transfer_config=None,
+        )
+
+    def test_an_override_is_refused_by_name(self):
+        from atom.plugin.vllm.platform import _refuse_v41_hf_overrides
+
+        with pytest.raises(ValueError, match="hf-overrides"):
+            _refuse_v41_hf_overrides(
+                self._config({"text_config": {"rms_norm_eps": 1e-5}})
+            )
+
+    def test_no_override_passes(self):
+        from atom.plugin.vllm.platform import _refuse_v41_hf_overrides
+
+        for empty in (None, {}, ()):
+            _refuse_v41_hf_overrides(self._config(empty))
