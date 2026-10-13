@@ -98,6 +98,7 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
+| **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
 ## Kernel / backend selection
 
@@ -320,6 +321,8 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+| **ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS** | int | — (the model's native interval) | vLLM plugin (DeepSeek-V4 checkpoint images): overrides the checkpoint interval in tokens, snapped down to a multiple of the block size. `>0` a rung every N tokens plus the prompt-end anchor and the demand rung; `-1` no rungs, anchor and demand only; `0` no image is published, so there is no prefix hit at all (vLLM reports a hit only when every image group is cached; the image groups still allocate their working blocks). |
+| **ATOM_STATE_IMAGE_CHECK_BLOCKS** | bool | 0 (false) | vLLM plugin (checkpoint images) diagnostic: after every schedule, raise if a request holds more than two blocks in any image group. |
 
 ### LMCache offload tier
 

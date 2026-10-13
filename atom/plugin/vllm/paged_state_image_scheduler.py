@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import resolve_block_hashes
 
 from atom.plugin.vllm.paged_state_image import adapter_for_kv_cache_config
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -56,12 +56,10 @@ class ImagePlacement:
         cls, defaults: tuple[int, bool], block: int, **kwargs
     ) -> ImagePlacement:
         interval, demand = defaults
-        raw = os.environ.get("ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS")
-        if raw:
-            interval = int(raw)
-        raw = os.environ.get("ATOM_STATE_CHECKPOINT_DEMAND")
-        if raw:
-            demand = raw == "1"
+        if envs.ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS is not None:
+            interval = envs.ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS
+        if envs.is_set("ATOM_STATE_CHECKPOINT_DEMAND"):
+            demand = envs.ATOM_STATE_CHECKPOINT_DEMAND
         interval = max(-1, interval)
         if interval > 0 and interval % block:
             snapped = interval // block * block
@@ -180,10 +178,7 @@ class SchedulerImages:
         self._release_keep: dict[str, tuple[int, set]] = {}
         self._release_step = 0
 
-        self.check_blocks = (
-            os.environ.get("ATOM_STATE_IMAGE_CHECK_BLOCKS")
-            or os.environ.get("ATOM_V4_IMAGE_CHECK_BLOCKS")
-        ) == "1"
+        self.check_blocks = envs.ATOM_STATE_IMAGE_CHECK_BLOCKS
         self.counters = {
             "chunks_cut_for_rung": 0,
             "chunks_cut_for_anchor": 0,
