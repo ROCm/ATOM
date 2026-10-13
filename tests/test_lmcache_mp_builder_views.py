@@ -164,6 +164,7 @@ def mla_builder_cls():
                 ATOM_MLA_PAGE_SIZE=1,
                 ATOM_USE_TRITON_MLA=False,
                 ATOM_USE_TRITON_MLA_SHUFFLE_KV=False,
+                ATOM_MLA_KV_SHUFFLED=False,
             ),
             upload_numpy=noop,
         ),

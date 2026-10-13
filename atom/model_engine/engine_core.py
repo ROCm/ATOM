@@ -220,6 +220,7 @@ class EngineCore:
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+                exchange_prefill_costs=self.scheduler.cost_balance,
             )
         )
 

@@ -614,13 +614,14 @@ class tokenIDProcessor:
         # A newly admitted request has no row in `prev_token_ids`, so
         # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
         # must be staged here -- `scheduled_tokens` gave it committed history,
-        # correct only at column 0.
+        # correct only at column 0. A batch without drafts (`num_spec_step ==
+        # 0`: a P/D producer's decodes and DP dummies) has no draft table.
         #
         # Looped, not scattered: measured, the loop wins below ~24 admissions
         # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
         # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
         # being few.
-        if self.use_spec and num_new_seqs > 0:
+        if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
@@ -2522,6 +2523,20 @@ class ModelRunner:
         # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
         return int(q_eff)
 
+    def _verifies_drafts(self, batch: ScheduledBatch, is_prefill: bool) -> bool:
+        """Whether this forward scores drafts with the rejection sampler.
+
+        A P/D producer keeps the drafter only to write its context KV; the
+        scheduler never pads drafts for it, so its decodes (the step that
+        surfaces a deferred T0) are q=1 and have nothing to verify.
+        """
+        return (
+            not is_prefill
+            and hasattr(self, "drafter")
+            and not self.tokenID_processor.is_pd_producer
+            and not batch.is_dummy_run
+        )
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
@@ -2552,7 +2567,7 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
+        if self._verifies_drafts(batch, is_prefill):
             _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
             # Inside the staging window: without the token group it publishes
             # the indices itself. Packed indices already share the token upload.
@@ -2729,14 +2744,14 @@ class ModelRunner:
             token_group.counts[token_group.indices["cu_seqlens_q"]] = cu_count
             spec_group = self.h2d_groups.get("spec_decode")
             if spec_group is not None:
-                if batch.total_tokens_num_prefill == 0 and not batch.is_dummy_run:
+                if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
                     _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
                     spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                         lens, cu[1:], token_group
                     )
                 else:
-                    # A preceding decode may have filled these counts. Prefill
-                    # and dummy forwards must not publish its stale indices.
+                    # A preceding decode may have filled these counts. Forwards
+                    # that verify nothing must not publish its stale indices.
                     for binding in spec_group.members:
                         token_group.counts[token_group.indices[binding.name]] = None
             # No GPU consumer runs between these host producers and this
