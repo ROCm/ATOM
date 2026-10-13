@@ -47,7 +47,12 @@ def _manager(transfer, min_final_rows=0):
 
 def _seq(tokens, cached=0):
     return SimpleNamespace(
-        id=0, has_per_req_cache=True, num_tokens=tokens, num_cached_tokens=cached
+        id=0,
+        has_per_req_cache=True,
+        num_tokens=tokens,
+        num_cached_tokens=cached,
+        replay_start=0,
+        replay_end=0,
     )
 
 
@@ -73,6 +78,17 @@ def test_a_short_last_forward_backs_off_one_block_to_its_window():
     replay = _manager(StateTransfer.replay(), min_final_rows=128)
     assert replay.replay_start(_seq(16385), 16384, hit=True) == 16256
     assert replay.replay_start(_seq(20000), 16384, hit=True) == 16256
+
+
+def test_a_dsv4_bounded_replay_starts_at_its_replay_start():
+    # `can_allocate` chose a DeepSeek-V4 bounded replay for the hit at 9984
+    manager = _manager(StateTransfer.copy("layout"))
+    seq = _seq(20000)
+    seq.replay_start, seq.replay_end = 9984 - 7875, 9984
+    assert manager.replay_start(seq, 9984, hit=True) == 2109
+    # anywhere else it plays no part
+    assert manager.replay_start(seq, 9984, hit=False) == 9984
+    assert manager.replay_start(seq, 8192, hit=True) == 8192
 
 
 def test_a_resume_off_the_block_grid_backs_off_onto_it():
