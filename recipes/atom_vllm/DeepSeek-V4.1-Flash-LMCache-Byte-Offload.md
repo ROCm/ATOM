@@ -40,6 +40,33 @@ vllm serve /data/amd_int/models/DeepSeek-V4.1-Flash \
       "atom.offload.v41.state_interval":4096}}'
 ```
 
+For MP PAGE offload, start the shared server in a separate terminal with the
+same GPU visibility. Use a unique shared-memory name and unused ports:
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 LMCACHE_DISABLE_BANNER=1 lmcache server \
+  --host localhost --port 5561 --chunk-size 256 \
+  --l1-size-gb 32 --eviction-policy LRU \
+  --supported-transfer-mode auto --shm-name dsv41mp_5561 \
+  --no-l1-use-lazy --max-gpu-workers 4 \
+  --http-host 127.0.0.1 --http-port 8086 --prometheus-port 9006
+```
+
+In the model command above, replace only `--kv-transfer-config` with:
+
+```bash
+--kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector",
+  "kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector",
+  "kv_role":"kv_both","kv_load_failure_policy":"recompute",
+  "kv_connector_extra_config":{"atom.offload.backend":"mp",
+    "lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5561,
+    "lmcache.mp.state_transport":"own-pool","lmcache.mp.state_cpu_size_gb":4,
+    "lmcache.mp.tp_rank_collapse":true,"atom.offload.v41.state_interval":4096}}'
+```
+
+This MP configuration has one shared 32 GiB PAGE pool and a separate 4 GiB
+STATE pool per rank, not a 16 GiB PAGE pool per rank.
+
 Keep the explicit draft `kv_cache_dtype`: the target uses the ATOM BF16 pool,
 while DSpark uses its own `fp8_ds_mla` pool. Local HBM prefix reuse is **not yet
 supported by this tested configuration**; keep all three image/local-hit flags
@@ -75,7 +102,8 @@ not CPU tier versus local HBM reuse.
 
 2026-10-13: vLLM `0.31.1.dev0+gdb9527a46.d20261008`, LMCache
 `0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`; configuration above,
-single-client synthetic recall. Supply is warm-tier tokens / warm prompt tokens.
+synthetic recall, concurrency 1 unless specified. Supply is warm-tier tokens /
+warm prompt tokens.
 
 | Backend / run | Blind | Cold | Warm | Tier supply | Verdict |
 |---|---:|---:|---:|---:|---|
@@ -85,19 +113,29 @@ single-client synthetic recall. Supply is warm-tier tokens / warm prompt tokens.
 | MP, short before namespace fix | 0/16 | 16/16 | 16/16 | 0 / 21,520 (0%) | Invalid: no recovery |
 | MP, short after namespace fix | 0/16 | 16/16 | 16/16 | 20,480 / 21,520 (95.2%) | Passed |
 | MP, long after namespace fix | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) | Passed |
-| MP, long, concurrency 4 | 0/16 | 16/16 | Incomplete | Not scored | Failed: mixed verify/prefill step |
+| MP, long, concurrency 4, before holding-queue fix | 0/16 | 16/16 | Incomplete | Not scored | Failed: mixed verify/prefill step |
+| MP, long, after holding-queue fix | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) | Passed |
+| MP, long, concurrency 4, after holding-queue fix, twice | 0/16 | 16/16 | 16/16 | 278,528 / 279,344 (99.7%) each | Passed both runs |
 
 Completed arms had zero cold-tier and local-HBM supply. MP used a 32 GiB shared
 PAGE pool and a 4 GiB STATE pool per rank. The namespace fix aligns scheduler
 and worker PAGE blocks at 256 tokens while preserving draft blocks at 32.
-Concurrency 4 reached warm recovery but the engine rejected a mixed DSpark
-verify / restored tail-prefill batch; the client returned HTTP 500. It is not a
-passing concurrency result. The scheduling guard now also checks vLLM 0.31's
-KV-holding waiting queue; its CPU regression passes, but service revalidation
-of this fix is pending.
+Before the holding-queue fix, concurrency 4 returned HTTP 500 on a mixed
+verify / restored tail-prefill batch. After the fix, one long single-client run
+and two concurrency-4 runs passed with new prefix nonces in the **same boot**
+at source `1e3ecb590`; all client/drain exits were zero. The 1,051 tracked ATOM
+source files were unchanged throughout those runs. This is not independent-boot
+or high-concurrency validation.
+
+Shutdown subsequently logged LMCache `LocalCPUBackend` close errors and AITER
+`free_meta_buffer` destructor errors. They did not occur during the probes;
+vLLM escalated its four workers to SIGKILL on shutdown. All seven recorded
+model/MP processes and their host KFD entries were confirmed absent afterward.
 
 CPU-focused receive/STATE/namespace/scheduling/probe/wait-script regression:
-**517 passed**, plus 69 subtests. These checks and the smoke runs do not establish full
+**520 passed**, plus 69 subtests. This includes a subsequent CPU-only fix for
+running output-history replay beyond the original prompt; graph validation of
+that change is pending. These checks and the smoke runs do not establish full
 GSM8K accuracy, STATE byte equality, high-concurrency capacity safety, or local
 HBM restoration. Those validations remain pending. **No current performance
 result is claimed.**

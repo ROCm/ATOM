@@ -180,6 +180,50 @@ def test_remote_completion_clears_drafts_before_the_original_schedule(monkeypatc
     assert bridge._v41_prepare_kwargs(builder, batch, synthetic=False) == {}
 
 
+@pytest.mark.parametrize("replaying", [True, False])
+def test_running_output_history_uses_the_prefill_lifecycle_flag(replaying):
+    replay = _request(computed=256, prompt=256)
+    replay.num_tokens = 288 if replaying else 257
+    replay.num_output_placeholders = 0
+    replay.is_prefill_chunk = replaying
+    sched = _scheduler([_request(spec=True), replay], [], cap=2)
+    assert _would_mix_prefill_with_drafts(sched) is replaying
+
+
+def test_running_output_replay_clears_drafts_before_schedule(monkeypatch):
+    from atom.plugin.vllm.v41_speculative import patch_v41_speculative_scheduling
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    decode = _request(spec=True, computed=512, prompt=256)
+    decode.spec_token_ids = [1, 2, 3, 4, 5]
+    decode.num_tokens = 513
+    decode.is_prefill_chunk = False
+    replay = _request(computed=256, prompt=256)
+    replay.num_tokens = 288
+    replay.num_output_placeholders = 0
+    replay.is_prefill_chunk = True
+    sched = _scheduler([decode, replay], [], cap=2)
+    sched.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        model_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
+    )
+
+    def original(self):
+        counts = [len(request.spec_token_ids) for request in self.running]
+        lengths = [
+            request.num_tokens + count - request.num_computed_tokens
+            for request, count in zip(self.running, counts)
+        ]
+        return lengths, counts
+
+    monkeypatch.setattr(Scheduler, "schedule", original)
+    assert patch_v41_speculative_scheduling()
+    lengths, counts = Scheduler.schedule(sched)
+    assert lengths == [1, 32]
+    assert counts == [0, 0]
+    assert not decode.spec_token_ids
+
+
 def test_mixed_verify_and_restored_tail_is_still_refused(monkeypatch):
     from atom.plugin.vllm import deepseek_v41_bridge as bridge
 

@@ -168,10 +168,11 @@ def _would_mix_prefill_with_drafts(scheduler) -> bool:
         scheduler.waiting or getattr(scheduler, "kv_holding_waiting", ())
     ) and _admission_is_possible(scheduler):
         return True
-    # A running request can still be mid-prompt: chunked prefill keeps it in
-    # `running` while it works through the rest of its tokens.
+    # Recompute can pass the original prompt and still be replaying output
+    # history. vLLM keeps is_prefill_chunk set until that history is caught up.
     return any(
-        request.num_computed_tokens < request.num_prompt_tokens
+        getattr(request, "is_prefill_chunk", False)
+        or request.num_computed_tokens < request.num_prompt_tokens
         for request in scheduler.running
     )
 
