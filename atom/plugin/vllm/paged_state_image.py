@@ -65,6 +65,9 @@ class PagedStateImageAdapter:
     block_size: int = 0
     #: vLLM attention backend of the image layers (a ``PagedStateImageBackend``).
     backend_cls: type | None = None
+    #: A speculative drafter keeps its state in the target's slot, so an image
+    #: carries it (else images refuse to run with a drafter).
+    draft_state_in_image: bool = False
 
     @property
     def proxy_layer_name(self) -> str:
@@ -315,7 +318,10 @@ def follow_native_hit_rule(vllm_config) -> bool:
     Returns whether it changed the config.
     """
     spec = getattr(vllm_config, "speculative_config", None)
-    if spec is None or not spec.use_eagle() or spec.disable_eagle_block_drop:
+    use_eagle = getattr(spec, "use_eagle", None)
+    if not callable(use_eagle) or not use_eagle():
+        return False
+    if getattr(spec, "disable_eagle_block_drop", False):
         return False
     spec.disable_eagle_block_drop = True
     logger.info(
@@ -373,11 +379,15 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
     k = sizing.spec.units_per_checkpoint
     if pc:
         if getattr(vllm_config, "speculative_config", None) is not None:
-            raise ValueError(
-                f"{adapter.name} prefix caching through checkpoint images does not "
-                "drive the MTP draft proxy; drop --speculative-config or pass "
-                "--no-enable-prefix-caching."
-            )
+            if not adapter.draft_state_in_image:
+                raise ValueError(
+                    f"{adapter.name} prefix caching through checkpoint images does "
+                    "not carry a drafter's state; drop --speculative-config or pass "
+                    "--no-enable-prefix-caching."
+                )
+            follow_native_hit_rule(vllm_config)
+        # Align mode also makes vLLM correct an async spec-decode step's
+        # positions before the metadata build, which decode keeps rely on.
         vllm_config.cache_config.mamba_cache_mode = "align"
     configs = original(vllm_config, kv_cache_specs, available_memory)
     if getattr(vllm_config.model_config, "original_max_model_len", None) == -1:
