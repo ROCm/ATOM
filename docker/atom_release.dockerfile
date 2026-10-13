@@ -480,10 +480,11 @@ ARG INSTALL_MOONCAKE=1
 # `mooncake.store` client of the mooncake_store offload connector
 # (ATOM_KV_OFFLOAD=mooncake_store) and the `mooncake_master` /
 # `mooncake_client` processes the atomesh launcher starts (MOONCAKE_STORE=1).
-# Off unless asked for, so an image that only moves P->D KV keeps its build:
-# the Store adds dependencies (cachelib) that may not build on every base.
-# docker-release.yaml asks for it.
-ARG INSTALL_MOONCAKE_STORE=0
+# On by default: nothing runs the Store unless one of those two asks for it, so
+# P->D KV through the TransferEngine moves as it does without the Store.
+# INSTALL_MOONCAKE_STORE=0 configures WITH_STORE=OFF, for a base on which a
+# Store dependency (cachelib) does not build.
+ARG INSTALL_MOONCAKE_STORE=1
 # Upstream Mooncake release tag with HIP dma-buf MR support.
 # Note: this tag does not include the Ionic QP atomic resource clamp.
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"

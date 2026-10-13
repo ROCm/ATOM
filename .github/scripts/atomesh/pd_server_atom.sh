@@ -1228,15 +1228,15 @@ check_mooncake_store_settings() {
 }
 
 # The image must carry the Store: the master and owner binaries, which only a
-# Mooncake built WITH_STORE=ON installs (atom_release.dockerfile with
-# INSTALL_MOONCAKE_STORE=1, as the release images are), and the mooncake.store
-# module the prefill workers' connector imports. Without them a Store process would only
+# Mooncake built WITH_STORE=ON installs (atom_release.dockerfile builds it
+# unless INSTALL_MOONCAKE_STORE=0), and the mooncake.store module the prefill
+# workers' connector imports. Without them a Store process would only
 # "exit unexpectedly", or the workers fail late in their startup.
 check_mooncake_store_image() {
   local binary
   for binary in mooncake_master mooncake_client; do
     if ! command -v "${binary}" >/dev/null 2>&1; then
-      echo "[mooncake-store][FAIL] ${binary} is not on PATH: MOONCAKE_STORE=1 needs an image whose Mooncake is built WITH_STORE=ON (INSTALL_MOONCAKE_STORE=1)" >&2
+      echo "[mooncake-store][FAIL] ${binary} is not on PATH: MOONCAKE_STORE=1 needs an image whose Mooncake is built WITH_STORE=ON (not INSTALL_MOONCAKE_STORE=0)" >&2
       exit 2
     fi
   done
