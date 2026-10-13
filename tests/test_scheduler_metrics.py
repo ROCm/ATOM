@@ -451,6 +451,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
         schedule=lambda: next(proposals),
         take_rejected=list,
         mark_pp_inflight=lambda _: None,
+        prefill_delayer=None,
     )
     proc.runner_mgr = SimpleNamespace(
         call_func=lambda name, *a, **k: dispatched.append(name)
