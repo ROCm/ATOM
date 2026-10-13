@@ -1506,6 +1506,25 @@ models:
               <<: *dsv4_0813_agentic_ep8_mega_mp_ix_prefill
               OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT: "1"
 
+        # skiplookup + prefill state pool sized to what prefill uses: the
+        # state sub-pool is max_num_seqs slots of ~27 MB each, and prefill
+        # peaks at ~30 of 512 (13 GB/GPU reserved, unused) while its paged KV
+        # pool is full and evicting. 64 slots return ~12 GB/GPU to the KV pool.
+        - <<: *dsv4_0813_agentic_ep8_mega_mp_ix
+          name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-ix-skiplookup-pseqs64-c256
+          display_topology: 1P1D-DPA-TP8-EP8P-MEGA-EPLB-MP-DSPARK3-IX-SKIPLOOKUP-PSEQS64
+          server:
+            common_args:
+              max_num_seqs: 64
+              decode_max_num_seqs: 512
+              gpu_memory_utilization: 0.9
+              max_model_len: 1000000
+          env:
+            common: {}
+            prefill:
+              <<: *dsv4_0813_agentic_ep8_mega_mp_ix_prefill
+              OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT: "1"
+
         - <<: *dsv4_0813_agentic_ep8_mega_mp_ix
           name: ds-v4-0813-1p1d-dpa-tp8-dspark3-agentic-ep8-mega-mp-ix-skiplookup-noanchor-c256
           display_topology: 1P1D-DPA-TP8-EP8P-MEGA-EPLB-MP-DSPARK3-IX-SKIPLOOKUP-NOANCHOR
