@@ -301,6 +301,31 @@ def check_image_groups(cfg, adapter, sizing) -> None:
         )
 
 
+def follow_native_hit_rule(vllm_config) -> bool:
+    """Native ATOM's prefix-hit rule under an EAGLE-class drafter (MTP): no
+    block dropped beyond the last one, which is always recomputed for logits.
+
+    vLLM drops one more block for EAGLE drafters because a draft's paged KV row
+    at a cached block's last position was computed with the token after the
+    block, which a reader may not share. A family whose draft has no pages and
+    keeps its state in the slot gets that state back from the image, as native
+    restores it; the one row computed with the writer's next token only steers
+    proposals, which the target verifies. Sets vLLM's own
+    ``disable_eagle_block_drop`` (EngineCore, before the scheduler is built).
+    Returns whether it changed the config.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None or not spec.use_eagle() or spec.disable_eagle_block_drop:
+        return False
+    spec.disable_eagle_block_drop = True
+    logger.info(
+        "ATOM image prefix caching: the draft's state is in the checkpoint "
+        "image, so prefix hits follow native ATOM's rule "
+        "(disable_eagle_block_drop=True)"
+    )
+    return True
+
+
 def _refit_max_model_len(vllm_config, configs, proxy_name, sizing) -> None:
     """``--max-model-len -1``: vLLM fitted the length to every physical block;
     fit it again to the blocks left once the slot tail is withheld (minus the
