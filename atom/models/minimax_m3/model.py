@@ -347,7 +347,11 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, x_scale: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if x_scale is not None:
+            raise ValueError("MiniMaxM3MoE does not accept prequantized input")
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
@@ -628,6 +632,39 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
 
+def _minimax_m3_input_norm(layer, hidden_states, residual):
+    hidden_states_scale = None
+    fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
+        layer.self_attn.qkv_proj
+    )
+    if layer._m3_fused_gemma_fp8 and fuse_input_ar_rmsnorm_quant:
+        hidden_states, hidden_states_scale, residual = fused_m3_gemma_norm_fp8(
+            hidden_states,
+            layer.input_layernorm.weight,
+            layer.input_layernorm.variance_epsilon,
+            residual,
+        )
+    elif residual is None:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+    elif layer._tp_replicated_o_proj:
+        # The previous layer reduced only its increment; the replicated
+        # residual is added locally, outside QuickReduce quantization.
+        hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+    elif fuse_input_ar_rmsnorm_quant:
+        hidden_states, hidden_states_scale, residual = (
+            fused_allreduce_gemma_rms_norm_quant(
+                hidden_states, residual, layer.input_layernorm
+            )
+        )
+    else:
+        hidden_states, residual = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, layer.input_layernorm
+        )
+
+    return hidden_states, hidden_states_scale, residual
+
+
 class MiniMaxM3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -687,43 +724,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         capture_aux: bool = False,
+        *,
+        input_normalized: bool = False,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor | None]
         | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]
     ):
         tokens = hidden_states.shape[0]
-        hidden_states_scale = None
-        fuse_input_ar_rmsnorm_quant = _linear_consumes_per_token_fp8(
-            self.self_attn.qkv_proj
-        )
+        if not input_normalized:
+            hidden_states, hidden_states_scale, residual = _minimax_m3_input_norm(
+                self, hidden_states, residual
+            )
         fuse_post_attention_ar_rmsnorm_quant = (
             not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj)
         )
-        if self._m3_fused_gemma_fp8 and fuse_input_ar_rmsnorm_quant:
-            hidden_states, hidden_states_scale, residual = fused_m3_gemma_norm_fp8(
-                hidden_states,
-                self.input_layernorm.weight,
-                self.input_layernorm.variance_epsilon,
-                residual,
-            )
-        elif residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        elif self._tp_replicated_o_proj:
-            # The previous layer reduced only its increment; the replicated
-            # residual is added locally, outside QuickReduce quantization.
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        elif fuse_input_ar_rmsnorm_quant:
-            hidden_states, hidden_states_scale, residual = (
-                fused_allreduce_gemma_rms_norm_quant(
-                    hidden_states, residual, self.input_layernorm
-                )
-            )
-        else:
-            hidden_states, residual = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.input_layernorm
-            )
 
         # Eagle3 aux hidden state = the all-reduced residual stream entering this
         # layer (post input-norm). Captured here, not as `hidden_states + residual`
@@ -862,20 +878,79 @@ class MiniMaxM3Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states: list[torch.Tensor] = []
+        input_normalized = False
+        hidden_states_scale = None
         for idx in range(self.start_layer, self.end_layer):
-            if idx in self.aux_hidden_state_layers:
-                hidden_states, residual, aux_hidden_state = self.layers[idx](
-                    positions, hidden_states, residual, capture_aux=True
+            layer = self.layers[idx]
+            mega_name = getattr(layer, "_sp_mega_layer_name", None)
+            if mega_name is not None:
+                if not input_normalized:
+                    hidden_states, hidden_states_scale, residual = (
+                        _minimax_m3_input_norm(layer, hidden_states, residual)
+                    )
+                if idx in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(residual.clone())
+                hidden_states = layer.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    hidden_states_scale=hidden_states_scale,
                 )
-                aux_hidden_states.append(aux_hidden_state)
+                next_layer = self.layers[idx + 1] if idx + 1 < self.end_layer else None
+                next_norm = (
+                    next_layer.input_layernorm if next_layer is not None else self.norm
+                )
+                next_fp8 = next_layer is not None and _linear_consumes_per_token_fp8(
+                    next_layer.self_attn.qkv_proj
+                )
+                moe = layer.block_sparse_moe
+                hidden_states, hidden_states_scale, residual = (
+                    torch.ops.aiter.minimax_m3_sp_mega_block(
+                        hidden_states,
+                        residual,
+                        layer.post_attention_layernorm.weight,
+                        moe.gate.weight,
+                        moe.e_score_correction_bias,
+                        next_norm.weight,
+                        mega_name,
+                        next_norm.variance_epsilon,
+                        next_fp8,
+                    )
+                )
+                input_normalized = True
             else:
-                hidden_states, residual = self.layers[idx](
-                    positions, hidden_states, residual
+                # A tail may feed a dense layer too. Its input norm has already
+                # run; the dense FFN still leaves an increment for the next norm.
+                kwargs = (
+                    {
+                        "input_normalized": True,
+                        "hidden_states_scale": hidden_states_scale,
+                    }
+                    if input_normalized
+                    else {}
                 )
+                if idx in self.aux_hidden_state_layers:
+                    hidden_states, residual, aux_hidden_state = layer(
+                        positions, hidden_states, residual, capture_aux=True, **kwargs
+                    )
+                    aux_hidden_states.append(aux_hidden_state)
+                else:
+                    hidden_states, residual = layer(
+                        positions, hidden_states, residual, **kwargs
+                    )
+                input_normalized = False
+                hidden_states_scale = None
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        if input_normalized:
+            # The last MoE tail used the final Gemma norm, with BF16 output.
+            return (
+                (hidden_states, aux_hidden_states)
+                if aux_hidden_states
+                else hidden_states
             )
 
         if self._tp_replicated_o_proj:
