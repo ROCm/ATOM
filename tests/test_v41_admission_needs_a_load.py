@@ -125,7 +125,7 @@ def test_speculation_and_this_connector_are_refused_together():
     cfg = SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=3)
     )
-    with pytest.raises(ValueError, match="has not been run with"):
+    with pytest.raises(ValueError, match="works and is not yet trusted"):
         conn._refuse_v41_speculation_with_offload(cfg)
 
 

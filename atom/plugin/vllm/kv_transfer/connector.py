@@ -282,24 +282,31 @@ def _refuse_v41_speculation_with_offload(vllm_config) -> None:
     if n <= 0:
         return
     raise ValueError(
-        "DeepSeek-V4.1: AtomLMCacheOffloadConnector has not been run with "
-        f"speculative decoding ({n} draft tokens) to any useful end. It "
-        "boots, answers correctly and reuses nothing: measured, blind 0/16, "
-        "cold 16/16, warm 16/16 with zero stale-cursor refusals, and 0.0% of "
-        "the prompt supplied by the tier against 95.2% without drafts.\n\n"
-        "The reason is the store side, not the load side. A STATE boundary "
-        "may only sit on a whole PAGE block, and the sweep stores one when "
-        "the frontier LANDS on that grid exactly. Without drafts a decode "
-        "step advances by one token, so the frontier takes every value and "
-        "cannot miss a boundary; with them it advances by one to six and "
-        "steps over it. The tier is then empty at every position a later "
-        "request asks about.\n\n"
-        "Fixing it means storing at a boundary the frontier CROSSED rather "
-        "than one it landed on, which needs the state at that boundary and "
-        "not at the step's end. Drop --speculative-config, drop the "
-        "connector, or set ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1 to run it "
-        "knowing the tier is dead weight."
+        "DeepSeek-V4.1: AtomLMCacheOffloadConnector with speculative "
+        f"decoding ({n} draft tokens) works and is not yet trusted. "
+        "Measured: blind 0/16, cold 16/16, warm 16/16, 89.6% of the prompt "
+        "supplied by the tier, zero stale-cursor refusals, nine state loads "
+        "attempted and nine completed.\n\n"
+        "What keeps it behind this gate is that one dispatched load per run "
+        "still has to be withdrawn by `_reap_dispatched_loads` -- it is "
+        "performed, retrieves its tokens, and never reports. The withdrawal "
+        "costs that request a recomputed prefix and is why the run finishes "
+        "at all; the reason the report goes missing under drafts and never "
+        "without them is not known.\n\n"
+        "Set ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1 to run it knowing that, "
+        "or drop one of the two."
     )
+
+
+#: Scheduler steps a load may wait for its two halves to meet. Generous,
+#: because a legitimate wait is one or two steps and the cost of being wrong
+#: in this direction is one recomputed prefix, while being wrong in the
+#: other direction is a request that never completes.
+#: Scheduler steps a dispatched load may go unreported before it is
+#: withdrawn. Generous: a healthy load reports within a step or two, and
+#: being wrong this way costs one recomputed prefix while being wrong the
+#: other way costs the request.
+_DISPATCHED_LOAD_GRACE_STEPS = 256
 
 
 class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -448,6 +455,21 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._v41_views = None
         self._v41_leg = None
         self._state_load_failure_reports: dict[str, int] = {}
+        #: Requests whose PAGE half landed while the STATE half has not, and
+        #: for how many scheduler steps. Non-zero and growing is the
+        #: livelock; the join has no other way to say it is stuck.
+        self._kda_join_waiting: dict[str, int] = {}
+        #: How long each armed-but-unjoined load has waited, in scheduler
+        #: steps, and how many were given up on. Non-zero abandonment is a
+        #: bug somewhere else; it is bounded here so it costs a recompute
+        #: instead of the request.
+        #: Loads vLLM has been handed and has not reported back, aged in
+        #: scheduler steps. `_check_promised_loads` watches the step before
+        #: this one -- a promise that never becomes a dispatch -- and settles
+        #: its entry at dispatch, so without this nothing watches the gap
+        #: between a load going out and its result coming back.
+        self._dispatched_loads: dict[str, list[int]] = {}
+        self._dispatched_load_abandoned = 0
         # vLLM Request objects for the requests this connector has seen. The
         # recurrent key is derived from `request.block_hashes`, and a boundary
         # hand-off names only a request id. These are the scheduler's own
@@ -1504,6 +1526,54 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for store in stores:
             tier.submit_store(store, ready_event)
 
+    def _reap_dispatched_loads(self, inner) -> list[tuple[str, list[int]]]:
+        """Withdraw a load that was dispatched and never reported.
+
+        `_check_promised_loads` covers the other half of this: a promise that
+        never became a dispatched load. A promise is settled the moment it IS
+        dispatched, so nothing watches it afterwards -- and a load that is
+        dispatched, performed, and then never reported leaves the request
+        parked for good. Measured on DSpark: 12 state loads armed against 11
+        completed, three runs out of three, with the odd one retrieving its
+        1280 tokens and never arriving; one request was then re-examined
+        617k times while the client waited.
+
+        Aged here rather than in `_join_kda`, because the stall is quiescent:
+        the request is parked, nothing runs, the worker produces no output
+        and the join is never called. A bound counted there advances only
+        while the engine is busy, which is exactly when it is not needed --
+        measured, that counter stayed at zero through a run that hung.
+        """
+        for meta in getattr(inner, "requests", ()) or ():
+            if getattr(meta, "load_operation", None) is None and (
+                getattr(meta, "load_spec", None) is None
+            ):
+                continue
+            rid = str(getattr(meta, "req_id", "") or "")
+            if rid and rid not in self._dispatched_loads:
+                spec = getattr(meta, "load_spec", None)
+                start = int(getattr(spec, "hbm_cached_tokens", 0) or 0)
+                end = int(getattr(spec, "lmcache_cached_tokens", 0) or 0)
+                self._dispatched_loads[rid] = [0, start, max(0, end - start)]
+        withdrawn: list[tuple[str, list[int]]] = []
+        for rid in list(self._dispatched_loads):
+            state = self._dispatched_loads[rid]
+            state[0] += 1
+            if state[0] <= _DISPATCHED_LOAD_GRACE_STEPS:
+                continue
+            _, start, need = self._dispatched_loads.pop(rid)
+            self._dispatched_load_abandoned += 1
+            withdrawn.append((rid, self._promised_block_ids(rid, start, need)))
+        if withdrawn:
+            logger.error(
+                "ATOM LMCache offload: %s dispatched a load that never "
+                "reported within %d steps; withdrawing it so the request "
+                "leaves WAITING_FOR_REMOTE_KVS and recomputes",
+                sorted(r for r, _ in withdrawn),
+                _DISPATCHED_LOAD_GRACE_STEPS,
+            )
+        return withdrawn
+
     def _join_kda(self, dense_recving: set[str]) -> set[str]:
         """Hold a finished dense load until its recurrent half has landed.
 
@@ -1558,7 +1628,27 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in sorted(self._kda_dense_done):
             result = self._kda_results.pop(req_id, None)
             if result is None:
+                # The PAGE half landed and the STATE half has not. The
+                # request stays in `_kda_dense_done` and waits. Counted,
+                # because waiting forever and waiting one more step produce
+                # the same output here, and one of them is a livelock: a
+                # promised load that is never discharged leaves the request
+                # in WAITING with `num_computed` at zero for the life of the
+                # process.
+                self._kda_join_waiting[str(req_id)] = (
+                    self._kda_join_waiting.get(str(req_id), 0) + 1
+                )
+                n = self._kda_join_waiting[str(req_id)]
+                if n in (1, 8, 64) or n % 512 == 0:
+                    logger.warning(
+                        "ATOM LMCache offload: %s has its dense half and no "
+                        "recurrent state result after %d scheduler steps; "
+                        "its promised load cannot be discharged until one "
+                        "arrives",
+                        req_id, n,
+                    )
                 continue
+            self._kda_join_waiting.pop(str(req_id), None)
             self._kda_dense_done.discard(req_id)
             self._kda_expect.discard(req_id)
             released.add(req_id)
@@ -2175,6 +2265,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 seq.set_num_cached_tokens(min(int(num_tokens), covered))
         inner = self._scheduler.build_connector_meta()
         abandoned_loads = self._check_promised_loads(inner)
+        abandoned_loads += self._reap_dispatched_loads(inner)
         # Before `_collect_releases`, so a save abandoned on this step turns
         # into a release on this step rather than on the next one.
         self._reconcile_stale_saves()
@@ -2214,6 +2305,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
             kda_loads = list(kda_loads) + self._v41_planner.take_loads()
             self._v41_planner.log_stats()
+
         return AtomOffloadMetadata(
             inner,
             preempted,
@@ -2591,6 +2683,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         for req_id in connector_output.finished_recving or ():
             rid = str(req_id)
             self._promised_loads.pop(rid, None)
+            self._dispatched_loads.pop(rid, None)
             state_failed = self._state_load_failure_reports.pop(rid, 0) > 0
             for planner in (self._kda_planner, self._v41_planner):
                 if planner is not None:
