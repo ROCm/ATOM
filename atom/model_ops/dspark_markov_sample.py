@@ -218,6 +218,70 @@ def _dspark_markov_argmax_stage2(
     tl.store(out_ptr + row * stride_out, winner.to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _argmax_gather_kernel(
+    pairs_ptr,
+    out_ptr,
+    num_rows,
+    stride_out,
+    NUM_J: tl.constexpr,
+    BLOCK_ROW: tl.constexpr,
+):
+    """``out[i] = ids[argmax_j vals[j, i], i]`` over ``pairs`` ``[J, N, 2]``
+    fp32 ``(val, id)``: ``torch.argmax`` over ``j``, the gather of the ids at
+    the winner and the copy into a strided, integer ``out`` in one launch.
+
+    The same pick as ``torch.argmax``: the lowest ``j`` among equal values,
+    and the first NaN if any (``torch.argmax`` takes NaN as the max).
+    """
+    rows = tl.program_id(0) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    mask = rows < num_rows
+    best = tl.load(pairs_ptr + rows * 2, mask=mask, other=0.0)
+    best_id = tl.load(pairs_ptr + rows * 2 + 1, mask=mask, other=0.0)
+    best_nan = best != best  # noqa: PLR0124 -- NaN test in Triton
+    for j in tl.static_range(1, NUM_J):
+        base = pairs_ptr + (j * num_rows + rows) * 2
+        val = tl.load(base, mask=mask, other=0.0)
+        idx = tl.load(base + 1, mask=mask, other=0.0)
+        val_nan = val != val  # noqa: PLR0124
+        # strict `>`: an equal value keeps the lower j
+        take = (~best_nan) & (val_nan | (val > best))
+        best = tl.where(take, val, best)
+        best_id = tl.where(take, idx, best_id)
+        best_nan = best_nan | val_nan
+    tl.store(
+        out_ptr + rows * stride_out,
+        best_id.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def argmax_gather(pairs: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``out[i] = pairs[argmax_j pairs[j, i, 0], i, 1]`` for fp32 ``pairs``
+    ``[J, N, 2]`` of ``(value, id)``, written into integer ``out`` ``[N]``
+    (strided is fine); see ``_argmax_gather_kernel``."""
+    num_j, num_rows = pairs.shape[0], pairs.shape[1]
+    if pairs.shape != (num_j, num_rows, 2) or pairs.dtype != torch.float32:
+        raise ValueError(
+            f"pairs {tuple(pairs.shape)} {pairs.dtype} is not [J, N, 2] fp32"
+        )
+    if out.shape != (num_rows,):
+        raise ValueError(f"out {tuple(out.shape)} is not [{num_rows}]")
+    if num_rows:
+        pairs = pairs if pairs.is_contiguous() else pairs.contiguous()
+        block_row = min(1024, triton.next_power_of_2(num_rows))
+        _argmax_gather_kernel[(triton.cdiv(num_rows, block_row),)](
+            pairs,
+            out,
+            num_rows,
+            out.stride(0),
+            NUM_J=num_j,
+            BLOCK_ROW=block_row,
+            num_warps=1 if block_row <= 64 else 4,
+        )
+    return out
+
+
 def _dspark_markov_argmax_fake(
     base_logits: torch.Tensor,
     prev_ids: torch.Tensor,
@@ -346,13 +410,25 @@ def dspark_markov_argmax(
     return _launch(base_logits, prev_ids, markov_w1, markov_w2, out, 0, None)
 
 
-def _launch(base_logits, prev_ids, markov_w1, markov_w2, out, vocab_offset, packed):
+def _launch(
+    base_logits,
+    prev_ids,
+    markov_w1,
+    markov_w2,
+    out,
+    vocab_offset,
+    packed,
+    embed_out=None,
+):
     """Both stages over ``base_logits``' columns, which are vocab ids
-    ``vocab_offset ..``; ids to ``out``, or ``(max, id)`` to ``packed``."""
+    ``vocab_offset ..``; ids to ``out``, or ``(max, id)`` to ``packed``.
+    ``W1[prev_ids]`` goes to ``embed_out`` (rows may be strided) when given."""
     num_rows, vocab_size = base_logits.shape
     rank = markov_w2.shape[1]
-    markov_embed = torch.empty(
-        num_rows, rank, dtype=markov_w1.dtype, device=base_logits.device
+    markov_embed = (
+        torch.empty(num_rows, rank, dtype=markov_w1.dtype, device=base_logits.device)
+        if embed_out is None
+        else embed_out
     )
     num_tiles = triton.cdiv(vocab_size, _BLOCK_V)
     block_row = min(
@@ -418,8 +494,13 @@ def dspark_markov_argmax_tp(
     vocab_start: int,
     tp_group,
     use_custom: bool = True,
+    embed_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``dspark_markov_argmax`` over a TP-sharded vocab.
+
+    ``embed_out``, ``[B, r]`` with unit stride along ``r``, receives the
+    gathered ``W1[prev_ids]`` rows instead of a fresh tensor: a caller that
+    stacks the steps hands in its block's column and skips the stack.
 
     ``base_logits`` is this rank's ``[B, V / tp]`` slice of the LM head, ids
     ``vocab_start ..``; the Markov tables are whole. Each rank reduces its
@@ -435,10 +516,16 @@ def dspark_markov_argmax_tp(
         return markov_w1.new_empty(0, markov_w1.shape[1])
     packed = torch.empty((num_rows, 2), dtype=torch.float32, device=base_logits.device)
     markov_embed = _launch(
-        base_logits, prev_ids, markov_w1, markov_w2, out, vocab_start, packed
+        base_logits,
+        prev_ids,
+        markov_w1,
+        markov_w2,
+        out,
+        vocab_start,
+        packed,
+        embed_out,
     )
     gathered = tp_group.all_gather(packed, dim=0, use_custom=use_custom)
-    gathered = gathered.view(tp_group.world_size, num_rows, 2)
-    winner = gathered[:, :, 0].argmax(dim=0)
-    out.copy_(gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0))
+    # each rank's (max, id) -> the id of the largest max
+    argmax_gather(gathered.view(tp_group.world_size, num_rows, 2), out)
     return markov_embed
