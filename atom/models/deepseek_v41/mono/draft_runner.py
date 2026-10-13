@@ -86,6 +86,10 @@ class DraftMonoRunner(V41MonoDecodeRunner):
             for i in range(len(self.model.mtp))
         ]
 
+    def _tok_par(self, s: int) -> bool:
+        # the backbone gathers no rows: every K1 and K2 runs on all of them
+        return False
+
     def _rope_positions(self, cache, step) -> torch.Tensor:
         return self.positions
 

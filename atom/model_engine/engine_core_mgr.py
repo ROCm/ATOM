@@ -9,15 +9,32 @@ import multiprocessing.shared_memory
 import os
 import pickle
 import queue
+import time
+import uuid
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread, local
 
 import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.model_engine.collective_rpc import (
+    COLLECTIVE_RPC_CMD,
+    DISCARD_WEIGHT_SYNC_CMD,
+    FINISH_WEIGHT_SYNC_CMD,
+    RpcResponseRouter,
+    RpcResult,
+    checked_timeout,
+    engine_budget,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.engine_utility import (
+    FIRE_AND_FORGET_UTILITY_CMDS,
+    WEIGHT_UPDATE_UTILITY_CMDS,
+    completes_weight_sync,
+)
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.utils import (
@@ -28,6 +45,13 @@ from atom.utils import (
 )
 
 logger = logging.getLogger("atom")
+_WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
+# Only the sync that owns them sends these. A FINISH unfences every engine,
+# and a DISCARD aborts whichever sync is between its buckets.
+_WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
+    FINISH_WEIGHT_SYNC_CMD,
+    DISCARD_WEIGHT_SYNC_CMD,
+}
 
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
@@ -184,7 +208,23 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
-        self.utility_response_queue = queue.Queue()
+        # Utility replies are matched to their caller by request id, not by
+        # position on a shared queue, where a late or unasked-for reply became
+        # the next caller's answer.
+        self._rpc_router = RpcResponseRouter()
+        # Held across every bucket plus FINISH/abort. RLock lets the sender's
+        # outer session call the same synchronous command method per bucket.
+        self._weight_sync_lock = RLock()
+        self._weight_sync_context = local()
+        # Identity-only marker: unlike request_id, a caller cannot forge it by
+        # choosing a string. Never put it on the wire.
+        self._weight_sync_dispatch_token = object()
+        # Runner processes behind each engine -- EngineCore's own sizing -- so
+        # an engine that never answers still fails one result per rank. Read
+        # with defaults: managers are also built from bare stand-in configs.
+        self._rpc_ranks_per_engine = getattr(config, "tp_world_size", 1) * getattr(
+            config, "prefill_context_parallel_size", 1
+        )
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -615,7 +655,16 @@ class CoreManager:
                         break
 
                     obj = output_socket.recv(copy=False)
-                    request_type, data = pickle.loads(obj)
+                    try:
+                        request_type, data = pickle.loads(obj)
+                    except Exception:
+                        # Every request on this DP rank waits on this thread,
+                        # so one message it cannot decode must not end it.
+                        logger.exception(
+                            f"{self.label} (DP {dp_rank}): dropping an engine "
+                            f"message that cannot be decoded"
+                        )
+                        continue
                     if request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
@@ -684,7 +733,7 @@ class CoreManager:
                     elif request_type == EngineCoreRequestType.METRICS:
                         self.latest_metrics[dp_rank] = data
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
-                        self.utility_response_queue.put_nowait(data)
+                        self._route_utility_response(dp_rank, data)
                     elif request_type == EngineCoreRequestType.ADD:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
@@ -1313,6 +1362,7 @@ class CoreManager:
             self._dp_session_prompt_tokens.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
+        self._refuse_unowned_weight_sync_cmd(cmd, None)
         if dp_rank is None:
             # Send to all DP ranks
             for rank in range(len(self.control_sockets)):
@@ -1343,10 +1393,154 @@ class CoreManager:
         self._release_seq_load(req_id)
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
-    def broadcast_utility_command(self, cmd: str, **kwargs):
+    def _route_utility_response(self, dp_rank: int, data):
+        """Hand a utility reply to the caller waiting on its request id.
+
+        A reply nobody waits for is dropped: one with no usable id was asked
+        for by a sender that never waits, and one with an id nobody holds is
+        late, its caller having given up.
+        """
+        request_id = data.get("request_id") if isinstance(data, dict) else None
+        if not isinstance(request_id, str) or not request_id:
+            # Routing an unhashable id would raise on this thread and end it.
+            logger.debug(
+                f"{self.label}: dropping a utility reply no caller can be "
+                f"waiting for, from DP rank {dp_rank}"
+            )
+            return
+        if not self._rpc_router.route(request_id, (dp_rank, data)):
+            logger.warning(
+                f"{self.label}: dropping late utility reply {request_id} "
+                f"from DP rank {dp_rank}"
+            )
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        barrier: bool = False,
+        timeout: float = 300.0,
+    ) -> list[RpcResult]:
+        """Run *method* on every DP engine's every TP runner.
+
+        Returns replies in DP-major then TP-rank order. Every rank is
+        represented: a DP engine that did not answer in time contributes one
+        failed :class:`RpcResult` per TP rank rather than silently shortening
+        the list, because a caller checking coverage needs to know which ranks
+        are missing.
+
+        Never raises for a worker-side failure -- the failure travels in
+        ``RpcResult.error`` so the ranks that did succeed are still reported.
+        Raises up front for a timeout that is not a finite number of seconds,
+        and for a manager whose engines are not one DP rank each, which the
+        replies would otherwise be reported as.
+        """
+        timeout = checked_timeout(timeout)
+        unsupported = self._collective_rpc_unsupported()
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"{self.label}: collective_rpc needs one engine per DP rank, "
+                f"but {unsupported}"
+            )
+        request_id = uuid.uuid4().hex
+        engine_count = len(self.control_sockets)
+        deadline = time.monotonic() + timeout
+        worker_deadline = time.time() + engine_budget(timeout)
+
+        with self._rpc_router.register(request_id) as replies:
+            self.broadcast_utility_command(
+                COLLECTIVE_RPC_CMD,
+                request_id=request_id,
+                method=method,
+                args=tuple(args),
+                kwargs=dict(kwargs or {}),
+                barrier=bool(barrier),
+                timeout=engine_budget(timeout),
+                deadline=worker_deadline,
+            )
+            by_dp_rank: dict[int, dict] = {}
+            while len(by_dp_rank) < engine_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+                if dp_rank in by_dp_rank:
+                    logger.warning(
+                        f"{self.label}: duplicate collective_rpc reply from "
+                        f"DP rank {dp_rank}, ignoring"
+                    )
+                    continue
+                by_dp_rank[dp_rank] = body
+
+        return self._flatten_dp_replies(request_id, method, engine_count, by_dp_rank)
+
+    def _collective_rpc_unsupported(self) -> str | None:
+        """Why this manager's engines are not one DP rank each, if they are not."""
+        pp_size = getattr(self, "pp_size", 1)
+        if pp_size > 1:
+            # One engine per stage, each holding a slice of the layers.
+            return f"its {pp_size} engines are pipeline stages"
+        return None
+
+    def _flatten_dp_replies(
+        self,
+        request_id: str,
+        method: str,
+        engine_count: int,
+        by_dp_rank: dict[int, dict],
+    ) -> list[RpcResult]:
+        """DP-major, TP-minor, with a placeholder for every absent rank."""
+        ranks = self._rpc_ranks_per_engine
+        flat: list[RpcResult] = []
+        for dp_rank in range(engine_count):
+            body = by_dp_rank.get(dp_rank)
+            if body is None:
+                error = (
+                    f"DP rank {dp_rank} did not answer {method!r} before the deadline"
+                )
+                flat.extend(
+                    RpcResult(request_id, tp, error=error) for tp in range(ranks)
+                )
+                continue
+            if body.get("error"):
+                # The engine failed before reaching its runners, so every one of
+                # them shares the reason.
+                flat.extend(
+                    RpcResult(request_id, tp, error=body["error"])
+                    for tp in range(ranks)
+                )
+                continue
+            for entry in body.get("results", []):
+                flat.append(
+                    RpcResult(
+                        request_id,
+                        entry.get("tp_rank", -1),
+                        value=entry.get("value"),
+                        error=entry.get("error"),
+                    )
+                )
+        return flat
+
+    def _refuse_unowned_weight_sync_cmd(self, cmd: str, dispatch_token) -> None:
+        if (
+            cmd in _WEIGHT_SYNC_OWNED_CMDS
+            and dispatch_token is not self._weight_sync_dispatch_token
+        ):
+            raise ValueError(
+                f"{self.label}: {cmd!r} cannot be sent directly; weight syncs "
+                f"go through broadcast_utility_command_sync, which alone "
+                f"finishes or aborts them"
+            )
+
+    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+        self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
@@ -1357,30 +1551,199 @@ class CoreManager:
             # copy=True: the same buffer is reused for every rank.
             self._send_control(rank, serialized_payload, copy=True)
 
-    def broadcast_utility_command_sync(
-        self, cmd: str, timeout: float = 300.0, **kwargs
-    ):
-        # Drain any stale responses that might be left over
-        while not self.utility_response_queue.empty():
-            try:
-                self.utility_response_queue.get_nowait()
-            except queue.Empty:
-                break
+    @contextmanager
+    def weight_sync_session(self):
+        """Serialize one direct/SHM/IPC synchronization session.
 
-        self.broadcast_utility_command(cmd, **kwargs)
-
-        # Collect one response per routable engine (must match the broadcast count
-        # len(self.control_sockets), which is the global engine count on a coordinator).
-        responses = []
-        for _ in range(len(self.control_sockets)):
+        Its updates share one sync id until that sync finishes, and none can
+        be sent once it has failed: the engines would otherwise take the rest
+        of a failed sync's buckets for a new sync and commit them. A nested
+        session joins the outer one's sync.
+        """
+        with self._weight_sync_lock:
+            ctx = self._weight_sync_context
+            outer = getattr(ctx, "active", False)
+            if not outer:
+                ctx.sync_id = uuid.uuid4().hex
+                ctx.failure = None
+            ctx.active = True
             try:
-                resp = self.utility_response_queue.get(timeout=timeout)
-                responses.append(resp)
-            except queue.Empty:
-                raise TimeoutError(
-                    f"{self.label}: Timed out waiting for UTILITY_RESPONSE "
-                    f"for command '{cmd}' (timeout={timeout}s)"
+                yield
+            finally:
+                ctx.active = outer
+
+    def _discard_failed_weight_sync(self, failed_cmd: str) -> None:
+        """Fence every engine this reaches and drop the failed sync's scratch.
+
+        Tried on every rank and never raises: the caller is already raising
+        the failure that matters, and a rank whose socket fails here must not
+        keep its peers, which may hold the failed update, from hearing it.
+        """
+        payload = pickle.dumps(
+            (
+                EngineCoreRequestType.UTILITY,
+                {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd},
+            )
+        )
+        for rank in range(len(self.control_sockets)):
+            try:
+                self._send_control(rank, payload, copy=True)
+            except Exception:
+                logger.exception(
+                    f"{self.label}: could not tell DP rank {rank} to discard "
+                    f"the failed {failed_cmd!r}"
                 )
+
+    def broadcast_utility_command_sync(
+        self,
+        cmd: str,
+        timeout: float = 300.0,
+        **kwargs,
+    ):
+        """Run *cmd* on every engine and return their replies in DP order.
+
+        Raises if an engine reports an error or does not answer in time.
+        """
+        owns_sync = getattr(self._weight_sync_context, "active", False)
+        if cmd == FINISH_WEIGHT_SYNC_CMD:
+            raise ValueError(
+                f"{self.label}: {cmd!r} commits a weight sync; only the sync "
+                f"whose complete update succeeded on every DP engine sends it"
+            )
+        if cmd == DISCARD_WEIGHT_SYNC_CMD:
+            if not owns_sync:
+                raise ValueError(
+                    f"{self.label}: {cmd!r} aborts the weight sync in flight; "
+                    f"send it from inside the `with weight_sync_session()` that "
+                    f"owns it"
+                )
+            ctx = self._weight_sync_context
+            ctx.failure = ctx.failure or "aborted by its sender"
+        is_nonfinal_bucket = cmd in WEIGHT_UPDATE_UTILITY_CMDS and not (
+            completes_weight_sync(cmd, kwargs)
+        )
+        if is_nonfinal_bucket and not owns_sync:
+            raise ValueError(
+                f"{self.label}: non-final {cmd!r} needs "
+                f"`with weight_sync_session()` so another sync cannot interleave"
+            )
+        if cmd in FIRE_AND_FORGET_UTILITY_CMDS:
+            raise ValueError(
+                f"{self.label}: {cmd!r} is fire-and-forget; its handler never "
+                f"answers, so waiting on it could only time out. Send it with "
+                f"broadcast_utility_command instead."
+            )
+        if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+            # Re-entrant, so the weight_sync_session() a bucket belongs to
+            # takes it again rather than waiting on itself.
+            with self._weight_sync_lock:
+                return self._sync_weight_update(cmd, timeout, owns_sync, kwargs)
+        return self._broadcast_and_wait(cmd, timeout, **kwargs)
+
+    def _sync_weight_update(
+        self, cmd: str, timeout: float, in_session: bool, kwargs: dict
+    ):
+        """Send one weight update tagged with the sync it belongs to.
+
+        Outside a session the update is a whole sync on its own. Inside one, a
+        failure closes the session's sync and a finish starts its next one.
+        """
+        if not in_session:
+            return self._broadcast_and_wait(
+                cmd, timeout, sync_id=uuid.uuid4().hex, **kwargs
+            )
+        ctx = self._weight_sync_context
+        if ctx.failure is not None:
+            raise RuntimeError(
+                f"{self.label}: this session's weight sync already failed "
+                f"({ctx.failure}), and a failed sync cannot be completed; "
+                f"retry it from a new weight_sync_session()"
+            )
+        try:
+            responses = self._broadcast_and_wait(
+                cmd, timeout, sync_id=ctx.sync_id, **kwargs
+            )
+        except BaseException as exc:
+            ctx.failure = f"{cmd}: {type(exc).__name__}: {exc}"
+            raise
+        if completes_weight_sync(cmd, kwargs):
+            ctx.sync_id = uuid.uuid4().hex
+        return responses
+
+    def _broadcast_and_wait(self, cmd: str, timeout: float, **kwargs):
+        """The round trip behind broadcast_utility_command_sync, unchecked.
+
+        That method has already refused what its caller may not send, and for
+        an update has taken the session lock and named the update's sync. The
+        only other caller is the FINISH below, which runs under that lock.
+        """
+        timeout = checked_timeout(timeout)
+        request_id = uuid.uuid4().hex
+        # The global engine count on a coordinator, as the broadcast reaches.
+        engine_count = len(self.control_sockets)
+        deadline = time.monotonic() + timeout
+        worker_deadline = time.time() + engine_budget(timeout)
+        by_dp_rank: dict[int, object] = {}
+        with self._rpc_router.register(request_id) as replies:
+            try:
+                self.broadcast_utility_command(
+                    cmd,
+                    _dispatch_token=self._weight_sync_dispatch_token,
+                    request_id=request_id,
+                    timeout=engine_budget(timeout),
+                    deadline=worker_deadline,
+                    **kwargs,
+                )
+            except Exception:
+                # The engines before the failed send already hold this update.
+                if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                    self._discard_failed_weight_sync(cmd)
+                raise
+            while len(by_dp_rank) < engine_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                except queue.Empty:
+                    continue
+                by_dp_rank.setdefault(dp_rank, body)
+
+        responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
+        missing = sorted(set(range(engine_count)) - set(by_dp_rank))
+        if missing:
+            if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                self._discard_failed_weight_sync(cmd)
+            raise TimeoutError(
+                f"{self.label}: no reply to utility command {cmd!r} from DP "
+                f"rank(s) {missing} within {timeout}s"
+            )
+        failed = [r for r in responses if isinstance(r, dict) and r.get("error")]
+        if failed:
+            if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                # An engine whose local TP ranks all succeeded has no local
+                # reason to discard its packed/expert/IPC scratch. Once any DP
+                # engine failed, every engine belongs to the abandoned sync.
+                self._discard_failed_weight_sync(cmd)
+            # Callers read r["result"]; an error reply has none, and handing it
+            # back would turn a named failure into a KeyError somewhere else.
+            raise RuntimeError(
+                f"{self.label}: utility command {cmd!r} failed on {len(failed)} "
+                f"of {len(responses)} engine(s): "
+                + "; ".join(str(r["error"]) for r in failed)
+            )
+        if completes_weight_sync(cmd, kwargs):
+            try:
+                self._broadcast_and_wait(
+                    FINISH_WEIGHT_SYNC_CMD,
+                    _WEIGHT_SYNC_FINISH_TIMEOUT_S,
+                    sync_id=kwargs.get("sync_id"),
+                    completed_cmd=cmd,
+                    completed_request_id=request_id,
+                )
+            except Exception:
+                self._discard_failed_weight_sync(cmd)
+                raise
         return responses
 
     def _shutdown_engine_core_rank(self, dp_rank: int):
@@ -1726,6 +2089,9 @@ class DisaggCoreManager(CoreManager):
             prefill_seqs.append(ps)
         prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
         self._send_request(0, prefill_payload)
+
+    def _collective_rpc_unsupported(self) -> str | None:
+        return "its two engines are the prefill and decode halves of one replica"
 
     def close(self):
         super().close()

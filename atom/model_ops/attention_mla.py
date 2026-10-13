@@ -52,6 +52,7 @@ from atom.config import (
     qrep_for_step,
 )
 from atom.distributed.dcp_utils import (
+    NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
     get_dcp_group,
@@ -59,6 +60,9 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_kv_splits,
+    mla_dcp_sparse_prefill_mode,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -887,6 +891,7 @@ class MLAAttention(nn.Module):
         # can't silently borrow decode's answer if the two ever diverge.
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
+        self.dcp_sparse_prefill_nonps = False
         if dcp_world_size > 1 and self.is_sparse_mla:
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
@@ -902,6 +907,21 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
+            )
+            self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
+                dcp_world_size,
+                self.num_heads * dcp_world_size,
+                self.kv_cache_dtype.startswith("fp8"),
+                self.dcp_persistent_supported,
+                get_current_atom_config().max_num_batched_tokens,
+            )
+            (
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
+            ) = mla_dcp_sparse_prefill_mode(
+                self.dcp_sparse_prefill_nonps,
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
             )
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -2243,10 +2263,13 @@ class MLAAttention(nn.Module):
                 # -- rebuild it here, or run non-persistent.
                 #
                 # Read from the same predicate the gathered pad width came from
-                # rather than re-deriving the gate: gqa=64 is correct only in
-                # persistent mode, so running one way while the width was chosen
-                # for the other silently miscomputes. The assert keeps the two
-                # spellings honest if either side gains a condition.
+                # rather than re-deriving the gate: on the persistent kernel set
+                # gqa=64 is correct only in persistent mode, so running one way
+                # while the width was chosen for the other silently miscomputes.
+                # The non-persistent gqa64 kernel (dcp_sparse_prefill_nonps) is
+                # the exception, and runs at 64 non-persistent by design. The
+                # assert keeps the two spellings honest if either side gains a
+                # condition.
                 sparse_dcp_persistent = (
                     dcp_sparse and self.dcp_sparse_prefill_persistent
                 )
@@ -2255,10 +2278,17 @@ class MLAAttention(nn.Module):
                     and self.sparse_dcp_metadata_rebuild
                     and self.dcp_persistent_supported
                     and page_size <= 1
+                    and not self.dcp_sparse_prefill_nonps
                 ), (
                     "DCP sparse prefill would run in a different mode than the "
                     "one its gathered query width was padded for; update "
                     "mla_dcp_sparse_prefill_is_persistent alongside this gate."
+                )
+                nonps = dcp_sparse and self.dcp_sparse_prefill_nonps
+                assert not nonps or q.shape[0] <= NONPS_MAX_Q_ROWS, (
+                    f"non-persistent DCP sparse prefill got total_q={q.shape[0]} "
+                    f"q rows, more than the {NONPS_MAX_Q_ROWS} it takes; the "
+                    "max_num_batched_tokens gate should have kept it persistent."
                 )
                 if sparse_dcp_persistent and self.owns_sparse_indexer:
                     self._rebuild_sparse_dcp_persistent_metadata(
@@ -2288,7 +2318,9 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
+                    num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
+                        nonps, self.dcp_world_size
+                    ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
                     kv_scale=self._k_scale if is_fp8 else None,

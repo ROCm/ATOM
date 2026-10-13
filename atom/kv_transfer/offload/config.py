@@ -382,10 +382,11 @@ def build_lmcache_config(
     from lmcache.v1.config import LMCacheEngineConfig
 
     cfg = LMCacheEngineConfig.from_env()
-    # Preserve the legacy rank-0 default; explicit overrides can opt into
-    # all-rank lookup ([]) so every shard gets matching touches and pins.
+    # Every shard needs the lookup's pins and LRU touches. Rank-0-only lookup
+    # can advertise a prefix already evicted on another rank. LMCache uses
+    # [] for all workers and takes the minimum hit length across responses.
     if getattr(cfg, "lookup_server_worker_ids", None) is None:
-        cfg.lookup_server_worker_ids = [0]
+        cfg.lookup_server_worker_ids = []
     apply_extra_overrides(cfg, kv_transfer_config)
     # Async lookup has a separate polling/cancellation contract. This
     # connector currently implements only synchronous lookup; do not let an
@@ -441,8 +442,8 @@ def lmcache_replica_world_size(config) -> int:
 
     Worker ids index this replica-local grid rather than the global one.
     LMCache selects its lookup servers by worker id
-    (``cfg.lookup_server_worker_ids``, defaulting to ``[0]``), so global
-    numbering would leave every replica except the first without a server.
+    (``cfg.lookup_server_worker_ids``, defaulting to all workers), so explicit
+    subsets must also use replica-local numbering.
     Replica-local ids are also the right cache-key component: id ``i`` means
     "shard i of the model", which holds the same bytes in every replica, so
     replicas sharing a disk/remote backend share entries instead of
@@ -469,6 +470,39 @@ def lmcache_replica_world_size(config) -> int:
     pp_size = _dim("pipeline_parallel_size")
     tp_size = _dim("tensor_parallel_size")
     return max(1, pp_size * tp_size)
+
+
+def validate_lmcache_lookup_scope(cfg: Any, world_size: int) -> None:
+    """Reject lookup-server worker ids outside this replica-local world."""
+
+    world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    worker_ids = getattr(cfg, "lookup_server_worker_ids", None)
+    if worker_ids is None:
+        return
+    if not isinstance(worker_ids, (list, tuple)):
+        # Preserve the public configuration-error contract requested for invalid
+        # lookup scope values, rather than leaking Python container semantics.
+        raise ValueError(  # noqa: TRY004
+            "LMCache lookup_server_worker_ids must be a list or tuple of worker ids, "
+            f"got {type(worker_ids).__name__}"
+        )
+    if not worker_ids:
+        return
+    normalized = [
+        _strict_integer(f"LMCache lookup server worker id[{index}]", worker_id)
+        for index, worker_id in enumerate(worker_ids)
+    ]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            "LMCache lookup_server_worker_ids must not contain duplicate worker ids; "
+            f"got {normalized}"
+        )
+    invalid = [worker_id for worker_id in normalized if worker_id >= world_size]
+    if invalid:
+        raise ValueError(
+            "LMCache lookup_server_worker_ids must be within the replica-local "
+            f"world [0, {world_size}); got {normalized}"
+        )
 
 
 def scale_cpu_size_for_pp(cfg, config) -> None:
@@ -618,6 +652,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     )
     chunk_size = _strict_integer("LMCache chunk size", cfg.chunk_size, minimum=1)
     world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    validate_lmcache_lookup_scope(cfg, world_size)
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")

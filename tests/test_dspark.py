@@ -70,16 +70,21 @@ def test_markov_head_conditioning_is_token_specific():
     assert not torch.allclose(b0, b1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="aiter GEMV on GPU")
 def test_confidence_head_range_and_input_concat():
-    hidden, r = 16, 8
-    head = DSparkConfidenceHead(hidden_size=hidden, rank=r)
-    h = torch.randn(5, hidden)
-    m = torch.randn(5, r)
+    hidden, r = 64, 32
+    head = DSparkConfidenceHead(hidden_size=hidden, rank=r).cuda().bfloat16()
+    h = torch.randn(5, hidden, device="cuda").bfloat16()
+    m = torch.randn(5, r, device="cuda").bfloat16()
     c = head(h, m)
-    assert c.shape == (5,)
+    assert c.shape == (5,) and c.dtype == torch.float32
     assert torch.all(c > 0) and torch.all(c < 1)
-    # Matches sigmoid(proj([h; m])).
-    expected = torch.sigmoid(head.proj(torch.cat([h, m], dim=-1).float()).squeeze(-1))
+    # Matches sigmoid(proj([h; m])) in FP32.
+    expected = torch.sigmoid(
+        torch.nn.functional.linear(
+            torch.cat([h, m], dim=-1).float(), head.proj.weight.float()
+        ).squeeze(-1)
+    )
     torch.testing.assert_close(c, expected, rtol=1e-5, atol=1e-5)
 
 

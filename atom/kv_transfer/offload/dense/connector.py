@@ -401,6 +401,12 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
 
         tok_tensor = tokens_to_tensor(toks)
         t_store0 = time.perf_counter()
+        # Wait on the producing stream before this thread reads KV. An event
+        # that only records the fence (the unit-test double) has no
+        # synchronize; the same event is still handed to store() below.
+        synchronize = getattr(producer_event, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
         track_source = getattr(gpu_connector, "track_save_source", None)

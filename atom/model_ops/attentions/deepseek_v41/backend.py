@@ -313,10 +313,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
 
     def state_transfer(self):
+        # Encoder SWA bounded replay: a hit rebuilds the state from the PAGE
+        # below it instead of restoring a checkpoint (`BlockManager.
+        # replay_start`).
+        if self.model_runner.config.enable_encoder_swa_bounded_replay:
+            return StateTransfer.replay()
         return StateTransfer.copy(self.geometry.layout_id)
 
     def checkpoint_image_bytes(self):
-        return self.geometry.state_bytes
+        return self.geometry.checkpoint_image_bytes
 
     def allocate_kv_cache_tensors(self, *, blocks, buf):
         self.num_blocks = blocks
@@ -454,6 +459,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             offset += length
         if offset != batch.total_tokens_num or running_tokens < offset:
             raise ValueError("CSA2 batch token spans disagree with the runner")
+        # Each span's batch index: zero-token scheduler rows have none.
+        scheduled = np.flatnonzero(batch.num_scheduled_tokens)
+        resumes, floors, cached_until, histories = (
+            (None,) * 4
+            if batch.is_dummy_run or not batch.replaying
+            else self._replay_layout(batch.replaying, scheduled, spans)
+        )
         cache = (
             PagedAttentionCache(
                 self.geometry,
@@ -494,6 +506,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         plans = self._build_compress_plans(
             np.asarray([span.length for span in spans], dtype=np.int32),
             np.asarray([span.end for span in spans], dtype=np.int32),
+            write_from=resumes,
             running_bs=None if max_q_len is None else running_bs,
             max_q_len=max_q_len,
             extra_write=self.geometry.speculative_tokens if verifying else 0,
@@ -522,6 +535,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state_slot_out=state_slot_out,
             plans=plans,
             planners=self.step_planners,
+            floors=floors,
+            cached_until=cached_until,
+            finals=(
+                None
+                if batch.is_final_chunk is None or batch.is_dummy_run
+                else np.asarray(batch.is_final_chunk)[scheduled]
+            ),
+            start_histories=histories,
             publication_group=step_group,
             query_prefix_ready=query_prefix_ready and len(spans) == len(batch.req_ids),
             query_prefix_republish_reason=(
@@ -542,6 +563,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             state=AttnState.DECODE if step.decode else AttnState.PREFILL_PREFIX,
         )
         metadata.cache, metadata.step = cache, step
+        # A bounded replay's `QueryRows`, while a layer runs on some rows only
+        metadata.queries = None
         metadata.state_slot_out = state_slot_out
         metadata.dummy = batch.is_dummy_run
         metadata.token_mask = token_mask
@@ -565,6 +588,34 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                         at = span.offset + first - span.position
                         token_mask[at : at + end - first] = False
         return token_mask
+
+    def _replay_layout(self, replaying, scheduled, spans):
+        """Per span, for the forwards starting below where they resumed
+        (`ScheduledBatch.replaying`), 0 for every other: that point, below
+        which it writes no global KV; its window floor, the forward's start;
+        that point again where its state came along, its ring exact below it;
+        and, with Engram, the history its cursor starts at, as a full prefill
+        leaves it there."""
+        resumes, floors, cached = np.zeros((3, len(spans)), np.int32)
+        histories = (
+            None
+            if self.engram is None
+            else np.full((len(spans), self.geometry.history_size), -1, np.int64)
+        )
+        for k in np.flatnonzero(np.isin(scheduled, list(replaying))):
+            replay = replaying[int(scheduled[k])]
+            resumes[k], floors[k] = replay.until, spans[k].position
+            cached[k] = 0 if replay.rebuilds else replay.until
+            if histories is not None:
+                mapping = self.engram.mapping
+                ids = np.asarray(replay.history_ids, np.int64)
+                # An image position, which carries the image id, is DEAD.
+                image = getattr(self.config, "image_token_id", None)
+                compressed = mapping.compress_tokens(
+                    ids, None if image is None else (ids != image)[None]
+                )
+                histories[k] = mapping.advance_history(None, compressed)[0]
+        return resumes, floors, cached, histories
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
@@ -747,6 +798,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             block_tables=((0,) * pages,) * bs,
             total_seqs_num=bs,
             total_tokens_num=tokens,
+            is_final_chunk=None,
+            replaying={},
         )
         metadata, positions = self._prepare(
             batch,

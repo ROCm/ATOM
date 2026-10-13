@@ -133,6 +133,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
+    # DCP decode rank owns into a GPU staging slot and send whole destination
+    # pages instead of one RDMA descriptor per token. 0 = per-token path.
+    "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
+    # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
+    # GPU landing pool, first come, first served (see mla_landing.py). A stage
+    # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
+    # the decode side scatters them into the paged KV and returns the slot.
+    # 0 = staged per-page writes only.
+    "ATOM_PD_MLA_LANDING": lambda: _flag_env("ATOM_PD_MLA_LANDING", "1"),
+    # Mooncake P/D: how long a write Mooncake gave up on may still land. A
+    # decode holds a failed receive's KV pages this long before reporting the
+    # failure; a prefill keeps a landing slot whose write failed out of use
+    # this long. 0 = release at once.
+    "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
+        os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
@@ -278,9 +295,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
     "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "0") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
-    # Match SGLang's gfx950 pure-prefill fast path: cast Q/K/V to FP8 and use
-    # AITER's head-dim-256 per-tensor FMHA kernel. Set to 0 for the BF16
-    # flash_attn_varlen_func fallback.
+    # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
+    # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.
+    # Set to 0 for the BF16 flash_attn_varlen_func fallback.
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
@@ -310,6 +327,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QK-norm-rope-cache-quant fusion for Qwen3 dense and MoE; disabled by default.
     "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", "0") == "1"
+    ),
+    # With that fusion on, batches above this token count run the Gemma q/k
+    # norm, RoPE and cache write as separate kernels: the one-kernel version
+    # loses at prefill sizes while saving launches at decode sizes (crossover
+    # between 8192 and 16384 tokens for Qwen3.5 TP4 on MI355X).
+    "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
     ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
@@ -356,6 +380,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
+    # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
+    "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: os.getenv(
+        "ATOM_DCP_SPARSE_PREFILL_NONPS", "1"
+    )
+    == "1",
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
@@ -673,12 +703,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
         os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
-    # Route the paged decode to aiter's FlyDSL kernel (#4332) instead of gluon.
+    # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
+    # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
-    # FlyDSL GPU work planner, built once per forward in the metadata
-    # builder. Needs ATOM_PA_FLYDSL=1. On by default so enabling FlyDSL gets the
-    # measured configuration (+20.5% interactivity at conc 20).
-    "ATOM_PA_FLYDSL_PLAN": lambda: (os.getenv("ATOM_PA_FLYDSL_PLAN", "1") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
