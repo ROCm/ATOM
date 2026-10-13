@@ -1947,6 +1947,7 @@ class Config:
     sequence_parallel_size: int = 1
     # Snapshot the experimental layout once and propagate it to all workers.
     m3_tp_replicated_o_proj: bool = field(init=False, default=False)
+    sp_mega_moe_enabled: bool = field(init=False, default=False)
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2224,6 +2225,7 @@ class Config:
 
     def __post_init__(self):
         self.m3_tp_replicated_o_proj = envs.ATOM_M3_TP_REPLICATED_O_PROJ
+        self.sp_mega_moe_enabled = envs.ATOM_SP_MOE_MEGA
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
@@ -2759,6 +2761,10 @@ class Config:
         factors.append(self.sequence_parallel_size)
         if getattr(self, "m3_tp_replicated_o_proj", False):
             factors.append("m3_tp_replicated_o_proj_v2")
+        if getattr(self, "sp_mega_moe_enabled", False):
+            # This changes the decoder graph, including the next input norm
+            # and final norm. Never load a native SP artifact for this region.
+            factors.append("sp_mega_moe_full_fusion_v1")
         # Expert layout and transport also change compiled shapes/subgraphs.
         factors.append(
             (self.enable_expert_parallel, self.moe_all2all_backend, self.moe_backend)

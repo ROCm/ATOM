@@ -52,6 +52,7 @@ def FusedMoEDecoratorForPluginMode(cls: Type[T]) -> Type[T]:
     LazyMoEWrapper.__name__ = original_cls.__name__
     LazyMoEWrapper.__qualname__ = original_cls.__qualname__
     LazyMoEWrapper.__module__ = original_cls.__module__
+    LazyMoEWrapper.__wrapped__ = original_cls
 
     logger.info("Create lazy wrapper for FusedMoE to change the naming")
     return LazyMoEWrapper
