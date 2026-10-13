@@ -467,3 +467,50 @@ def test_an_unstamped_orphan_still_times_out(monkeypatch):
     client._orphan_since["7"] -= mp_lookup._ORPHAN_TIMEOUT_S + 1
     client.pump()
     assert not client.has_orphans()
+
+
+class _FallbackConn:
+    """Declines the detach (the kept prefix is shorter than the probe's)."""
+
+    def __init__(self, detach_ok):
+        self.detach_ok = detach_ok
+        self.detach_calls = []
+        self.matched = []
+
+    def detach_lookup(self, seq, hbm):
+        self.detach_calls.append(hbm)
+        return self.detach_ok
+
+    def get_num_new_matched_tokens(self, seq):
+        self.matched.append(seq)
+        return 32, True
+
+
+def _admitted_seq(num_cached_tokens):
+    return SimpleNamespace(
+        num_cached_tokens=num_cached_tokens,
+        offload_joint=SimpleNamespace(kv_prefix_tokens=0),
+    )
+
+
+def test_declined_detach_after_allocate_runs_the_ordinary_lookup():
+    """`allocate` disowned the probed prefix: the tier must still be asked."""
+    from atom.model_engine.scheduler import Scheduler
+
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = conn = _FallbackConn(detach_ok=False)
+    seq = _admitted_seq(0)
+    assert s._detach_or_query_lookup(seq) is True
+    assert conn.detach_calls == [0]  # re-checked on the kept prefix
+    assert conn.matched == [seq]
+    assert seq.offload_joint.kv_prefix_tokens == 32
+
+
+def test_accepted_detach_after_allocate_skips_the_ordinary_lookup():
+    from atom.model_engine.scheduler import Scheduler
+
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = conn = _FallbackConn(detach_ok=True)
+    assert s._detach_or_query_lookup(_admitted_seq(60)) is False
+    assert conn.detach_calls == [60]
+    assert conn.matched == []

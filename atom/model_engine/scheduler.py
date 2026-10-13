@@ -1943,7 +1943,7 @@ class Scheduler:
 
             if lookup_detachable:
                 # Before the alloc notification, which reads the save floor.
-                self.kv_connector.detach_lookup(seq, int(seq.num_cached_tokens))
+                needs_remote_load = self._detach_or_query_lookup(seq)
 
             self._notify_connector_after_prefill_alloc(seq)
 
@@ -2605,6 +2605,20 @@ class Scheduler:
             return False
         num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
         return bool(conn.can_detach_lookup(seq, num_hbm_tokens))
+
+    def _detach_or_query_lookup(self, seq: Sequence) -> bool:
+        """Detach `seq`'s lookup after `allocate`, or fall back to the ordinary one.
+
+        The detach decision was taken on the HBM prefix `can_allocate`
+        offered, but `allocate` may disown part of it (for example when the
+        state checkpoint behind the boundary is lost), leaving a gap a tier
+        load could fill. `detach_lookup` re-checks against the prefix the
+        request kept; if it declines, query the tier now so the ordinary
+        load decision still runs. Returns whether the request needs a load.
+        """
+        if self.kv_connector.detach_lookup(seq, int(seq.num_cached_tokens)):
+            return False
+        return self._query_connector_prefill_match(seq, skip=False)
 
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""
