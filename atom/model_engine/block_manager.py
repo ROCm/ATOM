@@ -794,12 +794,14 @@ class BlockManager:
         # luck. (`get_num_new_matched_tokens` withholds one token on a
         # full-prompt hit, which takes the lookup off the grid.)
         lmc_tokens = (lmc_tokens // chunk) * chunk
-        if lmc_tokens <= hbm_boundary * hbs:
+        hbm_tokens = hbm_boundary * hbs
+        if lmc_tokens <= hbm_tokens:
             return self._no_joint("lmcache_within_hbm")
-        # The KV leg moves whole chunks and the blocks below the HBM prefix are
-        # shared, so an unaligned start cannot be rounded down.
-        if (hbm_boundary * hbs) % chunk != 0:
-            return self._no_joint("hbm_off_chunk_grid")
+        # The KV leg moves whole chunks. An aligned HBM hit is already a legal
+        # start. An unaligned one cannot be rounded down onto shared blocks, and
+        # rounding the start *up* would leave a hole the forward then skips.
+        # The start stays on the chunk floor; `allocate` reloads that partial
+        # chunk into private blocks and keeps the rung above the real HBM hit.
         cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
         if cap <= hbm_boundary:
             return self._no_joint("no_room_above_hbm")
@@ -831,7 +833,12 @@ class BlockManager:
         # Floored to the chunk grid so the KV leg starts aligned and writes
         # only into blocks below it that nobody else can be reading.
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
-        claim_tokens = max(claim_tokens, hbm_boundary * hbs)
+        if hbm_tokens % chunk == 0:
+            claim_tokens = max(claim_tokens, hbm_tokens)
+        else:
+            # Below the real HBM hit, on the chunk grid. `allocate` stops the
+            # shared claim here and refills the partial chunk privately.
+            claim_tokens = (hbm_tokens // chunk) * chunk
         # `allocate` claims the boundary in whole hash blocks --
         # `claim_tokens // hbs` -- but the value above is floored to
         # the *chunk* grid, not the hash-block grid. When `hbs` does not divide
@@ -1089,10 +1096,36 @@ class BlockManager:
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
         hbs = self._hash_block_size()
+        hbm_tokens = num_cached_blocks * hbs
+        claim_tokens = int(seq.offload_joint.claim_tokens or 0)
+        # Unaligned HBM hit: the joint start sits on the chunk floor, strictly
+        # below the hit. Claiming the tail would hand the KV leg shared blocks
+        # to write. Reload that partial chunk into private blocks instead, and
+        # if the pool cannot back them, drop the joint and keep the HBM hit.
+        if (
+            int(seq.offload_joint.boundary_tokens or 0) > hbm_tokens
+            and claim_tokens < hbm_tokens
+            and claim_tokens % hbs == 0
+        ):
+            extra = num_cached_blocks - claim_tokens // hbs
+            if self._ensure_page_units(extra):
+                num_cached_blocks = claim_tokens // hbs
+            else:
+                self.joint_skips["partial_chunk_no_room"] = (
+                    self.joint_skips.get("partial_chunk_no_room", 0) + 1
+                )
+                seq.offload_joint.boundary_tokens = 0
+                seq.offload_joint.boundary_hash = -1
+                seq.offload_joint.kv_tokens = 0
+                seq.offload_joint.claim_tokens = 0
+                claim_tokens = 0
+        # After the partial-chunk reload above, which lowers the hit on
+        # purpose: what follows compares against this to catch only the claim
+        # loop's own eviction clamp.
         requested_blocks = num_cached_blocks
         claim_blocks = max(
             num_cached_blocks,
-            int(seq.offload_joint.claim_tokens or 0) // hbs,
+            claim_tokens // hbs,
         )
         h = seq.cache_seed
         hit_hash = -1

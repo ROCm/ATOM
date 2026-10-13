@@ -1565,6 +1565,59 @@ class TestPagedCopyCheckpoint:
         # The KV leg has real work: the walk stopped well below the boundary.
         assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
 
+    def test_an_unaligned_hbm_hit_still_reaches_the_rung_above_it(self):
+        """A hit that is not a multiple of the KV chunk used to refuse the
+        whole CPU prefix (`hbm_off_chunk_grid`). The shared claim stops at
+        the chunk floor and the partial chunk is reloaded into private
+        blocks, so the rung above the real HBM hit stays reachable.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        # 5 blocks (20 tokens) is off the 16-token chunk grid and still in
+        # HBM. 8 blocks (32 tokens) is the rung only the CPU tier can serve.
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        # One boundary per drain: a second pending boundary of the same seq
+        # supersedes the first, because both would be read from one slot.
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_last = first.block_table[3]  # tokens [12, 16)
+        shared_tail = first.block_table[4]  # tokens [16, 20), partial chunk
+        victim = first.block_table[6]  # walk stops at 6 blocks, hit gates to 5
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+        h = h_cpu
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert hbm_hit * BLOCK % chunk != 0
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert "hbm_off_chunk_grid" not in bm.joint_skips
+        assert second.offload_joint.boundary_tokens == 8 * BLOCK
+        assert second.offload_joint.claim_tokens == chunk
+        assert second.offload_joint.kv_tokens == 8 * BLOCK
+
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == chunk
+        assert second.block_table[3] == shared_last
+        assert second.block_table[4] != shared_tail
+        assert second.offload_joint.load_hash == h
+
     def test_the_split_says_which_tier_the_state_leg_came_from(self):
         """`state_tier` is the only counter here that cannot be non-zero with
         the CPU tier switched off, which makes it the honest test of "did this
