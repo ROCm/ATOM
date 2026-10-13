@@ -3,7 +3,8 @@
 ## Startup
 
 Run inside the prepared vLLM 0.31 / ATOM environment. This tested configuration
-uses TP4, FULL graphs, DSpark 5, and in-process PAGE + STATE offload.
+uses TP4, FULL decode graphs (FULL_AND_PIECEWISE with breakable capture),
+DSpark 5, and in-process PAGE + STATE offload.
 
 ```bash
 export PYTHONPATH=/workspace/ATOM-dsv41-lmc031
@@ -74,13 +75,15 @@ above at zero. Stop the service before changing its editable source tree.
 
 ## Test method
 
-Against an otherwise idle server, run the two long concurrency-4 probes:
+Against an otherwise idle server, run long concurrency-4 probes:
 
 ```bash
 python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
   --concurrency 4 --seed 2026101301 --out accuracy-seed1.json
 python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
   --concurrency 4 --seed 2026101302 --out accuracy-seed2.json
+python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
+  --concurrency 4 --seed 2026101303 --out accuracy-seed3.json
 ```
 
 The different seeds produce different warm documents. For a short smoke test,
@@ -103,35 +106,40 @@ not CPU tier versus local HBM reuse.
 
 ## Test results
 
-2026-10-13, source `f29878cab`: vLLM `0.31.1.dev0+gdb9527a46.d20261008`,
-LMCache `0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`; TP4,
-FULL graphs + DSpark 5, MP PAGE 32 GiB shared + STATE 4 GiB/rank.
+2026-10-13: vLLM `0.31.1.dev0+gdb9527a46.d20261008`, LMCache
+`0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`; TP4, FULL decode
+and PIECEWISE graphs + DSpark 5, MP PAGE 32 GiB shared + STATE 4 GiB/rank.
 Supply below is warm-tier tokens / all actual warm-arm prompt tokens.
 
-| Long probe, concurrency 4 | Blind | Cold | Warm | Tier supply | Verdict |
+| Source / long probe, concurrency 4 | Blind | Cold | Warm | Tier supply | Verdict |
 |---|---:|---:|---:|---:|---|
-| Seed 2026101301 | 0/16 | 16/16 | 16/16 | 278,528 / 278,880 (99.874%) | Passed |
-| Seed 2026101302 | 0/16 | 16/16 | 16/16 | 278,528 / 279,488 (99.657%) | Passed |
+| `f29878cab`, seed 2026101301 | 0/16 | 16/16 | 16/16 | 278,528 / 278,880 (99.874%) | Passed |
+| `f29878cab`, seed 2026101302 | 0/16 | 16/16 | 16/16 | 278,528 / 279,488 (99.657%) | Passed |
+| `10228cb99`, seed 2026101303 | 0/16 | 16/16 | 16/16 | 278,528 / 279,264 (99.736%) | Passed |
 
-The two warm documents were different, but shared one boot. Both client/drain
-exits were zero; cold-tier and local-HBM supply were zero. Four TP ranks
-completed graph capture. No workload error matched the recorded fault scan,
-all 12 logged `cursor_mismatch` counters were zero, and 1,051 tracked ATOM
-source files were unchanged through teardown. This service smoke covers the
-new source, not proof that each CPU regression's specific corner case occurred.
+The first two distinct warm documents shared one boot. The third ran in a new
+boot with the TP lifecycle fix (`3a97b1657`); its tested production/test bytes
+match `10228cb99`, committed after teardown. All client/drain exits were zero;
+cold-tier and local-HBM supply were zero. The latest run completed target and
+DSpark FULL graph capture on four ranks, served 49 requests, and verified every
+question's correctness and prompt-token sums. All 1,051 tracked ATOM files and
+five validation files stayed unchanged through its model/MP teardown. These
+are service smoke tests, not proof of every CPU corner case or full accuracy.
 
-Shutdown: four `LocalCPUBackend closed successfully` lines and zero
-`Error closing` lines; the prior STATE-shape close error did not recur.
-AITER `free_meta_buffer` destructor errors and vLLM's four-worker SIGKILL
-escalation **remain unresolved**. Model launcher exit was 0; the separately
-terminated MP launcher exited 143 (intentional SIGTERM). All seven recorded
-model/MP processes, their host KFD entries, and all four listening ports were
-gone afterward. This was not a clean graceful shutdown.
+Latest shutdown **failed graceful-exit acceptance**: four explicit reused-AITER
+TP close markers, four `LocalCPUBackend closed successfully` lines and zero
+`Error closing` lines, followed by 12 AITER `free_meta_buffer` destructor
+`UnicodeDecodeError`s and vLLM SIGKILL escalation for all four workers. The
+worker timeout remained the default 5 seconds plus 4 seconds after SIGTERM.
+Explicit close markers do not establish that every native resource was freed.
+Model launcher exit was 0; MP exit was 143 from intentional SIGTERM. All seven
+recorded processes and host KFD entries disappeared and four ports closed.
 
 CPU-focused receive/STATE/namespace/scheduling/codec/probe/wait regression:
-**811 passed + 69 subtests**, with 90 deprecation warnings. Tests include real
-sync/async scheduler padding red/green cases and real LMCache token-accounting,
-flat-byte, `clear`/`close`, and full-pool cases.
+**825 passed + 69 subtests**, with 90 deprecation warnings. Includes ten TP
+ownership/cleanup cases, 29 real sync/async admission cases (DSpark input-budget
+edges use the real drafting-slot property), and real LMCache token-accounting,
+flat-byte, `clear`/`close`, and full-pool cases. Black and Ruff passed.
 
 Earlier in-process short/long and MP short/long probes passed. The earlier MP
 namespace run with zero tier supply was invalid; the pre-holding-queue-fix
