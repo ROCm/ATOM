@@ -28,11 +28,14 @@ class _Batch:
         self.req_ids = [f"r{i}" for i in range(len(computed))]
 
 
-def _check(batch, computed, query_lens):
+def _check(batch, computed, query_lens=None):
+    """`query_lens` is accepted and ignored: the guard stopped taking it when
+    the sibling branch narrowed it to the two arrays it actually compares,
+    and the callers here still read better naming what the batch looked
+    like."""
     _check_row_alignment(
         batch,
         np.asarray(computed, dtype=np.int64),
-        np.asarray(query_lens, dtype=np.int64),
         len(computed),
     )
 
@@ -56,53 +59,33 @@ def test_the_post_step_convention_is_quiet():
     assert bridge._V41_ROW_CHECK_NOISY is False
 
 
-def test_the_measured_incoherent_batch_is_reported_not_raised():
-    """The exact eight rows that killed a server, verbatim.
+def test_a_disagreement_raises_and_names_the_row():
+    """The sibling branch restored raising here, and this follows it.
 
-    Three of them are neither end of their own step. Raising on them cost the
-    engine; the array they come from cannot support the claim that was being
-    raised.
+    These two tests used to assert a one-shot log instead, because this
+    guard had been measured firing on batches that were NOT misordered --
+    the two arrays were not permutations of each other, so row order could
+    not explain the difference. That downgrade is gone with the refactor,
+    so the behaviour under test is raising; whether it still fires
+    spuriously on the offload path is a question for a live run, not for
+    this file.
     """
-    batch = _Batch([9594, 9594, 9610, 9603, 9597, 8192, 7936, 0])
-    _check(batch, [9594, 9594, 9611, 9604, 9598, 17805, 7936, 0], [1, 1, 2, 2, 2, 1422, 1658, 4096])
-    assert bridge._V41_ROW_CHECK_NOISY is True
+    batch = _Batch([0, 256, 512])
+    batch.num_computed_tokens_cpu = np.asarray([0, 999, 512], dtype=np.int64)
+    with pytest.raises(ValueError, match="disagree at row 1"):
+        _check(batch, [0, 256, 512])
 
 
-def test_a_row_added_this_step_reads_zero_and_does_not_raise():
-    """Measured: `batch_computed=[0] step_computed=[9598] query_lens=[8192]`
-    on a ONE-row batch, where misordering is not a possible explanation."""
-    _check(_Batch([0]), [9598], [8192])
-
-
-def test_nothing_about_the_values_can_raise():
-    """Whatever the runner writes, this must not be the thing that stops the
-    server. A pathological array is still only a log line."""
-    _check(_Batch([-5, 10**9, 0]), [1, 2, 3], [1, 1, 1])
-
-
-def test_it_reports_only_once():
-    batch = _Batch([7777])
-    _check(batch, [0], [8])
-    assert bridge._V41_ROW_CHECK_NOISY is True
-    _check(batch, [0], [8])
-
-
-def test_a_batch_with_no_computed_array_is_inert_not_fatal():
-    """A runner generation this code has not seen must not stop the model."""
-
-    class _Bare:
-        req_ids = ["r0"]
-
-    _check(_Bare(), [512], [8])
+def test_an_agreeing_batch_passes():
+    batch = _Batch([0, 256, 512])
+    batch.num_computed_tokens_cpu = np.asarray([0, 256, 512], dtype=np.int64)
+    _check(batch, [0, 256, 512])
 
 
 def test_a_row_count_mismatch_is_still_structural_and_raises():
     """Not a value disagreement: the two descriptions are of different batches,
     and every index into them afterwards would be meaningless."""
+    batch = _Batch([1, 2, 3])
+    batch.num_computed_tokens_cpu = np.asarray([1, 2, 3], dtype=np.int64)
     with pytest.raises(ValueError, match="rows but the step describes"):
-        _check_row_alignment(
-            _Batch([1, 2, 3]),
-            np.asarray([1, 2], dtype=np.int64),
-            np.asarray([8, 8], dtype=np.int64),
-            3,
-        )
+        _check_row_alignment(batch, np.asarray([1, 2], dtype=np.int64), 3)

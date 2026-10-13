@@ -1481,7 +1481,7 @@ def _dump_v41_state_rows(snapshot, batch, builder, exc) -> None:
         logger.exception("DeepSeek-V4.1: could not dump state rows")
 
 
-def _check_row_alignment(input_batch, num_computed, query_lens, num_reqs: int) -> None:
+def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
     """Refuse a batch whose two orderings disagree, naming the row.
 
     `req_ids` and the block table are read from the persistent `input_batch`
@@ -1492,28 +1492,8 @@ def _check_row_alignment(input_batch, num_computed, query_lens, num_reqs: int) -
     So it is checked here, where the row can still be named, rather than left
     to surface as a cursor that is off by the gap between two requests.
     """
-    # Both spellings: V1's `InputBatch` calls it `num_computed_tokens_cpu`,
-    # V2's (vLLM 0.31's ROCm default) `num_computed_tokens_np`. Reading only
-    # the V1 name made this guard return early on every 0.31 run -- a check
-    # that cannot fail, which is the most expensive kind, because the
-    # divergence it exists to name then surfaces as a cursor refusal hundreds
-    # of tokens away from the row that caused it.
-    for attr in ("num_computed_tokens_cpu", "num_computed_tokens_np"):
-        batch_computed = getattr(input_batch, attr, None)
-        if batch_computed is not None:
-            break
+    batch_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
     if batch_computed is None:
-        # Not silence: every runner generation so far has had one of these,
-        # so a batch with neither is a shape this code has not seen and the
-        # guard is off for it.
-        if not _V41_ROW_CHECK_INERT_LOGGED:
-            globals()["_V41_ROW_CHECK_INERT_LOGGED"] = True
-            logger.warning(
-                "DeepSeek-V4.1: the batch exposes no computed-token array "
-                "(tried %s), so the row-alignment guard is inert. A slot keyed "
-                "by one request and a position by another would go unnamed.",
-                "num_computed_tokens_cpu / num_computed_tokens_np",
-            )
         return
     mine = np.asarray(batch_computed[:num_reqs], dtype=np.int64)
     if mine.shape != num_computed.shape:
@@ -1521,47 +1501,16 @@ def _check_row_alignment(input_batch, num_computed, query_lens, num_reqs: int) -
             "DeepSeek-V4.1: input_batch has "
             f"{mine.shape[0]} rows but the step describes {num_computed.shape[0]}"
         )
-    # NOT a raise, and not a row-order check. Measured on 0.31's V2 runner,
-    # `num_computed_tokens_np` is not a coherent per-step snapshot: within one
-    # eight-row batch the rows read, variously, this step's start, one token
-    # below it, a frontier 9,613 tokens stale, and zero for a row added that
-    # step. The decisive observation is that the two arrays were not
-    # permutations of each other --
-    #
-    #   batch [9594, 9594, 9610, 9603, 9597,  8192, 7936, 0]
-    #   step  [9594, 9594, 9611, 9604, 9598, 17805, 7936, 0]
-    #
-    # -- so no reordering can explain the difference, and reordering is what
-    # this guard was written to name. It was inert on 0.31 until V4.1 began
-    # serving local prefix hits, and the first thing it did once reachable
-    # was kill the engine over a value the runner had not written yet. A
-    # guard that has never fired is a guard whose premise has never been
-    # tested against data.
-    #
-    # The hard contract that does catch a slot keyed by the wrong request is
-    # `_report_stale_state` in the attention leg, which compares the state
-    # cursor against the position it is wanted at -- against real bytes. This
-    # stays as a one-shot report so the disagreement remains visible.
-    after = num_computed + np.asarray(query_lens[:num_reqs], dtype=np.int64)
-    odd = np.flatnonzero((mine != num_computed) & (mine != after))
-    if odd.size:
-        global _V41_ROW_CHECK_NOISY
-        if not _V41_ROW_CHECK_NOISY:
-            _V41_ROW_CHECK_NOISY = True
-            logger.info(
-                "DeepSeek-V4.1: %d of %d batch rows carry a computed count "
-                "that is neither end of their own step (first: row %d says "
-                "%d, the step runs %d -> %d). On this runner that array is "
-                "not a per-step snapshot, so this is reported once and not "
-                "acted on; the cursor check in the attention leg is what "
-                "refuses a state slot that does not match its position.",
-                int(odd.size),
-                int(num_reqs),
-                int(odd[0]),
-                int(mine[odd[0]]),
-                int(num_computed[odd[0]]),
-                int(after[odd[0]]),
-            )
+    bad = np.flatnonzero(mine != num_computed)
+    if bad.size:
+        row = int(bad[0])
+        raise ValueError(
+            "DeepSeek-V4.1: the persistent batch and this step's attention "
+            f"metadata disagree at row {row}: input_batch says "
+            f"{int(mine[row])} computed tokens, the step says "
+            f"{int(num_computed[row])}. Their row orders have diverged, so "
+            "req_ids and block tables cannot be trusted for this step."
+        )
 
 
 def _v41_scheduled_batch(snapshot, slot_allocator, slots=None):

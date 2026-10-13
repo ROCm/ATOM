@@ -994,7 +994,15 @@ class V41BoundaryPlanner:
             merged.update(index_stats())
         return merged
 
-    def log_stats(self, *, interval_s: float = 60.0, force: bool = False) -> None:
+    #: Seconds between stat lines. 60 by default, and settable because a
+    #: workload shorter than one interval produces its last line BEFORE the
+    #: load and none during it -- which reads exactly like a load in which
+    #: nothing happened. `ATOM_V41_STATS_INTERVAL=5` is for measuring.
+    _STATS_INTERVAL = float(
+        os.environ.get("ATOM_V41_STATS_INTERVAL", "") or 60.0
+    )
+
+    def log_stats(self, *, interval_s: float | None = None, force: bool = False) -> None:
         """Say what this leg did, including when it did nothing.
 
         Unconditional, for the reason K3's counters exist: a run that produced
@@ -1002,6 +1010,8 @@ class V41BoundaryPlanner:
         so, and a by-construction null reads as a quiet success.
         """
         now = time.monotonic()
+        if interval_s is None:
+            interval_s = self._STATS_INTERVAL
         if not force and now - self._last_stats_log < interval_s:
             return
         self._last_stats_log = now
