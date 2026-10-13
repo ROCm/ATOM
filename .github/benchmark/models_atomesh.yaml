@@ -778,6 +778,11 @@ models:
               # owners pin huge pages, not just this one's: compaction would
               # reclaim it otherwise.
               MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              # A node whose free memory is fragmented compacts at about
+              # 0.8 GB/s (pit2-p03-g35), so 768 GiB takes about 16 min; within
+              # the default 600 s owner0 got 4 KiB pages its NICs refused.
+              # Startup only: each NUMA node compacts before the servers start.
+              MOONCAKE_STORE_COMPACT_TIMEOUT: "1800"
               # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
