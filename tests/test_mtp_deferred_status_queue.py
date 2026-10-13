@@ -400,6 +400,10 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
     assert result.shape == (8,)
     assert input_ids_group.counts == [8, 2]
     fill_ids.assert_called_once()
+    # Both requests are new, so their draft columns come from the draft table,
+    # not from `scheduled_tokens` (which would leave 1-3 and 5-7 here).
+    np.testing.assert_array_equal(processor.input_ids.np[1:4], [0, 1, 2])
+    np.testing.assert_array_equal(processor.input_ids.np[5:8], [3, 4, 5])
 
 
 def test_a_producer_dp_dummy_stages_without_a_draft_table():
@@ -417,7 +421,8 @@ def test_a_producer_dp_dummy_stages_without_a_draft_table():
     ModelRunner.dummy_execution(runner)
     (batch,) = seen
     assert batch.num_spec_step == 0
-    assert not hasattr(batch, "scheduled_spec_decode_tokens")
+    spec = getattr(batch, "scheduled_spec_decode_tokens", None)
+    assert spec is None or spec.size == 0
 
     processor, input_ids_group = _deferred_processor(
         np.array([0, 1], dtype=np.int32), [0]
