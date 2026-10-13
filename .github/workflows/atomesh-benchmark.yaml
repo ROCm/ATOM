@@ -203,7 +203,7 @@ on:
         type: boolean
 
 env:
-  ATOMESH_NODE_POOL: pit2-p03-g01,pit2-p03-g03,pit2-p03-g07,pit2-p03-g08,pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g13,pit2-p03-g15,pit2-p03-g17,pit2-p03-g19,pit2-p03-g20,pit2-p03-g23,pit2-p03-g24,pit2-p03-g25,pit2-p03-g27,pit2-p03-g42
+  ATOMESH_NODE_POOL: ""
   # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
   NCCL_IB_GID_INDEX: '1'
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
@@ -1773,8 +1773,8 @@ jobs:
         if: ${{ always() && matrix.name == 'kimi-k3-mooncake-inferencex-c48' }}
         uses: actions/upload-artifact@v4
         with:
-          name: atomesh-prior-slurm-7970-${{ github.run_id }}
-          path: atomesh-results/prior-slurm-7970.json
+          name: atomesh-prior-slurm-8019-${{ github.run_id }}
+          path: atomesh-results/prior-slurm-8019.json
           if-no-files-found: error
 
       - name: Run Slurm benchmark cell

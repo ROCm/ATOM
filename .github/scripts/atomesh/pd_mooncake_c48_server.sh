@@ -29,6 +29,13 @@ print('Mooncake ROCm imports passed:', MooncakeConnector.__name__, MooncakeStore
 PY
   export VLLM_MOONCAKE_BOOTSTRAP_PORT=$((18998 + ATOMESH_SERVICE_PORT_OFFSET))
   export MOONCAKE_MASTER_PORT=$((19051 + ATOMESH_SERVICE_PORT_OFFSET))
+  # Separate caches preserve the normal service's cold-start compilation path.
+  local device
+  for device in 0 1 2 3 4 5 6 7; do
+    MOONCAKE_KERNEL_EVIDENCE_DIR="${RUNTIME_LOG_DIR}/kernel-preflight-rank-${NODE_RANK}" \
+    TRITON_CACHE_DIR="/tmp/mooncake-kernel-preflight-${NODE_RANK}-${device}" \
+      /tmp/mooncake-c48-venv/bin/python -m vllm._mooncake_kernel_evidence "${device}"
+  done
 }
 
 start_mooncake_c48_store() {
@@ -70,7 +77,8 @@ start_vllm_server() {
   local -a cache_env=()
   build_server_cache_env "${role}" "${port}" cache_env
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" \
-    env "${cache_env[@]}" /tmp/mooncake-c48-venv/bin/python "${ATOMESH_SCRIPT_DIR}/pd_mooncake_c48_launch.py" \
+    env "${cache_env[@]}" MOONCAKE_KERNEL_EVIDENCE_DIR="${RUNTIME_LOG_DIR}/kernel-warmup-${role}" \
+    /tmp/mooncake-c48-venv/bin/python "${ATOMESH_SCRIPT_DIR}/pd_mooncake_c48_launch.py" \
     --config "${ATOMESH_SCRIPT_DIR}/../../benchmark/mooncake-c48.json" \
     --role "${role}" --model "${MODEL_PATH}" --host "${host_ip}" --port "${port}" \
     --output "${RUNTIME_LOG_DIR}/${log_name}.launch.json" --execute

@@ -33,8 +33,15 @@ def main():
     multi.unlink()
     shutil.copyfile(vendor / "multi_connector.py", multi)
     assert digest(multi) == provenance["multi_connector_after_sha256"]
+    warmup = target / "model_executor/warmup/mamba_triton_warmup.py"
+    assert digest(warmup) == "63cc5af797ecc41384e7a60a1f387a1bbae400f7128c71c27be6b29adbac021c"
+    original = warmup.read_text()
+    warmup.unlink()
+    warmup.write_text(original + "\nfrom vllm._mooncake_kernel_evidence import trace_warmup\n"
+                      "_warm_batch_memcpy_kernel = trace_warmup(_warm_batch_memcpy_kernel)\n")
+    shutil.copyfile(vendor / "kernel_evidence.py", target / "_mooncake_kernel_evidence.py")
     versions = {}
-    for name in ("vllm", "torch", "triton", "aiter", "mori", "mooncake-transfer-engine-rocm"):
+    for name in ("vllm", "torch", "triton", "amd-aiter", "amd_mori", "mooncake-transfer-engine-rocm"):
         try:
             versions[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -44,6 +51,8 @@ def main():
         "overlay_package": str(target), "versions": versions,
         "verified_image_source_hashes": before,
         "multi_connector_after_sha256": digest(multi),
+        "warmup_observer_sha256": digest(warmup),
+        "kernel_evidence_sha256": digest(target / "_mooncake_kernel_evidence.py"),
         "provenance": provenance,
         "compiled_extensions": [
             {"path": str(p), "resolved": str(p.resolve()), "bytes": p.stat().st_size}
