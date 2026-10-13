@@ -311,6 +311,23 @@ def test_interval_zero_still_counts_working_blocks_and_never_hits(
     eng.drain()
 
 
+def test_auto_fit_max_model_len_leaves_room_for_the_slot_tail(adapter, tmp_path):
+    """--max-model-len -1 under memory pressure: vLLM fits the length to all
+    100 physical blocks (23,808 tokens = 99 blocks with the images and the null
+    block); the slots then take 11, so the length has to fit 89."""
+    vc, cfg = _upstream_configs(adapter, tmp_path, 100, max_model_len=-1)
+    assert vc.model_config.original_max_model_len == -1
+    fitted = vc.model_config.max_model_len
+    assert fitted == (89 - 1 - 2 * K) * BLOCK < 23808
+    assert cfg.num_blocks == 89
+    # The slot bytes stay allocated after the schedulable blocks.
+    assert {t.size for t in cfg.kv_cache_tensors} == {100 * PAGE}
+    s = _scheduler(adapter, tmp_path, num_blocks=cfg.num_blocks, max_model_len=fitted)
+    eng = _Engine(s)
+    _request(s, "long", range(1, fitted), max_tokens=1)
+    eng.drain()
+
+
 @pytest.mark.parametrize("hash_block", [BLOCK, BLOCK // 2])
 def test_abort_with_a_deferred_decode_keep_frees_the_request(
     adapter, tmp_path, hash_block
