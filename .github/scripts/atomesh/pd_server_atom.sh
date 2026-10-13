@@ -1539,9 +1539,15 @@ start_mooncake_page_cache_dropper() {
 # since, which no signal of the cleanup may reach: the pid must still run the
 # dropper.
 mooncake_page_cache_dropper_running() {
-  local pid="${mooncake_page_cache_dropper_pid}" cmdline
+  local pid="${mooncake_page_cache_dropper_pid}" cmdline i
   [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
-  cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || return 1
+  # A process's command line reads empty while it execs, and the dropper execs
+  # more than once as it starts (setsid, then python3): read it again.
+  for ((i = 0; i < 50; i++)); do
+    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || return 1
+    [[ -n "${cmdline}" ]] && break
+    sleep 0.01
+  done
   [[ "${cmdline}" == *"/drop_page_cache.py --every "* ]]
 }
 
