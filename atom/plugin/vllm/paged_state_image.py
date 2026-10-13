@@ -482,7 +482,8 @@ def _apply_zeroing_patch() -> bool:
 # ---------------------------------------------------------------------------
 
 # Worker-side lifecycle events go straight to every slot allocator in the
-# process (target and, if any, draft), before this step's metadata is built.
+# process (the target's; an MTP draft only looks its slots up there), before
+# this step's metadata is built.
 _slot_allocators: list = []
 _event_counts = {"finished": 0, "preempted": 0, "resumed": 0}
 # This step's image stores as the scheduler hashed them: req_id -> boundary.
