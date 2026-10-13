@@ -227,11 +227,25 @@ class DSparkConfidenceHead(nn.Module):
         Returns:
             confidence: [*]  sigmoid survival probability in (0, 1).
         """
-        # Confidence is computed in fp32 (the checkpoint head is fp32 and the
-        # downstream scheduler needs calibrated absolute probabilities).
-        x = torch.cat([hidden_states, markov_embeds], dim=-1).float()
-        logit = torch.nn.functional.linear(x, self.proj.weight.float()).squeeze(-1)
-        return torch.sigmoid(logit)
+        # FP32 out (the downstream scheduler needs calibrated absolute
+        # probabilities). The checkpoint head is BF16 [1, hidden + rank]: the
+        # GEMV takes it as is and accumulates and writes FP32, which is what
+        # casting both operands to FP32 first would compute, minus the casts.
+        # aiter is imported here, not at module load: this module (the heads'
+        # shapes and the draft's plain-torch pieces) imports without it.
+        x = torch.cat([hidden_states, markov_embeds], dim=-1)
+        weight = self.proj.weight
+        if not x.is_cuda:
+            logit = torch.nn.functional.linear(x.float(), weight.float()).squeeze(-1)
+            return torch.sigmoid(logit)
+
+        import aiter
+        from aiter.tuned_gemm import tgemm
+
+        if weight.dtype != x.dtype:
+            weight = weight.to(x.dtype)
+        logit = tgemm.mm(x.reshape(-1, x.shape[-1]), weight, otype=torch.float32)
+        return aiter.sigmoid(logit).view(x.shape[:-1])
 
 
 # ---------------------------------------------------------------------------

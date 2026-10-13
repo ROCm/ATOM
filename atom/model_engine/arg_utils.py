@@ -133,6 +133,7 @@ class EngineArgs:
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
     enable_decoder_swa_bounded_replay: bool = True
+    enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
     throughput_log_interval: float = 10.0
@@ -512,12 +513,29 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             default=True,
             help=(
-                "DeepSeek-V4.1: in prefill, run the layers after the last "
-                "KV-source layer on each request's last window-ring rows only "
-                "(window + speculative tokens). Faster prefill; not numerically "
-                "equivalent to a full prefill. On by default, as vLLM's "
-                "--swa-bounded-replay; --no-decoder-swa-bounded-replay turns it "
-                "off. No effect on other models."
+                "DeepSeek-V4.1: in prefill, run the decoder (the last KV-source "
+                "layer and those after it) only on each request's last window "
+                "rows, their windows truncated there, and the last layer on its "
+                "last row (the V4.1 report's SWA Bounded Replay). Faster "
+                "prefill; not numerically equivalent to a full prefill. On by "
+                "default; --no-decoder-swa-bounded-replay turns it off. No "
+                "effect on other models."
+            ),
+        )
+        parser.add_argument(
+            "--encoder-swa-bounded-replay",
+            "--enable-encoder-swa-bounded-replay",
+            dest="enable_encoder_swa_bounded_replay",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "DeepSeek-V4.1: a prefix hit resumes without a state checkpoint, "
+                "rebuilding the sliding-window state by recomputing the hash "
+                "block below the hit (no cached row is rewritten); no state "
+                "checkpoint is kept, so no prefill chunk is cut for one. Not "
+                "numerically equivalent to resuming a checkpoint. On by "
+                "default; --no-encoder-swa-bounded-replay keeps checkpoints. No "
+                "effect on other models."
             ),
         )
         parser.add_argument(

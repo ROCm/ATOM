@@ -57,7 +57,11 @@ def test_production_geometry_has_only_four_global_owners():
     assert geo.paged_bytes == 32 * (3 / 2 + 1) * (512 * 2 + 132)
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes
     assert geo.state_fields[0].layers == 40
-    assert all(field.in_checkpoint for field in geo.state_fields)
+    # Rings and cursor are checkpointed; the compressor tails are not.
+    assert [f.name for f in geo.state_fields if f.in_checkpoint] == [
+        "window",
+        "cursor",
+    ]
 
 
 def runtime_config(**overrides):
@@ -82,7 +86,8 @@ def runtime_config(**overrides):
         "kv_cache_block_size": 16,
         "tensor_parallel_size": 4,
         "enable_expert_parallel": True,
-        "hf_config": SimpleNamespace(),
+        "hf_config": SimpleNamespace(sliding_window=128),
+        "enable_encoder_swa_bounded_replay": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -109,6 +114,8 @@ def runtime_config(**overrides):
         {"kv_cache_dtype": "fp8"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
+        # a hit's one-PAGE rebuild would not cover the window
+        {"enable_encoder_swa_bounded_replay": True},
     ],
 )
 def test_unimplemented_modes_fail_before_loading(override):

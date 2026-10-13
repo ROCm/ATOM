@@ -32,7 +32,7 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_scatter_rows_reference,
     swa_write,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, upload_numpy
 
 from .indices import (
     build_indices,
@@ -128,6 +128,14 @@ class PagedAttentionCache:
         # `index_fill_` takes no other width, unlike the `index_select` above.
         self._reset_slots = CpuGpuBuffer(
             slots, dtype=torch.int64, device=device, pin_memory=pinned
+        )
+        # The Engram history each of those starts at (`BatchStep.start_histories`).
+        self._reset_histories = CpuGpuBuffer(
+            slots,
+            self.cursor.shape[1] - 1,
+            dtype=self.cursor.dtype,
+            device=device,
+            pin_memory=pinned,
         )
         # Where a caller that wants no history lands its cursor rows: the copy
         # is issued and judged a step later, so nothing waits for it. See
@@ -247,7 +255,14 @@ class PagedAttentionCache:
         query_prefix_ready=False,
         query_prefix_republish_reason=None,
         planners=(),
+        floors=None,
+        cached_until=None,
+        finals=None,
+        start_histories=None,
     ):
+        """`floors`, `cached_until`, `finals`, `start_histories`: per request,
+        on the host, `BatchStep`'s `request_*` and `start_histories`; None for
+        a forward recomputing nothing, ending every prompt."""
         self.require_committed()
         requests = tuple(requests)
         if tentative and (
@@ -297,15 +312,28 @@ class PagedAttentionCache:
         step.plans = (
             self._private_plans(requests, tentative) if plans is None else plans
         )
+        count = len(requests)
+        zeros = np.zeros(count, np.int32)
+        step.request_floors = zeros if floors is None else floors
+        step.request_cached_until = zeros if cached_until is None else cached_until
+        step.request_finals = (
+            np.ones(count, np.bool_) if finals is None else np.asarray(finals)
+        )
+        step.start_histories = start_histories
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
-        step.swa_replay_start = self._replay_start_zeros(
-            len(requests) if running_bs is None else running_bs
-        )
+        # Before the indptrs, which count each row's window from its floor.
+        zeros = self._replay_start_zeros(count if running_bs is None else running_bs)
+        step.swa_replay_start = step.swa_cached_until = zeros
+        if step.request_floors.any() and not step.decode:
+            step.swa_replay_start, step.swa_cached_until = upload_numpy(
+                np.stack((step.request_floors, step.request_cached_until)),
+                step.positions.device,
+            )
         step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
         return step
 
@@ -358,14 +386,14 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
-    def _report_stale_state(self, cursors, starts, requests):
+    def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
 
-        Fresh requests are excluded by their own position: the slot they are
-        about to reuse holds whatever the last tenant left, and the reset below
-        is what makes it theirs.
+        Fresh requests are excluded: the slot they are about to reuse holds
+        whatever the last tenant left, and the reset below is what makes it
+        theirs.
         """
-        wrong = np.flatnonzero((starts != 0) & (cursors[:, 0] != starts))
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
             return
         first = int(wrong[0])
@@ -384,9 +412,11 @@ class PagedAttentionCache:
             return
         if self._probe_done is not None and not self._probe_done.query():
             return
-        starts, requests = self._probe_claim
+        starts, requests, fresh = self._probe_claim
         self._probe_claim = None
-        self._report_stale_state(self._probe[: starts.size].numpy(), starts, requests)
+        self._report_stale_state(
+            self._probe[: starts.size].numpy(), starts, requests, fresh
+        )
 
     def prepare_state(self, step, *, histories=True):
         """Read restored cursors; reset recycled slots before any layer writes.
@@ -410,37 +440,54 @@ class PagedAttentionCache:
         count = step.scheduled_bs
         starts = step.request_positions[:count]
         ids = [span.request_id for span in step.requests]
+        # A slot starts over at its floor: 0, or where a request rebuilds its
+        # state below a prefix hit (`BatchStep.request_floors`). One
+        # recomputing rows below where its state is keeps the state, and its
+        # cursor steps back to the forward's start.
+        resumes = step.request_cached_until[:count]
+        fresh = (starts == step.request_floors[:count]) & (resumes == 0)
+        restarted = np.concatenate((np.flatnonzero(fresh), np.flatnonzero(resumes)))
+        # where each state has to be
+        wanted = np.where(resumes > 0, resumes, starts)
         if histories:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
+            self._report_stale_state(cursors, wanted, ids, fresh)
         else:
             # Issued before the reset below, so a recycled slot is captured as
-            # its old tenant left it -- which is why the judge skips position 0.
+            # its old tenant left it -- which is why the judge skips fresh ones.
             self._probe[:count].copy_(
                 torch.index_select(self.cursor, 0, step.slots[:count]),
                 non_blocking=True,
             )
             if self._probe_done is not None:
                 self._probe_done.record()
-            self._probe_claim = (starts.copy(), ids)
+            self._probe_claim = (wanted, ids, fresh.copy())
             cursors = None
-        fresh = starts == 0
-        if fresh.any():
-            # Both resets take the same index, so the slots cross once.
-            slots = self._reset_slots.np[: int(fresh.sum())]
-            slots[:] = [span.slot for span, new in zip(step.requests, fresh) if new]
+        if restarted.size:
+            # The resets take one index, fresh slots first, so the slots cross
+            # once.
+            slots = self._reset_slots.np[: restarted.size]
+            slots[:] = [step.requests[i].slot for i in restarted]
             index = self._reset_slots.copy_to_gpu(slots.size)
-            self.state_bytes.index_fill_(0, index, 0)
-            self.cursor[:, 1:].index_fill_(0, index, -1)
+            self.state_bytes.index_fill_(0, index[: int(fresh.sum())], 0)
+            if step.start_histories is None:
+                self.cursor[:, 1:].index_fill_(0, index, -1)
+                started = -1
+            else:
+                started = step.start_histories[:count][restarted]
+                self._reset_histories.np[: restarted.size] = started
+                self.cursor[:, 1:].index_copy_(
+                    0, index, self._reset_histories.copy_to_gpu(restarted.size)
+                )
             if cursors is not None:
-                cursors[fresh, 0] = 0
-                cursors[fresh, 1:] = -1
+                cursors[restarted, 0] = starts[restarted]
+                cursors[restarted, 1:] = started
         if cursors is None:
             if step.tentative:
                 self.pending = TentativeState(self, step)
             return None
-        self._report_stale_state(cursors, starts, ids)
         if step.tentative:
             self.pending = TentativeState(self, step, cursors[:, 1:])
         return cursors[:, 1:]
@@ -655,13 +702,19 @@ class PagedAttentionCache:
         payload, so both halves of that read the same either way.
 
         Returns the BF16 row an extend pass attends to and whatever the window
-        still owes, `None` for each the caller has no use for.
+        still owes, `None` for each the caller has no use for. `query` None:
+        the KV row alone, for a prefill whose queries are not its rows
+        (`rotate_query`).
         """
         dim, packed = self.geometry.head_dim, self.packed
         if not step.width:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
-            query.view(step.width, -1, dim),
+            (
+                kv.new_empty(step.width, 0, dim)
+                if query is None
+                else query.view(step.width, -1, dim)
+            ),
             kv.view(step.width, dim),
             rope.cos_cache,
             rope.sin_cache,
@@ -697,15 +750,29 @@ class PagedAttentionCache:
         )
         return qat, (values, scales) if packed else qat
 
+    def rotate_query(self, query, rope, positions):
+        """`rope_quant_window`'s query half alone, at `positions`."""
+        if positions.numel():
+            rope_quant_window(
+                query.view(positions.numel(), -1, self.geometry.head_dim),
+                None,
+                rope.cos_cache,
+                rope.sin_cache,
+                positions,
+                rope_dim=rope.rope_dim,
+            )
+
     def write_window(self, layer, kv, step):
         # `None` is `rope_quant_window` reporting that it already stored the
         # row, not an empty batch: those two differ in whether `step.width` is
         # zero, and only this one can reach here after a real forward.
         if kv is not None and step.width:
             window = self.geometry.window(layer, self.num_pages)
+            # rows below where a request's ring already holds them stay
+            cached = step.swa_cached_until if step.request_cached_until.any() else None
             if self.packed:
                 write_packed_window(
-                    *kv, self.backing, step, window, self.geometry.head_dim
+                    *kv, self.backing, step, window, self.geometry.head_dim, cached
                 )
                 return
             swa_write(
@@ -720,6 +787,7 @@ class PagedAttentionCache:
                 # zero-length in `cu_seqlens_q`, which is what keeps it from
                 # writing anything at all.
                 min(step.max_q_len, window.ring_slots),
+                cached_until=cached,
             )
 
     def attention_indices(self, spec, step):

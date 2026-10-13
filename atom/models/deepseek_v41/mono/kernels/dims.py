@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from atom.mono.plan.shard import Shard, Tiles, padded
 
 # the model's full widths
+HIDDEN = 5120
+HC = 4  # hyper-connection streams
+Q_RANK, KV_DIM = 1280, 512  # the q latent, the window row
 Q_HEADS = 64  # attention query heads
 O_GROUPS = 8  # wo_a groups
 O_RANK = 1024  # wo_a output rows a group

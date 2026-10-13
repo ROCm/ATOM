@@ -73,6 +73,11 @@ class BatchStep:
     group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
     # A split decode's window rows (`indices.build_window_rows`), every layer's.
     window_rows: torch.Tensor | None = None
+    # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
+    # bounded_replay`): the rows its decoder ran on, for what else reads the
+    # decoder's rows after it (the DSpark draft's window). None where the
+    # forward did not replay.
+    replay: object | None = None
     indptrs: dict[int, tuple] = field(default_factory=dict)
     # ratio -> [width] int32: compressed rows each query row may see. Worked
     # out on the host, where `positions` is staged and where RoPE takes its
@@ -88,17 +93,41 @@ class BatchStep:
     request_positions: np.ndarray = field(
         default_factory=lambda: np.empty(0, dtype=np.int32)
     )
+    # Host, per request, filled by `begin_step` (a bounded-replay row step
+    # has none). `request_floors`: the lowest position it has a window row at,
+    # above 0 for a forward recomputing rows below where it resumed
+    # (`Sequence.replay_until`), which starts there. `request_cached_until`:
+    # for such a forward whose state came with it, where it resumed -- its
+    # ring already holds every row below, exact, and keeps them -- 0 for every
+    # other (`swa_cached_until`). `request_finals`: whether its forward ends
+    # its prompt. `start_histories`: the Engram history a recomputing forward
+    # starts its slot's cursor at, if any request runs one.
+    request_floors: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    request_cached_until: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    request_finals: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.bool_)
+    )
+    start_histories: np.ndarray | None = None
     # buffer name -> GPU view of what a step planner (`add_step_planner`)
     # laid out for this step; absent when it planned nothing
     planned: dict[str, torch.Tensor] = field(default_factory=dict)
     # name -> what a step planner worked out on the host (`StepPlan.host`)
     planned_host: dict[str, object] = field(default_factory=dict)
     # [requests] int32: the lowest position whose window row a request's
-    # queries may read. Zeros (the cache's fixed buffer, so a capture records
-    # one address) except on a bounded-replay tail step
-    # (`models.deepseek_v41.bounded_replay`), whose late layers wrote no
-    # window row below the tail (SGLang's `swa_replay_start`).
+    # queries may read (SGLang's `swa_replay_start`). Zeros (the cache's fixed
+    # buffer, so a capture records one address) except on a bounded-replay
+    # tail step (`models.deepseek_v41.bounded_replay`), whose decoder layers
+    # wrote no window row below the tail, and `request_floors`'.
     swa_replay_start: torch.Tensor | None = None
+    # [requests] int32, `request_cached_until` on the device: zeros (as
+    # `swa_replay_start`) but where a forward recomputes rows below a point
+    # its ring already holds. Its rows from there on read the ring below it,
+    # and only they are written to the ring.
+    swa_cached_until: torch.Tensor | None = None
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -113,6 +142,7 @@ class BatchStep:
         self.candidate_blocks.clear()
         self.group_indices.clear()
         self.window_rows = None
+        self.replay = None
 
     @property
     def width(self):
