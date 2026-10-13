@@ -71,7 +71,7 @@ _V41_MODEL_TYPE = "deepseek_v41"
 # Model path -> normalized text config. `atom.config.get_hf_config` reads and
 # normalizes the checkpoint's config.json; doing that once per process keeps
 # the sizing helpers below cheap enough to call from a patch.
-_V41_TEXT_CONFIG_CACHE: dict[str, object] = {}
+_V41_TEXT_CONFIG_CACHE: dict[int, object] = {}
 
 
 def is_deepseek_v41_vllm_config(vllm_config) -> bool:
@@ -93,22 +93,58 @@ def is_deepseek_v41_vllm_config(vllm_config) -> bool:
 
 
 def v41_text_config(vllm_config):
-    """The normalized V4.1 text config, from the checkpoint.
+    """The normalized V4.1 text config, from the config vLLM resolved.
 
-    Not ``vllm_config.model_config.hf_config``: that is the AutoConfig shim
-    vLLM built, which carries the fields vLLM reads and not the normalized
-    field set ``build_attention_topology`` / ``V41PoolGeometry`` need.
-    ``atom.config.get_hf_config`` is the single authority for that
-    normalization, and the runtime model is constructed from the same object.
+    From vLLM's, not from the checkpoint on disk, because the two differ
+    exactly where it matters: `--hf-overrides` is applied to vLLM's and never
+    reaches the file. Reading the file gave the runtime model, the pool
+    geometry and the attention topology a config the operator had asked to
+    change, with nothing to say so.
+
+    `normalize_hf_config` is still the single authority for the flat field
+    set those three are written against; what changes is only which raw dict
+    it is handed. Cached by the resolved config's identity rather than by
+    model path, since two runs of the same checkpoint with different
+    overrides are different configs.
     """
-    from atom.config import get_hf_config
+    from atom.models.deepseek_v41.config import normalize_hf_config
 
-    model = str(vllm_config.model_config.model)
-    config = _V41_TEXT_CONFIG_CACHE.get(model)
+    resolved = getattr(vllm_config.model_config, "hf_config", None)
+    if resolved is None:
+        raise ValueError(
+            "DeepSeek-V4.1 plugin mode needs vLLM's resolved HF config; "
+            "model_config carries none"
+        )
+    key = id(resolved)
+    config = _V41_TEXT_CONFIG_CACHE.get(key)
     if config is None:
-        config = get_hf_config(model)
-        _V41_TEXT_CONFIG_CACHE[model] = config
+        config = normalize_hf_config(_v41_resolved_raw(resolved))
+        _V41_TEXT_CONFIG_CACHE[key] = config
     return config
+
+
+def _v41_resolved_raw(resolved) -> dict:
+    """vLLM's resolved config as the dict `normalize_hf_config` reads.
+
+    Two things `transformers` does on the way out have to be undone, and
+    both are its doing rather than this checkpoint's:
+
+    * `to_dict` writes `output["model_type"] = self.__class__.model_type`,
+      so a sub-config's type has to come from its class. The shim in
+      `atom.plugin.vllm.register` declares it; this asserts it arrived,
+      because the failure is silent -- an empty `model_type` reads as "not
+      a V4.1 text config" and the override is lost rather than refused.
+    * RoPE standardization renames `rope_scaling` to `rope_parameters`.
+      Restored under the name ATOM's schema uses.
+    """
+    raw = resolved.to_dict()
+    text = raw.get("text_config")
+    if isinstance(text, dict) and "rope_scaling" not in text:
+        rope = text.get("rope_parameters")
+        if rope is not None:
+            text = dict(text, rope_scaling=rope)
+            raw = dict(raw, text_config=text)
+    return raw
 
 
 def v41_kv_cache_dtype(vllm_config) -> str:
@@ -896,24 +932,44 @@ def snapshot_v41_batch(common_attn_metadata):
 
     block_table_np = None
     req_ids = None
+    # The end position each request reaches this step, which is what decides
+    # how many PAGE columns are live. Computed here because the fallback copy
+    # below is sized from it; `ends` below is the same arithmetic kept in the
+    # order the batch protocol documents.
+    ends_preview = (num_computed + query_lens).astype(np.int64)
     if input_batch is not None:
+        # Two separate acquisitions, because the two live on different
+        # runners. The V2 `InputBatch` has `req_ids` and no block table at
+        # all; reading both under one `try` meant its perfectly good request
+        # ids were thrown away with the failed block-table lookup, and slot
+        # keying silently fell back to first-block ids -- on the runner V4.1
+        # selects by default, so on every run.
         try:
             req_ids = list(input_batch.req_ids)[:num_reqs]
-            block_table_np = input_batch.block_table[0].block_table.np
         except Exception:  # noqa: BLE001
             # The accessor is an ATOM patch over another engine's internals;
             # absent is the caller's ordinary "fall back" case.
             req_ids = None
-            block_table_np = None
-        else:
-            # Outside the fallback, deliberately. A row divergence is not a
-            # missing accessor: falling back on it would key state slots on
-            # first-block ids -- `-1` for every block-less row, so two such
-            # requests share one slot -- which is the wrong output this check
-            # exists to name. It has to reach the caller.
+        host_table = getattr(input_batch, "block_table", None)
+        if host_table is not None:
+            try:
+                block_table_np = host_table[0].block_table.np
+            except Exception:  # noqa: BLE001
+                block_table_np = None
+        if req_ids is not None:
+            # Keyed on the ids above, so the orderings have to agree. A row
+            # divergence is not a missing accessor: it would key the state
+            # slot by one request and the position by another, which is wrong
+            # output rather than a crash, so it has to reach the caller.
             _check_row_alignment(input_batch, num_computed, num_reqs)
     if block_table_np is None:
-        block_table_np = common_attn_metadata.block_table_tensor.cpu().numpy()
+        # Only the columns this step reads. The whole table was being copied
+        # and then sliced per request; its width is the pool's, not this
+        # step's, so the copy was paying for every PAGE a request could ever
+        # own rather than the ones it owns now.
+        widest = -(-int(max(ends_preview, default=0)) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
+        table = common_attn_metadata.block_table_tensor
+        block_table_np = table[:num_reqs, : max(widest, 1)].cpu().numpy()
 
     # `context_lens` in ATOM's batch protocol is the request's end position
     # after this step -- vLLM's `seq_lens`.
