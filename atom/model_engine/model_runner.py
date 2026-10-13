@@ -710,6 +710,60 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def _lossless_verify_inputs(drafter, req_ids, *, all_greedy, top_ks, top_ps):
+    """The verify step's `(draft_probs, draft_probs_row_base)`, or `(None, None)`.
+
+    `(None, None)` is the shipped exact-match verification; anything else is the
+    probability-ratio rule in `rejection_sampler.rejection_sample`. Three ways to
+    stay on exact match, and they are different claims:
+
+    * **No q published.** Every drafter but a DSpark one armed with
+      `ATOM_SPEC_LOSSLESS_SAMPLING` inherits `Drafter`'s no-op hooks and answers
+      `None`. This is the default, since the flag defaults off.
+    * **`all_greedy`.** At temperature 0 the two rules COINCIDE -- a greedy draft
+      is a delta q and `sum_x min(p, q) = p(x*)` -- so the ratio kernel would buy
+      nothing and could only move the answer by an ulp. Keeping the exact-match
+      kernel is what makes the flag a bit-for-bit no-op on a greedy batch, which
+      is most deployments.
+    * **Any row carries top-k or top-p.** `rejection_sampler._ratio_target_probs`
+      builds p as a plain temperature softmax and does NOT filter it, so a
+      filtered row verified by the ratio rule would accept against -- and draw
+      its correction token from -- the UNFILTERED target, silently serving a
+      distribution the request did not ask for. Exact match against the target's
+      own FILTERED draw stays lossless: the draft token does not depend on the
+      target's fresh noise, and the emitted token is the target's sample.
+
+    The filter test is BATCH-WIDE, not per row, and that is a property of the
+    kernel rather than a shortcut: `rejection_ratio_sample_kernel` has one accept
+    rule for the whole launch and no exact-match branch to route a row into, and
+    its negative-row-base sentinel is not one either (it resamples from the same
+    unfiltered p). Routing per row would mean teaching the ratio path to
+    materialize a FILTERED fp32 `[num_tokens, V]` p, which is a verify-hot-path
+    change this does not make.
+
+    Batch-wide used to be a genuine regression: the drafts for such a batch had
+    still been SAMPLED, and a sampled proposal under exact-match acceptance
+    matches strictly less often than the greedy proposal the flag-off path
+    makes, so one `top_p < 1` request made every row in the batch worse than if
+    the flag were off. It no longer is. `DSparkProposer.stage_draft_sampling`
+    reads `ModelRunner.sampling_has_row_filter` and drafts such a batch
+    greedily, so a filtered batch is now exactly the flag-off pair -- greedy
+    proposal, exact-match acceptance -- rather than worse than it.
+
+    Host-side throughout, so it costs no sync: `prepare_sample` sets `top_ks` and
+    `top_ps` to None exactly when no row filters. It raises nothing. The filter
+    case used to be a `NotImplementedError` thrown inside the kernel wrapper,
+    i.e. inside every TP worker, so one request with `top_p < 1` killed the
+    engine for good while `/health` went on answering 200.
+    """
+    if all_greedy or drafter is None:
+        return None, None
+    draft_probs = drafter.draft_probs
+    if draft_probs is None or top_ks is not None or top_ps is not None:
+        return None, None
+    return draft_probs, drafter.draft_probs_row_base(req_ids)
+
+
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -1387,6 +1441,20 @@ class ModelRunner:
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         f32_kwargs = {"dtype": torch.float, "device": self.device}
+
+        # Does the batch currently being sampled carry an active top-k/top-p on
+        # ANY row? Written by `prepare_sample` and read, a few hundred
+        # microseconds later in the same step, by
+        # `DSparkProposer.stage_draft_sampling` -- which has to know it BEFORE
+        # it drafts, because the only thing that can un-regress a filtered
+        # batch is drafting it greedily. See the comment there.
+        #
+        # A host bool rather than a device tensor: `prepare_sample` already
+        # decides it on the CPU to keep the sampler free of syncs, so reading
+        # it back costs nothing. Seeded False so a drafter reached before any
+        # `prepare_sample` (the warmup and capture paths) sees the ordinary
+        # unfiltered answer.
+        self.sampling_has_row_filter = False
 
         # TODO: remove it in forward_context
         self.forward_vars = {
@@ -2621,6 +2689,14 @@ class ModelRunner:
         needs_topk = (batch.top_ks != -1).any()
         needs_topp = (batch.top_ps < 1.0).any()
 
+        # Hand that same decision to the drafter, which runs later in this step
+        # and has to draft for the batch the NEXT verify will see. Set here
+        # rather than derived from the `top_ks`/`top_ps` returned below because
+        # those collapse a uniform filter to a host scalar and an absent one to
+        # None, so "any row filters" is a fact this function knows and nobody
+        # downstream can recover without a sync.
+        self.sampling_has_row_filter = bool(needs_topk or needs_topp)
+
         # Uniform filters are already known on the CPU. Keep them as scalars
         # for AITER's fast dispatch instead of uploading and reading them back.
         top_ks = top_ps = None
@@ -3286,42 +3362,15 @@ class ModelRunner:
             # from (`coin * q < p`) instead of requiring the draft token to
             # equal the target's own draw. Published by the PREVIOUS step's
             # propose, so it is keyed back onto this batch by req_id -- the
-            # scheduler reorders between the two. Every drafter but a DSpark one
-            # armed with ATOM_SPEC_LOSSLESS_SAMPLING inherits `Drafter`'s no-op
-            # hooks and answers None here, which keeps the exact-match path.
-            #
-            # `all_greedy` keeps the exact-match kernel, and not only to avoid
-            # the work: at temperature 0 the two rules COINCIDE (a greedy draft
-            # is a delta q, `sum_x min(p, q) = p(x*)`), so the ratio kernel
-            # would buy nothing and could only move the answer by an ulp.
-            draft_probs = None
-            draft_probs_row_base = None
-            drafter = getattr(self, "drafter", None)
-            if not all_greedy and drafter is not None:
-                draft_probs = drafter.draft_probs
-                if draft_probs is not None and (
-                    top_ks is not None or top_ps is not None
-                ):
-                    # A filtered batch drops to exact-match acceptance for this
-                    # step. The draft drew from an UNFILTERED softmax(logits/T),
-                    # so the ratio rule against a filtered target p would be
-                    # biased -- but exact match against the target's FILTERED
-                    # draw stays lossless, because the draft token does not
-                    # depend on the target's fresh noise and the emitted token
-                    # is the target's own sample. It accepts less often; it
-                    # never changes what is emitted.
-                    #
-                    # This used to be a NotImplementedError raised inside the
-                    # kernel wrapper, i.e. inside every TP worker, so one
-                    # request with top_p < 1 killed the engine for good while
-                    # /health went on answering 200. `prepare_sample` sets
-                    # these to None exactly when no row filters, so the test is
-                    # host-side and costs no sync.
-                    draft_probs = None
-                if draft_probs is not None:
-                    draft_probs_row_base = drafter.draft_probs_row_base(
-                        batch.req_ids[:bs]
-                    )
+            # scheduler reorders between the two. See the helper for which
+            # batches take it and which stay on exact match.
+            draft_probs, draft_probs_row_base = _lossless_verify_inputs(
+                getattr(self, "drafter", None),
+                batch.req_ids[:bs],
+                all_greedy=all_greedy,
+                top_ks=top_ks,
+                top_ps=top_ps,
+            )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,

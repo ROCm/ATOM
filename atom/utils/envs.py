@@ -497,7 +497,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # house convention is that a behaviour-changing flag defaults off. A
     # top-k/top-p batch is not refused -- the draft's q is unfiltered, so that
     # step drops back to exact-match acceptance against the target's filtered
-    # draw, which is still lossless and only accepts less often.
+    # draw, which is still lossless and only accepts less often. That drop is
+    # BATCH-WIDE (the accept kernel has one rule per launch and no exact-match
+    # branch to route a single row into), so such a batch also DRAFTS GREEDILY
+    # for that step: it then runs exactly the flag-off pair rather than the
+    # strictly worse sampled-draft/exact-match pair it used to land on.
     #
     # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
     # q is [bs, T, V] and has to cross the step boundary. Twice over: the block

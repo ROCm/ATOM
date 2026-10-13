@@ -245,21 +245,65 @@ class DSparkProposer(Drafter):
 
         Reads the runner's own per-request sampling parameters rather than
         taking them as arguments, so the temperature the draft divides by is
-        literally the same tensor the target's verify softmax will divide by
-        -- `rejection_sampler._ratio_target_probs` reads the same buffer.
+        the number the target's verify softmax will divide by --
+        `rejection_sampler._ratio_target_probs` reads the runner's buffer and
+        this copies out of it. The ONE case where the two deliberately differ
+        is a top-k/top-p batch, which drafts greedily; see below.
         """
         if self.draft_sampling is None or scheduled_bs == 0:
             return
-        temperatures = self.runner.forward_vars["temperatures"].gpu[:scheduled_bs]
-        dst = self.draft_sampling.temperatures[:scheduled_bs]
-        dst.copy_(temperatures)
-        # A greedy row is "temperature was 0 before `prepare_sample` clamped it
-        # to SAMPLER_EPS", and `Sampler` itself tests `temperatures <=
-        # SAMPLER_EPS` -- the same predicate, so a row cannot be greedy to the
-        # target and stochastic to the draft.
-        self.draft_sampling.greedy_mask[:scheduled_bs].copy_(
-            (dst <= SAMPLER_EPS).to(torch.int32)
-        )
+        if self.runner.sampling_has_row_filter:
+            # A batch with top-k or top-p on ANY row drafts GREEDILY, the whole
+            # batch of it, and the reason is that the verify side cannot take
+            # the ratio rule for such a batch at all.
+            #
+            # `ModelRunner.postprocess` drops the whole batch to
+            # `draft_probs=None` whenever a filter is present. It has to:
+            # `rejection_sampler._ratio_target_probs` builds p as a plain
+            # temperature softmax with NO filtering, so a filtered row verified
+            # by the ratio kernel would accept against -- and resample its
+            # correction token from -- the UNFILTERED target, silently serving
+            # a distribution the request did not ask for. The drop is batch-wide
+            # rather than per-row because the kernel has one accept rule for the
+            # whole launch and no exact-match branch to route a row into.
+            #
+            # Left alone, that pairs a SAMPLED draft with exact-match
+            # acceptance, which is strictly worse than either pure mode: the
+            # draft no longer proposes its best guess, yet it is still required
+            # to equal the target's own draw. One `top_p < 1` request therefore
+            # made every row in the batch accept LESS often than with the flag
+            # off. Drafting greedily here puts the batch back on exactly the
+            # shipped pair -- greedy proposal, exact-match acceptance -- so a
+            # filtered batch is identical to flag-off rather than worse than it.
+            #
+            # Both halves, not just the mask. `greedy_mask` only replaces the
+            # exponential race with an argmax; the q the head publishes is still
+            # `softmax(logits/T)`, which for T=1 is nothing like the delta the
+            # argmax actually drew from. Clamping the DRAFT's temperature to
+            # SAMPLER_EPS makes q a true delta, so the published q is the
+            # distribution the token came from no matter which rule ends up
+            # testing it. That matters because propose and verify are a step
+            # apart: this batch's drafts are verified against NEXT step's batch,
+            # whose filters may differ, and a delta q is sound under both rules
+            # (`sum_x min(p, q) = p(x*)`, the ratio kernel's arithmetic no-op).
+            #
+            # This is the draft's own copy of the temperature, not the target's:
+            # `rejection_sampler` reads `forward_vars["temperatures"]`, which is
+            # untouched here, so the target's p keeps the request's real T.
+            dst = self.draft_sampling.temperatures[:scheduled_bs]
+            dst.fill_(SAMPLER_EPS)
+            self.draft_sampling.greedy_mask[:scheduled_bs].fill_(1)
+        else:
+            temperatures = self.runner.forward_vars["temperatures"].gpu[:scheduled_bs]
+            dst = self.draft_sampling.temperatures[:scheduled_bs]
+            dst.copy_(temperatures)
+            # A greedy row is "temperature was 0 before `prepare_sample` clamped
+            # it to SAMPLER_EPS", and `Sampler` itself tests `temperatures <=
+            # SAMPLER_EPS` -- the same predicate, so a row cannot be greedy to
+            # the target and stochastic to the draft.
+            self.draft_sampling.greedy_mask[:scheduled_bs].copy_(
+                (dst <= SAMPLER_EPS).to(torch.int32)
+            )
         # The Philox key. A plain SPMD counter, so every TP rank reaches the
         # same number without exchanging it -- which is the whole requirement:
         # ranks drawing different uniforms draft different blocks, and
