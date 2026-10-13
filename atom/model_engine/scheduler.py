@@ -1769,12 +1769,17 @@ class Scheduler:
             offload_resume = self._is_offload_prefill_resume(seq)
             # Side-effect free: the lookup is detached only after `allocate`
             # below, so a request held back by the budget or the pool keeps
-            # its prefetched lookup for the next pass.
-            lookup_detachable = (
+            # its prefetched lookup for the next pass. The HBM probe it needs
+            # is kept and reused by the admission probe below.
+            hbm_probe = None
+            lookup_detachable = False
+            if (
                 not remote_ready_for_decode
                 and not offload_resume
-                and self._can_detach_tier_lookup(seq)
-            )
+                and self._lookup_detach_enabled(seq)
+            ):
+                hbm_probe = self._probe_hbm_prefix(seq)
+                lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
             if (
                 not remote_ready_for_decode
                 and not offload_resume
@@ -1874,13 +1879,9 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            block_hashes = []
-            num_cached_blocks = self.block_manager.can_allocate(
-                seq,
-                record=False,
-                block_hashes=block_hashes,
-                reuse_hashes=self._local_prefill_coalescing,
-            )
+            if hbm_probe is None:
+                hbm_probe = self._probe_hbm_prefix(seq)
+            num_cached_blocks, block_hashes = hbm_probe
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
@@ -2570,41 +2571,56 @@ class Scheduler:
         """
         return self._connector_flag("is_offload") and resumes_offload_prefill(seq)
 
-    def _can_detach_tier_lookup(self, seq: Sequence) -> bool:
-        """Whether admission may proceed without waiting for `seq`'s lookup.
+    def _lookup_detach_enabled(self, seq: Sequence) -> bool:
+        """Whether `seq`'s tier lookup is a candidate for detaching at all.
 
-        Side-effect free. False, so the lookup is waited for as usual, when
-        the feature is off, the connector has no offload tier, joint KV/state
-        offload is active (a tier hit can change where it resumes), the
-        request loads remotely, the HBM probe finds no prefix, or the
-        connector declines (`can_detach_lookup`, which applies
-        `OFFLOAD_MIN_LOAD_TOKENS`).
-
-        The probe uses `record=False` in the same pass as the real admission,
-        so it sees the HBM prefix `_decide_load_after_alloc` will see.
+        False when the feature is off, the connector has no offload tier or
+        no detach support, joint KV/state offload is active (a tier hit can
+        change where it resumes), or the request loads remotely.
         """
         conn = self.kv_connector
-        if (
+        return not (
             not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT
             or conn is None
             or not self._connector_flag("is_offload")
             or getattr(conn, "can_detach_lookup", None) is None
             or getattr(conn, "detach_lookup", None) is None
             or getattr(self.block_manager, "state_offload", None) is not None
-            or seq.kv_transfer_params
-            and seq.kv_transfer_params.get("do_remote_prefill")
-        ):
-            return False
-        hit_blocks = self.block_manager.can_allocate(
+            or (seq.kv_transfer_params or {}).get("do_remote_prefill")
+        )
+
+    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+        """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
+        request does not fit) and the hash chain it walked.
+
+        Done once per admission attempt; the result is shared by the detach
+        decision and the admission itself, which run in the same pass with no
+        pool change in between.
+        """
+        block_hashes: list[int] = []
+        num_cached_blocks = self.block_manager.can_allocate(
             seq,
             record=False,
-            block_hashes=[],
+            block_hashes=block_hashes,
             reuse_hashes=self._local_prefill_coalescing,
         )
+        return num_cached_blocks, block_hashes
+
+    def _can_detach_tier_lookup(
+        self, seq: Sequence, hbm_probe: tuple[int, list[int]]
+    ) -> bool:
+        """Whether admission may proceed without waiting for `seq`'s lookup.
+
+        Side-effect free. Requires an HBM hit and the connector's consent
+        (`can_detach_lookup`, which applies `OFFLOAD_MIN_LOAD_TOKENS`). The
+        probe is the one admission uses, so it sees the HBM prefix
+        `_decide_load_after_alloc` will see.
+        """
+        hit_blocks = hbm_probe[0]
         if hit_blocks <= 0:
             return False
         num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
-        return bool(conn.can_detach_lookup(seq, num_hbm_tokens))
+        return bool(self.kv_connector.can_detach_lookup(seq, num_hbm_tokens))
 
     def _detach_or_query_lookup(self, seq: Sequence) -> bool:
         """Detach `seq`'s lookup after `allocate`, or fall back to the ordinary one.

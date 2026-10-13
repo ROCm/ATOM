@@ -166,7 +166,9 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
         can_allocate=lambda seq, **kw: hit_blocks,
     )
     seq = SimpleNamespace(kv_transfer_params=None)
-    return s._can_detach_tier_lookup(seq), conn
+    if not s._lookup_detach_enabled(seq):
+        return False, conn
+    return s._can_detach_tier_lookup(seq, s._probe_hbm_prefix(seq)), conn
 
 
 def test_scheduler_probe_is_pure_and_uses_the_hbm_frontier(monkeypatch):
@@ -530,3 +532,26 @@ def test_accepted_detach_after_allocate_skips_the_ordinary_lookup():
     assert s._detach_or_query_lookup(_admitted_seq(60)) is False
     assert conn.detach_calls == [60]
     assert conn.matched == []
+
+
+def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
+    """The detach decision and the admission share one `can_allocate` walk."""
+    from atom.model_engine import scheduler as sched_mod
+    from atom.model_engine.scheduler import Scheduler
+
+    monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
+    walks = []
+
+    def can_allocate(seq, *, record, block_hashes, reuse_hashes):
+        walks.append(record)
+        block_hashes.extend([11, 12])
+        return 2
+
+    s = Scheduler.__new__(Scheduler)
+    s.kv_connector = _Conn()
+    s._local_prefill_coalescing = False
+    s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
+    probe = s._probe_hbm_prefix(SimpleNamespace())
+    assert probe == (2, [11, 12]) and walks == [False]
+    assert s._can_detach_tier_lookup(SimpleNamespace(), probe)
+    assert walks == [False]  # the decision itself does not walk again
