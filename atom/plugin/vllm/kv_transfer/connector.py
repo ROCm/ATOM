@@ -282,13 +282,17 @@ def _refuse_v41_speculation_with_offload(vllm_config) -> None:
     if n <= 0:
         return
     raise ValueError(
-        "DeepSeek-V4.1: AtomLMCacheOffloadConnector has not been run with "
-        f"speculative decoding ({n} draft tokens). Both are supported alone "
-        "and the pair is unmeasured: drafts change every plane's size and let "
-        "a request's frontier move backwards, which this connector's boundary "
-        "machinery has never seen. Drop --speculative-config, drop the "
+        "DeepSeek-V4.1: AtomLMCacheOffloadConnector with speculative decoding "
+        f"({n} draft tokens) runs, answers correctly, and reuses nothing. "
+        "Measured: the engine boots, gsm8k-style arms score 16/16 with zero "
+        "stale-cursor refusals, and the tier stores 32 objects and retrieves "
+        "none -- external prefix cache hit rate 0.0%, against 44.1% for the "
+        "same configuration without drafts. The lookups happen and miss: a "
+        "draft moves the frontier a store is keyed on, so nothing later asks "
+        "for the key that was written. Fixing it means making the boundary "
+        "keys speculation-aware. Drop --speculative-config, drop the "
         "connector, or set ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1 to run it "
-        "knowing that."
+        "knowing the tier is dead weight."
     )
 
 
@@ -377,14 +381,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             ),
             kv_cache_config,
         )
-        self._attn_group_id = self._resolve_attention_group(kv_cache_config)
         # DeepSeek-V4.1 registers one proxy layer whose tensor is an opaque
         # byte arena, not a per-layer K/V pair; it is carved into PAGE planes
         # by ATOM itself. `register_kv_caches` takes those planes directly
         # rather than inferring them from the registration dict.
+        #
+        # Set BEFORE resolving the attention group, which reads it: the class
+        # attribute defaults to False, so leaving the assignment after the
+        # call made the V4.1 branch there dead without any error.
         from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
 
         self._is_deepseek_v41 = is_deepseek_v41_vllm_config(vllm_config)
+        self._attn_group_id = self._resolve_attention_group(kv_cache_config)
         if self._is_deepseek_v41:
             _refuse_v41_speculation_with_offload(vllm_config)
         # Worker half of the recurrent leg.
@@ -685,6 +693,33 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
         if len(groups) <= 1:
             return 0
+        # V4.1 names its group positively rather than by elimination. The
+        # codec registers the proxy's planes, so the proxy's group is the
+        # one it owns -- and eliminating everything else needs a new clause
+        # per group anyone else adds. DSpark was the second: its draft KV is
+        # its own group and the engine refused to start with
+        # `found [0, 1]`.
+        if getattr(self, "_is_deepseek_v41", False):
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+            )
+
+            for gid, group in enumerate(groups):
+                names = list(getattr(group, "layer_names", []) or [])
+                if ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME in names:
+                    if len(groups) > 1:
+                        logger.info(
+                            "ATOM LMCache offload: V4.1 proxy is kv cache "
+                            "group %d of %d; the others are not offloaded",
+                            gid, len(groups),
+                        )
+                    return gid
+            raise ValueError(
+                "ATOM offload connector: DeepSeek-V4.1 is configured but no "
+                "kv cache group holds the proxy layer "
+                f"{ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME!r}; the codec has "
+                "nothing to register"
+            )
         mamba_ids = {group_id for group_id, _ in self._mamba_groups}
         # V4.1's state-image group is neither: it is dropped from the
         # recurrent leg above, and counting it here as an attention group

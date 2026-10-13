@@ -70,3 +70,43 @@ def test_a_model_without_images_has_none():
     from atom.plugin.vllm.kv_transfer.connector import _v41_image_group_ids
 
     assert _v41_image_group_ids(cfg) == set()
+
+
+def test_the_proxy_group_is_claimed_by_name_not_by_elimination():
+    """The codec registers the proxy's planes, so the proxy's group is the
+    one it owns. Resolving it by eliminating everything else needs a new
+    clause for every group anyone adds: DSpark's draft KV was the second
+    one and the engine refused to start with `found [0, 1]`.
+
+    Also pins the ordering. `_is_deepseek_v41` is a class attribute
+    defaulting to False, and it used to be assigned AFTER this resolution
+    ran -- which made the branch below dead without raising anything.
+    """
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+    from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._is_deepseek_v41 = True
+    c._mamba_groups = []
+    cfg = _cfg(["draft.layers.0.self_attn"], [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+    assert c._resolve_attention_group(cfg) == 1
+
+    cfg = _cfg([ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME], ["draft.layers.0.self_attn"])
+    assert c._resolve_attention_group(cfg) == 0
+
+
+def test_a_v41_run_with_no_proxy_group_says_so():
+    from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._is_deepseek_v41 = True
+    c._mamba_groups = []
+    cfg = _cfg(["a.self_attn"], ["b.self_attn"])
+    try:
+        c._resolve_attention_group(cfg)
+    except ValueError as exc:
+        assert "proxy layer" in str(exc)
+    else:
+        raise AssertionError("a V4.1 run with no proxy group was accepted")
