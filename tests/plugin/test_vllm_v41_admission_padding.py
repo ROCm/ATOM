@@ -25,6 +25,7 @@ pytest.importorskip("vllm")
 
 import torch
 from atom.plugin.vllm.v41_speculative import patch_v41_speculative_scheduling
+from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -66,6 +67,14 @@ def _pair(order):
         "D": _request("D"),
     }
     return [requests[req_id] for req_id in order]
+
+
+class _DSparkConfig(SimpleNamespace):
+    """Use the real drafting budget without constructing/loading model configs."""
+
+    max_num_new_slots_for_drafting = SpeculativeConfig.max_num_new_slots_for_drafting
+    use_dflash = SpeculativeConfig.use_dflash
+    uses_draft_model = SpeculativeConfig.uses_draft_model
 
 
 def _scheduler(
@@ -130,10 +139,11 @@ def _scheduler(
     )
     scheduler.vllm_config = SimpleNamespace(
         speculative_config=(
-            SimpleNamespace(
+            _DSparkConfig(
                 num_speculative_tokens=_K,
                 dynamic_sd_schedule=None,
-                max_num_new_slots_for_drafting=_K,
+                method="dspark",
+                parallel_drafting=True,
             )
             if speculating
             else None
@@ -363,6 +373,35 @@ def test_v41_new_admissions_never_mix_prefill_with_padding(monkeypatch, cls, ord
             assert request.num_output_placeholders == 1
             assert request.spec_token_ids is scheduler._spec_token_placeholders
             assert request.next_decode_eligible_step == scheduler.current_step + 1
+
+
+@pytest.mark.parametrize("cls", [Scheduler, AsyncScheduler], ids=["sync", "async"])
+@pytest.mark.parametrize("input_budget,expected_tokens", [(5, 1), (4, 0)])
+def test_dspark_admission_input_budget_boundary(
+    monkeypatch, cls, input_budget, expected_tokens
+):
+    """One unpadded query plus DSpark's four drafting slots must fit."""
+    decode = _request("D")
+    scheduler = _scheduler([decode], cls=cls)
+    # Keep the target-token budget ample; isolate the input/drafting budget.
+    scheduler.scheduler_config.max_num_batched_tokens = input_budget
+    _install(monkeypatch)
+    result = scheduler.schedule()
+    assert result.num_scheduled_tokens == ({"D": 1} if expected_tokens else {})
+    assert result.total_num_scheduled_tokens == expected_tokens
+    assert result.scheduled_spec_decode_tokens == {}
+    assert result.num_spec_tokens_to_schedule == _K
+    assert scheduler.dynamic_sd_lookup is None
+    assert decode.num_computed_tokens == 256 + expected_tokens
+    assert len(scheduler.waiting) == 1 - expected_tokens
+    if expected_tokens:
+        allocation = scheduler.kv_cache_manager.allocate_slots.call_args
+        assert allocation.args[:2] == (decode, 1)
+    else:
+        scheduler.kv_cache_manager.allocate_slots.assert_not_called()
+    if cls is AsyncScheduler:
+        assert decode.num_output_placeholders == expected_tokens
+        assert scheduler._spec_token_placeholders == [-1] * _K
 
 
 @pytest.mark.parametrize("cls", [Scheduler, AsyncScheduler], ids=["sync", "async"])
