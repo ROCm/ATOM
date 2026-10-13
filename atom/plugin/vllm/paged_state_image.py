@@ -491,9 +491,8 @@ _store_plan: dict[str, int] = {}
 
 # The image worker of each registered family's target model in this process.
 _workers: dict[str, ImageWorker] = {}
-# Stores registered by builds, and where they ran: right after the step's model
-# forward (the only intended site) or at the next build (a step whose forward
-# did not run after its build).
+# Stores registered by builds: planned, issued right after the step's model
+# forward (the only site), and found still pending at the next build (refused).
 _store_counts = {"planned": 0, "after_forward": 0, "at_next_build": 0}
 
 
@@ -775,7 +774,7 @@ def plan_image_ops(
 def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) -> None:
     """One step's slot work, outside any captured graph, in this order:
 
-    1. stores a step left behind (a build whose forward did not run);
+    1. refuse stores the last build left behind (its forward never ran);
     2. ``plan()`` (``plan_image_ops`` with the bridge's row data);
     3. ``reset_fn(md.reset_slots)``: fresh slots back to the reset state;
     4. restores of this step's prefix hits;
@@ -783,10 +782,23 @@ def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) ->
        them (``GPUModelRunner._model_forward``).
     """
     if not capturing and worker is not None and worker.pending_stores:
-        # Still stream-ordered after the forward that produced the state and
-        # before anything below touches a slot or a block.
-        logger.warning("ATOM %s: flushing image stores left by a step", name)
-        flush_worker(worker, site="at_next_build")
+        # The last build planned stores that its forward never issued, so the
+        # slots still hold an earlier position's state while the scheduler has
+        # already hashed (and may already have handed to a later step's prefix
+        # hit) the image blocks for the planned boundary. Neither copying nor
+        # unhashing from here can make that right.
+        _store_counts["at_next_build"] += len(worker.pending_stores[0])
+        logger.error(
+            "ATOM %s: image stores planned by the previous build were never issued",
+            name,
+        )
+        raise RuntimeError(
+            f"{name} image stores planned by the previous step's metadata build were "
+            "never issued: that step's model forward never ran after the build (or "
+            "ran outside GPUModelRunner._model_forward). Their image blocks are "
+            "already hashed for the planned boundary and copying the slot now would "
+            "cache an earlier position's state."
+        )
     if not capturing:
         plan()
     reset_slots = getattr(md, "reset_slots", None)

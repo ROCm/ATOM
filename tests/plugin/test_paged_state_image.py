@@ -282,10 +282,6 @@ def test_step_order_and_one_store_per_plan(fake, monkeypatch):
         image_store_slots=[2],
         image_store_units=[(7, 8, 9)],
     )
-    worker.pending_stores = (
-        [0],
-        [(1, 2, 3)],
-    )  # left by a step whose forward did not flush
 
     def plan():
         events.append(("plan", list(copier.calls)))
@@ -296,22 +292,21 @@ def test_step_order_and_one_store_per_plan(fake, monkeypatch):
     G.run_image_step(
         worker, md, capturing=False, plan=plan, reset_fn=reset, name="Fake"
     )
-    # Left-over store first, then plan, reset, restore; this step's store waits.
-    assert copier.calls[0] == ("copies", [(0, (1, 2, 3))], [], 1)
-    assert events[0] == ("plan", [copier.calls[0]])
-    assert events[1] == ("reset", [2], 1)
-    assert copier.calls[1] == ("copies", [], [(2, (4, 5, 6))], 0)
+    # Plan, reset, restore; this step's store waits for the forward.
+    assert events[0] == ("plan", [])
+    assert events[1] == ("reset", [2], 0)
+    assert copier.calls[0] == ("copies", [], [(2, (4, 5, 6))], 0)
     assert worker.pending_stores == ([2], [(7, 8, 9)])
     host = NS(_atom_image_worker=worker)
     G.flush_image_stores(host)
     G.flush_image_stores(host)
-    assert copier.calls[2:] == [("copies", [(2, (7, 8, 9))], [], 1)]
+    assert copier.calls[1:] == [("copies", [(2, (7, 8, 9))], [], 1)]
     # Capture path: nothing planned, nothing restored or stored.
     md2 = NS(reset_slots=set())
     G.run_image_step(
         worker, md2, capturing=True, plan=lambda: 1 / 0, reset_fn=reset, name="Fake"
     )
-    assert len(copier.calls) == 3
+    assert len(copier.calls) == 2
 
 
 def test_stores_run_once_right_after_the_runner_forward(fake):
@@ -367,20 +362,31 @@ def test_a_store_never_runs_inside_a_capture(fake, monkeypatch):
     assert worker.copier.calls == []
 
 
-def test_a_left_over_store_runs_first_at_the_next_build_and_is_counted(fake):
+def test_a_store_whose_forward_never_ran_is_refused_not_copied(fake):
+    """A build registers a store for its boundary (the scheduler has already
+    hashed the image blocks for it); the forward that would have advanced the
+    slot there never runs. The next build must not copy the slot, which still
+    holds an earlier position's state, into those blocks."""
     copier = _Copier()
+    copier.slots[2] = torch.randint(0, 256, (SLOT,), dtype=torch.uint8)
     worker = G.ImageWorker(fake, copier, [1, 2, 3])
-    worker.pending_stores = ([0], [(1, 2, 3)])
-    before = G.store_counts()
+    md = NS(reset_slots=set(), image_store_slots=[2], image_store_units=[(7, 8, 9)])
     G.run_image_step(
-        worker,
-        NS(reset_slots=set()),
-        capturing=False,
-        plan=lambda: None,
-        reset_fn=None,
-        name="Fake",
+        worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
     )
-    assert copier.calls == [("copies", [(0, (1, 2, 3))], [], 1)]
+    units_before = copier.units.clone()
+    before = G.store_counts()
+    # No GPUModelRunner._model_forward here.
+    with pytest.raises(RuntimeError, match="never ran"):
+        G.run_image_step(
+            worker,
+            NS(reset_slots=set()),
+            capturing=False,
+            plan=lambda: None,
+            reset_fn=None,
+            name="Fake",
+        )
+    assert copier.calls == [] and torch.equal(copier.units, units_before)
     assert G.store_counts()["at_next_build"] - before["at_next_build"] == 1
 
 
