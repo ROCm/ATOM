@@ -198,7 +198,7 @@ class UBatchWrapper(nn.Module):
                     # thread is unblocked via TBOContext.partner.done (set in
                     # __exit__) so the main thread's done-wait returns promptly
                     # and re-raises errors[idx].
-                    logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
+                    logger.exception("[TBO] ubatch %d crashed", idx)
                     errors[idx] = e
                 finally:
                     # The worker thread outlives the forward; do not let its
