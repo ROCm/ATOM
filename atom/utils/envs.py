@@ -1038,8 +1038,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Admit a prefill without waiting for its external-tier lookup when the HBM
     # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
     # could be loaded. The lookup is still sent to refresh the tier's LRU.
+    # On by default; set to 0 to always wait for the lookup.
     "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT": lambda: _flag_env(
-        "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT"
+        "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "1"
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),

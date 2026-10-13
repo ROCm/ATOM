@@ -528,3 +528,12 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     assert probe == (2, [11, 12]) and walks == [False]
     assert s._can_detach_tier_lookup(SimpleNamespace(), probe)
     assert walks == [False]  # the decision itself does not walk again
+
+
+def test_the_detach_is_on_by_default_and_0_turns_it_off(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", raising=False)
+    assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is True
+    monkeypatch.setenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "0")
+    assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is False
