@@ -161,7 +161,12 @@ def _admission_is_possible(scheduler) -> bool:
 def _would_mix_prefill_with_drafts(scheduler) -> bool:
     if not any(request.spec_token_ids for request in scheduler.running):
         return False
-    if scheduler.waiting and _admission_is_possible(scheduler):
+    # vLLM 0.31 resumes requests holding KV blocks from a separate queue,
+    # before ordinary waiting. Remote completion can admit a prefill tail from
+    # that queue inside schedule(), after running drafts have been consumed.
+    if (
+        scheduler.waiting or getattr(scheduler, "kv_holding_waiting", ())
+    ) and _admission_is_possible(scheduler):
         return True
     # A running request can still be mid-prompt: chunked prefill keeps it in
     # `running` while it works through the rest of its tokens.
