@@ -240,12 +240,12 @@ class StateTierCapability:
 
     Derived from configuration, not from the connector's public name. The name
     only says which connector class is constructed; whether that class builds a
-    `StateOffloadTier` depends on the layout it resolves, the pipeline depth,
-    and the role it was given. The engine used to install a `StateOffloadIndex`
-    for any `lmcache_offload`, so a K3 run under PP>1 -- or any `dense`/`hybrid`
-    run -- got an index against a worker that would never build the tier. That
-    mismatch is what left stores emitted with nowhere to go, and it is the
-    common root of the tier-none fallback paths.
+    `StateOffloadTier` depends on the layout it resolves and the role it was
+    given. The engine used to install a `StateOffloadIndex` for any
+    `lmcache_offload`, so any `dense`/`hybrid` run got an index against a
+    worker that would never build the tier. That mismatch is what left stores
+    emitted with nowhere to go, and it is the common root of the tier-none
+    fallback paths.
 
     `reason` is filled in whenever the tier is off, so the log names which check
     refused it rather than leaving the operator to guess.
@@ -329,9 +329,9 @@ def state_tier_capability(config) -> StateTierCapability:
 
     A capability descriptor rather than a name check, because the two are not
     the same question and the worker refuses on conditions the name cannot see
-    (no transfer config, a `multi` composite with no offload sub, `pp_size > 1`,
-    an unknown explicit override, a layout that offloads no state, or a `kv_role`
-    that neither saves nor loads). Config alone because this runs in the engine
+    (no transfer config, a `multi` composite with no offload sub, an unknown
+    explicit override, a layout that offloads no state, or a `kv_role` that
+    neither saves nor loads). Config alone because this runs in the engine
     process at
     `BlockManager.__init__`, before any worker connector exists -- so it must
     agree with the worker by construction, which is why the layout comes from
@@ -364,12 +364,6 @@ def state_tier_capability(config) -> StateTierCapability:
         layout_config = _SubConnectorView(config, cfg)
     if name not in _STATE_TIER_BACKENDS:
         return replace(none, reason=f"connector {name!r} hosts no state tier")
-
-    # The worker refuses PP outright: `CacheEngineKey` has no PP component, so
-    # two stages at the same TP rank would overwrite each other's entries.
-    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
-    if pp_size > 1:
-        return replace(none, reason=f"pipeline_parallel_size={pp_size}")
 
     try:
         layout = select_offload_layout(layout_config)
