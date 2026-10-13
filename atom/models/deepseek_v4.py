@@ -1767,11 +1767,13 @@ class Indexer(nn.Module):
         rather than through the opaque `indexer_score_topk` op, and hands it
         the fixed buffer the dense piece downstream reads, instead of copying
         a fresh result into it."""
+        attn_metadata = get_forward_context().attn_metadata
         self._score_topk_decode_fp4_flydsl(
             q_fp4,
             q_scale,
-            get_forward_context().attn_metadata.block_tables,
+            attn_metadata.block_tables,
             weights,
+            attn_metadata.indexer_meta,
             self.index_topk,
             out=out,
         )
@@ -1969,6 +1971,24 @@ class Indexer(nn.Module):
             topk_global - seq_base,
         )  # [total_tokens, topk] int32, raw seq-local with -1 in tail
 
+    def _decode_logits_width(self, indexer_meta: dict | None) -> int:
+        """Columns of this decode step's indexer logits plane.
+
+        The static `_max_model_len_idx` while a CUDA graph is captured: the
+        graph replays the width it was captured with, against contexts as long
+        as the model allows. An eager step -- every mixed step, and pure decode
+        past the captured sizes -- takes the builder's bound on its own rows
+        (`decode_logits_width`) instead: at the model max the plane is ~1 GiB
+        per thousand rows and changes size with the row count every step, which
+        fragments the caching allocator until a `hipFree` stalls against an
+        in-flight collective."""
+        if torch.cuda.is_current_stream_capturing():
+            return self._max_model_len_idx
+        width = (indexer_meta or {}).get("decode_logits_width")
+        if width is None:
+            return self._max_model_len_idx
+        return min(width, self._max_model_len_idx)
+
     def _score_topk_decode(
         self,
         q_fp8: torch.Tensor,  # [total_tokens, n_heads, head_dim] fp8
@@ -1978,10 +1998,10 @@ class Indexer(nn.Module):
         topk: int,
     ) -> torch.Tensor:
         """Pure-decode path: `deepgemm_fp8_paged_mqa_logits` reads paged FP8
-        cache directly, producing fixed-shape `[bs*next_n, max_model_len_idx]`
-        logits — CUDAGraph-friendly (no per-fwd `total_committed`-shaped
-        allocation). Mirrors V3.2 sparse_attn_indexer decode branch
-        (deepseek_v2.py:1047-1084).
+        cache directly, producing `[bs*next_n, W]` logits, `W` from
+        `_decode_logits_width` -- fixed while captured, so CUDAGraph-friendly
+        (no per-fwd `total_committed`-shaped allocation). Mirrors V3.2
+        sparse_attn_indexer decode branch (deepseek_v2.py:1047-1084).
 
         Top-k uses aiter `top_k_per_row_decode` (radix kernel, parametric `k`):
         ATOM passes the exact ratio-4 per-token row ends as `seqLens` with
@@ -2012,9 +2032,10 @@ class Indexer(nn.Module):
         # captured `total_tokens`. No `fill_(-inf)` needed —
         # `top_k_per_row_decode` receives the exact per-token CSA row end below,
         # so unwritten cols are never picked.
+        width = self._decode_logits_width(indexer_meta)
         logits = torch.empty(
             total_tokens,
-            self._max_model_len_idx,
+            width,
             dtype=torch.float32,
             device=q_fp8.device,
         )
@@ -2025,7 +2046,7 @@ class Indexer(nn.Module):
             logits,
             attn_md.csa_n_committed_per_token[:total_tokens],
             attn_md.block_tables_per_token[:total_tokens],
-            self._max_model_len_idx,
+            width,
             KVBlockSize=self.kv_cache.size(1),  # csa_rows_per_block = 64
             Preshuffle=True,
         )
@@ -2082,7 +2103,7 @@ class Indexer(nn.Module):
                 q_fp4, q_scale, block_tables, weights, indexer_meta, topk
             )
         return self._score_topk_decode_fp4_flydsl(
-            q_fp4, q_scale, block_tables, weights, topk
+            q_fp4, q_scale, block_tables, weights, indexer_meta, topk
         )
 
     # gfx1250 OPUS natural-layout launchers.
@@ -2173,8 +2194,9 @@ class Indexer(nn.Module):
         plan = indexer_meta["fp4_opus_plan"]
         local_ends = plan.local_ends
         padded_tokens = q_fp4.size(0)
+        width = self._decode_logits_width(indexer_meta)
         logits = torch.empty(
-            (padded_tokens, self._max_model_len_idx),
+            (padded_tokens, width),
             dtype=torch.float32,
             device=q_fp4.device,
         )
@@ -2186,7 +2208,7 @@ class Indexer(nn.Module):
             block_tables,
             weights,
             plan,
-            self._max_model_len_idx,
+            width,
             weight_scale=self._weights_scale,
             kv_block_size=self.kv_cache.size(1),
             out=logits,
@@ -2341,6 +2363,7 @@ class Indexer(nn.Module):
         q_scale: torch.Tensor,  # [padded_tokens, K_TILES, 4, 16, QS_PAD] uint8
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
         weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
+        indexer_meta: dict,
         topk: int,
         out: torch.Tensor | None = None,  # [>= padded_tokens, topk] int32
     ) -> torch.Tensor:
@@ -2358,7 +2381,9 @@ class Indexer(nn.Module):
         downstream).
 
         The launch is planned from the sequence count and `max_seqlen_q`, so it
-        must run where both are part of the graph key (see below).
+        must run where both are part of the graph key (see below), and
+        the logits width is the static `_max_model_len_idx` while captured
+        (`_decode_logits_width`).
         """
         device = q_fp4.device
         padded_tokens = q_fp4.size(0)
@@ -2372,9 +2397,7 @@ class Indexer(nn.Module):
         ragged = Fp4MqaRaggedMetadata(
             attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
         )
-        # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
-        # the rectangular decode path.
-        max_seq_len = self._max_model_len_idx
+        max_seq_len = self._decode_logits_width(indexer_meta)
         kv_block_size = self.kv_cache.size(3)  # csa_rows_per_block = 64
         # Same N_PHYS==1 packed-dword-scale contract as the other FP4 paths
         # (see `_score_topk_decode_fp4`): fail loudly on an unsupported block size.
