@@ -276,18 +276,6 @@ class ScheduledBatch:
         )
 
         self.is_final_chunk = is_final_chunk
-        # Per seq, the bounded-replay window (`Sequence.replay_start` /
-        # `replay_end`), 0 where the seq does not replay. Read by the V4
-        # prefill builder; a batch with no replay leaves `state_replay_end` None.
-        self.state_replay_start = None
-        self.state_replay_end = None
-        if any(seq.replay_end for seq in seqs.values()):
-            self.state_replay_start = np.asarray(
-                [seq.replay_start for seq in seqs.values()], dtype=np.int32
-            )
-            self.state_replay_end = np.asarray(
-                [seq.replay_end for seq in seqs.values()], dtype=np.int32
-            )
         # Per seq, the token following this forward where the scheduler knows it
         # (a middle prefill chunk's successor prompt token), -1 where sampling
         # supplies it. A drafter runs one position ahead of the target, so this
@@ -910,17 +898,29 @@ class Scheduler:
     def _resume_prefill(self, seq: Sequence, start: int, *, hit: bool) -> None:
         """Start `seq`'s prefill forward at `start`, where `BlockManager.
         replay_start` puts it for the point it resumes at, which `seq.replay`
-        keeps when the two differ. `hit`: it resumes at a prefix hit."""
+        keeps when the two differ. `hit`: it resumes at a prefix hit, whose
+        state a `replay` transfer never brings and a DeepSeek-V4 bounded replay
+        (`Sequence.replays_hit`) did not. A DeepSeek-V4 bounded replay may span
+        chunks: a forward picking up where one inside it ended continues it,
+        writing nothing below the point it resumed at either."""
         resume = seq.num_cached_tokens
+        replay = seq.replay
+        if replay is not None and not hit and start == resume < replay.until:
+            until, rebuilds = replay.until, replay.rebuilds
+        else:
+            until = resume
+            rebuilds = hit and (
+                self.block_manager.state.transfer.replays or seq.replays_hit
+            )
         seq.replay = (
             Replay(
-                resume,
-                hit and self.block_manager.state.transfer.replays,
+                until,
+                rebuilds,
                 tuple(
                     seq.token_ids[max(0, start - self.replay_history_tokens) : start]
                 ),
             )
-            if start < resume
+            if start < until
             else None
         )
         seq.num_cached_tokens = start
@@ -948,9 +948,10 @@ class Scheduler:
         if self._requires_atomic_prefill(seq):
             return chunk
         # The state starts at `resume`, a forward recomputing rows below it
-        # (`BlockManager.replay_start`) notwithstanding.
+        # (`BlockManager.replay_start`) notwithstanding, or where the bounded
+        # replay it continues resumed (`Sequence.replay_until`).
         target = self.block_manager.checkpoint_cut(
-            seq, max(start, resume), start + chunk, record=False
+            seq, max(start, resume, seq.replay_until), start + chunk, record=False
         )
         return target - start if target else chunk
 
@@ -1917,7 +1918,11 @@ class Scheduler:
             if (
                 chunk is None
                 or (atomic_prefill and chunk < num_new_tokens)
-                or start + chunk <= resume
+                # A forward that cannot pass where it resumes waits, but a
+                # DeepSeek-V4 bounded replay continues in the next forwards
+                # (`_resume_prefill`): it must not wait for a budget wider
+                # than itself, which may never come.
+                or (start + chunk <= resume and not seq.replays_hit)
             ):
                 self.waiting.appendleft(seq)
                 break
@@ -2038,10 +2043,13 @@ class Scheduler:
             # admission and wait for a step that can, exactly as the joint-disown
             # path above requeues. `num_cached_tokens` is post-allocation, so
             # this stays correct even if the prefix was disowned.
-            if (
-                atomic_prefill and chunk < seq.num_tokens - seq.num_cached_tokens
-            ) or seq.num_cached_tokens + chunk <= seq.replay_until:
-                # A replayed hit that cannot pass its hit this step waits too.
+            if (atomic_prefill and chunk < seq.num_tokens - seq.num_cached_tokens) or (
+                seq.num_cached_tokens + chunk <= seq.replay_until
+                and not seq.replays_hit
+            ):
+                # A replayed hit that cannot pass its hit this step waits too;
+                # a DeepSeek-V4 bounded replay continues in the next forwards
+                # (`_resume_prefill`).
                 self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
                 break

@@ -67,7 +67,6 @@ from atom.model_engine.page_unit_checkpoint import (
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
-from atom.model_ops.attentions import deepseek_v4_replay
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -230,12 +229,12 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     do not come from here — see `visible_csa` in `v4_pool_geometry`."""
     replay_start_cpu: Any | None = None
     """[bs] np.int32 or None — prefill only. Per seq, the lowest SWA ring
-    position the forward may read (`Sequence.replay_start`). None when no seq in
-    the batch replays."""
+    position the forward may read: a bounded replay's start, 0 for every other
+    seq. None when no seq in the batch replays (`ScheduledBatch.replaying`)."""
     replay_end_cpu: Any | None = None
     """[bs] np.int32 or None — prefill only. Per seq, the first position whose
-    compression boundary the forward writes (`Sequence.replay_end`). None when
-    no seq in the batch replays."""
+    compression boundary the forward writes: where a bounded replay resumed
+    (`Replay.until`), 0 for every other seq. None when no seq replays."""
 
     # ----- Per-seq GPU scalars (single-source-of-truth, shared by kernels) -----
     state_slot_out: torch.Tensor | None = None
@@ -1118,10 +1117,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def checkpoint_image_bytes(self) -> int:
         """Bytes one checkpoint image holds. Priced before the pool exists."""
         return sum(self._checkpoint_segment_sizes())
-
-    def state_replay_tokens(self) -> int:
-        """The window's receptive field; see `deepseek_v4_replay`."""
-        return deepseek_v4_replay.state_replay_tokens(self.model_runner.config)
 
     def _assert_ratios_divide_the_alignment(self) -> None:
         """A checkpoint boundary has to be a compression boundary too.
@@ -3051,16 +3046,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens_np = np.asarray(
             var["context_lens"].np[:scheduled_bs], dtype=np.int32
         )
-        # Bounded replay (`Sequence.replay_start` / `replay_end`): only set
-        # when some seq in the batch replays, so the common prefill pays nothing.
-        replay_end = getattr(batch, "state_replay_end", None)
-        if replay_end is not None and np.any(replay_end[:scheduled_bs]):
-            attn_metadata.replay_start_cpu = np.ascontiguousarray(
-                batch.state_replay_start[:scheduled_bs], dtype=np.int32
-            )
-            attn_metadata.replay_end_cpu = np.ascontiguousarray(
-                replay_end[:scheduled_bs], dtype=np.int32
-            )
+        # Bounded replay: a forward of a seq replaying below where it resumed
+        # (`ScheduledBatch.replaying`, read as V4.1's `_replay_layout` reads
+        # it) writes no compressed KV below that point, which the cache holds,
+        # and reads no window row below where the replay started, which its
+        # fresh ring does not hold: the forward's own start, or for a later
+        # chunk of the replay `state_replay_tokens` below that point. Only set
+        # when some seq replays: the common prefill pays nothing.
+        replaying = getattr(batch, "replaying", None)
+        if replaying:
+            field = self.model_runner.config.state_replay_tokens
+            starts = np.zeros(scheduled_bs, dtype=np.int32)
+            ends = np.zeros(scheduled_bs, dtype=np.int32)
+            for i, replay in replaying.items():
+                if i < scheduled_bs:
+                    starts[i] = min(
+                        start_pos_per_seq_np[i], max(0, replay.until - field)
+                    )
+                    ends[i] = replay.until
+            attn_metadata.replay_start_cpu = starts
+            attn_metadata.replay_end_cpu = ends
         attn_metadata.compress_plans = self._build_compress_plans(
             # Prefill: no slack. Nothing rejects a prefill chunk, so the next
             # fwd only ever reads back `K_pool`, and the chunk is wider than

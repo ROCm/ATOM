@@ -17,11 +17,11 @@ each of its layers writes its window from the same fused target hidden states
 from another draft layer, and it reads that window only at a verified anchor,
 which the replay always lies W or more below.
 
-The model side of the feature: the backend reports the length through
-`AttentionMetadataBuilder.state_replay_tokens`, `StateRuntime` carries it to
-the engine, and `BlockManager` decides per admission whether replaying beats
-resuming from the nearest checkpoint. Kept apart from the builder so the CPU
-tests can reach it without the AITER build the builder's module imports.
+The length is `Config.state_replay_tokens`, set from here the way V4.1's
+`min_final_prefill_rows` is; `BlockManager` decides per admission whether
+replaying beats resuming from the nearest checkpoint, and the forward runs as
+V4.1's do (`Replay`). Kept apart from the builder so the CPU tests and `Config`
+can reach it without the AITER build the builder's module imports.
 """
 
 import logging
@@ -38,8 +38,11 @@ def state_replay_tokens(config) -> int:
     field argument above holds and the V4 prefill can express it: the plain V4
     trunk, compress ratios 4 / 128, no speculative method but MTP or DSpark,
     and a single-rank prefill (context parallel splits the query axis the
-    floors are indexed by). Whether the engine can run one is `BlockManager`'s
-    question, not this one.
+    floors are indexed by). It replays a prefix-cache hit, so it also needs the
+    prefix cache, and no KV connector: a connector load starts at
+    `num_cached_tokens` and raises it when the load lands, and a replay moves
+    exactly that field below blocks it has claimed (an LMCache MP load would
+    write those shared blocks and resume past the replay).
     """
     if not envs.ATOM_DSV4_STATE_REPLAY:
         return 0
@@ -59,6 +62,10 @@ def state_replay_tokens(config) -> int:
         or config.decode_context_parallel_size > 1
     ):
         reason = "context parallelism"
+    elif not config.enable_prefix_caching:
+        reason = "prefix caching off"
+    elif config.kv_transfer_config:
+        reason = "a KV connector (connector loads do not replay yet)"
     if reason is not None:
         logger.warning("[State Cache] bounded replay off: %s.", reason)
         return 0
@@ -70,7 +77,8 @@ def state_replay_tokens(config) -> int:
         layers += 1  # one hop: every draft layer reads the trunk directly
     tokens = window + (layers - 1) * (window - 1)
     logger.info(
-        "[State Cache] bounded replay field: %d tokens (window %d, %d layers).",
+        "[State Cache] bounded replay on: a hit past the nearest checkpoint by "
+        "more than %d tokens replays that many (window %d, %d layers).",
         tokens,
         window,
         layers,

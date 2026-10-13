@@ -97,7 +97,6 @@ def test_state_runtime_wire_round_trip_revalidates_the_complete_contract():
         StateRuntime(
             transfer=StateTransfer.copy(COPY_SPEC.layout_id),
             checkpoint_spec=COPY_SPEC,
-            replay_tokens=7748,
         ),
     )
 
@@ -112,11 +111,6 @@ def test_state_runtime_wire_round_trip_revalidates_the_complete_contract():
 
     with pytest.raises(ValueError, match="fields"):
         StateRuntime.from_wire({"transfer": StateTransfer.none().to_wire()})
-
-    invalid_wire = runtimes[-1].to_wire()
-    invalid_wire["replay_tokens"] = -1
-    with pytest.raises(ValueError, match="replay_tokens"):
-        StateRuntime.from_wire(invalid_wire)
 
 
 def test_state_maintenance_bundle_is_typed_and_immutable():
