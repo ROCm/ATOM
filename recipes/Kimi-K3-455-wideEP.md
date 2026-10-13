@@ -6,14 +6,15 @@ Full-size **Kimi-K3** on **two gfx1250 B0 trays, 4 GPUs each (432 GiB/GPU, SPX)*
   MXFP4 routed experts, BF16 everything else.
 - **Parallelism:** `-tp 1`, DP 8, EP 8 (112 experts per GPU), DP attention.
 - **Checkpoint:** about 1.42 TiB, needed **in full on every tray**.
-- **Image:** `rocm/fw-bringup-mlperf:gfx1250-atom-20261012` with two ATOM patches; see
+- **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261013`. It is `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`
+  with two ATOM patches applied and the launch scripts in `/opt/k3`; see
   [Container and patches](#container-and-patches).
 
 Validated on CT15 (node0) and CT14 of the HeliosM rack below, 2026-10-13.
 
 | | |
 |---|---|
-| **GSM8K**, 5-shot, all 1319 | **strict-match 0.9659 ±0.0050**, flexible-extract 0.9651 ±0.0051 (flydsl compact dispatch, fp4 combine, 16384 batched tokens, no prefix caching) |
+| **GSM8K**, 5-shot, all 1319 | **strict-match 0.9674 ±0.0049**, flexible-extract 0.9666 ±0.0049 (flydsl compact dispatch, fp4 combine, 16384 batched tokens, no prefix caching) |
 | Gate | B0 text, decode matches prefill, chat `17 * 23` answers `391` |
 | Cold start | about 8 min in a fresh container (aiter JIT) |
 | AgentX | not measured with this image yet; method in [Agentic](#agentic-agentx) |
@@ -396,13 +397,25 @@ Then compare `find . -type f -printf '%P %s\n' | sort` on both sides.
 
 ## Container and patches
 
-**Image:** `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`, digest
-`sha256:e7fcdb088de972009dcd02778eadd5552374a30a3edfd26a3b35218cb7df116d`, 149 GB unpacked.
+**Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261013`, digest
+`sha256:9737256ddbd9860c99fc4f2ff0278d4cd210091ed07adb406e33c329d8362c08`. It is 150 GB unpacked, and pulls
+58.5 GB.
 
-- **Private repository.** `docker login` with a Docker Hub account that can read `rocm/fw-bringup-mlperf` (ask
-  the gfx1250 bring-up team), then `docker pull`. A tray that already has an earlier `gfx1250-atom-2026….`
-  tag of this repository pulls only the newer layers.
-- **Stack:** ROCm 10.1.0a20260811 from TheRock's Python wheels (`ROCM_PATH` is
+It is the gfx1250 bring-up team's DeepSeek-R1 MLPerf image `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`
+(digest `sha256:e7fcdb088de972009dcd02778eadd5552374a30a3edfd26a3b35218cb7df116d`) plus:
+- **the two ATOM patches below**, applied in `/app/ATOM`;
+- **`/opt/k3`**: this page's launch (`run_server.sh`, `env_k3.sh`), the gate, GSM8K, benchmark and AgentX
+  commands, and `verify_inside.sh`. It also holds `manifest.json`, which records the base digest, the
+  commits and the patches;
+- **aiperf** at `754356e9`, in `/opt/aiperf-venv` and on PATH;
+- **one ENV default, `MORI_AMD_SMI_PATH`** (see [Known issues](#known-issues)).
+
+Everything else is the base's, its DeepSeek-R1 ENV included; the launch overrides what K3 needs.
+
+- **Private repository.** `docker login` with a Docker Hub account that can read `rocm/fw-bringup` (ask the
+  gfx1250 bring-up team), then `docker pull`. A tray that already has the base image pulls only the top layers
+  (about 0.4 GB).
+- **Stack** (from the base): ROCm 10.1.0a20260811 from TheRock's Python wheels (`ROCM_PATH` is
   `/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core`), torch 2.11.0, Triton 3.8.0 (AMD-Triton
   `triton-mi450`, branch `shared/gfx1250`, in `/app/triton-mi450`), FlyDSL 0.3.3.dev886. System Python 3.12,
   no venv. py-spy is installed.
@@ -428,7 +441,7 @@ sudo docker run -d --name k3dp8 \
   --cap-add=SYS_PTRACE --cap-add=SYS_ADMIN --security-opt seccomp=unconfined --shm-size=128g \
   -v <model-dir>:/models:ro -v <work>/logs:/logs \
   -v <work>/triton:/root/.triton -v <work>/cache:/root/.cache \
-  --entrypoint sleep rocm/fw-bringup-mlperf:gfx1250-atom-20261012 infinity
+  --entrypoint sleep rocm/fw-bringup:gfx1250-atom-k3-20261013 infinity
 ```
 
 `--network=host` is required: the ranks reach each other by data-plane IP. Between attempts, clear stale
@@ -442,11 +455,13 @@ segments with `rm -f /dev/shm/psm_* /dev/shm/nccl-*`. Do this only when no other
 | [ATOM #2380](https://github.com/ROCm/ATOM/pull/2380) | unfused torch `gather_kv_b_proj`, enabled by `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. Without it, a chunked prefill aborts in an LLVM PHI assertion (fused Triton gather on gfx1250) | no: **patch 1** |
 | [ATOM #2532](https://github.com/ROCm/ATOM/pull/2532) | with `--enable_prefix_caching`, the DP dummy decode advanced a live KDA state through a stale index and poisoned a rank's cached prefixes | no: **patch 1** |
 | [ATOM #2533](https://github.com/ROCm/ATOM/pull/2533) | with `--enable_prefix_caching` and a large KV pool, the Triton MLA decode computed KV row offsets in int32 and decoded NaN past row 3,728,270 | no: **patch 1** |
-| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | the flydsl dispatch with the compact plan on the fp4 wire | superseded: this ATOM has upstream #2384 (`ATOM_MEGA_STAGE1_FUSED`, on by default). Only #2522's arena sizing is still needed: **patch 2** |
+| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | ATOM picks MegaMoE's dispatch kernel itself. For Kimi-K3 on the fp4 wire it measured the flydsl dispatch with the compact plan fastest; aiter's `MEGA_DISPATCH` overrides the pick. It also sizes the cco arena for the compact plan | Not in this image. Its ATOM has the unmerged #2384 instead (`ATOM_MEGA_STAGE1_FUSED`, on by default), which runs the same kernel. Only #2522's arena sizing is needed: **patch 2** |
 | [aiter #5431](https://github.com/ROCm/aiter/pull/5431) | custom all-reduce over torch.symm_mem, for the allgather LM head; skips mori's shmem init on gfx125x, without which every rank aborts at MoE init across trays | yes, at PR revision `c690195d` |
 | [aiter #5844](https://github.com/ROCm/aiter/pull/5844) | the FlyDSL PS1 MLA decode (`AITER_MLA_DECODE_PS1_FLYDSL`) | yes, merged |
 
-The two patches are next to this page, in [`Kimi-K3-455-wideEP-patches/`](Kimi-K3-455-wideEP-patches/):
+**Both patches are applied in this page's image.** `/opt/k3/verify_inside.sh` checks them. The patch files
+are next to this page, in [`Kimi-K3-455-wideEP-patches/`](Kimi-K3-455-wideEP-patches/), for starting from the
+base image instead:
 
 - **`atom-r1_1012-k3.diff`** (patch 1): #2380, #2532 and #2533, without their tests. #2380's `__init__` hunk
   sits below the image's QH128 ASM page-64 block. Otherwise the code is as in the PRs: #2380 at `dc83d9ef`,
@@ -455,6 +470,8 @@ The two patches are next to this page, in [`Kimi-K3-455-wideEP-patches/`](Kimi-K
   so ATOM sizes the cco arena with the token-major budget, 3.78 GiB at 16384 tokens. The compact plan needs
   5.79 GiB, and MoE init fails with `ccoMemAlloc failed: -1`. The patch adds #2522's compact-plan rows to that
   budget, giving 7.60 GiB.
+
+Only when starting from `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`:
 
 ```bash
 # on the host
@@ -469,7 +486,13 @@ cd /app/ATOM && for p in atom-r1_1012-k3 atom-r1_1012-mega-vmm; do
 rm -rf /root/.cache/atom/*     # after any code change
 ```
 
-- `docker rm` discards the patches.
+- `docker rm` discards patches applied by hand. Those in the image stay.
+- **#2522 was validated on its own stack**, revision 3 (`9cd096a2`): ATOM `main` of 2026-10-08 with aiter
+  `e965ebfe`, on 2026-10-13.
+  - With nothing set, it picked `flydsl_compact` on all 8 ranks.
+  - Full GSM8K strict-match was 0.9621, and 14k/500 con32 gave 279 output tok/s.
+  - Once an image carries #2522 instead of #2384, `ATOM_MEGA_STAGE1_FUSED=1` in the launch does nothing and
+    patch 2 is no longer needed.
 - After launch, check two lines on every rank:
   - `Custom allreduce: using torch.symm_mem transport (mori backend)`. If the probe fails, aiter falls back
     to IPC without saying so, and `assert not ca_comm.disabled` comes back at the first decode.
@@ -480,8 +503,13 @@ rm -rf /root/.cache/atom/*     # after any code change
 
 ## Launch (dp8ep8)
 
-Both trays run the same script inside their container, CT15 with `DPRANK=0` and CT14 with `DPRANK=4`. Only
+Both trays run the same launch inside their container, CT15 with `DPRANK=0` and CT14 with `DPRANK=4`. Only
 node0 serves the API on `:8000`.
+- **In the image.** It is `/opt/k3/run_server.sh <0|4> <node0 IP>`, which sources `/opt/k3/env_k3.sh`. The
+  script below shows what it sets and runs.
+- **Logs.** They go to `/logs/server_dp<rank>_<time>.log`, with a `server_dp<rank>.latest.log` link.
+- **Knobs.** `K3_MODE=agentic` turns on prefix caching with session affinity. `K3_LMHEAD=safe` selects the
+  replicated LM head.
 
 ```bash
 #!/bin/bash
@@ -540,8 +568,8 @@ exec python3 -m atom.entrypoints.openai_server \
 
 ```bash
 # from the jump host, both trays at once (CT15 = node0)
-ssh root@10.210.11.13 "docker exec -d k3dp8 bash /logs/run_server.sh 0 10.210.11.13"
-ssh root@10.210.11.25 "docker exec -d k3dp8 bash /logs/run_server.sh 4 10.210.11.13"
+ssh root@10.210.11.13 "docker exec -d k3dp8 bash /opt/k3/run_server.sh 0 10.210.11.13"
+ssh root@10.210.11.25 "docker exec -d k3dp8 bash /opt/k3/run_server.sh 4 10.210.11.13"
 until curl -sf -m 5 http://10.210.11.13:8000/v1/models >/dev/null; do sleep 15; done
 ```
 
@@ -552,13 +580,18 @@ until curl -sf -m 5 http://10.210.11.13:8000/v1/models >/dev/null; do sleep 15; 
 - **16384 rather than 2048.** A 14k prompt prefills in one step instead of seven. Before this image it gave
   16% more output throughput and a 30–40% lower median TTFT.
 - **The dispatch kernel.** `ATOM_MEGA_STAGE1_FUSED=1` runs the flydsl dispatch with the compact plan; `0` runs
-  mori's, for an A/B. Leave `MEGA_DISPATCH` unset. Before this image, the compact plan gave 6% more output
-  throughput than mori at 14k/500, con32, with 2048 batched tokens, and 10% more with 16384.
+  mori's, for an A/B. Leave `MEGA_DISPATCH` unset.
+  - Measured 2026-10-13 against mori at 14k/500, con32, 16384 batched tokens (ATOM `main` of 2026-10-08, aiter
+    `e965ebfe`). The compact plan gave 2.6% more output throughput (279.2 against 272.2 tok/s) and a 2.9% lower
+    median TPOT (94.4 against 97.2 ms). Its median TTFT was 5% higher (9.0 against 8.6 s).
+  - Earlier single runs had shown up to 10%.
 - **The fp4 combine wire** quantizes the combine on prefill steps only. Before this image it was as accurate
   as bf16 (GSM8K 0.9621 against 0.9629) and changed no throughput.
-- **DeepSeek-R1 features.** This ATOM adds `ATOM_MEGA_DECODE_FAST_PATH` (a separate small MegaMoE for decode
-  steps) and `ATOM_MEGA_MASK_PAD_ROWS` (DP pad rows skip the MoE). Both are on by default; the validated run
-  turns both off, and they are untested with K3.
+- **DeepSeek-R1 features.** This ATOM adds two MegaMoE features, both on by default; the validated runs turn
+  both off.
+  - `ATOM_MEGA_DECODE_FAST_PATH`: a separate small MegaMoE for decode steps. Untested with K3.
+  - `ATOM_MEGA_MASK_PAD_ROWS`: DP pad rows skip the MoE. Tested alone with K3 on 2026-10-13, under the compact
+    plan: full GSM8K strict-match 0.9651, and GSM8K's requests took as long as without it.
 - **The LM head.** The default allgather head (custom all-gather, #5431) hangs rarely; see
   [Known issues](#known-issues). The replicated head avoids it:
   `ATOM_DP_LM_HEAD_MODE=default ATOM_USE_CUSTOM_ALL_GATHER=0`, without `AITER_CUSTOM_AR_USE_SYMM_MEM`. That
@@ -599,7 +632,8 @@ only `content`, so a small budget scores 0.
 
 | server (dp8ep8, 0.90) | strict-match | flexible-extract | time |
 |---|---|---|---|
-| flydsl compact dispatch, fp4 combine, 16384, no prefix caching | **0.9659 ±0.0050** | 0.9651 ±0.0051 | 7 min |
+| flydsl compact dispatch, fp4 combine, 16384, no prefix caching | **0.9674 ±0.0049** | 0.9666 ±0.0049 | 9 min |
+| the same, on the base image with the patches applied by hand | 0.9659 ±0.0050 | 0.9651 ±0.0051 | 7 min |
 
 No answer was empty or `!!!!`.
 
