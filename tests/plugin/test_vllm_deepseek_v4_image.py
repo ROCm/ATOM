@@ -292,6 +292,7 @@ def test_partial_eviction_restores_by_group():
     pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=128)
     st = object.__new__(V4SchedulerImages)
     st.block_pool = pool
+    st.placement = V4ImagePlacement(interval=8192, demand=True)
     st.image_gids = gids
     st.k = len(gids)
     req = NS(block_hashes=[b"h0", b"h1"], request_id="r")

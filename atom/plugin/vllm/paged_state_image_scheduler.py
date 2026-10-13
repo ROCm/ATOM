@@ -19,6 +19,8 @@ import logging
 import os
 from dataclasses import dataclass
 
+from vllm.v1.core.kv_cache_utils import resolve_block_hashes
+
 from atom.plugin.vllm.paged_state_image import adapter_for_kv_cache_config
 
 logger = logging.getLogger("atom")
@@ -186,6 +188,7 @@ class SchedulerImages:
             "decode_keeps": 0,
             "duplicate_images_skipped": 0,
             "max_image_blocks_per_request": 0,
+            "pending_hashes_dropped": 0,
         }
 
     # -- admission (each get_computed_blocks call = native can_allocate) ------
@@ -370,7 +373,12 @@ class SchedulerImages:
         pend = self.pending_hash.pop(rid, None)
         self.decode_intents.pop(rid, None)
         if request.is_finished() and pend is not None:
-            self._hash_block(request, pend)
+            # An abort is handled before the step's output lands (EngineCore),
+            # so the token closing the block may never reach the CPU.
+            if self._has_boundary_hash(request, pend):
+                self._hash_block(request, pend)
+            else:
+                self.counters["pending_hashes_dropped"] += 1
         self.last_ckpt.pop(rid, None)
         self._scan_from.pop(rid, None)
         self._release_keep.pop(rid, None)
@@ -472,17 +480,29 @@ class SchedulerImages:
         blocks; it is stored again then, and a later hit may take some groups
         from one store and the rest from another. Every group's block is the
         state after the same hashed prefix, as in vLLM's own hybrid Mamba."""
-        if len(request.block_hashes) <= idx:
+        hashes = self._boundary_hashes(request)
+        if len(hashes) <= idx:
             return False
         return (
-            self.block_pool.get_cached_block(request.block_hashes[idx], self.image_gids)
-            is not None
+            self.block_pool.get_cached_block(hashes[idx], self.image_gids) is not None
         )
+
+    def _boundary_hashes(self, request):
+        """The request's prefix hashes at the image block size (vLLM computes
+        them at ``hash_block_size``, which may be finer)."""
+        return resolve_block_hashes(
+            request.block_hashes, self.block_pool.hash_block_size, self.placement.block
+        )
+
+    def _has_boundary_hash(self, request, idx: int) -> bool:
+        return len(self._boundary_hashes(request)) > idx
 
     def _hash_or_defer(self, request, idx: int) -> None:
         rid = request.request_id
         mgr0 = self.coordinator.single_type_managers[self.image_gids[0]]
-        if mgr0.num_cached_block.get(rid, 0) > idx and len(request.block_hashes) > idx:
+        if mgr0.num_cached_block.get(rid, 0) > idx and self._has_boundary_hash(
+            request, idx
+        ):
             self._hash_block(request, idx)
         else:
             self.pending_hash[rid] = idx
