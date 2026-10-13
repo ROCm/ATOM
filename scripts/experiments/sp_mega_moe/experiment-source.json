@@ -1,5 +1,5 @@
 {
-  "atom_integration_commit": "410884bfb9d0cbe1e03ed22609bc6e18b8df97f7",
+  "atom_integration_commit": "7b231f15ee4981c1efacb3cc1acd65c65bc257db",
   "aiter_main_commit": "cc709933512a056e04c596877086f92be9067df8",
   "packages": {
     "torch": "2.10.0+rocm7.2.4.lw.git3d3aa833",
@@ -80,8 +80,10 @@
     "model-00059-of-00059.safetensors": 5370979136
   },
   "model_identity_note": "Metadata hashes and shard sizes only; full weight-content hashes were not collected.",
-  "atom_tree_sha": "08e654074085acfcfd3eea4be43065213a35496c",
+  "atom_tree_sha": "ab9e0ee123abf1ee95e988d80a7a35ef3a42b639",
   "aiter_policy": "Clean upstream main at the pinned SHA; no local patch in either arm.",
   "historical_validation_scope": "Existing GPU, full-model trace and GSM8K results used this AITER SHA plus the former tiled-sort extension. They do not validate the new pure-main comparison.",
-  "current_validation_scope": "Current ATOM tree on clean pinned AITER main: 142 CPU tests, 9 GPU copy/graph tests, full-model 2K/4K four-rank traces and short decode passed. ATOM runtime watchdog checks are removed; full fused prefill uses sp_rs_norm, MegaMoE and copy_tail. No new end-to-end throughput or GSM8K result."
+  "current_validation_scope": "Rebased onto main 2c948339. On clean pinned AITER main: 209 focused tests, 81 CPU-only SP tests, 9 GPU copy/graph tests, full-model level-3/FULL graph capture, 2K/4K four-rank traces and short decode passed. ATOM runtime watchdog checks are removed; each full fused prefill block uses sp_rs_norm, MegaMoE and copy_tail. No new end-to-end throughput or GSM8K result. Complete CPU CI suite: 8453 passed, 883 skipped, 3 xfailed, zero failures; unmodified main 2c948339 comparison: 8290 passed, 871 skipped, 3 xfailed.",
+  "atom_base_commit": "2c948339a621e9a7f8a9740e8adb56693053bc3a",
+  "atom_validation_commit": "7a44d3ac45a1640a8f525084206384c77a4e6ff7"
 }
