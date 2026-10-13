@@ -420,3 +420,25 @@ def test_an_unanswered_orphan_is_given_up_after_its_timeout(monkeypatch):
     client.pump()
     assert not client.has_unreleased_orphans()
     assert not client.is_pending("7")
+
+
+def test_a_failing_requery_is_retried_up_to_the_bound(monkeypatch):
+    sched, client, adapter = _scheduler(monkeypatch, lookup_done=True)
+    calls = {"n": 0}
+
+    def status(_rid):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the status future handed out on transition
+            fut = _Future_cls(adapter._client.chunks)
+            fut.raise_on_result = True
+            return fut
+        raise RuntimeError("status channel down")  # every re-query
+
+    adapter._client.query_prefetch_status = status
+    sched.commit_tier_lookup_skip(_seq(), 60)
+    for _ in range(mp_lookup._ORPHAN_STATUS_RETRIES):
+        client.pump()
+        assert client.is_pending("7")  # failed re-query: still in flight
+    client.pump()  # bound reached
+    assert not client.is_pending("7")
+    assert not client.has_unreleased_orphans()

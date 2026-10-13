@@ -234,16 +234,20 @@ class _MPLookupClient:
         if tries >= _ORPHAN_STATUS_RETRIES:
             self._status_retries.pop(lookup_id, None)
             return False
+        # A failed re-query still counts as a try and keeps the lookup in
+        # flight: the next pump re-raises on the stale future and lands here
+        # again, so the bound above is what ends it, not the first failure.
+        self._status_retries[lookup_id] = tries + 1
         try:
             entry[3] = self._adapter._client.query_prefetch_status(entry[0])
         except Exception:
             logger.warning(
-                "LMCache MP: could not re-query discarded lookup %s",
+                "LMCache MP: could not re-query discarded lookup %s (try %d/%d)",
                 lookup_id,
+                tries + 1,
+                _ORPHAN_STATUS_RETRIES,
                 exc_info=True,
             )
-            return False
-        self._status_retries[lookup_id] = tries + 1
         logger.debug("LMCache MP: retrying status of discarded lookup %s", lookup_id)
         return True
 
