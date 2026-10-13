@@ -442,3 +442,14 @@ def test_a_failing_requery_is_retried_up_to_the_bound(monkeypatch):
     client.pump()  # bound reached
     assert not client.is_pending("7")
     assert not client.has_unreleased_orphans()
+
+
+def test_an_unanswerable_lookup_resets_the_save_floor(monkeypatch):
+    """No answer means the tier's holdings are unknown: save the prefix again."""
+    sched, client, _adapter = _scheduler(monkeypatch, lookup_done=False)
+    entry = _admit_and_track(sched, _seq(), 60)
+    assert entry[1] == 60
+    client._orphan_since["7"] -= mp_lookup._ORPHAN_TIMEOUT_S + 1
+    sched._end_finished_sessions()  # pump gives it up, then the floor resets
+    assert entry[1] == 0
+    assert sched._skipped_lookup_seqs() == {}

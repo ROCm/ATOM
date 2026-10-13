@@ -410,13 +410,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if entry is not None and entry[0] is seq and tier < int(entry[1]):
                 entry[1] = tier
                 self._perf_bump("lookup_skip_floor_lowered")
-        # Forget a request whose lookup can no longer answer with a hit (it
-        # failed, or answered empty) or that can no longer save.
+        # A lookup that left without an answer (failed, or given up after the
+        # orphan timeout) says nothing about what the tier holds, so the
+        # HBM-seeded floor is no longer trusted: drop it to 0 and save the
+        # prefix again. Answered lookups were handled above.
         pending_ids = getattr(self._lookup_client, "pending_ids", None)
         in_flight = pending_ids() if callable(pending_ids) else ()
         for sid in list(pending):
+            seq = pending[sid]
             entry = self._save_tracker.get(sid)
-            if sid not in in_flight or entry is None or entry[0] is not pending[sid]:
+            if sid not in in_flight:
+                if sid in self._hit_save_floors:
+                    self._hit_save_floors[sid] = 0
+                if entry is not None and entry[0] is seq:
+                    entry[1] = 0
+                    self._perf_bump("lookup_skip_floor_reset")
+                del pending[sid]
+            elif entry is None or entry[0] is not seq:
                 del pending[sid]
 
     def lookup_pending(self, seq) -> bool:
