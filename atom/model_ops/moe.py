@@ -3597,6 +3597,11 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+        if self._comm_fused_moe is not None:
+            # This must precede create_weights and process_weights_after_loading:
+            # comm-fused runners consume the Aiter/FlyDSL layout, while the
+            # Triton paths rewrite the same MXFP4 parameters incompatibly.
+            self._comm_fused_moe.configure_quant_method(self.quant_method)
         if self.expert_layout.uses_all2all_fusion and not isinstance(
             self.quant_method, (Mxfp4MoEMethod, Nvfp4MoEMethod)
         ):

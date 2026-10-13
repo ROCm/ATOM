@@ -3943,8 +3943,11 @@ class MoE(nn.Module):
         """
         routed_stream = torch.cuda.current_stream(x.device)
         self.alt_stream.wait_stream(routed_stream)
+        shared_produced = False
+        shared_waited = False
 
         def produce_shared(output_rows):
+            nonlocal shared_produced
             with torch.cuda.stream(self.alt_stream):
                 shared = self.shared_experts.forward(x)
                 if shared.shape[0] != output_rows:
@@ -3952,10 +3955,18 @@ class MoE(nn.Module):
                     padded[: shared.shape[0]].copy_(shared)
                     shared = padded
             shared.record_stream(routed_stream)
+            shared_produced = True
             return shared
 
         def wait_for_shared():
-            routed_stream.wait_stream(self.alt_stream)
+            nonlocal shared_waited
+            if not shared_produced:
+                raise RuntimeError(
+                    "comm-fused shared output was joined before it was produced"
+                )
+            if not shared_waited:
+                routed_stream.wait_stream(self.alt_stream)
+                shared_waited = True
 
         routed, is_complete = self.routed_expert_forward(
             x,
@@ -3964,6 +3975,11 @@ class MoE(nn.Module):
             stage2_stream=routed_stream,
         )
         if is_complete:
+            if not shared_produced or not shared_waited:
+                raise RuntimeError(
+                    "comm-fused Stage2 completed without joining the shared-output "
+                    "producer"
+                )
             return routed
         with torch.cuda.stream(self.alt_stream):
             shared = self.shared_experts.forward(x)

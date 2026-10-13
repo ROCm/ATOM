@@ -131,6 +131,21 @@ class CommFusedMoeBackend:
         self.runtime = None
         self._logged_buckets: set[int] = set()
 
+    @staticmethod
+    def configure_quant_method(method: Any) -> None:
+        """Select the FlyDSL weight layout before weights are prepared."""
+        # Importing here avoids a cycle while atom.model_ops.moe defines FusedMoE.
+        from atom.model_ops.moe import Mxfp4MoEMethod
+
+        if not isinstance(method, Mxfp4MoEMethod):
+            raise TypeError("Communication-fused MoE requires MXFP4 weights")
+        # Mega, Direct, and Window consume the ordinary Aiter/FlyDSL layout.
+        # Triton rewrites the same parameters into a different layout during
+        # process_weights_after_loading(), so make the ownership decision before
+        # create_weights and weight post-processing can observe these flags.
+        method.use_triton = False
+        method.use_triton_decode = False
+
     def _dpa_bucket_layout(self, max_tokens: int, world_size: int) -> tuple[int, int]:
         gathered_tokens = max_tokens * world_size
         bucket = self.runtime.bucket_for(gathered_tokens)
@@ -148,6 +163,11 @@ class CommFusedMoeBackend:
         method = layer.quant_method
         if not isinstance(method, Mxfp4MoEMethod):
             raise TypeError("Communication-fused MoE requires MXFP4 weights")
+        if method.use_triton or method.use_triton_decode:
+            raise RuntimeError(
+                "Communication-fused MoE requires the Aiter/FlyDSL weight layout; "
+                "configure_quant_method() must run before weight preparation"
+            )
         group = get_dp_group() if self.use_dp_reduce_scatter else get_tp_group()
         world_size = int(group.world_size)
         if self.use_dp_reduce_scatter:
@@ -186,6 +206,16 @@ class CommFusedMoeBackend:
             runners=self.host.create_flydsl_comm_fused_runners(**runner_args)
         )
 
+    @staticmethod
+    def _dpa_max_tokens(ctx: Any) -> int | None:
+        """Return a DP-uniform dispatch height, or None when it is unproven."""
+        dp_metadata = ctx.dp_metadata
+        if dp_metadata is not None:
+            return int(dp_metadata.max_tokens_across_dp)
+        if not bool(getattr(ctx.context, "running_tokens_are_unified", False)):
+            return None
+        return int(ctx.context.running_tokens)
+
     def supports(self, tokens: int) -> bool:
         if self.runtime is None:
             return False
@@ -194,12 +224,9 @@ class CommFusedMoeBackend:
         from atom.utils.forward_context import get_forward_context
 
         ctx = get_forward_context()
-        dp_metadata = ctx.dp_metadata
-        max_tokens = (
-            int(dp_metadata.max_tokens_across_dp)
-            if dp_metadata is not None
-            else int(ctx.context.running_tokens)
-        )
+        max_tokens = self._dpa_max_tokens(ctx)
+        if max_tokens is None:
+            return False
         world_size = int(get_dp_group().world_size)
         gathered_tokens = max_tokens * world_size
         try:
@@ -247,11 +274,12 @@ class CommFusedMoeBackend:
         group = get_dp_group()
         world_size = int(group.world_size)
         dp_metadata = ctx.dp_metadata
-        max_tokens = (
-            int(dp_metadata.max_tokens_across_dp)
-            if dp_metadata is not None
-            else int(ctx.context.running_tokens)
-        )
+        max_tokens = self._dpa_max_tokens(ctx)
+        if max_tokens is None:
+            raise RuntimeError(
+                "Communication-fused DPA requires dp_metadata or DP-uniform "
+                "running_tokens"
+            )
         if max_tokens < local_tokens:
             raise ValueError(
                 f"DPA comm-fused padding height {max_tokens} is below "

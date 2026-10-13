@@ -407,7 +407,7 @@ def test_support_predicate_uses_runtime_shape_and_fails_closed(comm_fused_env):
     assert _create_backend(modules, state) is None
 
 
-def test_runner_wiring_uses_real_moe_types(comm_fused_env):
+def test_runner_wiring_pins_flydsl_weight_layout(comm_fused_env):
     modules, state, tp_group, _ = comm_fused_env
     backend = _create_backend(modules, state)
     layer = _new_fused_moe(modules)
@@ -424,10 +424,11 @@ def test_runner_wiring_uses_real_moe_types(comm_fused_env):
     layer.global_num_experts = 384
     layer.top_k = 6
 
+    backend.configure_quant_method(layer.quant_method)
     backend.initialize(layer)
 
-    assert layer.quant_method.use_triton
-    assert layer.quant_method.use_triton_decode
+    assert not layer.quant_method.use_triton
+    assert not layer.quant_method.use_triton_decode
     assert state.runner_calls == [
         {
             "tp_group": tp_group,
@@ -441,6 +442,18 @@ def test_runner_wiring_uses_real_moe_types(comm_fused_env):
     ]
     assert backend.supports(32)
     assert not backend.supports(31)
+
+
+def test_runner_initialization_rejects_triton_weight_layout(comm_fused_env):
+    modules, state, _, _ = comm_fused_env
+    backend = _create_backend(modules, state)
+    layer = _new_fused_moe(modules)
+    layer.quant_method = object.__new__(modules.moe.Mxfp4MoEMethod)
+    layer.quant_method.use_triton = True
+    layer.quant_method.use_triton_decode = False
+
+    with pytest.raises(RuntimeError, match="requires the Aiter/FlyDSL weight layout"):
+        backend.initialize(layer)
 
 
 def test_dpa_runner_uses_reduce_scatter_group(comm_fused_env):
@@ -482,6 +495,7 @@ def test_dpa_runner_uses_reduce_scatter_group(comm_fused_env):
     layer.w2_weight = torch.nn.Parameter(torch.empty(1))
     layer.w2_weight_scale = torch.nn.Parameter(torch.empty(1))
 
+    backend.configure_quant_method(layer.quant_method)
     backend.initialize(layer)
 
     assert state.runner_calls == [
@@ -849,6 +863,103 @@ def test_dpa_support_accepts_any_runtime_bucket(monkeypatch, comm_fused_env):
     backend.runtime.supports.assert_called_once_with(32768)
 
 
+def test_dpa_support_requires_uniform_fallback_without_metadata(
+    monkeypatch, comm_fused_env
+):
+    modules, state, _, _ = comm_fused_env
+    state.config.enable_dp_attention = True
+    backend = _create_backend(
+        modules,
+        state,
+        parallel_config=SimpleNamespace(dp_size=8, use_ep=False, tp_size=8),
+    )
+    backend.runtime = SimpleNamespace(
+        supports=MagicMock(return_value=True),
+        bucket_for=MagicMock(return_value=32),
+    )
+    forward_context = importlib.import_module("atom.utils.forward_context")
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=None,
+            context=SimpleNamespace(
+                running_tokens=4,
+                running_tokens_are_unified=False,
+            ),
+        ),
+    )
+
+    assert backend.supports(4) is False
+    backend.runtime.bucket_for.assert_not_called()
+    backend.runtime.supports.assert_not_called()
+
+
+def test_dpa_support_accepts_uniform_fallback_without_metadata(
+    monkeypatch, comm_fused_env
+):
+    modules, state, _, _ = comm_fused_env
+    state.config.enable_dp_attention = True
+    backend = _create_backend(
+        modules,
+        state,
+        parallel_config=SimpleNamespace(dp_size=8, use_ep=False, tp_size=8),
+    )
+    backend.runtime = SimpleNamespace(
+        supports=MagicMock(return_value=True),
+        bucket_for=MagicMock(return_value=32),
+    )
+    backend._logged_buckets.add(32)
+    forward_context = importlib.import_module("atom.utils.forward_context")
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=None,
+            context=SimpleNamespace(
+                running_tokens=4,
+                running_tokens_are_unified=True,
+            ),
+        ),
+    )
+
+    assert backend.supports(4) is True
+    backend.runtime.bucket_for.assert_called_once_with(32)
+    backend.runtime.supports.assert_called_once_with(32)
+
+
+def test_dpa_gather_rejects_nonuniform_fallback_without_metadata(
+    monkeypatch, comm_fused_env
+):
+    modules, state, _, _ = comm_fused_env
+    state.config.enable_dp_attention = True
+    backend = _create_backend(
+        modules,
+        state,
+        parallel_config=SimpleNamespace(dp_size=8, use_ep=False, tp_size=8),
+    )
+    monkeypatch.setattr(
+        modules.comm,
+        "get_dp_group",
+        lambda: SimpleNamespace(world_size=8),
+    )
+    forward_context = importlib.import_module("atom.utils.forward_context")
+    monkeypatch.setattr(
+        forward_context,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            dp_metadata=None,
+            context=SimpleNamespace(
+                running_tokens=4,
+                running_tokens_are_unified=False,
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="requires dp_metadata or DP-uniform"):
+        backend._gather_dpa_inputs(torch.randn(4, 8), torch.randn(4, 16))
+
+
 @pytest.mark.parametrize("supported", [True, False])
 def test_fused_moe_dispatches_optional_backend(monkeypatch, atom_modules, supported):
     layer = _new_fused_moe(atom_modules)
@@ -1066,3 +1177,42 @@ def test_dsv4_comm_fused_dual_stream_rejoins_before_return(monkeypatch, atom_mod
     assert alt_stream.wait_stream.call_args_list[0].args == (routed_stream,)
     routed_stream.wait_stream.assert_called_once_with(alt_stream)
     moe.combine_outputs.assert_not_called()
+
+
+def test_dsv4_comm_fused_dual_stream_rejects_missing_shared_join(
+    monkeypatch, atom_modules
+):
+    moe = atom_modules.deepseek_v4.MoE.__new__(atom_modules.deepseek_v4.MoE)
+    torch.nn.Module.__init__(moe)
+    hidden_states = torch.randn(4, 8)
+    routed = torch.randn_like(hidden_states)
+    shared = MagicMock(name="shared")
+    routed_stream = MagicMock(name="routed_stream")
+    alt_stream = MagicMock(name="alt_stream")
+
+    def run_fused(
+        _x, *, before_stage2_for_rows, before_shared_add, stage2_stream, **_kwargs
+    ):
+        assert stage2_stream is routed_stream
+        assert before_stage2_for_rows(shared.shape[0]) is shared
+        return routed, True
+
+    moe.alt_stream = alt_stream
+    moe.shared_experts = MagicMock()
+    moe.shared_experts.forward.return_value = shared
+    moe.routed_expert_forward = MagicMock(side_effect=run_fused)
+    monkeypatch.setattr(
+        atom_modules.deepseek_v4.torch.cuda,
+        "current_stream",
+        lambda _device: routed_stream,
+    )
+    monkeypatch.setattr(
+        atom_modules.deepseek_v4.torch.cuda,
+        "stream",
+        lambda _stream: contextmanager(lambda: (yield))(),
+    )
+
+    with pytest.raises(RuntimeError, match="completed without joining"):
+        atom_modules.deepseek_v4.MoE.dual_stream_moe_forward(moe, hidden_states)
+
+    routed_stream.wait_stream.assert_not_called()
