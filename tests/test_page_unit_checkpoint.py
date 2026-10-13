@@ -101,6 +101,76 @@ def test_runtime_spec_rejects_a_drifted_wire_shape():
         )
 
 
+def test_pipeline_spec_takes_the_agreed_units_and_op_bytes():
+    """A PP stage needing fewer units than its peers still takes all of them,
+    and its ops name the summed image the head priced, not its own."""
+    own = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    spec = own.for_pipeline("pp2-joint:abc", units=5, op_bytes=60)
+
+    assert own.units_per_checkpoint == 3
+    assert spec.units_per_checkpoint == 5
+    assert spec.op_bytes == 60
+    assert spec.image_bytes == 25
+    assert spec.layout_id == "pp2-joint:abc"
+    assert own.op_bytes == own.image_bytes
+
+
+def test_pipeline_fields_ride_the_wire_only_when_set():
+    own = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    spec = own.for_pipeline("pp2-joint:abc", units=5, op_bytes=60)
+
+    assert "pipeline_units" not in own.to_wire()
+    assert spec.to_wire()["pipeline_units"] == 5
+    assert spec.to_wire()["pipeline_op_bytes"] == 60
+    assert PagedStateCheckpointSpec.from_wire(spec.to_wire()) == spec
+
+
+@pytest.mark.parametrize(
+    "units, op_bytes",
+    [
+        # Fewer units than this stage's own image needs.
+        (2, 60),
+        # Less than this stage's own image.
+        (5, 24),
+        # Agreed together or not at all.
+        (5, 0),
+        (0, 60),
+        (-1, 60),
+    ],
+)
+def test_pipeline_spec_rejects_an_agreement_this_stage_cannot_hold(units, op_bytes):
+    with pytest.raises(ValueError):
+        PagedStateCheckpointSpec(
+            10,
+            25,
+            "layout-v1",
+            image_bytes=25,
+            pipeline_units=units,
+            pipeline_op_bytes=op_bytes,
+        )
+
+
+def test_pipeline_store_and_restore_ops_name_the_agreed_geometry():
+    pool = BlockPool(20)
+    spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
+    store = PageUnitCheckpointStore(
+        pool, spec.for_pipeline("pp2-joint:abc", units=5, op_bytes=60)
+    )
+
+    op = store.begin_store(101, src_slot=3)
+    assert op is not None
+    assert len(op.unit_ids) == 5
+    assert op.total_bytes == 60
+    assert op.layout_id == "pp2-joint:abc"
+    assert pool.num_free == 15
+
+    store.complete_inflight()
+    restore = store.begin_restore(101, dst_slot=4)
+    assert restore is not None
+    assert restore.unit_ids == op.unit_ids
+    assert restore.total_bytes == 60
+
+
 def test_copying_is_not_hash_visible_and_ready_is():
     pool, store = make_store()
     op = store.begin_store(101, src_slot=3)
