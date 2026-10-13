@@ -104,14 +104,10 @@ tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 
 [profile.release]
-opt-level = "z"     # Optimize for size
-lto = "fat"         # Full LTO for smaller binaries
+opt-level = 3       # Optimize for speed; parsing and tokenization are CPU-bound
+lto = "fat"         # Full LTO for cross-crate inlining
 codegen-units = 1   # Better optimization, slower compile
 strip = true        # Strip debug symbols
-
-[profile.release.package.tokenizers]
-# Native tokenization is CPU-bound; size optimization reduces request throughput.
-opt-level = 3
 
 [profile.ci]
 inherits = "release"
@@ -119,10 +115,6 @@ opt-level = 2       # Lighter optimization (still fast runtime, much faster comp
 lto = "thin"        # Thin LTO - good balance
 codegen-units = 16  # More parallelization for faster builds
 strip = true
-
-[profile.ci.package.tokenizers]
-# Keep CI's optimization level instead of inheriting the release package override.
-opt-level = 2
 
 [profile.dev]
 opt-level = 0
