@@ -225,12 +225,21 @@ def test_kv_config_hook_aligns_and_withholds_slots(fake):
     def original(vc_, specs, mem):
         return [_groups(fake, 3)]
 
-    (cfg,) = G._kv_cache_configs_hook(original, vc, {}, 0)
+    specs = [{fake.proxy_layer_name: object()}]
+    (cfg,) = G._kv_cache_configs_hook(original, vc, specs, 0)
     assert vc.cache_config.mamba_cache_mode == "align"
     assert cfg.num_blocks == 100 - 11
     vc.speculative_config = object()
     with pytest.raises(ValueError, match="Fake prefix caching"):
-        G._kv_cache_configs_hook(original, vc, {}, 0)
+        G._kv_cache_configs_hook(original, vc, specs, 0)
+
+
+def test_a_matching_model_without_the_proxy_layer_passes_through(fake):
+    sentinel = object()
+    vc = _vcfg()
+    vc.speculative_config = object()
+    out = G._kv_cache_configs_hook(lambda *a: sentinel, vc, [{"x.attn": 0}], 0)
+    assert out is sentinel and vc.cache_config.mamba_cache_mode == "none"
 
 
 def test_placement_at_another_block_size():
@@ -395,8 +404,15 @@ def test_plan_refuses_an_unrestored_resume_without_images(monkeypatch):
     assert md.image_restore_rows == [] and md.image_store_rows == []
 
 
-def test_v4_adapter_spec_is_native_and_k_follows_it():
+def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
     pytest.importorskip("aiter", reason="the V4 bridge reaches AITER dtypes")
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    monkeypatch.setitem(
+        ModelRegistry.models,
+        "DeepseekV4ForCausalLM",
+        NS(module_name="atom.plugin.vllm.model_wrapper", class_name="X"),
+    )
     from atom.plugin.vllm.deepseek_v4_image import (
         register_v4_image_adapter,
         v4_image_sizing,

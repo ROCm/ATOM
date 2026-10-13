@@ -303,11 +303,13 @@ def check_image_groups(cfg, adapter, sizing) -> None:
 
 def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memory):
     adapter = adapter_for_config(vllm_config)
-    if adapter is None:
+    proxy_name = None if adapter is None else adapter.proxy_layer_name
+    # Only a model that registered the family's proxy layer is the family's;
+    # anything else (e.g. vLLM's own implementation) keeps vLLM's allocator.
+    if proxy_name is None or not any(proxy_name in s for s in kv_cache_specs):
         return original(vllm_config, kv_cache_specs, available_memory)
     from atom.plugin.vllm.paged_state_image_scheduler import ImagePlacement
 
-    proxy_name = adapter.proxy_layer_name
     bs = adapter.block_size
     pc = images_on(adapter, vllm_config)
     sizing = adapter.sizing(vllm_config)

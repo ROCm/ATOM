@@ -59,11 +59,16 @@ def deepseek_v4_image_layer_names(k: int) -> list[str]:
     ]
 
 
-def is_deepseek_v4_config(vllm_config) -> bool:
-    from atom.plugin.vllm.platform import _is_deepseek_v4
+def is_atom_deepseek_v4_config(vllm_config) -> bool:
+    """``DeepseekV4ForCausalLM`` exactly, and served by ATOM: vLLM's registry maps
+    it to an ATOM class (not vLLM's own V4, nor V4.1)."""
+    from atom.plugin.vllm.deepseek_v4_cudagraph_patch import atom_v4_arch
 
     mc = getattr(vllm_config, "model_config", None)
-    return mc is not None and _is_deepseek_v4(mc)
+    archs = getattr(mc, "architectures", None) or ()
+    return "DeepseekV4ForCausalLM" in archs and (
+        atom_v4_arch(["DeepseekV4ForCausalLM"]) is not None
+    )
 
 
 def deepseek_v4_images_on(vllm_config) -> bool:
@@ -470,7 +475,7 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
         return ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
 
     def matches(self, vllm_config) -> bool:
-        return is_deepseek_v4_config(vllm_config)
+        return is_atom_deepseek_v4_config(vllm_config)
 
     def sizing(self, vllm_config) -> V4ImageSizing:
         return v4_image_sizing(vllm_config)
