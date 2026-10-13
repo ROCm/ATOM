@@ -27,6 +27,7 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
+from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -268,6 +269,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if entry is not None and entry[0]() is seq:
                 continue
             if self._load_failed_seqs.get(sid) is seq:
+                continue
+            # Its lookup was consumed when it parked; a finished load moves it
+            # to the head before admission sets `offload_loaded`.
+            if getattr(seq, "status", None) == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            if resumes_offload_prefill(seq):
                 continue
             if self._lookup_len(seq) <= 0:
                 continue
@@ -611,6 +618,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
+            # The scheduler needs the physical load floor to publish the
+            # restored blocks' hashes before resuming suffix prefill.
+            seq.offload_load_start_tokens = hbm
             seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
             # req_id MUST be the raw seq.id (the type the scheduler compares
             # against in _update_waiting_for_remote_kv); str(seq.id) is only for

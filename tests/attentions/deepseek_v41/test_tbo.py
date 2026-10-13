@@ -820,7 +820,7 @@ def test_forward_does_not_repeat_request_admission(monkeypatch, dp_attention):
 def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     import threading
 
-    from atom.models.deepseek_v41.bounded_replay import replay_rows
+    from atom.models.deepseek_v41.bounded_replay import replayable
     from atom.utils.tbo import ubatching
 
     builder, metadata = make_parent("cpu")
@@ -847,11 +847,12 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
     )
     assert child.ubatch_slices is None
     width = child.attn_metadata.step.width
-    assert replay_rows(child, width) == builder.geometry.ring_slots
+    # without the worker context the child looks like a replayable prefill
+    assert replayable(child, width) is True
     monkeypatch.setitem(
         ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), ubatch_idx
     )
-    assert replay_rows(child, width) is None
+    assert replayable(child, width) is False
 
 
 def test_tbo_rejects_compacted_scheduler_rows_before_slicing():

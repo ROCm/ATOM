@@ -23,6 +23,33 @@ from atom.kv_transfer.disaggregation.base import (
 
 logger = logging.getLogger("atom")
 
+# Used when a non-empty kv_transfer_config omits "kv_connector".
+_DEFAULT_BACKEND = "moriio"
+
+# Backends with a remote peer. The rest of the registry is local storage.
+PD_TRANSFER_BACKENDS = frozenset({"moriio", "mooncake"})
+
+
+def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
+    """Name of the backend that will do P/D transfer, or ``None`` if none will.
+
+    Not the same as ``bool(kv_transfer_config)``: an aggregated node running
+    only the LMCache offload tier configures one too. ``multi`` is unwrapped,
+    since ``multi[mooncake + lmcache_offload]`` is a mooncake peer.
+    """
+    cfg = kv_transfer_config or {}
+    if not cfg:
+        return None
+
+    name = cfg.get("kv_connector", _DEFAULT_BACKEND)
+    if name == "multi":
+        for sub in cfg.get("connectors", []) or []:
+            sub_name = (sub or {}).get("kv_connector", _DEFAULT_BACKEND)
+            if sub_name in PD_TRANSFER_BACKENDS:
+                return sub_name
+        return None
+    return name if name in PD_TRANSFER_BACKENDS else None
+
 
 class KVConnectorFactory:
     """Registry + factory for KV connector backends.
@@ -254,6 +281,25 @@ class KVConnectorFactory:
         return False
 
     @classmethod
+    def kv_budget_reserve_bytes(cls, config: Any) -> int:
+        """GPU bytes the configured connectors allocate after the KV cache.
+
+        The model runner sizes the KV cache before any connector exists, so
+        each transport's worker class answers from its own config
+        (`KVConnectorBase.kv_budget_reserve_bytes`); a `multi` sums its subs.
+        """
+
+        total = 0
+        # An unparsable `multi` (None) reserves nothing: building it raises
+        # before any buffer is allocated.
+        for name, leaf_config in cls.leaf_connectors(config) or ():
+            entry = cls._registry[name]
+            mod = importlib.import_module(entry["worker_module"])
+            klass = getattr(mod, entry["worker_class"])
+            total += klass.kv_budget_reserve_bytes(leaf_config)
+        return total
+
+    @classmethod
     def create_connector(
         cls, config: Any, role: str = "worker"
     ) -> KVConnectorBase | KVConnectorSchedulerBase:
@@ -272,7 +318,7 @@ class KVConnectorFactory:
         """
         kv_cfg = getattr(config, "kv_transfer_config", {}) or {}
         backend_name = cls.canonical_name(
-            kv_cfg.get("kv_connector", "moriio"), path="kv_transfer_config"
+            kv_cfg.get("kv_connector", _DEFAULT_BACKEND), path="kv_transfer_config"
         )
 
         entry = cls._registry[backend_name]

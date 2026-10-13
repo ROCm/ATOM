@@ -1030,7 +1030,7 @@ jobs:
         run: |
           cat > Dockerfile.sglang-base <<EOF
           FROM ${SGLANG_BASE_IMAGE}
-          RUN pip install -U lm-eval[api]
+          RUN pip install -U "lm-eval[api]" "datasets==5.0.0"
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
           RUN pip show hf_transfer || true
