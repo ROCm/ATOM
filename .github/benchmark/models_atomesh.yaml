@@ -904,8 +904,17 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
               LMCACHE_CHUNK_SIZE: "1024"
               LMCACHE_NUMA_MODE: auto
+              ATOM_NUMA_BIND: "1"
+              ATOM_NUMA_NODE: "0,0,0,0,1,1,1,1"
+              ATOM_AUTO_NUMA_BIND: "0"
               OFFLOAD_PROFILE: "1"
               OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              # The TP8 cell's four decode passes per prefill. Under PP the
+              # interval counts decode microbatches and a full decode round is
+              # eight of them (ATOM_PP_DECODE_MICROBATCHES defaults to the
+              # stage count), so four rounds is 4 x 8.
+              ATOM_PREFILL_DECODE_INTERVAL: "32"
+              ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
 

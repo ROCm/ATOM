@@ -1017,7 +1017,7 @@ def _pp_engine_core_cls():
     return PPEngineCoreProc
 
 
-def _fake_head(batch):
+def _fake_head(batch, prefill_delayer=None):
     PPEngineCoreProc = _pp_engine_core_cls()
 
     head = SimpleNamespace(
@@ -1037,6 +1037,7 @@ def _fake_head(batch):
     )
     head.scheduler.schedule.side_effect = [(batch, {}), None]
     head.scheduler.take_rejected.return_value = None
+    head.scheduler.prefill_delayer = prefill_delayer
     head._advance_idle_kv_transfer = PPEngineCoreProc._advance_idle_kv_transfer.__get__(
         head
     )
@@ -1122,6 +1123,18 @@ def test_pp_head_forwards_normal_batch_with_meta():
     head.pp_transport.send_metadata.assert_called_once_with(batch)
     head.runner_mgr.call_func.assert_any_call("forward", batch, wait_out=True)
     head._dispatch_idle_offload_work.assert_called_once()  # Next schedule is None.
+
+
+@pytest.mark.parametrize("num_prefill,notified", [(1, True), (0, False)])
+def test_pp_head_reports_launched_prefill_to_delayer(num_prefill, notified):
+    """The head arms decode protection for prefill batches, not decode ones."""
+    batch = _fake_batch([7], None)
+    batch.total_seqs_num_prefill = num_prefill
+    batch.produces_output = lambda: False
+    delayer = MagicMock()
+    _fake_head(batch, prefill_delayer=delayer)
+
+    assert delayer.notify_prefill_executed.called is notified
 
 
 def test_pp_downstream_skips_forward_for_request_less_batch():
