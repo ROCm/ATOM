@@ -960,9 +960,7 @@ class Scheduler:
             else:
                 if probed_tokens >= budget:
                     break
-                cached_blocks = self.block_manager.can_allocate(
-                    seq, record=False, reuse_hashes=True
-                )
+                cached_blocks = self.block_manager.can_allocate(seq, record=False)
                 probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
@@ -1122,12 +1120,10 @@ class Scheduler:
                     seq, resume, hit=seq.replays_hit
                 )
             else:
-                # Runs on every tick with prefill work, holds included: keep
-                # the head's prompt-block hashes instead of rehashing its
-                # cached prefix each time.
-                cached_blocks = self.block_manager.can_allocate(
-                    seq, record=False, reuse_hashes=True
-                )
+                # Runs on every tick with prefill work, holds included; the
+                # head's prompt-block hashes come from its cached chain
+                # (`BlockManager._prompt_hashes`), not a rehash each time.
+                cached_blocks = self.block_manager.can_allocate(seq, record=False)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission
@@ -2989,7 +2985,6 @@ class Scheduler:
             seq,
             record=False,
             block_hashes=block_hashes,
-            reuse_hashes=self._local_prefill_coalescing,
         )
         return num_cached_blocks, block_hashes
 

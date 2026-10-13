@@ -343,6 +343,34 @@ class TestPrefixCaching:
         block_manager_prefix.allocate(s2, n)
         assert s2.num_cached_tokens == 4
 
+    def test_admission_hashes_each_prompt_block_once(
+        self, block_manager_prefix, seq_factory, monkeypatch
+    ):
+        bm = block_manager_prefix
+        s1 = seq_factory(list(range(1, 17)))
+        bm.allocate(s1)
+        bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
+        bm.deallocate(s1)
+
+        calls = []
+        real = BlockManager.compute_hash
+        monkeypatch.setattr(
+            BlockManager,
+            "compute_hash",
+            classmethod(lambda cls, t, p=-1: calls.append(1) or real(t, p)),
+        )
+        s2 = seq_factory(list(range(1, 17)) + [90, 91, 92, 93])
+        # The delayer's probe, the lookup-detach probe, its re-probe after the
+        # tier answer, and admission's probe, then the claim.
+        for _ in range(3):
+            bm.can_allocate(s2, record=False)
+        n = bm.can_allocate(s2, record=False)
+        bm.allocate(s2, n)
+        # Four probes and a claim over a 5-block prompt: the hit walk reaches
+        # block 4 (the last is never matched), each block hashed once.
+        assert n == 4
+        assert len(calls) == 4
+
     def test_prefix_cache_miss_different_tokens(
         self, block_manager_prefix, seq_factory
     ):

@@ -134,7 +134,9 @@ class BlockManager:
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
-        # Content hashes only: pool hits and resource fit are always rechecked.
+        # Each seq's chained prompt-block hashes, computed once and shared by
+        # every prefix walk of its admission (`_block_hash`). Content hashes
+        # only: pool hits and resource fit are always rechecked.
         # Weak keys keep this scheduler-side cache out of request serialization.
         self._prefill_probe_hashes: WeakKeyDictionary[
             Sequence, tuple[int, list[int]]
@@ -681,6 +683,39 @@ class BlockManager:
         """
         seq.replay_kv_load = False
 
+    def _prompt_hashes(self, seq: Sequence) -> list[int]:
+        """`seq`'s cached chain of prompt-block hashes, for `_block_hash`.
+
+        An admission walks the prompt's chain several times -- the delayer's
+        pending-work probe on every pass it waits (and the DP balancer's
+        chunk-cost estimate), the lookup-detach probe and its re-probe after
+        the tier answer, the fit probe, `allocate`'s claim -- and xxhash over a
+        186k-token prompt is ~9 ms of the scheduler thread each time, which
+        the GPU waits out. Prompt blocks never change, so the chain is
+        computed once. Keyed on `cache_seed` too, since a different seed is a
+        different chain.
+        """
+        seed = seq.cache_seed
+        cached = self._prefill_probe_hashes.get(seq)
+        if cached is None or cached[0] != seed:
+            cached = (seed, [])
+            self._prefill_probe_hashes[seq] = cached
+        return cached[1]
+
+    def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
+        """Chained hash of block `i` given block `i - 1`'s hash `prev`.
+
+        `chain` is `_prompt_hashes(seq)`, filled front to back: block `i` is
+        read from it when present, else computed and appended while it is
+        still a prompt block (those past the prompt can still change).
+        """
+        if i < len(chain):
+            return chain[i]
+        h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
+        if i == len(chain) and (i + 1) * self.hash_block_size <= seq.num_prompt_tokens:
+            chain.append(h)
+        return h
+
     def _gated_hit(
         self,
         seq: Sequence,
@@ -906,8 +941,9 @@ class BlockManager:
         """
         chain = list(block_hashes)
         h = chain[-1] if chain else seq.cache_seed
+        prompt = self._prompt_hashes(seq)
         for i in range(len(chain), blocks):
-            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            h = self._block_hash(seq, prompt, i, h)
             chain.append(h)
         return chain
 
@@ -924,7 +960,6 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
-        reuse_hashes: bool = False,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -966,23 +1001,13 @@ class BlockManager:
         # match). Record each block's hash for the SWA scan below.
         h = seq.cache_seed
         compressed_hit = 0
-        cached_hashes = None
-        if reuse_hashes:
-            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
-            if seed != h:
-                cached_hashes = []
-            self._prefill_probe_hashes[seq] = (h, cached_hashes)
-        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
+        prompt = self._prompt_hashes(seq)
         for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            if cached_hashes is not None and i < len(cached_hashes):
-                h = cached_hashes[i]
-            else:
-                h = self.compute_hash(token_ids, h)
-                if cached_hashes is not None and i < immutable_blocks:
-                    cached_hashes.append(h)
+            h = self._block_hash(seq, prompt, i, h)
             block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
+            if block_id == -1 or self.kv.block(block_id).token_ids != (
+                self._hash_block_tokens(seq, i)
+            ):
                 break
             block_hashes.append(h)
             compressed_hit += 1
@@ -1096,9 +1121,9 @@ class BlockManager:
         )
         h = seq.cache_seed
         hit_hash = -1
+        prompt = self._prompt_hashes(seq)
         for i in range(claim_blocks):
-            token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = self._block_hash(seq, prompt, i, h)
             block_id = self.kv.lookup(h)
             if block_id == -1:
                 # Evicted between `can_allocate` and here. For the widened joint
