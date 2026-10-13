@@ -1765,6 +1765,18 @@ jobs:
           print(json.dumps(cell, indent=2, sort_keys=True))
           PY
 
+      - name: Reconcile previous Mooncake C48 job
+        if: ${{ matrix.name == 'kimi-k3-mooncake-inferencex-c48' }}
+        run: python3 .github/scripts/atomesh/pd_mooncake_retry_guard.py
+
+      - name: Upload previous Mooncake job state
+        if: ${{ always() && matrix.name == 'kimi-k3-mooncake-inferencex-c48' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: atomesh-prior-slurm-7477-${{ github.run_id }}
+          path: atomesh-results/prior-slurm-7477.json
+          if-no-files-found: error
+
       - name: Run Slurm benchmark cell
         env:
           # Build the reviewed source in a separate setup container. Use the
