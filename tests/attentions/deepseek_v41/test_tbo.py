@@ -460,6 +460,64 @@ def test_real_tbo_workers_share_one_uva_prefetch_and_keep_cross_layer_state(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_microbatch_steps_are_freed_when_the_forward_returns(monkeypatch):
+    """Each microbatch's attention metadata, and so its step and every GPU
+    tensor memoized on it, is released when the forward returns -- not left
+    to Python's cycle collector, which runs on object counts and never sees
+    GPU memory. The TBO contexts point at each other (`partner`); holding
+    their forward contexts through that cycle leaked one step per forward
+    until the GPU ran out on long prefills."""
+    import gc
+    import weakref
+
+    from atom.utils.forward_context import get_forward_context
+    from atom.utils.tbo.ubatching import (
+        tbo_switch_to_compute_sync,
+        tbo_yield_and_switch_from_compute_to_comm,
+    )
+
+    builder, parent = make_parent("cuda", lengths=(9, 5))
+    seen = []
+
+    class Model(torch.nn.Module):
+        def forward(self, ids, positions, inputs_embeds=None):
+            seen.append(weakref.ref(get_forward_context().attn_metadata))
+            tbo_yield_and_switch_from_compute_to_comm()
+            out = ids.float()[:, None].clone()
+            tbo_switch_to_compute_sync()
+            return out
+
+    wrapper = UBatchWrapper(Model(), builder)
+    ids = torch.arange(14, device="cuda", dtype=torch.int32)
+    ctx = ForwardContext(
+        attn_metadata=parent,
+        no_compile_layers={},
+        kv_cache_data={},
+        context=Context(
+            positions=parent.step.positions,
+            is_prefill=True,
+            scheduled_bs=2,
+            running_bs=2,
+            scheduled_tokens=14,
+            running_tokens=14,
+        ),
+        ubatch_slices=_split_prefill_token_midpoint(2, [9, 5], 2, None),
+    )
+    monkeypatch.setattr(_forward_context_local, "ctx", ctx, raising=False)
+    gc.collect()
+    gc.disable()
+    try:
+        wrapper(ids, parent.step.positions)
+        torch.cuda.synchronize()
+        assert len(seen) == 2
+        assert all(
+            ref() is None for ref in seen
+        ), "microbatch metadata outlived the forward"
+    finally:
+        gc.enable()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 def test_microbatch_failing_on_the_comm_stream_still_fences_buffer_reuse(
     monkeypatch,
 ):

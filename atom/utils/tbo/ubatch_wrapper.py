@@ -200,6 +200,10 @@ class UBatchWrapper(nn.Module):
                     # and re-raises errors[idx].
                     logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
                     errors[idx] = e
+                finally:
+                    # The worker thread outlives the forward; do not let its
+                    # thread-local context keep this microbatch's step alive.
+                    _forward_context_local.ctx = None
 
             return _job
 
@@ -229,6 +233,16 @@ class UBatchWrapper(nn.Module):
                 for i in range(N):
                     self._worker_job_done[i].wait()
         finally:
+            # The contexts point at each other (`partner`), a cycle that
+            # outlives the forward until Python's cycle collector runs, and
+            # each holds its microbatch's ForwardContext -- the attention
+            # metadata and every GPU tensor the step memoized. The collector
+            # runs on object counts and never sees that memory, so those
+            # steps piled up until the GPU ran out. Break the cycle here, with
+            # every worker done.
+            for tbo_ctx in tbo_ctxs:
+                tbo_ctx.partner = None
+                tbo_ctx.forward_context = None
             # Order everything the workers left on the comm stream before any
             # later work on the compute stream. A comm section normally rejoins
             # (`switch_to_compute_sync`), but one that raised did not, and the
