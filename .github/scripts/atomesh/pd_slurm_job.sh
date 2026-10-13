@@ -136,53 +136,9 @@ PY
 }
 
 pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
-
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-  else
-    echo "no running containers"
-  fi
-  set -e
-}
-
-# The image ships every tuned FlyDSL kernel AOT-compiled under
-# /app/aiter-test/aiter/jit/flydsl_cache, but as root-only (0600) files the
-# --user container cannot read. Without them each new prefill M bucket compiles
-# at runtime and stalls the engine for 8-60 s. Extract them once per node, uid
-# and image (~90 MB, ~2 s); FlyDSL's per-key file locks make the directory safe
-# to share between workers and jobs. Prints the directory, or nothing on failure.
-prepare_flydsl_aot_cache() {
-  [[ "${ATOMESH_FLYDSL_AOT:-1}" == "1" ]] || return 0
-  local image_id root dir
-  image_id="$(docker image inspect --format '{{.Id}}' "${DOCKER_IMAGE}" 2>/dev/null)" || return 0
-  image_id="${image_id#sha256:}"
-  [[ -n "${image_id}" ]] || return 0
-  root="${ATOMESH_FLYDSL_AOT_ROOT:-${TMPDIR:-/tmp}/atomesh-flydsl-aot-$(id -u)}"
-  dir="${root}/${image_id:0:16}"
-  mkdir -p "${root}" 2>/dev/null || return 0
-  (
-    flock -w 600 9 || exit 1
-    [[ -f "${dir}/.complete" ]] && exit 0
-    tmp="$(mktemp -d "${root}/.extract.XXXXXX")" || exit 1
-    # shellcheck disable=SC2016
-    if docker run --rm --user 0 --entrypoint /bin/bash "${DOCKER_IMAGE}" -c '
-        d="$(python3 -c "import importlib.util as u, os; s = u.find_spec(\"aiter\"); print(os.path.join(os.path.dirname(s.origin), \"jit\", \"flydsl_cache\"))")" \
-          && [ -d "$d" ] && tar -C "$d" -cf - .' | tar -xf - -C "${tmp}"; then
-      rm -rf "${dir}"
-      mv "${tmp}" "${dir}" && touch "${dir}/.complete"
-    else
-      rm -rf "${tmp}"
-      exit 1
-    fi
-  ) 9>"${root}/.lock" >&2 || return 0
-  echo "${dir}"
+  echo "=== pre-cleanup: explicitly selected previous jobs on $(hostname) ==="
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_cleanup.py" \
+    --job-ids "${ATOMESH_CLEANUP_JOB_IDS:-}" --current-job-id "${JOB_ID}"
 }
 
 run_container_rank() {
@@ -247,14 +203,6 @@ EOF
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
     docker pull "${DOCKER_IMAGE}"
-  fi
-
-  local flydsl_aot_dir
-  flydsl_aot_dir="$(prepare_flydsl_aot_cache)"
-  if [[ -n "${flydsl_aot_dir}" ]]; then
-    echo "[flydsl-aot] rank=${rank} shared cache ${flydsl_aot_dir}"
-  else
-    echo "[flydsl-aot] rank=${rank} no shared cache; workers fall back to copying or runtime JIT"
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
@@ -362,12 +310,6 @@ EOF
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
   [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
-  if [[ -n "${flydsl_aot_dir}" ]]; then
-    docker_args+=(
-      -v "${flydsl_aot_dir}:/opt/atomesh/flydsl-aot"
-      -e ATOMESH_FLYDSL_AOT_DIR=/opt/atomesh/flydsl-aot
-    )
-  fi
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -438,7 +380,11 @@ run_spur_job() {
   echo "ips=${IPADDRS}"
   echo "run_dir=${RUN_DIR}"
 
-  pre_cleanup_local
+  pre_cleanup_local || {
+    local cleanup_rc=$?
+    publish_rank_rc "${node_rank}" "${cleanup_rc}"
+    return "${cleanup_rc}"
+  }
   write_env_file "${env_file}"
   if [[ "${node_rank}" -eq 0 ]]; then
     cat > "${RUN_DIR}/cell-metadata.json" <<EOF
@@ -533,31 +479,12 @@ SELECTED_NODES=("${ALLOC_NODES[@]:0:${NUM_NODES}}")
 SELECTED_NODELIST="$(IFS=,; echo "${SELECTED_NODES[*]}")"
 
 pre_cleanup_nodes() {
-  echo "=== pre-cleanup: stop all running containers ==="
+  echo "=== pre-cleanup: explicitly selected previous jobs ==="
   for node in "${SELECTED_NODES[@]}"; do
     echo "[pre-cleanup] node=${node}"
-    srun --nodes=1 --ntasks=1 --nodelist="${node}" bash -lc '
-      set +e
-      echo "host=$(hostname)"
-
-      running=()
-      while read -r id; do
-        [[ -n "${id}" ]] && running+=("${id}")
-      done < <(docker ps -q 2>/dev/null)
-
-      if [[ "${#running[@]}" -gt 0 ]]; then
-        echo "stopping running containers:"
-        docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-        docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-      else
-        echo "no running containers"
-      fi
-
-      sleep 2
-      if command -v rocm-smi >/dev/null 2>&1; then
-        rocm-smi --showmemuse 2>/dev/null || true
-      fi
-    ' || true
+    srun --nodes=1 --ntasks=1 --nodelist="${node}" \
+      python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_cleanup.py" \
+      --job-ids "${ATOMESH_CLEANUP_JOB_IDS:-}" --current-job-id "${JOB_ID}"
   done
   echo "=== pre-cleanup done ==="
 }
