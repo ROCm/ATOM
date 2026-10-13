@@ -171,6 +171,12 @@ def _release_manual_graphs(runner) -> bool:
     if graph_logits:
         graph_logits.clear()
         released = True
+    # A non-last PP stage holds each graph's outgoing activations, which pin
+    # the same pool.
+    graph_pp_outputs = getattr(runner, "graph_pp_outputs", None)
+    if graph_pp_outputs:
+        graph_pp_outputs.clear()
+        released = True
     return released
 
 
