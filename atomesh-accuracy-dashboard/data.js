@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791828635575,
+  "lastUpdate": 1791917175598,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3918,6 +3918,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8931,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38276632862 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610121516 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1903 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ZhangLirong",
+            "username": "ZhangLirong-amd",
+            "email": "lirzhang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "661ef7661eef0d804d2b52d81ed41d80aeaf9fdb",
+          "message": "fix(v4): FP4 decode bounds drop the DP-padded empty tail (#2556)\n\n#2543 publishes fixed-capacity FP4 row-group boundaries per token\nbucket and raised when cu_seqlens_q had more sequences than the bucket\nhas rows. Under DP attention that is a normal step: while a peer is\nprefilling, running_bs stays the group's batch but running_tokens is\nthis rank's own (ForwardMode.running_tokens is not unified), so an idle\nrank's one-row dummy decode carries running_bs+1 boundaries against a\none-row bucket. V4-Pro DEP accuracy failed on the first gsm8k requests\nwith 'FP4 sequence boundaries exceed the decode bucket' and the group\nhung.\n\nThose trailing sequences are padding published empty, and every\nnonempty sequence holds a row, so they fit the bucket: drop the empty\ntail. A nonempty sequence at or past the capacity still raises.\n\nTests: an idle rank's dummy against a 16-request peer and a decoding\nrank with fewer rows than the group's batch (both fail on main), plus\nthe rejection case.\n\nCo-authored-by: ZhangLirong <219599949+ZhangLirong-amd@users.noreply.github.com>",
+          "timestamp": "2026-10-13T14:30:56Z",
+          "url": "https://github.com/ROCm/ATOM/commit/661ef7661eef0d804d2b52d81ed41d80aeaf9fdb"
+        },
+        "date": 1791917173698,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9507,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38429714525 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610131505 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.956,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38429714525 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610131505 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.956 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.66,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38429714525 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610131505 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.956 | fewshot: 3 | Model: deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.97,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8992,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38429714525 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610131505 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1842 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
