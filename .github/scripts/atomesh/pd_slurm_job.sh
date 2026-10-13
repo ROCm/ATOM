@@ -23,6 +23,18 @@ JOB_ID="${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}"
 CURRENT_USER="$(id -un 2>/dev/null || id -u)"
 RUN_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
 
+# Host-network C48 routers must not all use the shared default HTTP port 8000.
+# Every rank derives the same endpoint from this allocation. This is not a
+# socket reservation: the sidecar checks below still reject a bind conflict.
+if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" && "${BACKEND:-}" == "vllm" ]]; then
+  if [[ ! "${JOB_ID}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: C48 router port selection requires a numeric Slurm job ID" >&2
+    exit 2
+  fi
+  export ROUTER_PORT=$((20000 + 10#${JOB_ID} % 10000))
+  echo "[router] allocation=${JOB_ID} base_http_port=${ROUTER_PORT}"
+fi
+
 mkdir -p "${RUN_DIR}"
 # Shared NFS: every Spur rank writes rank-rc-* here for GHA accounting fallback.
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
@@ -137,6 +149,18 @@ PY
 
 # vLLM workers self-register with vllm-router over ZMQ. The router ships in its
 # own image, so rank 0 runs it as a sidecar next to the serving container.
+vllm_router_running() {
+  local container="$1" log_file="$2" running
+  if running="$(timeout --kill-after=2s 10s docker inspect \
+      --format '{{.State.Running}}' "${container}")" && [[ "${running}" == "true" ]]; then
+    return 0
+  fi
+  echo "ERROR: router ${container} is not running or its state could not be read" >&2
+  timeout --kill-after=2s 10s docker inspect --format '{{json .State}}' "${container}" \
+    > "${log_file}.state.json" 2>&1 || true
+  return 1
+}
+
 start_vllm_router() {
   local container="$1"
   local log_file="$2"
@@ -164,6 +188,22 @@ start_vllm_router() {
     --decode-policy "${ROUTER_POLICY}" \
     --log-level info >/dev/null || return $?
   docker logs -f "${container}" > "${log_file}" 2>&1 &
+  # Detached docker run only acknowledges container creation. A different
+  # listener can answer HTTP after this router exits with AddrInUse, so check
+  # the owned sidecar on both sides of the HTTP probe. /health needs registered
+  # P/D workers; /liveness is usable before starting the model containers.
+  local deadline=$((SECONDS + 60))
+  while (( SECONDS < deadline )); do
+    vllm_router_running "${container}" "${log_file}" || return 1
+    if curl -sf --max-time 2 "http://127.0.0.1:${port}/liveness" >/dev/null; then
+      vllm_router_running "${container}" "${log_file}" || return 1
+      echo "[router] ${container} running with HTTP liveness on :${port}"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: router ${container} did not become live within 60s; see ${log_file}" >&2
+  return 1
 }
 
 peer_state() {
@@ -405,8 +445,14 @@ EOF
   local docker_pid=$!
   local peer_rc=1
   while kill -0 "${docker_pid}" 2>/dev/null; do
-    peer_state failed
-    peer_rc=$?
+    if [[ -n "${router_container}" ]] && ! vllm_router_running \
+        "${router_container}" "${rank_dir}/router${phase_suffix}.log"; then
+      echo "[router-failure] stopping this rank's ${container} after sidecar exit" >&2
+      peer_rc=2
+    else
+      peer_state failed
+      peer_rc=$?
+    fi
     if [[ "${peer_rc}" -ne 1 ]]; then
       echo "[peer-failure] stopping this rank's ${container}, checker_rc=${peer_rc}"
       timeout --kill-after=2s 12s docker rm -f "${container}" "${router_container}" \
