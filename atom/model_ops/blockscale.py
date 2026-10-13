@@ -35,7 +35,7 @@ def _get_aiter_fp8_gemm():
     try:
         if get_gfx() != "gfx950":
             return None
-    except Exception:
+    except RuntimeError:
         return None
     # The older same-named interface only supports FP32 128x128 scales.
     # The registered schema retains the signature hidden by torch_compile_guard.
@@ -120,15 +120,13 @@ def _activations_for_ocp_group32(x, x_scale):
         scale = (code << 23).view(torch.float32)
         flat = x.reshape(-1, x.shape[-1]).float()
         scale_f = scale.reshape(flat.shape[0], -1)
-        dequant = (
-            flat.reshape(flat.shape[0], -1, 32) * scale_f[:, :, None]
-        ).reshape(x.shape)
+        dequant = (flat.reshape(flat.shape[0], -1, 32) * scale_f[:, :, None]).reshape(
+            x.shape
+        )
         return quantize_fp8_ocp(dequant.to(torch.bfloat16))
     if x_scale is None and x.dtype in (torch.bfloat16, torch.float16, torch.float32):
         return quantize_fp8_ocp(x)
-    raise ValueError(
-        f"Unsupported activation dtype for native group32 GEMM: {x.dtype}"
-    )
+    raise ValueError(f"Unsupported activation dtype for native group32 GEMM: {x.dtype}")
 
 
 def _e8m0_codes_to_float(scale: torch.Tensor) -> torch.Tensor:
@@ -165,7 +163,7 @@ def _use_group32_bf16_fallback() -> bool:
         from aiter.jit.utils.chip_info import get_gfx
 
         return get_gfx() != "gfx950"
-    except Exception:
+    except (ImportError, RuntimeError):
         return True
 
 

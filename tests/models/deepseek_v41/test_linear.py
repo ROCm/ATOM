@@ -76,15 +76,21 @@ def test_native_fp8_group32_accepts_e4m3fnuz(linear_modules):
     )
     qc = SimpleNamespace(get_layer_quant_config=lambda _: spec, online_quant=False)
     module = linear.MergedColumnParallelLinear(
-        5120, [2304, 2304], quant_config=qc, prefix="layers.0.ffn.shared_experts.gate_up_proj"
+        5120,
+        [2304, 2304],
+        quant_config=qc,
+        prefix="layers.0.ffn.shared_experts.gate_up_proj",
     )
     assert module.native_a8_group_rows == 32
     assert module.weight.shape == (1152, 5120)
     assert module.weight_scale.shape == (36, 160)
     # One disk shard (w1) is 72 scale rows; TP4 rank 3 keeps rows 54:72.
-    scales = torch.arange(72 * 160, dtype=torch.int32).remainder(120).to(
-        torch.float8_e8m0fnu
-    ).reshape(72, 160)
+    scales = (
+        torch.arange(72 * 160, dtype=torch.int32)
+        .remainder(120)
+        .to(torch.float8_e8m0fnu)
+        .reshape(72, 160)
+    )
     module.weight_loader(module.weight_scale, scales, 0)
     assert torch.equal(
         module.weight_scale[:18].view(torch.uint8),

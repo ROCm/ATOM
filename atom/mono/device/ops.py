@@ -380,7 +380,7 @@ def _has_bf16_mfma_k32() -> bool:
             from aiter.jit.utils.chip_info import get_gfx
 
             _HAS_BF16_MFMA_K32 = not str(get_gfx()).startswith("gfx942")
-        except Exception:
+        except (ImportError, RuntimeError):
             _HAS_BF16_MFMA_K32 = True
     return _HAS_BF16_MFMA_K32
 

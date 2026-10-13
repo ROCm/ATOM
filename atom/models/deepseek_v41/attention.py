@@ -324,7 +324,7 @@ class Attention(nn.Module):
             from aiter.jit.utils.chip_info import get_gfx
 
             use_aiter_bmm = get_gfx() == "gfx950"
-        except Exception:
+        except (ImportError, RuntimeError):
             use_aiter_bmm = False
         if use_aiter_bmm:
             y = batched_gemm_a8w8_mxscale_bpreshuffle(
