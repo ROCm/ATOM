@@ -794,6 +794,7 @@ class _SpecWorld:
         G._decode_plan.update(out.atom_image_decode_candidates)
         G.store_decode_keeps(self.worker, ids, starts, fresh)
         lens = [sched[r] for r in ids]
+        self.last_rows = {r: (starts[i], lens[i]) for i, r in enumerate(ids)}
         G.record_decode_candidates(self.worker, ids, slots, starts, lens, BLOCK, "t")
         for i in fresh:
             if starts[i] > 0:
@@ -1052,3 +1053,60 @@ def test_mtp_follow_up_hits_a_decode_keep_and_a_preempted_request_resumes(
     assert world.checked > 0 and not world.published
     kept_b = [end for kind, rid, end in st.events if kind == "hash" and rid == "b"]
     assert [p for p in kept_b if p > decode_a[0] + 512], kept_b
+
+
+def test_align_under_spec_decode_keeps_the_running_block_at_end_over_block_minus_one(
+    adapter, tmp_path, monkeypatch
+):
+    """vLLM's Mamba align bookkeeping for the image groups under MTP k=1: no
+    speculative blocks (an image is not a running state), no lookahead
+    allocation, the running block at column ``end // block - 1`` of the
+    scheduled (optimistic) end, which also holds every boundary a step can
+    commit to; vLLM's accepted-column copy moves nothing."""
+    layer_spec = G.PagedStateImageLayer("x", 0, PAGE, adapter).get_kv_cache_spec(None)
+    assert layer_spec.num_speculative_blocks == 0
+    assert layer_spec.mamba_cache_mode == "align"
+    s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=True, num_blocks=96)
+    st = s._atom_state_images
+    mgrs = [st.coordinator.single_type_managers[g] for g in st.image_gids]
+    assert all(m.num_speculative_blocks == 0 for m in mgrs)
+    assert all(m.mamba_cache_mode == "align" for m in mgrs)
+    world = _SpecWorld(s, lambda rid, j: j % 3 != 1, monkeypatch)
+    req = _request(s, "c", [7, 8], max_tokens=1400)
+    checked = 0
+    boundaries = set()
+    for _ in range(5000):
+        if "c" not in s.requests:
+            break
+        world.schedule()
+        out = world.q[-1][0]
+        threshold = out.atom_image_decode_candidates.get("c")
+        if threshold is not None:
+            end = int(req.num_computed_tokens)  # scheduled end, all drafts accepted
+            start, n = world.last_rows["c"]  # the worker's exact start
+            for m in mgrs:
+                blocks = m.req_to_blocks["c"]
+                # No lookahead blocks; the running block is the last one,
+                # which is column end // block - 1 whenever end is aligned.
+                assert len(blocks) == -(-end // BLOCK)
+                assert not blocks[-1].is_null
+                # Every boundary this step can commit to keeps its block.
+                for b in range((start // BLOCK + 1) * BLOCK, start + n + 1, BLOCK):
+                    if b >= threshold:
+                        assert not blocks[b // BLOCK - 1].is_null, (b, start, n, end)
+                        boundaries.add(b)
+            checked += 1
+        if len(world.q) >= 2:
+            world.land()
+    world.drain()
+    assert checked > 500 and len(boundaries) >= 2, (checked, boundaries)
+    # vLLM's pre/post copy of the accepted column (preprocess_mamba /
+    # postprocess_mamba) goes through the image layers' copy function.
+    from vllm.model_executor.layers.mamba.mamba_utils import MambaCopySpec
+
+    state = torch.zeros(8, PAGE, dtype=torch.uint8)
+    (copy,) = G.image_state_copy_funcs()
+    for accepted in (1, 2):
+        spec = copy(state, [3, 5], 1, accepted)
+        assert isinstance(spec, MambaCopySpec) and spec.num_elements == 0
+        assert spec.start_addr == state[5].data_ptr()
