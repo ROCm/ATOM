@@ -1,12 +1,16 @@
-"""What V4.1 does to ``cudagraph_mode``, and why it is PIECEWISE and not FULL.
+"""What V4.1 does to ``cudagraph_mode``.
 
-The interesting case is not "graphs on": it is that the mode must land on
-PIECEWISE *exactly*. ``eager_break_during_capture`` skips the break when the
-forward context reports a FULL runtime mode, so a mode carrying FULL would
-record V4.1's per-step Engram and state work into the graph and never run it
-again -- a frozen cursor, every replayed step re-answering the first, with
-nothing raised. A test that only asserted "not NONE" would pass on the one
-setting that is silently wrong.
+The interesting case is not "graphs on": it is which modes survive the gate
+and in what form. These tests keep FULL-bearing modes rather than forcing
+PIECEWISE -- a serving run captures both (47 FULL and 110 PIECEWISE on TP4
+with DSpark) -- so the thing being pinned is that an explicit NONE is left
+alone, and that the two opt-in flags are both required.
+
+Worth knowing while reading them: ``eager_break_during_capture`` returns the
+function unwrapped under a FULL runtime mode, so there is no break there.
+The bridge accounts for that rather than avoiding FULL -- it joins Engram's
+fork immediately on that path instead of leaving it open across layers
+(``_v41_join_covers_the_layers``).
 """
 
 import pytest

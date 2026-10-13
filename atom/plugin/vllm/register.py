@@ -90,6 +90,34 @@ class MiniMaxM3Config(PretrainedConfig):
             setattr(text_config, name, value)
 
 
+class DeepseekV41TextConfig(PretrainedConfig):
+    """The ``text_config`` block, as a class that survives serialization.
+
+    ``model_type`` has to be a *class* attribute: ``PretrainedConfig.to_dict``
+    ends with ``output["model_type"] = self.__class__.model_type``, so an
+    instance attribute is overwritten by the base class's ``""`` on the way
+    out. That is what made vLLM's resolved config unnormalizable, which is
+    what made ``--hf-overrides`` unreachable for V4.1 -- the bridge read the
+    checkpoint off disk instead, and the override was never in that file.
+
+    Naming the type also makes ``transformers`` run its RoPE back-compat on
+    this class, which logs once per config load:
+
+        DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set
+        it as attribute.
+
+    Cosmetic -- ``rope_scaling`` arrives intact, and the normalized config is
+    byte-identical either way. Declaring ``rope_parameters`` on the class is
+    what the message asks for and what ``configuration_utils.py``'s
+    ``hasattr`` test reads, but it does not silence this; the construction
+    that warns is not the one this shim makes, and chasing it was not worth
+    more than the three attempts it got. Left as noise rather than papered
+    over with a change that does not do what its comment would claim.
+    """
+
+    model_type = "deepseek_v41_text"
+
+
 def _text_config_from_dict(values: dict) -> PretrainedConfig:
     """Build a text config out of a checkpoint's nested ``text_config`` block.
 
@@ -102,7 +130,7 @@ def _text_config_from_dict(values: dict) -> PretrainedConfig:
     ``ModelConfig``. Setting the fields afterwards standardizes RoPE off a
     fully populated object.
     """
-    config = PretrainedConfig()
+    config = DeepseekV41TextConfig()
     for name, value in values.items():
         setattr(config, name, value)
     return config

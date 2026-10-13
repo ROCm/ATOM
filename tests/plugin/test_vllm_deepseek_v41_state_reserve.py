@@ -102,9 +102,22 @@ class TestReserveArithmetic:
         assert "--max-num-seqs" in message
 
     def test_exactly_one_max_length_request_still_admits(self):
-        config = _kv_cache_config(64, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+        """32 PAGEs of history plus the null block vLLM keeps: 33.
+
+        This asserted 32 and passed, which is the off-by-one itself --
+        `BlockPool` pops one block as its null placeholder, so 32 block ids
+        allocate 31, and an 8191-token prompt needs 32.
+        """
+        config = _kv_cache_config(65, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
         _reserve_state_tail([config], 32, _vllm_config(max_model_len=8192))
-        assert config.num_blocks == 32
+        assert config.num_blocks == 33
+
+    def test_one_page_short_of_that_is_refused(self):
+        """The boundary from the other side: 32 left is one too few, and the
+        old check accepted exactly this."""
+        config = _kv_cache_config(64, [ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+        with pytest.raises(ValueError, match="null block"):
+            _reserve_state_tail([config], 32, _vllm_config(max_model_len=8192))
 
 
 def _recorder():
@@ -271,3 +284,93 @@ class TestLocalHitCapInstallSite:
                 f"register_model must install {installer}; the platform hook "
                 "is not guaranteed to run"
             )
+
+
+class TestHfOverridesAreRefused:
+    """`--hf-overrides` cannot reach ATOM's V4.1 schema, so it is refused.
+
+    Measured through vLLM's own `ModelConfig`, which is what a worker gets:
+    the resolved config carries `text_config=None` and no `vision_config`,
+    and `normalize_hf_config` is built from exactly those two. So the bridge
+    reads the checkpoint, and an override applied to vLLM's object is not in
+    that file. Refusing says so; the alternative is a server that starts and
+    answers as though the flag had not been passed.
+    """
+
+    @staticmethod
+    def _config(overrides):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV41ForCausalLM"],
+                hf_overrides=overrides,
+                model="/models/DeepSeek-V4.1-Flash",
+            ),
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            speculative_config=None,
+            kv_transfer_config=None,
+        )
+
+    def test_an_override_is_refused_by_name(self):
+        from atom.plugin.vllm.platform import _refuse_v41_hf_overrides
+
+        with pytest.raises(ValueError, match="hf-overrides"):
+            _refuse_v41_hf_overrides(
+                self._config({"text_config": {"rms_norm_eps": 1e-5}})
+            )
+
+    def test_no_override_passes(self):
+        from atom.plugin.vllm.platform import _refuse_v41_hf_overrides
+
+        for empty in (None, {}, ()):
+            _refuse_v41_hf_overrides(self._config(empty))
+
+
+class TestDsparkDraftKvDtype:
+    """DSpark must name its draft's KV dtype, and is told so by name.
+
+    vLLM's V4.1 draft attention takes only a packed `*_ds_mla` layout. Given
+    `auto` it resolves to `fp8_ds_mla` and writes that back onto whatever
+    `cache_config` it was handed -- the target's, unless the speculative
+    config overrode it for the draft alone. ATOM has no fp8 V4.1 pool, so the
+    run then died naming a dtype the operator never typed, two layers from
+    the flag that fixes it. Reported by a sibling session that hit exactly
+    this while trying to measure something else.
+    """
+
+    @staticmethod
+    def _config(spec_kv):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV41ForCausalLM"], hf_overrides=None
+            ),
+            speculative_config=SimpleNamespace(method="dspark", kv_cache_dtype=spec_kv),
+        )
+
+    def test_a_dspark_config_without_one_is_refused_by_flag_name(self):
+        from atom.plugin.vllm.platform import _require_v41_draft_kv_cache_dtype
+
+        with pytest.raises(ValueError, match="kv_cache_dtype") as excinfo:
+            _require_v41_draft_kv_cache_dtype(self._config(None))
+        message = str(excinfo.value)
+        # Actionable: the flag, the value, and that the target's is separate.
+        assert "--speculative-config" in message
+        assert "fp8_ds_mla" in message
+        assert "--kv-cache-dtype" in message
+
+    def test_naming_it_passes(self):
+        from atom.plugin.vllm.platform import _require_v41_draft_kv_cache_dtype
+
+        _require_v41_draft_kv_cache_dtype(self._config("fp8_ds_mla"))
+
+    def test_no_speculation_is_unaffected(self):
+        from types import SimpleNamespace
+
+        from atom.plugin.vllm.platform import _require_v41_draft_kv_cache_dtype
+
+        _require_v41_draft_kv_cache_dtype(
+            SimpleNamespace(speculative_config=None, model_config=None)
+        )

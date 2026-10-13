@@ -27,8 +27,8 @@ fixed acceptance length 3.51.
 | DSpark speculation and accepted-prefix state commit | Fixed-width lifecycle supported at level 0; [quality and throughput acceptance remain incomplete](../docs/deepseek_v41_dspark.md#current-limitations) |
 | Candidate-only indexing, Engram residency and fusion | Partial: Engram UVA/overlap and fusions exist. Visibility-sized scratch, candidate-only Reindex and HBM residency remain |
 | Fused decode (mono) for DSpark verify steps of up to 12 rows and their draft backbone | On by default (`ATOM_MONO_ENABLE`) but currently refused: its MoE kernel still runs MXFP4 activations; see [Fused decode](#fused-decode-mono) |
-| Optional CED decoder replay | Not started |
-| Optional encoder replay with a persistent global cache | Not started |
+| Decoder SWA bounded replay (the decoder on each prompt's last window rows) | On by default (`--no-decoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
+| Encoder SWA bounded replay (no state checkpoints; a hit rebuilds one PAGE) | On by default (`--no-encoder-swa-bounded-replay`); see [the runtime guide](../docs/deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
 | TP4 with routed experts sharded across TP instead of whole-expert EP | Supported; relative throughput is workload-dependent |
 | TP2 no EP | GPU benchmark completed at level 3 FULL; see the [AgentX recipe](DeepSeek-V4.1-Flash-Agentic.md) for commands and measured points |
 | Other TP sizes | Configuration tests cover TP1/2/4/8 and dimension divisibility; this does not establish GPU or quality validation for TP1/8. TP8 does not start: AITER's FP8 blockscale GEMM runs no K = 288 (the shared expert's down projection) |

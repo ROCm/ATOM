@@ -95,10 +95,21 @@ def is_deepseek_v41_vllm_config(vllm_config) -> bool:
 def v41_text_config(vllm_config):
     """The normalized V4.1 text config, from the checkpoint.
 
-    Not ``vllm_config.model_config.hf_config``: that is the AutoConfig shim
-    vLLM built, which carries the fields vLLM reads and not the normalized
-    field set ``build_attention_topology`` / ``V41PoolGeometry`` need.
-    ``atom.config.get_hf_config`` is the single authority for that
+    Not ``vllm_config.model_config.hf_config``, and this was measured rather
+    than assumed. Going through vLLM's own ``ModelConfig`` -- which is what a
+    worker gets -- leaves the shim carrying ``text_config=None`` and no
+    ``vision_config`` at all: vLLM rebuilds it for the fields it reads and
+    does not preserve the nested blocks. ``normalize_hf_config`` needs both,
+    so the resolved object cannot be normalized, whatever is done to the
+    shim's serialization. (Direct ``AutoConfig.from_pretrained`` does keep
+    them, which is why this looks workable until a worker starts.)
+
+    The consequence is that ``--hf-overrides`` cannot reach ATOM's schema on
+    this path. It is refused at startup rather than dropped --
+    ``enforce_deepseek_v41_constraints`` -- so an operator who passes one is
+    told, instead of being served a model that quietly ignores it.
+
+    ``atom.config.get_hf_config`` is the single authority for the
     normalization, and the runtime model is constructed from the same object.
     """
     from atom.config import get_hf_config
@@ -339,6 +350,16 @@ def _v41_capture_batch(snapshot, vllm_config, builder=None):
         req_ids=snapshot.req_ids,
         num_scheduled_tokens=query_lens,
         context_lens=context_lens,
+        # Neither is tracked on this path, and neither has a reader here.
+        # `is_final_chunk` feeds `step.request_finals`, whose only consumer is
+        # `bounded_replay`, which the model wrapper forces off for V4.1 on the
+        # plugin. `replaying` names the seqs whose forward starts below where
+        # they resumed, which needs restored state -- and prefix caching, KV
+        # connectors and bounded replay are all refused here, so nothing
+        # resumes. None and {} are what core reads as "this frontend does not
+        # track it", not placeholders.
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=slots,
         block_tables=block_tables,
         total_seqs_num=num_reqs,
@@ -1011,7 +1032,13 @@ def snapshot_v41_batch(common_attn_metadata):
 
     block_table_np = None
     req_ids = None
+    # The end position each request reaches this step, which is what decides
+    # how many PAGE columns are live. Computed here because the fallback copy
+    # below is sized from it; `ends` below is the same arithmetic kept in the
+    # order the batch protocol documents.
+    ends_preview = (num_computed + query_lens).astype(np.int64)
     if input_batch is not None:
+<<<<<<< HEAD
         # Two acquisitions, two `try`s, because they fail independently and
         # only one of them matters. `req_ids` is the slot key; losing it means
         # slots are keyed on first-block ids, which works for everything inside
@@ -1057,8 +1084,40 @@ def snapshot_v41_batch(common_attn_metadata):
             # which is the wrong output this check exists to name. It has to
             # reach the caller.
             _check_row_alignment(input_batch, num_computed, query_lens, num_reqs)
+=======
+        # Two separate acquisitions, because the two live on different
+        # runners. The V2 `InputBatch` has `req_ids` and no block table at
+        # all; reading both under one `try` meant its perfectly good request
+        # ids were thrown away with the failed block-table lookup, and slot
+        # keying silently fell back to first-block ids -- on the runner V4.1
+        # selects by default, so on every run.
+        try:
+            req_ids = list(input_batch.req_ids)[:num_reqs]
+        except Exception:  # noqa: BLE001
+            # The accessor is an ATOM patch over another engine's internals;
+            # absent is the caller's ordinary "fall back" case.
+            req_ids = None
+        host_table = getattr(input_batch, "block_table", None)
+        if host_table is not None:
+            try:
+                block_table_np = host_table[0].block_table.np
+            except Exception:  # noqa: BLE001
+                block_table_np = None
+        if req_ids is not None:
+            # Keyed on the ids above, so the orderings have to agree. A row
+            # divergence is not a missing accessor: it would key the state
+            # slot by one request and the position by another, which is wrong
+            # output rather than a crash, so it has to reach the caller.
+            _check_row_alignment(input_batch, num_computed, num_reqs)
+>>>>>>> origin/perzhang/dsv41-flash-vllm-plugin-nolmcache
     if block_table_np is None:
-        block_table_np = common_attn_metadata.block_table_tensor.cpu().numpy()
+        # Only the columns this step reads. The whole table was being copied
+        # and then sliced per request; its width is the pool's, not this
+        # step's, so the copy was paying for every PAGE a request could ever
+        # own rather than the ones it owns now.
+        widest = -(-int(max(ends_preview, default=0)) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
+        table = common_attn_metadata.block_table_tensor
+        block_table_np = table[:num_reqs, : max(widest, 1)].cpu().numpy()
 
     # `context_lens` in ATOM's batch protocol is the request's end position
     # after this step -- vLLM's `seq_lens`.
@@ -1583,6 +1642,16 @@ def _v41_scheduled_batch(snapshot, slot_allocator, slots=None):
         req_ids=snapshot.req_ids,
         num_scheduled_tokens=snapshot.query_lens,
         context_lens=snapshot.ends,
+        # Neither is tracked on this path, and neither has a reader here.
+        # `is_final_chunk` feeds `step.request_finals`, whose only consumer is
+        # `bounded_replay`, which the model wrapper forces off for V4.1 on the
+        # plugin. `replaying` names the seqs whose forward starts below where
+        # they resumed, which needs restored state -- and prefix caching, KV
+        # connectors and bounded replay are all refused here, so nothing
+        # resumes. None and {} are what core reads as "this frontend does not
+        # track it", not placeholders.
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=slots,
         block_tables=snapshot.block_rows,
         total_seqs_num=len(slots),
@@ -1621,6 +1690,10 @@ def _v41_dummy_batch(running_tokens, *, max_req_tokens, max_reqs):
         req_ids=tuple(range(num_reqs)),
         num_scheduled_tokens=lengths,
         context_lens=lengths,
+        # `_prepare` reads both before it reads `is_dummy_run`, so a dummy
+        # batch needs them present even though it uses neither.
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=(),
         block_tables=(),
         total_seqs_num=num_reqs,
@@ -1866,24 +1939,42 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
         return {"tentative": True, "max_q_len": width}
     lengths = [int(n) for n in batch.num_scheduled_tokens]
     ends = [int(n) for n in batch.context_lens]
-    rows = [(end - length, length) for end, length in zip(ends, lengths) if length]
+    drafts = _v41_scheduled_draft_counts(len(lengths))
+    if drafts is not None and not any(drafts):
+        # vLLM scheduled no drafts this step. Nothing to verify, whatever the
+        # rows look like.
+        return {}
+    rows = [
+        (end - length, length, 0 if drafts is None else int(drafts[i]))
+        for i, (end, length) in enumerate(zip(ends, lengths))
+        if length
+    ]
     if not rows:
         return {}
 
     # A tentative step is a verification step: every row is a draft block on
     # top of an existing prefix. A prefill row is neither -- it starts at
     # position 0 and is longer than a block -- and the cache refuses the mix.
-    # Such a step verifies nothing, so there is nothing to hold back from its
-    # cursor and the ordinary advance is right.
-    # A row carries a draft block only if it continues an existing prefix and
-    # is wider than the single token a plain decode runs. A one-token decode
-    # row verifies nothing, so its cursor can advance the ordinary way.
+    #
+    # Which rows carry drafts is read from the scheduler, not inferred from
+    # their shape. The inference was `position > 0 and 1 < length <= spec+1`,
+    # and an ordinary chunked prefill satisfies it: a 4099-token prompt whose
+    # first chunk took 4096 comes back as position=4096, length=3, which is
+    # indistinguishable by shape from a 3-wide draft block and carries no
+    # drafts at all. Sharing that step with a newly admitted request then
+    # raised the mixed-step error below for a step that was never verifying
+    # anything -- and clearing draft lists in the scheduler could not help,
+    # because the positions and lengths it keyed on do not change.
     def _is_draft(row):
-        position, length = row
+        position, length, draft_count = row
+        if drafts is not None:
+            return draft_count > 0
+        # No per-request counts from this runner: fall back to the shape,
+        # which is what this had before the counts were available.
         return position > 0 and 1 < length <= speculative_tokens + 1
 
     def _fits_tentative(row):
-        position, length = row
+        position, length, _draft_count = row
         return position > 0 and length <= speculative_tokens + 1
 
     if not any(_is_draft(row) for row in rows):
@@ -1895,12 +1986,38 @@ def _v41_prepare_kwargs(builder, batch, synthetic):
         raise NotImplementedError(
             "DeepSeek-V4.1 on the vLLM plugin cannot verify a draft block in "
             "the same step as a prefill "
-            f"(rows position/length: {rows[:16]}, spec={speculative_tokens})"
+            f"(rows position/length/drafts: {rows[:16]}, "
+            f"spec={speculative_tokens})"
         )
     return {
         "tentative": True,
-        "max_q_len": max(length for _position, length in rows),
+        "max_q_len": max(length for _position, length, _drafts in rows),
     }
+
+
+def _v41_scheduled_draft_counts(num_rows):
+    """Per-request draft counts for this step, or None if unavailable.
+
+    vLLM's `InputBatch` carries `num_draft_tokens_per_req`, which is what the
+    scheduler actually scheduled rather than what the rows look like. None
+    when no batch is exposed, when this runner does not carry the field, or
+    when its length disagrees with the step -- in each case the caller falls
+    back to the shape rule rather than indexing into something that does not
+    describe these rows.
+    """
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
+
+    batch = get_current_input_batch()
+    if batch is None:
+        return None
+    per_req = getattr(batch, "num_draft_tokens_per_req", None)
+    if per_req is None:
+        # The field exists but is unset exactly when nothing was drafted, so
+        # a batch that carries the attribute still answers the question.
+        return [0] * num_rows if hasattr(batch, "num_draft_tokens_per_req") else None
+    if len(per_req) != num_rows:
+        return None
+    return per_req
 
 
 def v41_commit_speculative_state(anchors) -> bool:

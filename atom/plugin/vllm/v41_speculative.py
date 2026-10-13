@@ -132,10 +132,36 @@ def _is_v41_speculating(scheduler) -> bool:
     return any(str(arch) in _DEEPSEEK_V41_ARCHES for arch in arches)
 
 
+def _admission_is_possible(scheduler) -> bool:
+    """Whether this step could admit a waiting request at all.
+
+    A nonempty waiting queue is not proof that a prefill will be scheduled.
+    vLLM stops admitting at
+
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        if num_running >= self.max_num_active_reqs: break
+
+    so at the cap every running request decodes and nothing can join them,
+    however long the queue is. Clearing their drafts there buys nothing and
+    costs that step its speculation.
+
+    Only this one gate is read, not the token budget or per-request
+    eligibility: the cap is a plain comparison on state that is already
+    settled, while the rest is decided inside the scheduler as it goes. Where
+    this cannot tell, it says admission is possible, which keeps the drafts
+    cleared -- the side that was safe before.
+    """
+    cap = getattr(scheduler, "max_num_active_reqs", None)
+    if cap is None:
+        return True
+    streaming = getattr(scheduler, "num_waiting_for_streaming_input", 0) or 0
+    return len(scheduler.running) + streaming < cap
+
+
 def _would_mix_prefill_with_drafts(scheduler) -> bool:
     if not any(request.spec_token_ids for request in scheduler.running):
         return False
-    if scheduler.waiting:
+    if scheduler.waiting and _admission_is_possible(scheduler):
         return True
     # A running request can still be mid-prompt: chunked prefill keeps it in
     # `running` while it works through the rest of its tokens.
@@ -218,14 +244,26 @@ def patch_v41_speculative_commit() -> int:
         def postprocess_sampled(
             self,
             idx_mapping,
-            sampled_token_ids,
+            sampled_tokens,
             num_sampled,
             num_rejected,
-            query_start_loc,
+            query_start_loc=None,
             *args,
             _original=original,
             **kwargs,
         ):
+            """Upstream's signature, exactly, plus the V4.1 commit.
+
+            The names and the default are the interface, not a style: a
+            non-last pipeline rank calls this as
+            `postprocess_sampled(**get_prev_sampled_outputs(...))`, whose dict
+            is `sampled_tokens`/`num_sampled`/`num_rejected`/`idx_mapping` and
+            carries no `query_start_loc`. Renaming the first or requiring the
+            last makes that call fail at argument binding -- before any of the
+            code below runs, and for every plugin model using the V2 runner
+            with pipeline parallelism, speculating or not, because this patch
+            is installed globally.
+            """
             from atom.plugin.vllm.deepseek_v41_bridge import (
                 v41_commit_speculative_state,
                 v41_speculative_step_is_pending,
@@ -243,7 +281,7 @@ def patch_v41_speculative_commit() -> int:
                     )
 
                     batch = get_current_input_batch()
-                    starts = None if batch is None else batch.query_start_loc
+                    starts = getattr(batch, "query_start_loc", None)
                 if starts is None:
                     raise RuntimeError(
                         "V4.1 speculative step cannot be committed: vLLM gave "
@@ -251,14 +289,21 @@ def patch_v41_speculative_commit() -> int:
                     )
                 count = int(num_rejected.shape[0])
                 v41_commit_speculative_state(_anchors(num_rejected, starts, count))
+            # Forwarded by keyword, so a caller that omitted the optional
+            # argument reaches the original having omitted it too rather than
+            # being given a None this wrapper invented.
             return _original(
                 self,
                 idx_mapping,
-                sampled_token_ids,
+                sampled_tokens,
                 num_sampled,
                 num_rejected,
-                query_start_loc,
                 *args,
+                **(
+                    {}
+                    if query_start_loc is None
+                    else {"query_start_loc": query_start_loc}
+                ),
                 **kwargs,
             )
 

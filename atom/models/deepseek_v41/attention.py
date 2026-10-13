@@ -279,9 +279,11 @@ class Attention(nn.Module):
         """Every compression boundary in the batch, in one call.
 
         The cache owns where the main latent lands; what comes back is the
-        unrotated latent, which is all the index key needs.
+        unrotated latent, which is all the index key needs. A step without a
+        compress plan is some rows of a forward whose compression ran over
+        all of them (bounded replay): nothing to do.
         """
-        if not self.spec.ratio or self.compressor is None:
+        if not self.spec.ratio or self.compressor is None or not step.plans:
             return
         owner = self.spec.kv_owner
         values, scores = self.compressor.project(hidden)
@@ -378,25 +380,34 @@ class Attention(nn.Module):
         """
         return
 
-    def forward(self, hidden, hidden_scale, cache, step, rope):
+    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+        """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
+        layer is asked outputs for; KV is still every row's."""
         attn_out = self._attn_out_buffer(hidden)
-        rows = self._attend_block(attn_out, hidden, hidden_scale, cache, step, rope)
+        rows = self._attend_block(
+            attn_out, hidden, hidden_scale, cache, step, rope, queries
+        )
         return self._project_out(
-            rows if attn_out is None else attn_out, rope, cache.rope_positions(step)
+            rows if attn_out is None else attn_out,
+            rope,
+            cache.rope_positions(step) if queries is None else queries.positions,
         )
 
-    def _attend_block(self, attn_out, hidden, hidden_scale, cache, _step, rope):
+    def _attend_block(
+        self, attn_out, hidden, hidden_scale, cache, step, rope, queries=None
+    ):
         """Everything from the compressor fork to the attention rows.
 
-        Takes the cache, not the step. A frontend that breaks a capture here
-        (`atom.plugin.vllm.v41_core_overrides`) binds the break's arguments at
-        capture time and reruns no host code to rebind them, so a `step`
-        parameter would hold the step the graph was recorded with on every
-        later replay -- the warmup batch's lengths and
-        cursors, for the life of that graph. The cache outlives every step and
-        `begin_step` leaves the current one on it, so `cache.current_step` is
-        this step's. `_step` is kept in the signature for the native callers
-        that still pass it positionally, and deliberately unused.
+        Uses the `step` it is handed, and nothing else. An earlier version
+        took it from `cache.current_step` instead, to survive a capture that
+        binds this call's arguments once -- but that is a fact about one
+        frontend, and here it silently overrode the caller. Bounded replay
+        re-enters with a *tail* Step while the cache still holds the whole
+        forward's, so a 1024-token prefill with a 128-token window handed
+        attention 128 rows and a Step describing 1024. The frontend that
+        needs the substitution now makes it in its own wrapper
+        (`atom.plugin.vllm.v41_core_overrides`), inside the eager region, so
+        native keeps the Step its caller chose.
 
         The wide eager region, and wide on purpose. Upstream keeps a narrower
         one for Model Runner V2 and a wide one for V1, because V1's piecewise
@@ -413,39 +424,54 @@ class Attention(nn.Module):
         find it. Without one -- ATOM's own path, where nothing is decorated --
         it returns the rows and nothing is allocated or copied.
         """
-        step = getattr(cache, "current_step", None) or _step
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         selecting = self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
+        if queries is not None:
+            qr, qr_scale = queries.take(qr, qr_scale)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        return self._attend(attn_out, query, kv_normed, selecting, cache, step, rope)
+        return self._attend(
+            attn_out, query, kv_normed, selecting, cache, step, rope, queries
+        )
 
-    def _attend(self, attn_out, query, kv_normed, selecting, cache, step, rope):
-        """The sparse indexer's join and the MLA attention, into `attn_out`.
+    def _attend(
+        self, attn_out, query, kv_normed, selecting, cache, step, rope, queries=None
+    ):
+        """The sparse indexer's join and the MLA attention.
 
-        Writes and returns nothing. That is the contract a breakable-cudagraph
-        eager region is held to, and keeping it here -- rather than returning
-        the rows and letting `forward` place them -- is what lets this region
-        be marked without restructuring it again later.
+        With `attn_out` it writes there and returns None, which is the
+        contract a breakable-cudagraph eager region is held to. Without one --
+        ATOM's own path -- it returns the rows and allocates nothing. Keeping
+        the placement here, rather than returning rows and letting `forward`
+        put them away, is what lets this region be marked without
+        restructuring it again later.
         """
         # One launch for both rotations, the KV row's FP8 bytes and, where a
         # decode allows it, the window write. `window_kv` is what is left for
         # `write_window` below, which is nothing when that fold happened.
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step
-        )
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step
+            )
+            cache.rotate_query(query, rope, queries.positions)
         # A forked compressor is already inside this join, having been waited
         # at the scorer; where the scorer itself was not forked it waited on
         # the main stream instead and there is nothing left to join here.
         if selecting is not None:
             selecting.wait_stream(self.index_stream)
-        prefix, prefix_indptr, second, second_indptr = cache.attention_indices(
-            self.spec, step
+        prefix, prefix_indptr, second, second_indptr = (
+            cache.attention_indices(self.spec, step)
+            if queries is None
+            else queries.indices(cache, self.spec)
         )
         flat_query = query.flatten(0, 1)
         # None on ATOM's own path: nothing was allocated to land in, so the

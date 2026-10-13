@@ -4144,6 +4144,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         buf_prefix_ubatch: str = "",
         extra_write: int,
         defer_to=None,
+        write_from=None,
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -4200,6 +4201,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_bs=running_bs,
             max_q_len=max_q_len,
             extra_write=extra_write,
+            write_from=write_from,
         )
 
     def _populate_state_slot_mappings(

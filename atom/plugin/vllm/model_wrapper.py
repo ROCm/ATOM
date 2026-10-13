@@ -502,13 +502,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
-            # V4.1 keeps the hf_config it was built with: `normalize_hf_config`
-            # is what produces the flat text schema the runtime model, the pool
-            # geometry and the attention topology are all written against, and
-            # `Config.__post_init__` already ran the V4.1 runtime gate on it.
-            # vLLM's root config here is the AutoConfig shim registered in
-            # `atom.plugin.vllm.register`, which carries none of that.
-            if model_arch not in _DEEPSEEK_V41_ARCHES:
+            if model_arch in _DEEPSEEK_V41_ARCHES:
+                # V4.1 keeps the hf_config it was built with: the runtime
+                # model, the pool geometry and the attention topology are all
+                # written against `normalize_hf_config`'s flat schema, and
+                # vLLM's root config here is the AutoConfig shim, which by the
+                # time a worker sees it carries `text_config=None` and no
+                # `vision_config` -- so it cannot be normalized at all. See
+                # `v41_text_config`. `--hf-overrides` is refused at startup
+                # rather than silently dropped.
+                pass
+            else:
                 # root HF config so --hf-overrides survive without losing
                 # multimodal sub-configs such as Kimi-K2.5's
                 # vision_config/text_config.

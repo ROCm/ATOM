@@ -107,6 +107,76 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
 
+def _require_v41_draft_kv_cache_dtype(vllm_config) -> None:
+    """DSpark must name its own KV dtype, or it rewrites the target's.
+
+    vLLM drives the DSpark draft with its own DeepSeek-V4.1 attention, which
+    only accepts a packed `*_ds_mla` layout. Given `auto` it resolves to
+    `fp8_ds_mla` and *writes that back onto the `cache_config` it was handed*
+    (`vllm/models/deepseek_v41/attention.py`). Without a draft-level override
+    that config is the target's, so ATOM's own pool dtype silently becomes a
+    spelling it has no pool for, and the run dies later naming an
+    `fp8_ds_mla` the operator never typed.
+
+    `--speculative-config`'s `kv_cache_dtype` is applied to the draft's own
+    copy of the config (`_DRAFT_VLLM_CONFIG_OVERRIDES`), which is exactly the
+    separation this needs: the draft gets its packed layout, ATOM's target
+    pool stays bf16 or fp4.
+
+    Refused here, where the flag to add can be named, rather than left to
+    surface as a dtype mismatch two layers down.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return
+    if (getattr(spec, "method", None) or "").lower() != "dspark":
+        return
+    if getattr(spec, "kv_cache_dtype", None):
+        return
+    msg = (
+        "DeepSeek-V4.1 DSpark on the vLLM plugin needs its draft's KV dtype "
+        'named explicitly: add "kv_cache_dtype": "fp8_ds_mla" to '
+        "--speculative-config. vLLM's V4.1 draft attention takes only a "
+        "packed *_ds_mla layout, and without a draft-level override it "
+        "rewrites the target's cache_dtype to it -- which ATOM has no pool "
+        "for. The target's own --kv-cache-dtype stays auto/bfloat16/nvfp4."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
+def _refuse_v41_hf_overrides(vllm_config) -> None:
+    """Refuse `--hf-overrides`, which this path cannot honour.
+
+    ATOM's V4.1 schema comes from `normalize_hf_config`, which needs the
+    checkpoint's nested `text_config` and `vision_config`. vLLM's resolved
+    config does not carry them by the time a worker sees it -- measured
+    through `ModelConfig`: `text_config` is None and there is no
+    `vision_config` -- so there is nothing to normalize and the bridge reads
+    the file instead. An override applied to vLLM's object therefore never
+    reaches the model, the pool geometry or the attention topology.
+
+    Loud rather than silent, because the alternative is a server that starts,
+    serves, and answers as though the flag had not been passed. Lifting this
+    means getting the nested blocks through vLLM's own config path, not
+    changing anything here.
+    """
+    mc = getattr(vllm_config, "model_config", None)
+    overrides = getattr(mc, "hf_overrides", None)
+    if not overrides:
+        return
+    msg = (
+        "DeepSeek-V4.1 on the vLLM plugin does not support --hf-overrides "
+        f"({sorted(overrides) if isinstance(overrides, dict) else overrides}): "
+        "ATOM reads this model's config from the checkpoint, because vLLM's "
+        "resolved config does not carry the nested text_config/vision_config "
+        "its schema is built from. The override would be ignored rather than "
+        "applied. Edit the checkpoint's config.json instead."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
 def _refuse_unsupported_v41_speculation(vllm_config) -> None:
     """Admit DSpark, refuse every other speculative method.
 
@@ -176,32 +246,25 @@ _V41_EXPERIMENTAL_CUDAGRAPH_ENV = "ATOM_V41_EXPERIMENTAL_CUDAGRAPH"
 def _breakable_cudagraph_available() -> bool:
     """Whether to let V4.1 be captured. Off unless explicitly asked for.
 
-    Breakable capture removes the *stated* reason V4.1 ran eager: that reason
-    was that ATOM's plugin models are not fx-split, so vLLM's PIECEWISE mode
-    had nothing to split on, and breakable capture ends the stream capture at
-    runtime instead of splitting an fx graph. Everything that follows from
-    that is in place -- `v41_stage_step` carries the break, PIECEWISE passes
-    vLLM's three `AttentionCGSupport.NEVER` gates untouched (all three test
-    FULL), and the dummy-batch cache is reused rather than freed under the
-    recorded kernels.
+    Capture works, and this gate is about who turns it on rather than whether
+    it is correct. Three things make a V4.1 forward recordable, each needed:
+    the step's host work is staged outside the forward, attention runs in an
+    eager break writing through a caller-owned buffer (a fresh tensor would
+    change address on every replay), and Engram keeps its side stream with
+    the orderings in breaks. Measured on TP4, full GSM8K: 0.9303 +/- 0.0070
+    with DSpark and graphs, against 0.9295 +/- 0.0071 eager, 47 FULL and 110
+    PIECEWISE graphs captured.
 
-    It is still not enough, and this is measured, not assumed. With the above,
-    V4.1 captures and serves without raising -- and answers degenerate into
-    noise after the first few tokens. What stays behind is the attention
-    itself: its kernels are launched with per-step host values (the batch's
-    longest KV extent among them), which a capture freezes at the length it
-    happened to record while every decode step grows past it. The ordinary
-    remedy -- an eager break on the attention op, as vLLM does for
-    `unified_attention_with_output` -- does not apply as a decoration, because
-    V4.1's attention returns a fresh tensor and the decorator requires an
-    in-place output buffer; applying it anyway faults inside capture.
+    What this earlier said -- that the answers degenerate into noise and the
+    decorator cannot be applied because attention returns a fresh tensor --
+    described the branch before `_attn_out_buffer`, which is exactly the
+    buffer that was missing.
 
-    So capturing V4.1 needs attention-level work (a persistent per-layer
-    output buffer and a device-side length bound), not configuration. Until
-    then this returns False by default, so a vLLM that auto-enables
-    VLLM_USE_BREAKABLE_CUDAGRAPH cannot quietly turn V4.1's answers to noise.
-    Set ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 to pick that work back up; it is
-    wrong on purpose and is not a serving configuration.
+    Still default-off, and the reason is not doubt about the numbers: vLLM
+    auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH for some architectures, so
+    without a second condition of our own, a vLLM upgrade that adds V4.1 to
+    that list would change how this path runs with nothing in the log. Set
+    ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 to opt in.
     """
     if os.environ.get(_V41_EXPERIMENTAL_CUDAGRAPH_ENV, "") not in ("1", "true", "True"):
         return False
@@ -284,7 +347,9 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         logger.error(msg)
         raise ValueError(msg)
 
+    _refuse_v41_hf_overrides(vllm_config)
     _refuse_unsupported_v41_speculation(vllm_config)
+    _require_v41_draft_kv_cache_dtype(vllm_config)
 
     from vllm.config import CUDAGraphMode
 

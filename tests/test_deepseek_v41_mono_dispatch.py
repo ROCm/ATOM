@@ -69,6 +69,26 @@ def test_supported_deployment_has_no_refusal(native, tp):
     assert mono_config.config_refusal(_atom_config(tensor_parallel_size=tp)) is None
 
 
+def test_no_speculative_decoding_is_served(native):
+    config = _atom_config(speculative_config=None)
+    assert mono_config.config_refusal(config) is None
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 5, 7, 47])
+def test_any_verify_within_a_step_is_served(native, tokens):
+    spec = SimpleNamespace(method="dspark", num_speculative_tokens=tokens)
+    assert mono_config.config_refusal(_atom_config(speculative_config=spec)) is None
+
+
+@pytest.mark.parametrize(
+    "schedule, ragged", [(True, False), (True, True), (False, True)]
+)
+def test_per_request_verify_lengths_are_served(native, schedule, ragged):
+    # the target is routed by its rows, however they split into requests
+    dspark = SimpleNamespace(confidence_schedule=schedule, ragged=ragged)
+    assert mono_config.config_refusal(_atom_config(dspark=dspark)) is None
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [
@@ -92,28 +112,22 @@ def test_supported_deployment_has_no_refusal(native, tp):
         ),
         ({"kv_cache_dtype": "fp4"}, "kv cache"),
         ({"index_cache_dtype": "bf16"}, "index cache"),
-        ({"speculative_config": None}, "not DSpark"),
         (
             {
                 "speculative_config": SimpleNamespace(
                     method="mtp", num_speculative_tokens=5
                 )
             },
-            "not DSpark",
+            "speculative method mtp",
         ),
         (
             {
                 "speculative_config": SimpleNamespace(
-                    method="dspark", num_speculative_tokens=3
+                    method="dspark", num_speculative_tokens=48
                 )
             },
-            "speculative tokens",
+            "a verify of more than 48 rows",
         ),
-        (
-            {"dspark": SimpleNamespace(confidence_schedule=True, ragged=False)},
-            "confidence",
-        ),
-        ({"dspark": SimpleNamespace(confidence_schedule=False, ragged=True)}, "ragged"),
         (
             {"hf_config": SimpleNamespace(**{**_HF, "index_topk": 1024})},
             "attention keys",
@@ -169,6 +183,18 @@ def test_verify_step_is_routed(monkeypatch):
     assert dispatch.step_supported(torch.zeros(6, dtype=torch.int64), None)
 
 
+def test_plain_decode_step_is_routed(monkeypatch):
+    # no drafter: a token a request, not a tentative verify
+    _context(monkeypatch, tentative=False, requests=[object()] * 3, width=3)
+    assert dispatch.step_supported(torch.zeros(3, dtype=torch.int64), None)
+
+
+def test_ragged_verify_step_is_routed(monkeypatch):
+    # requests verifying 2, 4 and 1 + 5 tokens: 12 rows, split unevenly
+    _context(monkeypatch, requests=[object()] * 3, width=12)
+    assert dispatch.step_supported(torch.zeros(12, dtype=torch.int64), None)
+
+
 @pytest.mark.parametrize(
     "tokens, kwargs",
     [
@@ -177,7 +203,6 @@ def test_verify_step_is_routed(monkeypatch):
         (6, {"prefill": True}),
         (6, {"ubatch": object()}),
         (6, {"decode": False}),
-        (6, {"tentative": False}),
         (6, {"width": 12}),
     ],
 )

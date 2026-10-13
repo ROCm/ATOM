@@ -465,7 +465,7 @@ def transfer_stub(slot_regions):
         # Matches the absence of the FP4 keys in `transfer_args`; the dtype
         # cross-check now runs before Phase 2 and would reject the pair first.
         _fp4_index_layout=False,
-        _rdma_write_with_retry=lambda *a, **k: True,
+        _rdma_write=lambda *a, **k: True,
         _gather_slot=None,
         _staging_base_addr=0,
         _staging_slot_bytes=0,
