@@ -57,6 +57,74 @@ def _vcfg(max_num_seqs=4):
     )
 
 
+def _hook_vcfg(arch, ratios, *, prefix=True, spec=None):
+    vc = _vcfg()
+    vc.model_config.architectures = [arch]
+    vc.model_config.hf_config.compress_ratios = ratios
+    vc.model_config.hf_config.num_hidden_layers = len(ratios) - 1
+    vc.cache_config.enable_prefix_caching = prefix
+    vc.cache_config.mamba_cache_mode = "none"
+    vc.speculative_config = spec
+    vc.scheduler_config.long_prefill_token_threshold = 0
+    return vc
+
+
+def _through_hook(vc, specs):
+    from atom.plugin.vllm import paged_state_image as G
+    from atom.plugin.vllm.deepseek_v4_image import register_v4_image_adapter
+
+    register_v4_image_adapter()
+    sentinel, called = [object()], []
+
+    def original(vc_, specs_, mem):
+        called.append(specs_)
+        return sentinel
+
+    return G._kv_cache_configs_hook(original, vc, specs, [0]), sentinel, called
+
+
+@pytest.mark.parametrize("prefix", [True, False])
+def test_vllms_own_v41_is_left_to_vllm(prefix):
+    # vLLM's native V4.1: ratios 1 and 2 are not V4 pool geometry.
+    vc = _hook_vcfg("DeepseekV41ForCausalLM", [0, 1, 2, 4, 128, 0], prefix=prefix)
+    out, sentinel, called = _through_hook(vc, [{"model.layers.0.attn": object()}])
+    assert out is sentinel and len(called) == 1
+    assert vc.cache_config.mamba_cache_mode == "none"
+
+
+def test_v4_served_by_vllm_itself_is_left_to_vllm():
+    # Without the plugin's registration the registry resolves V4 to vLLM.
+    from atom.plugin.vllm.deepseek_v4_image import is_atom_deepseek_v4_config
+
+    vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=NS(num_speculative_tokens=1))
+    assert not is_atom_deepseek_v4_config(vc)
+    out, sentinel, called = _through_hook(vc, [{"model.layers.0.attn": object()}])
+    assert out is sentinel and len(called) == 1
+    assert vc.cache_config.mamba_cache_mode == "none"
+
+
+def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    from atom.plugin.vllm.deepseek_v4_image import is_atom_deepseek_v4_config
+
+    atom = NS(module_name="atom.plugin.vllm.model_wrapper", class_name="X")
+    monkeypatch.setitem(ModelRegistry.models, "DeepseekV4ForCausalLM", atom)
+    monkeypatch.setitem(ModelRegistry.models, "DeepseekV41ForCausalLM", atom)
+    assert is_atom_deepseek_v4_config(_hook_vcfg("DeepseekV4ForCausalLM", RATIOS))
+    assert not is_atom_deepseek_v4_config(_hook_vcfg("DeepseekV41ForCausalLM", RATIOS))
+    # ATOM's V4 without its proxy in the specs (e.g. a pooling / non-plugin path)
+    # is still not touched.
+    vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=NS(num_speculative_tokens=1))
+    out, sentinel, _ = _through_hook(vc, [{"model.layers.0.attn": object()}])
+    assert out is sentinel and vc.cache_config.mamba_cache_mode == "none"
+    # With the proxy: images on, MTP with prefix caching refused as before.
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+
+    with pytest.raises(ValueError, match="does not drive the MTP draft proxy"):
+        _through_hook(vc, [{ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME: object()}])
+
+
 def test_event_driven_slots_never_take_a_live_requests_slot():
     alloc = StateSlotAllocator(2, evict_lru=False)
     slots, reset = alloc.assign(["a", "b"], np.array([0, 256]))
