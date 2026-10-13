@@ -6,9 +6,24 @@ import json
 import os
 from pathlib import Path
 import platform
+import resource
 import shutil
 import socket
 import traceback
+
+
+def host_memory():
+    values = {}
+    for file, prefixes in (
+        ("/proc/meminfo", ("MemTotal:", "MemAvailable:", "Committed_AS:", "CommitLimit:")),
+        ("/proc/self/status", ("VmSize:", "VmRSS:", "VmLck:", "VmPin:", "Threads:")),
+    ):
+        for line in Path(file).read_text().splitlines():
+            if line.startswith(prefixes):
+                key, value = line.split(":", 1)
+                values[key] = value.strip()
+    values["memlock_limits"] = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    return values
 
 
 def trace_warmup(function):
@@ -33,6 +48,7 @@ def trace_warmup(function):
             "gpu": str(torch.cuda.get_device_properties(device)),
             "gpu_arch": torch.cuda.get_device_properties(device).gcnArchName,
             "memory_before": list(torch.cuda.mem_get_info(device)),
+            "host_memory_before": host_memory(),
             "environment": {
                 key: os.environ[key] for key in (
                     "TRITON_CACHE_DIR", "TRITON_LIBHIP_PATH", "TRITON_OVERRIDE_ARCH",
@@ -79,6 +95,7 @@ def trace_warmup(function):
             utils.load_binary = original
             try:
                 record["memory_after"] = list(torch.cuda.mem_get_info(device))
+                record["host_memory_after"] = host_memory()
                 paths = sorted({
                     line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines()
                     if any(name in line for name in (
