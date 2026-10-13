@@ -20,7 +20,7 @@
           "label": "DSpark5 DPA TP2 TBO AL3.51",
           "suffix": "-agentic-dspark5-dpa-tp2-tbo-al351",
           "extra_args": "-tp 2 --enable-dp-attention --enable-tbo prefill",
-          "env_vars": "HIP_VISIBLE_DEVICES=0,1\nATOM_TBO_PREFILL_TOKEN_SPLIT=1",
+          "env_vars": "HIP_VISIBLE_DEVICES=0,1\nATOM_TBO_PREFILL_TOKEN_SPLIT=1\nGPU_MAX_HW_QUEUES=5",
           "concurrency": [
             32,
             64,
