@@ -36,9 +36,10 @@ class StateSlotAllocator:
     under the same id, so the slot's accumulated state must be cleared on resume.
 
     Slots are reclaimed lazily on exhaustion by evicting the least-recently-seen
-    slot whose ``req_id`` is absent from the current step (its request finished
-    or was preempted). vLLM caps concurrency at ``num_slots`` (max_num_seqs), so
-    a request that is live this step never has its slot evicted.
+    slot whose ``req_id`` is absent from the current step and has no pending
+    reservation. vLLM's running-request limit does not include parked restores;
+    if the batch plus reservations exceeds capacity, assignment fails before
+    changing ownership rather than resetting another request's state.
     """
 
     def __init__(self, num_slots: int):
@@ -52,9 +53,7 @@ class StateSlotAllocator:
         # the last batch held. Together they are what a reservation may not
         # evict. `_key_to_slot` is NOT that set: a finished request's entry
         # stays in it until its slot is recycled, so treating every bound key
-        # as live makes the pool look full after `num_slots` requests and
-        # sends `_acquire` to its slot-0 fallback -- handing a live request's
-        # slot to a second tenant.
+        # as live would prevent stale slots from ever being recycled.
         self._reserved: set = set()
         self._last_active: set = set()
 
@@ -144,7 +143,6 @@ class StateSlotAllocator:
         ``req_keys`` is a per-request sequence of stable, hashable keys (the
         ``req_id`` strings), aligned with the batch rows.
         """
-        self._step += 1
         # Pull num_computed to a Python list in one C call (per-element
         # numpy-scalar -> int was the dominant cost of this per-decode-step
         # loop). req_keys is already a host-side list[str]. Local-bind the
@@ -158,6 +156,14 @@ class StateSlotAllocator:
         )
         n = len(keys)
         active = set(keys)
+        live = active | self._reserved
+        if len(live) > self.num_slots:
+            raise RuntimeError(
+                f"state slot capacity exceeded: {len(active)} active requests + "
+                f"{len(self._reserved - active)} unclaimed restores > "
+                f"{self.num_slots} slots"
+            )
+        self._step += 1
         key_to_slot = self._key_to_slot
         slot_to_key = self._slot_to_key
         last_seen = self._last_seen
@@ -173,7 +179,7 @@ class StateSlotAllocator:
                 # batch member puts two requests on one ring. They are not in
                 # `active` because their request has no batch row yet -- which
                 # is the whole reason reservations exist.
-                slot = self._acquire(active | self._reserved)
+                slot = self._acquire(live)
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
                 reset.add(slot)
@@ -190,12 +196,7 @@ class StateSlotAllocator:
         return np.asarray(slots, dtype=np.int32), reset
 
     def _acquire_unused(self, live: set):
-        """A slot no live tenant holds, or None. Never a fallback victim.
-
-        `_acquire`'s slot-0 fallback is correct for `assign`, where vLLM has
-        already guaranteed the batch fits. A reservation has no such
-        guarantee, so here "no room" has to be sayable.
-        """
+        """A slot no live tenant holds, or None without changing ownership."""
         if self._free:
             return self._free.pop()
         victim, victim_seen = None, None
@@ -212,23 +213,8 @@ class StateSlotAllocator:
         self._slot_to_key[victim] = None
         return victim
 
-    def _acquire(self, active: set) -> int:
-        if self._free:
-            return self._free.pop()
-        victim = -1
-        victim_seen = None
-        for s in range(self.num_slots):
-            if self._slot_to_key[s] in active:
-                continue
-            if victim_seen is None or self._last_seen[s] < victim_seen:
-                victim = s
-                victim_seen = self._last_seen[s]
-        # A negative victim means every slot belongs to a request active this
-        # step, which needs concurrency above num_slots and vLLM forbids it.
-        # Slot 0 rather than a crash.
-        victim = max(victim, 0)
-        old = self._slot_to_key[victim]
-        if old is not None:
-            self._key_to_slot.pop(old, None)
-        self._slot_to_key[victim] = None
-        return victim
+    def _acquire(self, live: set) -> int:
+        slot = self._acquire_unused(live)
+        if slot is None:
+            raise RuntimeError("state slot capacity exhausted: no evictable slot")
+        return slot

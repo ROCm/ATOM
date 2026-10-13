@@ -69,6 +69,8 @@ def _adapter(monkeypatch, dcp=1, *, block_size=BLOCK, chunk_size=CHUNK):
     adapter._requests = {}
     adapter._attn_group_id = 0
     adapter._kda_planner = None
+    adapter._v41_planner = None
+    adapter._state_load_failure_reports = {}
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}

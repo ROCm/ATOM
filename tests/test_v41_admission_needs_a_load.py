@@ -17,8 +17,6 @@ refused; never neither.
 from types import SimpleNamespace
 
 import pytest
-
-from atom.plugin.vllm.kv_transfer.kda_state import NULL_BLOCK_ID
 from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
 
 INTERVAL = 4096
@@ -38,9 +36,7 @@ def make_planner(**kw):
 
 
 def make_request(req_id="r0", nblocks=64):
-    return SimpleNamespace(
-        request_id=req_id, block_hashes=tuple(range(1, nblocks + 1))
-    )
+    return SimpleNamespace(request_id=req_id, block_hashes=tuple(range(1, nblocks + 1)))
 
 
 def test_a_refusal_is_a_load_that_cannot_resolve():
@@ -50,7 +46,7 @@ def test_a_refusal_is_a_load_that_cannot_resolve():
     planner.refuse_admission(request, (11, 12, 13))
     (load,) = planner.take_loads()
     assert load.req_id == "r0"
-    assert all(b <= NULL_BLOCK_ID for b in load.block_ids)
+    assert load.block_ids == (-1,)
     assert load.error_block_ids == (11, 12, 13)
     assert planner.stats()["admission_refused"] == 1
 
@@ -111,21 +107,11 @@ def test_every_admitted_boundary_either_loads_or_refuses(boundary):
 
 
 def test_speculation_and_this_connector_are_refused_together():
-    """Both are supported alone; the pair has never been run.
-
-    The plugin once refused every KV connector for V4.1, and separately every
-    speculative method. Both refusals were lifted independently -- DSpark is
-    admitted, and this connector is how V4.1 gets prefix caching at all -- so
-    the combination became reachable with nobody having measured it. Drafts
-    resize every registered plane and let a frontier move backwards, which is
-    precisely what the boundary machinery assumes cannot happen.
-    """
+    """The patched receive path still needs graph service validation."""
     import atom.plugin.vllm.kv_transfer.connector as conn
 
-    cfg = SimpleNamespace(
-        speculative_config=SimpleNamespace(num_speculative_tokens=3)
-    )
-    with pytest.raises(ValueError, match="works and is not yet trusted"):
+    cfg = SimpleNamespace(speculative_config=SimpleNamespace(num_speculative_tokens=3))
+    with pytest.raises(ValueError, match="experimental pending graph service"):
         conn._refuse_v41_speculation_with_offload(cfg)
 
 
@@ -142,9 +128,7 @@ def test_the_refusal_can_be_overridden_on_purpose():
 
     import atom.plugin.vllm.kv_transfer.connector as conn
 
-    cfg = SimpleNamespace(
-        speculative_config=SimpleNamespace(num_speculative_tokens=3)
-    )
+    cfg = SimpleNamespace(speculative_config=SimpleNamespace(num_speculative_tokens=3))
     os.environ["ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD"] = "1"
     try:
         conn._refuse_v41_speculation_with_offload(cfg)

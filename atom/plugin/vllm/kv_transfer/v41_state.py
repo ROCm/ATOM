@@ -49,7 +49,7 @@ import torch
 
 from atom.model_engine.state_offload import StateOffloadIndex
 
-from .kda_state import NULL_BLOCK_ID, KdaLoad, KdaStore, boundary_prefix_hash
+from .kda_state import KdaLoad, KdaStore, boundary_prefix_hash
 
 logger = logging.getLogger("atom")
 
@@ -93,6 +93,7 @@ def _images_can_serve() -> bool:
         return bool(images_can_serve())
     except Exception:
         return False
+
 
 # How many intervals `cap_hit` walks back before giving up. The same bound K3
 # uses: a hit far past every stored boundary is a cold tier, and descending
@@ -609,7 +610,10 @@ class V41BoundaryPlanner:
             # the caller and reads, from outside, exactly like a decline.
             logger.info(
                 "V4.1 cap_hit: req=%s hit=%d boundary=%d hashes=%d -> %d",
-                req_id, hit, boundary, len(block_hashes),
+                req_id,
+                hit,
+                boundary,
+                len(block_hashes),
                 0 if boundary <= 0 else min(hit, boundary),
             )
         if boundary <= 0:
@@ -984,7 +988,7 @@ class V41BoundaryPlanner:
             KdaLoad(
                 str(request.request_id),
                 0,
-                (NULL_BLOCK_ID,),
+                (-1,),  # slot zero is valid; only a negative slot refuses
                 tuple(error_block_ids),
             )
         )
@@ -1028,11 +1032,11 @@ class V41BoundaryPlanner:
     #: workload shorter than one interval produces its last line BEFORE the
     #: load and none during it -- which reads exactly like a load in which
     #: nothing happened. `ATOM_V41_STATS_INTERVAL=5` is for measuring.
-    _STATS_INTERVAL = float(
-        os.environ.get("ATOM_V41_STATS_INTERVAL", "") or 60.0
-    )
+    _STATS_INTERVAL = float(os.environ.get("ATOM_V41_STATS_INTERVAL", "") or 60.0)
 
-    def log_stats(self, *, interval_s: float | None = None, force: bool = False) -> None:
+    def log_stats(
+        self, *, interval_s: float | None = None, force: bool = False
+    ) -> None:
         """Say what this leg did, including when it did nothing.
 
         Unconditional, for the reason K3's counters exist: a run that produced

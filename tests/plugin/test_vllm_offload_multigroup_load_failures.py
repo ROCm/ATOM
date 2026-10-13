@@ -43,6 +43,7 @@ def _connector(groups, blocks=(), reqs=(), finished=((), ())):
     c._kda_error_reqs = set()
     c._abandoned_error_blocks = set()
     c._abandoned_loads = set()
+    c._pending_failed_recving = set()
     c.get_finished = lambda ids: finished
     return c
 
@@ -71,12 +72,12 @@ class TestMultiGroupMustUseTheRequestChannel:
         c = _connector(2, reqs={"r0"})
         assert c.get_transfer_results(set()).failed_recving == {"r0"}
 
-    def test_a_failed_request_is_not_also_reported_finished(self):
-        # vLLM would cache the external prefix of a request it sees in both.
+    def test_a_failed_request_is_also_reported_finished(self):
+        # vLLM waits for a completion quorum before releasing failed receives.
         c = _connector(2, reqs={"r0"}, finished=((), {"r0", "r1"}))
         res = c.get_transfer_results(set())
         assert res.failed_recving == {"r0"}
-        assert res.finished_recving == {"r1"}
+        assert res.finished_recving == {"r0", "r1"}
 
     def test_the_block_sets_are_drained_not_stashed(self):
         """Draining matters even though the answer is empty.
@@ -91,6 +92,45 @@ class TestMultiGroupMustUseTheRequestChannel:
         assert c.get_block_ids_with_load_errors() == set()
         c._kv_cache_config = _Cfg(1)
         assert c.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.parametrize("failed_ranks", [{0}, {0, 1, 2, 3}])
+@pytest.mark.parametrize("staggered", [False, True])
+def test_failed_receive_reaches_real_vllm_quorum(failed_ranks, staggered):
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    aggregator = KVOutputAggregator(expected_finished_count=4)
+    snapshots = range(4) if staggered else [None]
+    for step in snapshots:
+        outputs = []
+        for rank in range(4):
+            terminal = step is None or step == rank
+            c = _connector(
+                2,
+                reqs={"r0"} if terminal and rank in failed_ranks else (),
+                finished=((), {"r0"} if terminal else ()),
+            )
+            result = c.get_transfer_results(set())
+            outputs.append(
+                ModelRunnerOutput(
+                    req_ids=[],
+                    req_id_to_index={},
+                    kv_connector_output=KVConnectorOutput(
+                        finished_recving=result.finished_recving,
+                        failed_recving=result.failed_recving,
+                    ),
+                )
+            )
+        combined = aggregator.aggregate(outputs).kv_connector_output
+        if staggered and step < 3:
+            assert not combined.finished_recving
+            assert not combined.failed_recving
+        else:
+            assert combined.finished_recving == {"r0"}
+            assert combined.failed_recving == {"r0"}
+    assert aggregator._recv_remaining_count == {}
+    assert aggregator._failed_recving_pending == set()
 
 
 def test_vllm_still_refuses_block_ids_for_multiple_groups():
@@ -139,6 +179,7 @@ def test_a_worker_without_the_request_set_is_not_an_error():
     c._kv_cache_config = _Cfg(2)
     c._kda_error_reqs = set()
     c._abandoned_loads = set()
+    c._pending_failed_recving = set()
     c.get_finished = lambda ids: ({"s"}, {"r0"})
     res = c.get_transfer_results(set())
     assert res.failed_recving == set()

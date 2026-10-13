@@ -10,6 +10,9 @@ window ring with a KV prefix that claims otherwise. Nothing downstream checks
 it, so it is pinned here.
 """
 
+from copy import deepcopy
+
+import pytest
 from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
 
 
@@ -121,6 +124,30 @@ def test_assign_does_not_evict_a_reserved_slot():
     allocator.assign(["batch0"], [100])
     assert allocator.slot_for("parked") == parked
     assert allocator.slot_for("batch0") != parked
+
+
+@pytest.mark.parametrize("parked", [False, True])
+def test_an_overfull_batch_fails_before_changing_slot_ownership(parked):
+    allocator = StateSlotAllocator(2)
+    if parked:
+        assert allocator.reserve("parked") == 0
+    keys = ["cold0", "cold1"] if parked else ["cold0", "cold1", "cold2"]
+    before = deepcopy(vars(allocator))
+
+    with pytest.raises(RuntimeError, match="state slot capacity"):
+        allocator.assign(keys, [0] * len(keys))
+
+    assert vars(allocator) == before
+
+
+def test_a_claimed_reservation_counts_only_once_toward_capacity():
+    allocator = StateSlotAllocator(2)
+    parked = allocator.reserve("parked")
+    slots, reset = allocator.assign(["cold", "parked"], [0, 1280])
+    assert len(set(slots)) == 2
+    assert slots[1] == parked
+    assert parked not in reset
+    assert not allocator._reserved
 
 
 def test_a_claimed_reservation_stops_protecting_its_slot():

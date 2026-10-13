@@ -7,10 +7,12 @@ expects its own shape: `AttributeError: 'KdaStore' object has no attribute
 'req_id'` on the first request, on every rank, engine down.
 """
 
+from copy import copy
 from types import SimpleNamespace
 
+import pytest
 from atom.plugin.vllm.kv_transfer.connector import _without_v41_image_groups
-from atom.plugin.vllm.v41_state_image import expected_layer_names, sizing_from_geometry
+from atom.plugin.vllm.v41_state_image import expected_layer_names
 
 
 def _cfg(*layer_name_lists):
@@ -138,7 +140,7 @@ def test_the_scheduler_is_told_the_block_size_of_the_group_it_strides():
     blocks, chunk = 6, 256
     covered = blocks * c._scheduler.block_size
     assert covered == 1536
-    assert (min(1345, covered) // chunk) * chunk == 1280    # was 0
+    assert (min(1345, covered) // chunk) * chunk == 1280  # was 0
     assert blocks >= -(-1280 // c._scheduler.virtual_block_size)  # was False
 
 
@@ -168,6 +170,116 @@ def test_a_single_group_run_is_left_alone():
     assert c._scheduler.block_size == 256
 
 
+@pytest.mark.parametrize("backend", ["inproc", "mp"])
+@pytest.mark.parametrize("role_name", ["SCHEDULER", "WORKER"])
+@pytest.mark.parametrize("proxy_first", [False, True])
+@pytest.mark.parametrize("engine_block_size", [32, 256])
+@pytest.mark.parametrize("layout", ["v41-draft", "hybrid", "single"])
+def test_target_geometry_is_resolved_before_transport_construction(
+    monkeypatch, backend, role_name, proxy_first, engine_block_size, layout
+):
+    """Changing scheduler arithmetic after construction leaves MP keys stale.
+
+    Record the real PAGE namespace at the transport constructor boundary:
+    the worker publishes 256-token PAGE blocks, not the draft's global 32.
+    No transport is opened and no GPU is initialized.
+    """
+    import sys
+    from types import ModuleType
+
+    from atom.kv_transfer.offload.config import build_page_namespace
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+    from atom.plugin.vllm.kv_transfer import connector as mod
+
+    cls = mod.AtomLMCacheOffloadConnector
+    monkeypatch.setattr(mod.KVConnectorBase_V1, "__init__", lambda *a, **kw: None)
+    monkeypatch.setattr(cls, "_init_kda_planner", lambda *a: None)
+    monkeypatch.setattr(cls, "_init_v41_planner", lambda *a: None)
+    monkeypatch.setenv("ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD", "1")
+    patch = ModuleType("atom.plugin.vllm.kv_transfer.hybrid_invalid_blocks_patch")
+    patch.apply_vllm_hybrid_invalid_blocks_patch = lambda: None
+    monkeypatch.setitem(sys.modules, patch.__name__, patch)
+
+    captured = []
+    chunks = SimpleNamespace(chunk_size=256)
+
+    def transport(config):
+        captured.append(
+            (config.kv_cache_block_size, build_page_namespace(config, chunks, 4))
+        )
+        return SimpleNamespace(
+            block_size=config.kv_cache_block_size,
+            virtual_block_size=config.kv_cache_block_size,
+        )
+
+    for path, names in (
+        ("atom.kv_transfer.offload.mp.connector", ["LMCacheMPConnector"]),
+        ("atom.kv_transfer.offload.mp.scheduler", ["LMCacheMPConnectorScheduler"]),
+        (
+            "atom.kv_transfer.offload.dense.connector",
+            ["DenseOffloadConnector", "DenseOffloadScheduler"],
+        ),
+    ):
+        module = ModuleType(path)
+        for name in names:
+            setattr(module, name, transport)
+        monkeypatch.setitem(sys.modules, path, module)
+
+    cfg = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=engine_block_size, cache_dtype="auto"),
+        model_config=SimpleNamespace(
+            model="test-v41",
+            dtype="bfloat16",
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v41" if layout == "v41-draft" else "test"
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=4, world_size=4),
+        speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=5),
+        kv_transfer_config=SimpleNamespace(
+            kv_role="kv_both",
+            kv_connector_extra_config={"atom.offload.backend": backend},
+        ),
+    )
+    draft = SimpleNamespace(
+        layer_names=["draft.layers.0.self_attn"],
+        kv_cache_spec=SimpleNamespace(block_size=32),
+    )
+    proxy = SimpleNamespace(
+        layer_names=[ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME],
+        kv_cache_spec=SimpleNamespace(block_size=256),
+    )
+    groups = [proxy, draft] if proxy_first else [draft, proxy]
+    expected_group = 0 if proxy_first else 1
+    expected_block_size = 256
+    if layout == "hybrid":
+        # Exercise the non-V4.1 resolver without depending on MambaSpec's API.
+        monkeypatch.setattr(
+            mod,
+            "find_mamba_groups",
+            lambda _: [(1 - expected_group, draft.kv_cache_spec)],
+        )
+    elif layout == "single":
+        groups = [proxy]
+        proxy.kv_cache_spec.block_size = engine_block_size
+        expected_group = 0
+        expected_block_size = engine_block_size
+    c = cls(
+        cfg,
+        getattr(mod.KVConnectorRole, role_name),
+        SimpleNamespace(kv_cache_groups=groups),
+    )
+    registered = copy(c._config)
+    registered.kv_cache_block_size = expected_block_size
+    assert captured == [
+        (expected_block_size, build_page_namespace(registered, chunks, 4))
+    ]
+    assert c._config.kv_cache_block_size == expected_block_size
+    assert cfg.cache_config.block_size == engine_block_size
+    assert draft.kv_cache_spec.block_size == 32
+    assert c._attn_group_id == expected_group
 
 
 def test_the_reconcile_runs_after_the_scheduler_exists():

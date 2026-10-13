@@ -1,11 +1,9 @@
 """How the connector picks an offload transport, and what ``mp`` demands first.
 
-Both resolvers guard the same fact: LMCache's multiprocess registration
-addresses every KV cache group by paged block, so a hybrid model's per-slot
-recurrent state cannot ride along as one more group. Under ``mp`` it gets an
-LMCache engine and a host pool of its own, which is a second allocation the
-operator has to know about -- hence an option with no default rather than a
-sized-for-you pool.
+The MP transport can publish recurrent state with the PAGE object. An
+explicit ``own-pool`` transport instead allocates a separate per-rank host
+pool and therefore requires an explicit size. Merely choosing MP must not
+force that second allocation.
 
 Exercised unbound, off a stub, because everything either reads is the option
 bag and the mamba group list. Constructing a real connector would drag in a
@@ -17,11 +15,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-
 from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
 
 _resolve_backend = AtomLMCacheOffloadConnector._resolve_offload_backend
 _resolve_state_size = AtomLMCacheOffloadConnector._resolve_state_cpu_size_gb
+_resolve_state_transport = AtomLMCacheOffloadConnector._resolve_state_transport
 
 
 def _stub(*, mamba_groups=(), **options):
@@ -30,7 +28,7 @@ def _stub(*, mamba_groups=(), **options):
         _mamba_groups=list(mamba_groups),
         _state_cpu_size_gb=0.0,
     )
-    # Mirrors __init__'s order: the size is resolved first, and the backend
+    # Mirrors __init__'s order: the size is resolved first, and the transport
     # refusal reads the resolved value. Tests that feed a bad size call the
     # resolver directly, so a stub that cannot be built for them would hide
     # the very error they assert on.
@@ -65,11 +63,21 @@ def test_inproc_hybrid_needs_no_state_pool_size():
     assert _resolve_backend(stub) == "inproc"
 
 
-def test_mp_hybrid_without_a_state_pool_size_is_refused():
+def test_mp_hybrid_without_a_state_pool_uses_mp_state_transport():
     stub = _stub(mamba_groups=[(1, object())], **{"atom.offload.backend": "mp"})
 
+    assert _resolve_backend(stub) == "mp"
+    assert _resolve_state_transport(stub) == "mp"
+
+
+def test_explicit_own_pool_without_a_size_is_refused():
+    stub = _stub(
+        mamba_groups=[(1, object())],
+        **{"atom.offload.backend": "mp", "lmcache.mp.state_transport": "own-pool"},
+    )
+
     with pytest.raises(ValueError, match="lmcache.mp.state_cpu_size_gb"):
-        _resolve_backend(stub)
+        _resolve_state_transport(stub)
 
 
 def test_mp_hybrid_with_a_state_pool_size_is_allowed():
@@ -79,6 +87,20 @@ def test_mp_hybrid_with_a_state_pool_size_is_allowed():
     )
 
     assert _resolve_backend(stub) == "mp"
+    assert _resolve_state_transport(stub) == "own-pool"
+
+
+def test_explicit_mp_transport_overrides_legacy_pool_size():
+    stub = _stub(
+        mamba_groups=[(1, object())],
+        **{
+            "atom.offload.backend": "mp",
+            "lmcache.mp.state_cpu_size_gb": 8,
+            "lmcache.mp.state_transport": "mp",
+        },
+    )
+
+    assert _resolve_state_transport(stub) == "mp"
 
 
 def test_state_pool_size_defaults_to_zero_meaning_unset():

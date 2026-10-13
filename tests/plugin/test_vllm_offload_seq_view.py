@@ -155,6 +155,9 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
         _load_lifecycles={},
         _active_load_operations={},
         _load_failed_seqs={},
+        _lookup_defer_since={},
+        _lookup_client=None,
+        _save_retry_blocked={},
         _save_tracker={"r1": [view, 0]},
         _early_release=True,
         should_defer_free=lambda seq: False,
@@ -166,6 +169,10 @@ def test_view_accepts_the_frozen_placement_the_chunked_scheduler_writes():
     )
     scheduler._drop_finished_save_state = (
         ChunkedOffloadSchedulerBase._drop_finished_save_state.__get__(scheduler)
+    )
+    ChunkedOffloadSchedulerBase._init_tier_hit_memo(scheduler)
+    scheduler._forget_tier_hit = (
+        ChunkedOffloadSchedulerBase._forget_tier_hit.__get__(scheduler)
     )
 
     ChunkedOffloadSchedulerBase.request_finished(scheduler, view)
