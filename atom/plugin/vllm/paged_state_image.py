@@ -308,7 +308,10 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
     # anything else (e.g. vLLM's own implementation) keeps vLLM's allocator.
     if proxy_name is None or not any(proxy_name in s for s in kv_cache_specs):
         return original(vllm_config, kv_cache_specs, available_memory)
-    from atom.plugin.vllm.paged_state_image_scheduler import ImagePlacement
+    from atom.plugin.vllm.paged_state_image_scheduler import (
+        IMAGE_BLOCKS_PER_GROUP,
+        ImagePlacement,
+    )
 
     bs = adapter.block_size
     pc = images_on(adapter, vllm_config)
@@ -328,8 +331,9 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
     placement = (
         ImagePlacement.from_env(adapter.checkpoint_defaults(), bs) if pc else None
     )
-    # A request holds at most two images' blocks at once.
-    images_per_req = placement.images_per_request() if pc else 0
+    # A running request's peak: its KV blocks, and in each image group the
+    # running block plus the previous one, published or not.
+    image_blocks = IMAGE_BLOCKS_PER_GROUP * k if pc else 0
     for cfg in configs:
         if not any(proxy_name in g.layer_names for g in cfg.kv_cache_groups):
             continue
@@ -338,30 +342,32 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
             logger.info(
                 "ATOM %s image placement: state_checkpoint_interval_tokens=%d "
                 "state_checkpoint_demand=%s block_size=%d images_per_request=%d; "
-                "pool check: %d proxy blocks (max_model_len=%d) + %d x k=%d image blocks = %d",
+                "pool check: %d proxy blocks (max_model_len=%d) + %d x k=%d image "
+                "blocks + 1 null block = %d",
                 adapter.name,
                 placement.interval,
                 placement.demand,
                 bs,
-                images_per_req,
+                placement.images_per_request(),
                 per_req,
                 max_model_len,
-                images_per_req,
+                IMAGE_BLOCKS_PER_GROUP,
                 k,
-                per_req + images_per_req * k,
+                per_req + image_blocks + 1,
             )
         tensor_blocks = int(cfg.num_blocks)
         usable = sizing.usable_blocks(tensor_blocks)
-        need = per_req + images_per_req * k
+        # vLLM's block pool keeps one block (the null block) for good.
+        need = per_req + image_blocks + 1
         if usable < need:
-            images = f" + {images_per_req}x{k} image blocks" if pc else ""
+            images = f" + {IMAGE_BLOCKS_PER_GROUP}x{k} image blocks" if pc else ""
             raise ValueError(
                 f"{adapter.name} plugin pool too small: "
                 f"{tensor_blocks} blocks of {sizing.page_bytes} B, "
                 f"{tensor_blocks - usable} withheld for {sizing.num_slots} slots of "
                 f"{sizing.slot_bytes} B, {usable} left; one max_model_len="
                 f"{max_model_len} request needs {need} "
-                f"({per_req} KV blocks{images})"
+                f"({per_req} KV blocks{images} + 1 null block)"
             )
         cfg.num_blocks = usable
         logger.info(
