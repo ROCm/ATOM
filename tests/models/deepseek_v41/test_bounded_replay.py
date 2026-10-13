@@ -288,6 +288,7 @@ def _forward(lengths, **overrides):
         ({"ctx.is_dummy_run": True}, False),
         ({"ctx.is_draft": True}, False),
         ({"fwd.ubatch_slices": [object()]}, False),
+        ({"fwd.dp_metadata": object()}, False),  # unpadded DP still gathers
         ({"step.decode": True}, False),
         # image rows replay: the router reads its rows' slice of the mask
         ({"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, True),
