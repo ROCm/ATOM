@@ -56,6 +56,8 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8)):
     attach_ubatch_buffers(builder, 32)
     batch = SimpleNamespace(
         is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=[3, 1][: len(lengths)],
         req_ids=tuple(range(len(lengths))),
         num_scheduled_tokens=lengths,
@@ -239,6 +241,8 @@ def test_kv_release_keeps_persistent_ubatch_buffers_for_rebind(device):
     builder.cache = PagedAttentionCache(builder.geometry, 8, 4, device, max_tokens=32)
     batch = SimpleNamespace(
         is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=[3, 1],
         req_ids=(0, 1),
         num_scheduled_tokens=(10, 4),

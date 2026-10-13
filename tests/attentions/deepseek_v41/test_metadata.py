@@ -379,6 +379,8 @@ def test_idle_dp_rank_refreshes_captured_pool_metadata(
             tensor.fill_(123)
     batch = SimpleNamespace(
         is_dummy_run=True,
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=[],
         req_ids=(-1,),
         num_scheduled_tokens=(6,),
@@ -472,6 +474,8 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     )
     batch = SimpleNamespace(
         is_dummy_run=True,
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=[],
         req_ids=(-1,),
         num_scheduled_tokens=(6,),
@@ -524,6 +528,8 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     )
     batch = SimpleNamespace(
         is_dummy_run=False,
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=[0],
         req_ids=(17,),
         num_scheduled_tokens=(length,),

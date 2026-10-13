@@ -608,6 +608,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 else None
             ),
             engram_live=engram_live,
+            scheduled=scheduled,
+            replay_layout=(resumes, floors, cached_until, histories),
         )
 
     def _prepare_step(
@@ -625,7 +627,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         query_prefix_ready,
         query_prefix_republish_reason=None,
         engram_live=True,
+        scheduled=None,
+        replay_layout=(None, None, None, None),
     ):
+        """``replay_layout``: ``_replay_layout``'s (resumes, floors,
+        cached_until, histories) for a resumed prefill, else all None;
+        ``scheduled``, each span's batch index, is read with it."""
+        resumes, floors, cached_until, histories = replay_layout
         offset = sum(span.length for span in spans)
         groups = getattr(self.model_runner, "h2d_groups", None)
         combined = None if groups is None else groups.get("v41_metadata")
@@ -688,7 +696,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             cached_until=cached_until,
             finals=(
                 None
-                if batch.is_final_chunk is None or batch.is_dummy_run
+                if batch.is_final_chunk is None
+                or batch.is_dummy_run
+                or scheduled is None
                 else np.asarray(batch.is_final_chunk)[scheduled]
             ),
             start_histories=histories,

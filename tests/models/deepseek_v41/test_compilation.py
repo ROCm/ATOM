@@ -281,6 +281,8 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
     )
     batch = SimpleNamespace(
         is_dummy_run=True,
+        is_final_chunk=None,
+        replaying={},
         state_slots_committed=[],
         req_ids=(-1,),
         num_scheduled_tokens=(8,),
