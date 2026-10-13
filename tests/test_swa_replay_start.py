@@ -166,7 +166,7 @@ def test_a_backed_off_forward_places_checkpoints_from_where_it_resumed():
         block_manager=SimpleNamespace(checkpoint_cut=checkpoint_cut),
         _requires_atomic_prefill=lambda seq: False,
     )
-    seq = SimpleNamespace(replay_until=6784, state_fork_src=-1)
+    seq = SimpleNamespace(replay_until=6784, replays_hit=False, state_fork_src=-1)
     assert Scheduler._finalize_prefill_chunk(scheduler, seq, 6528, 272) == 272
     assert Scheduler._preview_prefill_chunk(scheduler, seq, 6528, 6784, 272) == 272
     assert calls == [(6784, 6800), (6784, 6800)]

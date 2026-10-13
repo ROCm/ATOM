@@ -21,7 +21,11 @@ from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.model_engine.scheduler import Scheduler, _scheduled_replay_until
+from atom.model_engine.scheduler import (
+    Scheduler,
+    _cut_floor,
+    _scheduled_replay_until,
+)
 from atom.model_engine.sequence import Replay, Sequence
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
@@ -113,6 +117,27 @@ def _engine_with_a_replayed_head(budget):
     seq = _seq(40)
     engine.add(seq)
     return engine, seq
+
+
+def _prefill_with_cuts(bm, seq):
+    """Prefill an allocated `seq` as the scheduler does: start at
+    `replay_start`, cut chunks where checkpoints go (`checkpoint_cut` above
+    `scheduler._cut_floor`), drain the state work after each forward. Returns
+    the cuts."""
+    _resume(bm, seq, hit=True)
+    cuts = []
+    while seq.num_cached_tokens < seq.num_prompt_tokens:
+        start = seq.num_cached_tokens
+        end = seq.num_prompt_tokens
+        floor = _cut_floor(seq, start, start)
+        if target := bm.checkpoint_cut(seq, floor, end):
+            end = target
+            cuts.append(target)
+        _forward(bm, seq, end)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        _resume(bm, seq, hit=False)
+    return cuts
 
 
 def _forward(bm, seq, end):
@@ -271,16 +296,19 @@ def test_off_the_gate_decides_as_before():
 
 
 def test_no_checkpoint_cut_inside_the_replay():
-    """The scheduler cuts no forward below where the seq resumed
-    (`checkpoint_cut` from `replay_until`), so an anchor inside it is skipped."""
+    """No forward is cut below the hit (`scheduler._cut_floor`): an anchor
+    inside the replay is skipped, one at the hit is taken."""
     bm = _bm()
     _prefill_and_finish(bm, _seq(32))
     seq = _seq(40)
     assert bm.allocate(seq, bm.can_allocate(seq))
     _resume(bm, seq, hit=True)
+    floor = _cut_floor(seq, seq.num_cached_tokens, seq.num_cached_tokens)
+    assert floor == 31
     seq.checkpoint_end_pos = 28
-    start = max(seq.num_cached_tokens, seq.replay_until)
-    assert bm.checkpoint_cut(seq, start, 40, record=False) not in (28, 32)
+    assert bm.checkpoint_cut(seq, floor, 40, record=False) != 28
+    seq.checkpoint_end_pos = 32
+    assert bm.checkpoint_cut(seq, floor, 40, record=False) == 32
 
 
 def test_a_readmission_decides_afresh():
@@ -295,10 +323,10 @@ def test_a_readmission_decides_afresh():
     assert not seq.replays_hit
 
 
-def test_a_replayed_hit_demands_no_checkpoint():
-    """A replay already reaches the hit the gates declined, and its forward is
-    cut only past it, so there is no demand to place: a later branch off the
-    same prefix replays again rather than resuming."""
+def test_a_replay_demands_a_checkpoint_at_its_hit():
+    """The replay keeps this admission's reuse; a checkpoint at the hit, where
+    the replay has rebuilt the state whole, keeps the next branch there from
+    paying the replay again."""
     bm = _bm(state_checkpoint_demand=True)
     # A branch: 32 tokens shared, then a tail of its own, so the first prompt's
     # own end anchors nothing a later prompt reaches.
@@ -308,24 +336,39 @@ def test_a_replayed_hit_demands_no_checkpoint():
     seq = _seq(40)
     assert bm.allocate(seq, bm.can_allocate(seq))
     assert seq.replays_hit
-    assert seq.checkpoint_demand_pos == 0
-    _resume(bm, seq, hit=True)
-    cuts = []
-    while seq.num_cached_tokens < seq.num_prompt_tokens:
-        start = seq.num_cached_tokens
-        end = seq.num_prompt_tokens
-        if target := bm.checkpoint_cut(seq, max(start, seq.replay_until), end):
-            end = target
-            cuts.append(target)
-        _forward(bm, seq, end)
-        bm.take_state_maintenance_ops()
-        bm.complete_previous_state_batch()
-        _resume(bm, seq, hit=False)
-    assert cuts == [36]  # the prompt-end anchor only
+    assert seq.checkpoint_demand_pos == 32
+    assert _prefill_with_cuts(bm, seq) == [32, 36]  # the demand, then the anchor
     bm.deallocate(seq)
     branch = Sequence(list(range(100, 132)) + [777] * 8, BLOCK, has_per_req_cache=True)
     assert bm.can_allocate(branch) == 8
-    assert branch.replays_hit
+    assert not branch.replays_hit
+
+
+def test_a_resent_prompt_replays_once():
+    """A prompt sent again whose checkpoint is gone: its hit is its own
+    prompt-end anchor, which the replay checkpoints, so the next copy
+    restores."""
+    bm = _bm()
+    _prefill_and_finish(bm, _seq(36))  # published, no checkpoint kept
+    first = _seq(36)
+    assert bm.allocate(first, bm.can_allocate(first))
+    assert first.replays_hit and first.checkpoint_end_pos == 32
+    assert _prefill_with_cuts(bm, first) == [32]
+    bm.deallocate(first)
+    again = _seq(36)
+    assert bm.can_allocate(again) == 8
+    assert not again.replays_hit
+
+
+def test_a_forward_ending_inside_the_replay_is_not_checkpointed():
+    bm = _bm()
+    _prefill_and_finish(bm, _seq(32))
+    seq = _seq(40)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    _resume(bm, seq, hit=True)
+    seq.checkpoint_end_pos = 28
+    _forward(bm, seq, 28)
+    assert seq.last_checkpoint_pos == 0
 
 
 def test_a_replay_wider_than_the_step_budget_is_admitted_and_spans_chunks():
@@ -385,3 +428,39 @@ def test_deallocate_clears_the_replay():
     _resume(bm, seq, hit=True)
     bm.deallocate(seq)
     assert seq.replay is None and not seq.replays_hit
+
+
+def test_a_separate_dspark_draft_model_turns_replay_off(monkeypatch):
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    spec = SimpleNamespace(method="dspark", use_dspark_with_draft=lambda: True)
+    assert state_replay_tokens(_config(speculative_config=spec)) == 0
+
+
+def test_a_continued_replay_counts_the_long_prefill_cap_from_its_hit():
+    """Its rows below the hit ride on top of the cap, as the first forward's
+    did, rather than eating into it."""
+    engine, seq = _engine_with_a_replayed_head(budget=4)
+    engine.long_prefill_token_threshold = 3
+    engine.max_num_batched_tokens = 64
+    seq.replay = Replay(32, True, (), 32 - REPLAY)
+    seq.num_cached_tokens = 28  # an earlier chunk ended inside the replay
+    chunk = Scheduler._partial_prefill_chunk(
+        engine, seq, 28, 28, 0, cap_from=max(28, seq.replay_until)
+    )
+    assert chunk == 32 + 3 - 28
+    assert Scheduler._partial_prefill_chunk(engine, seq, 28, 28, 0) == 3
+
+
+def test_a_replay_past_the_prompt_demands_nothing():
+    """A preempted seq re-prefilling what it generated replays a hit past its
+    prompt, where prefill keeps no checkpoint: no demand, so no cut."""
+    bm = _bm(state_checkpoint_demand=True)
+    _prefill_and_finish(bm, _seq(40))
+    bm.take_state_maintenance_ops()
+    bm.complete_previous_state_batch()
+    seq = _seq(40)
+    seq.num_prompt_tokens = 20  # 20 prompt tokens, 20 generated
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    assert seq.replays_hit
+    assert seq.checkpoint_demand_pos == 0
+    assert bm.demands_recorded == 0

@@ -456,6 +456,20 @@ class ScheduledBatch:
         return any(self.is_final_chunk)
 
 
+def _cut_floor(seq: Sequence, start: int, resume: int) -> int:
+    """Where a checkpoint cut of a forward from `start` must land above: where
+    the seq resumed (`resume`, or the `until` of the replay the forward
+    continues), since below it a forward recomputing cached rows
+    (`BlockManager.replay_start`) holds no state worth keeping. A DeepSeek-V4
+    bounded replay has rebuilt the state whole by that point, so a cut may land
+    right on it, and a later branch at the same hit restores from there instead
+    of replaying again."""
+    floor = max(start, resume, seq.replay_until)
+    if seq.replays_hit and floor > start:
+        floor -= 1
+    return floor
+
+
 def _scheduled_replay_until(batch, i: int) -> int:
     """Where batch entry `i`'s forward resumed if it started below that point
     (`ScheduledBatch.replaying`), as scheduled, 0 otherwise. Under pipeline
@@ -847,7 +861,13 @@ class Scheduler:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
-                chunk = self._partial_prefill_chunk(seq, start, resume, pending)
+                chunk = self._partial_prefill_chunk(
+                    seq,
+                    start,
+                    resume,
+                    pending,
+                    cap_from=max(resume, seq.replay_until),
+                )
                 if not chunk:
                     break
                 chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
@@ -1000,8 +1020,14 @@ class Scheduler:
                 if not seq.is_partial_prefill:
                     continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
-                if 0 < self.long_prefill_token_threshold < remaining:
-                    remaining = self.long_prefill_token_threshold
+                # A continued replay's rows below its `until` ride on top.
+                cap_from = max(seq.num_cached_tokens, seq.replay_until)
+                if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
+                    remaining = (
+                        self.long_prefill_token_threshold
+                        + cap_from
+                        - seq.num_cached_tokens
+                    )
                 k = min(remaining, token_cap - tokens)
                 if k <= 0:
                     return cost
@@ -1065,15 +1091,25 @@ class Scheduler:
             )
 
     def _partial_prefill_chunk(
-        self, seq: Sequence, start: int, resume: int, batched_tokens: int
+        self,
+        seq: Sequence,
+        start: int,
+        resume: int,
+        batched_tokens: int,
+        *,
+        cap_from: int | None = None,
     ) -> int:
         """The next chunk of a running prefill that resumes at `resume` and
         starts at `start`, or 0. A chunk ending at or below `resume` only
         recomputes rows the cache holds, and the next pass would back off the
-        same way again, forever: it waits for a step with room instead."""
+        same way again, forever: it waits for a step with room instead.
+        `cap_from`: where the long-prefill cap counts from, `resume` unless the
+        forward continues a bounded replay, whose rows below its `until` ride
+        on top as its first forward's did."""
+        cap_from = resume if cap_from is None else cap_from
         remaining = seq.num_tokens - start
-        if 0 < self.long_prefill_token_threshold < seq.num_tokens - resume:
-            remaining = self.long_prefill_token_threshold + resume - start
+        if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
+            remaining = self.long_prefill_token_threshold + cap_from - start
         chunk = self._chunked_prefill_size(
             remaining, self._prefill_room(batched_tokens, start), batched_tokens
         )
@@ -1086,11 +1122,8 @@ class Scheduler:
         # finalizes that decision after the delayer releases the batch.
         if self._requires_atomic_prefill(seq):
             return chunk
-        # The state starts at `resume`, a forward recomputing rows below it
-        # (`BlockManager.replay_start`) notwithstanding, or where the bounded
-        # replay it continues resumed (`Sequence.replay_until`).
         target = self.block_manager.checkpoint_cut(
-            seq, max(start, resume, seq.replay_until), start + chunk, record=False
+            seq, _cut_floor(seq, start, resume), start + chunk, record=False
         )
         return target - start if target else chunk
 
@@ -1862,7 +1895,11 @@ class Scheduler:
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
                 chunk = self._partial_prefill_chunk(
-                    seq, start, resume, num_batched_tokens
+                    seq,
+                    start,
+                    resume,
+                    num_batched_tokens,
+                    cap_from=max(resume, seq.replay_until),
                 )
                 if chunk:
                     self._resume_prefill(seq, start, hit=False)
@@ -2867,9 +2904,7 @@ class Scheduler:
         bm = self.block_manager
         if self._requires_atomic_prefill(seq):
             return chunk
-        # The state starts where the seq resumed, a forward recomputing rows
-        # below it (`Sequence.replay_until`) notwithstanding.
-        target = bm.checkpoint_cut(seq, max(start, seq.replay_until), start + chunk)
+        target = bm.checkpoint_cut(seq, _cut_floor(seq, start, start), start + chunk)
         if target:
             chunk = target - start
         # `cancel_state_fork` runs only when the first two hold, and returning

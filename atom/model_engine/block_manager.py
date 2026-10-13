@@ -1683,9 +1683,11 @@ class BlockManager:
         `replay_until`: where the forward resumed if it started below that
         point, as the batch was scheduled (`ScheduledBatch.replaying`). Nothing
         below it is published or checkpointed: those blocks are the hit's, and
-        a forward ending there leaves a replay's state still inexact. Left
-        unset it reads `seq.replay_until`, which under pipeline parallelism a
-        later chunk's scheduling may already have moved.
+        a forward ending below it leaves a replay's state still inexact. One
+        ending right at it publishes nothing either, but a DeepSeek-V4 bounded
+        replay has rebuilt the state whole there, so that may be checkpointed.
+        Left unset it reads `seq.replay_until`, which under pipeline
+        parallelism a later chunk's scheduling may already have moved.
         """
         if not self.enable_prefix_caching:
             return
@@ -1698,7 +1700,9 @@ class BlockManager:
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
         end = min(end, len(seq.block_table))
-        if start >= end:
+        if start >= end and not (
+            seq.replays_hit and until and base + num_new_tokens == until
+        ):
             return
         h = self._chain_parent_hash(seq, start)
         if h is None:
@@ -1906,10 +1910,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
-        # A replayed hit (`_replay_hit`) already reaches `wanted`, and its
-        # forward is cut only past the hit (`checkpoint_cut`'s callers start
-        # at `replay_until`): a demand there would be counted and never filled.
-        if seq.replays_hit:
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and its
+        # forward may be cut at the hit but nowhere below it
+        # (`scheduler._cut_floor`): a demand below would be counted and never
+        # filled, and so would one at a hit past the prompt (a preempted seq
+        # re-prefilling what it generated), where prefill keeps nothing. One
+        # at the hit keeps the next branch there from replaying.
+        hit_tokens = compressed_hit * self.hash_block_size
+        if seq.replays_hit and (demand < hit_tokens or demand >= seq.num_prompt_tokens):
             demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store

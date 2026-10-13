@@ -68,9 +68,12 @@ from atom.model_ops.v4_kernels.pool_index import (
 from atom.utils.decorators import mark_trace
 
 
-# `has_swa_floor` is a runtime switch, unspecialized: as a constexpr (or a
-# specialized int) the floored variant compiled on the first replay, mid-serving.
-@triton.jit(do_not_specialize=["has_swa_floor"])
+# The SWA floor is a runtime switch, and neither it nor its pointer is
+# specialized: as a constexpr (or a specialized int) the floored variant
+# compiled on the first replay, mid-serving, and so would a floor tensor whose
+# alignment differs from the pointer standing in for it without a replay (a
+# TBO ubatch's slice of the state slots).
+@triton.jit(do_not_specialize=["swa_floor_per_seq_ptr", "has_swa_floor"])
 def _v4_paged_prefill_indices_kernel(
     # Per-token inputs.
     positions_ptr,  # [T] int — global token position

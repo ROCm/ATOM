@@ -36,8 +36,8 @@ def state_replay_tokens(config) -> int:
 
     Off unless ATOM_DSV4_STATE_REPLAY is set, and only where the receptive
     field argument above holds and the V4 prefill can express it: the plain V4
-    trunk, compress ratios 4 / 128, no speculative method but MTP or DSpark,
-    and a single-rank prefill (context parallel splits the query axis the
+    trunk, compress ratios 4 / 128, no speculative method but MTP or the
+    model's own DSpark layers, and a single-rank prefill (context parallel splits the query axis the
     floors are indexed by). It replays a prefix-cache hit, so it also needs the
     prefix cache, and no KV connector: a connector load starts at
     `num_cached_tokens` and raises it when the load lands, and a replay moves
@@ -57,6 +57,11 @@ def state_replay_tokens(config) -> int:
         reason = "compress ratios other than 4 / 128"
     elif method not in ("", "mtp", "dspark"):
         reason = f"speculative method {method!r}"
+    elif getattr(spec, "use_dspark_with_draft", lambda: False)():
+        # A separate draft model keeps its own paged KV under the target's
+        # block ids, which a replay would rewrite inside the hit; and the one
+        # hop argument above is about DSpark layers reading the trunk.
+        reason = "a separate DSpark draft model (--draft-model)"
     elif (
         config.prefill_context_parallel_size > 1
         or config.decode_context_parallel_size > 1

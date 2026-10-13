@@ -143,12 +143,14 @@ class Replay(NamedTuple):
     state a backend derives from the preceding tokens (V4.1's Engram n-gram
     history, `Config.replay_history_tokens` of them), and where the replay's
     first forward started: a DeepSeek-V4 bounded replay may span forwards, and
-    no row below that start is in the state it rebuilds."""
+    no row below that start is in the state it rebuilds. `Scheduler.
+    _resume_prefill` always records it; 0 (no floor) is for a record built
+    elsewhere, which no V4 forward reads."""
 
     until: int
     rebuilds: bool
     history_ids: tuple[int, ...]
-    start: int
+    start: int = 0
 
 
 class SequenceStatus(Enum):
