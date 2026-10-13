@@ -11,7 +11,7 @@ Validated on CT2 + CT3 of the HeliosM rack below, 2026-10-10 and 10-11.
 
 | | |
 |---|---|
-| **GSM8K**, 5-shot, all 1319 | **strict-match 0.9621 ±0.0053**, flexible-extract 0.9613 (flydsl dispatch, fp4 combine, 16384 batched tokens), with or without prefix caching (with it: #2532 + #2533) |
+| **GSM8K**, 5-shot, all 1319 | **strict-match 0.9621 ±0.0053**, flexible-extract 0.9613 (flydsl_compact dispatch, fp4 combine, 16384 batched tokens), with or without prefix caching (with it: #2532 + #2533) |
 | **AgentX**, 4 concurrencies, 3600 s each | per GPU 123–447 tok/s, P90 interactivity 0.21–0.35 (E2E-normalized); see [Agentic](#agentic-agentx) |
 | Cold start | about 3½ min with warm caches; 8 min on a tray's first run (aiter JIT) |
 
@@ -423,7 +423,7 @@ segments with `rm -f /dev/shm/psm_* /dev/shm/nccl-*`. Do this only when no other
 |---|---|---|
 | [ATOM #2380](https://github.com/ROCm/ATOM/pull/2380) | **always** | unfused torch `gather_kv_b_proj`, enabled by `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. The env var does nothing without the patch. Without it, a chunked prefill aborts in an LLVM PHI assertion (fused Triton gather on gfx1250) |
 | [aiter #5431](https://github.com/ROCm/aiter/pull/5431) | the allgather LM head (default) | custom all-reduce over torch.symm_mem (`AITER_CUSTOM_AR_USE_SYMM_MEM`). Without it, custom all-reduce is disabled on any group spanning trays, and the LM head's all-gather asserts `not ca_comm.disabled` at the first decode |
-| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | `MEGA_DISPATCH=flydsl` | lets the flydsl dispatch run aiter's compact plan on the fp4/fp8 wire; this ATOM hard-wires mori there. `mori` stays the default |
+| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | **always** | `ATOM_MEGA_DISPATCH_KERNEL` picks MegaMoE's dispatch kernel: `mori`, `flydsl_token_major` or `flydsl_compact`. This recipe runs `flydsl_compact`. Without the patch the env var does nothing, and the fp4 wire runs mori |
 | [ATOM #2532](https://github.com/ROCm/ATOM/pull/2532) | `--enable_prefix_caching` | the DP dummy decode advanced a live KDA state through a stale index. With prefix caching, that poisoned a rank's cached prefixes |
 | [ATOM #2533](https://github.com/ROCm/ATOM/pull/2533) | `--enable_prefix_caching` (large, full KV pools) | the Triton MLA decode computed KV row offsets in int32. Rows ≥ 3,728,270 (block 233,016) read out of bounds and decoded NaN |
 
@@ -453,8 +453,13 @@ rm -rf /root/.cache/atom/*     # after any code change
 - #2532 and #2533 are each a few lines (`gdn_attn.py`, `triton_mla.py`). If a newer revision of either no
   longer applies to this image, apply the change by hand.
 - `docker rm` discards every patch.
+- #2522 was revised on 2026-10-13 to add `ATOM_MEGA_DISPATCH_KERNEL`. In a container patched before then,
+  reverse-apply the old diff first, or start a fresh container.
 - After launch, every rank must log `Custom allreduce: using torch.symm_mem transport (mori backend)`. If the
   probe fails, aiter falls back to IPC without saying so, and the assert comes back.
+- Every rank's `[MORI-V2] Created MegaMoE` line must read
+  `kernel=flydsl_compact dispatch=flydsl stage1_fused=True wire=fp4`. A line without `kernel=` means #2522 is
+  missing or predates the 2026-10-13 revision, and the dispatch runs mori.
 
 ---
 
@@ -481,7 +486,8 @@ export ATOM_USE_UNIFIED_ATTN=1
 # --- MoE
 export ATOM_MOE_GU_ITLV=1                # required on gfx1250
 export ATOM_USE_TRITON_MOE_DECODE=0      # K3's activation is situ, not SiLU
-export MEGA_DISPATCH=flydsl MEGA_DISPATCH_WIRE=fp4   # flydsl needs ATOM #2522; mori works without it
+export MEGA_DISPATCH_WIRE=fp4
+export ATOM_MEGA_DISPATCH_KERNEL=flydsl_compact   # ATOM #2522; replaces MEGA_DISPATCH
 export ATOM_MEGA_COMBINE_WIRE=fp4        # prefill steps only; decode combines in bf16
 export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1
 export AITER_USE_GROUPED_GEMM=1
@@ -527,9 +533,13 @@ until curl -sf -m 5 http://10.210.11.24:8000/v1/models >/dev/null; do sleep 15; 
   runs out of memory. The budget does not reserve it.
 - Expect `peak_torch` about 295 GB and `available_for_kv` 54–56 GB per rank.
 - **16384 rather than 2048.** A 14k prompt prefills in one step instead of seven. Output throughput: +16% on
-  flydsl, +11% on mori; TTFT median drops 30–40%.
-- **flydsl vs mori dispatch.** flydsl (compact plan, #2522) gives 6% more output throughput than mori at 14k/500,
-  con32, with 2048 batched tokens, and 10% more with 16384. To run without #2522, set `MEGA_DISPATCH=mori`.
+  flydsl_compact, +11% on mori; TTFT median drops 30–40%.
+- **The dispatch kernel.** `flydsl_compact` gives 6% more output throughput than `mori` at 14k/500, con32,
+  with 2048 batched tokens, and 10% more with 16384. For an A/B, set `ATOM_MEGA_DISPATCH_KERNEL=mori`.
+  - Do not run `flydsl_token_major` on the fp4 wire: its output was wrong and nondeterministic. ATOM logs a
+    warning when it is selected.
+  - `ATOM_MEGA_DISPATCH_KERNEL` replaces aiter's `MEGA_DISPATCH`. Leave `MEGA_DISPATCH` unset: if both are
+    set, they must name the same backend.
 - **The fp4 combine wire** is accurate, and gives no measurable throughput change. It quantizes the combine on
   prefill steps only.
   - Full GSM8K: 0.9621 with fp4 against 0.9629 with bf16. 19 and 20 questions flip in either direction.
@@ -577,7 +587,7 @@ only `content`, so a small budget scores 0.
 
 | server (dp8ep8, 0.90) | strict-match | flexible-extract | time |
 |---|---|---|---|
-| flydsl dispatch, fp4 combine, 16384, no prefix caching | **0.9621 ±0.0053** | 0.9613 | 7 min |
+| flydsl_compact dispatch, fp4 combine, 16384, no prefix caching | **0.9621 ±0.0053** | 0.9613 | 7 min |
 | the same with the bf16 combine | 0.9629 ±0.0052 | 0.9621 | 8 min |
 | the same with prefix caching (#2532 + #2533, replicated LM head) | **0.9621 ±0.0053** | 0.9613 | 12 min |
 | mori dispatch, bf16 combine, 2048, no prefix caching | 0.9575 ±0.0056 | 0.9568 | 5½ min |
@@ -629,7 +639,7 @@ Neither is aiperf's own per-user p90.
 
 ### Results, dp8ep8 (2026-10-11)
 
-flydsl dispatch, fp4 combine, 16384, 0.90, prefix caching, session affinity, no EPLB; default amdgpu
+flydsl_compact dispatch, fp4 combine, 16384, 0.90, prefix caching, session affinity, no EPLB; default amdgpu
 parameters (`HSA_XNACK=1`).
 
 | concurrency | P90 interactivity, E2E-normalized | P90 interactivity, 1/p90(ITL) | throughput per GPU (total) | prefix cache hit | valid |
@@ -672,6 +682,8 @@ prompt tokens over prompt tokens.
 | `torch.OutOfMemoryError … Tried to allocate 14.05 GiB` in `_grouped_a8w4_tdm_moe` | 16384 batched tokens at 0.94. Use 0.90 |
 | Ranks on the two trays cannot connect at startup | the image's ENV sets `NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo`. Set `NCCL_`, `GLOO_` and `MORI_SOCKET_IFNAME=enp1s0f1` |
 | `MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE` | drop `MEGA_WIRE` |
+| `MEGA_DISPATCH=mori disagrees with ATOM_MEGA_DISPATCH_KERNEL=flydsl_compact` at startup | an old `MEGA_DISPATCH` is still set. Unset it; `ATOM_MEGA_DISPATCH_KERNEL` replaces it |
+| `[MORI-V2] Created MegaMoE` reads `dispatch=mori` and has no `kernel=` | ATOM #2522 is missing, or predates its 2026-10-13 revision. Re-download and apply it |
 | MoE GUGU layout error / `ATOM_USE_TRITON_MOE_DECODE=1` asserts | `ATOM_MOE_GU_ITLV=1` / leave it 0 (K3 uses situ) |
 | GSM8K near 0 with empty answers | `max_tokens` too small, or `--max-model-len` capped |
 | `available KV budget (-NN GB)` or OOM with `0 bytes is free` at load | someone else's job; see [Is the rack free](#is-the-rack-free) |
