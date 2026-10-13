@@ -752,11 +752,19 @@ def _dspark_markov_sample_stage3(
     # one on every rank.
     seed = tl.load(seed_ptr)
     u = tl.rand(seed, noise_offset + row * vocab_size + offs_v)
-    # `1 - u` rather than `u`: tl.rand is [0, 1), so -log(u) is +inf at u == 0
-    # and the race would hand that id a key of 0 -- a systematic, if tiny, bias
-    # against whichever id drew the zero. torch's `.exponential_(1)` makes the
-    # same choice.
-    exp_noise = -tl.log(1.0 - u)
+    # `u` rather than `1 - u`, and the difference is which end is exact. tl.rand
+    # is [0, 1), so E = -log(u) is in (0, inf]: every draw gives a STRICTLY
+    # POSITIVE exponential and the key probs / E is always finite. The u == 0
+    # draw (P = 2^-31) gives E = inf and so key 0, which loses the race -- the
+    # same negligible bias `1 - u` was written to avoid, and in the same
+    # direction, but reached without depending on the SIGN OF ZERO.
+    #
+    # `1 - u` has the opposite, sharper edge: 1 - u rounds to exactly 1.0 for
+    # every u <= 2^-25 in fp32 (65 of tl.rand's 2^-31 grid points, so ~0.5% of
+    # draft rows contain one), E is then -0.0, and probs / -0.0 is -inf. That
+    # happens to EXCLUDE the id, which is also harmless -- but only because the
+    # zero came out negative.
+    exp_noise = -tl.log(u)
     greedy = tl.load(greedy_mask_ptr + row) != 0
     denom = tl.where(greedy, 1.0, exp_noise)
     key = tl.where(v_mask, probs / denom, -1.0)
