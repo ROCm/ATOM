@@ -615,9 +615,17 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 if self._is_deepseek_v4_mtp
                 else ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
             )
+            # The MTP draft's layers live in the target's slot, as natively:
+            # its proxy only carries the drafter's metadata and reuses the
+            # target proxy's KV, so vLLM gives it no pages of its own.
             register_deepseek_v4_proxy_layer(
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
+                kv_sharing_target_layer_name=(
+                    ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+                    if self._is_deepseek_v4_mtp
+                    else None
+                ),
             )
             if not self._is_deepseek_v4_mtp:
                 from atom.plugin.vllm.deepseek_v4_image import (

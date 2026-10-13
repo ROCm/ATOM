@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -249,9 +250,10 @@ def _proxy_carve_source(proxy_kv_cache: torch.Tensor, sizing, ratios):
     """``(carve_cache, carve_blocks)`` for a proxy layer that carves ``ratios``.
 
     The hook lowers ``num_blocks`` for the whole KV-cache config, so every proxy
-    layer in it (the target's and the MTP draft's) has the withheld tail right
-    after its own view. A proxy carves its view's blocks plus its own slots
-    there; the slots must fit in what the hook priced from the checkpoint.
+    layer in it has the withheld tail right after its own view (the MTP draft's
+    proxy is not in it: it shares the target's tensor). A proxy carves its
+    view's blocks plus its own slots there; the slots must fit in what the hook
+    priced from the checkpoint.
     """
     blocks = int(_proxy_block_major_view(proxy_kv_cache).shape[0])
     ratios = tuple(int(r) for r in ratios)
@@ -644,9 +646,16 @@ class AtomDeepseekV4ProxyBackend(AttentionBackend):
 
 
 class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
-    def __init__(self, prefix: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME):
+    def __init__(
+        self,
+        prefix: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        kv_sharing_target_layer_name: str | None = None,
+    ):
         super().__init__()
         self.prefix = prefix
+        # Set on the MTP draft's proxy: vLLM allocates nothing for it and binds
+        # it to the target proxy's tensor (`apply_vllm_v4_draft_kv_sharing_patch`).
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self._atom_v4_proxy_layer = True
         self._atom_v4_profiling_kv_cache = False
         self.kv_cache = torch.tensor([])
@@ -671,21 +680,72 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
 def register_deepseek_v4_proxy_layer(
     vllm_config,
     layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+    kv_sharing_target_layer_name: str | None = None,
 ) -> AtomDeepseekV4ProxyAttention:
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
         apply_vllm_v4_profile_cache_patch,
     )
 
     apply_vllm_v4_profile_cache_patch()
+    if kv_sharing_target_layer_name is not None:
+        apply_vllm_v4_draft_kv_sharing_patch()
     sfc = vllm_config.compilation_config.static_forward_context
     existing = sfc.get(layer_name)
     if isinstance(existing, AtomDeepseekV4ProxyAttention):
         return existing
     if existing is not None:
         raise ValueError(f"Duplicate layer name: {layer_name}")
-    proxy = AtomDeepseekV4ProxyAttention(prefix=layer_name)
+    proxy = AtomDeepseekV4ProxyAttention(
+        prefix=layer_name,
+        kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+    )
     sfc[layer_name] = proxy
     return proxy
+
+
+def _v4_kv_sharing_layers(static_forward_context) -> dict[str, str]:
+    """V4 proxy layers that reuse another proxy's KV: ``{layer: target}``."""
+    return {
+        name: layer.kv_sharing_target_layer_name
+        for name, layer in static_forward_context.items()
+        if isinstance(layer, AtomDeepseekV4ProxyAttention)
+        and layer.kv_sharing_target_layer_name
+    }
+
+
+def apply_vllm_v4_draft_kv_sharing_patch() -> None:
+    """Let the MTP draft's proxy use the target proxy's KV instead of its own.
+
+    vLLM's V1 runner honours ``kv_sharing_target_layer_name`` only on its own
+    ``Attention`` class (``GPUModelRunner.get_kv_cache_spec``): such a layer gets
+    no spec, so no pages, and is recorded in ``shared_kv_cache_layers``, which
+    the rest of vLLM already handles -- ``initialize_kv_cache_tensors`` hands it
+    the target's tensor and ``add_kv_sharing_layers_to_kv_cache_groups`` puts it
+    in the target's group, where the drafter finds it for its metadata builder.
+    The proxy is a bare ``AttentionLayerBase``, so this does the same for it.
+    """
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    original = GPUModelRunner.get_kv_cache_spec
+    if getattr(original, "_atom_v4_draft_kv_sharing_patched", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped_get_kv_cache_spec(self, *args, **kwargs):
+        specs = original(self, *args, **kwargs)
+        shared = _v4_kv_sharing_layers(self.compilation_config.static_forward_context)
+        for name, target in shared.items():
+            if target not in specs:
+                raise RuntimeError(
+                    f"DeepSeek-V4 proxy {name} shares the KV of {target}, which "
+                    "has no KV cache spec in this worker"
+                )
+            specs.pop(name, None)
+            self.shared_kv_cache_layers[name] = target
+        return specs
+
+    wrapped_get_kv_cache_spec._atom_v4_draft_kv_sharing_patched = True
+    GPUModelRunner.get_kv_cache_spec = wrapped_get_kv_cache_spec
 
 
 def _bind_compressor_state(
@@ -926,6 +986,8 @@ def bind_deepseek_v4_proxy_cache_views(
     ptr = proxy.kv_cache.untyped_storage().data_ptr()
     if getattr(model, "_atom_vllm_v4_proxy_cache_ptr", None) == ptr:
         return True
+    if proxy.kv_sharing_target_layer_name:
+        return _bind_deepseek_v4_draft_to_target_slot(model, vllm_config, proxy, ptr)
     ratios = [int(r) for r in model.args.compress_ratios]
     num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
     # Stash the per-request state-slot allocator and the geometry parameters
@@ -988,7 +1050,6 @@ def bind_deepseek_v4_proxy_cache_views(
     model._atom_image_worker = None
     if is_target:
         _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy)
-    arena = views["state_arena"]
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
         window_size=window_size,
@@ -997,10 +1058,105 @@ def bind_deepseek_v4_proxy_cache_views(
         kv_fp8=kv_fp8,
         geometry=geometry,
     )
+    model._atom_v4_views = views
+    model._atom_v4_carve_ratios = ratios
+    _bind_v4_attn_layers(
+        model,
+        views,
+        ratios,
+        kv_fp8=kv_fp8,
+        win_with_spec=win_with_spec,
+        main_write_mode=main_write_mode,
+        vllm_config=vllm_config,
+    )
+    # Stash the model on the proxy so the metadata builder (which only sees
+    # vllm_config) can reach it.
+    proxy._atom_v4_model = model
+    _ensure_v4_decode_bufs(model, vllm_config, ratios, proxy.kv_cache.device)
+    model._atom_vllm_v4_proxy_cache_ptr = ptr
+    return True
+
+
+def _bind_deepseek_v4_draft_to_target_slot(model, vllm_config, proxy, ptr) -> bool:
+    """Bind the MTP draft onto the target's carve, as native does.
+
+    The draft's proxy has no KV of its own: vLLM hands it the target proxy's
+    tensor. The draft's layers are layers of the target's slot (the target
+    carves every ratio the checkpoint lists, MTP layer included), so each binds
+    to the target's view of its own ``layer_id``, and the draft uses the
+    target's slot allocator, geometry and per-slot reset. It keeps its own
+    decode-metadata buffers: its build overwrites them after the target's
+    forward is enqueued, which the target's buffers must not see.
+    """
+    sfc = vllm_config.compilation_config.static_forward_context
+    target_name = proxy.kv_sharing_target_layer_name
+    target_proxy = sfc.get(target_name)
+    target = getattr(target_proxy, "_atom_v4_model", None)
+    if target is None or getattr(target, "_atom_vllm_v4_proxy_cache_ptr", None) != ptr:
+        # The target forwards first in every step; until it has bound this very
+        # tensor the draft stays on the dummy path.
+        return False
+    views = target._atom_v4_views
+    ratios = list(target._atom_v4_carve_ratios)
+    draft_ratios = [int(r) for r in model.args.compress_ratios]
+    if draft_ratios != ratios:
+        raise RuntimeError(
+            f"DeepSeek-V4 MTP draft lists compress ratios {draft_ratios} but the "
+            f"target's slot carves {ratios}"
+        )
+    params = target._atom_v4_meta_params
+    kv_fp8 = bool(params.kv_fp8)
+    attns = _bind_v4_attn_layers(
+        model,
+        views,
+        ratios,
+        kv_fp8=kv_fp8,
+        win_with_spec=int(params.cs),
+        main_write_mode="main_2buff_fp8" if kv_fp8 else "bf16",
+        vllm_config=vllm_config,
+    )
+    model._atom_v4_slot_allocator = _V4SharedSlotLookup(target._atom_v4_slot_allocator)
+    model._atom_v4_geometry = target._atom_v4_geometry
+    model._atom_v4_meta_params = params
+    model._atom_v4_is_target = False
+    model._atom_image_worker = None
+    # The target's per-slot reset covers the draft's rows of the slot too.
+    target._atom_v4_slot_sharers = attns
+    proxy._atom_v4_model = model
+    _ensure_v4_decode_bufs(model, vllm_config, ratios, proxy.kv_cache.device)
+    model._atom_vllm_v4_proxy_cache_ptr = ptr
+    logger.info(
+        "ATOM DeepSeek-V4 MTP draft bound to the target's slot: layers %s of %d",
+        [int(a.layer_id) for a in attns],
+        len(ratios),
+    )
+    return True
+
+
+def _bind_v4_attn_layers(
+    model,
+    views,
+    ratios,
+    *,
+    kv_fp8: bool,
+    win_with_spec: int,
+    main_write_mode: str,
+    vllm_config,
+) -> list:
+    """Point every attention module of ``model`` at its layer's carved views."""
+    geometry = views["geometry"]
+    arena = views["state_arena"]
+    attns = []
     for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
+        if ratio != int(ratios[layer_id]):
+            raise RuntimeError(
+                f"DeepSeek-V4 layer {layer_id} has ratio {ratio} but the carve "
+                f"placed it as {ratios[layer_id]}"
+            )
+        attns.append(attn)
         attn.unified_kv = views["unified"][layer_id]
         attn.swa_kv = attn.unified_kv
         attn.swa_plane = attn.unified_kv
@@ -1057,12 +1213,15 @@ def bind_deepseek_v4_proxy_cache_views(
                 write_mode=main_write_mode,
                 kv_cache_rope=views["hca_main_rope"][hca_i],
             )
+    return attns
+
+
+def _ensure_v4_decode_bufs(model, vllm_config, ratios, device) -> None:
     # Persistent decode-metadata buffers for the FULL decode CUDA/HIP graph.
     # Allocated once (sized to the worst-case decode shape) so build() can
     # refresh them in place each step; the captured kernels read stable
-    # addresses. Eager prefill never touches them. Stash the model on the proxy
-    # so the metadata builder (which only sees vllm_config) can reach it.
-    proxy._atom_v4_model = model
+    # addresses. Eager prefill never touches them.
+    num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
     if not hasattr(model, "_atom_v4_decode_bufs"):
         max_spec = _v4_max_spec_steps(vllm_config)
         max_model_len = int(vllm_config.model_config.max_model_len)
@@ -1076,11 +1235,9 @@ def bind_deepseek_v4_proxy_cache_views(
             index_topk=int(getattr(model.args, "index_topk", 1024)),
             max_committed_hca=max_committed_hca,
             ratios_overlap=ratios_overlap,
-            device=proxy.kv_cache.device,
+            device=device,
             max_blocks=max_committed_hca,
         )
-    model._atom_vllm_v4_proxy_cache_ptr = ptr
-    return True
 
 
 def _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy) -> None:
@@ -1169,9 +1326,12 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
     layers = getattr(getattr(model, "model", None), "layers", [])
     if not layers:
         return
+    # Modules of another model (the MTP draft) bound into these same slots.
+    attns = [getattr(block, "attn", None) for block in layers]
+    attns += list(getattr(model, "_atom_v4_slot_sharers", ()))
     device = None
-    for block in layers:
-        swa = getattr(getattr(block, "attn", None), "swa_kv", None)
+    for attn in attns:
+        swa = getattr(attn, "swa_kv", None)
         if isinstance(swa, torch.Tensor):
             device = swa.device
             break
@@ -1179,8 +1339,7 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
         return
     physical_slots = sorted(int(s) for s in slots)
     idx = torch.as_tensor(physical_slots, dtype=torch.long, device=device)
-    for block in layers:
-        attn = getattr(block, "attn", None)
+    for attn in attns:
         if attn is None:
             continue
         swa = getattr(attn, "swa_plane", None)
@@ -1491,6 +1650,17 @@ class _V4StateSlotAllocator:
         self.last_fresh_rows = fresh
         return np.asarray(slots, dtype=np.int32), reset
 
+    def lookup(self, req_keys) -> np.ndarray:
+        """The slots ``req_keys`` are bound to, without binding or resetting any."""
+        key_to_slot = self._key_to_slot
+        missing = [k for k in req_keys if k not in key_to_slot]
+        if missing:
+            raise RuntimeError(
+                f"requests {sorted(map(str, missing))[:4]} have no state slot; the "
+                "target binds one before anything else may read it"
+            )
+        return np.asarray([key_to_slot[k] for k in req_keys], dtype=np.int32)
+
     def _acquire(self, active: set) -> int:
         if self._free:
             return self._free.pop()
@@ -1517,6 +1687,22 @@ class _V4StateSlotAllocator:
             self._key_to_slot.pop(old, None)
         self._slot_to_key[victim] = None
         return victim
+
+
+class _V4SharedSlotLookup:
+    """The target's slot allocator as a model sharing its slots sees it.
+
+    The MTP draft forwards the requests the target forwarded earlier in the same
+    step, so every request already has its slot, and binding, resetting and
+    releasing stay with the target. ``assign`` only looks the slots up.
+    """
+
+    def __init__(self, owner: _V4StateSlotAllocator):
+        self.owner = owner
+        self.last_fresh_rows: list[int] = []
+
+    def assign(self, req_keys, num_computed):
+        return self.owner.lookup(list(req_keys)), set()
 
 
 def build_atom_v4_attention_metadata(
