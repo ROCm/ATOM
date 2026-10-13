@@ -473,7 +473,8 @@ export PYTORCH_ROCM_ARCH=gfx1250 GPU_ARCHS=gfx1250 GPU_ARCH_LIST=gfx1250 MORI_GP
 export HSA_OVERRIDE_GFX_VERSION=12.5.0
 export ENABLE_CK=0
 # --- attention
-export ATOM_USE_TRITON_MLA=1             # unset: first decode SIGABRTs
+export ATOM_USE_TRITON_MLA=0
+export AITER_MLA_DECODE_PS1_FLYDSL=1
 export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0  # the unfused gather has no shuffled layout
 export ATOM_UNFUSED_GATHER_KV_B_PROJ=1   # ATOM #2380
 export ATOM_USE_UNIFIED_ATTN=1
