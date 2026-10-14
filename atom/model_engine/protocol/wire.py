@@ -87,7 +87,9 @@ class FrameWriter:
 
     def frames(self, envelope: "pb.Envelope") -> list:
         envelope.protocol_version = PROTOCOL_VERSION
-        frames = [envelope.SerializeToString(), *self._frames]
+        # Deterministic: map entries in key order, so one message has one
+        # encoding and the golden vectors can pin it byte for byte.
+        frames = [envelope.SerializeToString(deterministic=True), *self._frames]
         if self._packed is not None:
             frames[self._packed_index] = self._packed
         return frames

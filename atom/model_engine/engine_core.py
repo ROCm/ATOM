@@ -23,7 +23,8 @@ from atom.model_engine.dynamic_chunking import (
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.protocol.codec import (
-    AdmissionDefaults,
+    REJECT_INTERNAL,
+    AdmissionContext,
     build_sequence,
     decode_client_message,
     encode_completions,
@@ -33,6 +34,7 @@ from atom.model_engine.protocol.codec import (
     encode_stopped,
     encode_stream,
     encode_utility_reply,
+    rejection_code,
 )
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
@@ -100,7 +102,7 @@ class EngineCore:
         self.input_address = input_address
         self.output_address = output_address
         # What the input thread builds admitted sequences with.
-        self._admission_defaults = AdmissionDefaults.from_config(config)
+        self._admission = AdmissionContext(config)
         # Control traffic arrives on its own socket so CoreManager can keep the
         # request socket single-writer; see CoreManager._send_request.
         self.control_address = config.parallel_config.control_address
@@ -737,11 +739,13 @@ class EngineCore:
         rejected = list(failures)
         for spec in specs:
             try:
-                seq = build_sequence(spec, self._admission_defaults)
+                seq = build_sequence(spec, self._admission)
             except Exception as exc:
                 # Reported to its client below; the batch-mates still run.
                 logger.exception(f"{self.label}: rejecting request {spec.seq_id}")
-                rejected.append((spec.seq_id, f"{type(exc).__name__}: {exc}"))
+                rejected.append(
+                    (spec.seq_id, f"{type(exc).__name__}: {exc}", rejection_code(exc))
+                )
                 continue
             SchedulerMetrics.enqueue(seq, received_at=received_at)
             seqs.append(seq)
@@ -876,7 +880,11 @@ class EngineCore:
                         )
                         frames = encode_rejected(
                             [
-                                (seq.id, f"output encoding failed: {exc}")
+                                (
+                                    seq.id,
+                                    f"output encoding failed: {exc}",
+                                    REJECT_INTERNAL,
+                                )
                                 for seq in valid_seqs
                             ]
                         )

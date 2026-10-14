@@ -37,9 +37,9 @@ from atom.model_engine.engine_utility import (
 from atom.model_engine.protocol.codec import (
     decode_core_message,
     encode_abort,
+    encode_command,
     encode_shutdown,
     encode_submit,
-    encode_utility,
 )
 from atom.model_engine.protocol.requests import CompletionResult, EngineRequest
 from atom.model_engine.request import RequestOutput
@@ -1376,12 +1376,12 @@ class CoreManager:
                 logger.debug(
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
-                self._send_control(rank, encode_utility({"cmd": cmd}))
+                self._send_control(rank, encode_command({"cmd": cmd}))
         else:
             logger.debug(
                 f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}"
             )
-            self._send_control(dp_rank, encode_utility({"cmd": cmd}))
+            self._send_control(dp_rank, encode_command({"cmd": cmd}))
 
     def abort_request(self, req_id):
         """Tell the engine core(s) to drop a request (client disconnected).
@@ -1548,7 +1548,7 @@ class CoreManager:
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Encode once and reuse for all ranks.
-        frames = encode_utility(payload)
+        frames = encode_command(payload)
         for rank in range(len(self.control_sockets)):
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
@@ -1584,7 +1584,7 @@ class CoreManager:
         the failure that matters, and a rank whose socket fails here must not
         keep its peers, which may hold the failed update, from hearing it.
         """
-        frames = encode_utility(
+        frames = encode_command(
             {"cmd": DISCARD_WEIGHT_SYNC_CMD, "failed_cmd": failed_cmd}
         )
         for rank in range(len(self.control_sockets)):

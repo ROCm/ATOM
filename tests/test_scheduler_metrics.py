@@ -120,7 +120,7 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     from aiter_stub import stubbed_aiter
 
     from atom.model_engine.protocol.codec import (
-        AdmissionDefaults,
+        AdmissionContext,
         encode_shutdown,
         encode_submit,
     )
@@ -150,8 +150,12 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     engine.label = "metrics-test"
     engine.input_queue = Queue()
     engine.output_queue = Queue()
-    engine._admission_defaults = AdmissionDefaults(
-        block_size=4, num_draft_tokens=0, has_per_req_cache=False
+    engine._admission = AdmissionContext(
+        SimpleNamespace(
+            kv_cache_block_size=4,
+            speculative_config=None,
+            hf_config=SimpleNamespace(model_type="llama"),
+        )
     )
     engine.process_input_sockets("input", "control")
     received = engine.input_queue.get_nowait()[0]

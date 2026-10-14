@@ -38,7 +38,7 @@ from types import SimpleNamespace
 
 from atom.model_engine.llm_engine import InputOutputProcessor
 from atom.model_engine.protocol.codec import (
-    AdmissionDefaults,
+    AdmissionContext,
     build_sequence,
     decode_client_message,
     encode_submit,
@@ -124,8 +124,8 @@ class TestPreprocessFanout:
             hf_config=SimpleNamespace(model_type="llama"),
         )
         _, specs, _ = decode_client_message(encode_submit(reqs))
-        defaults = AdmissionDefaults.from_config(config)
-        seqs = [build_sequence(spec, defaults) for spec in specs]
+        context = AdmissionContext(config)
+        seqs = [build_sequence(spec, context) for spec in specs]
         assert seqs[0].token_ids == seqs[1].token_ids
         seqs[0].append_token(999)
         assert seqs[1].token_ids != seqs[0].token_ids
