@@ -140,37 +140,77 @@ def dp_stage_sync_enabled(forward) -> bool:
 
 @dataclass(frozen=True)
 class DPStageTokens:
-    """Every DP rank's MoE token count past the decoder's KV source, in DP
-    order: ``decoder`` for layers 20..38 (layer 20's FFN onward),
-    ``last_layer`` for layer 39. A rank that does not replay runs all its
-    tokens through both."""
+    """The DP group's plan for the layers past the decoder's KV source.
+
+    ``decoder`` and ``last_layer``: every rank's MoE token count, in DP order,
+    for layers 20..38 (layer 20's FFN onward) and for layer 39. A rank that
+    does not replay runs all its tokens through both.
+
+    ``decoder_active``: whether any rank has decoder work -- a tail of its
+    own, or all its rows because it does not replay. When none does, every
+    rank skips the decoder; otherwise a replaying rank without a tail joins
+    each collective on placeholder tokens."""
 
     decoder: tuple[int, ...]
     last_layer: tuple[int, ...]
+    decoder_active: bool = True
 
 
 def sync_dp_stage_tokens(
-    forward, decoder_tokens: int, last_layer_tokens: int
+    forward,
+    decoder_tokens: int,
+    last_layer_tokens: int,
+    *,
+    replaying: bool,
+    decoder_active: bool,
 ) -> DPStageTokens | None:
     """Share this rank's decoder and last-layer token counts with the DP group.
 
-    One CPU all_reduce of ``2 x dp_size`` int32, issued by every rank of a
+    One CPU all_reduce of ``4 x dp_size`` int32, issued by every rank of a
     forward for which `dp_stage_sync_enabled` holds (decode ranks and dummy
-    runs of a prefill step included). None when no rank replays, so the
-    caller keeps the step's own DP table.
+    runs of a prefill step included). Besides the counts each rank reports
+    whether it replays and whether it has decoder work, so the group decides
+    from explicit flags rather than from whether the counts changed (a
+    placeholder count can equal a rank's own).
+
+    None when no rank replays: the caller keeps the step's own DP table.
     """
     import torch.distributed as dist
 
-    sizes = tuple(int(n) for n in forward.dp_metadata.get_sizes_across_dp())
+    num_ranks = len(forward.dp_metadata.get_sizes_across_dp())
     # The slot `DPMetadata.num_tokens_across_dp` fills, so the tables line up.
     rank = _data_parallel_rank()
-    table = torch.zeros((2, len(sizes)), dtype=torch.int32)
-    table[0, rank], table[1, rank] = decoder_tokens, last_layer_tokens
+    table = torch.zeros((4, num_ranks), dtype=torch.int32)
+    table[:, rank] = torch.tensor(
+        [decoder_tokens, last_layer_tokens, int(replaying), int(decoder_active)],
+        dtype=torch.int32,
+    )
     dist.all_reduce(table, group=_dp_cpu_group())
-    tokens = DPStageTokens(tuple(table[0].tolist()), tuple(table[1].tolist()))
-    if tokens.decoder == sizes and tokens.last_layer == sizes:
+    if not bool(table[2].any()):
         return None
-    return tokens
+    return DPStageTokens(
+        tuple(table[0].tolist()),
+        tuple(table[1].tolist()),
+        decoder_active=bool(table[3].any()),
+    )
+
+
+@contextlib.contextmanager
+def placeholder_rows_of(metadata, rows):
+    """A request-less step over ``rows`` of the forward while this block runs.
+
+    For a rank that joins its peers' decoder collectives without work of its
+    own: attention sees no requests (`v41_attention` returns zeros and writes
+    no cache), there are no layer-39 queries, and the image mask -- which the
+    MoE router reads row for row -- is cut to the same rows."""
+    outer = metadata.step, metadata.queries, metadata.image_mask
+    metadata.step, metadata.queries = replace(outer[0], requests=()), None
+    if outer[2] is not None:
+        metadata.image_mask = outer[2].index_select(1, rows)
+    try:
+        yield
+    finally:
+        metadata.step, metadata.queries, metadata.image_mask = outer
 
 
 def _dp_cpu_group():
