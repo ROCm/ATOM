@@ -1023,6 +1023,9 @@ start_aggregated() {
   local -a server_profiler_args=()
   build_torch_profiler_args "${log_name}" server_profiler_args
   echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
+  # With no router in front, aiperf pools its sockets to this server for 300 s.
+  # uvicorn's 5 s default closes them first, and a request sent on a socket the
+  # server just closed is reset, which AgentX treats as a fatal warmup failure.
   local -a server_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
@@ -1033,6 +1036,7 @@ start_aggregated() {
     "${server_kv_transfer_args[@]}"
     "${decode_cudagraph_args[@]}"
     "${server_profiler_args[@]}"
+    --timeout-keep-alive 900
     ${DECODE_SERVER_ARGS}
   )
   dump_launch_info "SERVER" "${server_cmd[@]}"
