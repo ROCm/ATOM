@@ -1,6 +1,6 @@
 import fnmatch
 import re
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -43,6 +43,19 @@ from atom.models.utils import (
 )
 from atom.quant_spec import LayerQuantConfig
 from atom.utils.forward_context import get_forward_context
+
+
+def qwen4_exp_packed_modules_mapping(
+    base_mapping: dict[str, Any], split_ngram_parts: int
+) -> dict[str, Any]:
+    """Add the checkpoint's n-gram shards to this model's packed mapping."""
+    return {
+        **base_mapping,
+        **{
+            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+            for shard in range(int(split_ngram_parts))
+        },
+    }
 
 
 class _Qwen4ExpQuantizationConfig:
@@ -160,7 +173,10 @@ def install_stacked_expert_loaders(experts: FusedMoE) -> None:
         # A fused shared expert occupies slots past the routed ones.
         expert_slice = slice(0, experts.expert_layout.num_routed)
     else:
-        local = torch.nonzero(expert_map >= 0).flatten()
+        # The map can append a fused shared expert and an AITER sentinel.
+        # Stacked checkpoint tensors contain routed experts only.
+        routed_map = expert_map[: experts.expert_layout.num_routed]
+        local = torch.nonzero(routed_map >= 0).flatten()
         first, last = int(local[0]), int(local[-1])
         if last - first + 1 != local.numel():
             raise NotImplementedError(
@@ -944,13 +960,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             if atom_config.speculative_config is not None
             else ()
         )
-        self.packed_modules_mapping = {
-            **self.packed_modules_mapping,
-            **{
-                f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
-                for shard in range(int(config.split_ngram_parts))
-            },
-        }
+        self.packed_modules_mapping = qwen4_exp_packed_modules_mapping(
+            self.packed_modules_mapping, int(config.split_ngram_parts)
+        )
         self.atom_config = atom_config
         self.quant_config = (
             _Qwen4ExpQuantizationConfig(atom_config.quant_config)

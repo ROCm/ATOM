@@ -48,6 +48,11 @@ Key entry points:
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
+- Pipeline parallel: `atom/model_engine/pp_engine_core.py` (head / downstream stage
+  loops) over `atom/distributed/pp_transport.py`; dynamic chunked PP prefill in
+  `atom/model_engine/dynamic_chunking.py` (latency model, pure) and
+  `dynamic_chunking_worker.py` (startup sweep and runtime timing in the runner),
+  sized by `Scheduler._dynamic_chunk_limit`
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),
@@ -107,6 +112,7 @@ Key entry points:
 | Serving & benchmarking | `docs/serving_benchmarking_guide.md` |
 | Configuration | `docs/configuration_guide.md` |
 | Distributed | `docs/distributed_guide.md` |
+| Dynamic chunked pipeline parallel | `docs/dynamic_chunking_guide.md` |
 | Metrics & observability | `docs/metrics_guide.md` |
 | CI/PR workflow | `/ci-pr-guide` |
 | Performance benchmark | `/benchmark-guide` |

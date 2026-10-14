@@ -463,6 +463,7 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
         ),
         cu_seqlens_q=torch.tensor(starts, dtype=torch.int32, device="cuda"),
         max_seqlen_q=next_n,
+        indexer_meta={},
     )
     monkeypatch.setattr(
         deepseek_v4,
@@ -791,3 +792,217 @@ def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
         lambda keys: keys[row_to_batch.long()],
     )
     _assert_agrees(logits, want, local_ends, topk=256)
+
+
+@pytest.mark.parametrize("rows,capacity", [(8, 8), (64, 64), (64, 16)])
+@pytest.mark.parametrize("prefix", ["", "ub0_", "ub1_"])
+def test_v4_fp4_one_graph_replays_sequence_layouts(
+    on_gfx950, monkeypatch, rows, capacity, prefix
+):
+    """One graph, fixed launch, changing GPU metadata (including empty slots)."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.models import deepseek_v4
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttnState
+
+    width, topk = 768, 512
+    table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(
+        rows, 1, width, seed=17
+    )
+    weights = weights.bfloat16()
+    ends = torch.empty(rows, dtype=torch.int32, device="cuda")
+    var = {
+        prefix
+        + "cu_seqlens_q": CpuGpuBuffer(capacity + 1, dtype=torch.int32, device="cuda"),
+        prefix
+        + "v4_fp4_query_start_loc": CpuGpuBuffer(
+            capacity + 1, dtype=torch.int32, device="cuda"
+        ),
+        prefix + "block_tables": SimpleNamespace(gpu=table[:capacity]),
+    }
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 7
+    builder._indexer_fp4 = True
+    builder.indexer_layout = "gfx950"
+    metadata = SimpleNamespace(state=AttnState.DECODE, csa_n_committed_per_token=ends)
+    monkeypatch.setattr(
+        deepseek_v4,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer.kv_cache, indexer.kv_scale = kv, ks
+    indexer._max_model_len_idx, indexer._weights_scale = width, WEIGHTS_SCALE
+
+    def publish(counts, empty=False):
+        bs = len(counts)
+        cu = np.r_[np.int32(0), np.cumsum(counts, dtype=np.int32)]
+        metadata.cu_seqlens_q = builder._stage(prefix + "cu_seqlens_q", cu)
+        metadata.max_seqlen_q = max(counts)
+        metadata.block_tables = table[:bs]
+        bounds = [width - c + i + 1 for c in counts for i in range(c)]
+        bounds += [0] * (rows - len(bounds))
+        if empty:
+            bounds = [0] * rows
+        ends.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
+        metadata.indexer_meta = builder._build_v4_indexer_meta(
+            attn_metadata=metadata,
+            positions_gpu=None,
+            scheduled_bs=bs,
+            total_tokens=int(cu[-1]),
+            device="cuda",
+            buf_prefix_ubatch=prefix,
+        )
+        return bounds
+
+    def run():
+        return indexer._score_topk_decode_fp4_flydsl(
+            q, qs, metadata.block_tables, weights, topk
+        )
+
+    shapes = (
+        [[1] * 8, [8], [3, 1, 4], [4, 4], [1, 0, 3], [0]]
+        if rows == 8
+        else [[1] * 64, [8] * 8, [3, 1, 4] * 8, [4] * 16, [1, 0, 3], [0]]
+    )
+    if capacity < rows:
+        shapes = [[4] * 16, [8] * 8, [3, 1, 4] * 4 + [8] * 4, [1, 0, 3], [0]]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        publish(shapes[0])
+        for _ in range(3):
+            run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            got = run()
+        stream.synchronize()
+        output_ptr = got.data_ptr()
+        metadata_ptr = metadata.indexer_meta["fp4_decode"].query_start_loc.data_ptr()
+
+        # Python-side launches must never run again: every shape replays the
+        # SAME captured row-group scorer and top-k.
+        def no_recapture(*args, **kwargs):
+            raise AssertionError("scorer was relaunched instead of replayed")
+
+        monkeypatch.setattr(deepseek_v4, "flydsl_pa_mqa_logits_fp4", no_recapture)
+        for counts in shapes[::-1] + shapes:
+            bounds = publish(counts)
+            ragged = metadata.indexer_meta["fp4_decode"]
+            assert ragged.query_start_loc.data_ptr() == metadata_ptr
+            assert ragged.query_start_loc.numel() == capacity + 1
+            assert ragged.max_qlen == 8
+            graph.replay()
+            stream.synchronize()
+            assert got.data_ptr() == output_ptr
+            n_real = sum(counts)
+            seq = [b for b, count in enumerate(counts) for _ in range(count)]
+            if n_real:
+                want = _oracle(
+                    q[:n_real],
+                    qs[:n_real],
+                    kv,
+                    ks,
+                    table[: len(counts)],
+                    width,
+                    weights[:n_real],
+                    lambda keys, seq=seq: keys[seq],
+                )
+                for row, end in enumerate(bounds[:n_real]):
+                    chosen = set(got[row][got[row] >= 0].tolist())
+                    best = set(want[row, :end].topk(topk).indices.tolist())
+                    assert len(chosen) == topk and max(chosen) < end
+                    assert len(chosen & best) / topk > 0.99
+            assert bool((got[n_real:] == -1).all())
+        publish(shapes[0], empty=True)
+        graph.replay()
+        stream.synchronize()
+        assert bool((got == -1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "rows,counts,running_bs",
+    [
+        # An idle DP rank's one-row dummy while a peer prefills 16 requests.
+        (1, [1], 16),
+        # A decoding rank with fewer rows than the group's batch.
+        (4, [1, 1, 1], 8),
+        # Unified: the batch fits the bucket exactly.
+        (8, [1] * 8, 8),
+    ],
+)
+def test_fp4_decode_bounds_drop_the_dp_padded_empty_tail(rows, counts, running_bs):
+    """Under DP a prefilling peer keeps `running_bs` at the group's batch while
+    this rank runs only its own rows, so `cu_seqlens_q` carries more (empty)
+    sequences than the token bucket holds. They are padding: the published
+    boundaries keep the nonempty ones and repeat the end for the rest."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.utils import CpuGpuBuffer
+
+    max_bs = 32
+    cu = np.full(running_bs + 1, sum(counts), dtype=np.int32)
+    cu[0] = 0
+    cu[1 : len(counts) + 1] = np.cumsum(counts)
+    var = {
+        "cu_seqlens_q": CpuGpuBuffer(max_bs + 1, dtype=torch.int32, device="cuda"),
+        "v4_fp4_query_start_loc": CpuGpuBuffer(
+            max_bs + 1, dtype=torch.int32, device="cuda"
+        ),
+        "block_tables": SimpleNamespace(
+            gpu=torch.zeros(max_bs, 4, dtype=torch.int32, device="cuda")
+        ),
+    }
+    var["cu_seqlens_q"].np[: cu.size] = cu
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 0
+    metadata = SimpleNamespace(
+        cu_seqlens_q=torch.empty(running_bs + 1),
+        csa_n_committed_per_token=torch.empty(rows),
+    )
+    meta = builder._refresh_fp4_rowgroup_decode_meta(metadata)
+    want = np.full(rows + 1, sum(counts))
+    want[: len(counts) + 1] = cu[: len(counts) + 1]
+    assert meta.query_start_loc.tolist() == want.tolist()
+    assert meta.block_tables.shape[0] == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_fp4_decode_bounds_reject_a_sequence_past_the_bucket():
+    """Only the empty tail may be dropped: a nonempty sequence at or past the
+    bucket's capacity still raises rather than losing its rows."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.utils import CpuGpuBuffer
+
+    var = {
+        "cu_seqlens_q": CpuGpuBuffer(9, dtype=torch.int32, device="cuda"),
+        "v4_fp4_query_start_loc": CpuGpuBuffer(9, dtype=torch.int32, device="cuda"),
+        "block_tables": SimpleNamespace(
+            gpu=torch.zeros(8, 4, dtype=torch.int32, device="cuda")
+        ),
+    }
+    # Two rows, but the second nonempty sequence is the third one.
+    var["cu_seqlens_q"].np[:5] = [0, 1, 1, 2, 2]
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 0
+    metadata = SimpleNamespace(
+        cu_seqlens_q=torch.empty(5), csa_n_committed_per_token=torch.empty(2)
+    )
+    with pytest.raises(ValueError, match="exceed the decode bucket"):
+        builder._refresh_fp4_rowgroup_decode_meta(metadata)

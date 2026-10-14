@@ -4,6 +4,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
@@ -164,6 +165,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         no additional action.
         """
         return
+
+    def ubatch_forward(self, metadata):
+        """Keep parent resources alive until all microbatch work is enqueued."""
+        return nullcontext()
 
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""

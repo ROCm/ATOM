@@ -288,6 +288,7 @@ def _forward(lengths, **overrides):
         ({"ctx.is_dummy_run": True}, False),
         ({"ctx.is_draft": True}, False),
         ({"fwd.ubatch_slices": [object()]}, False),
+        ({"fwd.dp_metadata": object()}, False),  # unpadded DP still gathers
         ({"step.decode": True}, False),
         # image rows replay: the router reads its rows' slice of the mask
         ({"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, True),
@@ -374,7 +375,7 @@ def test_a_replayed_history_marks_image_positions_dead(image):
     builder.geometry = SimpleNamespace(history_size=mapping.config.max_ngram_size - 1)
     builder.config = SimpleNamespace(image_token_id=image)
     resumes, floors, cached, histories = builder._replay_layout(
-        {1: Replay(384, True, (5, 7))},
+        {1: Replay(384, True, (5, 7), 256)},
         np.array([0, 1]),
         [RequestSpan(1, 0, 0, 10, 0), RequestSpan(2, 256, 10, 200, 1)],
     )

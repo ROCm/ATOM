@@ -29,8 +29,9 @@ def kv_config_has_producer(kv_config: object) -> bool:
     """Whether a KV config contains a P/D producer, including ``multi``.
 
     Both the scheduler and the model runner branch on this: a producer
-    prefills and hands the request off after one token, so it neither defers
-    output nor speculates.
+    prefills and hands the request off after one token, so it never
+    speculates. It still defers output (unless its attention keeps recurrent
+    state), so surfacing that token can take one extra q=1 decode.
     """
     if not isinstance(kv_config, dict):
         return False

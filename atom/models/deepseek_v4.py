@@ -2315,16 +2315,23 @@ class Indexer(nn.Module):
         out by), zero on the pad tail, so pad rows get top-k -1 (ignored
         downstream).
 
-        CG-safe: every input is the step's metadata at a fixed address,
-        published on EVERY decode fwd, since a rectangular step can replay a
-        ragged-captured graph (`graph_key` is only `(running_bs, max_q_len)`),
-        and the logits width is the static `_max_model_len_idx`; the kernel's
-        grid follows the batch and that width alone.
+        Native decode keeps the sequence capacity and query-span bound fixed
+        for each token bucket. The builder refreshes its complete boundary
+        buffer every forward, including empty slots, so a token-count graph
+        can replay another sequence layout with the same launch and addresses.
         """
         device = q_fp4.device
         padded_tokens = q_fp4.size(0)
         attn_metadata = get_forward_context().attn_metadata
         local_ends = attn_metadata.csa_n_committed_per_token[:padded_tokens]
+        # Native decode publishes a token-bucket-sized view and a fixed query
+        # span, so the launch captured inside a dense piece remains valid when
+        # the sequence layout changes. Other callers keep their own metadata.
+        ragged = (attn_metadata.indexer_meta or {}).get("fp4_decode")
+        if ragged is None:
+            ragged = Fp4MqaRaggedMetadata(
+                attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
+            )
         # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
         # the rectangular decode path.
         max_seq_len = self._max_model_len_idx
@@ -2353,9 +2360,7 @@ class Indexer(nn.Module):
             weight_scale=self._weights_scale,
             kv_block_size=kv_block_size,
             out=logits,
-            **Fp4MqaRaggedMetadata(
-                attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
-            ).kernel_args(
+            **ragged.kernel_args(
                 local_ends,
                 heads=weights.shape[1],
                 page_size=kv_block_size,
@@ -3240,7 +3245,7 @@ class DeepseekV4Attention(nn.Module):
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP4
-        varqlen scorer takes `padded_tokens = q_fp4.size(0)` on a constant grid --
+        row-group scorer uses fixed-capacity metadata per token bucket --
         and everything it reads is token-shaped or a whole persistent buffer. So it
         belongs in a dense piece, keyed on num_tokens, not in the core.
         """

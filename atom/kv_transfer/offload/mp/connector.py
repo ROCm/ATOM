@@ -43,6 +43,16 @@ def _publishes_native_state(transfer_tensors: Any) -> bool:
     return True
 
 
+def _has_per_request_state(kv_caches: Any) -> bool:
+    """Whether registration includes a slot-addressed recurrent state."""
+
+    if not kv_caches:
+        return False
+    return any(
+        getattr(value, "per_request_state", False) for value in kv_caches.values()
+    )
+
+
 def _copies_paged_state(transfer_tensors: Any) -> bool:
     """Whether the backend keeps PAGE-backed state checkpoints.
 
@@ -92,6 +102,16 @@ class LMCacheMPConnector(KVConnectorBase):
                 "lmcache_mp: this backend keeps PAGE-backed state checkpoints "
                 "but publishes no paged_state_checkpoint_spec and "
                 "execute_paged_state_copies for the native-state transfer"
+            )
+        elif _has_per_request_state(kv_caches):
+            # Fork-slot GDN (pipeline parallelism, RapidServe) publishes no
+            # checkpoint image. PAGE-only would restore full-attention KV
+            # over that stale state.
+            raise ValueError(
+                "lmcache_mp: per-request recurrent state is registered, but "
+                "this backend publishes no PAGE checkpoint. PAGE-only offload "
+                "would restore KV over stale state. Enable prefix caching "
+                "without pipeline parallelism or RapidServe, or disable offload."
             )
         else:
             impl = mp_worker.LMCacheMPConnector(self._config)

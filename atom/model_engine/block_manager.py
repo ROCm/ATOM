@@ -132,6 +132,7 @@ class BlockManager:
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
+        self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
         # Content hashes only: pool hits and resource fit are always rechecked.
         # Weak keys keep this scheduler-side cache out of request serialization.
@@ -638,6 +639,21 @@ class BlockManager:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
+    def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
+        """`hit` widened to `compressed_hit` when replaying is cheaper.
+
+        Resuming from the checkpoint at `hit` recomputes `compressed_hit - hit`
+        blocks; replaying recomputes `state_replay_tokens`. Records on `seq`
+        whether the hit it returns replays (`replay_start`).
+        """
+        hbs = self.hash_block_size
+        seq.replays_hit = bool(
+            self.state_replay_tokens
+            and seq.has_per_req_cache
+            and (compressed_hit - hit) * hbs > self.state_replay_tokens
+        )
+        return compressed_hit if seq.replays_hit else hit
+
     def _gated_hit(
         self,
         seq: Sequence,
@@ -886,9 +902,10 @@ class BlockManager:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
         `record=False` returns the same fit and HBM hit without committing
-        joint-load fields or joint-boundary counters. Checkpoint demand/end
-        and hit instrumentation still refresh; demand counters deduplicate per
-        request. An optional `block_hashes` output
+        joint-load fields or joint-boundary counters. Checkpoint demand/end,
+        hit instrumentation and `Sequence.replays_hit` (whether the hit it
+        returns replays, which `replay_start` reads for it) still refresh;
+        demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
 
@@ -955,7 +972,10 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+        # A checkpoint far below the compressed hit loses to a bounded replay,
+        # which keeps the whole hit and rebuilds the state at its end.
+        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -972,9 +992,12 @@ class BlockManager:
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
+        #
+        # `resumable`, not the replayed hit: the counterfactual is asked of the
+        # gates, whose answer a replay does not change.
         self._record_checkpoint_demand(
             seq,
-            hit=num_cached_blocks,
+            hit=resumable,
             compressed_hit=compressed_hit,
             block_hashes=block_hashes,
             live_blocks=num_new_blocks,
@@ -1088,6 +1111,10 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
+        if self.state_replay_tokens and seq.replays_hit:
+            # A replay starts from a fresh state slot, never a checkpoint: it
+            # rebuilds the state below whatever the claim above reached.
+            hit_hash = -1
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1175,12 +1202,16 @@ class BlockManager:
         and at a `hit`, the state (one hash block); and in a forward finishing
         the prompt, `min_final_prefill_rows` rows before its end (decoder
         bounded replay), on the hash-block grid. `start` itself everywhere
-        else."""
+        else. And at a hit `can_allocate` admitted with no checkpoint behind
+        its state (`_replay_hit`, DeepSeek-V4), the state's receptive field,
+        `state_replay_tokens`."""
         if not (seq.has_per_req_cache and start):
             return start
         hbs = self.hash_block_size
         if hit and self.state.transfer.replays:
             start -= hbs
+        elif hit and self.state_replay_tokens and seq.replays_hit:
+            start -= self.state_replay_tokens
         short = self.min_final_prefill_rows - (seq.num_tokens - start)
         if short > 0:
             start = (start - short) // hbs * hbs
@@ -1630,6 +1661,7 @@ class BlockManager:
         start_tokens: int | None = None,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        replay_until: int | None = None,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -1648,18 +1680,30 @@ class BlockManager:
 
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
+
+        `replay_until`: where the forward resumed if it started below that
+        point, as the batch was scheduled (`ScheduledBatch.replaying`). Nothing
+        below it is published or checkpointed: those blocks are the hit's, and
+        a forward ending below it leaves a replay's state still inexact. One
+        ending right at it publishes nothing either, but a DeepSeek-V4 bounded
+        replay has rebuilt the state whole there, so that may be checkpointed.
+        Left unset it reads `seq.replay_until`, which under pipeline
+        parallelism a later chunk's scheduling may already have moved.
         """
         if not self.enable_prefix_caching:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         # A replaying forward's rows below where it resumed are published.
-        start = max(base, seq.replay_until) // hbs
+        until = seq.replay_until if replay_until is None else replay_until
+        start = max(base, until) // hbs
         end = (base + num_new_tokens) // hbs
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
         end = min(end, len(seq.block_table))
-        if start >= end:
+        if start >= end and not (
+            seq.replays_hit and until and base + num_new_tokens == until
+        ):
             return
         h = self._chain_parent_hash(seq, start)
         if h is None:
@@ -1867,6 +1911,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
+            demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -2648,6 +2700,7 @@ class BlockManager:
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
         seq.replay = None
+        seq.replays_hit = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.

@@ -82,9 +82,9 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so does a padded step: prefill pads only under DP attention,
-    where the MoE collectives are sized by every rank's token count, which a
-    rank-local tail would change.
+    row, and so do DP attention and padded steps: DP's MoE collectives are
+    sized by every rank's token count, even when a rank needs no padding,
+    and a rank-local tail would change those counts.
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
@@ -93,7 +93,14 @@ def replayable(forward, num_tokens: int) -> bool:
         or context.is_dummy_run
         or context.is_draft
         or forward.ubatch_slices is not None
+        or getattr(forward, "dp_metadata", None) is not None
     ):
+        return False
+    # Workers clear ubatch_slices to prevent recursive splitting. Their live
+    # TBO context still identifies them, including the child at token offset 0.
+    from atom.utils.tbo.ubatching import tbo_active
+
+    if tbo_active():
         return False
     step = getattr(metadata, "step", None)
     return not (
