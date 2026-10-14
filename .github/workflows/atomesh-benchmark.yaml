@@ -333,6 +333,10 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
+      - name: Refuse unready prefix READ experiment
+        if: ${{ github.ref == 'refs/heads/whx/k3-prefix-read-c48-81198-20261014' || contains(inputs.case_names, 'prefix-read-fixed') }}
+        run: python3 .github/scripts/atomesh/pd_prefix_read.py require-ready
+
       - name: Install YAML parser
         run: python3 -m pip install pyyaml
 

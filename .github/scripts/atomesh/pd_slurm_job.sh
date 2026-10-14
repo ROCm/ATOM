@@ -300,6 +300,12 @@ EOF
   fi
   echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == "prefix-read-fixed" ]]; then
+    python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read.py" require-ready || return $?
+    python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read.py" host-preflight \
+      --model "${MODEL_PATH}" --run-dir "${RUN_DIR}" --rank "${rank}" \
+      --image "${DOCKER_IMAGE}" --output "${rank_dir}/prefix-read-host-preflight.json" || return $?
+  fi
   bounded_docker_rm "${container}"
   if [[ "${execution_phase}" != "eval" ]]; then
     if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
@@ -312,6 +318,10 @@ EOF
       } > "${rank_dir}/host-storage-before-pull.txt" 2>&1
     fi
     docker pull "${DOCKER_IMAGE}" || return $?
+    if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == "prefix-read-fixed" ]]; then
+      python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read.py" verify-image \
+        --image "${DOCKER_IMAGE}" --output "${rank_dir}/prefix-read-image.json" || return $?
+    fi
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
@@ -377,6 +387,10 @@ EOF
   if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
     source "${REPO_ROOT}/.github/scripts/atomesh/pd_c48_port_mount.sh"
     c48_append_port_mount "${REPO_ROOT}" || return $?
+    if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == "prefix-read-fixed" ]]; then
+      source "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read_mount.sh"
+      prefix_read_append_mount "${REPO_ROOT}" || return $?
+    fi
   fi
   if [[ -d /shared_nfs ]]; then
     docker_args+=(-v /shared_nfs:/shared_nfs)

@@ -44,6 +44,7 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
     env["VLLM_HOST_IP"] = host
     env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
     env["C48_DIAG_ROLE"] = role
+    env["C48_PREFIX_READ_FIXED"] = str(int(config["name"] == "kimi-k3-vllm-c48-prefix-read-fixed"))
     env["C48_DIAG_PTPC"] = str(int("quantization-config" in args))
     env["C48_DIAG_AL"] = str(args["speculative-config"]["synthetic_acceptance_length"])
     env["C48_DIAG_DRAFT_TOKENS"] = str(args["speculative-config"]["num_speculative_tokens"])
@@ -63,6 +64,9 @@ def main() -> None:
     parser.add_argument("--execute", action="store_true")
     options = parser.parse_args()
     config = json.loads(options.config.read_text())
+    if options.execute and config["name"] == "kimi-k3-vllm-c48-prefix-read-fixed":
+        from pd_prefix_read import require_ready
+        require_ready()
     argv, additions = render(config, options.role, options.model, options.host,
                              options.proxy, options.port, options.discovery)
     additions["C48_DIAG_DIR"] = str(options.output.parent / "model-manifests")
@@ -82,6 +86,14 @@ def main() -> None:
                 record["versions"][name] = None
         assert "81198e97b" in record["versions"]["vllm"], record["versions"]
         record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
+        if config["name"] == "kimi-k3-vllm-c48-prefix-read-fixed":
+            from pd_prefix_read import verify_overlay, verify_bundle, verify_runtime_overlays
+            record["product_overlay"] = verify_overlay(Path(vllm.__file__).parent)
+            record["runtime_overlays"] = verify_runtime_overlays(Path(vllm.__file__).parent)
+            from pd_prefix_read import check_memory, cgroup_headroom
+            record["container_cpu_memory"] = check_memory(Path("/proc/meminfo").read_text(),
+                0 if options.role == "prefill" else 1, cgroup_headroom())
+            record["prefix_read_bundle"] = verify_bundle(Path(__file__).resolve().parents[3])
         record["model_files"] = {}
         for root in (Path(options.model), draft_path(options.model)):
             assert (root / "config.json").is_file(), root

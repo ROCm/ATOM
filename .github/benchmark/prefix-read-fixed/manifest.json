@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "case": "prefix-read-fixed",
+  "reference_job_id": 115416366193,
+  "reference_run_id": 38295633957,
+  "engine_commit": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "image": "vllm/vllm-openai-rocm:nightly-81198e97ba7eee2a22540caaa756b7fdddcb4d93@sha256:a401e4f46872dcde77e07ae3d7fa2d3a71b7f2773714316116532e2b39deb179",
+  "harness_base_commit": "620e7552269c44c30613d751c2825ea9e0e400b5",
+  "harness_identity": "base commit plus every file hash below; eventual experiment commit recorded by workflow checkout",
+  "original_remote": "https://github.com/ROCm/ATOM.git",
+  "readiness": "LOCAL_CHECKS_PASSED_RUNTIME_GATED",
+  "blockers": [],
+  "local_review": {
+    "passed": true,
+    "scope": "Pinned product, shared-MR observer and runtime/phase wiring reviewed; parent independently reran focused CPU tests and qualified-pool tests",
+    "runtime_test_limit": "Actual EngineCore utility codec is tested; worker collective uses substitutes, not eight spawned GPU processes",
+    "gpu_verified": false,
+    "pending_runtime_gates": [
+      "qualified pool",
+      "allocated-host resources and pristine image",
+      "warmup observation and all-rank restoration",
+      "merged D8 mechanism PASS",
+      "full formal workload and cleanup"
+    ],
+    "dispatch_policy": "Separate live shared reservation required; one workflow maximum, no automatic retry"
+  },
+  "product": {
+    "path": "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py",
+    "base_sha256": "11093795802a92494aeda37835789fdf3b87be5f8d01b3e0305d18959e189f8d",
+    "after_sha256": "c8713a6590cb1a023597ae43d19e16b4bb8a98ebc2589fc40621e738231be8bb",
+    "patch_sha256": "75e31a74a2afc80bd7828d033d8047837dc6839eadbef71e384979b8b5f1d0da",
+    "deployment": "independent readonly single-file bind mount, no image rebuild or pip product replacement",
+    "container_destination": "/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py",
+    "base_image_runtime_hash_verified": false
+  },
+  "startup_overlay": {
+    "path": "moriio_common.py",
+    "base_sha256": "819cff0ed4157533a5793abf69ac609aba1176f01ca849b10adb2be37a721a48",
+    "after_sha256": "23cd517ed12a0102bbedd0aeb755fae7a865f8d5f56bb2bb1f59e02d0d804268",
+    "scope": "existing startup-only RDMA listener bind, not prefix fix"
+  },
+  "aiperf": {
+    "commit": "89b21867872a5bbc4b0676bf5005c404da5e9f94",
+    "scenario": "agentx",
+    "benchmark_duration": 3600,
+    "concurrency": 48,
+    "warmup_requests_per_lane": 10,
+    "warmup_grace_period": 1800,
+    "cancel_drain_timeout": 10,
+    "old_cohort_cancel_drain_timeout": 300,
+    "warmup_seamless": false,
+    "closure_hook_installed": true,
+    "source_evidence": [
+      "src/aiperf/common/scenario/inferencex_agentx_mvp.py:43-69",
+      "src/aiperf/timing/config.py:607-661 (seamless=False)",
+      "src/aiperf/timing/phase_orchestrator.py:249-304 (no external awaited closure gate)",
+      "src/aiperf/common/environment.py:1158-1163 CANCEL_DRAIN_TIMEOUT default=10.0"
+    ],
+    "closure_gate": "Post-existing-nonseamless-warmup drain await: P scheduler+P8 explicit SKIPPED; D scheduler+D8 restored; hashed shared artifacts; D8 mechanism submission/completion PASS and common eligible sample; 90s closure/120s total timeout; no extra drain or model step",
+    "gate_runtime_verified": false,
+    "cpu_lifecycle_verified": true
+  },
+  "resources": {
+    "nodes": 2,
+    "gpus_per_node": 8,
+    "node_selection": "auto; no pinned pair",
+    "minimum_free_inodes_per_storage_path": 100000,
+    "prefill_cpu_offload_bytes": 1799000000000,
+    "memory_reserve_bytes_per_node": 68719476736,
+    "host_checks_readonly": true,
+    "prune_shared_storage": false,
+    "minimum_free_bytes_uncached": 214748364800,
+    "minimum_free_bytes_cached": 42949672960,
+    "cgroup_headroom_checked": true,
+    "pre_sbatch_qualification": {
+      "selector": ".github/scripts/atomesh/pd_prefix_pool.py",
+      "selection": "all qualified candidates; scheduler chooses exactly 2; no fixed pair",
+      "storage_threshold_bytes": 214748364800,
+      "memory_threshold_all_candidates": 1867719476736,
+      "source": "readonly scontrol inventory + node-exporter fresh filesystem/MemAvailable metrics",
+      "default_root_assumptions": [
+        "/var/lib/docker",
+        "/var/lib/containerd",
+        "/tmp"
+      ],
+      "run_dir": "actual LOG_ROOT supplied at submission; longest matching exported mount",
+      "limitations": "mount coverage does not prove directory existence or actual Docker root/cgroup; allocated-host authoritative preflight retained",
+      "hardware_schema_evidence": "/app/test_scripts/dspark_pd/inspect-current-38177061854/atomesh-inspection-38174661539-38177061854/node-details.txt (Partitions and 8 repeated gpu:mi355x:1 Gres entries)",
+      "spur_pool_evidence": "/app/test_scripts/dspark_pd/inspect-current-36112312705/atomesh-inspection-36111010819-36112312705/job-4447.txt (17 requested nodes; actual g07,g09; NumNodes=2)"
+    }
+  },
+  "observer": {
+    "installed": true,
+    "proposed_interface": "readonly adapter.py + observer.py; runtime_install(mori_connector), stop_sampling(), close_scheduler(), close_worker(); per-rank READY only means restored, not mechanism PASS",
+    "unsupported_evidence": "UNVERIFIED, never PASS",
+    "validated_for_real_registration": true,
+    "sample_policy": "First 32 natural eligible final-E-positive complete-cache-hit episodes; explicit sidecar skips; drop/unknown/zero coverage fail closed",
+    "max_events": 100000,
+    "validation_scope": "CPU actual shared allocation/registration and original READ poll path; independent shared/remote MR and multilayer-session review accepted; GPU runtime not validated",
+    "adapter_sha256": "501a2e142f84af6c7cde0a505f6733942f86695328f6c3ab2c7bb0ef5e4e8af1",
+    "observer_sha256": "9056a6101dc2a2396b7937897151afcdb7271eba57f27b92b0ad92ee451c1dac"
+  },
+  "publication": {
+    "publish_dashboard": false,
+    "run_eval": false,
+    "maximum_workflows": 1,
+    "baseline_rerun": false,
+    "dispatched": false
+  },
+  "files": {
+    ".github/benchmark/c48-model-gap/V0.json": "443d4b5afb6f5fde482cba368ed45e65d3bbd109a7deb212207bbcc8ff4cfbe5",
+    ".github/benchmark/c48-model-gap/moriio_common.py": "23cd517ed12a0102bbedd0aeb755fae7a865f8d5f56bb2bb1f59e02d0d804268",
+    ".github/benchmark/models_atomesh.yaml": "c4d584327ea71158f7892f875aa08170c8ffa6c9690a10269c9cb6e8ee37ab67",
+    ".github/benchmark/prefix-read-fixed/adapter.py": "501a2e142f84af6c7cde0a505f6733942f86695328f6c3ab2c7bb0ef5e4e8af1",
+    ".github/benchmark/prefix-read-fixed/client/phase_orchestrator.py": "20c40e513c15a2a81724de8b32c2f837aaaa4d13f335d0d262620ca21b5f3001",
+    ".github/benchmark/prefix-read-fixed/client/sitecustomize.py": "e879bf68c9834dff5a4e99d37f15039bcab2128c22779197a2c9ec1a60d8e0a0",
+    ".github/benchmark/prefix-read-fixed/config.json": "b937c6bf1fce3ca38823fac3e22801e4ac2bad954b24eb0e9bbe887078b14446",
+    ".github/benchmark/prefix-read-fixed/fix-81198.patch": "75e31a74a2afc80bd7828d033d8047837dc6839eadbef71e384979b8b5f1d0da",
+    ".github/benchmark/prefix-read-fixed/inputs.json": "afc76e715339ff6b14e64e5fe44e8151d92c1ae8218dea0ba00d7bcfbcb45c11",
+    ".github/benchmark/prefix-read-fixed/moriio_connector.py": "c8713a6590cb1a023597ae43d19e16b4bb8a98ebc2589fc40621e738231be8bb",
+    ".github/benchmark/prefix-read-fixed/observer.py": "9056a6101dc2a2396b7937897151afcdb7271eba57f27b92b0ad92ee451c1dac",
+    ".github/benchmark/prefix-read-fixed/runtime-overlays.json": "a0f9035960023f2663fede455f50dcacf66fd66b011d7f809a0bf1e88bc8f16f",
+    ".github/benchmark/prefix-read-fixed/runtime/core.py": "bd1f3844066c77477b908fbb0dfcf25612005143053d519b0bbaf8c6d8e2b64f",
+    ".github/benchmark/prefix-read-fixed/runtime/factory.py": "5636b3abbd3f8acb7528c2b9f07418e8be9cbb48bcc0f634c5eeb7a871d27a9a",
+    ".github/benchmark/prefix-read-fixed/runtime/routers.py": "41f1b0a191d333a2ba4117303ffa94481adeed2295e2f3b5905f08bc57971910",
+    ".github/scripts/atomesh/pd_c48_launch.py": "0b695345326ca409c154a1b9683ac63009681a0a5faf800d1eef4a7a9a487e70",
+    ".github/scripts/atomesh/pd_c48_port_mount.sh": "32b2701fe8f4f80123d87c2bb56f9dd13452dd935491c3848018f9de71324da9",
+    ".github/scripts/atomesh/pd_c48_port_patch.py": "2e6264f3d156f7b59ca22be3c71b89e5453a0225f41f78b89a5f69f781e5a563",
+    ".github/scripts/atomesh/pd_c48_previous_jobs.py": "e92957c07a5317f4408580684eff6c896d58912312af38aa127fe7971a028462",
+    ".github/scripts/atomesh/pd_c48_server.sh": "21e2f30dc661cee91ffa6ec5c4d39d93a6640cef437e70b4bb7b7d4cbacd5d9f",
+    ".github/scripts/atomesh/pd_c48_worker.py": "e8d501e4b9a45aaf73401033b152c9a534bc95a9d02bc8bea1c4102e81f09615",
+    ".github/scripts/atomesh/pd_matrix.py": "7b1683a392b6b3b6ce76c9567fe024eb510f2fc805b43e7064f6748e5c7d8d4d",
+    ".github/scripts/atomesh/pd_prefix_client.py": "b760f4d2ce19d2522b562bd1e2d45793fcec083b2fc754635de64ae44e8eef8f",
+    ".github/scripts/atomesh/pd_prefix_gate.py": "aca51ff6e4c7efa11828141d7b5cbc7e11e3e15b4c2ee327c85f20847db35a3d",
+    ".github/scripts/atomesh/pd_prefix_read.py": "e80ee3bbdb4cc26496dfa8fe0e14e99a8de7368814563cbd31c4e13ad1e4aa57",
+    ".github/scripts/atomesh/pd_prefix_read_mount.sh": "b5c93e0464b497acc66969edc10fe190806e75a455b668335800f80bd3498ae3",
+    ".github/scripts/atomesh/pd_prefix_runtime.py": "deefcb034f2f1526180c2c65885f105ef8e891f27992f53dfc4361def8d6085d",
+    ".github/scripts/atomesh/pd_server_atom.sh": "8072434dbf9e9e01575da874396cabbe9239be315d3c4a48c2b16bc264e08de7",
+    ".github/scripts/atomesh/pd_server_vllm.sh": "697d48d48d3f8f1ba771edbe28533a6e8199999fc5a1886fc94269f23ae374ee",
+    ".github/scripts/atomesh/pd_slurm_job.sh": "5e27ddcafd3a55870eace490400f9560d92691b4b2a6bfe81d8738967f3fb835",
+    ".github/scripts/atomesh/pd_submit.sh": "1d38b19d2647a59a87e720f45d9a1cd0f0a158e5bb6a741bfd1cedf35a647334",
+    ".github/workflows/atomesh-benchmark.yaml": "51b73490957a48806802733294d16a0dc2aafb8f24a6e30a3a70f7d3918b0c77",
+    "tests/test_prefix_read_harness.py": "33c24bcdd415d2f7352bf31bf24b2681e6c68954ccbb081b89b0595357b350bc",
+    "tests/test_prefix_read_lifecycle.py": "e58abd91c966b217f48d2ee14fd6af30d3b40f0bde0cc57ff47192f05ddf890c",
+    "tests/test_prefix_read_runtime_integration.py": "904417b912a33727d7f81cd76871850ad654b059777173527911e17a6f7e1bd2",
+    ".github/scripts/atomesh/pd_prefix_pool.py": "bb6c7550a5819703a6ba3d8e0adf672e62d643ef54d8487a8239e46483ec6f5e",
+    "tests/test_prefix_read_pool.py": "8beb48f33eed9645d6f308194469331cb64d14fd7cd317a3363534617359df24",
+    ".github/scripts/slurm_submit_helpers.sh": "a6f8e4ba1a896adb68e080de0afa0e0dfedbe94fe3b89fa8afd92500c961f377"
+  },
+  "runtime_overlays": [
+    {
+      "source": "vllm/distributed/kv_transfer/kv_connector/factory.py",
+      "payload": ".github/benchmark/prefix-read-fixed/runtime/factory.py",
+      "destination": "/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/factory.py",
+      "base_sha256": "029202ea640823ac5cf9b0517bcc7d28daafde265ceb40eb4c8dd209093103b6",
+      "after_sha256": "5636b3abbd3f8acb7528c2b9f07418e8be9cbb48bcc0f634c5eeb7a871d27a9a"
+    },
+    {
+      "source": "vllm/v1/engine/core.py",
+      "payload": ".github/benchmark/prefix-read-fixed/runtime/core.py",
+      "destination": "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py",
+      "base_sha256": "2cd8a20a47c3f0367d0cbbe6a86cc6a3e89d19315edaf5d206fcdab2fbe62259",
+      "after_sha256": "bd1f3844066c77477b908fbb0dfcf25612005143053d519b0bbaf8c6d8e2b64f"
+    },
+    {
+      "source": "vllm/entrypoints/launchers/api_server/routers.py",
+      "payload": ".github/benchmark/prefix-read-fixed/runtime/routers.py",
+      "destination": "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/launchers/api_server/routers.py",
+      "base_sha256": "13d35100613098f246674f466c5099e58673d6c43083bde06628cf91bdae6c51",
+      "after_sha256": "41f1b0a191d333a2ba4117303ffa94481adeed2295e2f3b5905f08bc57971910"
+    },
+    {
+      "source": "aiperf/timing/phase_orchestrator.py",
+      "payload": ".github/benchmark/prefix-read-fixed/client/phase_orchestrator.py",
+      "deployment": "client-only exact-module import overlay via sitecustomize",
+      "base_sha256": "2754025a891b05348baa8615e04a1c0f10d5fbff2298ad403730dccf12dd8feb",
+      "after_sha256": "20c40e513c15a2a81724de8b32c2f837aaaa4d13f335d0d262620ca21b5f3001"
+    }
+  ]
+}

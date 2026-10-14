@@ -59,6 +59,10 @@ class ManifestWorker(Worker):
                 "speculative": inspect_speculative(spec,
                     int(os.environ["C48_DIAG_DRAFT_TOKENS"]),
                     float(os.environ["C48_DIAG_AL"]))}
+        if os.environ.get("C48_PREFIX_READ_FIXED") == "1":
+            import vllm
+            from pd_prefix_read import verify_overlay
+            data["product_overlay"] = verify_overlay(Path(vllm.__file__).parent)
         out = Path(os.environ["C48_DIAG_DIR"])
         out.mkdir(parents=True, exist_ok=True)
         (out / f'{data["role"]}-rank-{self.rank}.json').write_text(json.dumps(data, indent=2) + "\n")

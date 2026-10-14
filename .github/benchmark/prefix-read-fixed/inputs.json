@@ -1,0 +1,13 @@
+{
+  "suite": "vllm",
+  "case_names": "kimi-k3-vllm-c48-prefix-read-fixed",
+  "run_model_benchmark": "true",
+  "run_all_models": "false",
+  "publish_dashboard": "false",
+  "atomesh_slurm_submit_runner": "atomesh-cicd",
+  "atomesh_slurm_account": "amd-frameworks",
+  "atomesh_slurm_partition": "amd-spur",
+  "atomesh_1p1d_nodes": "auto",
+  "atomesh_image": "vllm/vllm-openai-rocm:nightly-81198e97ba7eee2a22540caaa756b7fdddcb4d93@sha256:a401e4f46872dcde77e07ae3d7fa2d3a71b7f2773714316116532e2b39deb179",
+  "benchmark_concurrency": "48"
+}

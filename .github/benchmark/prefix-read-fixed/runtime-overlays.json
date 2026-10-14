@@ -1,0 +1,30 @@
+[
+  {
+    "source": "vllm/distributed/kv_transfer/kv_connector/factory.py",
+    "payload": ".github/benchmark/prefix-read-fixed/runtime/factory.py",
+    "destination": "/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/factory.py",
+    "base_sha256": "029202ea640823ac5cf9b0517bcc7d28daafde265ceb40eb4c8dd209093103b6",
+    "after_sha256": "5636b3abbd3f8acb7528c2b9f07418e8be9cbb48bcc0f634c5eeb7a871d27a9a"
+  },
+  {
+    "source": "vllm/v1/engine/core.py",
+    "payload": ".github/benchmark/prefix-read-fixed/runtime/core.py",
+    "destination": "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py",
+    "base_sha256": "2cd8a20a47c3f0367d0cbbe6a86cc6a3e89d19315edaf5d206fcdab2fbe62259",
+    "after_sha256": "bd1f3844066c77477b908fbb0dfcf25612005143053d519b0bbaf8c6d8e2b64f"
+  },
+  {
+    "source": "vllm/entrypoints/launchers/api_server/routers.py",
+    "payload": ".github/benchmark/prefix-read-fixed/runtime/routers.py",
+    "destination": "/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/launchers/api_server/routers.py",
+    "base_sha256": "13d35100613098f246674f466c5099e58673d6c43083bde06628cf91bdae6c51",
+    "after_sha256": "41f1b0a191d333a2ba4117303ffa94481adeed2295e2f3b5905f08bc57971910"
+  },
+  {
+    "source": "aiperf/timing/phase_orchestrator.py",
+    "payload": ".github/benchmark/prefix-read-fixed/client/phase_orchestrator.py",
+    "deployment": "client-only exact-module import overlay via sitecustomize",
+    "base_sha256": "2754025a891b05348baa8615e04a1c0f10d5fbff2298ad403730dccf12dd8feb",
+    "after_sha256": "20c40e513c15a2a81724de8b32c2f837aaaa4d13f335d0d262620ca21b5f3001"
+  }
+]
