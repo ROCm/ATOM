@@ -640,6 +640,28 @@ def test_a_fused_fp8_parameter_missing_a_shard_fails_the_update(monkeypatch, pat
     assert not runner._packed_weight_accum
 
 
+@pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
+def test_a_failed_update_while_fenced_does_not_count_toward_lifting_it(path):
+    """Recovering from an aborted stream, an update that failed partway still
+    had its writes counted, so a later update of the rest lifted the fence over
+    a model whose halves came from different syncs."""
+    runner = _fenced(_Runner(_dense_model()))
+    later = _dense_checkpoint(fill=3.0)
+    unfit = {
+        **_dense_checkpoint(fill=2.0),
+        "attn.o_proj.weight": torch.ones(HIDDEN + 1, 4, dtype=torch.bfloat16),
+    }
+
+    with pytest.raises(RuntimeError, match="could not be written"):
+        _direct_reload(runner, path, unfit)
+    _direct_reload(runner, path, {"attn.o_proj.weight": later["attn.o_proj.weight"]})
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+    _direct_reload(runner, path, later)
+    runner.assert_weight_update_ready()
+
+
 def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():
     """A fused FP8 parameter still waiting on a shard was never rewritten, so
     finishing the call is not the same as finishing the reload."""

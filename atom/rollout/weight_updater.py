@@ -155,17 +155,22 @@ class WeightUpdaterMixin:
         so this state now outlives a failed call unless it is explicitly
         cleared. Expert-relayout bookkeeping is recovery state rather than
         scratch and deliberately survives. Parameters already written cannot
-        be rolled back; EngineCore fences serving until a complete sync.
+        be rolled back; EngineCore fences serving until a complete sync, and on
+        a runner already fenced they stop counting toward the reload that
+        lifts its fence.
         """
         if hasattr(self, "_ipc_buffer"):
             self._ipc_buffer = None
-        # An open transaction's shards are its own, and its commit or abort
-        # clears them.
-        if (
-            hasattr(self, "_packed_weight_accum")
-            and getattr(self, "_weight_update_version", None) is None
-        ):
+        # An open transaction's shards and coverage are its own, and its
+        # commit or abort clears them.
+        if getattr(self, "_weight_update_version", None) is not None:
+            return
+        if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
+        # What a failed update wrote may be another version than the writes
+        # that complete the rewrite after it, so only a reload that rewrites
+        # everything afresh lifts a fence.
+        self._reset_reload_coverage()
         # Do not clear _expert_relayout_pending. A weight already written
         # row-major still needs the later complete sync's finalizer to restore
         # the layout its kernel reads, even if that sync does not touch it.
