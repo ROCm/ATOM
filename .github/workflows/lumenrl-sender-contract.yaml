@@ -43,11 +43,12 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ZhangDanyang-AMD/Lumen-RL
-          path: lumenrl
+          path: Lumen-RL
           persist-credentials: false
       - name: Run the sender contract tests
         env:
-          # The checkout's root, which holds the lumenrl/ package: the test
-          # appends lumenrl/engine/inference/... to it.
-          LUMENRL_ROOT: ${{ github.workspace }}/lumenrl
+          # The checkout's root, named after the repository. It holds the
+          # lumenrl/ package, so the sender is at
+          # Lumen-RL/lumenrl/engine/inference/rdma_weight_transfer.py.
+          LUMENRL_ROOT: ${{ github.workspace }}/Lumen-RL
         run: python -m pytest tests/test_rdma_weight_receiver.py -k "sender or snapshot" -rs
