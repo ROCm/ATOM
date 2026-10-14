@@ -122,6 +122,10 @@ class EngineUtilityHandler:
         self.scheduler = scheduler
         self._weight_sync_fenced = False
         self._weight_sync_in_progress = False
+        # From a sync's first update until its FINISH commits it or a discard
+        # ends it. A failed update ends _weight_sync_in_progress but not this:
+        # the sync is not over until its sender discards it.
+        self._weight_sync_open = False
         # Why the current sync can no longer complete. Its later updates and
         # its FINISH are refused while this is set.
         self._weight_sync_failure: str | None = None
@@ -160,6 +164,7 @@ class EngineUtilityHandler:
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
                     self._weight_sync_in_progress = True
+                    self._weight_sync_open = True
                 reply = self._execute_utility_command(cmd, args)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
@@ -206,6 +211,7 @@ class EngineUtilityHandler:
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD:
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
+                    self._weight_sync_open = False
                     self._awaiting_finish = None
                     self._weight_sync_failure = self._weight_sync_failure or str(
                         args.get("error") or args.get("failed_cmd") or "aborted"
@@ -231,6 +237,7 @@ class EngineUtilityHandler:
                     else:
                         self._weight_sync_fenced = False
                         self._weight_sync_in_progress = False
+                        self._weight_sync_open = False
                         self._weight_sync_failure = None
                         self._awaiting_finish = None
                         engine._rl_weights_inconsistent = False
@@ -320,11 +327,13 @@ class EngineUtilityHandler:
 
         try:
             kwargs = dict(args.get("kwargs") or {})
-            if method in WEIGHT_WRITING_RPC_METHODS and self._weight_sync_in_progress:
+            if method in WEIGHT_WRITING_RPC_METHODS and self._weight_sync_open:
                 # Taken between that sync's buckets, or before its FINISH, the
                 # stream committed and the sync's later buckets went on over
-                # it. The runners refuse it, draining it first: refused here,
-                # it would leave the trainer in its first broadcast.
+                # it; taken after a failed bucket, it committed and the sync's
+                # discard then fenced the engine over it. The runners refuse
+                # it, draining it first: refused here, it would leave the
+                # trainer in its first broadcast.
                 kwargs["engine_refusal"] = (
                     f"weight sync {self._sync_id!r} of the direct, SHM or IPC "
                     f"paths is open until its FINISH or discard"
@@ -400,7 +409,7 @@ class EngineUtilityHandler:
             and bool(results)
             and not any(r.get("error") for r in results)
         )
-        if committed and self._weight_sync_in_progress:
+        if committed and self._weight_sync_open:
             return
         if not self._a_runner_is_fenced():
             if committed:
@@ -445,12 +454,13 @@ class EngineUtilityHandler:
         Its id is all that marks a sync's first update. Without one, the rest
         of a failed sync's buckets passed for a new sync and committed.
         """
-        abandoned = self._weight_sync_in_progress
+        abandoned = self._weight_sync_open
         self._sync_id = sync_id
         self._weight_sync_failure = None
         if abandoned:
-            # The previous sync stopped between buckets and was never aborted;
-            # its packed shards and IPC mapping must not carry into this one.
+            # The previous sync stopped between buckets, or failed, and was
+            # never discarded; its packed shards and IPC mapping must not
+            # carry into this one.
             reply = self._discard_failed_update_on_every_rank(
                 "abandoned weight sync", _FAILED_SYNC_CLEANUP_TIMEOUT_S
             )

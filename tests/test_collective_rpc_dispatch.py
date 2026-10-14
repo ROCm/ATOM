@@ -475,10 +475,52 @@ def test_a_committed_weight_stream_lifts_a_fence_a_failed_sync_left():
     engine = _Engine()
     _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
     assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+    # As the failed sync's sender does once it stops.
+    _process_one(h, out, engine, "discard_failed_weight_sync", {})
 
     _stream_rpc(h, out, engine)
 
     assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
+
+
+def test_a_stream_is_refused_until_a_failed_sync_is_discarded():
+    """A failed bucket ended the sync's progress, but not the sync. A stream
+    taken before its discard committed and served, and the discard then
+    fenced the engine again over the model that stream had made whole."""
+    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
+    mgr._replies = _ONE_RANK_FAILED
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
+
+    _stream_rpc(h, out, engine)
+    assert engine._weight_sync_fenced
+    _process_one(h, out, engine, "discard_failed_weight_sync", {})
+    _stream_rpc(h, out, engine)
+
+    sent = [call[1].kwargs for call in mgr.calls if call[0] == "receive_weights_rdma"]
+    assert "'s1'" in sent[0]["engine_refusal"]
+    assert "engine_refusal" not in sent[1]
+    assert not engine._weight_sync_fenced
+
+
+def test_a_new_sync_first_clears_a_failed_one_never_discarded():
+    """A failed bucket ended the sync's progress, so the next sync took the
+    old one for over and cleared nothing: a rank whose own cleanup had failed
+    kept that sync's reload open, for the new sync's buckets to continue."""
+    h, mgr, out = _handler(replies=_ONE_RANK_FAILED)
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("a1", False))
+    mgr.calls.clear()
+
+    mgr._replies = _TWO_RANKS_OK
+    _process_one(
+        h, out, engine, "update_weights_shm", _bucket("b1", True, sync_id="s2")
+    )
+
+    assert [call[0] for call in mgr.calls] == [
+        "discard_failed_weight_sync",
+        "update_weights_from_shm",
+    ]
 
 
 def test_a_committed_weight_stream_leaves_an_open_sync_to_its_finish():
