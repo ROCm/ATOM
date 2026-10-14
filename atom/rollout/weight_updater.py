@@ -385,6 +385,22 @@ class WeightUpdaterMixin:
             self._expert_relayout_pending = {}
         return self._expert_relayout_pending
 
+    def _note_expert_shards(self, module, param_name, expert_ids, shard_ids) -> None:
+        """Register expert slices this sync wrote, for the relayout and, while
+        writes are being counted, for coverage.
+
+        Two records, since a failed update outlasts them differently: its
+        slices still need their layout back, but are no part of whatever
+        reload completes the rewrite after it.
+        """
+        key = (module, param_name)
+        records = [self._pending_expert_relayout.setdefault(key, {})]
+        if self._counting_writes():
+            records.append(self._weight_update_expert_shards.setdefault(key, {}))
+        for record in records:
+            for expert_id in expert_ids:
+                record.setdefault(expert_id, set()).update(shard_ids)
+
     def _apply_expert_weight(
         self,
         name: str,
@@ -437,8 +453,7 @@ class WeightUpdaterMixin:
             )
             # The layout these buffers must end up in is re-established once
             # per sync -- see _finalize_expert_weight_sync.
-            arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
-            arrived.setdefault(expert_id, set()).add(shard_id)
+            self._note_expert_shards(module, param_name, [expert_id], [shard_id])
             return "updated"
         return "skipped"
 
@@ -503,9 +518,7 @@ class WeightUpdaterMixin:
                 expert_id=0,
             )
         # One tensor covers every expert, so every slice of the buffer is new.
-        arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
-        for expert_id in range(param.shape[0]):
-            arrived.setdefault(expert_id, set()).update(shard_ids)
+        self._note_expert_shards(module, param_name, range(param.shape[0]), shard_ids)
         return "updated"
 
     def _apply_named_expert_buffer(
@@ -556,11 +569,9 @@ class WeightUpdaterMixin:
             )
         self._copy_into_param(param, tensor.to(device=self.device, dtype=param.dtype))
         # One tensor covers every expert, so every slice of the buffer is new.
-        arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
-        for expert_id in range(param.shape[0]):
-            arrived.setdefault(expert_id, set()).update(
-                _EXPERT_BUFFER_SHARDS[param_name]
-            )
+        self._note_expert_shards(
+            module, param_name, range(param.shape[0]), _EXPERT_BUFFER_SHARDS[param_name]
+        )
 
     def _check_expert_sync_supported(
         self,
@@ -1225,19 +1236,22 @@ class WeightUpdaterMixin:
     def _relayout_rewritten_experts(self) -> None:
         """Re-establish the expert layout, then credit the slices it covered.
 
-        Read off the relayout bookkeeping before the relayout consumes it: it
-        records exactly which (expert, shard) slices were written, and begin
-        clears it. Credited only once the relayout has returned, since a slice
-        is rewritten when its layout is back rather than when its bytes are;
-        and per expert, so a buffer whose experts arrive over several syncs
-        still adds up to the whole buffer.
+        Credited from what this reload wrote, not from the relayout
+        bookkeeping: that outlasts a failed update, so the shard one wrote
+        would complete a slice whose other shard came from the reload after
+        it. Credited only once the relayout has returned, since a slice is
+        rewritten when its layout is back rather than when its bytes are; and
+        per expert, so a buffer whose experts arrive over several syncs still
+        adds up to the whole buffer.
         """
+        written = getattr(self, "_weight_update_expert_shards", {})
         relaid = []
-        for (module, param_name), arrived in self._pending_expert_relayout.items():
+        for (module, param_name), arrived in written.items():
             whole = _EXPERT_BUFFER_SHARDS[param_name]
             experts = [e for e, shards in arrived.items() if whole <= shards]
             relaid.append((getattr(module, param_name), experts))
         self._finalize_expert_weight_sync()
+        written.clear()
         for buffer, experts in relaid:
             for expert_id in experts:
                 self._credit_reload_part(buffer, expert_id, range(buffer.shape[0]))
@@ -1253,6 +1267,8 @@ class WeightUpdaterMixin:
     def _reset_reload_coverage(self) -> None:
         self._weight_update_written: set[int] = set()
         self._weight_update_parts: dict[int, tuple[frozenset, set]] = {}
+        # (module, param_name) -> {expert_id: shards}; see _note_expert_shards.
+        self._weight_update_expert_shards: dict[tuple, dict[int, set]] = {}
 
     def _discard_reload_scratch(self) -> None:
         """Forget cross-bucket state, so no reload inherits another's."""

@@ -662,6 +662,28 @@ def test_a_failed_update_while_fenced_does_not_count_toward_lifting_it(path):
     runner.assert_weight_update_ready()
 
 
+def test_a_failed_update_leaves_no_expert_shard_for_a_later_one_to_complete():
+    """A failed update's expert shard still waits for its layout. The update
+    after it sent the expert's other shard, and the slice, half from each, was
+    credited as rewritten and could lift the fence."""
+    runner = _fenced(_Runner(_moe_model()))
+    first = "mlp.experts.0.gate_proj.weight"
+
+    def broken():
+        yield first, _expert_checkpoint(experts=[0])[first]
+        raise RuntimeError("the trainer's stream broke")
+
+    with pytest.raises(RuntimeError, match="stream broke"):
+        runner.update_weights(broken())
+    rest = [(n, t) for n, t in _expert_checkpoint().items() if n != first]
+    runner.update_weights(rest)
+
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+    runner.update_weights(list(_expert_checkpoint().items()))
+    runner.assert_weight_update_ready()
+
+
 def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():
     """A fused FP8 parameter still waiting on a shard was never rewritten, so
     finishing the call is not the same as finishing the reload."""
