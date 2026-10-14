@@ -45,8 +45,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
-    use_gfx1250_mxfp4_preshuffle_triton,
-    use_triton_gemm,
+    use_mxfp4_preshuffle_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -403,9 +402,8 @@ class KimiSparseMoeBlock(nn.Module):
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
             fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
-                use_triton_gemm()
-                or use_fp4_non_shuffle_triton_gemm()
-                or use_gfx1250_mxfp4_preshuffle_triton(up_proj_quant_dtype)
+                use_fp4_non_shuffle_triton_gemm()
+                or use_mxfp4_preshuffle_triton_gemm(up_proj_quant_dtype)
             )
             # RMSNorm's generic MXFP4 fusion always emits shuffled scales. Triton
             # needs an M-dependent layout, so its routed path uses the existing

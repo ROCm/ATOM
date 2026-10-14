@@ -64,21 +64,6 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
-def use_gfx1250_mxfp4_preshuffle_triton(
-    params_dtype: torch.dtype,
-    *,
-    arch: str | None = None,
-) -> bool:
-    """Force the consumer compatible with ATOM's stored MXFP4 scale layout."""
-    if params_dtype != dtypes.fp4x2 or use_fp4_non_shuffle_triton_gemm():
-        return False
-    if arch is None:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        arch = get_gfx_runtime()
-    return arch == "gfx1250"
-
-
 def _require_mxfp4_preshuffle_triton() -> Callable:
     global gemm_afp4wfp4_preshuffle
 
@@ -89,7 +74,7 @@ def _require_mxfp4_preshuffle_triton() -> Callable:
             )
         except ImportError as exc:
             raise RuntimeError(
-                "gfx1250 preshuffled MXFP4 requires "
+                "The selected preshuffled MXFP4 backend requires "
                 "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
             ) from exc
         gemm_afp4wfp4_preshuffle = preshuffle_gemm
@@ -136,6 +121,25 @@ else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
+
+
+def use_mxfp4_preshuffle_triton_gemm(
+    params_dtype: torch.dtype,
+    *,
+    arch: str | None = None,
+) -> bool:
+    """Select the consumer compatible with the stored MXFP4 preshuffle layout."""
+    if params_dtype != dtypes.fp4x2 or use_fp4_non_shuffle_triton_gemm():
+        return False
+    if arch is None:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+    return arch == "gfx1250" or (
+        use_triton_gemm() and gemm_afp4wfp4_preshuffle is not None
+    )
+
+
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 
@@ -247,17 +251,8 @@ def gemm_a4w4_quant(
             otype,
             y,
         )
-    # gfx1250 stores per-1x32 FP4 weights with AITER's preshuffled scale
-    # layout. The gfx1250 ASM F4GEMM consumes a different scale permutation,
-    # so this contract always uses the compatible Triton/Gluon backend.
-    elif (
-        params_dtype == dtypes.fp4x2
-        and not use_fp4_non_shuffle_triton_gemm()
-        and (
-            use_gfx1250_mxfp4_preshuffle_triton(params_dtype)
-            or (use_triton_gemm() and gemm_afp4wfp4_preshuffle is not None)
-        )
-    ):
+    # Consume ATOM's stored preshuffled weight/scale layout directly.
+    elif use_mxfp4_preshuffle_triton_gemm(params_dtype):
         preshuffle_gemm = _require_mxfp4_preshuffle_triton()
         m, _ = x.view(-1, x.size(-1)).shape
 

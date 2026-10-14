@@ -33,7 +33,7 @@ from aiter import QuantType, dtypes
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
     LinearBase,
-    use_gfx1250_mxfp4_preshuffle_triton,
+    use_mxfp4_preshuffle_triton_gemm,
     weight_is_stored_preshuffled,
 )
 from atom.rollout.weight_updater import WeightUpdaterMixin
@@ -111,26 +111,30 @@ def test_unquantized_and_per_tensor_are_not_shuffled():
     assert weight_is_stored_preshuffled(QuantType.per_Tensor, dtypes.fp8) is False
 
 
-def test_gfx1250_mxfp4_preshuffle_always_uses_triton(monkeypatch):
+def test_mxfp4_preshuffle_selects_a_compatible_backend(monkeypatch):
     monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: False)
-    assert use_gfx1250_mxfp4_preshuffle_triton(dtypes.fp4x2, arch="gfx1250")
-    assert not use_gfx1250_mxfp4_preshuffle_triton(dtypes.fp4x2, arch="gfx950")
-    assert not use_gfx1250_mxfp4_preshuffle_triton(dtypes.fp8, arch="gfx1250")
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: False)
+    assert use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx1250")
+    assert not use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx950")
+    assert not use_mxfp4_preshuffle_triton_gemm(dtypes.fp8, arch="gfx1250")
+
+    monkeypatch.setattr(linear_mod, "use_triton_gemm", lambda: True)
+    monkeypatch.setattr(linear_mod, "gemm_afp4wfp4_preshuffle", object())
+    assert use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx950")
 
 
 def test_nonshuffle_fp4_override_keeps_its_existing_backend(monkeypatch):
     monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
-    assert not use_gfx1250_mxfp4_preshuffle_triton(dtypes.fp4x2, arch="gfx1250")
+    assert not use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2, arch="gfx1250")
 
 
 def test_forced_gfx1250_triton_uses_legacy_m_dependent_activation_layout(monkeypatch):
     from atom.models import deepseek_v2
 
     monkeypatch.setattr(deepseek_v2, "use_fp4_non_shuffle_triton_gemm", lambda: False)
-    monkeypatch.setattr(deepseek_v2, "use_triton_gemm", lambda: False)
     monkeypatch.setattr(
         deepseek_v2,
-        "use_gfx1250_mxfp4_preshuffle_triton",
+        "use_mxfp4_preshuffle_triton_gemm",
         lambda dtype: dtype == dtypes.fp4x2,
     )
 
