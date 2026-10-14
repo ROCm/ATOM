@@ -2,19 +2,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The generated engine_v1 binding, checked against the .proto it came from.
 
-engine_v1_pb2.py is generated at install time (setup.py) and not checked in.
-Import it through here: a missing or stale binding then fails with how to fix
-it, instead of as a bare ImportError or as messages the peer cannot read.
+engine_v1_pb2.py is generated from engine_v1.proto and checked in. Import it
+through here: a binding left stale by a .proto edit then fails with how to fix
+it, instead of as messages the peer cannot read.
 """
 
 import hashlib
 from pathlib import Path
 
 _PROTO = Path(__file__).with_name("engine_v1.proto")
-_HINT = (
-    "regenerate it with `python atom/model_engine/protocol/generate.py`, "
-    "or reinstall ATOM (`pip install -e .`)"
-)
+_HINT = "regenerate it with `python atom/model_engine/protocol/generate.py`"
 
 try:
     import atom.model_engine.protocol.engine_v1_pb2 as pb
