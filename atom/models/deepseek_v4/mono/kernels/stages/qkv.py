@@ -284,7 +284,20 @@ def qkv_stages(ctx):
     def window_pool(p, j_tok, ring, launch, own):
         """Online softmax over the compressor window ending at p -> (den, num). Element i
         comes from the ring, this token (``own``), or, for a token d back in this launch,
-        its mailbox (``launch``): its state write may not be visible yet."""
+        its mailbox (``launch``): its state write may not be visible yet. With overlapping
+        windows (CSA) the first one reaches before position 0; those ring rows are masked,
+        as ATOM's compressor masks them: a reused state slot still holds its previous
+        request's rows there. A window of CR rows (HCA) starts at a boundary, never before 0.
+        """
+        if const_expr(OVERLAP):
+            read_ring = ring
+
+            def ring(i):
+                sv, kv = read_ring(i)
+                live = p + 1 - C_ROWS + i >= 0
+                return live.select(sv, fx.Float32(NEG)), live.select(
+                    kv, fx.Float32(0.0)
+                )
 
         def fold(acc, svs, kvs):
             m, den, num = acc
