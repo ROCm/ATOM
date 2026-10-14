@@ -12,11 +12,10 @@
   "blockers": [],
   "local_review": {
     "passed": true,
-    "scope": "Pinned product, shared-MR observer and runtime/phase wiring reviewed; parent independently reran focused CPU tests and qualified-pool tests",
+    "scope": "Pinned product, shared-MR observer and runtime/phase wiring reviewed; parent independently reran focused CPU tests",
     "runtime_test_limit": "Actual EngineCore utility codec is tested; worker collective uses substitutes, not eight spawned GPU processes",
     "gpu_verified": false,
     "pending_runtime_gates": [
-      "qualified pool",
       "allocated-host resources and pristine image",
       "warmup observation and all-rank restoration",
       "merged D8 mechanism PASS",
@@ -72,22 +71,7 @@
     "minimum_free_bytes_uncached": 214748364800,
     "minimum_free_bytes_cached": 42949672960,
     "cgroup_headroom_checked": true,
-    "pre_sbatch_qualification": {
-      "selector": ".github/scripts/atomesh/pd_prefix_pool.py",
-      "selection": "all qualified candidates; scheduler chooses exactly 2; no fixed pair",
-      "storage_threshold_bytes": 214748364800,
-      "memory_threshold_all_candidates": 1867719476736,
-      "source": "readonly scontrol inventory + node-exporter fresh filesystem/MemAvailable metrics",
-      "default_root_assumptions": [
-        "/var/lib/docker",
-        "/var/lib/containerd",
-        "/tmp"
-      ],
-      "run_dir": "actual LOG_ROOT supplied at submission; longest matching exported mount",
-      "limitations": "mount coverage does not prove directory existence or actual Docker root/cgroup; allocated-host authoritative preflight retained",
-      "hardware_schema_evidence": "/app/test_scripts/dspark_pd/inspect-current-38177061854/atomesh-inspection-38174661539-38177061854/node-details.txt (Partitions and 8 repeated gpu:mi355x:1 Gres entries)",
-      "spur_pool_evidence": "/app/test_scripts/dspark_pd/inspect-current-36112312705/atomesh-inspection-36111010819-36112312705/job-4447.txt (17 requested nodes; actual g07,g09; NumNodes=2)"
-    }
+    "allocation": "sbatch --nodes 2 --gres gpu:8 in the agreed account/partition/QoS, empty NODE_LIST (no -w); resource checks run on the allocated hosts only"
   },
   "observer": {
     "installed": true,
@@ -138,13 +122,11 @@
     ".github/scripts/atomesh/pd_server_atom.sh": "8072434dbf9e9e01575da874396cabbe9239be315d3c4a48c2b16bc264e08de7",
     ".github/scripts/atomesh/pd_server_vllm.sh": "697d48d48d3f8f1ba771edbe28533a6e8199999fc5a1886fc94269f23ae374ee",
     ".github/scripts/atomesh/pd_slurm_job.sh": "5e27ddcafd3a55870eace490400f9560d92691b4b2a6bfe81d8738967f3fb835",
-    ".github/scripts/atomesh/pd_submit.sh": "1d38b19d2647a59a87e720f45d9a1cd0f0a158e5bb6a741bfd1cedf35a647334",
+    ".github/scripts/atomesh/pd_submit.sh": "4a953166feccab7066fac82810da365de982b0d003c99765ffa88cd3ebd7ee19",
     ".github/workflows/atomesh-benchmark.yaml": "51b73490957a48806802733294d16a0dc2aafb8f24a6e30a3a70f7d3918b0c77",
     "tests/test_prefix_read_harness.py": "33c24bcdd415d2f7352bf31bf24b2681e6c68954ccbb081b89b0595357b350bc",
     "tests/test_prefix_read_lifecycle.py": "e58abd91c966b217f48d2ee14fd6af30d3b40f0bde0cc57ff47192f05ddf890c",
     "tests/test_prefix_read_runtime_integration.py": "904417b912a33727d7f81cd76871850ad654b059777173527911e17a6f7e1bd2",
-    ".github/scripts/atomesh/pd_prefix_pool.py": "bb6c7550a5819703a6ba3d8e0adf672e62d643ef54d8487a8239e46483ec6f5e",
-    "tests/test_prefix_read_pool.py": "8beb48f33eed9645d6f308194469331cb64d14fd7cd317a3363534617359df24",
     ".github/scripts/slurm_submit_helpers.sh": "a6f8e4ba1a896adb68e080de0afa0e0dfedbe94fe3b89fa8afd92500c961f377"
   },
   "runtime_overlays": [

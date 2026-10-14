@@ -370,24 +370,11 @@ fi
 
 if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == "prefix-read-fixed" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read.py" require-ready
-  # PREFIX_READ_POOL_BEGIN
-  pool_args=(--partition "${SLURM_PARTITION}" --run-dir "${LOG_ROOT}"
-    --output "${RESULT_DIR}/${ATOMESH_CELL_ID}-eligibility.json"
-    --cell-output "${RESULT_DIR}/${ATOMESH_CELL_ID}-qualified-cell.json")
-  if [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${SPUR_CONTROLLER_ADDR}" ]]; then
-    pool_args+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  # A non-empty NODE_LIST becomes -w/--exclude; the scheduler must pick both nodes.
+  if [[ -n "${NODE_LIST}" ]]; then
+    echo "prefix READ case requires scheduler allocation, got NODE_LIST=${NODE_LIST}" >&2
+    exit 1
   fi
-  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_pool.py" "${pool_args[@]}"
-  CELL_JSON="$(python3 - "${RESULT_DIR}/${ATOMESH_CELL_ID}-qualified-cell.json" <<'PYPOOL'
-import json, sys
-print(json.dumps(json.load(open(sys.argv[1]))))
-PYPOOL
-)"
-  NODE_LIST="$(python3 -c 'import json,os; print(",".join(json.loads(os.environ["CELL_JSON"])["nodes"]))')"
-  export CELL_JSON NODE_LIST
-  # NUM_NODES remains exactly two; NODE_LIST is the complete eligible pool.
-  echo "prefix_read_eligible_pool=${NODE_LIST} required_nodes=${NUM_NODES}"
-  # PREFIX_READ_POOL_END
 fi
 mkdir -p "${LOG_ROOT}"
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
