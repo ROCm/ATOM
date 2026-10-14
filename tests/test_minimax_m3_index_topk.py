@@ -22,6 +22,8 @@ abort the run for every other test as well.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -972,6 +974,60 @@ class TestPrefillScoreAgainstTheDefinition:
         ).to(kw["index_kv_cache"].dtype)
         moved, _ = _prefill_score(kw, 2, backend)
         assert not torch.allclose(moved[live], want[live], rtol=2e-2, atol=2e-2)
+
+
+def test_the_vllm_pool_allocator_refuses_bf16_by_name():
+    """The refusal that matters most: it happens before anything is allocated.
+
+    `_resolve_index_cache_dtype` runs when the KV pool is sized. Without this
+    the same configuration starts, serves a prefill and dies at the first
+    decode inside aiter, which names neither the flag nor ATOM as the refuser.
+
+    Pinned because a refusal nothing watches is one refactor from disappearing,
+    and this one is the whole of the fp8 narrowing on the vLLM/native path.
+    """
+    from atom.model_ops.attentions.aiter_attention import _resolve_index_cache_dtype
+
+    # explicit bf16
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        _resolve_index_cache_dtype(SimpleNamespace(index_cache_dtype="bf16"))
+    # and the case nobody passes a flag for: inherited from --kv_cache_dtype
+    with pytest.raises(ValueError, match="inherited from --kv_cache_dtype"):
+        _resolve_index_cache_dtype(
+            SimpleNamespace(index_cache_dtype=None, kv_cache_dtype="bf16")
+        )
+    # fp8 still resolves, so the guard is not refusing everything
+    assert (
+        _resolve_index_cache_dtype(SimpleNamespace(index_cache_dtype="fp8"))
+        == aiter.dtypes.fp8
+    )
+
+
+def test_the_sglang_pool_refuses_bf16_by_name():
+    """The same refusal, at the same stage, on the other front end.
+
+    SGLang does not go through `_resolve_index_cache_dtype`; it resolves the
+    index dtype itself in `_atom_m3_index_dtype`, called from `configure`
+    before weights load. Left unguarded that path kept the old behaviour --
+    start, then die at the first decode -- which is the one thing the narrowing
+    exists to prevent.
+    """
+    from atom.plugin.sglang.minimax_m3_bridge import _atom_m3_index_dtype
+
+    bf16_owner = SimpleNamespace(
+        model_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="bfloat16",
+    )
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        _atom_m3_index_dtype(bf16_owner)
+    # an fp8 KV cache still resolves, through the fallback this guard sits after
+    fp8_owner = SimpleNamespace(
+        model_dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype_str="fp8_e4m3",
+    )
+    assert _atom_m3_index_dtype(fp8_owner) == aiter.dtypes.fp8
 
 
 @gpu

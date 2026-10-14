@@ -4,7 +4,6 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-import aiter
 import pytest
 import torch
 import torch.nn.functional as F
@@ -255,6 +254,11 @@ def test_qsa_real_requests_change_within_and_between_buckets():
 
 
 def test_m3_context_and_batch_reuse_kernels():
+    # aiter imported here and not at module scope: the only CI job that runs
+    # tests/ has no aiter, and a module-scope import makes this whole file a
+    # collection error there instead of the skip the importorskip above sets up.
+    import aiter
+
     from atom.model_ops.minimax_m3 import indexer_candidate_exchange as ex
     from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
 
