@@ -83,10 +83,9 @@ def replayable(forward, num_tokens: int) -> bool:
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
     row, and so do padded steps. Under DP attention a prefill replays only
-    when the group can agree on each stage's token counts
-    (`dp_stage_sync_enabled`): DP's MoE collectives are sized by every rank's
-    token count, which a rank-local tail changes, so the ranks first share
-    their decoder and last-layer counts (`sync_dp_stage_tokens`).
+    when the step's DP sync carried the group's per-stage token counts
+    (`dp_stage_tokens`): DP's MoE collectives are sized by every rank's
+    count, which a rank-local tail changes.
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
@@ -97,8 +96,8 @@ def replayable(forward, num_tokens: int) -> bool:
         or forward.ubatch_slices is not None
     ):
         return False
-    if getattr(forward, "dp_metadata", None) is not None and not (
-        dp_stage_sync_enabled(forward)
+    if getattr(forward, "dp_metadata", None) is not None and (
+        dp_stage_tokens(forward) is None
     ):
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
@@ -114,28 +113,6 @@ def replayable(forward, num_tokens: int) -> bool:
         or num_tokens != step.width
         or step.width != step.scheduled
     )
-
-
-def dp_stage_sync_enabled(forward) -> bool:
-    """Whether the DP group shares per-stage token counts this forward.
-
-    Agreed by every rank: each condition is a group decision -- an eager,
-    variable-length step (`running_tokens_are_unified` is off on all ranks
-    once any rank prefills) that TBO did not split. A decode-only step pads
-    every rank to one height and never replays; a TBO-split step runs
-    microbatches, which compute every row.
-    """
-    context = forward.context
-    if (
-        context is None
-        or getattr(forward, "dp_metadata", None) is None
-        or context.running_tokens_are_unified
-        or forward.ubatch_slices is not None
-    ):
-        return False
-    from atom.utils.tbo.ubatching import tbo_active
-
-    return not tbo_active()
 
 
 @dataclass(frozen=True)
@@ -156,43 +133,67 @@ class DPStageTokens:
     decoder_active: bool = True
 
 
-def sync_dp_stage_tokens(
-    forward,
-    decoder_tokens: int,
-    last_layer_tokens: int,
-    *,
-    replaying: bool,
-    decoder_active: bool,
-) -> DPStageTokens | None:
-    """Share this rank's decoder and last-layer token counts with the DP group.
+# Rows a DP rank without decoder work of its own runs through the decoder to
+# join a peer's MoE collectives (`placeholder_rows_of`). Two, not one: the
+# decoder graph is compiled dynamic in its rows, and one row would specialize it.
+DP_PLACEHOLDER_TOKENS = 2
 
-    One CPU all_reduce of ``4 x dp_size`` int32, issued by every rank of a
-    forward for which `dp_stage_sync_enabled` holds (decode ranks and dummy
-    runs of a prefill step included). Besides the counts each rank reports
-    whether it replays and whether it has decoder work, so the group decides
-    from explicit flags rather than from whether the counts changed (a
-    placeholder count can equal a rank's own).
 
-    None when no rank replays: the caller keeps the step's own DP table.
+def placeholder_tokens(num_tokens: int) -> int:
+    return min(DP_PLACEHOLDER_TOKENS, num_tokens)
+
+
+def tail_lengths(lengths, window: int) -> np.ndarray:
+    """Each finishing request's replayed rows: its last ``window`` rows."""
+    return np.minimum(np.asarray(lengths), window)
+
+
+def local_stage_tokens(
+    lengths, finals, window: int, num_tokens: int, *, replaying: bool
+) -> tuple[int, int, int, int]:
+    """This rank's row for the step's DP sync: ``(decoder tokens, last-layer
+    tokens, replaying, decoder active)``.
+
+    Computed from the batch before the step's metadata exists, and the same
+    counts `plan_stage_tokens` reads off the replay plan afterwards. A rank
+    that does not replay runs all its rows through both stages; one that
+    replays runs each finishing request's tail through the decoder and its
+    last row through layer 39, or placeholder rows when nothing finishes.
     """
-    import torch.distributed as dist
+    if not replaying:
+        return num_tokens, num_tokens, 0, 1
+    tails = tail_lengths(lengths, window)[np.asarray(finals, dtype=bool)]
+    if not len(tails):
+        placeholder = placeholder_tokens(num_tokens)
+        return placeholder, placeholder, 1, 0
+    return int(tails.sum()), len(tails), 1, 1
 
-    num_ranks = len(forward.dp_metadata.get_sizes_across_dp())
-    # The slot `DPMetadata.num_tokens_across_dp` fills, so the tables line up.
-    rank = _data_parallel_rank()
-    table = torch.zeros((4, num_ranks), dtype=torch.int32)
-    table[:, rank] = torch.tensor(
-        [decoder_tokens, last_layer_tokens, int(replaying), int(decoder_active)],
-        dtype=torch.int32,
-    )
-    dist.all_reduce(table, group=_dp_cpu_group())
-    if not bool(table[2].any()):
+
+def plan_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
+    """The decoder and last-layer tokens this rank's forward will run."""
+    if plan is None:
+        return num_tokens, num_tokens
+    if plan.tail is None:
+        placeholder = placeholder_tokens(num_tokens)
+        return placeholder, placeholder
+    return plan.tail.scheduled, len(plan.tail.requests)
+
+
+def dp_stage_tokens(forward) -> DPStageTokens | None:
+    """The group's per-stage token counts, from the step's DP sync.
+
+    None outside DP, and on any step where no rank replays, TBO split the
+    step, or no rank prefills: `sync_dp_metadata` carries the table only
+    when every rank must follow it, so the decision is the group's.
+    """
+    if getattr(forward, "dp_metadata", None) is None:
         return None
-    return DPStageTokens(
-        tuple(table[0].tolist()),
-        tuple(table[1].tolist()),
-        decoder_active=bool(table[3].any()),
-    )
+    mode = getattr(forward.context, "forward_mode", None)
+    rows = getattr(getattr(mode, "sync", None), "stage_tokens_across_dp", None)
+    if rows is None:
+        return None
+    decoder, last_layer, _, active = rows
+    return DPStageTokens(decoder, last_layer, decoder_active=any(active))
 
 
 @contextlib.contextmanager
@@ -211,12 +212,6 @@ def placeholder_rows_of(metadata, rows):
         yield
     finally:
         metadata.step, metadata.queries, metadata.image_mask = outer
-
-
-def _dp_cpu_group():
-    from aiter.dist.parallel_state import get_dp_group
-
-    return get_dp_group().cpu_group
 
 
 def _data_parallel_rank() -> int:
@@ -304,7 +299,7 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     (their compression ran over ``step``). Laid out on the host and uploaded
     in one copy per dtype."""
     picks = [
-        (span, min(span.length, window), i)
+        (span, int(tail_lengths(span.length, window)), i)
         for i, span in enumerate(step.requests)
         if step.request_finals[i]
     ]

@@ -293,13 +293,10 @@ def _forward(lengths, **overrides):
         ({"ctx.is_dummy_run": True}, False),
         ({"ctx.is_draft": True}, False),
         ({"fwd.ubatch_slices": [object()]}, False),
-        # DP attention replays once the group trades its rows per stage ...
-        ({"fwd.dp_metadata": object()}, True),
-        # ... which a padded, unified group step never does
-        (
-            {"fwd.dp_metadata": object(), "ctx.running_tokens_are_unified": True},
-            False,
-        ),
+        # DP attention replays when the step's sync carried a stage table ...
+        ({"fwd.dp_metadata": object(), "ctx.forward_mode": "table"}, True),
+        # ... and not when it did not (no rank replays, or TBO split the step)
+        ({"fwd.dp_metadata": object()}, False),
         ({"step.decode": True}, False),
         # image rows replay: the router reads its rows' slice of the mask
         ({"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, True),
@@ -307,6 +304,13 @@ def _forward(lengths, **overrides):
     ],
 )
 def test_only_an_unpadded_prefill_replays(overrides, expected):
+    if overrides.get("ctx.forward_mode") == "table":
+        overrides = {
+            **overrides,
+            "ctx.forward_mode": SimpleNamespace(
+                sync=SimpleNamespace(stage_tokens_across_dp=((128,), (1,), (1,), (1,)))
+            ),
+        }
     forward = _forward([500], **overrides)
     assert replayable(forward, 500) == expected
 
@@ -399,7 +403,7 @@ def test_a_replayed_history_marks_image_positions_dead(image):
     assert sorted(histories[1].tolist()) == ([5, 7] if image is None else [-1, 5])
 
 
-# ── DP attention: the group agrees on each stage's MoE rows ──────────────
+# ── DP attention: the step's DP sync carries each stage's token counts ───
 
 
 class _DPMeta:
@@ -410,105 +414,106 @@ class _DPMeta:
         return list(self.sizes)
 
 
-def _dp_forward(sizes, rank, monkeypatch):
+def _with_stage_rows(forward, rows):
+    """The step's `ForwardMode.sync` carrying `rows` (None: no rank replays)."""
+    sync = SimpleNamespace(stage_tokens_across_dp=rows)
+    forward.context.forward_mode = SimpleNamespace(sync=sync)
+    return forward
+
+
+def _dp_forward(sizes, rank, monkeypatch, rows=None):
     from atom.models.deepseek_v41 import bounded_replay
 
     monkeypatch.setattr(bounded_replay, "_data_parallel_rank", lambda: rank)
-    monkeypatch.setattr(bounded_replay, "_dp_cpu_group", lambda: None)
     context = SimpleNamespace(
         scheduled_tokens=sizes[rank],
         running_tokens_across_dp=tuple(sizes),
         running_tokens_are_unified=False,
     )
-    return SimpleNamespace(
+    forward = SimpleNamespace(
         context=context, dp_metadata=_DPMeta(sizes), ubatch_slices=None
     )
+    return _with_stage_rows(forward, rows)
 
 
-def _fake_all_reduce(peer_columns):
-    """`dist.all_reduce(SUM)` with the peers' columns already filled in:
-    rank -> (decoder tokens, last-layer tokens, replaying, decoder active)."""
+@pytest.mark.parametrize(
+    "replaying, lengths, finals, expected",
+    [
+        # a decoding (or dummy) rank runs all its rows through both stages
+        (False, [40], [True], (40, 40, 0, 1)),
+        # two finishing prompts: tails capped at the window, one row each
+        (True, [500, 64], [True, True], (128 + 64, 2, 1, 1)),
+        # a non-final chunk: placeholder rows, no decoder work of its own
+        (True, [16384], [False], (2, 2, 1, 0)),
+        # a 1-row non-final chunk: one placeholder row
+        (True, [1], [False], (1, 1, 1, 0)),
+    ],
+)
+def test_a_rank_reports_its_stage_tokens_from_the_batch(
+    replaying, lengths, finals, expected
+):
+    from atom.models.deepseek_v41.bounded_replay import local_stage_tokens
 
-    def all_reduce(table, group=None):
-        for rank, column in peer_columns.items():
-            table[:, rank] += torch.tensor(column, dtype=table.dtype)
-
-    return all_reduce
+    got = local_stage_tokens(lengths, finals, 128, sum(lengths), replaying=replaying)
+    assert got == expected
 
 
-def _sync(monkeypatch, sizes, rank, peers, *tokens, replaying, active):
-    import torch.distributed as dist
+@cuda
+def test_the_plan_runs_what_the_rank_reported():
+    """The counts a rank reports from its batch are the counts its replay plan
+    runs, or its peers' collectives would wait on rows it never sends."""
+    from atom.models.deepseek_v41.bounded_replay import (
+        local_stage_tokens,
+        plan_stage_tokens,
+    )
 
-    from atom.models.deepseek_v41.bounded_replay import sync_dp_stage_tokens
+    cache = _cache(pages=128)
+    lengths, finals = [300, 200, 5], [True, False, True]
+    step = _forward_step(cache, lengths, [0, 0, 64], finals)
+    plan = build_replay_plan(step, 128)
+    reported = local_stage_tokens(lengths, finals, 128, 505, replaying=True)
+    assert plan_stage_tokens(plan, 505) == reported[:2] == (133, 2)
+    idle = _forward_step(cache, [300], [0], [False])
+    assert plan_stage_tokens(build_replay_plan(idle, 128), 300) == (2, 2)
+    assert local_stage_tokens([300], [False], 128, 300, replaying=True)[:2] == (2, 2)
+    assert plan_stage_tokens(None, 40) == (40, 40)
 
-    forward = _dp_forward(sizes, rank, monkeypatch)
-    monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce(peers))
-    return sync_dp_stage_tokens(
-        forward, *tokens, replaying=replaying, decoder_active=active
+
+def test_the_group_table_comes_from_the_steps_dp_sync(monkeypatch):
+    from atom.models.deepseek_v41.bounded_replay import DPStageTokens, dp_stage_tokens
+
+    # rank 0 replays a 128-row tail of one request; rank 1 decodes 40 rows
+    rows = ((128, 40), (1, 40), (1, 0), (1, 1))
+    forward = _dp_forward([500, 40], 0, monkeypatch, rows)
+    assert dp_stage_tokens(forward) == DPStageTokens(
+        (128, 40), (1, 40), decoder_active=True
     )
 
 
-def test_the_group_shares_decoder_and_last_layer_tokens(monkeypatch):
-    from atom.models.deepseek_v41.bounded_replay import DPStageTokens
+def test_no_table_means_no_rank_replays(monkeypatch):
+    from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
 
-    # rank 1 decodes (all its rows); this rank replays a 128-row tail
-    got = _sync(
-        monkeypatch,
-        [500, 40],
-        0,
-        {1: (40, 40, 0, 1)},
-        128,
-        1,
-        replaying=True,
-        active=True,
-    )
-    assert got == DPStageTokens((128, 40), (1, 40), decoder_active=True)
-
-
-def test_no_replay_anywhere_keeps_the_steps_own_table(monkeypatch):
-    got = _sync(
-        monkeypatch,
-        [500, 40],
-        0,
-        {1: (40, 40, 0, 1)},
-        500,
-        500,
-        replaying=False,
-        active=True,
-    )
-    assert got is None
+    assert dp_stage_tokens(_dp_forward([500, 40], 0, monkeypatch, None)) is None
 
 
 def test_a_group_with_no_decoder_work_skips_the_decoder(monkeypatch):
     """Every rank is on a non-final chunk: nobody has a tail, so no rank runs
     placeholder rows through layers 20..39."""
-    got = _sync(
-        monkeypatch,
-        [16384, 16384],
-        0,
-        {1: (2, 2, 1, 0)},
-        2,
-        2,
-        replaying=True,
-        active=False,
-    )
+    from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
+
+    rows = ((2, 2), (2, 2), (1, 1), (0, 0))
+    got = dp_stage_tokens(_dp_forward([16384, 16384], 0, monkeypatch, rows))
     assert got is not None and not got.decoder_active
 
 
 def test_a_placeholder_count_equal_to_the_ranks_own_still_replays(monkeypatch):
     """A 2-row non-final prefill beside a decoding peer: the placeholder count
-    equals the rank's own, yet the group must still run the replay plan --
-    the peer runs its decoder and counts on this rank's collectives."""
-    got = _sync(
-        monkeypatch,
-        [2, 40],
-        0,
-        {1: (40, 40, 0, 1)},
-        2,
-        2,
-        replaying=True,
-        active=False,
-    )
+    equals the rank's own, yet the table still drives the group, since the
+    replay decision is an explicit flag, not a changed count."""
+    from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
+
+    rows = ((2, 40), (2, 40), (1, 0), (0, 1))
+    got = dp_stage_tokens(_dp_forward([2, 40], 0, monkeypatch, rows))
     assert got is not None and got.decoder_active
     assert got.decoder == (2, 40) and got.last_layer == (2, 40)
 
@@ -536,7 +541,6 @@ def test_a_placeholder_step_cuts_the_image_mask_to_its_rows():
 
 
 def test_dp_token_counts_size_the_moe_gather_and_restore_it(monkeypatch):
-    from atom.models.deepseek_v41 import bounded_replay
     from atom.models.deepseek_v41.bounded_replay import dp_token_counts
 
     forward = _dp_forward([500, 40], 1, monkeypatch)
@@ -556,20 +560,3 @@ def test_dp_token_counts_size_the_moe_gather_and_restore_it(monkeypatch):
     assert forward.context.running_tokens_across_dp == (500, 40)
     with dp_token_counts(forward, None):  # outside DP replay: nothing changes
         assert forward.dp_metadata is outer
-    assert bounded_replay  # module import kept for monkeypatching
-
-
-@pytest.mark.parametrize(
-    "overrides, expected",
-    [
-        ({}, True),
-        ({"ctx.running_tokens_are_unified": True}, False),  # decode-only group
-        ({"fwd.ubatch_slices": [object()]}, False),  # TBO split
-        ({"fwd.dp_metadata": None}, False),  # one rank: nothing to trade
-    ],
-)
-def test_the_group_syncs_only_on_an_eager_unsplit_dp_step(overrides, expected):
-    from atom.models.deepseek_v41.bounded_replay import dp_stage_sync_enabled
-
-    forward = _forward([500], **{"fwd.dp_metadata": object(), **overrides})
-    assert dp_stage_sync_enabled(forward) == expected

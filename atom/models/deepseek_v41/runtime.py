@@ -15,32 +15,24 @@ from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
 from .bounded_replay import (
+    _data_parallel_rank,
     build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
-    dp_stage_sync_enabled,
+    dp_stage_tokens,
     dp_token_counts,
     late_layer_start,
     placeholder_rows_of,
+    placeholder_tokens,
+    plan_stage_tokens,
     replayable,
     rows_of,
-    sync_dp_stage_tokens,
 )
 from .config import validate_tbo_parallelism
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
 
 logger = logging.getLogger("atom")
-
-# Rows a DP rank whose prefill finishes no prompt runs through the decoder to
-# join its peers' MoE collectives (`DeepseekV41RuntimeModel._join_decoder_collectives`).
-# Two, not one: the decoder graph is compiled dynamic in its rows, and a
-# one-row input would specialize it.
-_DP_PLACEHOLDER_TOKENS = 2
-
-
-def _dp_placeholder_tokens(num_tokens: int) -> int:
-    return min(_DP_PLACEHOLDER_TOKENS, num_tokens)
 
 
 def _fake_layer_output(hidden, layer_name):
@@ -313,7 +305,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             step = forward.attn_metadata.step
             window = forward.attn_metadata.cache.geometry.window_size
             plan = step.replay = build_replay_plan(step, window)
-        dp_tokens = self._sync_dp_stage_tokens(forward, plan, num_tokens)
+        dp_tokens = self._dp_stage_tokens(forward, plan, num_tokens)
         if plan is not None:
             return self._replayed(state, num_tokens, plan, dp_tokens)
         with dp_token_counts(forward, dp_tokens and dp_tokens.decoder):
@@ -323,26 +315,27 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    def _sync_dp_stage_tokens(self, forward, plan, num_tokens):
-        """Under DP attention, the group's tokens past the decoder's KV source.
+    def _dp_stage_tokens(self, forward, plan, num_tokens):
+        """Under DP attention, the group's tokens past the decoder's KV source,
+        as the step's DP sync agreed them (`dp_stage_tokens`). None outside DP
+        or when no rank replays.
 
-        A replaying rank runs the decoder on its tail and layer 39 on its last
-        rows; one without a tail joins each MoE collective on
-        `_dp_placeholder_tokens` rows (`_join_decoder_collectives`) if any
-        rank has decoder work; a rank that does not replay runs all its rows.
-        None outside DP, or when no rank replays."""
-        if not dp_stage_sync_enabled(forward):
+        This rank reported its counts from the batch before the step's
+        metadata existed (`DeepseekV41MetadataBuilder.dp_stage_tokens`); the
+        plan built here must run exactly those, or its peers' collectives
+        would wait on rows it never sends."""
+        tokens = dp_stage_tokens(forward)
+        if tokens is None:
             return None
-        if plan is None:
-            tokens, active = (num_tokens, num_tokens), True
-        elif plan.tail is None:
-            placeholder = _dp_placeholder_tokens(num_tokens)
-            tokens, active = (placeholder, placeholder), False
-        else:
-            tokens, active = (plan.tail.scheduled, len(plan.tail.requests)), True
-        return sync_dp_stage_tokens(
-            forward, *tokens, replaying=plan is not None, decoder_active=active
-        )
+        rank = _data_parallel_rank()
+        expected = (tokens.decoder[rank], tokens.last_layer[rank])
+        actual = plan_stage_tokens(plan, num_tokens)
+        if actual != expected:
+            raise RuntimeError(
+                f"DP rank {rank} runs {actual} decoder/last-layer tokens but "
+                f"reported {expected} to its DP group"
+            )
+        return tokens
 
     def _replayed(self, state, num_tokens, plan, dp_tokens=None):
         """The forward's rows cut as `bounded_replay` lays them out: layer 20
@@ -390,13 +383,13 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
         A rank whose prefill finishes no prompt runs none of the decoder, but
         while a peer has decoder work its MoE gathers count on this rank once
-        per layer. It runs the decoder on `_dp_placeholder_tokens` of its rows
+        per layer. It runs the decoder on `placeholder_tokens` of its rows
         under a request-less step (`placeholder_rows_of`): attention returns
         zeros and writes no cache, so the rows only feed the collectives, and
         their output is dropped."""
         metadata = forward.attn_metadata
         rows = torch.arange(
-            _dp_placeholder_tokens(normed.shape[1]),
+            placeholder_tokens(normed.shape[1]),
             dtype=torch.int32,
             device=normed.device,
         )
