@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791917175598,
+  "lastUpdate": 1791997605126,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -3969,6 +3969,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8992,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38429714525 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610131505 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1842 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "amd-ruitang3",
+            "username": "amd-ruitang3",
+            "email": "145657428+amd-ruitang3@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "6e9b3e1c5b50b9e6a3b2f8bcf651a9b0229d3ac0",
+          "message": "feat(openai): accept an OpenAI-spec token-array `prompt` on /v1/completions (#2578)\n\nThe OpenAI completions API lets `prompt` be a string, an array of strings,\nan array of token ids, or an array of token arrays. We only accepted a\nstring, so any client sending the token-array form was rejected by pydantic\nwith \"Input should be a valid string\" (HTTP 422) before reaching the engine.\n\nATOM already supports a pre-tokenized prompt, but only under the\nnon-standard `prompt_token_ids` field, which spec-conforming clients do not\nsend. This was found while bringing up the MLCommons Endpoints benchmark\nclient (mlcommons/endpoints) against ATOM serve: its `openai_completions`\nadapter sends the token-array form, and every request in the DeepSeek-R1\nrun failed validation. That dataset is pre-tokenized on purpose -- the\nprompt must reach the model byte-identical to MLPerf's, bypassing the\nserver-side chat template -- so the token path is the only correct one\nthere.\n\nWiden `prompt` to `str | list[int]` and route the list form through the\nexisting pre-tokenized path in `get_prompt_or_tokens()`, so it behaves\nexactly like `prompt_token_ids`. An empty array is rejected explicitly\nrather than reaching the engine as an empty prompt.\n\nThe nested array-of-token-arrays (batch) form is still unsupported; it\ncarries separate batching semantics and is out of scope here.\n\nCo-authored-by: hwang <hwang@amd.com>\nCo-authored-by: Claude Opus 5 <noreply@anthropic.com>\nCo-authored-by: Lingpeng Jin <103567126+valarLip@users.noreply.github.com>",
+          "timestamp": "2026-10-14T15:28:21Z",
+          "url": "https://github.com/ROCm/ATOM/commit/6e9b3e1c5b50b9e6a3b2f8bcf651a9b0229d3ac0"
+        },
+        "date": 1791997604548,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38597007157 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610141459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9492,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38597007157 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610141459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.11,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38597007157 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610141459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9492 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8984,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38597007157 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610141459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2206 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
