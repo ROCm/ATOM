@@ -135,8 +135,8 @@ class StandaloneTest(unittest.TestCase):
         self.assertEqual(resources["total_gpu"], 8)
         self.assertEqual(resources["num_decode_gpu"], 0)
 
-    def launch(self):
-        (cell,) = self.cells()
+    def launch(self, case=CASE):
+        (cell,) = self.cells(case)
         submit = (SCRIPTS / "pd_submit.sh").read_text()
         export_code = submit.split("python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         exports = subprocess.run(
@@ -227,6 +227,37 @@ export PREFILL_TP_SIZE="$PREFILL_TP" DECODE_TP_SIZE="$DECODE_TP"
             name: json.loads((self.directory / f"{name}.json").read_text())
             for name in ("launch", "benchmark", "health")
         }
+
+    def test_c72_launch_matches_agg_execution_settings(self):
+        for spare in (True, False):
+            with self.subTest(spare=spare):
+                variant = "state" if spare else "no-spare-state"
+                case = (
+                    "kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-"
+                    f"{variant}-1m-c72"
+                )
+                captures = self.launch(case)
+                args = captures["launch"]["args"]
+                for flag, value in {
+                    "-tp": "8",
+                    "--decode-context-parallel-size": "8",
+                    "--max-num-seqs": "144",
+                    "--cudagraph-mode": "FULL",
+                    "--level": "3",
+                }.items():
+                    self.assertEqual(args[args.index(flag) + 1], value)
+                self.assertEqual(
+                    json.loads(args[args.index("--cudagraph-capture-sizes") + 1]),
+                    list(range(1, 145)),
+                )
+                env = captures["launch"]["env"]
+                self.assertEqual(env["AITER_REUSE_IDENTICAL_COMM_GROUPS"], "1")
+                self.assertEqual(env["ATOM_WARMUP_GEMM_M_BUCKETS"], "1")
+                self.assertEqual(
+                    env["ATOM_KDA_SPARE_STATE_CHECKPOINTS"], str(int(spare))
+                )
+                client = captures["benchmark"]["args"]
+                self.assertEqual(client[client.index("--concurrency") + 1], "72")
 
     def test_real_launch_and_client_connect_directly_with_original_recipe(self):
         captures = self.launch()

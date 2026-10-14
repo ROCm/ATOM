@@ -677,7 +677,7 @@ models:
           isl: [1048576]
           osl: 1024
           concurrency: [48]
-          prefill:
+          prefill: &kimi_k3_standalone_state_prefill
             workers: 1
             tp: 8
             dcp: 8
@@ -748,6 +748,12 @@ models:
           <<: *kimi_k3_standalone_state
           name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72
           concurrency: [72]
+          # Match the agg C72 recipe from run 38052766052. Agentic lanes can
+          # have more than 72 active requests, so capture the full server limit.
+          prefill:
+            <<: *kimi_k3_standalone_state_prefill
+            cudagraph: auto
+            cudagraph_max_num_seqs: 144
           server:
             common_args:
               <<: *kimi_k3_standalone_state_args
@@ -755,6 +761,8 @@ models:
           env:
             common: &kimi_k3_standalone_state_c72_env
               <<: *kimi_k3_standalone_state_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: '1'
+              ATOM_WARMUP_GEMM_M_BUCKETS: '1'
               LMCACHE_MAX_LOCAL_CPU_SIZE: '192'
 
         # C48 control: keep PAGE checkpoints and LMCache STATE offload;
