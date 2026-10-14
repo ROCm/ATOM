@@ -812,6 +812,42 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class DPStage:
+    """One stage of a forward whose MoE layers run on fewer rows than the step
+    (`ForwardContext.use_dp_stage`): every rank's token count and the
+    `DPMetadata` the variable-length gather reads."""
+
+    tokens_across_dp: tuple[int, ...]
+    local_tokens: int
+    dp_metadata: DPMetadata
+
+
+# The stages `sync_dp_metadata`'s stage rows describe, in row order. Rows 2 and
+# 3 (replaying, decoder active) are flags, read by the model, not stages.
+DP_STAGE_NAMES = ("decoder", "last_layer")
+
+
+def _dp_stages(parallel_config, sync) -> dict[str, DPStage]:
+    rows = None if sync is None else getattr(sync, "stage_tokens_across_dp", None)
+    if rows is None:
+        return {}
+    rank = parallel_config.data_parallel_rank
+    stages = {}
+    for name, tokens in zip(DP_STAGE_NAMES, rows):
+        tokens = tuple(int(n) for n in tokens)
+        stages[name] = DPStage(
+            tokens_across_dp=tokens,
+            local_tokens=tokens[rank],
+            dp_metadata=DPMetadata.make(
+                parallel_config,
+                tokens[rank],
+                torch.tensor(tokens, dtype=torch.int32),
+            ),
+        )
+    return stages
+
+
 @dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
@@ -874,11 +910,49 @@ class ForwardContext:
     # The DP pad-row work this forward already did (see `step_pad_rows`).
     pad_rows_done: set = field(default_factory=set)
 
+    # A prefill whose model runs some layers on fewer rows than the step
+    # (DeepSeek-V4.1 decoder bounded replay): one `DPStage` per such stage,
+    # built from the step's DP sync (`sync_dp_metadata` stage rows) when the
+    # forward context is set. Empty on every other step.
+    dp_stages: dict[str, "DPStage"] = field(default_factory=dict)
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
         if self.attn_metadata is None:
             self.attn_metadata = {}
+
+    @contextmanager
+    def use_dp_stage(self, name: str | None):
+        """Size the DP MoE collectives for stage ``name`` while this block runs.
+
+        The variable-length gather reads every rank's count from
+        ``dp_metadata`` and this rank's own from ``context.scheduled_tokens``;
+        both are switched to the stage's, prepared with the forward context,
+        and restored on exit. A no-op when ``name`` is None or this step has
+        no such stage, so a caller outside DP runs unchanged.
+        """
+        stage = self.dp_stages.get(name) if name is not None else None
+        if stage is None:
+            yield
+            return
+        context = self.context
+        outer = (
+            self.dp_metadata,
+            context.scheduled_tokens,
+            context.running_tokens_across_dp,
+        )
+        self.dp_metadata = stage.dp_metadata
+        context.scheduled_tokens = stage.local_tokens
+        context.running_tokens_across_dp = stage.tokens_across_dp
+        try:
+            yield
+        finally:
+            (
+                self.dp_metadata,
+                context.scheduled_tokens,
+                context.running_tokens_across_dp,
+            ) = outer
 
 
 _forward_context: ForwardContext | None = ForwardContext()
@@ -1110,6 +1184,14 @@ def set_forward_context(
         ub_tokens_across_dp=ub_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
+        dp_stages=(
+            {}
+            if dp_metadata is None
+            else _dp_stages(
+                atom_config.parallel_config,
+                getattr(context.forward_mode, "sync", None),
+            )
+        ),
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

@@ -15,12 +15,10 @@ from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
 from .bounded_replay import (
-    _data_parallel_rank,
     build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
     dp_stage_tokens,
-    dp_token_counts,
     late_layer_start,
     placeholder_rows_of,
     placeholder_tokens,
@@ -308,9 +306,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         dp_tokens = self._dp_stage_tokens(forward, plan, num_tokens)
         if plan is not None:
             return self._replayed(state, num_tokens, plan, dp_tokens)
-        with dp_token_counts(forward, dp_tokens and dp_tokens.decoder):
+        with forward.use_dp_stage("decoder"):
             state = self._late_layers(self._layer(self.decoder_start, state))
-            with dp_token_counts(forward, dp_tokens and dp_tokens.last_layer):
+            with forward.use_dp_stage("last_layer"):
                 hidden = self._layer(self.last_layer, state).collapse()
         self.end_forward(hidden, None)
         return hidden.squeeze(0)
@@ -327,12 +325,12 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         tokens = dp_stage_tokens(forward)
         if tokens is None:
             return None
-        rank = _data_parallel_rank()
-        expected = (tokens.decoder[rank], tokens.last_layer[rank])
+        stages = forward.dp_stages
+        expected = (stages["decoder"].local_tokens, stages["last_layer"].local_tokens)
         actual = plan_stage_tokens(plan, num_tokens)
         if actual != expected:
             raise RuntimeError(
-                f"DP rank {rank} runs {actual} decoder/last-layer tokens but "
+                f"this DP rank runs {actual} decoder/last-layer tokens but "
                 f"reported {expected} to its DP group"
             )
         return tokens
@@ -345,8 +343,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         read (the LM head's), and a chunk that holds none has its logits
         discarded.
 
-        ``dp_tokens``: the group's tokens per stage (`DPStageTokens`) when DP attention
-        replays; the decoder's MoE collectives are sized by it."""
+        ``dp_tokens``: the group's tokens per stage (`DPStageTokens`) when DP
+        attention replays. Each stage's MoE collectives are sized by
+        `ForwardContext.use_dp_stage`, prepared with the forward context."""
         forward = get_forward_context()
         metadata = forward.attn_metadata
         step, cache = metadata.step, metadata.cache
@@ -360,25 +359,23 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
             with (
                 rows_of(metadata, plan.tail, rows=plan.tail_rows),
-                dp_token_counts(forward, dp_tokens and dp_tokens.decoder),
+                forward.use_dp_stage("decoder"),
             ):
                 output = layer.attention_forward(normed, None, None, rope)
                 tail = self._late_layers(layer.ffn_forward(output, *seam))
                 with (
                     rows_of(metadata, plan.tail, plan.q39, plan.q39.rows),
-                    dp_token_counts(forward, dp_tokens and dp_tokens.last_layer),
+                    forward.use_dp_stage("last_layer"),
                 ):
                     last = self._layer(self.last_layer, tail, plan.q39)
             self._move_aux_rows(plan.tail_rows)
             full[plan.last_rows] = last.collapse().squeeze(0)
         elif dp_tokens is not None and dp_tokens.decoder_active:
-            self._join_decoder_collectives(
-                forward, layer, rope, normed, seam, dp_tokens
-            )
+            self._join_decoder_collectives(forward, layer, rope, normed, seam)
         self.end_forward(full, None)
         return full
 
-    def _join_decoder_collectives(self, forward, layer, rope, normed, seam, dp_tokens):
+    def _join_decoder_collectives(self, forward, layer, rope, normed, seam):
         """Join the decoder's DP collectives without a tail of one's own.
 
         A rank whose prefill finishes no prompt runs none of the decoder, but
@@ -396,11 +393,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         normed, *seam = gather_rows(rows, normed, *seam, dim=1)
         with (
             placeholder_rows_of(metadata, rows),
-            dp_token_counts(forward, dp_tokens.decoder),
+            forward.use_dp_stage("decoder"),
         ):
             output = layer.attention_forward(normed, None, None, rope)
             state = self._late_layers(layer.ffn_forward(output, *seam))
-            with dp_token_counts(forward, dp_tokens.last_layer):
+            with forward.use_dp_stage("last_layer"):
                 self._layer(self.last_layer, state)
 
     def _move_aux_rows(self, rows):
