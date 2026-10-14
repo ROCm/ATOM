@@ -286,6 +286,11 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     the output allocation length, this is NOT capped by `index_topk`. Named
     for its class: HCA has a per-token count of its own, and the bare name read
     as if it covered both."""
+    fp4_decode_topk: torch.Tensor | None = None
+    """int32 GPU `[decode_rows, index_topk]` -- the gfx950 FP4 decode scorer's
+    top-k, at a fixed address. Narrow PIECEWISE scores in the batch-keyed
+    `_attn_compress` core and the token-keyed dense piece reads it here; None
+    when that scorer is off (FP8, gfx1250, prefill)."""
     block_tables_per_token: torch.Tensor | None = None
     """int32 GPU `[decode_rows, block_table_cols]` — compressed-cache block
     table expanded from sequences to query rows by a device-side gather. It
@@ -580,6 +585,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         self.indexer_layout = (
             fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
+        )
+        # The gfx950 FP4 decode scorer: a row-group launch planned from the
+        # sequence count, scored in the batch-keyed core (`fp4_decode_topk`).
+        self._fp4_rowgroup_decode = (
+            self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL
         )
         if self.indexer_layout == FP4_GFX1250_NATURAL:
             if self.max_bs > 2048:
@@ -2118,43 +2128,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
-    def _refresh_fp4_rowgroup_decode_meta(
-        self, attn_metadata, *, buf_prefix_ubatch: str = ""
-    ):
-        """Publish fixed-capacity row-group metadata for a token-count graph."""
-        from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-
-        var = self.model_runner.forward_vars
-        rows = attn_metadata.csa_n_committed_per_token.shape[0]
-        name = f"{buf_prefix_ubatch}v4_fp4_query_start_loc"
-        capacity = min(rows, var[name].np.shape[0] - 1)
-        cu = var[f"{buf_prefix_ubatch}cu_seqlens_q"].np[
-            : attn_metadata.cu_seqlens_q.shape[0]
-        ]
-        max_qlen = min(rows, 1 + self.max_spec_steps)
-        # `running_bs` can outrun the rows: when a DP peer is prefilling, the
-        # batch stays the group's while this rank runs only its own tokens (a
-        # non-unified `ForwardMode.running_tokens`; an idle rank's dummy is one
-        # row). Those trailing sequences are padding, published empty, and every
-        # nonempty one holds a row, so they all fit; drop the empty tail. A
-        # nonempty sequence at or past `capacity` would be dropped with it.
-        if cu[-1] > rows or np.any(cu[capacity:] != cu[-1]):
-            raise ValueError("FP4 sequence boundaries exceed the decode bucket")
-        cu = cu[: capacity + 1]
-        if np.any(np.diff(cu) < 0) or np.any(np.diff(cu) > max_qlen):
-            raise ValueError("FP4 query lengths exceed the configured decode span")
-        # Refresh the WHOLE captured view, including slots left over from a
-        # larger batch. Repeated final boundaries mean empty sequences.
-        padded_cu = np.full(capacity + 1, cu[-1], dtype=np.int32)
-        padded_cu[: cu.size] = cu
-        query_start_loc = self._stage(name, padded_cu)
-        # The kernel speculatively reads table entries even for empty slots,
-        # so expose the full allocated table view, not the live-batch slice.
-        # Only nonempty sequences consume KV; their table rows are published
-        # by prepare_decode/capture before this helper.
-        tables = var[f"{buf_prefix_ubatch}block_tables"].gpu[:capacity]
-        return Fp4MqaRaggedMetadata(query_start_loc, max_qlen, tables)
-
     def _refresh_fp4_opus_decode_plan(
         self,
         attn_metadata: AttentionMetaData_DSV4,
@@ -2301,7 +2274,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # prepare_*/CG-capture path).
         bs = scheduled_bs
 
-        # DECODE short-circuit: only FP4 graph metadata is needed here.
+        # DECODE short-circuit: only the gfx1250 OPUS plan is needed here.
         # The prefill-only derivations
         # further down (CPU cumsum + H2D for `cu_committed_gpu`; GPU launches
         # for `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill`
@@ -2309,12 +2282,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
         if attn_metadata.state is AttnState.DECODE:
             meta = {}
-            # Keep the gfx950 row-group launch invariant across sequence
-            # layouts sharing a token bucket. FULL uses the same metadata.
-            if self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL:
-                meta["fp4_decode"] = self._refresh_fp4_rowgroup_decode_meta(
-                    attn_metadata, buf_prefix_ubatch=buf_prefix_ubatch
-                )
             # The OPUS decode plan, once per fwd rather than per CSA layer.
             if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
                 self._refresh_fp4_opus_decode_plan(
@@ -3957,6 +3924,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         attn_metadata.kv_indices_swa = swa_indices_gpu
         attn_metadata.kv_indices_csa = csa_indices_gpu
         attn_metadata.csa_n_committed_per_token = csa_ncmt_gpu
+        if getattr(self, "_fp4_rowgroup_decode", False):
+            attn_metadata.fp4_decode_topk = var[
+                f"{buf_prefix_ubatch}v4_fp4_decode_topk"
+            ][:T_pad]
         attn_metadata.block_tables_per_token = block_tables_per_token_gpu
         attn_metadata.kv_indices_hca = hca_indices_buf
         attn_metadata.kv_indptr_swa = swa_indptr_gpu
@@ -4616,8 +4587,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "publication_group": f"{prefix}v4_indexer",
         }
         buffers = {f"{prefix}v4_indexer_cu_committed": CpuGpuBuffer(bs + 1, **i32)}
-        if self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL:
-            buffers[f"{prefix}v4_fp4_query_start_loc"] = CpuGpuBuffer(bs + 1, **i32)
         if getattr(self, "indexer_layout", None) == FP4_GFX1250_NATURAL:
             # Each nonempty query chunk contributes at most one extra request
             # fragment per boundary and one leading zero. Across all chunks:
@@ -4700,6 +4669,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # of this constant table; read-only, so all of them share it.
         self._split_table = v4_uniform_split_table(T_dec, self.device)
         bufs["v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
+        if self._fp4_rowgroup_decode:
+            bufs["v4_fp4_decode_topk"] = torch.empty(T_dec, self.index_topk, **i32)
         # Device-only, and as wide as the `block_tables` it gathers from: a host
         # mirror would be `T_dec * cols * 4` of pinned memory nothing writes.
         # Absent under the FP4 indexer (no reader -- see
@@ -4887,6 +4858,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_csa"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = torch.zeros(T_dec + 1, **i32)
             bufs[f"{p}v4_csa_n_committed_per_token"] = torch.zeros(T_dec, **i32)
+            if self._fp4_rowgroup_decode:
+                bufs[f"{p}v4_fp4_decode_topk"] = torch.empty(
+                    T_dec, self.index_topk, **i32
+                )
             if not self._indexer_fp4:
                 bufs[f"{p}v4_block_tables_per_token"] = torch.zeros(
                     T_dec, self.block_table_cols, **i32
