@@ -440,24 +440,6 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 shapes.append((tokens // q, q))
         return shapes
 
-    def piecewise_buffer_bytes(self):
-        totals = {"attention": 0, "engram": 0, "late_inputs": 0}
-        for layer in self.layers:
-            slots = getattr(layer, "_piecewise_outputs", None)
-            if slots is not None:
-                for key, tensor in slots._slots.items():
-                    totals[key[0]] += tensor.numel() * tensor.element_size()
-        if self._late_input_buffers is not None:
-            totals["late_inputs"] = self._late_input_buffers.nbytes()
-        else:
-            totals["late_inputs"] = sum(
-                t.numel() * t.element_size()
-                for tensors in self._late_piecewise_inputs.values()
-                for t in tensors
-                if t is not None
-            )
-        return totals
-
     def _run_stage(self, stage, *inputs):
         # The initial graphs are captured for text. Image routing reads a live
         # mask whose shape/address differs, so execute the stage's Python body

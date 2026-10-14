@@ -4291,33 +4291,6 @@ class ModelRunner:
 
         capture_plan = self._cudagraph_capture_plan(q_buckets)
 
-        def capture_memory(stage):
-            torch.cuda.synchronize()
-            free, total = torch.cuda.mem_get_info()
-            logger.info(
-                "CUDAGraph memory rank=%d stage=%s: allocated=%.2fGiB "
-                "reserved=%.2fGiB device_used=%.2fGiB free=%.2fGiB",
-                self.rank,
-                stage,
-                torch.cuda.memory_allocated() / (1 << 30),
-                torch.cuda.memory_reserved() / (1 << 30),
-                (total - free) / (1 << 30),
-                free / (1 << 30),
-            )
-            buffer_bytes = getattr(self.model, "piecewise_buffer_bytes", None)
-            if buffer_bytes is not None:
-                logger.info(
-                    "Piecewise owned buffers rank=%d stage=%s GiB: %s",
-                    self.rank,
-                    stage,
-                    {
-                        name: round(size / (1 << 30), 4)
-                        for name, size in buffer_bytes().items()
-                    },
-                )
-
-        capture_memory("before")
-
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for capture_mode, max_q_len, sizes in capture_plan:
                 piecewise_capture = capture_mode == CUDAGraphMode.PIECEWISE
@@ -4492,7 +4465,6 @@ class ModelRunner:
                     if prof is not None:
                         prof.step()
                         self._capture_trace_tag = None
-                capture_memory(f"after_{capture_mode.name}_q{max_q_len}")
             # Inside the `with`: graph_capture() arms the custom all-reduce for
             # capture and pause_gc() keeps the collector from aborting one. The
             # drafter gets the capture builder already bound to this backend's
@@ -4507,7 +4479,6 @@ class ModelRunner:
                     ),
                     capture_ctx.stream,
                 )
-                capture_memory("after_draft")
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 

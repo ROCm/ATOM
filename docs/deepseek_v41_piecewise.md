@@ -49,12 +49,7 @@ stage's inputs once at the maximum token capacity, then supplies prefix views
 to each bucket. These model-owned buffers have stable addresses across
 serial forwards. Compiled intermediates retain their per-bucket graph pools.
 
-Every rank logs allocated/reserved/device-used/free GiB before capture,
-after each target mode/Q, and after draft capture. Subtract those readings to
-separate target piecewise, target FULL and draft memory. The final capture
-summary includes total reserved and allocated deltas. Device-used includes
-KV caches and allocations outside the PyTorch allocator, not just graphs.
-`Piecewise owned buffers` also reports attention, Engram and late-input bytes.
+The final capture summary reports total reserved and allocated deltas.
 These startup measurements exclude AF graphs first captured by live prefills.
 The pre-capture memory-budget estimate remains conservative and still uses
 the sum of token sizes; it does not reclaim the boundary-buffer savings for KV.

@@ -363,9 +363,6 @@ class StableOutputs:
             self._slots[key] = buf
         return buf.narrow(self.token_dim, 0, tokens) if self.capacity else buf
 
-    def nbytes(self):
-        return sum(t.numel() * t.element_size() for t in self._slots.values())
-
     def deliver(self, key, out: torch.Tensor) -> torch.Tensor:
         """Copy an eagerly computed `out` into its slot and return the slot."""
         buf = self.slot(key, out)

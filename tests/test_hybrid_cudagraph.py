@@ -39,7 +39,7 @@ def test_token_buffers_share_capacity_without_growing_recorded_storage(
     large = torch.zeros(large_shape, dtype=small.dtype)
     view = buffers.slot("attention", small)
     assert buffers.slot("attention", large).data_ptr() == view.data_ptr()
-    assert buffers.nbytes() == large.numel() * large.element_size()
+    assert view.untyped_storage().nbytes() == large.numel() * large.element_size()
     assert buffers.slot("engram", small).data_ptr() != view.data_ptr()
     large_shape[token_dim] = 9
     with pytest.raises(ValueError, match="capacity"):
