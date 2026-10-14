@@ -333,16 +333,20 @@ class WeightUpdaterMixin:
         return "updated"
 
     def _note_fused_shard(self, atom_name: str, shard_id, required) -> None:
-        """Record a shard written straight into a fused parameter by a direct,
-        SHM or IPC update, so one that ends with the parameter part-written is
-        refused; see ``_take_incomplete_fused``. A transaction's coverage
-        covers its own."""
-        if getattr(self, "_weight_update_version", None) is not None:
-            return
-        written = getattr(self, "_fused_shards_written", None)
-        if written is None:
-            written = self._fused_shards_written = {}
-        written.setdefault(atom_name, (frozenset(required), set()))[1].add(shard_id)
+        """Record a shard written straight into a fused parameter, so a direct,
+        SHM or IPC update that ends with the parameter part-written is refused;
+        see ``_take_incomplete_fused``.
+
+        Those run with no transaction open -- each is refused while one is --
+        so they are what this records. A transaction's coverage checks its own
+        shards at commit.
+        """
+        if getattr(self, "_weight_update_version", None) is None:
+            written = getattr(self, "_fused_shards_written", None)
+            if written is None:
+                written = self._fused_shards_written = {}
+            entry = written.setdefault(atom_name, (frozenset(required), set()))
+            entry[1].add(shard_id)
 
     def _apply_unmatched_weight(
         self,
