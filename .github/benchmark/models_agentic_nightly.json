@@ -22,41 +22,14 @@
           "extra_args": "-tp 2",
           "env_vars": "HIP_VISIBLE_DEVICES=0,1",
           "concurrency": [
-            1,
-            2,
-            4,
-            8,
-            16,
-            32,
-            64,
             128
           ]
         },
         {
-          "label": "DSpark5 TP4 AL3.51",
-          "suffix": "-agentic-dspark5-tp4-al351",
-          "extra_args": "-tp 4",
-          "env_vars": "HIP_VISIBLE_DEVICES=0,1,2,3",
-          "concurrency": [
-            1,
-            4,
-            8
-          ]
-        },
-        {
-          "label": "DSpark5 TP2 DPA TBO interval10 AL3.51",
-          "suffix": "-agentic-dspark5-tp2-dpa-i10-al351",
-          "extra_args": "-tp 2 --enable-dp-attention --enable-tbo --dp-load-balance least_tokens",
+          "label": "DSpark5 TP2 DPA replay interval10 AL3.51",
+          "suffix": "-agentic-dspark5-tp2-dpa-replay-i10-al351",
+          "extra_args": "-tp 2 --enable-dp-attention --dp-load-balance least_tokens",
           "env_vars": "HIP_VISIBLE_DEVICES=0,1\nGPU_MAX_HW_QUEUES=5\nATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_ENABLE_PREFILL_DELAYER=1\nATOM_PREFILL_DECODE_INTERVAL=10",
-          "concurrency": [
-            128
-          ]
-        },
-        {
-          "label": "DSpark5 TP2 DPA TBO interval4 AL3.51",
-          "suffix": "-agentic-dspark5-tp2-dpa-i4-al351",
-          "extra_args": "-tp 2 --enable-dp-attention --enable-tbo --dp-load-balance least_tokens",
-          "env_vars": "HIP_VISIBLE_DEVICES=0,1\nGPU_MAX_HW_QUEUES=5\nATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_ENABLE_PREFILL_DELAYER=1\nATOM_PREFILL_DECODE_INTERVAL=4",
           "concurrency": [
             128
           ]
