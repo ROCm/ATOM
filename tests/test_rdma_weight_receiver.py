@@ -1324,6 +1324,66 @@ def test_a_repeated_init_reuses_its_group_only_for_the_same_join(monkeypatch):
     assert joined == ["tcp://10.0.0.1:29500", "tcp://10.0.0.2:29500"]
 
 
+def _voting_worker(outcome):
+    """A worker whose engine's vote on joining comes out as *outcome* gives it;
+    records the ballots it cast."""
+    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    worker.cast = []
+
+    def vote(ballot, will_join):
+        worker.cast.append(ballot)
+        return outcome(ballot, will_join)
+
+    worker._vote_with_engine_peers = vote
+    return worker
+
+
+def test_no_worker_joins_while_another_of_its_engine_cannot(monkeypatch):
+    """Each worker checked its own rank, then joined: one whose rank was out
+    of range raised, and the others waited in the rendezvous for it."""
+    joined = _joins(monkeypatch)
+    worker = _voting_worker(lambda ballot, will_join: (receiver._CANNOT_JOIN, True))
+
+    with pytest.raises(RuntimeError, match="another worker of this engine cannot"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+
+    assert worker.cast == [receiver._WILL_JOIN]
+    assert joined == []
+
+
+def test_a_worker_that_cannot_join_says_so_before_any_joins(monkeypatch):
+    joined = _joins(monkeypatch)
+    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
+
+    with pytest.raises(ValueError, match="invalid RDMA rank"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=1, group_name="g"
+        )
+
+    assert worker.cast == [receiver._CANNOT_JOIN]
+    assert joined == []
+
+
+def test_a_group_joined_on_only_some_workers_is_not_reused(monkeypatch):
+    """Retried after a partial failure, a worker that had joined reused its
+    group while one that had not joined it anew, alone in a rendezvous."""
+    joined = _joins(monkeypatch)
+    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
+    join = {"base_rank": 1, "world_size": 2, "group_name": "g"}
+    assert worker.init_rdma_weight_group("127.0.0.1", 29500, **join)
+
+    worker._vote_with_engine_peers = lambda ballot, will_join: (
+        min(ballot, receiver._JOINED_ALREADY),
+        True,
+    )
+    with pytest.raises(RuntimeError, match="joined on only some workers"):
+        worker.init_rdma_weight_group("127.0.0.1", 29500, **join)
+
+    assert joined == [1]
+
+
 def _world(monkeypatch, size):
     """aiter's world group as the vote finds it, and the groups voted over."""
     world = SimpleNamespace(world_size=size, cpu_group=object())

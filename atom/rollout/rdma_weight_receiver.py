@@ -66,6 +66,12 @@ _BROKEN_OFF = 0  # cannot follow the stream any further, or cannot commit it
 _PREPARED = 1  # at the end marker, with this rank's commit prepared
 _RECEIVING = 2  # can receive the frame just announced
 
+# A worker's ballot before it joins a weight group, the least deciding again;
+# see init_rdma_weight_group.
+_CANNOT_JOIN = 0
+_JOINED_ALREADY = 1
+_WILL_JOIN = 2
+
 
 class RDMAStreamOutOfStep(RuntimeError):
     """This rank can no longer follow the stream.
@@ -572,12 +578,18 @@ class RDMAWeightReceiverMixin:
         it in order. Refused before joining on an engine where a reload over
         RDMA would be unsafe, so the trainer's rendezvous fails rather than a
         later stream.
+
+        Decided by every worker of the engine before any joins. One that could
+        not -- its rank out of range, its earlier join a different one -- or
+        that had joined where the others had not, left them in the rendezvous
+        waiting for a rank that never came.
         """
         # Vendored, so a container with ATOM but no RL framework still works.
         from atom.utils.independent_process_group import (
             init_independent_process_group,
         )
 
+        # Its config's and its model's, so every worker refuses alike.
         refusal = self._rdma_reload_refusal()
         if refusal:
             raise RuntimeError(f"cannot receive weights over RDMA: {refusal}")
@@ -592,32 +604,51 @@ class RDMAWeightReceiverMixin:
             self._rdma_weight_group_joins = joins
 
         rank = int(base_rank) + int(self.rank)
-        if rank <= 0 or rank >= int(world_size):
-            workers = _workers_per_engine(getattr(self, "config", None))
-            raise ValueError(
-                f"invalid RDMA rank {rank} for world_size={world_size} "
-                f"(base_rank={base_rank}, worker={self.rank}, "
-                f"workers_per_engine={workers}); rank 0 is the trainer"
-            )
-
         join = {
             "master": f"{master_addr}:{int(master_port)}",
             "world_size": int(world_size),
             "rank": rank,
         }
-        if group_name in groups:
+        joined = group_name in groups
+        problem: Exception | None = None
+        if rank <= 0 or rank >= int(world_size):
+            workers = _workers_per_engine(getattr(self, "config", None))
+            problem = ValueError(
+                f"invalid RDMA rank {rank} for world_size={world_size} "
+                f"(base_rank={base_rank}, worker={self.rank}, "
+                f"workers_per_engine={workers}); rank 0 is the trainer"
+            )
+        elif joined and joins.get(group_name, join) != join:
             # Idempotent only for the same join: the orchestrator may retry
             # init after a partial failure elsewhere, and rejoining would
             # deadlock the rendezvous. A changed one -- a restarted trainer, a
             # new rank layout -- would leave this worker in the old group while
             # its peers joined the new one.
-            if joins.get(group_name, join) != join:
-                raise RuntimeError(
-                    f"RDMA weight group {group_name!r} is already joined as "
-                    f"{joins[group_name]}, not {join}; call "
-                    f"destroy_rdma_weight_group({group_name!r}) on every rank "
-                    f"before joining it again"
-                )
+            problem = RuntimeError(
+                f"RDMA weight group {group_name!r} is already joined as "
+                f"{joins[group_name]}, not {join}; call "
+                f"destroy_rdma_weight_group({group_name!r}) on every rank "
+                f"before joining it again"
+            )
+
+        if problem is not None:
+            ballot = _CANNOT_JOIN
+        else:
+            ballot = _JOINED_ALREADY if joined else _WILL_JOIN
+        outcome, any_will_join = self._vote_with_engine_peers(ballot, not joined)
+        if outcome == _CANNOT_JOIN:
+            raise problem or RuntimeError(
+                f"RDMA weight group {group_name!r} not joined: another worker "
+                f"of this engine cannot join it"
+            )
+        if outcome == _JOINED_ALREADY and any_will_join:
+            raise RuntimeError(
+                f"RDMA weight group {group_name!r} is joined on only some "
+                f"workers of this engine; call "
+                f"destroy_rdma_weight_group({group_name!r}) on every rank "
+                f"before joining it again"
+            )
+        if joined:
             logger.warning(
                 "%s: RDMA weight group %s already joined, reusing",
                 getattr(self, "label", "runner"),
@@ -701,8 +732,9 @@ class RDMAWeightReceiverMixin:
         return None
 
     def _vote_with_engine_peers(self, ballot: int, began: bool) -> tuple[int, bool]:
-        """The stream's decision across this engine's workers, every one of
-        which takes it: one worker's yes is not enough to serve it.
+        """A decision across this engine's workers, every one of which takes
+        the stream: one worker's yes is not enough to serve it, nor to join
+        the group it comes over.
 
         Over aiter's world group, not its TP group. A runner's world is its
         engine's workers alone, DP being isolated per engine, and holds every
