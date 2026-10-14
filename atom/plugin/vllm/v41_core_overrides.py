@@ -171,13 +171,17 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         start_positions=None,
         query_prefix_ready=False,
         engram_live=True,
+        cache_override=None,
     ):
-        """``engram_live`` False: Engram's forward kernels run on no token (a
-        capture: they record on serving's buffers, touching none)."""
+        """``engram_live`` False: Engram's forward kernels run on no token.
+
+        ``cache_override`` selects private profiling capture storage without
+        changing the serving binding or forcing a verify batch into prefill.
+        """
         # Once graphs bind the serving pool, an idle DP rank must publish
         # padding into that pool's metadata. A fresh scratch cache would refill
         # different indptr addresses while replay still reads the captured ones.
-        if batch.is_dummy_run and self.cache is not None:
+        if batch.is_dummy_run and self.cache is not None and cache_override is None:
             return self._prepare_idle(
                 batch,
                 running_bs,
@@ -223,13 +227,15 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             if batch.is_dummy_run or not batch.replaying
             else self._replay_layout(batch.replaying, scheduled, spans)
         )
-        cache = (
-            self._capture_dummy_cache(
-                max(next_page, 1), max(len(spans), 1), running_tokens
+        cache = cache_override
+        if cache is None:
+            cache = (
+                self._capture_dummy_cache(
+                    max(next_page, 1), max(len(spans), 1), running_tokens
+                )
+                if batch.is_dummy_run
+                else self.cache
             )
-            if batch.is_dummy_run
-            else self.cache
-        )
         if cache is None:
             raise RuntimeError("CSA2 cache must be allocated before serving")
         compacted = len(spans) != len(batch.req_ids)

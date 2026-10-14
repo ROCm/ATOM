@@ -18,16 +18,17 @@ from atom.utils.h2d import PublicationError
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
 
-@pytest.fixture
-def builder():
+def _builder(*, speculative_tokens=2, max_tokens=12):
     builder = VllmDeepseekV41MetadataBuilder.__new__(VllmDeepseekV41MetadataBuilder)
     builder.geometry = V41PoolGeometry(
-        2, ((0, 1), (1, 2)), 32, 4, 512, 32, speculative_tokens=2
+        2, ((0, 1), (1, 2)), 32, 4, 512, 32, speculative_tokens=speculative_tokens
     )
-    builder.cache = PagedAttentionCache(builder.geometry, 16, 4, "cpu", max_tokens=12)
+    builder.cache = PagedAttentionCache(
+        builder.geometry, 16, 4, "cpu", max_tokens=max_tokens
+    )
     builder.block_size, builder.device = 32, "cpu"
-    builder.max_bs, builder.max_num_batched_tokens = 4, 12
-    buffers = metadata_buffers(4, 12, 4, "cpu", builder.geometry)
+    builder.max_bs, builder.max_num_batched_tokens = 4, max_tokens
+    buffers = metadata_buffers(4, max_tokens, 4, "cpu", builder.geometry)
     for name in ("positions", "batch_id_per_q_token"):
         buffers[name].publication_group = "v41_step"
     buffers["cu_seqlens_q"].publication_group = "early"
@@ -40,9 +41,164 @@ def builder():
         engram_max_ngram_size=3,
         engram_n_heads=2,
         engram_head_dim=4,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        compilation_config=SimpleNamespace(static_forward_context={}),
     )
     builder.engram = None
     return builder
+
+
+@pytest.fixture
+def builder():
+    return _builder()
+
+
+@pytest.mark.parametrize("speculative_tokens,width", [(0, 1), (5, 6)])
+def test_profile_full_builder_prepares_scratch_before_forward(
+    monkeypatch, speculative_tokens, width
+):
+    """V2 calls the factory twice in mode NONE before ordinary FULL capture."""
+    from atom.plugin.vllm import req_id_passthrough_patch as passthrough
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _mark_v4_proxy_cache_mode
+    from atom.model_ops.engram.device.staging import EngramStagedRows
+    from atom.utils.forward_context import get_forward_context
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import override_forward_context
+
+    builder = _builder(speculative_tokens=speculative_tokens, max_tokens=24)
+    builder.cache = None
+    builder.score_workspace = None
+    builder.model_runner.v41_graphs_enabled = True
+    proxy = bridge.AtomDeepseekV41ProxyAttention()
+    model = SimpleNamespace()
+    proxy._atom_v41_model, proxy._atom_v41_builder = model, builder
+    # Nonempty but deliberately too small to be a serving pool: the marker,
+    # not an empty tensor, must keep bind from carving it.
+    proxy.kv_cache = torch.full((1,), 73, dtype=torch.uint8)
+    layer = bridge.ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+    sfc = {layer: proxy}
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        compilation_config=SimpleNamespace(static_forward_context=sfc),
+        speculative_config=(
+            SimpleNamespace(num_speculative_tokens=speculative_tokens)
+            if speculative_tokens
+            else None
+        ),
+    )
+    factory = bridge.AtomDeepseekV41ProxyMetadataBuilder.__new__(
+        bridge.AtomDeepseekV41ProxyMetadataBuilder
+    )
+    factory.vllm_config, factory.device = config, "cpu"
+    _mark_v4_proxy_cache_mode(sfc, True)
+    assert not bridge.bind_deepseek_v41_proxy_cache(model, builder, config)
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_reqs_after_padding=4,
+        num_tokens_after_padding=4 * width,
+        input_ids=torch.zeros(4 * width, dtype=torch.int32),
+        req_ids=["profile-0", "profile-1"],
+        idx_mapping_np=np.array([2, 3], dtype=np.int32),
+    )
+    monkeypatch.setattr(passthrough, "get_current_input_batch", lambda: batch)
+    monkeypatch.setattr(
+        passthrough, "get_current_cudagraph_mode", lambda: CUDAGraphMode.NONE
+    )
+    monkeypatch.setattr(bridge, "_V41_PENDING_SPECULATIVE_STEP", None)
+    monkeypatch.setattr(bridge, "_V41_OPEN_ENGRAM_FORK", None)
+    fallback = Mock(side_effect=AssertionError("FULL called host staging"))
+    monkeypatch.setattr(bridge, "v41_stage_step", fallback)
+    staging = SimpleNamespace(
+        host=SimpleNamespace(buffers={}), start=Mock(), join=Mock()
+    )
+    original_inputs = builder.prepare_model_inputs
+
+    def prepare_inputs(input_ids, metadata):
+        original_inputs(input_ids, metadata)
+        metadata.engram_embeddings = EngramStagedRows(staging, input_ids.numel())
+
+    inputs_spy = Mock(side_effect=prepare_inputs)
+    prepare_spy = Mock(wraps=builder._prepare)
+    monkeypatch.setattr(builder, "prepare_model_inputs", inputs_spy)
+    monkeypatch.setattr(builder, "_prepare", prepare_spy)
+    scratch = None
+    for count in (2, 2, 1):
+        batch.num_reqs = count
+        common = SimpleNamespace(
+            num_reqs=count,
+            max_query_len=width,
+            query_start_loc_cpu=torch.arange(count + 1, dtype=torch.int32) * width,
+            seq_lens=torch.full((count,), width, dtype=torch.int32),
+            block_table_tensor=torch.full((count, 1), 999, dtype=torch.int32),
+        )
+        returned = factory.build_for_cudagraph_capture(common)
+        assert returned is common and not common.atom_v41_snapshot.full_graph
+        prepared = getattr(returned, "atom_v41_prepared", None)
+        assert prepared is not None, "profiling FULL skipped graph-external staging"
+        metadata, step = prepared.metadata, prepared.metadata.step
+        if scratch is None:
+            scratch = metadata.cache
+        assert metadata.cache is scratch is builder._capture_dummy
+        assert builder.cache is None and not hasattr(model, "_atom_v41_proxy_cache_ptr")
+        assert proxy.kv_cache.tolist() == [73]
+        assert prepared.running_bs == 4 and prepared.running_tokens == 4 * width
+        assert step.scheduled_bs == count and step.max_q_len == width
+        assert [span.slot for span in step.requests] == list(range(count))
+        assert step.tentative == (width > 1) and step.decode
+        if width > 1:
+            assert all(
+                span.position == builder.geometry.window_size for span in step.requests
+            )
+        assert step.block_tables.eq(0).all()
+        assert metadata.dummy and metadata.staged_outside_forward
+        assert scratch.pending is None and not bridge.v41_speculative_step_is_pending()
+        for ratio, plan in step.plans.items():
+            assert plan.compress_plan_gpu.shape[0] == 4 * -(-width // ratio)
+            assert (plan.compress_plan_gpu[plan.num_compress :, 2] == -1).all()
+        before = (
+            prepare_spy.call_count,
+            inputs_spy.call_count,
+            staging.start.call_count,
+        )
+        context = SimpleNamespace(attn_metadata={layer: returned})
+        with override_forward_context(context):
+            with bridge.atom_deepseek_v41_forward_context(
+                atom_config=builder.config,
+                builder=builder,
+                input_ids=batch.input_ids,
+                positions=None,
+                vllm_config=config,
+                force_dummy=True,
+            ) as positions:
+                assert get_forward_context().attn_metadata is metadata
+                assert positions.data_ptr() == prepared.positions.data_ptr()
+        assert before == (
+            prepare_spy.call_count,
+            inputs_spy.call_count,
+            staging.start.call_count,
+        )
+        assert staging.join.call_count == staging.start.call_count
+    fallback.assert_not_called()
+    assert prepare_spy.call_count == inputs_spy.call_count == 3
+
+    # A subsequent serving allocation must replace the cache used by newly
+    # captured graphs, never promote the profiling scratch to serving storage.
+    config.scheduler_config.max_num_batched_tokens = 24
+    config.cache_config = SimpleNamespace(num_gpu_blocks=8, cache_dtype="auto")
+    monkeypatch.setattr(bridge, "v41_proxy_geometry", lambda _: builder.geometry)
+    size = builder.geometry.paged_extents(8)[1] + 8 * builder.geometry.state_bytes
+    proxy.kv_cache = torch.zeros(size, dtype=torch.uint8).reshape(1, 1, 1, -1)
+    _mark_v4_proxy_cache_mode(sfc, False)
+    common.block_table_tensor.zero_()
+    serving = factory.build_for_cudagraph_capture(common).atom_v41_prepared
+    assert serving.metadata.cache is builder.cache
+    assert builder.cache is not scratch and builder._capture_dummy is scratch
+    assert model._atom_v41_proxy_cache_ptr == proxy.kv_cache.data_ptr()
+    assert [span.slot for span in serving.metadata.step.requests] == [4]
+    assert serving.metadata.step.tentative == (width > 1)
+    assert (
+        builder.cache.pending is None and not bridge.v41_speculative_step_is_pending()
+    )
 
 
 def snapshot(ids=("A", "B"), slots=(2, 0), start=0, width=1):

@@ -4,6 +4,7 @@
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -110,3 +111,71 @@ def test_full_capture_never_defers_engram_join_even_with_mode_none():
     # V2 passes NONE while preparing an ordinary FULL graph.
     functions = _functions("_v41_join_covers_the_layers")
     assert not functions._v41_join_covers_the_layers(capturing=True)
+
+
+@pytest.mark.parametrize(
+    "bound,profiling,capturing,staged_on",
+    [
+        (False, False, False, None),
+        (False, False, True, None),
+        (False, True, False, None),
+        (False, True, True, "scratch"),
+        (True, False, False, "serving"),
+        (True, False, True, "serving"),
+        (True, True, False, "serving"),
+        (True, True, True, "serving"),
+    ],
+)
+def test_proxy_factory_stages_unbound_profiling_full_only(
+    bound, profiling, capturing, staged_on
+):
+    # Execute the production entry method without importing optional GPU/vLLM
+    # dependencies. The full metadata/forward integration lives in tests/plugin.
+    cls = next(
+        node
+        for node in ast.parse(BRIDGE.read_text()).body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "AtomDeepseekV41ProxyMetadataBuilder"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_and_attach"
+    )
+    model, builder, prepared, snapshot = object(), object(), object(), object()
+    stage = Mock(return_value=prepared)
+    proxy = SimpleNamespace(
+        _atom_v41_model=model,
+        _atom_v41_builder=builder,
+        _atom_v4_profiling_kv_cache=profiling,
+    )
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={"proxy": proxy})
+    )
+    scope = {
+        "ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME": "proxy",
+        "snapshot_v41_batch": lambda _: snapshot,
+        "bind_deepseek_v41_proxy_cache": lambda *_: bound,
+        "_v41_stage_outside_forward": stage,
+    }
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(BRIDGE), "exec"), scope
+    )
+    common = SimpleNamespace()
+    returned = scope[method.name](
+        SimpleNamespace(vllm_config=config), common, capturing=capturing
+    )
+    assert returned is common and common.atom_v41_snapshot is snapshot
+    if staged_on is None:
+        stage.assert_not_called()
+        assert not hasattr(common, "atom_v41_prepared")
+    else:
+        stage.assert_called_once_with(
+            builder,
+            model,
+            config,
+            snapshot,
+            capturing=capturing,
+            profiling=staged_on == "scratch",
+        )
+        assert common.atom_v41_prepared is prepared
