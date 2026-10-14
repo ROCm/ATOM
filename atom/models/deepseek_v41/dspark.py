@@ -103,6 +103,9 @@ class DraftAttention(Attention):
 class DraftBlock(Block):
     attention_cls = DraftAttention
 
+    def attention_forward(self, normed, cache, step, rope):
+        return self.attn(normed, None, cache, step, rope)
+
     def __init__(
         self,
         config,
