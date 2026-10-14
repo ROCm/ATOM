@@ -821,6 +821,47 @@ def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
     assert peers.ballots[-1] == (receiver._BROKEN_OFF, True)
 
 
+def test_a_vote_that_failed_leaves_the_group_to_be_joined_again(monkeypatch):
+    """A peer gone during the vote at the end marker. Raised as it was, the
+    error kept receive_weights_rdma from tearing the group down, and the next
+    stream rode a group that still listed the dead rank."""
+    import torch
+
+    group = object()
+    destroyed = []
+    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
+    monkeypatch.setattr(
+        receiver,
+        "dist",
+        SimpleNamespace(
+            broadcast=trainer.broadcast, destroy_process_group=destroyed.append
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    runner = _transacting_runner()
+    runner._rdma_weight_groups = {"g": group}
+    ballots = []
+
+    def vote(ballot, began):
+        ballots.append(ballot)
+        if ballot != receiver._RECEIVING:
+            raise RuntimeError("peer gone mid-vote")
+        return ballot, began
+
+    runner._vote_with_engine_peers = vote
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="could not vote"):
+        runner.receive_weights_rdma("g", 1)
+
+    # Not voted on again over a group that had just failed to vote.
+    assert ballots == [receiver._RECEIVING, receiver._PREPARED]
+    assert destroyed == [group]
+    with pytest.raises(RuntimeError, match="not initialized"):
+        runner.receive_weights_rdma("g", 2)
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+
 def test_a_broadcast_that_fails_puts_the_rank_out_of_step(monkeypatch):
     """Typically a peer that left: this rank's own frames are fine, but the
     group is no longer in step, so it is out of step all the same."""

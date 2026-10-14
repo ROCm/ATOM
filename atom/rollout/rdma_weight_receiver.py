@@ -70,9 +70,10 @@ class RDMAStreamOutOfStep(RuntimeError):
     so a frame one receiver cannot allocate for is one none of them can take
     part in -- and the sender, already broadcasting it, cannot be told. A
     broadcast that failed, typically because a peer left, puts the group in the
-    same place. Nothing more can ride it: this rank's end is torn down, and the
-    sender and any peer still in a broadcast are released when their side of
-    it fails, or by the group's timeout.
+    same place, and so does a vote that failed: the group still lists the peer
+    it could not reach. Nothing more can ride it: this rank's end is torn down,
+    and the sender and any peer still in a broadcast are released when their
+    side of it fails, or by the group's timeout.
     """
 
 
@@ -260,6 +261,15 @@ def receive_weight_stream(
     any_began = False
     ended = False
     voted = False
+    vote_failed = False
+
+    def decide(ballot: int) -> tuple[int, bool]:
+        nonlocal vote_failed
+        try:
+            return agree(ballot, began)
+        except Exception:
+            vote_failed = True
+            raise
 
     try:
         try:
@@ -325,9 +335,7 @@ def receive_weight_stream(
                 except RuntimeError as exc:  # out of memory, within the bounds
                     metadata_tensor = payload = None
                     reason = str(exc)
-            outcome, any_began = agree(
-                _RECEIVING if reason is None else _BROKEN_OFF, began
-            )
+            outcome, any_began = decide(_RECEIVING if reason is None else _BROKEN_OFF)
             if outcome != _RECEIVING:
                 voted = True
                 raise RDMAStreamOutOfStep(
@@ -377,7 +385,7 @@ def receive_weight_stream(
                 torch.cuda.synchronize(device)
             except Exception as exc:  # noqa: BLE001 - voted on, then raised
                 failure = exc
-        outcome, any_began = agree(_PREPARED if failure is None else _BROKEN_OFF, began)
+        outcome, any_began = decide(_PREPARED if failure is None else _BROKEN_OFF)
         voted = True
         if failure is None and outcome != _PREPARED:
             failure = RuntimeError(
@@ -409,10 +417,14 @@ def receive_weight_stream(
                         "RDMA weight stream v%d: leaving its group failed",
                         expected_version,
                     )
-            try:
-                _, any_began = agree(_BROKEN_OFF, began)
-            except Exception:  # noqa: BLE001 - the stream's own failure is raised
+            if vote_failed:
+                # Not voted on again over a group that just failed to vote.
                 any_began = True  # unknown, so take it that a peer began
+            else:
+                try:
+                    _, any_began = agree(_BROKEN_OFF, began)
+                except Exception:  # noqa: BLE001 - the stream's own failure is raised
+                    any_began = True  # unknown, so take it that a peer began
         if began:
             # Fence before re-raising: the parameters are now a mix of
             # versions, so serving must stop until a later full reload succeeds.
@@ -422,10 +434,16 @@ def receive_weight_stream(
             # longer hold one version -- and a rank still serving would wait in
             # its next forward's collectives for peers that refuse to.
             runner.fence_weight_update(exc)
-        if not ended and not isinstance(exc, RDMAStreamOutOfStep):
-            raise RDMAStreamOutOfStep(
-                f"RDMA weight stream broke off before its end marker: {exc}"
-            ) from exc
+        if not isinstance(exc, RDMAStreamOutOfStep):
+            if not ended:
+                raise RDMAStreamOutOfStep(
+                    f"RDMA weight stream broke off before its end marker: {exc}"
+                ) from exc
+            if vote_failed:
+                raise RDMAStreamOutOfStep(
+                    f"RDMA weight stream v{expected_version}: the ranks taking it "
+                    f"could not vote on it: {exc}"
+                ) from exc
         raise
 
     elapsed = time.perf_counter() - started
