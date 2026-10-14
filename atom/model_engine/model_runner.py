@@ -424,8 +424,8 @@ class tokenIDProcessor:
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
-        # Previous copy_done covers token + route D2H from last step. Commit
-        # and queue this step's route copy *before* send records copy_done.
+        # Queued ahead of this step's token D2H, so the next recv's copy_done
+        # wait also covers the route copy and `take` does not block on it.
         if after_recv is not None:
             after_recv()
         self.send_to_cpu_async(
@@ -2392,34 +2392,11 @@ class ModelRunner:
         *,
         stream: torch.cuda.Stream | None = None,
         slot_mapping: torch.Tensor | None = None,
-    ) -> bool:
-        if not getattr(self.config, "enable_return_routed_experts", False):
-            return False
-        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
-            return False
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
-
-        capturer = RoutedExpertsCapturer.get()
-        if capturer is None:
-            return False
-        return capturer.store_step(slot_mapping, stream=stream)
-
-    def _commit_routed_experts(self, *, keep_last: bool = False) -> None:
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
-
-        capturer = RoutedExpertsCapturer.get()
-        if capturer is not None:
-            capturer.commit_pending(keep_last=keep_last)
-
-    def _attach_routed_experts(
-        self, batch: ScheduledBatch, output: ScheduledBatchOutput
     ) -> None:
-        """CPU gather in this runner process. The capturer is not visible to
-        the EngineCore scheduler (runner is an ``AsyncIOProcManager`` child).
+        """Queue this step's routes; ``_attach_routed_experts`` claims them.
+
+        Must run in the same forward as ``prepare_model``: each request's first
+        position is read from that forward's ``positions`` mirror.
         """
         if not getattr(self.config, "enable_return_routed_experts", False):
             return
@@ -2432,16 +2409,52 @@ class ModelRunner:
         capturer = RoutedExpertsCapturer.get()
         if capturer is None:
             return
-        block_tables = getattr(batch, "block_tables", None)
-        if not block_tables or len(block_tables) != len(batch.req_ids):
-            return
-        starts = getattr(batch, "routed_export_starts", None)
-        output.routed_experts = capturer.export_range(
+        lens = batch.num_scheduled_tokens
+        first = np.cumsum(lens) - lens
+        batch.routed_experts_ticket = capturer.store_step(
+            slot_mapping,
             batch.req_ids,
-            block_tables,
-            batch.context_lens,
-            self.block_size,
-            starts,
+            self.forward_vars["positions"].np[first],
+            lens,
+            prefix=self._routed_prefix_slots(batch),
+            stream=stream,
+        )
+
+    def _routed_prefix_slots(self, batch: ScheduledBatch):
+        """Slots of cached prefixes the scheduler has no routes for yet."""
+        ranges = getattr(batch, "routed_prefix_ranges", None)
+        if not ranges:
+            return None
+        from atom.model_ops.fused_moe.routed_experts_capturer import prefix_slots
+
+        req_ids = np.asarray([batch.req_ids[i] for i, _, _ in ranges], np.int64)
+        starts = np.asarray([lo for _, lo, _ in ranges], np.int64)
+        lens = np.asarray([hi - lo for _, lo, hi in ranges], np.int64)
+        slots = np.concatenate(
+            [
+                prefix_slots(batch.block_tables[i], lo, hi, self.block_size)
+                for i, lo, hi in ranges
+            ]
+        )
+        return req_ids, starts, lens, slots
+
+    def _attach_routed_experts(
+        self, batch: ScheduledBatch, output: ScheduledBatchOutput
+    ) -> None:
+        """Hand ``batch``'s stored routes to the scheduler in ``output``."""
+        if not getattr(self.config, "enable_return_routed_experts", False):
+            return
+        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
+            return
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsCapturer,
+        )
+
+        capturer = RoutedExpertsCapturer.get()
+        if capturer is None:
+            return
+        output.routed_experts = capturer.take(
+            getattr(batch, "routed_experts_ticket", None)
         )
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
@@ -3523,7 +3536,6 @@ class ModelRunner:
         slots = _current_slot_mapping()
 
         def _queue_routed_store_after_recv() -> None:
-            self._commit_routed_experts()
             self._store_routed_experts_step(
                 batch,
                 stream=self.tokenID_processor.async_copy_stream,

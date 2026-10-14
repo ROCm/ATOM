@@ -12,12 +12,14 @@ from atom.config import Config
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_ops.fused_moe.routed_experts_capturer import (
+    UNCAPTURED,
     RoutedExpertsCapturer,
+    RoutedExpertsPatch,
     capture_bytes_per_kv_block,
     capture_pad_row_bytes,
     check_return_routed_experts,
-    kv_slots_from_block_table,
     maybe_capture_routed_experts,
+    prefix_slots,
     topk_ids_from_triton_routing,
     trim_routed_experts,
 )
@@ -32,6 +34,18 @@ def _reset_capturer():
 
 def _device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _segments(patch: RoutedExpertsPatch) -> list[tuple[int, int, np.ndarray]]:
+    off = patch.offsets.tolist()
+    return [
+        (int(r), int(s), patch.rows[off[j] : off[j + 1]])
+        for j, (r, s) in enumerate(zip(patch.req_ids, patch.starts))
+    ]
+
+
+def _store_take(capturer, slots, req_ids, starts, lens, **kw):
+    return capturer.take(capturer.store_step(slots, req_ids, starts, lens, **kw))
 
 
 def test_config_flag_defaults_off():
@@ -85,47 +99,53 @@ def test_flag_off_leaves_field_absent():
     assert ro.routed_experts is None
 
 
-def test_interleaved_two_request_scatter_gather():
-    """Two requests share one select_experts-style batch; gather by block table."""
+def test_two_request_batch_order_segments():
+    """A step's rows come back in batch token order, one segment per request."""
     device = _device()
-    block_size = 16
     capturer = RoutedExpertsCapturer.init(
         num_slots=64, num_layers=3, top_k=2, device=device
     )
-    # Request A: blocks [0], tokens at slots 0,1 then later 2
-    # Request B: blocks [1], tokens at slots 16,17
-    # Interleaved batch 1: A0, B0, A1, B1
-    slots_b1 = torch.tensor([0, 16, 1, 17], device=device)
-    ids_b1 = torch.tensor(
-        [[10, 11], [20, 21], [12, 13], [22, 23]],
-        dtype=torch.int32,
-        device=device,
+    # Request A on block 0, request B on block 1, two prefill tokens each.
+    slots = torch.tensor([0, 1, 16, 17], device=device)
+    ids = torch.tensor(
+        [[10, 11], [12, 13], [20, 21], [22, 23]], dtype=torch.int32, device=device
     )
-    capturer.capture(0, ids_b1, slot_mapping=slots_b1)
-    capturer.capture(1, ids_b1 + 100, slot_mapping=slots_b1)
-    capturer.store_step(slots_b1)
-
-    # Later step: only A token 2, B idle
-    slots_b2 = torch.tensor([2], device=device)
-    ids_b2 = torch.tensor([[14, 15]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids_b2, slot_mapping=slots_b2)
-    capturer.capture(1, ids_b2 + 100, slot_mapping=slots_b2)
-    capturer.store_step(slots_b2)
-
-    exported = capturer.export_batch(
-        req_ids=[7, 9],
-        block_tables=[[0], [1]],
-        num_tokens_list=[3, 2],
-        block_size=block_size,
-    )
-    a = exported[7]
-    b = exported[9]
-    assert a.shape == (3, 3, 2)
-    assert b.shape == (2, 3, 2)
-    assert a.dtype == np.int16
-    np.testing.assert_array_equal(a[:, 0, :], [[10, 11], [12, 13], [14, 15]])
-    np.testing.assert_array_equal(a[:, 1, :], [[110, 111], [112, 113], [114, 115]])
+    capturer.capture(0, ids, slot_mapping=slots)
+    capturer.capture(1, ids + 100, slot_mapping=slots)
+    patch = _store_take(capturer, slots, [7, 9], [0, 0], [2, 2])
+    assert patch.rows.dtype == np.int16
+    assert patch.rows.shape == (4, 3, 2)
+    (ra, sa, a), (rb, sb, b) = _segments(patch)
+    assert (ra, sa, rb, sb) == (7, 0, 9, 0)
+    np.testing.assert_array_equal(a[:, 0, :], [[10, 11], [12, 13]])
+    np.testing.assert_array_equal(a[:, 1, :], [[110, 111], [112, 113]])
     np.testing.assert_array_equal(b[:, 0, :], [[20, 21], [22, 23]])
+
+    # Next step decodes A alone at position 2.
+    slots2 = torch.tensor([2], device=device)
+    ids2 = torch.tensor([[14, 15]], dtype=torch.int32, device=device)
+    capturer.capture(0, ids2, slot_mapping=slots2)
+    patch2 = _store_take(capturer, slots2, [7], [2], [1])
+    [(r, s, rows)] = _segments(patch2)
+    assert (r, s) == (7, 2)
+    np.testing.assert_array_equal(rows[:, 0, :], [[14, 15]])
+
+
+def test_patches_rebuild_request_history():
+    seq = Sequence([1, 2, 3], 3)
+    seq.id = 7
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=32, num_layers=1, top_k=1, device=device
+    )
+    for start, n in ((0, 3), (3, 1), (4, 1)):
+        slots = torch.arange(start, start + n, device=device)
+        ids = slots.to(torch.int32).unsqueeze(-1) + 40
+        capturer.capture(0, ids, slot_mapping=slots)
+        patch = _store_take(capturer, slots, [7], [start], [n])
+        for _r, s, rows in _segments(patch):
+            seq.apply_routed_expert_patch(s, rows)
+    assert seq.routed_experts[:, 0, 0].tolist() == [40, 41, 42, 43, 44]
 
 
 def test_length_contract_prompt_plus_completion_minus_one():
@@ -140,10 +160,8 @@ def test_length_contract_prompt_plus_completion_minus_one():
     slots = torch.arange(n_routes, device=device)
     ids = torch.arange(n_routes, device=device, dtype=torch.int32).unsqueeze(-1)
     capturer.capture(0, ids, slot_mapping=slots)
-    capturer.store_step(slots)
-    exported = capturer.export_batch([1], [[0]], [n_routes], block_size=16)[1]
-    assert exported.shape[0] == n_routes
-    assert exported.shape[0] == prompt_len + completion_len - 1
+    patch = _store_take(capturer, slots, [1], [0], [n_routes])
+    assert patch.rows.shape[0] == prompt_len + completion_len - 1
 
 
 def test_graph_dummy_does_not_clobber_slot_zero():
@@ -176,7 +194,8 @@ def test_graph_dummy_negative_slots_ignored():
     assert got3 == [5, 6]
 
 
-def test_prefix_hit_reuses_physical_slots():
+def test_prefix_hit_segment_reads_cached_slots():
+    """B prefix-hits A's block: its cached rows come first, then its new token."""
     device = _device()
     capturer = RoutedExpertsCapturer.init(
         num_slots=32, num_layers=1, top_k=2, device=device
@@ -184,12 +203,23 @@ def test_prefix_hit_reuses_physical_slots():
     slots = torch.tensor([0, 1, 2], device=device)
     ids = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32, device=device)
     capturer.capture(0, ids, slot_mapping=slots)
-    capturer.store_step(slots)
-    # Request B prefix-hits A's blocks; gather the same physical slots.
-    a = capturer.export_batch([1], [[0]], [3], block_size=16)[1]
-    b = capturer.export_batch([2], [[0]], [3], block_size=16)[2]
-    np.testing.assert_array_equal(a, b)
-    np.testing.assert_array_equal(a[:, 0, :], [[7, 8], [9, 10], [11, 12]])
+    a = _store_take(capturer, slots, [1], [0], [3])
+
+    b_slots = torch.tensor([3], device=device)
+    capturer.capture(
+        0, torch.tensor([[5, 6]], dtype=torch.int32, device=device), slot_mapping=b_slots
+    )
+    prefix = (
+        np.array([2]),
+        np.array([0]),
+        np.array([3]),
+        prefix_slots([0, 1], 0, 3, 16),
+    )
+    b = _store_take(capturer, b_slots, [2], [3], [1], prefix=prefix)
+    (r0, s0, cached), (r1, s1, new) = _segments(b)
+    assert (r0, s0, r1, s1) == (2, 0, 2, 3)
+    np.testing.assert_array_equal(cached, a.rows)
+    np.testing.assert_array_equal(new[:, 0, :], [[5, 6]])
 
 
 def test_maybe_capture_skips_when_uninitialized():
@@ -200,135 +230,95 @@ def test_maybe_capture_skips_when_uninitialized():
     assert RoutedExpertsCapturer.get() is None
 
 
-def test_kv_slots_from_block_table():
-    slots = kv_slots_from_block_table([4, 9], num_tokens=18, block_size=16)
-    assert slots.tolist() == list(range(4 * 16, 4 * 16 + 16)) + [
-        9 * 16,
-        9 * 16 + 1,
-    ]
-    pos = torch.arange(18, dtype=torch.long)
-    blocks = torch.tensor([4, 9], dtype=torch.long)
-    gpu_formula = (blocks[pos // 16] * 16 + (pos % 16)).tolist()
-    assert slots.tolist() == gpu_formula
+def test_prefix_slots_match_gpu_formula():
+    table = [4, 9, 2, 7]
+    pos = torch.arange(50, dtype=torch.long)
+    blocks = torch.tensor(table, dtype=torch.long)
+    full = (blocks[pos // 16] * 16 + (pos % 16)).tolist()
+    for lo, hi in ((0, 18), (5, 16), (15, 17), (16, 50), (33, 34)):
+        assert prefix_slots(table, lo, hi, 16).tolist() == full[lo:hi]
 
 
-def test_store_step_skips_pad_and_matches_gpu_rows():
+def test_store_step_drops_graph_pad_tail():
+    """Graph-padded slot_mapping: only the step's real tokens are returned."""
     device = _device()
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=2, device=device
     )
-    capturer.buffer[:, 0, :] = -7
-    real = torch.tensor([0], device=device)
+    slots = torch.tensor([0, -1, -1], device=device)
     capturer.capture(
         0,
-        torch.tensor([[9, 8]], dtype=torch.int32, device=device),
-        slot_mapping=real,
+        torch.tensor([[9, 8], [1, 2], [3, 4]], dtype=torch.int32, device=device),
+        slot_mapping=slots,
     )
-    capturer.store_step(real)
-    dummy = torch.tensor([-1, -1], device=device)
-    capturer.capture(
-        0,
-        torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device=device),
-        slot_mapping=dummy,
-    )
-    capturer.store_step(dummy)
-    exported = capturer.export_batch([1], [[0]], [1], block_size=16)[1]
-    np.testing.assert_array_equal(exported[:, 0, :], [[9, 8]])
+    patch = _store_take(capturer, slots, [1], [0], [1])
+    np.testing.assert_array_equal(patch.rows[:, 0, :], [[9, 8]])
 
 
-def test_export_without_store_step_is_empty():
+def test_uncaptured_rows_are_minus_one():
+    """Layers or slots no MoE layer wrote read back as UNCAPTURED, not expert 0."""
     device = _device()
     capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
+        num_slots=8, num_layers=2, top_k=2, device=device
     )
     slots = torch.tensor([0, 1], device=device)
-    ids = torch.tensor([[7, 8], [9, 10]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids, slot_mapping=slots)
-    exported = capturer.export_batch([1], [[0]], [2], block_size=16)[1]
-    np.testing.assert_array_equal(exported, np.zeros((2, 1, 2), dtype=np.int16))
+    capturer.capture(
+        0, torch.tensor([[7, 8], [9, 10]], dtype=torch.int32, device=device), slots
+    )
+    patch = _store_take(capturer, slots, [1], [0], [2])
+    np.testing.assert_array_equal(patch.rows[:, 0, :], [[7, 8], [9, 10]])
+    assert (patch.rows[:, 1, :] == UNCAPTURED).all()
 
 
-def test_commit_pending_keep_last_does_not_wait():
-    """In-flight step stays in _pending until the next recv-equivalent commit."""
+def test_short_slot_mapping_pads_uncaptured():
+    """A metadata builder exposing fewer slots than tokens yields -1 rows."""
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=1, device=device
+    )
+    slots = torch.tensor([2], device=device)
+    capturer.capture(0, torch.tensor([[5]], dtype=torch.int32, device=device), slots)
+    patch = _store_take(capturer, slots, [1, 2], [0, 0], [2, 1])
+    assert patch.rows[:, 0, 0].tolist() == [5, UNCAPTURED, UNCAPTURED]
+    assert patch.offsets.tolist() == [0, 2, 3]
+
+
+def test_empty_step_has_no_ticket():
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=2, device="cpu"
     )
-    dest = torch.tensor([3], dtype=torch.int32)
-    rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
-    capturer._pending.append((dest, rows, None))
-    capturer.commit_pending(keep_last=True)
-    np.testing.assert_array_equal(
-        capturer.cpu_buffer[3], np.zeros((1, 2), dtype=np.int16)
-    )
-    capturer.commit_pending(keep_last=False)
-    np.testing.assert_array_equal(capturer.cpu_buffer[3, 0], [5, 6])
+    assert capturer.store_step(torch.tensor([], dtype=torch.long), [], [], []) is None
+    assert capturer.store_step(None, [1], [0], [1]) is None
+    assert capturer.take(None) is None
 
 
-def test_store_step_empty_returns_false_so_flush_can_commit():
-    """Last deferred flush has no slots: caller must commit keep_last=False."""
+def test_take_claims_once_and_by_ticket():
     capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device="cpu"
+        num_slots=8, num_layers=1, top_k=1, device="cpu"
     )
-    dest = torch.tensor([3], dtype=torch.int32)
-    rows = torch.tensor([[[5, 6]]], dtype=torch.int16)
-    capturer._pending.append((dest, rows, None))
-    empty = torch.tensor([], dtype=torch.long)
-    assert capturer.store_step(empty) is False
-    capturer.commit_pending(keep_last=False)
-    np.testing.assert_array_equal(capturer.cpu_buffer[3, 0], [5, 6])
+    a = capturer.store_step(torch.tensor([1]), [1], [0], [1])
+    b = capturer.store_step(torch.tensor([2]), [2], [0], [1])
+    assert capturer.take(b).req_ids.tolist() == [2]
+    assert capturer.take(a).req_ids.tolist() == [1]
+    assert capturer.take(a) is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
-def test_async_store_step_applies_only_after_copy_done_commit():
-    """Route D2H stays in _pending until the recv-equivalent commit."""
-    device = torch.device("cuda")
+def test_untaken_steps_are_bounded():
     capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
+        num_slots=8, num_layers=1, top_k=1, device="cpu"
     )
-    slots = torch.tensor([1], device=device)
-    ids = torch.tensor([[7, 8]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids, slot_mapping=slots)
-    stream = torch.cuda.Stream()
-    assert capturer.store_step(slots, stream=stream) is True
-    np.testing.assert_array_equal(
-        capturer.cpu_buffer[1], np.zeros((1, 2), dtype=np.int16)
-    )
-    done = torch.cuda.Event()
-    with torch.cuda.stream(stream):
-        done.record(stream)
-    done.synchronize()
-    capturer.commit_pending()
-    np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
-def test_blocking_store_waits_for_inflight_async_copy():
-    """A middle-chunk blocking store must not commit a D2H still in flight."""
-    device = torch.device("cuda")
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=2, device=device
-    )
-    slots = torch.tensor([1], device=device)
-    capturer.capture(
-        0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slot_mapping=slots
-    )
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        torch.cuda._sleep(2_000_000_000)
-    assert capturer.store_step(slots, stream=stream) is True
-    other = torch.tensor([2], device=device)
-    capturer.capture(
-        0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=other
-    )
-    assert capturer.store_step(other) is True
-    np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
-    np.testing.assert_array_equal(capturer.cpu_buffer[2, 0], [3, 4])
+    tickets = [
+        capturer.store_step(torch.tensor([0]), [1], [i], [1]) for i in range(20)
+    ]
+    assert len(capturer._pending) == RoutedExpertsCapturer._MAX_PENDING
+    assert capturer.take(tickets[0]) is None
+    assert capturer.take(tickets[-1]) is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
 def test_async_store_snapshots_slots_before_staging_reuse():
     """The next forward rewrites slot_mapping in place on the compute stream;
-    a stalled copy stream must still export this step's slots."""
+    a stalled copy stream must still return this step's rows."""
     device = torch.device("cuda")
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=2, device=device
@@ -340,16 +330,12 @@ def test_async_store_snapshots_slots_before_staging_reuse():
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         torch.cuda._sleep(2_000_000_000)
-    assert capturer.store_step(slots, stream=stream) is True
+    ticket = capturer.store_step(slots, [1], [0], [1], stream=stream)
     slots.fill_(2)
     capturer.capture(
         0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=slots
     )
-    capturer.commit_pending()
-    np.testing.assert_array_equal(capturer.cpu_buffer[1, 0], [7, 8])
-    np.testing.assert_array_equal(
-        capturer.cpu_buffer[2], np.zeros((1, 2), dtype=np.int16)
-    )
+    np.testing.assert_array_equal(capturer.take(ticket).rows[:, 0, :], [[7, 8]])
 
 
 def test_capture_page_bytes_are_budgeted_per_block():
@@ -425,102 +411,6 @@ def test_triton_routing_ids_match_packed_histogram():
     assert ids.tolist() == [[1, 4], [3, 5], [3, 4]]
 
 
-def test_export_range_matches_export_batch_prefix():
-    device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=32, num_layers=2, top_k=2, device=device
-    )
-    slots = torch.arange(5, device=device)
-    ids = torch.arange(10, device=device, dtype=torch.int32).reshape(5, 2)
-    capturer.capture(0, ids, slot_mapping=slots)
-    capturer.capture(1, ids + 50, slot_mapping=slots)
-    capturer.store_step(slots)
-    full = capturer.export_batch([1], [[0]], [5], block_size=16)[1]
-    start, rows = capturer.export_range([1], [[0]], [5], 16, [2])[1]
-    assert start == 2
-    np.testing.assert_array_equal(rows, full[2:])
-    np.testing.assert_array_equal(
-        capturer.export_batch([1], [[0]], [5], 16, [2])[1], full[2:]
-    )
-
-
-def test_export_range_decode_only_row():
-    device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=32, num_layers=1, top_k=2, device=device
-    )
-    prefill = torch.tensor([0, 1, 2], device=device)
-    capturer.capture(
-        0,
-        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device),
-        slot_mapping=prefill,
-    )
-    capturer.store_step(prefill)
-    decode = torch.tensor([3], device=device)
-    capturer.capture(
-        0,
-        torch.tensor([[7, 8]], dtype=torch.int32, device=device),
-        slot_mapping=decode,
-    )
-    capturer.store_step(decode)
-    start, rows = capturer.export_range([1], [[0]], [4], 16, [3])[1]
-    assert start == 3
-    assert rows.shape == (1, 1, 2)
-    np.testing.assert_array_equal(rows[:, 0, :], [[7, 8]])
-
-
-def test_export_range_empty_when_start_eq_end():
-    device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=16, num_layers=1, top_k=1, device=device
-    )
-    slots = torch.tensor([0, 1], device=device)
-    capturer.capture(
-        0,
-        torch.tensor([[1], [2]], dtype=torch.int32, device=device),
-        slot_mapping=slots,
-    )
-    capturer.store_step(slots)
-    assert capturer.export_range([1], [[0]], [2], 16, [2]) == {}
-
-
-def test_interleaved_requests_independent_ranges():
-    device = _device()
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=64, num_layers=1, top_k=2, device=device
-    )
-    slots = torch.tensor([0, 16, 1, 17], device=device)
-    ids = torch.tensor(
-        [[10, 11], [20, 21], [12, 13], [22, 23]],
-        dtype=torch.int32,
-        device=device,
-    )
-    capturer.capture(0, ids, slot_mapping=slots)
-    capturer.store_step(slots)
-    patches = capturer.export_range([7, 9], [[0], [1]], [2, 2], 16, [1, 0])
-    assert patches[7][0] == 1
-    np.testing.assert_array_equal(patches[7][1][:, 0, :], [[12, 13]])
-    assert patches[9][0] == 0
-    np.testing.assert_array_equal(patches[9][1][:, 0, :], [[20, 21], [22, 23]])
-
-
-def test_kv_slots_start_token_skips_prefix():
-    slots = kv_slots_from_block_table(
-        [4, 9], num_tokens=18, block_size=16, start_token=16
-    )
-    assert slots.tolist() == [9 * 16, 9 * 16 + 1]
-
-
-def test_kv_slots_start_token_mid_block_matches_full():
-    table = [4, 9, 2, 7]
-    full = kv_slots_from_block_table(table, num_tokens=50, block_size=16)
-    for start in (0, 5, 15, 16, 31, 33, 49):
-        part = kv_slots_from_block_table(
-            table, num_tokens=50, block_size=16, start_token=start
-        )
-        assert part.tolist() == full[start:].tolist()
-
-
 def test_dest_cache_invalidates_on_in_place_slot_rewrite():
     """Staging slot buffer is rewritten in place between forwards; the
     per-forward dest cache must not reuse the previous forward's slots."""
@@ -532,19 +422,20 @@ def test_dest_cache_invalidates_on_in_place_slot_rewrite():
     ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
     for layer in range(3):
         capturer.capture(layer, ids + 10 * layer, slot_mapping=staging)
-    capturer.store_step(staging)
+    first = _store_take(capturer, staging, [0], [0], [2])
     staging.copy_(torch.tensor([2, 3, -1], device=device))
     for layer in range(3):
         capturer.capture(layer, ids + 100 + 10 * layer, slot_mapping=staging)
-    capturer.store_step(staging)
-    rows = capturer.export_batch([0], [[0]], [4], block_size=16)[0]
+    second = _store_take(capturer, staging, [0], [2], [2])
     for layer in range(3):
-        np.testing.assert_array_equal(rows[:2, layer], (ids[:2] + 10 * layer).cpu())
         np.testing.assert_array_equal(
-            rows[2:, layer], (ids[:2] + 100 + 10 * layer).cpu()
+            first.rows[:, layer], (ids[:2] + 10 * layer).cpu()
+        )
+        np.testing.assert_array_equal(
+            second.rows[:, layer], (ids[:2] + 100 + 10 * layer).cpu()
         )
     # Pad slot (-1) lands in the sacrificial row, never a real slot.
-    assert (capturer.buffer[4:32] == 0).all()
+    assert (capturer.buffer[4:32] == UNCAPTURED).all()
 
 
 def test_apply_patch_extends_none_and_appends():
@@ -561,11 +452,11 @@ def test_apply_patch_extends_none_and_appends():
     )
 
 
-def test_apply_patch_rejects_gap():
+def test_apply_patch_gap_fills_uncaptured():
     seq = Sequence([1, 2, 3], 3)
     seq.apply_routed_expert_patch(0, np.zeros((2, 1, 1), dtype=np.int16))
-    with pytest.raises(ValueError, match="gap"):
-        seq.apply_routed_expert_patch(4, np.zeros((1, 1, 1), dtype=np.int16))
+    seq.apply_routed_expert_patch(4, np.full((1, 1, 1), 5, dtype=np.int16))
+    assert seq.routed_experts[:, 0, 0].tolist() == [0, 0, -1, -1, 5]
 
 
 def test_apply_patch_replaces_suffix():
@@ -635,9 +526,12 @@ def test_incremental_decode_payload_smaller_than_full_history():
 
     layers, top_k, ctx, batch = 48, 8, 512, 8
     full = {i: np.zeros((ctx, layers, top_k), dtype=np.int16) for i in range(batch)}
-    patch = {
-        i: (ctx - 1, np.zeros((1, layers, top_k), dtype=np.int16)) for i in range(batch)
-    }
+    patch = RoutedExpertsPatch(
+        np.arange(batch),
+        np.full(batch, ctx - 1),
+        np.arange(batch + 1),
+        np.zeros((batch, layers, top_k), dtype=np.int16),
+    )
     full_size = len(pickle.dumps(full))
     patch_size = len(pickle.dumps(patch))
     assert patch_size * 20 < full_size

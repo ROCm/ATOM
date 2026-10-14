@@ -296,12 +296,9 @@ class ScheduledBatch:
             dtype=np.int32,
         )
 
-        # Already-accumulated route rows per request. The runner exports
-        # [start, context_len) so decode IPC stays O(new tokens).
-        self.routed_export_starts = np.asarray(
-            [int(seq.routed_expert_rows) for seq in seqs.values()],
-            dtype=np.int32,
-        )
+        # `(batch index, lo, hi)` cached-prefix route ranges the runner returns
+        # with this step; set by `Scheduler._plan_routed_prefixes`.
+        self.routed_prefix_ranges = None
 
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
@@ -485,7 +482,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
-        routed_experts: dict[int, np.ndarray] | None = None,
+        routed_experts=None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -500,8 +497,7 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
-        # Per-request MoE route patches, keyed by req_id.
-        # Each value is (start_row, int16 [delta_rows, num_layers, top_k]).
+        # This step's MoE routes in batch token order, a `RoutedExpertsPatch`.
         self.routed_experts = routed_experts
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
@@ -577,7 +573,10 @@ class Scheduler:
         # tokens a replaying forward carries from before it (`Replay.history_ids`)
         self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
 
-        if getattr(config, "enable_return_routed_experts", False):
+        self._return_routed_experts = bool(
+            getattr(config, "enable_return_routed_experts", False)
+        )
+        if self._return_routed_experts:
             from atom.model_ops.fused_moe.routed_experts_capturer import (
                 check_return_routed_experts,
             )
@@ -1736,8 +1735,31 @@ class Scheduler:
         quiet, which is indistinguishable from an idle engine.
         """
         result = self._schedule()
+        if result is not None and self._return_routed_experts:
+            self._plan_routed_prefixes(*result)
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
+
+    @staticmethod
+    def _plan_routed_prefixes(
+        batch: ScheduledBatch, seqs: dict[int, Sequence]
+    ) -> None:
+        """Mark cached prefixes whose routes no earlier step returned.
+
+        The runner sends only the rows a step forwards, so a prefix-cache hit
+        names its ``[forwarded_end, first_position)`` range for the runner to
+        read from the cached blocks once.
+        """
+        ranges = []
+        for i, seq in enumerate(seqs.values()):
+            if seq.type != SequenceType.PREFILL:
+                continue
+            n = int(batch.num_scheduled_tokens[i])
+            first = int(batch.context_lens[i]) - n
+            if first > seq.routed_forwarded_end:
+                ranges.append((i, seq.routed_forwarded_end, first))
+            seq.routed_forwarded_end = max(seq.routed_forwarded_end, first + n)
+        batch.routed_prefix_ranges = ranges
 
     def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.
@@ -3323,15 +3345,16 @@ class Scheduler:
             self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
 
     @staticmethod
-    def _merge_routed_expert_payload(seq: Sequence, payload) -> None:
-        """Apply a range patch or a full-history array onto ``seq``."""
-        if payload is None:
-            return
-        if isinstance(payload, tuple) and len(payload) == 2:
-            start, rows = payload
-            seq.apply_routed_expert_patch(start, rows)
-            return
-        seq.routed_experts = payload
+    def _apply_routed_experts_patch(seq_map: dict[int, Sequence], patch) -> None:
+        """Write each segment of a step's ``RoutedExpertsPatch`` onto its seq."""
+        rows = patch.rows
+        offsets = patch.offsets.tolist()
+        for j, (req_id, start) in enumerate(
+            zip(patch.req_ids.tolist(), patch.starts.tolist())
+        ):
+            seq = seq_map.get(req_id)
+            if seq is not None:
+                seq.apply_routed_expert_patch(start, rows[offsets[j] : offsets[j + 1]])
 
     def postprocess(
         self,
@@ -3366,14 +3389,11 @@ class Scheduler:
                 if seq is not None and "embedding_spans" in data:
                     seq.multimodal_cache_ready = True
         routed = getattr(fwd_output, "routed_experts", None)
-        if routed:
+        if routed is not None:
             seq_map = dict(running_by_id)
             for seq in seqs:
                 seq_map[seq.id] = seq
-            for req_id, payload in routed.items():
-                seq = seq_map.get(req_id)
-                if seq is not None:
-                    self._merge_routed_expert_payload(seq, payload)
+            self._apply_routed_experts_patch(seq_map, routed)
         num_prefill = int(getattr(batch, "total_seqs_num_prefill", 0))
         prefill_ids = set(batch.req_ids[:num_prefill]) if num_prefill else set()
         if self._connector_flag("is_offload") and num_prefill:

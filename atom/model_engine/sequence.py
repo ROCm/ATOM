@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import array
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -29,6 +30,23 @@ def new_token_ids(token_ids=()) -> array.array:
     `BlockManager.compute_hash` pins its dtype.
     """
     return array.array("i", token_ids)
+
+
+_routed_expert_gap_warned = False
+
+
+def _warn_routed_expert_gap(req_id: int, have: int, start: int) -> None:
+    global _routed_expert_gap_warned
+    if _routed_expert_gap_warned:
+        return
+    _routed_expert_gap_warned = True
+    logging.getLogger("atom").warning(
+        "routed experts: request %s has rows up to %d but the next patch starts "
+        "at %d; the gap is returned as -1 (further gaps are not logged)",
+        req_id,
+        have,
+        start,
+    )
 
 
 # Drawn once per table and once per non-append mutation of one, never reused.
@@ -443,6 +461,9 @@ class Sequence:
         # `_routed_expert_rows` is the live length; the tail is unused.
         self._routed_expert_buf: np.ndarray | None = None
         self._routed_expert_rows: int = 0
+        # Positions some scheduled forward already returns routes for; a
+        # prefix-cache hit past it must have its rows read from the cache.
+        self.routed_forwarded_end: int = 0
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every
@@ -593,7 +614,11 @@ class Sequence:
         self._routed_expert_buf = grown
 
     def apply_routed_expert_patch(self, start: int, rows: np.ndarray | None) -> None:
-        """Merge an absolute-range patch. Gaps are rejected; overlap overwrites."""
+        """Merge an absolute-range patch; overlap overwrites.
+
+        Rows a gap skips are filled with -1 (uncaptured) rather than failing
+        the engine loop, and warned about once.
+        """
         if rows is None:
             return
         arr = np.ascontiguousarray(rows, dtype=np.int16)
@@ -601,13 +626,12 @@ class Sequence:
         if n == 0:
             return
         start = int(start)
-        if start > self._routed_expert_rows:
-            raise ValueError(
-                f"gap in routed-expert patch: start={start} "
-                f"have={self._routed_expert_rows}"
-            )
+        have = self._routed_expert_rows
         end = start + n
         self._ensure_routed_expert_capacity(end, arr.shape[1], arr.shape[2])
+        if start > have:
+            _warn_routed_expert_gap(self.id, have, start)
+            self._routed_expert_buf[have:start] = -1
         self._routed_expert_buf[start:end] = arr
         self._routed_expert_rows = end
 
