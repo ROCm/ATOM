@@ -1465,27 +1465,42 @@ class WeightUpdaterMixin:
         self._weight_update_version = None
         self._weight_update_manifest = None
         self._last_committed_weight_version = version
-        self._weight_update_healthy = True
-        self._weight_update_failure = None
+        # A fence put off for this reload goes up now: its weights are whole,
+        # but not the version this rank's peers took while it was open.
+        pending = getattr(self, "_weight_update_fence_pending", None)
+        self._weight_update_fence_pending = None
+        self._weight_update_healthy = pending is None
+        self._weight_update_failure = pending
+        if pending is not None:
+            self._reset_reload_coverage()
         self._discard_reload_scratch()
         logger.info(
             f"{self.label}: committed weight update v{version} "
             f"({manifest['buckets']} buckets, "
             f"{manifest['loaded_internal']} parameters)"
         )
+        if pending is not None:
+            logger.error(f"{self.label}: serving fenced after v{version}: {pending}")
         return manifest
 
     def fence_weight_update(self, error: object) -> dict:
         """Stop serving until a full reload. A reload already in progress stays
-        open, for its caller to finish.
+        open, for its caller to finish, and the fence goes up when it does.
 
         For a rank that took no part in a stream its peers took: its own weights
         are whole, but no longer the version the rest of the engine holds. A
-        reload in progress here fences already, and is its caller's to end.
+        reload in progress here fences serving already, and is its caller's to
+        end; its commit would otherwise mark this rank healthy beside peers
+        that are fenced, or that recover to another version.
         """
-        if getattr(self, "_weight_update_version", None) is None and getattr(
-            self, "_weight_update_healthy", True
-        ):
+        if getattr(self, "_weight_update_version", None) is not None:
+            if getattr(self, "_weight_update_fence_pending", None) is None:
+                self._weight_update_fence_pending = str(error)
+                logger.error(
+                    f"{self.label}: serving fenced once the reload in progress "
+                    f"ends: {error}"
+                )
+        elif getattr(self, "_weight_update_healthy", True):
             self._weight_update_healthy = False
             self._weight_update_failure = str(error)
             self._reset_reload_coverage()
@@ -1503,6 +1518,7 @@ class WeightUpdaterMixin:
         version = int(active if active is not None else version)
         self._weight_update_version = None
         self._weight_update_manifest = None
+        self._weight_update_fence_pending = None  # the abort fences anyway
         self._weight_update_healthy = False
         self._weight_update_failure = str(error)
         # Counted afresh from here: what lifts the fence is a reload that

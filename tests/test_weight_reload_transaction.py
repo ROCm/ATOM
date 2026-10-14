@@ -383,10 +383,12 @@ def test_only_what_was_prepared_can_be_finished():
         runner.finish_weight_commit(1)
 
 
-def test_a_fence_stops_a_serving_runner_but_leaves_a_reload_in_progress():
+def test_a_fence_stops_a_serving_runner_and_waits_for_a_reload_in_progress():
     """For a rank that refused a stream its peers took: its weights are whole,
     but not the version the engine holds. A reload open there is its caller's
-    to end."""
+    to end, and the fence goes up when it does: the reload's commit marked
+    the rank healthy beside peers fenced, or about to recover to another
+    version."""
     serving = _Runner(_dense_model())
     _reload(serving, [_dense_checkpoint()])
     serving.fence_weight_update(RuntimeError("peers took v2"))
@@ -399,6 +401,9 @@ def test_a_fence_stops_a_serving_runner_but_leaves_a_reload_in_progress():
     assert reloading.get_weight_update_status()["in_progress"] == 1
     reloading.apply_weight_bucket(list(_dense_checkpoint().items()))
     reloading.commit_weight_update(1)
+    with pytest.raises(RuntimeError, match="peers took v2"):
+        reloading.assert_weight_update_ready()
+    reloading.update_weights(list(_dense_checkpoint(fill=2.0).items()))
     reloading.assert_weight_update_ready()
 
 
