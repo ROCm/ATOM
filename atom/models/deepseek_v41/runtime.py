@@ -28,6 +28,7 @@ from .bounded_replay import (
 from .config import validate_tbo_parallelism
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
+from .piecewise_buffers import TokenBuffers
 
 logger = logging.getLogger("atom")
 
@@ -98,7 +99,12 @@ def _piecewise_slot(layer_name, kind, output):
     layer, _ = context.no_compile_layers[layer_name]
     slots = layer.__dict__.get("_piecewise_outputs")
     if slots is None:
-        slots = layer._piecewise_outputs = StableOutputs()
+        capacity = getattr(layer, "piecewise_buffer_tokens", 0)
+        slots = layer._piecewise_outputs = (
+            TokenBuffers(capacity, token_dim=1) if capacity else StableOutputs()
+        )
+    if isinstance(slots, TokenBuffers):
+        return slots.slot(kind, output)
     key = (kind, tuple(output.shape), output.dtype, output.device)
     return slots.slot(key, output)
 
@@ -304,8 +310,19 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             and not config.enforce_eager
         )
         self._late_piecewise_inputs = {}
+        buffer_tokens = (
+            min(max(config.capture_sizes), config.max_num_batched_tokens)
+            if self.piecewise
+            and config.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_AND_PIECEWISE
+            else 0
+        )
+        self._late_input_buffers = (
+            TokenBuffers(buffer_tokens, token_dim=0) if buffer_tokens else None
+        )
         for i, layer in enumerate(self.layers):
             layer.piecewise = self.piecewise
+            layer.piecewise_buffer_tokens = buffer_tokens
             layer.af_piecewise = (
                 self.piecewise
                 and config.compilation_config.cudagraph_mode
@@ -426,6 +443,24 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 shapes.append((tokens // q, q))
         return shapes
 
+    def piecewise_buffer_bytes(self):
+        totals = {"attention": 0, "engram": 0, "late_inputs": 0}
+        for layer in self.layers:
+            slots = getattr(layer, "_piecewise_outputs", None)
+            if slots is not None:
+                for key, tensor in slots._slots.items():
+                    totals[key[0]] += tensor.numel() * tensor.element_size()
+        if self._late_input_buffers is not None:
+            totals["late_inputs"] = self._late_input_buffers.nbytes()
+        else:
+            totals["late_inputs"] = sum(
+                t.numel() * t.element_size()
+                for tensors in self._late_piecewise_inputs.values()
+                for t in tensors
+                if t is not None
+            )
+        return totals
+
     def _run_stage(self, stage, *inputs):
         # The initial graphs are captured for text. Image routing reads a live
         # mask whose shape/address differs, so execute the stage's Python body
@@ -455,7 +490,19 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         )
         if capture:
             if tokens not in slots:
-                slots[tokens] = tuple(None if t is None else t.clone() for t in inputs)
+                buffers = getattr(self, "_late_input_buffers", None)
+                slots[tokens] = tuple(
+                    (
+                        None
+                        if t is None
+                        else (
+                            t.clone()
+                            if buffers is None
+                            else buffers.slot(i, t).copy_(t)
+                        )
+                    )
+                    for i, t in enumerate(inputs)
+                )
             else:
                 for dst, src in zip(slots[tokens], inputs):
                     if dst is not None:

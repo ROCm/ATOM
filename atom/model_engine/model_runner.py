@@ -4304,6 +4304,17 @@ class ModelRunner:
                 (total - free) / (1 << 30),
                 free / (1 << 30),
             )
+            buffer_bytes = getattr(self.model, "piecewise_buffer_bytes", None)
+            if buffer_bytes is not None:
+                logger.info(
+                    "Piecewise owned buffers rank=%d stage=%s GiB: %s",
+                    self.rank,
+                    stage,
+                    {
+                        name: round(size / (1 << 30), 4)
+                        for name, size in buffer_bytes().items()
+                    },
+                )
 
         capture_memory("before")
 

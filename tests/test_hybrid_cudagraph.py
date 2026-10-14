@@ -26,6 +26,51 @@ def _runner(mode):
     return runner
 
 
+@pytest.mark.parametrize("token_dim,shape", [(0, (3, 4)), (1, (1, 3, 4))])
+def test_token_buffers_share_capacity_without_growing_recorded_storage(
+    token_dim, shape
+):
+    from atom.models.deepseek_v41.piecewise_buffers import TokenBuffers
+
+    buffers = TokenBuffers(8, token_dim)
+    small = torch.zeros(shape, dtype=torch.bfloat16)
+    large_shape = list(shape)
+    large_shape[token_dim] = 8
+    large = torch.zeros(large_shape, dtype=small.dtype)
+    view = buffers.slot("attention", small)
+    assert buffers.slot("attention", large).data_ptr() == view.data_ptr()
+    assert buffers.nbytes() == large.numel() * large.element_size()
+    assert buffers.slot("engram", small).data_ptr() != view.data_ptr()
+    large_shape[token_dim] = 9
+    with pytest.raises(ValueError, match="capacity"):
+        buffers.slot("attention", torch.empty(large_shape, dtype=small.dtype))
+    assert buffers.slot("attention", small).data_ptr() == view.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+def test_token_views_replay_with_separate_bucket_graph_pools():
+    from atom.models.deepseek_v41.piecewise_buffers import TokenBuffers
+
+    buffers = TokenBuffers(8, token_dim=0)
+    graphs, outputs = {}, {}
+    for tokens in (8, 3):
+        view = buffers.slot("attention", torch.ones(tokens, 4, device="cuda"))
+        view.fill_(1)
+        outputs[tokens] = torch.empty_like(view)
+        outputs[tokens].copy_(view * 3)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+            outputs[tokens].copy_(view * 3)
+        graphs[tokens] = graph
+    assert graphs[8].pool() != graphs[3].pool()
+    for tokens, value in [(3, 2), (8, 4), (3, 7), (8, 3)]:
+        buffers.slot("attention", outputs[tokens]).fill_(value)
+        graphs[tokens].replay()
+        torch.testing.assert_close(
+            outputs[tokens], torch.full_like(outputs[tokens], 3 * value)
+        )
+
+
 @pytest.mark.parametrize(
     "mode,expected",
     [

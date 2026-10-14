@@ -17,12 +17,15 @@ whole attention call. Both modes use the existing attention kernels.
 Use hybrid mode for AF piecewise prefill and whole-forward FULL decode:
 
 ```bash
---level 3 --cudagraph-mode FULL_AND_PIECEWISE --cuda-graph-sizes '[1024]'
+CAPTURE_SIZES=$(python3 -c 'import json; print(json.dumps([1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 1025, 16))))')
+# Add these arguments to the existing server launch command:
+--level 3 --cudagraph-mode FULL_AND_PIECEWISE --cudagraph-capture-sizes "$CAPTURE_SIZES"
 ```
 
-In this mode, the capture ladder is measured in **tokens**. A single
-`cuda_graph_sizes` value expands to `[1, 2, 4]`, multiples of 8 below 256,
-then multiples of 16 through that maximum. An explicit
+In this mode, the capture ladder is measured in **tokens**. The command above
+captures 83 token sizes through 1024. For Python configuration, a single
+`CompilationConfig.cuda_graph_sizes` value expands to `[1, 2, 4]`, multiples
+of 8 below 256, then multiples of 16 through that maximum. An explicit
 `--cudagraph-capture-sizes '[1, 2, 4, 8, 16, 32, 64, 128, 256, 448, 512, 704, 768, 1024]'`
 uses exactly those token candidates. Existing FULL, PIECEWISE and AF_PIECEWISE
 options retain their batch-size units.
@@ -39,12 +42,20 @@ the compiled pieces without inner graph replay/capture. Draft warmup covers
 the union of batch sizes reachable at every decode Q. Bounded-replay tail
 buckets are added internally when missing. The existing per-bucket piecewise
 memory pools are retained; a shared token ladder does not merge graph objects.
+Hybrid mode allocates each layer's attention/Engram output slot and the late
+stage's inputs once at the maximum token capacity, then supplies prefix views
+to each bucket. These model-owned buffers have stable addresses across
+serial forwards. Compiled intermediates retain their per-bucket graph pools.
 
 Every rank logs allocated/reserved/device-used/free GiB before capture,
 after each target mode/Q, and after draft capture. Subtract those readings to
 separate target piecewise, target FULL and draft memory. The final capture
 summary includes total reserved and allocated deltas. Device-used includes
 KV caches and allocations outside the PyTorch allocator, not just graphs.
+`Piecewise owned buffers` also reports attention, Engram and late-input bytes.
+These startup measurements exclude AF graphs first captured by live prefills.
+The pre-capture memory-budget estimate remains conservative and still uses
+the sum of token sizes; it does not reclaim the boundary-buffer savings for KV.
 
 ## Graph boundaries
 
