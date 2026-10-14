@@ -312,6 +312,84 @@ def test_outside_forward_and_fallback_both_publish_full_capacity(builder, monkey
     assert builder.cache.cursor[[2, 0], 0].tolist() == [2, 2]
 
 
+def _scratch_storage(cache):
+    tensors = [cache.backing, cache.cursor, cache.tentative_staging.gpu]
+    tensors.extend(
+        tensor for planes in cache.index_planes.values() for tensor in planes
+    )
+    tensors.extend(tensor for pair in cache.indptr_buffers.values() for tensor in pair)
+    return tuple(
+        (tensor.data_ptr(), tensor.shape, tensor.stride()) for tensor in tensors
+    )
+
+
+def test_capture_scratch_covers_split_dummy_pages_and_keeps_addresses():
+    """Artificial helper ordering, not V2's descending capture sequence."""
+    builder = _builder(max_tokens=96)
+    builder.cache = None
+    builder.score_workspace = None
+    builder.model_runner.v41_graphs_enabled = True
+    scratch = builder._capture_dummy_cache(1, 1, 1)
+    pointers = _scratch_storage(scratch)
+    batch = bridge._v41_dummy_batch(96, max_req_tokens=64, max_reqs=4)
+    assert batch.num_scheduled_tokens == (48, 48)
+    for lengths, expected_rows in [
+        ((48, 48), [[0, 1], [2, 3]]),
+        ((32, 64), [[0], [1, 2]]),
+        ((1, 1, 1, 1), [[0], [1], [2], [3]]),
+        ((1,), [[0]]),
+    ]:
+        batch.num_scheduled_tokens = batch.context_lens = lengths
+        batch.req_ids = tuple(range(len(lengths)))
+        batch.total_seqs_num, batch.total_tokens_num = len(lengths), sum(lengths)
+        metadata, _ = builder._prepare(batch, 4, sum(lengths), engram_live=False)
+        assert metadata.cache is scratch and builder.cache is None
+        assert [row.tolist() for row in metadata.block_table_rows] == expected_rows
+        assert scratch.num_pages > max(page for row in expected_rows for page in row)
+        assert _scratch_storage(scratch) == pointers
+    assert builder._capture_dummy_cache(1, 1, 1) is scratch
+
+
+@pytest.mark.parametrize("dimension", ["num_pages", "num_slots", "max_tokens"])
+def test_capture_scratch_rejects_oversize_without_replacing_storage(builder, dimension):
+    builder.cache = None
+    builder.score_workspace = None
+    builder.model_runner.v41_graphs_enabled = True
+    scratch = builder._capture_dummy_cache(1, 1, 1)
+    pointers = _scratch_storage(scratch)
+    current_step = scratch.current_step = object()
+    request = {
+        "num_pages": scratch.num_pages,
+        "num_slots": scratch.num_slots,
+        "max_tokens": scratch.max_tokens,
+    }
+    request[dimension] += 1
+    with pytest.raises(RuntimeError, match="capture scratch capacity"):
+        builder._capture_dummy_cache(*request.values())
+    assert builder._capture_dummy is scratch
+    assert scratch.current_step is current_step
+    assert _scratch_storage(scratch) == pointers
+    assert builder._capture_dummy_cache(1, 1, 1) is scratch
+
+
+def test_eager_scratch_has_exact_independent_storage(builder):
+    builder.score_workspace = None
+    first = builder._capture_dummy_cache(1, 1, 1)
+    second = builder._capture_dummy_cache(3, 2, 6)
+    assert first is not second and first.backing.data_ptr() != second.backing.data_ptr()
+    assert (first.num_pages, first.num_slots, first.max_tokens) == (1, 1, 1)
+    assert (second.num_pages, second.num_slots, second.max_tokens) == (3, 2, 6)
+    assert not hasattr(builder, "_capture_dummy")
+    builder.model_runner.v41_graphs_enabled = True
+    captured = builder._capture_dummy_cache(1, 1, 1)
+    pointers = _scratch_storage(captured)
+    builder.model_runner.v41_graphs_enabled = False
+    eager = builder._capture_dummy_cache(1, 1, 1)
+    assert eager.backing.data_ptr() != captured.backing.data_ptr()
+    assert builder._capture_dummy is captured
+    assert _scratch_storage(captured) == pointers
+
+
 @pytest.mark.parametrize("graphs_enabled", [False, True])
 def test_capture_scratch_lifetime_follows_effective_mode(
     builder, monkeypatch, graphs_enabled
@@ -324,7 +402,7 @@ def test_capture_scratch_lifetime_follows_effective_mode(
     allocated = []
 
     def allocate(geometry, pages, slots, device, *, max_tokens, workspace):
-        cache = SimpleNamespace(pages=pages, slots=slots, max_tokens=max_tokens)
+        cache = SimpleNamespace(num_pages=pages, num_slots=slots, max_tokens=max_tokens)
         allocated.append(cache)
         return cache
 
@@ -333,7 +411,7 @@ def test_capture_scratch_lifetime_follows_effective_mode(
     second = builder._capture_dummy_cache(1, 2, 6)
     if graphs_enabled:
         assert first is second and len(allocated) == 1
-        assert (first.pages, first.slots, first.max_tokens) == (1, 4, 12)
+        assert (first.num_pages, first.num_slots, first.max_tokens) == (4, 4, 12)
         # Changing mode must not drop storage that an existing graph references.
         builder.model_runner.v41_graphs_enabled = False
         assert builder._capture_dummy_cache(1, 1, 1) is not first
@@ -341,8 +419,8 @@ def test_capture_scratch_lifetime_follows_effective_mode(
     else:
         assert first is not second and len(allocated) == 2
         assert not hasattr(builder, "_capture_dummy")
-        assert (first.slots, first.max_tokens) == (1, 1)
-        assert (second.slots, second.max_tokens) == (2, 6)
+        assert (first.num_slots, first.max_tokens) == (1, 1)
+        assert (second.num_slots, second.max_tokens) == (2, 6)
 
 
 def test_outside_staging_is_not_repeated_by_forward_boundaries(builder, monkeypatch):

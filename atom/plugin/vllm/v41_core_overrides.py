@@ -144,18 +144,33 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             )
         cached = getattr(self, "_capture_dummy", None)
         if cached is None:
+            ceiling_tokens = max(running_tokens, self.max_num_batched_tokens)
+            ceiling_slots = max(slots, self.max_bs)
+            # Dummy requests own distinct PAGEs, including each request's tail.
             ceiling_pages = max(
-                pages, -(-self.max_num_batched_tokens // self.block_size)
+                pages, ceiling_tokens // self.block_size + ceiling_slots
             )
             cached = PagedAttentionCache(
                 self.geometry,
                 ceiling_pages,
-                max(slots, self.max_bs),
+                ceiling_slots,
                 self.device,
-                max_tokens=max(running_tokens, self.max_num_batched_tokens),
+                max_tokens=ceiling_tokens,
                 workspace=self.score_workspace,
             )
             self._capture_dummy = cached
+        elif (
+            pages > cached.num_pages
+            or slots > cached.num_slots
+            or running_tokens > cached.max_tokens
+        ):
+            # Being outside capture does not release an older graph's pointers.
+            raise RuntimeError(
+                "V4.1 capture scratch capacity exceeded: "
+                f"requested pages={pages}, slots={slots}, tokens={running_tokens}; "
+                f"allocated pages={cached.num_pages}, slots={cached.num_slots}, "
+                f"tokens={cached.max_tokens}"
+            )
         return cached
 
     @_publish_v41_metadata
