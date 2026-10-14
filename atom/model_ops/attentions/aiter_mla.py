@@ -1999,7 +1999,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if pcp_is_enabled() and not batch.is_dummy_run:
                 self._apply_pcp_reindex(attn_metadata, scheduled_tokens, sparse_counts)
 
-        if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
+        # The token-granular paged CSR (kv_indptr / kv_indices /
+        # kv_last_page_lens) is read by the drafter and by the plain-layout
+        # cached-prefix gather. The shuffled gather reads only block-granular
+        # CSR (built below), so a shuffled cached prefill without a drafter
+        # skips it.
+        has_drafter = hasattr(self.model_runner, "drafter")
+        if has_drafter or (attn_metadata.has_cached and not self.kv_shuffled):
             # Populate kv_last_page_lens for full sequence (needed for MLA prefill with
             # prefix cache; decode does the same)
             if self.model_runner.block_size != 1:
@@ -2040,28 +2046,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.max_seqlen_k,
             )
 
-            # Build chunked-context metadata when enabled AND the cached
-            # prefix is large enough to risk OOM in the single-pass path.
-            # The non-cached new-tokens portion is handled separately by the
-            # forward (self-attention via kv_b_proj), so chunks span only the
-            # cached prefix.
-            if self.dcp_world_size > 1 and attn_metadata.has_cached:
-                # DCP always routes the cached-prefix prefill through the chunked
-                # context path (even single-chunk) because the cross-rank
-                # AllGather + reorg live there. attn_prefill_chunk_size still
-                # bounds per-chunk memory.
-                attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta_dcp(batch, bs)
-            elif (
-                self.attn_prefill_chunk_size > 0
-                and attn_metadata.has_cached
-                and sum(batch.num_cached_tokens[:bs]) > self.attn_prefill_chunk_size
-            ):
-                build_chunk_meta = (
-                    self._build_mla_chunk_meta_shuffle
-                    if self.kv_shuffled
-                    else self._build_mla_chunk_meta
-                )
-                attn_metadata.mla_chunk_meta = build_chunk_meta(batch, bs)
+        # Build chunked-context metadata when enabled AND the cached
+        # prefix is large enough to risk OOM in the single-pass path.
+        # The non-cached new-tokens portion is handled separately by the
+        # forward (self-attention via kv_b_proj), so chunks span only the
+        # cached prefix.
+        if self.dcp_world_size > 1 and attn_metadata.has_cached:
+            # DCP always routes the cached-prefix prefill through the chunked
+            # context path (even single-chunk) because the cross-rank
+            # AllGather + reorg live there. attn_prefill_chunk_size still
+            # bounds per-chunk memory.
+            attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta_dcp(batch, bs)
+        elif (
+            self.attn_prefill_chunk_size > 0
+            and attn_metadata.has_cached
+            and sum(batch.num_cached_tokens[:bs]) > self.attn_prefill_chunk_size
+        ):
+            build_chunk_meta = (
+                self._build_mla_chunk_meta_shuffle
+                if self.kv_shuffled
+                else self._build_mla_chunk_meta
+            )
+            attn_metadata.mla_chunk_meta = build_chunk_meta(batch, bs)
 
         self._attach_kv_shuffled_prefill_meta(attn_metadata, bs)
         attn_metadata.dtype_q = self.dtype_q
@@ -2071,7 +2077,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return attn_metadata, positions
 
     def _attach_kv_shuffled_prefill_meta(self, attn_metadata, bs: int) -> None:
+        # Only the single-pass gather reads the full-context CSR; the chunked
+        # path carries its own per-chunk CSR in mla_chunk_meta.
         if not (self.kv_shuffled and attn_metadata.has_cached):
+            return
+        if getattr(attn_metadata, "mla_chunk_meta", None) is not None:
             return
         # The shuffled cached-prefix gather (gather_kv_b_proj with
         # shuffled_kv_cache=True) reads block_size-token blocks, so it needs
@@ -2127,8 +2137,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # Global logical block list in per-seq CSR order: the leading cached
         # blocks of each row of the host block table (row-major mask order).
-        block_tables = self.model_runner.forward_vars["block_tables"].np[:bs]
-        col = np.arange(block_tables.shape[1])
+        # Scan only the columns this batch reaches, not the configured max.
+        valid_cols = int(per_seq_blocks.max(initial=0))
+        block_tables = self.model_runner.forward_vars["block_tables"].np[
+            :bs, :valid_cols
+        ]
+        col = np.arange(valid_cols)
         global_blocks = block_tables[col[None, :] < per_seq_blocks[:, None]]
 
         # [num_chunks, bs]: intersect each seq's block range with each chunk's.
