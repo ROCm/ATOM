@@ -1200,6 +1200,83 @@ def _attention(*, use_mla=None, kv_b_proj=False):
     return module
 
 
+def _runner_holding(weight, quant_type=None):
+    """The real updater, receiver and capability report over one layer whose
+    weight is *weight*; an FP8 one gets the scale an FP8 layer has."""
+    import torch
+    from torch import nn
+
+    from atom.rollout.capabilities import CapabilityProviderMixin
+    from atom.rollout.weight_updater import WeightUpdaterMixin
+
+    class _Real(
+        WeightUpdaterMixin, receiver.RDMAWeightReceiverMixin, CapabilityProviderMixin
+    ):
+        device = torch.device("cpu")
+        label = "test"
+        rank = 0
+        world_size = 1
+
+    runner = _Real()
+    runner.model = nn.Module()
+    runner.model.layer = nn.Module()
+    runner.model.layer.weight = nn.Parameter(weight, requires_grad=False)
+    if weight.dtype.is_floating_point and weight.element_size() == 1:
+        runner.model.layer.weight_scale = nn.Parameter(
+            torch.ones(1), requires_grad=False
+        )
+    if quant_type is not None:
+        runner.model.layer.quant_type = quant_type
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("resident", "refused"),
+    [
+        ("fp4-packed", True),
+        ("int8", True),
+        ("fp8-per_1x32", True),
+        ("fp8-per_1x128", False),
+        ("bf16", False),
+    ],
+)
+def test_a_format_the_updater_cannot_rewrite_is_refused_before_joining(
+    monkeypatch, resident, refused
+):
+    """The updater writes full-precision parameters as sent and requantises
+    the FP8 schemes it knows, and nothing else. An FP4 or integer model was
+    advertised all the same, so every worker joined the group only for the
+    stream to fail -- or, where the shapes agreed, to be cast into garbage."""
+    import enum
+
+    import torch
+
+    quant_types = enum.Enum("QuantType", ["per_1x128", "per_1x32"])
+    weight = {
+        "fp4-packed": lambda: torch.zeros(4, 2, dtype=torch.uint8),
+        "int8": lambda: torch.zeros(4, 4, dtype=torch.int8),
+        "bf16": lambda: torch.zeros(4, 4, dtype=torch.bfloat16),
+    }.get(resident, lambda: torch.zeros(4, 4).to(torch.float8_e4m3fn))()
+    quant_type = quant_types[resident[4:]] if resident.startswith("fp8-") else None
+    runner = _runner_holding(weight, quant_type)
+    joined = _joins(monkeypatch)
+
+    refusal = runner._rdma_reload_refusal()
+    features = runner.get_worker_capabilities()["features"]
+
+    if not refused:
+        assert refusal is None
+        assert "rdma_weight_receive" in features
+        return
+    assert "cannot rewrite in place" in refusal and "layer.weight" in refusal
+    assert "rdma_weight_receive" not in features
+    with pytest.raises(RuntimeError, match="cannot rewrite in place"):
+        runner.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+    assert joined == []
+
+
 @pytest.mark.parametrize(
     "layer",
     [{"kv_b_proj": True}, {"use_mla": True}],

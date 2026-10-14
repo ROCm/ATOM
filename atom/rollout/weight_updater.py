@@ -822,6 +822,35 @@ class WeightUpdaterMixin:
             and getattr(module, "weight_scale", None) is not None
         )
 
+    # The quant types _requantize_fp8_weight rebuilds, by name, so that asking
+    # which parameters a reload can rewrite needs no aiter.
+    _REQUANTISABLE_FP8 = frozenset({"per_1x128", "per_Tensor", "per_Token"})
+
+    def _unreloadable_params(self) -> list[str]:
+        """Parameters a full-precision reload cannot rewrite in place.
+
+        A floating-point parameter of two bytes or more is written as sent, and
+        an FP8 one is requantised if _requantize_fp8_weight knows its quant
+        type. Anything else -- FP4 or MXFP4 packed bytes, integer quantisation,
+        FP8 of another scheme -- a reload refuses only once its stream has
+        ended, or casts into garbage where the shapes happen to agree.
+        """
+        if getattr(self, "model", None) is None:
+            return []
+        unreloadable = []
+        for prefix, module in self._sync_target_model().named_modules():
+            quant_type = getattr(getattr(module, "quant_type", None), "name", None)
+            for name, param in module.named_parameters(recurse=False):
+                if param.dtype.is_floating_point and param.element_size() >= 2:
+                    continue
+                if (
+                    self._is_fp8_param(module, param)
+                    and quant_type in self._REQUANTISABLE_FP8
+                ):
+                    continue
+                unreloadable.append(f"{prefix}.{name}" if prefix else name)
+        return unreloadable
+
     def _requantize_fp8_weight(
         self,
         module: torch.nn.Module,

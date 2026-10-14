@@ -688,6 +688,16 @@ class RDMAWeightReceiverMixin:
                 "kv_b_proj and leaves them as they were, so the engine would "
                 "serve old and new weights together."
             )
+        unreloadable = getattr(self, "_unreloadable_params", None)
+        held = unreloadable() if callable(unreloadable) else []
+        if held:
+            return (
+                f"{len(held)} parameter(s), {held[:3]} among them, are held in "
+                f"a format a full-precision stream cannot rewrite in place: "
+                f"FP4 or MXFP4 packed bytes, integer quantisation, or FP8 of a "
+                f"scheme the updater does not requantise. Every rank would join "
+                f"the group only for the stream to fail."
+            )
         return None
 
     def _vote_with_engine_peers(self, ballot: int, began: bool) -> tuple[int, bool]:
