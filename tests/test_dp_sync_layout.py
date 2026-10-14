@@ -174,3 +174,53 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
         assert r.max_seqlen_q_across_dp == 9, f"tbo_on={tbo_on}"
         alone = _sync(monkeypatch, peers=[], **_base(tbo_on=tbo_on, max_seqlen_q=3))
         assert alone.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"
+
+
+# ── stage rows (DeepSeek-V4.1 decoder bounded replay) ─────────────────────
+
+
+def test_stage_rows_ride_the_same_collective(monkeypatch):
+    """A replaying prefill rank beside a decoding peer: the table comes back
+    in DP order, and the step still issues one all_gather."""
+    calls = []
+
+    def peer(local):
+        calls.append(1)
+        out = local.clone()
+        out[2] = 0  # the peer decodes
+        out[-4:] = torch.tensor([40, 40, 0, 1], dtype=torch.int32)
+        return out
+
+    sync = _sync(
+        monkeypatch,
+        peers=[peer],
+        **_base(is_prefill=True, stage_tokens=(128, 1, 1, 1)),
+    )
+    assert sync.stage_tokens_across_dp == ((128, 40), (1, 40), (1, 0), (1, 1))
+    assert len(calls) == 1
+
+
+def test_no_replaying_rank_carries_no_table(monkeypatch):
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, stage_tokens=(500, 500, 0, 1)),
+    )
+    assert sync.stage_tokens_across_dp is None
+
+
+def test_a_decode_only_group_carries_no_table(monkeypatch):
+    sync = _sync(
+        monkeypatch, peers=[_with(0, 10)], **_base(stage_tokens=(10, 10, 1, 0))
+    )
+    assert sync.stage_tokens_across_dp is None
+
+
+def test_stage_rows_follow_the_dspark_row(monkeypatch):
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, max_seqlen_q=6, stage_tokens=(128, 1, 1, 1)),
+    )
+    assert sync.max_seqlen_q_across_dp == 6
+    assert sync.stage_tokens_across_dp[0] == (128, 128)

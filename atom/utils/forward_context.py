@@ -260,6 +260,7 @@ class ForwardMode:
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
         graph_shapes: Collection[tuple[int, int]] | None = None,
+        local_stage_tokens: tuple[int, int, int, int] | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -296,6 +297,9 @@ class ForwardMode:
                 # other flavor keeps its own and the two extra wire rows are
                 # not sent.
                 max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+                # A model's per-stage row counts (V4.1 decoder bounded
+                # replay), so the step still issues one collective.
+                stage_tokens=local_stage_tokens,
             )
             # The group's query length, taken BEFORE the rows are read off it:
             # a rank still on its local q settles on a different `running_tokens`
