@@ -141,6 +141,9 @@ class BatchStep:
     # and only they are written to the ring.
     swa_cached_until: torch.Tensor | None = None
 
+    # AF publication memo; reset even when a BatchStep is reused.
+    af_inputs: dict = field(default_factory=dict)
+
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
 
@@ -148,6 +151,7 @@ class BatchStep:
         the recorded pass is a kernel that pass skips -- absent from the graph,
         and read at capture-time values on every replay.
         """
+        self.af_inputs.clear()
         self.selected.clear()
         self.candidates.clear()
         self.tiles.clear()

@@ -2405,8 +2405,8 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
-            # currently requires a FULL graph. Explicit choices are preserved.
+            # Preserve V4.1's FULL default; PIECEWISE and AF are opt-in.
+            # Explicit choices are preserved.
             # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
                 self.compilation_config.cudagraph_mode = (

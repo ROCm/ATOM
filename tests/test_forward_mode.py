@@ -495,3 +495,55 @@ def test_a_backend_that_publishes_none_is_not_invented_a_width_for():
     md.slot_mapping = None
     md.state_slot_out = None
     mode.assert_shape_contract(_ids(mode), md)
+
+
+@pytest.mark.parametrize("seqs", [1, 3, 8])
+def test_opted_in_prefill_uses_total_token_bucket(seqs):
+    mode = _decide(
+        _batch(seqs=seqs, tokens=600, prefill_tokens=600, q=6),
+        supports_piecewise_prefill=True,
+        captured_tokens=[6, 12, 48, 192, 384, 768],
+        is_block_drafter=True,
+    )
+    assert mode.running_tokens == 768
+    assert mode.piecewise_captured
+    assert not mode.use_cudagraph  # never dispatch a FULL graph for a prefill
+    assert mode.scheduled_tokens == 600
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"supports_piecewise_prefill": False},
+        {"enforce_eager": True},
+        {"step_needs_eager": True},
+        {"tbo_on": True},
+        {"captured_tokens": []},
+        {"captured_tokens": [48, 384]},
+    ],
+)
+def test_prefill_capture_refusals_keep_exact_rows(overrides):
+    options = {"supports_piecewise_prefill": True, "captured_tokens": [768]}
+    options.update(overrides)
+    mode = _decide(_batch(seqs=3, tokens=600, prefill_tokens=600), **options)
+    assert mode.running_tokens == 600
+    assert not mode.piecewise_captured
+
+
+@pytest.mark.parametrize("field", ["is_dummy_run", "multimodal_data"])
+def test_dummy_and_multimodal_prefills_do_not_replay_text_graphs(field):
+    batch = _batch(seqs=1, tokens=600, prefill_tokens=600)
+    setattr(batch, field, True)
+    mode = _decide(batch, supports_piecewise_prefill=True, captured_tokens=[768])
+    assert not mode.piecewise_captured and mode.running_tokens == 600
+
+
+def test_dp_prefill_does_not_take_single_rank_token_padding(monkeypatch):
+    _fake_sync(monkeypatch, peer_tokens=700, peer_bs=2, peer_prefill=True)
+    mode = _decide(
+        _batch(seqs=1, tokens=600, prefill_tokens=600),
+        dp_size=2,
+        supports_piecewise_prefill=True,
+        captured_tokens=[768],
+    )
+    assert not mode.piecewise_captured and mode.running_tokens == 600

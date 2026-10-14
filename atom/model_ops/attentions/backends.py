@@ -173,6 +173,13 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
 
+    supports_piecewise_prefill = False
+
+    def prepare_prefill_padded(self, batch, running_bs, running_tokens):
+        """Opt-in token padding; existing backends keep their prefill layout."""
+        assert running_tokens == batch.total_tokens_num
+        return self.prepare_prefill(batch, running_bs)
+
     def step_needs_eager(self, batch: ScheduledBatch) -> bool:
         """True when this backend cannot run `batch`'s decode from a captured
         graph, whatever its width. Read before the step's metadata is built,
@@ -1033,12 +1040,12 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         neither is derivable from the other, since a ragged step replays a flat
         token bucket rather than a `running_bs * q` grid.
 
-        Prefill takes only the first: its rows are the prompt's, so there is no
-        `running_tokens` to hand it, but its per-sequence tail still pads to
-        `running_bs` for the draft pass that follows. That padding is visible
-        past attention -- `cu_seqlens_q` doubles as the selector for the
-        sampler's rows, so the LM head emits `running_bs` of them. `postprocess`
-        cuts back to the scheduled batch, and that is the one place it does.
+        Prefill normally runs its exact scheduled token count. Backends that
+        opt into PIECEWISE prefill receive a token bucket through
+        `prepare_prefill_padded`; their request spans and cu_seqlens still
+        describe only live tokens. Independently, the per-sequence tail pads
+        to `running_bs` for the following draft/sampling pass. `postprocess`
+        cuts that batch dimension back to the scheduled requests.
         """
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
@@ -1050,7 +1057,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
-            return self.prepare_prefill(batch, running_bs)
+            return self.prepare_prefill_padded(batch, running_bs, running_tokens)
         else:
             return self.prepare_decode(batch, running_bs, running_tokens, max_seqlen_q)
 

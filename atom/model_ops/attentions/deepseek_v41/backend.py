@@ -807,6 +807,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 histories[k] = mapping.advance_history(None, compressed)[0]
         return resumes, floors, cached, histories
 
+    supports_piecewise_prefill = True
+
+    def prepare_prefill_padded(self, batch, running_bs, running_tokens):
+        # The request spans stay exact; begin_step marks the padded rows with
+        # batch_id=-1 and extends per-token metadata to the chosen graph bucket.
+        return self._prepare(batch, running_bs, running_tokens, query_prefix_ready=True)
+
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
             batch,

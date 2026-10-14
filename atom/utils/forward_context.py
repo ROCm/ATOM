@@ -260,6 +260,7 @@ class ForwardMode:
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
         graph_shapes: Collection[tuple[int, int]] | None = None,
+        supports_piecewise_prefill: bool = False,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -368,6 +369,13 @@ class ForwardMode:
             captured_tokens=captured_tokens,
             is_block_drafter=is_block_drafter,
             max_seqlen_q=max_seqlen_q,
+            piecewise_prefill=(
+                supports_piecewise_prefill
+                and dp_size == 1
+                and not (enforce_eager or step_needs_eager or tbo_on)
+                and not batch.is_dummy_run
+                and not getattr(batch, "multimodal_data", None)
+            ),
         )
         return cls(
             use_cudagraph=use_cudagraph,
@@ -394,6 +402,7 @@ class ForwardMode:
         captured_tokens,
         is_block_drafter: bool,
         max_seqlen_q: int,
+        piecewise_prefill: bool = False,
     ) -> tuple[int, bool]:
         """``(running_tokens, piecewise_captured)``.
 
@@ -407,10 +416,14 @@ class ForwardMode:
             # allocated.
             return scheduled_tokens, False
         if is_prefill:
-            # Reachable on one rank only: a group of one is unified whatever it
-            # runs, while under DP any prefill clears `unified` above. Prompts
-            # are ragged, so no product recovers a height and this rank's own
-            # count is the whole answer.
+            # Opt-in backends separate request-shaped attention from dense
+            # work, which can pad by total tokens independently of BS.
+            if piecewise_prefill and captured_tokens:
+                recorded = next(
+                    (n for n in captured_tokens if n >= scheduled_tokens), None
+                )
+                if recorded is not None:
+                    return recorded, True
             return scheduled_tokens, False
 
         # The batch was rounded onto the ladder AFTER the sync, so this runs rows

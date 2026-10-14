@@ -82,9 +82,9 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do DP attention and padded steps: DP's MoE collectives are
-    sized by every rank's token count, even when a rank needs no padding,
-    and a rank-local tail would change those counts.
+    row, and so does DP attention: its MoE collectives are sized by every
+    rank's token count, even when a rank needs no padding. Single-rank
+    PIECEWISE token padding can still replay the live requests' tails.
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
@@ -98,16 +98,22 @@ def replayable(forward, num_tokens: int) -> bool:
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
     # TBO context still identifies them, including the child at token offset 0.
+    from atom.config import CUDAGraphMode
     from atom.utils.tbo.ubatching import tbo_active
 
     if tbo_active():
         return False
     step = getattr(metadata, "step", None)
+    # Single-rank token padding does not change request spans or the tail plan.
+    token_padding = (
+        getattr(forward, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+        and getattr(forward, "dp_metadata", None) is None
+    )
     return not (
         step is None
         or step.decode
         or num_tokens != step.width
-        or step.width != step.scheduled
+        or (step.width != step.scheduled and not token_padding)
     )
 
 

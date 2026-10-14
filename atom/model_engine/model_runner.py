@@ -1725,7 +1725,11 @@ class ModelRunner:
             # total) as the reference — it tracks the configured memory envelope.
             budget = self.config.gpu_memory_utilization * torch.cuda.mem_get_info()[1]
             target_reserve = 0.15 * budget
-            all_shapes = sorted({bs * q for bs in cap_sizes for q in q_buckets})
+            extra_shapes = self._extra_piecewise_capture_shapes(cap_sizes, q_buckets)
+            all_shapes = sorted(
+                {bs * q for bs in cap_sizes for q in q_buckets}
+                | {bs * q for bs, q in extra_shapes}
+            )
             # Mirror the capture-loop token-budget skip: a bucket over
             # `max_num_batched_tokens` is not schedulable and is not captured,
             # so reserving for it would only shrink KV.
@@ -2716,6 +2720,9 @@ class ModelRunner:
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             graph_shapes=self._producer_graph_shapes(),
+            supports_piecewise_prefill=getattr(
+                self.attn_metadata_builder, "supports_piecewise_prefill", False
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3021,6 +3028,30 @@ class ModelRunner:
             positions[..., scheduled:].zero_()
         return ids, positions
 
+    def _run_piecewise_prefill(self, forward_mode):
+        """Run an opted-in text prefill on persistent, token-padded inputs."""
+        scheduled, running = (
+            forward_mode.scheduled_tokens,
+            forward_mode.running_tokens,
+        )
+        ids = self.forward_vars["input_ids"].gpu[:running]
+        positions = self.forward_vars["positions"].gpu[:running]
+        context = get_forward_context()
+        step = context.attn_metadata.step
+        assert ids.shape[0] == positions.shape[0] == step.width == running
+        assert step.scheduled == scheduled
+        if running > scheduled:
+            ids[scheduled:].zero_()
+            positions[scheduled:].zero_()
+        mode, descriptor = context.cudagraph_runtime_mode, context.batch_descriptor
+        try:
+            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            context.batch_descriptor = BatchDescriptor(running)
+            # Sampling, draft KV and postprocessing consume only live rows.
+            return self.model(ids, positions)[:scheduled]
+        finally:
+            context.cudagraph_runtime_mode, context.batch_descriptor = mode, descriptor
+
     @_profile_runner_stage
     @record_gpu_forward
     def run_model(
@@ -3153,6 +3184,9 @@ class ModelRunner:
                         intermediate_tensors=intermediate_tensors,
                         inputs_embeds=inputs_embeds,
                     )
+                elif is_prefill and forward_mode.piecewise_captured:
+                    assert inputs_embeds is None
+                    model_output = self._run_piecewise_prefill(forward_mode)
                 elif inputs_embeds is None:
                     model_output = self.model(input_ids, positions)
                 else:
@@ -3854,6 +3888,11 @@ class ModelRunner:
             per_token *= float(dp_size) ** 0.6
         return per_token
 
+    def _extra_piecewise_capture_shapes(self, capture_sizes, q_buckets):
+        """Use the same model-specific additions for memory budgeting/capture."""
+        extra = getattr(self.model, "extra_piecewise_capture_shapes", None)
+        return [] if extra is None else extra(capture_sizes, q_buckets)
+
     def _piecewise_skip_capture(self, num_tokens: int) -> bool:
         """Whether to skip capturing a PIECEWISE bucket of ``num_tokens`` tokens.
 
@@ -4150,13 +4189,22 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
-        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
-            for max_q_len in q_buckets:
-                capture_range = (
-                    tqdm.tqdm(self.capture_sizes)
-                    if self.rank == 0
-                    else self.capture_sizes
+        capture_plan = {q: list(self.capture_sizes) for q in q_buckets}
+        if _piecewise:
+            extra_shapes = self._extra_piecewise_capture_shapes(
+                self.capture_sizes, q_buckets
+            )
+            if extra_shapes:
+                logger.info(
+                    "PIECEWISE extra token buckets: %s",
+                    [bs * q for bs, q in extra_shapes],
                 )
+            for bs, q in extra_shapes:
+                capture_plan.setdefault(q, []).append(bs)
+
+        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
+            for max_q_len, sizes in capture_plan.items():
+                capture_range = tqdm.tqdm(sizes) if self.rank == 0 else sizes
                 for bs in capture_range:
                     if self.rank == 0:
                         capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")

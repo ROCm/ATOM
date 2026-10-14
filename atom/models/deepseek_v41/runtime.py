@@ -7,10 +7,13 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
+from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.token_layout.gather import gather_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.engram.device.staging import EngramStagedRows
+from atom.utils import mark_spliting_op
 from atom.utils.backends import set_model_tag
+from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
@@ -87,13 +90,91 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
     return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
 
 
+def _piecewise_slot(layer_name, kind, output):
+    """An eager boundary must publish to the address its consumer captured."""
+    context = get_forward_context()
+    if context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
+        return output
+    layer, _ = context.no_compile_layers[layer_name]
+    slots = layer.__dict__.get("_piecewise_outputs")
+    if slots is None:
+        slots = layer._piecewise_outputs = StableOutputs()
+    key = (kind, tuple(output.shape), output.dtype, output.device)
+    return slots.slot(key, output)
+
+
+def _piecewise_output(layer_name, kind, output):
+    buffer = _piecewise_slot(layer_name, kind, output)
+    if buffer is not output:
+        buffer.copy_(output)
+    return buffer
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_fake_layer_output)
+def v41_piecewise_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
+    context = get_forward_context()
+    layer, rope = context.no_compile_layers[layer_name]
+    if (
+        getattr(layer, "af_piecewise", False)
+        and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    ):
+        from .af_attention import AttentionGraphs
+
+        metadata = context.attn_metadata
+        if AttentionGraphs.eligible(layer.attn, metadata, context):
+            graphs = getattr(layer, "_af_attention", None)
+            if graphs is None:
+                graphs = layer._af_attention = AttentionGraphs()
+            output = graphs.forward(
+                layer.attn,
+                hidden,
+                metadata.cache,
+                metadata.step,
+                rope,
+                queries=metadata.queries,
+                output_slot=lambda value: _piecewise_slot(
+                    layer_name, "attention", value
+                ),
+                zero_copy_hidden=layer.af_zero_copy_hidden,
+            )
+            return output
+    return _piecewise_output(layer_name, "attention", v41_attention(hidden, layer_name))
+
+
+@mark_spliting_op(is_custom=True, gen_fake=_fake_layer_output)
+def v41_piecewise_engram(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
+    return _piecewise_output(layer_name, "engram", v41_engram(hidden, layer_name))
+
+
+@mark_spliting_op(is_custom=True, gen_fake=lambda hidden: None, mutates_args=["hidden"])
+def v41_piecewise_begin(hidden: torch.Tensor) -> None:
+    # Python step reset and Engram staging run on EVERY invocation. Close the
+    # staging fork before capturing a dense segment; FULL retains its overlap.
+    v41_begin_forward(hidden)
+    metadata = get_forward_context().attn_metadata
+    if not metadata.step.requests:
+        return
+    rows = metadata.engram_embeddings
+    if getattr(rows, "stage", None) is not None:
+        rows.join()
+
+
+@mark_spliting_op(is_custom=True, gen_fake=lambda hidden: None, mutates_args=["hidden"])
+def v41_piecewise_end(hidden: torch.Tensor) -> None:
+    v41_end_forward(hidden)
+
+
 class RuntimeBlock(Block):
-    """Serving uses the same guarded ops in eager and compiled execution."""
+    """Dispatch shared model math through eager or piecewise boundaries."""
 
     def attention_forward(self, normed, cache, step, rope):
+        if getattr(self, "piecewise", False):
+            return torch.ops.aiter.v41_piecewise_attention(normed, self.layer_name)
         return v41_attention(normed, self.layer_name)
 
     def engram_forward(self, residual, embeddings, image_mask):
+        if getattr(self, "piecewise", False):
+            return torch.ops.aiter.v41_piecewise_engram(residual, self.layer_name)
         return v41_engram(residual, self.layer_name)
 
 
@@ -195,6 +276,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # --no-decoder-swa-bounded-replay it is one graph (`_Backbone`).
 
     block_cls = RuntimeBlock
+    piecewise = False
 
     def __init__(self, atom_config):
         config = atom_config
@@ -207,7 +289,20 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             max_length=config.max_model_len,
             online_quant_config=config.online_quant_config,
         )
+        self.piecewise = (
+            config.compilation_config.level == 3
+            and config.compilation_config.cudagraph_mode
+            in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.AF_PIECEWISE)
+            and not config.enforce_eager
+        )
+        self._late_piecewise_inputs = {}
         for i, layer in enumerate(self.layers):
+            layer.piecewise = self.piecewise
+            layer.af_piecewise = (
+                self.piecewise
+                and config.compilation_config.cudagraph_mode
+                == CUDAGraphMode.AF_PIECEWISE
+            )
             atom_config.compilation_config.static_forward_context[layer.layer_name] = (
                 layer,
                 self._rope(i),
@@ -222,6 +317,10 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 logger.warning("Decoder SWA bounded replay is off: %s.", reason)
         if not self.replay:
             self.backbone = _Backbone(atom_config=config, owner=self)
+        for i, layer in enumerate(self.layers):
+            layer.af_zero_copy_hidden = not (
+                self.replay and i in (self.decoder_start, self.last_layer)
+            )
 
     def _build_replay_stages(self, config):
         hf = config.hf_config
@@ -249,10 +348,16 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         )
 
     def begin_forward(self, hidden, engram_embeddings):
-        v41_begin_forward(hidden)
+        if self.piecewise:
+            torch.ops.aiter.v41_piecewise_begin(hidden)
+        else:
+            v41_begin_forward(hidden)
 
     def end_forward(self, hidden, engram_embeddings):
-        v41_end_forward(hidden)
+        if self.piecewise:
+            torch.ops.aiter.v41_piecewise_end(hidden)
+        else:
+            v41_end_forward(hidden)
 
     def decoder_replay_active(self) -> bool:
         """Whether prefills replay: fixed at launch, since a prompt's earlier
@@ -285,14 +390,87 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             state, None, None, self._rope(i), None, image_mask=None, queries=queries
         )
 
-    def _late_layers(self, state):
-        return SinglePassHCState(*_batched(self.late(*_rows_first(state.fields()))))
+    def extra_piecewise_capture_shapes(self, capture_sizes, q_buckets):
+        """Startup shapes covering full-window replay tails, keyed by tokens.
+
+        The existing capture builder uses synthetic (BS, Q) inputs. Choose
+        valid pairs within its allocated bounds; dense graphs still key only
+        on token count. AF attention shapes are captured separately at runtime.
+        """
+        if not self.piecewise or not self.replay or not capture_sizes:
+            return []
+        max_bs, max_q = max(capture_sizes), max(q_buckets)
+        existing = {bs * q for bs in capture_sizes for q in q_buckets}
+        window = self.config.sliding_window
+        shapes = []
+        for tokens in range(window, max_bs * max_q + 1, window):
+            if tokens in existing:
+                continue
+            q = next(
+                (
+                    q
+                    for q in range(1, max_q + 1)
+                    if tokens % q == 0 and tokens // q <= max_bs
+                ),
+                None,
+            )
+            if q is not None:
+                shapes.append((tokens // q, q))
+        return shapes
+
+    def _run_stage(self, stage, *inputs):
+        # The initial graphs are captured for text. Image routing reads a live
+        # mask whose shape/address differs, so execute the stage's Python body
+        # for multimodal prefills instead of replaying a text graph.
+        if (
+            self.piecewise
+            and get_forward_context().attn_metadata.image_mask is not None
+        ):
+            return stage.forward(*inputs)
+        return stage(*inputs)
+
+    def _late_layers(self, state, *, allow_capture=True):
+        inputs = _rows_first(state.fields())
+        context = get_forward_context()
+        mode, descriptor = context.cudagraph_runtime_mode, context.batch_descriptor
+        if not self.piecewise or context.attn_metadata.image_mask is not None:
+            return SinglePassHCState(*_batched(self._run_stage(self.late, *inputs)))
+
+        # Layer 20 and the bounded-replay gather allocate fresh state. The late
+        # graph must read persistent copies, keyed by ITS row count, not early's.
+        tokens = inputs[0].shape[0]
+        slots = self._late_piecewise_inputs
+        # A prefill's tail may fit even when the early stage is too large
+        # for any graph. Its replay decision is independent of the outer mode.
+        capture = (mode == CUDAGraphMode.PIECEWISE and allow_capture) or (
+            not allow_capture and tokens in slots
+        )
+        if capture:
+            if tokens not in slots:
+                slots[tokens] = tuple(None if t is None else t.clone() for t in inputs)
+            else:
+                for dst, src in zip(slots[tokens], inputs):
+                    if dst is not None:
+                        dst.copy_(src)
+            inputs = slots[tokens]
+        try:
+            # Never capture a new tail shape in a live prefill. Reuse an exact
+            # startup bucket, or run the compiled pieces without CUDA graphs.
+            context.cudagraph_runtime_mode = (
+                CUDAGraphMode.PIECEWISE if capture else CUDAGraphMode.NONE
+            )
+            context.batch_descriptor = BatchDescriptor(tokens) if capture else None
+            return SinglePassHCState(*_batched(self._run_stage(self.late, *inputs)))
+        finally:
+            context.cudagraph_runtime_mode, context.batch_descriptor = mode, descriptor
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         """Tensor-only serving entry; guarded ops read the live forward context."""
         if not self.replay:
-            return self.backbone(input_ids, positions, inputs_embeds)
-        state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
+            return self._run_stage(self.backbone, input_ids, positions, inputs_embeds)
+        state = SinglePassHCState(
+            *_batched(self._run_stage(self.early, input_ids, inputs_embeds))
+        )
         if replayable(get_forward_context(), input_ids.numel()):
             return self._replayed(state, input_ids.numel())
         state = self._late_layers(self._layer(self.decoder_start, state))
@@ -320,7 +498,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
             with rows_of(metadata, plan.tail, rows=plan.tail_rows):
                 output = layer.attention_forward(normed, None, None, rope)
-                tail = self._late_layers(layer.ffn_forward(output, *seam))
+                tail = self._late_layers(
+                    layer.ffn_forward(output, *seam), allow_capture=False
+                )
                 with rows_of(metadata, plan.tail, plan.q39, plan.q39.rows):
                     last = self._layer(self.last_layer, tail, plan.q39)
             self._move_aux_rows(plan.tail_rows)
