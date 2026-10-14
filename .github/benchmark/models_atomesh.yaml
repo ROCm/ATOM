@@ -1341,7 +1341,7 @@ models:
           osl: 256
           concurrency:
           - 40
-          server:
+          server: &minimax_m3_scatter_bounds_server
             common_args:
               kv_cache_dtype: fp8
               block_size: 128
@@ -1356,17 +1356,17 @@ models:
               draft_model: ${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3
               num_speculative_tokens: 3
               extra_args: --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900
-          prefill:
+          prefill: &minimax_m3_scatter_bounds_prefill
             workers: 1
             tp: 4
             cudagraph_mode: FULL
             cudagraph: '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20,22,24,26,28,30,32,34,36,40,48,56,64]'
-          decode:
+          decode: &minimax_m3_scatter_bounds_decode
             workers: 1
             tp: 4
             cudagraph_mode: FULL
             cudagraph: '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20,22,24,26,28,30,32,34,36,40,48,56,64]'
-          env:
+          env: &minimax_m3_scatter_bounds_env
             common:
               PYTHONNOUSERSITE: '1'
               PYTHONHASHSEED: '0'
@@ -1406,6 +1406,42 @@ models:
           accuracy:
             threshold: 0.8
       nightly:
+        # Reuse the verified 32K-warmup service and pinned scatter-bounds aiter.
+        # Keep server capacity fixed at 80; each AgentX concurrency starts fresh.
+        - &minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c16
+          topology: 1p1d_eagle3
+          display_topology: 1P1D-TP4-EAGLE3
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [16]
+          server: *minimax_m3_scatter_bounds_server
+          prefill: *minimax_m3_scatter_bounds_prefill
+          decode: *minimax_m3_scatter_bounds_decode
+          env: *minimax_m3_scatter_bounds_env
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+          run_eval: false
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32
+          concurrency: [32]
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c40
+          concurrency: [40]
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c56
+          concurrency: [56]
+
+        - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
+          name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c72
+          concurrency: [72]
+
         - name: minimax-m3-fp4-1p1d-tp4
           topology: 1p1d
           pd_worker_layout: single_node
