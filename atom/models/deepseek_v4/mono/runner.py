@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
+from atom.models.deepseek_v4.mono.config import LAUNCH_WIDTHS, MAX_TOKENS
 from atom.models.deepseek_v4.mono.op import Dsv4MonoKernel, Dsv4Variant
 from atom.models.deepseek_v4.mono.packing import (
     pack_layer_weights,
@@ -43,10 +44,6 @@ from atom.mono.runtime.widths import WidthBuilds
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-
-# the launch widths the kernel is built for (samples a launch)
-LAUNCH_WIDTHS = (1, 2, 4, 8)
-MAX_TOKENS = LAUNCH_WIDTHS[-1]
 
 
 def baseline_refusal(experts, rows: int = MAX_TOKENS) -> str | None:

@@ -35,6 +35,9 @@ FP8_MAX = 448.0
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
 SUPPORTED_SAMPLES = tuple(range(1, 9))
+# the launch widths a plain decode step pads to (samples a launch)
+LAUNCH_WIDTHS = (1, 2, 4, 8)
+MAX_TOKENS = LAUNCH_WIDTHS[-1]
 SUPPORTED_PEERS = (1, 2, 4, 8)
 # The split-attention kernel requires heads % WAVES == 0 and heads <= 16.
 SUPPORTED_HEADS = (8, 16)

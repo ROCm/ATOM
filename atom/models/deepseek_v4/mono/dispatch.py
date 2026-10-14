@@ -25,8 +25,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from atom.models.deepseek_v4.mono.config import SUPPORTED_HEADS
-from atom.models.deepseek_v4.mono.runner import MAX_TOKENS, Dsv4MonoDecodeRunner
+from atom.models.deepseek_v4.mono.config import MAX_TOKENS, SUPPORTED_HEADS
 from atom.mono.plan.shard import Shard, ShardError
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -118,7 +117,7 @@ def step_supported(input_ids: torch.Tensor) -> bool:
 class MonoDecodeModel(nn.Module):
     """The loaded V4 model, with its supported decode steps routed to mono."""
 
-    def __init__(self, model: nn.Module, runner: Dsv4MonoDecodeRunner) -> None:
+    def __init__(self, model: nn.Module, runner) -> None:
         super().__init__()
         self.model = model
         self._runner = runner
@@ -162,6 +161,12 @@ def install_mono_decode(
     why = config_refusal(atom_config)
     if why is not None:
         logger.info("DeepSeek-V4 mono decode off: %s", why)
+        return model
+    # the kernels (FlyDSL) load only once the deployment is one mono serves
+    try:
+        from atom.models.deepseek_v4.mono.runner import Dsv4MonoDecodeRunner
+    except ImportError as e:
+        logger.warning("DeepSeek-V4 mono decode off: %s", e)
         return model
     try:
         # the rings ATOM sized: C_ROWS + the drafter's mtp_k (max_spec_steps)
