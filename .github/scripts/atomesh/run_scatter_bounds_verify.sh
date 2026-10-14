@@ -93,10 +93,17 @@ docker exec \
   python3 -c "import torch; print(\"torch\", torch.__version__, \"hip\", torch.version.hip); print(\"devices\", torch.cuda.device_count())"
   python3 -c "import aiter; print(\"aiter_before\", aiter.__file__)"
 
+  # Keep the image pybind11 ABI. Upgrading 3.0.4 -> 3.1.0 (run 38523159059)
+  # rebuilt module_moe_mxfp4_aux with internals v12 while module_aiter_core
+  # stayed on v11 and every scatter launch failed the ABI check.
+  if ! python3 -c "import pybind11" 2>/dev/null; then
+    python3 -m pip install "pybind11>=3.0.1"
+  fi
+  python3 -m pip show pybind11 | grep -E '^(Name|Version):' || true
+
   if [[ "${SCATTER_INSTALL_MODE}" == "aiter_ref" && -n "${AITER_GIT_REF}" ]]; then
     echo "=== install aiter from ref ${AITER_GIT_REF} ==="
     python3 -m pip uninstall -y amd-aiter || true
-    python3 -m pip install --upgrade "pybind11>=3.0.1"
     rm -rf /app/aiter-test
     git clone --filter=blob:none --no-checkout https://github.com/ROCm/aiter.git /app/aiter-test
     cd /app/aiter-test
@@ -110,6 +117,16 @@ docker exec \
     echo "=== apply vendored scatter_reduce bounds patch ==="
     REPO_ROOT=/workspace/ATOM bash /workspace/ATOM/.github/scripts/apply_aiter_scatter_reduce_bounds_patch.sh
   fi
+
+  # Drop any JIT blobs so aiter_core and moe_mxfp4_aux rebuild together under
+  # the same pybind11 (error text from run 38523159059).
+  for d in "${AITER_JIT_DIR:-}" "${AITER_CACHE_DIR:-}/jit" "${HOME}/.aiter"; do
+    [[ -n "${d}" && -d "${d}" ]] || continue
+    echo "clearing aiter JIT dir: ${d}"
+    rm -rf "${d}"
+    mkdir -p "${d}"
+  done
+  export AITER_REBUILD=1
 
   python3 - <<'"'"'PY'"'"'
 from pathlib import Path
@@ -129,7 +146,7 @@ PY
   python3 -c "import atom, aiter; print(\"atom\", atom.__file__); print(\"aiter\", aiter.__file__)"
 
   echo "=== ATOM MiniMax-M3 scatter_reduce tests ==="
-  python3 -m pytest -p no:cacheprovider -v -s \
+  AITER_REBUILD=1 python3 -m pytest -p no:cacheprovider -v -s \
     /workspace/ATOM/tests/test_minimax_m3_moe_scatter_reduce.py \
     2>&1 | tee /out/pytest_atom_scatter.log
 
@@ -139,7 +156,7 @@ PY
     T=/workspace/ATOM/.github/patches/test_moe_scatter_reduce_aiter.py
   fi
   echo "=== aiter scatter_reduce tests (${T}) ==="
-  python3 -m pytest -p no:cacheprovider -v -s "$T" \
+  AITER_REBUILD=1 python3 -m pytest -p no:cacheprovider -v -s "$T" \
     2>&1 | tee /out/pytest_aiter_scatter.log
 
   echo "=== scatter_bounds verify OK ==="
