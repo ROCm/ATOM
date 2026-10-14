@@ -602,6 +602,7 @@ def test_placeholder_rows_run_every_decoder_layer_under_its_stage(monkeypatch):
     rows must reach layers 20..38 under the decoder counts and layer 39 under
     the last-layer counts, once each -- a skipped layer or a wrong table
     leaves the peer waiting in a mismatched collective."""
+    pytest.importorskip("aiter")  # the runtime module imports aiter's guards
     from atom.models.deepseek_v41 import runtime
     from atom.utils import forward_context as fc
 
