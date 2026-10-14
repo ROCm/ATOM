@@ -713,6 +713,24 @@ def test_a_failed_update_leaves_no_expert_shard_for_a_later_one_to_complete():
     runner.assert_weight_update_ready()
 
 
+@pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
+def test_a_fused_parameter_missing_a_shard_fails_the_update(path):
+    """A BF16 one takes each shard as it comes, so an update that ended without
+    one left that part of it at its earlier version, and reported success. An
+    RDMA reload's coverage caught it; a direct, SHM or IPC one did not."""
+    runner = _Runner(_dense_model())
+    ckpt = _dense_checkpoint(fill=2.0)
+    del ckpt["attn.v_proj.weight"]
+
+    with pytest.raises(RuntimeError, match=r"only some of their shards.*qkv_proj"):
+        _direct_reload(runner, path, ckpt)
+
+    assert runner.model.attn.o_proj.weight.eq(2.0).all()
+    # Nothing is kept for the next update to complete.
+    complete = _dense_checkpoint(fill=3.0)
+    assert _direct_reload(runner, path, complete) == len(complete)
+
+
 def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():
     """A fused FP8 parameter still waiting on a shard was never rewritten, so
     finishing the call is not the same as finishing the reload."""

@@ -167,6 +167,7 @@ class WeightUpdaterMixin:
             return
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
+        getattr(self, "_fused_shards_written", {}).clear()
         # What a failed update wrote may be another version than the writes
         # that complete the rewrite after it, so only a reload that rewrites
         # everything afresh lifts a fence.
@@ -326,10 +327,22 @@ class WeightUpdaterMixin:
 
         tensor_gpu = tensor.to(device=self.device)
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
-        self._credit_reload_part(
-            param, shard_id, self._get_packed_shard_order().get(tgt_suffix, ())
-        )
+        required = self._get_packed_shard_order().get(tgt_suffix, ())
+        self._credit_reload_part(param, shard_id, required)
+        self._note_fused_shard(atom_name, shard_id, required)
         return "updated"
+
+    def _note_fused_shard(self, atom_name: str, shard_id, required) -> None:
+        """Record a shard written straight into a fused parameter by a direct,
+        SHM or IPC update, so one that ends with the parameter part-written is
+        refused; see ``_take_incomplete_fused``. A transaction's coverage
+        covers its own."""
+        if getattr(self, "_weight_update_version", None) is not None:
+            return
+        written = getattr(self, "_fused_shards_written", None)
+        if written is None:
+            written = self._fused_shards_written = {}
+        written.setdefault(atom_name, (frozenset(required), set()))[1].add(shard_id)
 
     def _apply_unmatched_weight(
         self,
@@ -1200,23 +1213,33 @@ class WeightUpdaterMixin:
         if incomplete:
             stale.append(
                 f"{len(incomplete)} fused parameter(s) got only some of their "
-                f"shards, so none of them was written: {list(incomplete)[:20]}"
+                f"shards, so each holds an earlier version in part or in "
+                f"whole: {list(incomplete)[:20]}"
             )
         if stale:
             raise RuntimeError(f"{self.label}: " + "; ".join(stale))
 
     def _take_incomplete_fused(self) -> list[str]:
-        """Drop the fused parameters still waiting on shards, and name them.
+        """Drop the fused parameters an update left without all their shards,
+        and name them.
 
         An FP8 one is composed and requantised only once every shard has
-        arrived, so one that got some of them was not written at all.
+        arrived, so one that got some of them was not written at all. Any other
+        takes each shard as it comes, so one that got some of them holds the
+        rest at their earlier version.
         """
+        incomplete = set()
         accum = getattr(self, "_packed_weight_accum", None)
-        if not accum:
-            return []
-        incomplete = sorted(accum)
-        accum.clear()
-        return incomplete
+        if accum:
+            incomplete.update(accum)
+            accum.clear()
+        written = getattr(self, "_fused_shards_written", None)
+        if written:
+            incomplete.update(
+                name for name, (required, got) in written.items() if not required <= got
+            )
+            written.clear()
+        return sorted(incomplete)
 
     # ── what a reload has rewritten ───────────────────────────────────────
     #
@@ -1303,6 +1326,7 @@ class WeightUpdaterMixin:
         """Forget cross-bucket state, so no reload inherits another's."""
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
+        getattr(self, "_fused_shards_written", {}).clear()
         self._pending_expert_relayout.clear()
 
     # ── bucketed, transactional reload (the RDMA path) ────────────────────
