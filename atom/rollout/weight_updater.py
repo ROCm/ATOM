@@ -46,6 +46,28 @@ def _discard_sync_state_on_error(method):
     return guarded
 
 
+def _refused_during_a_transaction(method):
+    """A direct, SHM or IPC update may not write into an open transaction.
+
+    Its writes would be credited to the transaction, which could then commit
+    what neither sender sent whole. Applied outside
+    ``_discard_sync_state_on_error``, so the refusal discards nothing: that
+    scratch is the transaction's, and its commit or abort ends it.
+    """
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        active = getattr(self, "_weight_update_version", None)
+        if active is not None:
+            raise RuntimeError(
+                f"{getattr(self, 'label', 'runner')}: {method.__name__} refused "
+                f"while weight update v{active} is in progress"
+            )
+        return method(self, *args, **kwargs)
+
+    return guarded
+
+
 def _unwrap_once(module) -> torch.nn.Module | None:
     """The model inside one wrapper `ModelRunner` may have rebound onto itself,
     or None when *module* is not one. See `_sync_target_model`.
@@ -137,7 +159,12 @@ class WeightUpdaterMixin:
         """
         if hasattr(self, "_ipc_buffer"):
             self._ipc_buffer = None
-        if hasattr(self, "_packed_weight_accum"):
+        # An open transaction's shards are its own, and its commit or abort
+        # clears them.
+        if (
+            hasattr(self, "_packed_weight_accum")
+            and getattr(self, "_weight_update_version", None) is None
+        ):
             self._packed_weight_accum.clear()
         # Do not clear _expert_relayout_pending. A weight already written
         # row-major still needs the later complete sync's finalizer to restore
@@ -942,6 +969,7 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+    @_refused_during_a_transaction
     @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
@@ -1388,7 +1416,8 @@ class WeightUpdaterMixin:
         return manifest
 
     def fence_weight_update(self, error: object) -> dict:
-        """Stop serving until a full reload, leaving a reload in progress be.
+        """Stop serving until a full reload. A reload already in progress stays
+        open, for its caller to finish.
 
         For a rank that took no part in a stream its peers took: its own weights
         are whole, but no longer the version the rest of the engine holds. A
@@ -1490,6 +1519,7 @@ class WeightUpdaterMixin:
             "failure": getattr(self, "_weight_update_failure", None),
         }
 
+    @_refused_during_a_transaction
     @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
@@ -1571,6 +1601,7 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
+    @_refused_during_a_transaction
     @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,

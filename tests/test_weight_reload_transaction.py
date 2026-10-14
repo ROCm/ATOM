@@ -629,3 +629,54 @@ def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():
 
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
+
+
+# ── nothing outside a transaction writes into it ───────────────────────────
+
+
+def _fp8_attention_model():
+    """The dense block with an FP8 qkv_proj, whose shards wait to be composed."""
+    model = _dense_model()
+    model.attn.qkv_proj.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
+    model.attn.qkv_proj.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+    return model
+
+
+def _open_transaction(monkeypatch):
+    """A runner one bucket into a stream: q_proj's shard waits for k and v."""
+    monkeypatch.setattr(
+        WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: True
+    )
+    runner = _Runner(_fp8_attention_model())
+    ckpt = _dense_checkpoint()
+    runner.begin_weight_update(1)
+    runner.apply_weight_bucket([("attn.q_proj.weight", ckpt.pop("attn.q_proj.weight"))])
+    return runner, list(ckpt.items())
+
+
+@pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
+def test_a_legacy_reload_is_refused_while_a_transaction_is_open(monkeypatch, path):
+    """Taken mid-stream, it wrote over the stream's parameters and was credited
+    to it, and then cleared the shards the stream had gathered so far."""
+    runner, rest = _open_transaction(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="v1 is in progress"):
+        _direct_reload(runner, path, _dense_checkpoint(fill=2.0))
+
+    assert runner.model.attn.o_proj.weight.eq(0.0).all()
+    runner.apply_weight_bucket(rest)
+    assert runner.commit_weight_update(1)["loaded_internal"] == 3
+
+
+def test_a_failed_update_elsewhere_leaves_an_open_transaction_its_shards(
+    monkeypatch,
+):
+    """Once any rank's direct, SHM or IPC update failed, every rank dropped its
+    scratch -- an open stream's half-gathered fused shards with it, so the
+    stream could no longer complete."""
+    runner, rest = _open_transaction(monkeypatch)
+
+    runner.discard_failed_weight_sync()
+
+    runner.apply_weight_bucket(rest)
+    assert runner.commit_weight_update(1)["loaded_internal"] == 3
