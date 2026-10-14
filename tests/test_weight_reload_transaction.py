@@ -597,6 +597,14 @@ def test_a_name_the_model_has_no_parameter_for_is_still_only_skipped(path):
     assert _direct_reload(runner, path, ckpt) == len(_dense_checkpoint())
 
 
+def _fp8_attention_model():
+    """The dense block with an FP8 qkv_proj, whose shards wait to be composed."""
+    model = _dense_model()
+    model.attn.qkv_proj.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
+    model.attn.qkv_proj.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+    return model
+
+
 def test_a_fused_fp8_parameter_whose_requantisation_refused_fails_the_update(
     monkeypatch,
 ):
@@ -605,41 +613,48 @@ def test_a_fused_fp8_parameter_whose_requantisation_refused_fails_the_update(
     monkeypatch.setattr(
         WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: False
     )
-    model = _dense_model()
-    model.attn.qkv_proj.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
-    model.attn.qkv_proj.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
-    runner = _Runner(model)
+    runner = _Runner(_fp8_attention_model())
 
     with pytest.raises(RuntimeError, match=r"could not be written.*'attn\.v_proj"):
         runner.update_weights(list(_dense_checkpoint().items()))
 
 
+@pytest.mark.parametrize("path", ["direct", "shm", "ipc"])
+def test_a_fused_fp8_parameter_missing_a_shard_fails_the_update(monkeypatch, path):
+    """Its shards wait to be composed, and the update ended without the last.
+    Dropped with a warning at most, the parameter kept its earlier value under
+    an update that reported success."""
+    monkeypatch.setattr(
+        WeightUpdaterMixin, "_requantize_fp8_weight", lambda self, *a: True
+    )
+    runner = _Runner(_fp8_attention_model())
+    ckpt = _dense_checkpoint(fill=2.0)
+    del ckpt["attn.v_proj.weight"]
+
+    with pytest.raises(RuntimeError, match=r"only some of their shards.*qkv_proj"):
+        _direct_reload(runner, path, ckpt)
+
+    # The rest of the batch still lands, and nothing is left for a later
+    # update to compose with shards of another version.
+    assert runner.model.attn.o_proj.weight.eq(2.0).all()
+    assert not runner._packed_weight_accum
+
+
 def test_a_legacy_reload_that_did_not_complete_keeps_the_fence():
     """A fused FP8 parameter still waiting on a shard was never rewritten, so
     finishing the call is not the same as finishing the reload."""
-    model = _dense_model()
-    qkv = model.attn.qkv_proj
-    qkv.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
-    qkv.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
-    runner = _fenced(_Runner(model))
+    runner = _fenced(_Runner(_fp8_attention_model()))
     ckpt = _dense_checkpoint()
     del ckpt["attn.v_proj.weight"]
 
-    runner.update_weights(list(ckpt.items()))
+    with pytest.raises(RuntimeError, match="only some of their shards"):
+        runner.update_weights(list(ckpt.items()))
 
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
 
 # ── nothing outside a transaction writes into it ───────────────────────────
-
-
-def _fp8_attention_model():
-    """The dense block with an FP8 qkv_proj, whose shards wait to be composed."""
-    model = _dense_model()
-    model.attn.qkv_proj.weight = _param(8, HIDDEN, dtype=torch.float8_e4m3fn)
-    model.attn.qkv_proj.weight_scale = nn.Parameter(torch.ones(1), requires_grad=False)
-    return model
 
 
 def _open_transaction(monkeypatch):

@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from functools import wraps
 
 import torch
@@ -994,7 +994,8 @@ class WeightUpdaterMixin:
 
         Raises:
             RuntimeError: a tensor named a parameter but could not be written
-                to it. Raised once the rest of the batch is applied.
+                to it, or a fused parameter got only some of its shards. Raised
+                once the rest of the batch is applied.
         """
         counts = self._apply_named_tensors(named_tensors)
         updated = counts["updated"]
@@ -1004,8 +1005,7 @@ class WeightUpdaterMixin:
         if clear_kv_cache:
             self.clear_kv_cache()
 
-        if hasattr(self, "_packed_weight_accum"):
-            self._packed_weight_accum.clear()
+        incomplete = self._take_incomplete_fused()
 
         logger.info(
             f"{self.label}: Weight update complete - "
@@ -1013,7 +1013,7 @@ class WeightUpdaterMixin:
             f"ignored_scales={counts['ignored_scales']}"
         )
         self._warn_if_nothing_matched(updated, counts["skipped"])
-        self._refuse_unwritten(counts)
+        self._refuse_unwritten(counts, incomplete)
         self._lift_partial_reload_fence("direct")
         return updated
 
@@ -1134,21 +1134,44 @@ class WeightUpdaterMixin:
             "unwritten_names": unwritten_names,
         }
 
-    def _refuse_unwritten(self, counts: dict) -> None:
+    def _refuse_unwritten(self, counts: dict, incomplete: Sequence[str] = ()) -> None:
         """Fail a direct, SHM or IPC update that left a parameter it named stale.
 
         Returning the count alone reported success over it: nothing told the
         caller, and where only some ranks skipped, the shards stopped belonging
         to one model. Called once the batch is applied and finalised, so the
-        rest of it is not left half-done as well.
+        rest of it is not left half-done as well. *incomplete* are the fused
+        parameters the update ended with still waiting on shards; see
+        ``_take_incomplete_fused``.
         """
-        unwritten = counts["unwritten_names"]
+        stale = []
+        unwritten = sorted(counts["unwritten_names"])
         if unwritten:
-            raise RuntimeError(
-                f"{self.label}: {len(unwritten)} weight(s) could not be written "
-                f"to the parameter they name, which keeps its earlier value: "
-                f"{sorted(unwritten)[:20]}"
+            stale.append(
+                f"{len(unwritten)} weight(s) could not be written to the "
+                f"parameter they name, which keeps its earlier value: "
+                f"{unwritten[:20]}"
             )
+        if incomplete:
+            stale.append(
+                f"{len(incomplete)} fused parameter(s) got only some of their "
+                f"shards, so none of them was written: {list(incomplete)[:20]}"
+            )
+        if stale:
+            raise RuntimeError(f"{self.label}: " + "; ".join(stale))
+
+    def _take_incomplete_fused(self) -> list[str]:
+        """Drop the fused parameters still waiting on shards, and name them.
+
+        An FP8 one is composed and requantised only once every shard has
+        arrived, so one that got some of them was not written at all.
+        """
+        accum = getattr(self, "_packed_weight_accum", None)
+        if not accum:
+            return []
+        incomplete = sorted(accum)
+        accum.clear()
+        return incomplete
 
     # ── what a reload has rewritten ───────────────────────────────────────
     #
@@ -1578,23 +1601,20 @@ class WeightUpdaterMixin:
             counts = self._apply_named_tensors(views())
             updated, skipped = counts["updated"], counts["skipped"]
 
+            # Kept across buckets until the last: a fused parameter's shards
+            # may span them.
+            incomplete = []
             if is_last:
                 self._relayout_rewritten_experts()
                 self.clear_kv_cache()
-                if hasattr(self, "_packed_weight_accum"):
-                    if self._packed_weight_accum:
-                        logger.warning(
-                            f"{self.label}: Incomplete packed weight accumulators: "
-                            f"{list(self._packed_weight_accum.keys())}"
-                        )
-                    self._packed_weight_accum.clear()
+                incomplete = self._take_incomplete_fused()
             logger.info(
                 f"{self.label}: SHM weight update bucket done - "
                 f"updated={updated}, skipped={skipped}, "
                 f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
             )
             self._warn_if_nothing_matched(updated, skipped)
-            self._refuse_unwritten(counts)
+            self._refuse_unwritten(counts, incomplete)
             if is_last:
                 self._lift_partial_reload_fence("SHM")
             return updated
@@ -1699,6 +1719,7 @@ class WeightUpdaterMixin:
         updated, skipped = counts["updated"], counts["skipped"]
 
         # Only release the IPC buffer mapping on the last bucket
+        incomplete = []
         if is_last:
             self._relayout_rewritten_experts()
             self._ipc_buffer = None
@@ -1709,20 +1730,14 @@ class WeightUpdaterMixin:
                 logger.debug("torch.cuda.ipc_collect skipped: %s", e)
 
             self.clear_kv_cache()
-            if hasattr(self, "_packed_weight_accum"):
-                if self._packed_weight_accum:
-                    logger.warning(
-                        f"{self.label}: Incomplete packed weight accumulators: "
-                        f"{list(self._packed_weight_accum.keys())}"
-                    )
-                self._packed_weight_accum.clear()
+            incomplete = self._take_incomplete_fused()
         logger.info(
             f"{self.label}: IPC weight update bucket done - "
             f"updated={updated}, skipped={skipped}, "
             f"ignored_scales={counts['ignored_scales']}, is_last={is_last}"
         )
         self._warn_if_nothing_matched(updated, skipped)
-        self._refuse_unwritten(counts)
+        self._refuse_unwritten(counts, incomplete)
         if is_last:
             self._lift_partial_reload_fence("IPC")
         return updated
