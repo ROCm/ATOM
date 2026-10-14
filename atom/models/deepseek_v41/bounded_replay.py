@@ -82,9 +82,11 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do DP attention and padded steps: DP's MoE collectives are
-    sized by every rank's token count, even when a rank needs no padding,
-    and a rank-local tail would change those counts.
+    row, and so do padded steps. Under DP attention a prefill replays only
+    when the group can agree on each stage's rows (`dp_rows_exchangeable`):
+    DP's MoE collectives are sized by every rank's row count, which a
+    rank-local tail changes, so the ranks trade their decoder and last-layer
+    rows first (`exchange_dp_rows`).
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
@@ -93,7 +95,10 @@ def replayable(forward, num_tokens: int) -> bool:
         or context.is_dummy_run
         or context.is_draft
         or forward.ubatch_slices is not None
-        or getattr(forward, "dp_metadata", None) is not None
+    ):
+        return False
+    if getattr(forward, "dp_metadata", None) is not None and not (
+        dp_rows_exchangeable(forward)
     ):
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
@@ -109,6 +114,102 @@ def replayable(forward, num_tokens: int) -> bool:
         or num_tokens != step.width
         or step.width != step.scheduled
     )
+
+
+def dp_rows_exchangeable(forward) -> bool:
+    """Whether the DP group trades per-stage row counts this forward.
+
+    Agreed by every rank: each condition is a group decision -- an eager,
+    variable-length step (`running_tokens_are_unified` is off on all ranks
+    once any rank prefills) that TBO did not split. A decode-only step pads
+    every rank to one height and never replays; a TBO-split step runs
+    microbatches, which compute every row.
+    """
+    context = forward.context
+    if (
+        context is None
+        or getattr(forward, "dp_metadata", None) is None
+        or context.running_tokens_are_unified
+        or forward.ubatch_slices is not None
+    ):
+        return False
+    from atom.utils.tbo.ubatching import tbo_active
+
+    return not tbo_active()
+
+
+@dataclass(frozen=True)
+class DPRows:
+    """Every DP rank's MoE rows past the decoder's KV source, in DP order:
+    ``decoder`` for layers 20..38 (layer 20's FFN onward), ``last`` for layer
+    39. A rank that does not replay runs all its rows through both."""
+
+    decoder: tuple[int, ...]
+    last: tuple[int, ...]
+
+
+def exchange_dp_rows(forward, decoder_rows: int, last_rows: int) -> DPRows | None:
+    """Trade this rank's decoder and last-layer row counts with the DP group.
+
+    One CPU all_reduce of ``2 x dp_size`` int32, issued by every rank of a
+    forward for which `dp_rows_exchangeable` holds (decode ranks and dummy
+    runs of a prefill step included). None when no rank replays, so the
+    caller keeps the step's own DP table.
+    """
+    import torch.distributed as dist
+    from aiter.dist.parallel_state import get_dp_group
+
+    sizes = tuple(int(n) for n in forward.dp_metadata.get_sizes_across_dp())
+    # The slot `DPMetadata.num_tokens_across_dp` fills, so the tables line up.
+    rank = _dp_rank()
+    table = torch.zeros((2, len(sizes)), dtype=torch.int32)
+    table[0, rank], table[1, rank] = decoder_rows, last_rows
+    dist.all_reduce(table, group=get_dp_group().cpu_group)
+    rows = DPRows(tuple(table[0].tolist()), tuple(table[1].tolist()))
+    if rows.decoder == sizes and rows.last == sizes:
+        return None
+    return rows
+
+
+def _dp_rank() -> int:
+    from atom.config import get_current_atom_config
+
+    return get_current_atom_config().parallel_config.data_parallel_rank
+
+
+@contextlib.contextmanager
+def dp_rows(forward, rows: tuple[int, ...] | None):
+    """Size the forward's DP MoE collectives for ``rows`` while this block
+    runs: the variable-length gather reads every rank's count from
+    ``dp_metadata`` and this rank's own from ``context.scheduled_tokens``."""
+    if rows is None:
+        yield
+        return
+    from atom.config import get_current_atom_config
+    from atom.utils.forward_context import DPMetadata
+
+    context = forward.context
+    own = rows[_dp_rank()]
+    outer = (
+        forward.dp_metadata,
+        context.scheduled_tokens,
+        context.running_tokens_across_dp,
+    )
+    forward.dp_metadata = DPMetadata.make(
+        get_current_atom_config().parallel_config,
+        own,
+        torch.tensor(rows, dtype=torch.int32),
+    )
+    context.scheduled_tokens = own
+    context.running_tokens_across_dp = rows
+    try:
+        yield
+    finally:
+        (
+            forward.dp_metadata,
+            context.scheduled_tokens,
+            context.running_tokens_across_dp,
+        ) = outer
 
 
 @dataclass(frozen=True)
