@@ -533,61 +533,43 @@ def dspark_markov_argmax_tp(
 
 # ---------------------------------------------------------------------------
 # Sampled variant: the same bias GEMV, but drawing x_k ~ softmax(logits_k / T)
-# and PUBLISHING that q.
+# and publishing that q.
 # ---------------------------------------------------------------------------
 #
-# Why this exists at all, and why it costs what the op above was written to
-# avoid. ATOM proposes the block greedily and accepts a draft token only on
-# exact equality with the token the target sampled. The lossless alternative
-# samples the draft at the request temperature and accepts with the
-# probability-ratio rule (`coin * q < p`); see
-# `envs.ATOM_SPEC_LOSSLESS_SAMPLING`, which is the single switch arming BOTH
-# halves, and `atom/model_ops/rejection_sampler.py` for the consumer.
+# This deliberately gives up the property the op above exists for. q has to
+# leave the kernel for the probability-ratio accept rule to have anything to
+# test, and q is `[B, V]` -- a full-vocab fp32 tensor per block position, the
+# one thing the module docstring says this is written not to materialize. See
+# `envs.ATOM_SPEC_LOSSLESS_SAMPLING` for the trade, and
+# `atom/model_ops/rejection_sampler.py` for the consumer.
 #
-# The two halves are inseparable. For a greedy delta draft q,
-# `sum_x min(p(x), q(x)) = p(x*)`, which is exactly what the exact-match kernel
-# already computes: a ratio kernel over a greedy draft is an arithmetic NO-OP.
-# And sampling the draft WITHOUT the ratio rule is strictly worse than greedy,
-# because a sampled proposal matches the target's own draw less often. So q has
-# to leave this kernel, and q is `[B, V]` -- the one thing the docstring above
-# says this module exists not to materialize. That is the trade, taken
-# knowingly: 200 MiB fp32 at `--max-num-seqs 64` / V=163840 / T=5.
+# Arithmetic: `probs = softmax(step_logits.float() / temperatures[:, None])`,
+# then `probs.div_(noise).argmax(-1)` with `noise = where(greedy_mask, 1.0,
+# exp_noise)` and `exp_noise ~ Exp(1)`. Dividing a categorical by i.i.d. Exp(1)
+# and taking the argmax is a multinomial draw (the exponential race / Gumbel-max
+# trick), so this and `torch.multinomial` are one sampler. A greedy row is one
+# whose temperature was at or below `SAMPLER_EPS` before the caller clamped it;
+# `greedy_mask` carries that and the row falls out as a plain argmax.
 #
-# Arithmetic:
-#   * `probs = softmax(step_logits.float() / temperatures[:, None])`, then
-#     `probs.div_(noise).argmax(-1)` with `noise = where(greedy_mask, 1.0,
-#     exp_noise)` and `exp_noise ~ Exp(1)`. Dividing a categorical by i.i.d.
-#     Exp(1) and taking the argmax IS a multinomial draw (the exponential race /
-#     Gumbel-max trick), which is why this and a `torch.multinomial` spelling
-#     are the same sampler.
-#   * A greedy row is one whose temperature was at or below `SAMPLER_EPS`
-#     before the caller clamped it (`atom/model_ops/sampler.py`); the caller
-#     hands that in as `greedy_mask` and the row falls out as a plain argmax.
+# Two deviations from the obvious eager spelling. The noise is drawn in-kernel
+# from Philox rather than handed in as a `[B, V]` `exp_noise` tensor -- another
+# full-vocab tensor per block position, and a pre-drawn one needs a host RNG the
+# captured graph cannot have. And the softmax is online (per-tile max and sumexp
+# combined in a second launch), so V is read once per block position rather than
+# three times.
 #
-# Deviations from the obvious eager spelling, both stated rather than silent:
-#   * The noise is drawn IN-KERNEL from Philox rather than handed in as a
-#     `[B, V]` `exp_noise` tensor. A [64, 163840] fp32 noise tensor per block
-#     position is 40 MiB of traffic that buys nothing, and a pre-drawn tensor
-#     needs a host RNG the captured graph cannot have. The arithmetic is
-#     unchanged: `E = -log(u)`, `u` uniform.
-#   * The softmax is ONLINE (per-tile max and sumexp combined in a second
-#     launch) rather than a separate max pass, so V is read once and written
-#     once per block position instead of three times.
-#
-# CUDA-graph safety. The seed is a DEVICE int32 scalar whose address is baked at
+# CUDA-graph safety. The seed is a device int32 scalar whose address is baked at
 # capture and whose value is refreshed outside the recording; the per-position
 # offset base is a host int derived from the static block width. No host RNG, no
 # `.item()`, no data-dependent shape.
 #
-# TP/PCP determinism. Every rank must draw the SAME uniforms or the drafts fork:
+# TP/PCP determinism. Every rank must draw the same uniforms or the drafts fork:
 # `num_bonus_tokens` is rank-local while `sampled_tokens` is broadcast from rank
-# 0, so a desync makes the anchor gather read a -1 column and the draft embed an
-# invalid id (HSA out-of-bounds). Philox keyed on a value every rank computes
-# identically (an SPMD step counter) gives that; see `rejection_sampler.py` for
-# the same discipline and the same bug it is guarding against.
+# 0, so a desync leaves the anchor gather on a -1 column. Philox keyed on an
+# SPMD step counter gives that; `rejection_sampler.py` does the same.
 
-# The sampling stages are bandwidth-bound over V rather than MFMA-bound, so they
-# take a wider V tile than the GEMV's 128.
+# Bandwidth-bound over V rather than MFMA-bound, so a wider V tile than the
+# GEMV's.
 _SAMPLE_BLOCK_V = 1024
 
 
@@ -618,8 +600,8 @@ def _dspark_markov_sample_stage1(
     """One (V tile, row tile): bias GEMV, add base, scale by 1/T, publish
     ``s`` plus this tile's (max, sum exp(s - max)).
 
-    ``s`` lands in the caller's q buffer, which stage 3 then normalizes IN
-    PLACE: the alternative is a second `[B, V]` scratch for no gain.
+    ``s`` lands in the caller's q buffer, which stage 3 then normalizes in
+    place: the alternative is a second `[B, V]` scratch for no gain.
     """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
@@ -655,9 +637,9 @@ def _dspark_markov_sample_stage1(
         mask=row_mask[:, None] & v_mask[None, :],
         other=0.0,
     )
-    # Pre-clamped by the caller to SAMPLER_EPS (atom/model_ops/sampler.py), so a
-    # greedy row gets a near-delta q rather than a division by zero; the
-    # greedy_mask below is what actually makes it an argmax.
+    # Pre-clamped by the caller to SAMPLER_EPS, so a greedy row gets a
+    # near-delta q rather than a division by zero; `greedy_mask` is what
+    # actually makes it an argmax.
     temperature = tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0)
     scaled = (base.to(tl.float32) + acc) / temperature[:, None]
     scaled = tl.where(v_mask[None, :], scaled, float("-inf"))
@@ -699,10 +681,9 @@ def _dspark_markov_sample_stage2(
     rescaled = tl.where(tile_mask, sums * tl.exp(maxes - global_max), 0.0)
     z = tl.sum(rescaled, axis=0)
     # An all--inf row (the fp8-KV warmup forward drafts before the pool is
-    # written, and 0x7F decodes to NaN) leaves Z at 0; 1/0 would then make every
-    # probability inf and the argmax below meaningless. Answer a uniform-ish 0
-    # instead -- the cross-tile reduce clamps the resulting all-tie to id 0,
-    # which is what `torch.argmax` answers for an all-NaN row too.
+    # written) leaves Z at 0, and 1/0 would make every probability inf. Answer 0
+    # instead; the cross-tile reduce resolves the all-tie to id 0, as
+    # `torch.argmax` does.
     tl.store(row_max_ptr + row, global_max)
     tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
 
@@ -722,17 +703,16 @@ def _dspark_markov_sample_stage3(
     stride_scaled_row,
     BLOCK_V: tl.constexpr,
 ):
-    """One (row, V tile): normalize ``s`` into q IN PLACE, then run the
+    """One (row, V tile): normalize ``s`` into q in place, then run the
     exponential race over this tile.
 
     ``probs.div_(noise).argmax(-1)``, with ``noise = where(greedy_mask, 1.0,
     exp_noise)`` -- the greedy rows fall out as a plain argmax.
 
-    ONE row per program, and for the reason it has to be: this stage only
-    streams, so its live tile is ``[1, BLOCK_V]`` of fp32 rather than stage 1's
-    MFMA accumulator. Tiling it ``[BLOCK_ROW, BLOCK_V]`` instead put 256
-    VGPR/lane in flight and spilled -- measured 1199 us/block at bs=64 against
-    460 us for this shape.
+    One row per program, deliberately: this stage only streams, so its live tile
+    is ``[1, BLOCK_V]`` of fp32 rather than stage 1's MFMA accumulator. Tiling
+    it ``[BLOCK_ROW, BLOCK_V]`` instead puts enough VGPR/lane in flight to
+    spill, which costs far more than the extra programs save.
     """
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -748,22 +728,14 @@ def _dspark_markov_sample_stage3(
 
     # Philox, keyed on a device scalar every rank fills with the same SPMD step
     # counter. The flat element index is the counter offset, so a given (step,
-    # block position, row, id) draws one and only one uniform -- and the same
-    # one on every rank.
+    # position, row, id) draws one uniform, the same one on every rank.
     seed = tl.load(seed_ptr)
     u = tl.rand(seed, noise_offset + row * vocab_size + offs_v)
-    # `u` rather than `1 - u`, and the difference is which end is exact. tl.rand
-    # is [0, 1), so E = -log(u) is in (0, inf]: every draw gives a STRICTLY
-    # POSITIVE exponential and the key probs / E is always finite. The u == 0
-    # draw (P = 2^-31) gives E = inf and so key 0, which loses the race -- the
-    # same negligible bias `1 - u` was written to avoid, and in the same
-    # direction, but reached without depending on the SIGN OF ZERO.
-    #
-    # `1 - u` has the opposite, sharper edge: 1 - u rounds to exactly 1.0 for
-    # every u <= 2^-25 in fp32 (65 of tl.rand's 2^-31 grid points, so ~0.5% of
-    # draft rows contain one), E is then -0.0, and probs / -0.0 is -inf. That
-    # happens to EXCLUDE the id, which is also harmless -- but only because the
-    # zero came out negative.
+    # `-log(u)` rather than `-log(1 - u)`: tl.rand is [0, 1), so E = -log(u) is
+    # in (0, inf] and the key probs / E is always finite (u == 0 gives key 0,
+    # which simply loses the race). With `1 - u`, a small u rounds the
+    # complement to exactly 1.0, E is then -0.0 and probs / -0.0 is -inf --
+    # harmless only because the zero happened to come out negative.
     exp_noise = -tl.log(u)
     greedy = tl.load(greedy_mask_ptr + row) != 0
     denom = tl.where(greedy, 1.0, exp_noise)
@@ -811,8 +783,8 @@ def _torch_dspark_markov_sample(
 ) -> torch.Tensor:
     """The reference this op replaces, with the markov bias folded in.
 
-    Kept as the out-of-range fallback AND as the thing the kernel is tested
-    against. It draws its noise from the global RNG, so it is NOT rank-safe and
+    Kept as the out-of-range fallback and as the thing the kernel is tested
+    against. It draws its noise from the global RNG, so it is not rank-safe and
     not reachable on the serving path; `_fused_is_supported` gates it.
     """
     markov_embed = markov_w1[prev_ids]
@@ -859,7 +831,7 @@ def dspark_markov_sample(
                               anything live.
         temperatures: [B]     fp32, pre-clamped away from 0 by the caller.
         greedy_mask:  [B]     int32, nonzero where the draw is an argmax.
-        seed:         [1]     int32 DEVICE scalar. Must hold the same value on
+        seed:         [1]     int32 device scalar. Must hold the same value on
                               every TP/PCP rank; see the module notes.
         noise_offset:         host int, the Philox counter base for this block
                               position. Static (position * B * V), so it does
@@ -979,10 +951,10 @@ def dspark_markov_sample(
         num_warps=4,
         num_stages=2,
     )
-    # Stage 4 IS the greedy op's stage 2: "pick the winning V tile, lowest id
+    # Stage 4 is the greedy op's stage 2: "pick the winning V tile, lowest id
     # among tiles that tie" is the same reduction over a different key. Driven
-    # in its non-PACKED (whole-vocab) form -- `part_key` stands in for the
-    # unused `packed_ptr`, which that branch never dereferences.
+    # in its non-packed form, where `part_key` stands in for the unused
+    # `packed_ptr` that branch never dereferences.
     _dspark_markov_argmax_stage2[(num_rows,)](
         part_key,
         part_idx,

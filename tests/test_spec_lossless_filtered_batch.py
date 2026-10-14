@@ -1,38 +1,36 @@
 # SPDX-License-Identifier: MIT
-"""A top-k/top-p batch runs the flag-OFF pair, not half of each.
+"""A top-k/top-p batch runs the flag-off pair, not half of each.
 
 The probability-ratio accept rule cannot verify a filtered row:
 `rejection_sampler._ratio_target_probs` builds `p` as a plain temperature
 softmax and never filters it, so such a row would accept against -- and draw
-its correction token from -- the UNFILTERED target. So the verify side drops the
+its correction token from -- the unfiltered target. So the verify side drops the
 batch to exact-match acceptance, and batch-wide at that: the ratio kernel has
 one accept rule per launch and no exact-match branch to route a single row into.
 
-That drop used to be a REGRESSION rather than a fallback. The drafts had still
-been sampled, and a sampled proposal under exact-match acceptance matches the
-target's own draw strictly less often than the greedy proposal the flag-off path
-makes -- so one `top_p < 1` request made every row in the batch accept less often
-than with the flag off entirely. The fix is on the draft side, a step earlier:
-such a batch drafts GREEDILY, which puts it back on exactly the shipped pair.
+The draft side has to move with it. A sampled proposal under exact-match
+acceptance matches the target's own draw strictly less often than a greedy one,
+so a filtered batch left sampling would be worse than flag-off; drafting it
+greedily puts it back on exactly the shipped pair.
 
 Two halves, one test file:
 
 * `_lossless_verify_inputs` -- the verify side never hands the ratio kernel a
   filtered batch.
-* `stage_draft_sampling_host` -- the draft side answers that by clamping the DRAFT's
+* `stage_draft_sampling_host` -- the draft side answers by clamping the draft's
   temperature to `SAMPLER_EPS` and setting every `greedy_mask` row, so the token
-  is an argmax AND the published `q` is the delta that argmax drew from. The
+  is an argmax and the published `q` is the delta that argmax drew from. The
   mask alone would not do: it only replaces the exponential race, leaving `q` at
-  `softmax(logits/T)`, which for `T = 1` is nothing like a delta. That matters
+  `softmax(logits/T)`, a distribution the token was not drawn from. That matters
   because propose and verify are a step apart -- this batch's drafts are tested
-  against the NEXT batch's filters -- and a delta `q` is sound under either rule.
+  against the next batch's filters -- and a delta `q` is sound under either rule.
   `tests/test_spec_lossless_no_op_at_t0.py` is where that delta is pinned.
 
 CPU-only, and lifted out of the shipped sources with `ast` for the reason
-`tests/test_dspark_q_slots.py` states at length: `atom.model_engine.model_runner`
-and `atom.spec_decode.dspark_proposer` both need an AITER build to import, so an
+`tests/test_dspark_q_slots.py` gives: `atom.model_engine.model_runner` and
+`atom.spec_decode.dspark_proposer` both need an AITER build to import, so an
 imported version of this file would sit behind `importorskip("aiter")` and get
-ZERO coverage in CI (`.github/scripts/run_unit_tests.sh`).
+no coverage in CI.
 """
 
 import ast

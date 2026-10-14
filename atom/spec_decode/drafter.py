@@ -345,16 +345,14 @@ class Drafter(abc.ABC):
 
     # ---- lossless speculative sampling (DSpark-only; no-ops elsewhere) ----
     #
-    # THESE FOUR NO-OPS ARE THE GUARD. `EagleProposer` and every MTP/EAGLE3
-    # drafter inherits them unchanged, which is what keeps the probability-ratio
-    # accept rule unreachable from any flavor that has not been ported: the
-    # runner calls the hooks unconditionally and gets None / nothing back, so
-    # `draft_probs is None` and the exact-match kernel runs, as it always has.
+    # These four no-ops are the guard. `EagleProposer` and every MTP/EAGLE3
+    # drafter inherits them unchanged, which keeps the probability-ratio accept
+    # rule unreachable from any flavor that has not been ported: the runner
+    # calls the hooks unconditionally and gets None back.
     #
-    # Typed hooks rather than `getattr(drafter, "draft_probs", None)` probes,
-    # for the same reason the capability properties above exist: a flavor that
-    # renames one of these should break the call site, not quietly stop
-    # publishing q and leave the runner on exact-match acceptance.
+    # Typed hooks rather than `getattr(drafter, "draft_probs", None)` probes:
+    # a flavor that renames one should break the call site, not quietly stop
+    # publishing q.
 
     @property
     def draft_probs(self) -> torch.Tensor | None:

@@ -1,24 +1,20 @@
 # SPDX-License-Identifier: MIT
-"""A request with no live draft q reads NO q -- never another request's row.
+"""A request with no live draft q reads no q -- never another request's row.
 
 The accept kernel reaches a request's q by indirection: `draft_probs_row_base`
-answers the first row, and `coin * q < p` is tested there. The fallback for a
-request the map does not know used to be row 0. Row 0 is in range and holds
-q > 0, so it passes the kernel's probability guard and the ratio test then
-accepts UNCONDITIONALLY against somebody else's distribution -- measured at
-24.4% of inline accuracy lost while acceptance ROSE to 3.01, a failure shaped
-like a win. The answer is the -1 sentinel, and the second half of the answer is
-that a request should not BE unknown: persistent per-request slots, so a q
-survives the prefill-only steps between the propose that drew it and the verify
-that tests it.
+answers the first row, and `coin * q < p` is tested there. A fallback of row 0
+for a request the map does not know is in range and holds q > 0, so it passes
+the kernel's probability guard and the ratio test then accepts unconditionally
+against somebody else's distribution -- a failure shaped like a win. The answer
+is the -1 sentinel, and the second half of the answer is that a request should
+not be unknown: persistent per-request slots, so a q survives the prefill-only
+steps between the propose that drew it and the verify that tests it.
 
 This file runs on a plain CPU runner, which is the only kind CI has. That is
-deliberate and it is why the methods are lifted out of the proposer's source
-rather than imported: `atom.spec_decode.dspark_proposer` pulls in the model
-loader and cannot be imported without an AITER build, so importing it would put
-this file behind `importorskip("aiter")` and the regression above would have
-ZERO CI coverage -- see `.github/scripts/run_unit_tests.sh` and the note in
-`tests/conftest.py` about four suites that went quiet exactly that way.
+why the methods are lifted out of the proposer's source rather than imported:
+`atom.spec_decode.dspark_proposer` pulls in the model loader and cannot be
+imported without an AITER build, so importing it would put this file behind
+`importorskip("aiter")` and leave the regression above without CI coverage.
 """
 
 import ast
@@ -77,14 +73,14 @@ class QSlots:
     """The proposer's persistent-q seam, on CPU, over the real methods.
 
     Everything below the seam is stood in for: `propose` plays the part of the
-    captured block head, which writes q into the scratch at BATCH SLOT rows
+    captured block head, which writes q into the scratch at batch-slot rows
     `[0, bs * T)` and nothing else. That is the whole reason the persistent
     store exists -- a batch slot belongs to one step, and ATOM never mixes
     prefill and decode, so a prefill-only propose rewrites rows that belong to
     decode requests whose q has not been tested yet.
 
     A q row is a constant vector carrying a marker unique to the
-    (request, position) that drew it, so "this request read its OWN q" is an
+    (request, position) that drew it, so "this request read its own q" is an
     exact comparison rather than a plausible one.
     """
 
@@ -157,9 +153,9 @@ def test_a_request_the_q_map_never_saw_reads_the_sentinel_and_not_row_zero(
     slots = QSlots(max_num_seqs=4, tokens_per_seq=tokens_per_seq)
     slots.propose(["a", "b"])
     bases = slots.draft_probs_row_base(["a", "b", "never-drafted"]).tolist()
-    # Armed: the first free slot is 0, so row 0 IS a live row holding another
-    # request's q -- which is what made the historic fallback pass the kernel's
-    # `0 < q <= 1` guard and accept unconditionally.
+    # Armed: the first free slot is 0, so row 0 is a live row holding another
+    # request's q -- a row that would pass the kernel's `0 < q <= 1` guard and
+    # accept unconditionally.
     assert bases[0] == 0 and (slots._q_store[0] > 0).all()
     assert bases[1] == tokens_per_seq
     assert bases[2] == -1
@@ -171,10 +167,9 @@ def test_an_expired_slot_is_a_sentinel_rather_than_its_new_owners_rows():
     """The only other way to be absent: a q slot handed to somebody else.
 
     `_claim_q_slot` recycles the least recently drafted slot when the free list
-    runs out, and it DROPS the victim from the map on the way. Leaving the
-    entry would point the kernel at a row that is in range, holds q > 0 and
-    belongs to another request -- the 24.4% bug with one more step in front
-    of it.
+    runs out, and it drops the victim from the map on the way. Leaving the entry
+    would point the kernel at a row that is in range, holds q > 0 and belongs to
+    another request.
     """
     slots = QSlots(max_num_seqs=2, tokens_per_seq=2, oversubscribe=2)
     slots.propose(["stale"])
@@ -182,7 +177,7 @@ def test_an_expired_slot_is_a_sentinel_rather_than_its_new_owners_rows():
     for i in range(4):
         slots.propose([f"later-{i}"])
     assert slots.q_rows("stale") is None
-    # The rows themselves were reused, which is what the sentinel is protecting
+    # The rows themselves were reused, which is what the sentinel protects
     # against: answering the old base would have read a live stranger's q.
     assert not torch.equal(slots._q_store[0:2], stale_rows)
     assert all(slots.reads_its_own_q(f"later-{i}") for i in range(4))
@@ -195,11 +190,10 @@ def test_a_prefill_only_propose_leaves_every_decode_request_its_own_q(decode_bs)
     """The root cause, as a sequence of proposes: decode, prefill, verify.
 
     ATOM never mixes prefill and decode in one batch, and a prefill-only step
-    still runs the drafter -- over batch slots `[0, bs)`, which are the DECODE
-    requests' scratch rows. Measured on hardware before persistent slots, that
-    left 7.03% of verify rows with no live q, each forced to reject at position
-    1 and accept zero drafts; 0.0000% after. So: zero sentinels, and every
-    request reading the q IT drew rather than merely some q.
+    still runs the drafter -- over batch slots `[0, bs)`, which are the decode
+    requests' scratch rows. Without persistent slots those bystanders lose their
+    q and are forced to reject at position 1. So: zero sentinels, and every
+    request reading the q it drew rather than merely some q.
     """
     slots = QSlots(max_num_seqs=16, tokens_per_seq=3)
     decode = [f"decode-{i}" for i in range(decode_bs)]

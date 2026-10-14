@@ -179,20 +179,18 @@ class DSparkMarkovHead(nn.Module):
         seed: torch.Tensor,  # [1] int32, device
         noise_offset: int,
     ) -> torch.Tensor:
-        """One SAMPLED block position: draw ``x_k ~ softmax(biased / T)`` and
+        """One sampled block position: draw ``x_k ~ softmax(biased / T)`` and
         write that q out.
 
-        The sibling of ``sample_next``, and deliberately a separate entry point
-        rather than a flag on it: the two have different outputs (this one
-        publishes a ``[B, V]`` distribution the other exists not to
-        materialize), so a caller that takes the wrong one fails loudly rather
-        than silently drafting under a policy the accept rule does not match.
+        A separate entry point from ``sample_next`` rather than a flag on it:
+        the two have different outputs (this one publishes a ``[B, V]``
+        distribution the other exists not to materialize), so a caller that
+        takes the wrong one fails loudly rather than silently drafting under a
+        policy the accept rule does not match.
 
-        Unfused is NOT offered here. ``sample_next``'s eager spelling is a
-        two-line fallback; this one's would need a rank-safe ``[B, V]`` noise
-        draw, which the global RNG cannot give under TP, so the op's own torch
-        fallback (gated to the shapes the kernel refuses) is the only reference
-        and it is test-only.
+        No unfused spelling is offered: it would need a rank-safe ``[B, V]``
+        noise draw, which the global RNG cannot give under TP. The op's own
+        torch fallback is the only reference, and it is test-only.
         """
         return dspark_markov_sample(
             base_logits,
@@ -645,8 +643,7 @@ class KimiK3DSpark(DSparkDraftModel):
 
     # This flavor's markov head implements `sample_next_q` and `_sample_block`
     # below branches on the binding, so `DSparkProposer` may arm lossless
-    # speculative sampling here. See `DSparkDraftModel.supports_lossless_draft`
-    # for why this is an explicit flag and not a `hasattr` probe on the head.
+    # speculative sampling here.
     supports_lossless_draft = True
 
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
@@ -841,10 +838,9 @@ class KimiK3DSpark(DSparkDraftModel):
         than T backbone passes -- which is the entire point of DSpark.
         """
         # Lossless speculative sampling draws x_k from softmax(biased / T) and
-        # publishes that q for the accept rule. Branched here and not inside
-        # the loop: the block head is CAPTURED, so whichever side is taken at
-        # warmup is the one every replay runs, and `bind_draft_sampling` is
-        # settled at drafter init for exactly that reason.
+        # publishes that q for the accept rule. Branched here and not inside the
+        # loop: the block head is captured, so whichever side is taken at warmup
+        # is the one every replay runs.
         if self.draft_sampling is not None:
             return self.sample_block_lossless(base_logits, anchor_ids)
         bs, T, _ = base_logits.shape

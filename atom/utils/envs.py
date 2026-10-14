@@ -486,45 +486,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lossless speculative sampling: draw the DSpark draft block from
     # softmax(logits / T) and accept with the probability-ratio rule
     # (`coin * q < p`) instead of proposing greedily and accepting only on exact
-    # equality with the target's own draw. BOTH halves or neither -- a ratio
-    # kernel over a greedy draft is an arithmetic no-op (for a delta q,
-    # sum_x min(p, q) = p(x*), which is what the exact-match kernel already
-    # computes), and a sampled draft under exact-match acceptance is strictly
-    # worse than today.
+    # equality with the target's own draw. Both halves or neither: a ratio
+    # kernel over a greedy delta q is an arithmetic no-op (sum_x min(p, q) =
+    # p(x*), which is what the exact-match kernel already computes), and a
+    # sampled draft under exact-match acceptance matches the target's draw
+    # strictly less often than a greedy one does.
     #
-    # DEFAULT OFF, and deliberately: it changes the EMITTED TOKEN DISTRIBUTION
+    # Defaults off, deliberately: it changes the emitted token distribution
     # (both rules are target-exact, but they are not the same draw), and the
     # house convention is that a behaviour-changing flag defaults off. A
     # top-k/top-p batch is not refused -- the draft's q is unfiltered, so that
     # step drops back to exact-match acceptance against the target's filtered
     # draw, which is still lossless and only accepts less often. That drop is
-    # BATCH-WIDE (the accept kernel has one rule per launch and no exact-match
-    # branch to route a single row into), so such a batch also DRAFTS GREEDILY
-    # for that step: it then runs exactly the flag-off pair rather than the
-    # strictly worse sampled-draft/exact-match pair it used to land on.
+    # batch-wide (the accept kernel has one rule per launch and no exact-match
+    # branch to route a single row into), so such a batch also drafts greedily
+    # for that step and runs exactly the flag-off pair.
     #
     # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
-    # q is [bs, T, V] and has to cross the step boundary. Twice over: the block
-    # head's scratch, plus a persistent store of 2 x max_num_seqs per-request
-    # row blocks, because an intervening prefill-only step would otherwise
-    # overwrite the scratch rows a decode request's pending verify reads --
-    # 200 MiB + 400 MiB fp32 at --max-num-seqs 64, V=163840, T=5, plus one
-    # ~50 MiB index_copy_ per propose. The draft step also de-fuses, trading
-    # step latency for acceptance. Measured under CUDAGRAPH REPLAY on MI355X --
-    # which is what the engine does -- the sampled block costs +27 us at bs=1,
-    # +78 at bs=16, +191 at bs=32 and +233 at bs=64 over the greedy one. Total
-    # flag-on overhead across draft and verify is ~+272 us/step at bs=16, about
-    # 0.4% of a ~62 ms engine step at concurrency 16. Measure this EAGERLY and
-    # you get a misleading flat ~36 us: python dispatch, ~21 us a launch, masks
-    # the GPU signal. Temperature-0 is unaffected either way: an all-greedy
-    # batch keeps
-    # the exact-match accept kernel, and a greedy ROW inside a mixed batch draws
-    # a delta q that makes the ratio rule degenerate to exact match.
+    # q is a full-vocab fp32 tensor per draft position and has to cross the step
+    # boundary. Twice over -- the block head's scratch, plus a persistent store
+    # of 2 x max_num_seqs per-request row blocks, because an intervening
+    # prefill-only step would otherwise overwrite the scratch rows a decode
+    # request's pending verify reads. The draft step also de-fuses, trading step
+    # latency for acceptance. Temperature-0 is unaffected: an all-greedy batch
+    # keeps the exact-match kernel, and a greedy row in a mixed batch draws a
+    # delta q that makes the ratio rule degenerate to exact match.
     #
     # Only a draft model that declares `supports_lossless_draft` honours it;
-    # any other flavor keeps the greedy pair, silently -- "this flavor has not
-    # been ported" is not an operator error. Read at drafter construction, so it
-    # must be set before the server starts.
+    # any other flavor silently keeps the greedy pair. Not implemented under PP
+    # or PCP, which warn and fall back. Read at drafter construction, so it must
+    # be set before the server starts.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
         os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
     ),

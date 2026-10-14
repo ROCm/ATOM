@@ -37,14 +37,13 @@ _SYNTHETIC_COND_CACHE: dict[tuple[tuple[float, ...], torch.device], torch.Tensor
 # from the step counter gives that: same Philox stream, so bit-identical uniforms
 # on every rank, and isolated from whatever else consumes the global RNG.
 _SYNTHETIC_RNG_BASE_SEED = 0x5EED
-# Base seed for the probability-ratio path's accept coins. Same discipline, same
-# reason -- `coin * q < p` decides the verdict, which stays rank-local while
-# sampled_tokens is broadcast from rank 0, so the two desync the moment a rank
-# draws its own stream. A separate base from the synthetic one only so the two
-# knobs cannot alias each other's stream when both are on in a bring-up run.
+# Base seed for the probability-ratio path's accept coins. Same discipline and
+# same reason: `coin * q < p` decides the verdict, which stays rank-local while
+# sampled_tokens is broadcast from rank 0. Distinct from the synthetic base so
+# the two cannot alias each other's stream.
 _RATIO_RNG_BASE_SEED = 0x11A7
-# One generator per (device, purpose), kept alive so a draw costs a kernel and
-# nothing else.
+# One generator per (device, purpose), kept alive so a draw costs only a
+# kernel.
 _SYNTHETIC_GENERATORS: dict[torch.device, torch.Generator] = {}
 _RATIO_GENERATORS: dict[torch.device, torch.Generator] = {}
 
@@ -65,10 +64,9 @@ def _ratio_generator(device: torch.device) -> torch.Generator:
     return generator
 
 
-# Vocab tile the residual's two full-vocab passes walk in. A different tile
-# changes the fp32 summation ORDER of `norm_sum`, which moves the CDF boundary by
-# an ulp and can pick a different residual token on a near-tie, so it is a
-# constant rather than something autotuned per shape.
+# Vocab tile the residual's two full-vocab passes walk in. A constant rather
+# than something autotuned per shape: a different tile changes the fp32
+# summation order of `norm_sum`, moving the CDF boundary by an ulp.
 _RATIO_BLOCK_V = 4096
 
 
@@ -166,16 +164,16 @@ def _ratio_target_probs(
 ) -> torch.Tensor:
     """``p = softmax(target_logits / T)`` in fp32, one temperature per request.
 
-    This is the ONE tensor the verify side has to materialize that it did not
-    before. ATOM's unfiltered verify draw goes through aiter's fused
+    The one tensor the verify side has to materialize that it did not before.
+    ATOM's unfiltered verify draw goes through aiter's fused
     `mixed_sample_outer_exponential` (sampler.py), which takes raw logits and
     never forms probabilities -- only the top-k/top-p branch builds an fp32
-    `[rows, V]`, and that branch is refused here. So there is no existing tensor
+    `[rows, V]`, and that branch is refused here, so there is no existing tensor
     to borrow.
 
-    fp32 and not bf16: `p - q` is a DIFFERENCE of two near-equal numbers on
+    fp32 and not bf16: `p - q` is a difference of two near-equal numbers on
     exactly the rows the residual cares about, and bf16's 8 mantissa bits leave
-    that difference with ~0 significant ones.
+    that difference with almost no significant ones.
 
     Tiled across programs rather than one program per row: the row-per-program
     shape has only `num_rows` programs, which does not fill the device at the
@@ -340,8 +338,8 @@ class RejectionSampler(nn.Module):
         # lockstep across TP ranks (SPMD), so the forced accept/reject pattern is
         # identical on every rank while still varying step to step.
         self._synthetic_step = 0
-        # Same, for the probability-ratio accept coins. Advanced on EVERY forward
-        # that takes that path, so two consecutive steps never replay a stream.
+        # Same, for the probability-ratio accept coins. Advanced on every
+        # forward that takes that path, so no two steps replay a stream.
         self._ratio_step = 0
 
     def forward(
@@ -354,31 +352,20 @@ class RejectionSampler(nn.Module):
         *,
         target_token_ids: torch.Tensor | None = None,
         # ---- probability-ratio path ----------------------------------------
-        # [num_draft_rows, vocab_size] fp32: the q each draft token was actually
-        # drawn from. None => today's exact-match acceptance.
+        # [num_draft_rows, vocab_size] fp32: the q each draft token was drawn
+        # from. None selects exact-match acceptance.
         draft_probs: torch.Tensor | None = None,
-        # [batch_size] int32: first q row of each request, resolved from the
-        # drafter's req_id -> persistent-slot map (the batch has been reordered
-        # since the propose that drew q, and other batches have run in between).
-        # A NEGATIVE entry means "no live q for this request"; see the kernel.
+        # [batch_size] int32: first q row of each request, from the drafter's
+        # req_id -> slot map. Negative means "no live q"; see the kernel.
         draft_probs_row_base: torch.Tensor | None = None,
         # [batch_size] fp32, pre-clamped. Required with draft_probs.
         temperatures: torch.Tensor | None = None,
         # The caller drops draft_probs for a filtered batch, so these are
-        # disabled whenever the ratio path is live; see below.
+        # disabled whenever the ratio path is live.
         top_ks: torch.Tensor | int | None = None,
         top_ps: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if draft_probs is not None:
-            # Unreachable: `ModelRunner.postprocess` answers a filtered batch
-            # with draft_probs=None, which falls back to exact-match acceptance
-            # -- still lossless, because the draft token does not depend on the
-            # target's fresh noise and the emitted token is the target's own
-            # filtered sample. Kept because the failure it guards is SILENT:
-            # the draft's q is unfiltered, so a ratio test against a filtered p
-            # would bias the output with nothing to show for it. Doing better
-            # means masking and renormalising the draft's own q before the
-            # race, which is unimplemented.
             _assert_unfiltered(top_ks, top_ps)
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -420,9 +407,8 @@ def rejection_sample(
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
     # [num_draft_rows, vocab_size] fp32, or None. The q each draft token was
-    # actually drawn from; None keeps the exact-match acceptance below. Rows are
-    # reached through `draft_probs_row_base`, not through `start_idx`, so this
-    # does NOT have to be [num_tokens, vocab_size].
+    # drawn from; None keeps the exact-match acceptance below. Rows are reached
+    # through `draft_probs_row_base`, not `start_idx`.
     draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
@@ -436,16 +422,15 @@ def rejection_sample(
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
     target_token_ids: torch.Tensor | None = None,
-    # ---- probability-ratio path (keyword-only, so the positional callers in
-    # tests/ keep meaning what they meant) -----------------------------------
+    # ---- probability-ratio path (keyword-only, so the existing positional
+    # callers keep meaning what they meant) ----------------------------------
     *,
     # [batch_size] fp32, pre-clamped to SAMPLER_EPS. The ratio rule compares
-    # against p = softmax(target_logits / T), so the target's own temperature
-    # has to reach here; `target_probs` arrives as raw LOGITS (see below).
+    # against p = softmax(target_logits / T), and `target_probs` arrives raw.
     temperatures: torch.Tensor | None = None,
     # [batch_size] int32: this request's first row in `draft_probs`, or a
-    # NEGATIVE sentinel when the request has no live q. None means the flat
-    # ragged layout, i.e. row == the request's `start_idx`.
+    # negative sentinel when it has no live q. None means the flat ragged
+    # layout, i.e. row == the request's `start_idx`.
     draft_probs_row_base: torch.Tensor | None = None,
     # Per-step seed for the (rank-consistent) accept coins.
     ratio_step: int = 0,
@@ -473,14 +458,10 @@ def rejection_sample(
             "the probability-ratio path needs the target temperatures: p is "
             "softmax(target_logits / T), not softmax(target_logits)"
         )
-        # PRECEDENCE, stated rather than left to branch order. The ratio branch
-        # below sits ABOVE the relaxed one, so with ATOM_ENABLE_RELAXED_MTP=1
-        # the relaxed path would simply never run and nothing would say so.
-        # The two are not combinable: relaxed acceptance takes any draft inside
-        # a top-N probability band and is deliberately NOT distribution-
-        # preserving, while the ratio rule's entire claim is that it is. Silently
-        # dropping either one is the kind of thing that shows up as an accuracy
-        # number nobody can explain, so a config asking for both is refused.
+        # The ratio branch below sits above the relaxed one, so the relaxed
+        # path would simply never run. The two are not combinable: relaxed
+        # acceptance is deliberately not distribution-preserving, while the
+        # ratio rule's entire claim is that it is.
         if RELAXED_TOP_N > 1:
             raise NotImplementedError(
                 "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
@@ -556,27 +537,19 @@ def rejection_sample(
             num_warps=1,
         )
     elif draft_probs is not None:
-        # PROBABILITY-RATIO path. Accept with `coin * q < p` against the q the
-        # draft actually drew from, instead of requiring exact equality with
-        # the target's own draw. Same output distribution as the exact-match
-        # path above, higher acceptance.
+        # Probability-ratio path. Accept with `coin * q < p` against the q the
+        # draft actually drew from, instead of requiring exact equality with the
+        # target's own draw: same output distribution, higher acceptance.
+        # Inseparable from draft-side sampling, because for a greedy delta q
+        # sum_x min(p(x), q(x)) = p(x*) and the rule degenerates to exactly the
+        # exact-match kernel with a full-vocab softmax bolted on.
         #
-        # This half is inseparable from draft-side SAMPLING. For a GREEDY draft
-        # q is a delta, sum_x min(p(x), q(x)) = p(x*), and the ratio rule
-        # degenerates to exactly the exact-match kernel -- an arithmetic no-op
-        # with a full-vocab softmax bolted on.
-        #
-        # Ordered above the relaxed branch, and that precedence is ENFORCED
-        # rather than implied: `RELAXED_TOP_N > 1` with q published is refused
-        # at the top of this function.
-        #
-        # `target_probs` is raw logits here (every caller passes
-        # `target_logits`; only the relaxed path below ever softmaxed them), so
-        # build p as a plain temperature softmax in fp32.
+        # `target_probs` is raw logits here (only the relaxed path below ever
+        # softmaxed them), so build p as a temperature softmax in fp32.
         target_p = _ratio_target_probs(target_probs, cu_num_draft_tokens, temperatures)
         if draft_probs_row_base is None:
             # Flat ragged q: row == start_idx + pos, so the base is the request's
-            # own start. cu is EXCLUSIVE-end, so shift it by one.
+            # own start. cu is exclusive-end, so shift it by one.
             draft_probs_row_base = torch.cat(
                 (
                     cu_num_draft_tokens.new_zeros(1),
@@ -584,14 +557,12 @@ def rejection_sample(
                 )
             ).to(torch.int32)
         draft_probs_row_base = draft_probs_row_base.contiguous()
-        # Rank-consistent coins, same discipline and same failure mode as the
-        # synthetic path's: the accept decision sets the verdict, which is
-        # rank-local, while sampled_tokens is broadcast from rank 0. Drawn on
-        # the device so nothing between verify and propose blocks on an H2D.
+        # Rank-consistent coins, same discipline as the synthetic path's, drawn
+        # on the device so nothing here blocks on an H2D.
         generator = _ratio_generator(device)
         generator.manual_seed(_RATIO_RNG_BASE_SEED + int(ratio_step))
         # One coin per draft position plus one per request for the residual
-        # CDF, taken as a single draw so a batch costs a single kernel.
+        # CDF, as a single draw so a batch costs one kernel.
         coins = torch.rand(
             num_tokens + batch_size,
             dtype=torch.float32,
@@ -862,17 +833,17 @@ def rejection_ratio_sample_kernel(
 
     The classic rejection-sampling rule, in ATOM's ragged
     ``cu_num_draft_tokens`` layout and its ``output_token_ids`` / ``verdict``
-    output convention. A DSpark/EAGLE block is a CHAIN rather than a tree, so
-    the position IS the node id and ATOM's dense ``[batch, num_spec_steps + 1]``
+    output convention. A DSpark/EAGLE block is a chain rather than a tree, so
+    the position is the node id and ATOM's dense ``[batch, num_spec_steps + 1]``
     row replaces the usual gather.
 
-    The usual "final sampling" step covers BOTH outcomes -- the residual on
+    The usual "final sampling" step covers both outcomes -- the residual on
     rejection, and a plain draw from ``target_probs[num_steps]`` when every
     draft was accepted. ATOM already samples that all-accepted token upstream
     (``bonus_token_ids`` comes out of the main sampler over ``bonus_logits``),
     so only the residual half is done here. Same distribution, and it is what
     lets the full-vocab pass be skipped on every accepted row: the chain stops
-    at the FIRST rejection, so at most ONE position per request ever reads [V]
+    at the first rejection, so at most one position per request ever reads [V]
     of q.
     """
     req_idx = tl.program_id(0)
@@ -883,29 +854,22 @@ def rejection_ratio_sample_kernel(
         start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
-    # Where this request's q rows start. The draft wrote them at ITS batch slot
+    # Where this request's q rows start. The draft wrote them at its batch slot
     # a step ago and the scheduler may have reordered the batch since, so the
-    # row is reached by indirection rather than by `start_idx`. The flat ragged
-    # layout (q rows in verification order) is just `draft_row_base[req] ==
-    # start_idx`.
+    # row is reached by indirection rather than by `start_idx`.
     q_base = tl.load(draft_row_base_ptr + req_idx)
 
-    # A NEGATIVE base means this request has NO live q: it was drafted at an
-    # earlier step and its persistent q slot has since been expired and handed
-    # to another request (`DSparkProposer._claim_q_slot`), so the rows it used
-    # to own are someone else's. Answering 0 reads request 0's distribution --
-    # a row that is in range and carries q > 0, so it passes `q_is_prob` and
-    # `coin * q < p` then accepts UNCONDITIONALLY. Acceptance RISES while the
-    # accepted tokens are unfiltered draft samples; measured, that cost 24.4%
-    # of inline accuracy. In-range was never the safety property; being the
-    # RIGHT row is.
+    # A negative base means this request has no live q: its persistent slot was
+    # expired and handed to another request (`DSparkProposer._claim_q_slot`).
+    # The sentinel is negative and not 0 because row 0 is in range and carries
+    # q > 0 -- it would pass `q_is_prob`, and `coin * q < p` would then accept
+    # unconditionally against a stranger's distribution. In-range was never the
+    # safety property; being the right row is.
     #
-    # `has_q` gates every q LOAD; `q_safe_base` keeps the ADDRESS in range so a
-    # negative base cannot form a wild pointer even though the load is masked
-    # off. With q forced to 0 the `q_is_prob` test fails and the token is
-    # rejected -- the residual below then resamples from target `p` alone, a
-    # plain draw from the target. Distributionally exact; it costs this request
-    # its speculation for one step rather than corrupting it.
+    # `has_q` gates every q load; `q_safe_base` keeps the address in range so a
+    # negative base cannot form a wild pointer. With q forced to 0 the token is
+    # rejected and the residual below resamples from target `p` alone --
+    # distributionally exact, costing one step's speculation.
     has_q = q_base >= 0
     q_safe_base = tl.where(has_q, q_base, 0)
 
@@ -932,15 +896,11 @@ def rejection_ratio_sample_kernel(
 
             # X was sampled from q, so q(X) has to be a positive probability.
             # Anything else means this row is not the distribution X came from,
-            # and `coin * q < p` would then accept unconditionally -- -inf < p
-            # for an -inf q, 0 < p for a zero one. Reject instead: the residual
-            # path resamples from the target, which is the safe direction to
-            # fail in.
+            # and `coin * q < p` would accept unconditionally on it.
             q_is_prob = (q > 0.0) & (q <= 1.0)
 
-            # `coin * q < p` rather than `coin < p / q`: the product form has no
-            # division, so a denormal q cannot turn the ratio into an inf and
-            # accept on it.
+            # `coin * q < p` rather than `coin < p / q`: the product form has
+            # no division, so a denormal q cannot become an inf ratio.
             if q_is_prob & (coin * q < p):
                 tl.store(
                     output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
@@ -952,8 +912,7 @@ def rejection_ratio_sample_kernel(
             last_checked += 1
 
     if rejected:
-        # Residual resample from normalized relu(p - q) at the rejecting row:
-        # two passes over V, sum then CDF.
+        # Residual resample from normalized relu(p - q) at the rejecting row.
         tp_base_ptr = (
             target_probs_ptr + (start_idx + reject_pos).to(tl.int64) * VOCAB_SIZE
         )
@@ -969,22 +928,20 @@ def rejection_ratio_sample_kernel(
             mask = v_offsets < VOCAB_SIZE
             p_val = tl.load(tp_base_ptr + v_offsets, mask=mask, other=0.0)
             q_val = tl.load(dp_base_ptr + v_offsets, mask=mask, other=0.0)
-            # Treat any non-probability q (NaN, +-inf, negative) as 0: the
-            # residual falls back to p. A comparison against NaN is false, so
-            # the range test rejects it along with the infinities.
+            # Any non-probability q (NaN, +-inf, negative) counts as 0, so the
+            # residual falls back to p; a NaN comparison is false, so the range
+            # test rejects NaN along with the infinities.
             q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
-            # No live q (base was negative): the residual is relu(p - 0) == p,
-            # i.e. a plain draw from the target. Masking the load alone is not
-            # enough -- `q_safe_base` aliases row 0, so without this the
-            # residual would subtract request 0's distribution.
+            # No live q: the residual is relu(p - 0) == p, a plain draw from
+            # the target. Masking the load alone is not enough, since
+            # `q_safe_base` aliases row 0.
             q_val = tl.where(has_q, q_val, 0.0)
             diff = p_val - q_val
             norm_sum += tl.sum(tl.where(diff > 0.0, diff, 0.0))
 
         # Pass 2: walk the CDF. A degenerate residual (norm_sum == 0, i.e.
-        # p == q everywhere on rejection) leaves the cumsum at 0 <= target_u, so
-        # final_token falls back to VOCAB_SIZE - 1; acceptable since that case
-        # is numerically near-impossible.
+        # p == q everywhere on rejection) leaves the cumsum at 0 <= target_u and
+        # final_token falls back to VOCAB_SIZE - 1.
         target_u = coin_final * norm_sum
         cum_sum = 0.0
         final_token = VOCAB_SIZE - 1
@@ -996,7 +953,7 @@ def rejection_ratio_sample_kernel(
                 p_val = tl.load(tp_base_ptr + v_offsets, mask=mask, other=0.0)
                 q_val = tl.load(dp_base_ptr + v_offsets, mask=mask, other=0.0)
                 q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
-                # Same no-live-q handling as pass 1. The two passes MUST apply
+                # Same no-live-q handling as pass 1. The two passes must apply
                 # identical q, or the CDF walked here disagrees with the
                 # normalizer computed there and the residual draw is biased.
                 q_val = tl.where(has_q, q_val, 0.0)

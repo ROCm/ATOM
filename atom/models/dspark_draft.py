@@ -35,11 +35,10 @@ from torch import nn
 class DraftSampling:
     """Everything the block sampler needs to draw -- and publish -- a real q.
 
-    Bound ONCE, at drafter init, and never rebound: the block head is
+    Bound once, at drafter init, and never rebound: the block head is
     cudagraph-captured (``DSparkProposer._declare_draft_graphs``,
     ``capture_epilogue=True``), so every address here is baked into the
-    recording and a replay reads whatever the step before it wrote into these
-    exact buffers. That is also why the per-step seed is a one-element DEVICE
+    recording. That is also why the per-step seed is a one-element device
     tensor rather than a python int: the value has to be refreshable from
     outside the recording.
 
@@ -48,7 +47,7 @@ class DraftSampling:
     """
 
     #: [max_bs, T, V] fp32 -- q, the distribution each draft token was drawn
-    #: from. Read a STEP LATER by the accept kernel, so it outlives the pass
+    #: from. Read a step later by the accept kernel, so it outlives the pass
     #: and cannot live in the graph's private pool.
     probs: torch.Tensor
     #: [max_bs] fp32, pre-clamped away from 0 (``SAMPLER_EPS``).
@@ -57,7 +56,7 @@ class DraftSampling:
     #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
     #: predicate ``Sampler`` itself tests.
     greedy_mask: torch.Tensor
-    #: [1] int32, the Philox key. MUST hold the same value on every TP/PCP rank.
+    #: [1] int32, the Philox key. Must hold the same value on every TP/PCP rank.
     seed: torch.Tensor
 
 
@@ -66,24 +65,16 @@ class DSparkDraftModel(nn.Module):
 
     supports_block_graph = True
 
-    #: Does this flavor implement the SAMPLED block sampler -- i.e. does its
-    #: markov head provide ``sample_next_q`` and does ``_sample_block`` branch
-    #: on ``draft_sampling``? False here, and overridden to True only by the
-    #: flavors that have actually been ported and run on hardware.
-    #:
-    #: An EXPLICIT class flag rather than a ``hasattr(head, "sample_next_q")``
-    #: probe on purpose. The duck-typed version silently arms whichever flavor
-    #: happens to grow that method next -- and ``DSparkMarkovHead`` is a name
-    #: carried by two independent classes (``kimi_k3_dspark`` and
-    #: ``deepseek_v4_dspark``), so the day the V4 head grows one, DSv4 and
-    #: DSv4.1-Flash would flip on without anybody choosing it.
+    #: Does this flavor's markov head provide ``sample_next_q``, and does its
+    #: ``_sample_block`` branch on ``draft_sampling``? An explicit class flag
+    #: rather than a ``hasattr(head, "sample_next_q")`` probe:
+    #: ``DSparkMarkovHead`` is a name carried by two independent classes, so a
+    #: duck-typed probe would arm the other flavor the day its head grew one.
     supports_lossless_draft = False
 
     #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
-    #: None keeps the greedy block sampler, which is both the historical path
-    #: and the one a temperature-0 deployment should still take.
-    #: A CLASS default because every flavor's ``_sample_block`` reads it and
-    #: only the ported flavors implement the sampled branch.
+    #: None keeps the greedy block sampler. A class default because every
+    #: flavor's ``_sample_block`` reads it.
     draft_sampling: "DraftSampling | None" = None
 
     def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
@@ -91,8 +82,8 @@ class DSparkDraftModel(nn.Module):
 
         Called once from ``DSparkProposer.__init__``, before any warmup or
         capture, so the sampled branch is the one that gets JITed and recorded.
-        Switching it per STEP would not work anyway: the branch is python, and
-        a captured graph holds whichever side was taken at capture.
+        Switching it per step would not work: the branch is python, and a
+        captured graph holds whichever side was taken at capture.
         """
         if sampling is not None and not self.supports_lossless_draft:
             raise ValueError(
@@ -196,7 +187,7 @@ class DSparkDraftModel(nn.Module):
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
     ) -> torch.Tensor:
-        """Markov-biased left-to-right SAMPLING over the computed block.
+        """Markov-biased left-to-right sampling over the computed block.
 
             logits_k <- U_k + B(x_{k-1}, .)
             q_k      <- softmax(logits_k / T)        -- published
@@ -209,8 +200,7 @@ class DSparkDraftModel(nn.Module):
         inside one block and quietly bias q.
 
         See ``atom/model_ops/dspark_markov_sample.py`` for why this trades away
-        the fused op's "never materialize [B, V]" property, and
-        ``envs.ATOM_SPEC_LOSSLESS_SAMPLING`` for what it buys.
+        the fused op's "never materialize [B, V]" property.
         """
         sampling = self.draft_sampling
         assert sampling is not None, "sample_block_lossless needs bound buffers"
@@ -220,10 +210,8 @@ class DSparkDraftModel(nn.Module):
             f"q buffer is {tuple(probs.shape[1:])} per request but the block is "
             f"[{num_draft}, {vocab}]; the accept kernel indexes the two as one"
         )
-        # The counter STRIDE is the buffer's max batch, not this step's, so the
-        # uniform a (position, row, id) draws does not move when the batch
-        # does. Rank consistency is about the seed; this is about the step
-        # before it not having drawn the same numbers for different tokens.
+        # The counter stride is the buffer's max batch, not this step's, so the
+        # uniform a (position, row, id) draws does not move when the batch does.
         position_stride = probs.shape[0] * vocab
         temperatures = sampling.temperatures[:bs]
         greedy_mask = sampling.greedy_mask[:bs]
