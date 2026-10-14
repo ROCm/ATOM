@@ -150,7 +150,7 @@ def test_capture_plan_keeps_tail_buckets_out_of_full_decode(mode, expected):
         } == {(6, (8, 2, 1)), (1, (8,)), (2, (8,))}
 
 
-def test_hybrid_uses_one_token_ladder_with_query_aligned_full_decode():
+def test_hybrid_preserves_dense_small_decode_batches_with_token_prefill():
     runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
     runner.config.capture_sizes = (
         [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 1025, 16))
@@ -159,7 +159,8 @@ def test_hybrid_uses_one_token_ladder_with_query_aligned_full_decode():
     pw, full = plan
     assert pw == (CUDAGraphMode.PIECEWISE, 1, runner.config.capture_sizes[::-1])
     assert full[0:2] == (CUDAGraphMode.FULL, 6)
-    assert len(pw[2]) == 83 and len(full[2]) == 80
+    assert len(pw[2]) == 83 and len(full[2]) == 87
+    assert set(range(1, 33)) <= set(full[2])
     assert full[2][0] == 168 and full[2][-1] == 1
     assert 102 in full[2]  # 600 real tokens dispatch to 612, BS=102.
     runner.config.max_num_seqs = 128
@@ -180,7 +181,53 @@ def test_hybrid_default_ladder_and_internal_tail_shapes():
     runner._extra_piecewise_capture_shapes = lambda sizes, qs: [(128, 1), (256, 1)]
     pw, full = runner._cudagraph_capture_plan([6])
     assert pw[2] == [768, 256, 192, 128, 6]
-    assert full[2] == [128, 32, 1]
+    assert full[2] == [128] + list(range(32, 0, -1))
+
+
+@pytest.mark.parametrize("max_seqs,max_tokens", [(256, 16384), (7, 16384), (256, 48)])
+@pytest.mark.parametrize("ceiling", [16, 1024])
+def test_hybrid_small_decode_batches_respect_capacity_and_dispatch_exactly(
+    max_seqs, max_tokens, ceiling
+):
+    import numpy as np
+
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.capture_sizes = [1, 2, 4, 8, ceiling]
+    runner.config.max_num_seqs = max_seqs
+    runner.config.max_num_batched_tokens = max_tokens
+    plan = runner._cudagraph_capture_plan([2, 4, 6])
+    by_q = {
+        q: np.asarray(sizes[::-1])
+        for mode, q, sizes in plan
+        if mode == CUDAGraphMode.FULL
+    }
+    union = np.asarray(sorted({int(bs) for sizes in by_q.values() for bs in sizes}))
+    for q, sizes in by_q.items():
+        bound = min(max_seqs, max_tokens // 6, min(ceiling, max_tokens) // q)
+        assert all(0 < bs <= bound for bs in sizes)
+        for bs in range(1, min(32, bound) + 1):
+            batch = SimpleNamespace(
+                total_tokens_num_prefill=0,
+                total_tokens_num=bs * q,
+                total_seqs_num=bs,
+                is_dummy_run=False,
+            )
+            mode = ForwardMode.decide(
+                batch=batch,
+                dp_size=1,
+                dp_group=None,
+                enforce_eager=False,
+                step_needs_eager=False,
+                capture_sizes=union,
+                capture_sizes_by_q=by_q,
+                captured_tokens=None,
+                is_block_drafter=True,
+                tbo_on=False,
+                local_tbo=(False, False, 0, 0),
+                max_seqlen_q=q,
+            )
+            assert mode.use_cudagraph and not mode.piecewise_captured
+            assert mode.running_bs == bs and mode.running_tokens == bs * q
 
 
 @pytest.mark.parametrize("from_cli", [False, True])

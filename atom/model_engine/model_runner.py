@@ -4037,6 +4037,10 @@ class ModelRunner:
             ]
             for q in q_buckets:
                 sizes = {(t + q - 1) // q for t in tokens if t > 0}
+                # Small decode batches must remain exact, including every
+                # request count served by mono draft. Prefill buckets stay
+                # token-based; their spacing must not pad BS=5 to BS=6, etc.
+                sizes.update(range(1, 33))
                 sizes = sorted(
                     (bs for bs in sizes if bs <= min(max_bs, ceiling // q)),
                     reverse=True,

@@ -34,10 +34,19 @@ batch-size lists and units.
 
 Prefill captures the token ladder independently of request count. FULL decode
 rounds each candidate up to a multiple of Q, derives BS=T/Q, deduplicates and
-filters by the token ceiling and scheduler capacity. Padding selects the BS
+also includes every BS from 1 through 32, and filters by the token ceiling and
+scheduler capacity. The dense small-BS coverage keeps decode and mono draft
+from padding BS=5 to 6 or BS=9 to 10, regardless of prefill bucket spacing.
+Padding selects the BS
 ladder for the DP-agreed Q. With DSpark 5, Q=6: a 600-token prefill uses the
 608 bucket in the default 1024 ladder; BS=100 decode uses FULL at BS=102,
 612 tokens. Out-of-range decode runs eagerly, not through AF piecewise.
+
+Hybrid mode permits mono target decode and mono DSpark draft whenever their
+other deployment and per-step conditions hold. Mono eligibility checks the
+decode graph mode; piecewise prefill does not disable it. Target prefills
+continue through the original runtime model, and PIECEWISE/AF_PIECEWISE
+decode remains ineligible for mono.
 
 PIECEWISE is captured first, then FULL, then draft passes. FULL capture runs
 the compiled pieces without inner graph replay/capture. Draft warmup covers
