@@ -1345,6 +1345,34 @@ def test_a_format_the_updater_cannot_rewrite_is_refused_before_joining(
     assert joined == []
 
 
+def test_a_static_activation_scale_is_refused_before_joining(monkeypatch):
+    """Calibrated, not trained: no trainer's stream carries one, so no reload
+    could rewrite every parameter. Each stream failed at its commit and
+    fenced the runner, and no later reload could lift that fence either."""
+    import enum
+
+    import torch
+
+    quant_types = enum.Enum("QuantType", ["per_Tensor"])
+    weight = torch.zeros(4, 4).to(torch.float8_e4m3fn)
+    runner = _runner_holding(weight, quant_types.per_Tensor)
+    runner.model.layer.input_scale = torch.nn.Parameter(
+        torch.ones(1), requires_grad=False
+    )
+    joined = _joins(monkeypatch)
+
+    refusal = runner._rdma_reload_refusal()
+
+    assert "layer.input_scale" in refusal and "static activation scale" in refusal
+    assert "layer.weight" not in refusal, "its FP8 weight is requantised"
+    assert "rdma_weight_receive" not in runner.get_worker_capabilities()["features"]
+    with pytest.raises(RuntimeError, match="static activation scale"):
+        runner.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+    assert joined == []
+
+
 @pytest.mark.parametrize(
     "layer",
     [{"kv_b_proj": True}, {"use_mla": True}],

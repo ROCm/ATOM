@@ -867,6 +867,11 @@ class WeightUpdaterMixin:
         type. Anything else -- FP4 or MXFP4 packed bytes, integer quantisation,
         FP8 of another scheme -- a reload refuses only once its stream has
         ended, or casts into garbage where the shapes happen to agree.
+
+        Nor can it rewrite a static activation scale, ``input_scale``: one is
+        calibrated, not trained, so no trainer's stream carries it. Every
+        reload of such a model fell short of every parameter, and failed --
+        a transactional one leaving a fence no reload could then lift.
         """
         if getattr(self, "model", None) is None:
             return []
@@ -874,6 +879,9 @@ class WeightUpdaterMixin:
         for prefix, module in self._sync_target_model().named_modules():
             quant_type = getattr(getattr(module, "quant_type", None), "name", None)
             for name, param in module.named_parameters(recurse=False):
+                if "input_scale" in name:
+                    unreloadable.append(f"{prefix}.{name}" if prefix else name)
+                    continue
                 if param.dtype.is_floating_point and param.element_size() >= 2:
                     continue
                 if (

@@ -744,9 +744,10 @@ class RDMAWeightReceiverMixin:
             return (
                 f"{len(held)} parameter(s), {held[:3]} among them, are held in "
                 f"a format a full-precision stream cannot rewrite in place: "
-                f"FP4 or MXFP4 packed bytes, integer quantisation, or FP8 of a "
-                f"scheme the updater does not requantise. Every rank would join "
-                f"the group only for the stream to fail."
+                f"FP4 or MXFP4 packed bytes, integer quantisation, FP8 of a "
+                f"scheme the updater does not requantise, or a static "
+                f"activation scale, which no trainer's stream carries. Every "
+                f"rank would join the group only for the stream to fail."
             )
         return None
 
