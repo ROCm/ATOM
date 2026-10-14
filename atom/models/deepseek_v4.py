@@ -1752,6 +1752,29 @@ class Indexer(nn.Module):
             q_quant, weights, q_scale, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
 
+    def score_decode_topk_into(
+        self,
+        q_fp4: torch.Tensor,
+        weights: torch.Tensor,
+        q_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """The gfx950 FP4 decode top-k, written straight into `out`.
+
+        For `DeepseekV4Attention._attn_compress`, which runs in a split op --
+        already eager or its own graph -- so it calls the scorer directly
+        rather than through the opaque `indexer_score_topk` op, and hands it
+        the fixed buffer the dense piece downstream reads, instead of copying
+        a fresh result into it."""
+        self._score_topk_decode_fp4_flydsl(
+            q_fp4,
+            q_scale,
+            get_forward_context().attn_metadata.block_tables,
+            weights,
+            self.index_topk,
+            out=out,
+        )
+
     def indexer_score_topk(
         self,
         q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8, or packed FP4 (uint8) when the FP4 indexer is on
@@ -2318,6 +2341,7 @@ class Indexer(nn.Module):
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
         weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
         topk: int,
+        out: torch.Tensor | None = None,  # [>= padded_tokens, topk] int32
     ) -> torch.Tensor:
         """RAGGED decode FP4 via `flydsl_pa_mqa_logits_fp4` with
         `query_start_loc`, which at 64-row pages runs the row-group kernel: a
@@ -2384,7 +2408,11 @@ class Indexer(nn.Module):
         )  # [padded_tokens, max_seq_len] fp32, seq-local
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
-        topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
+        topk_out = (
+            torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
+            if out is None
+            else out[:padded_tokens]
+        )
         # DECODE top-k: every row's window starts at 0, the `rowStart == 0`
         # this entry assumes. The prefill entry dispatches on
         # `topk_use_mulblocks(rows, stride0)` with `stride0 =
@@ -3164,8 +3192,9 @@ class DeepseekV4Attention(nn.Module):
         # result off the fixed buffer.
         out = attn_md.fp4_decode_topk
         if out is not None and idx_q_quant is not None and not self.skip_topk:
-            topk = self.indexer.score_topk_from(idx_q_quant, idx_weights, idx_q_scale)
-            out[: topk.shape[0]].copy_(topk)
+            self.indexer.score_decode_topk_into(
+                idx_q_quant, idx_weights, idx_q_scale, out
+            )
 
     def _qk_norm_rope(
         self,

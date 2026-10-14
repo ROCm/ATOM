@@ -840,10 +840,21 @@ def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
         ends.copy_(torch.tensor(bounds, dtype=torch.int32))
         return bounds
 
-    def run(running_bs):
-        return indexer._score_topk_decode_fp4_flydsl(
-            q, qs, padded_table[:running_bs], weights, 512
+    # The fixed buffer `_attn_compress` scores into (`fp4_decode_topk`).
+    out_buf = torch.full((rows, 512), -7, dtype=torch.int32, device="cuda")
+
+    def run(running_bs, into=False):
+        got = indexer._score_topk_decode_fp4_flydsl(
+            q,
+            qs,
+            padded_table[:running_bs],
+            weights,
+            512,
+            out=out_buf if into else None,
         )
+        if into:
+            assert got.data_ptr() == out_buf.data_ptr()
+        return got
 
     def check(got, counts, bounds):
         n_real = sum(counts)
@@ -895,11 +906,11 @@ def test_v4_fp4_decode_graph_replays_every_layout_of_its_batch(
     with torch.cuda.stream(stream):
         publish(shapes[0], running_bs, max_q)
         for _ in range(3):
-            run(running_bs)
+            run(running_bs, into=True)
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            got = run(running_bs)
+            got = run(running_bs, into=True)
         stream.synchronize()
 
         def no_relaunch(*args, **kwargs):
