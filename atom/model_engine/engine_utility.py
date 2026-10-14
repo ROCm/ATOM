@@ -377,33 +377,38 @@ class EngineUtilityHandler:
 
         Committed on every rank, the stream rewrote every parameter there, so
         the fence comes down as a FINISH takes it down -- unless a sync of the
-        other paths is open, whose FINISH decides. Failed anywhere, it goes up
-        if any runner was left fenced; a stream every rank refused wrote
-        nothing, and leaves the engine as it was.
+        other paths is open, whose FINISH decides, or a runner still reports
+        its own fence up: a commit can leave one fenced, by a fence that was
+        put off while its reload was open. Failed anywhere, it goes up if any
+        runner was left fenced; a stream every rank refused wrote nothing, and
+        leaves the engine as it was.
         """
         method = reply.get("method")
         results = reply.get("results") or []
-        if (
+        committed = (
             not reply.get("error")
-            and results
+            and bool(results)
             and not any(r.get("error") for r in results)
-        ):
-            if self._weight_sync_in_progress:
-                return
-            self._weight_sync_fenced = False
-            self._weight_sync_failure = None
-            engine._rl_weights_inconsistent = False
-            engine._weight_sync_fenced = False
-            logger.info(f"{self.label}: {method} committed on every rank; serving")
+        )
+        if committed and self._weight_sync_in_progress:
             return
         if not self._a_runner_is_fenced():
+            if committed:
+                self._weight_sync_fenced = False
+                self._weight_sync_failure = None
+                engine._rl_weights_inconsistent = False
+                engine._weight_sync_fenced = False
+                logger.info(f"{self.label}: {method} committed on every rank; serving")
             return
+        outcome = "committed, but" if committed else "failed and"
         self._weight_sync_fenced = True
-        self._weight_sync_failure = self._weight_sync_failure or f"{method} failed"
+        self._weight_sync_failure = (
+            self._weight_sync_failure or f"{method} {outcome} left a runner fenced"
+        )
         engine._rl_weights_inconsistent = True
         engine._weight_sync_fenced = True
         logger.error(
-            f"{self.label}: {method} failed and left a runner fenced; serving "
+            f"{self.label}: {method} {outcome} left a runner fenced; serving "
             f"stays fenced until a complete sync succeeds"
         )
 

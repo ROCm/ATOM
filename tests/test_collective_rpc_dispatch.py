@@ -494,6 +494,23 @@ def test_a_committed_weight_stream_leaves_an_open_sync_to_its_finish():
     assert engine._weight_sync_fenced
 
 
+def test_a_committed_stream_leaves_the_engine_fenced_while_a_runner_is():
+    """A commit can leave a runner fenced: a fence put off while its reload
+    was open goes up as that reload commits. The engine served again, and its
+    next forward met that runner fenced and took the worker down."""
+    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 0])
+    engine = _Engine()
+
+    _stream_rpc(h, out, engine)
+
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+    assert "committed, but left a runner fenced" in h._weight_sync_failure
+    assert [call[0] for call in mgr.calls] == [
+        "receive_weights_rdma",
+        "get_weight_update_status",
+    ]
+
+
 def test_another_collective_rpc_leaves_the_fence_as_it_was():
     h, mgr, out = _stream_handler(stream=["boom", "boom"], healthy=[0, 0])
     engine = _Engine()
