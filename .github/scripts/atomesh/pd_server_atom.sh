@@ -33,6 +33,15 @@ if [[ -z "${atom_origin}" ]] \
   exit 1
 fi
 
+# Optional: harden image aiter's moe_scatter_reduce before any server starts.
+# Used by MiniMax-M3 C40 verification so CI does not depend on a rebuilt
+# atom-dev image. Prefer AITER_GIT_REF + install_aiter_from_ref when available;
+# this patch path is the fallback that still proves the fixed kernel.
+if [[ "${ATOM_APPLY_AITER_SCATTER_BOUNDS_PATCH:-0}" == "1" ]]; then
+  echo "[aiter] applying moe_scatter_reduce bounds patch"
+  REPO_ROOT="${PWD}" bash "${ATOMESH_SCRIPT_DIR}/../apply_aiter_scatter_reduce_bounds_patch.sh"
+fi
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
