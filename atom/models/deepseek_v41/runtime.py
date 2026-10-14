@@ -2,7 +2,6 @@
 """ModelRunner interface over the V4.1 multimodal backbone."""
 
 import logging
-from dataclasses import replace
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -22,6 +21,7 @@ from .bounded_replay import (
     dp_stage_sync_enabled,
     dp_token_counts,
     late_layer_start,
+    placeholder_rows_of,
     replayable,
     rows_of,
     sync_dp_stage_tokens,
@@ -324,22 +324,25 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         return hidden.squeeze(0)
 
     def _sync_dp_stage_tokens(self, forward, plan, num_tokens):
-        """Under DP attention, every rank's rows past the decoder's KV source.
+        """Under DP attention, the group's tokens past the decoder's KV source.
 
         A replaying rank runs the decoder on its tail and layer 39 on its last
-        rows; one without a tail still joins each MoE collective, on
-        `_DP_PLACEHOLDER_TOKENS` rows (`_join_decoder_collectives`); every other rank runs all its
-        rows. None outside DP, or when no rank replays."""
+        rows; one without a tail joins each MoE collective on
+        `_dp_placeholder_tokens` rows (`_join_decoder_collectives`) if any
+        rank has decoder work; a rank that does not replay runs all its rows.
+        None outside DP, or when no rank replays."""
         if not dp_stage_sync_enabled(forward):
             return None
         if plan is None:
-            tokens = (num_tokens, num_tokens)
+            tokens, active = (num_tokens, num_tokens), True
         elif plan.tail is None:
             placeholder = _dp_placeholder_tokens(num_tokens)
-            tokens = (placeholder, placeholder)
+            tokens, active = (placeholder, placeholder), False
         else:
-            tokens = (plan.tail.scheduled, len(plan.tail.requests))
-        return sync_dp_stage_tokens(forward, *tokens)
+            tokens, active = (plan.tail.scheduled, len(plan.tail.requests)), True
+        return sync_dp_stage_tokens(
+            forward, *tokens, replaying=plan is not None, decoder_active=active
+        )
 
     def _replayed(self, state, num_tokens, plan, dp_tokens=None):
         """The forward's rows cut as `bounded_replay` lays them out: layer 20
@@ -375,7 +378,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                     last = self._layer(self.last_layer, tail, plan.q39)
             self._move_aux_rows(plan.tail_rows)
             full[plan.last_rows] = last.collapse().squeeze(0)
-        elif dp_tokens is not None:
+        elif dp_tokens is not None and dp_tokens.decoder_active:
             self._join_decoder_collectives(
                 forward, layer, rope, normed, seam, dp_tokens
             )
@@ -386,10 +389,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         """Join the decoder's DP collectives without a tail of one's own.
 
         A rank whose prefill finishes no prompt runs none of the decoder, but
-        its peers' MoE gathers still count on it once per layer. It runs the
-        decoder on `_DP_PLACEHOLDER_TOKENS` of its rows under a step with no requests:
-        attention returns zeros and writes no cache (`v41_attention`), so the
-        rows only feed the collectives, and their output is dropped."""
+        while a peer has decoder work its MoE gathers count on this rank once
+        per layer. It runs the decoder on `_dp_placeholder_tokens` of its rows
+        under a request-less step (`placeholder_rows_of`): attention returns
+        zeros and writes no cache, so the rows only feed the collectives, and
+        their output is dropped."""
         metadata = forward.attn_metadata
         rows = torch.arange(
             _dp_placeholder_tokens(normed.shape[1]),
@@ -397,16 +401,14 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             device=normed.device,
         )
         normed, *seam = gather_rows(rows, normed, *seam, dim=1)
-        outer = metadata.step, metadata.queries
-        metadata.step, metadata.queries = replace(outer[0], requests=()), None
-        try:
-            with dp_token_counts(forward, dp_tokens.decoder):
-                output = layer.attention_forward(normed, None, None, rope)
-                state = self._late_layers(layer.ffn_forward(output, *seam))
-                with dp_token_counts(forward, dp_tokens.last_layer):
-                    self._layer(self.last_layer, state)
-        finally:
-            metadata.step, metadata.queries = outer
+        with (
+            placeholder_rows_of(metadata, rows),
+            dp_token_counts(forward, dp_tokens.decoder),
+        ):
+            output = layer.attention_forward(normed, None, None, rope)
+            state = self._late_layers(layer.ffn_forward(output, *seam))
+            with dp_token_counts(forward, dp_tokens.last_layer):
+                self._layer(self.last_layer, state)
 
     def _move_aux_rows(self, rows):
         """Decoder-layer aux captures wrote the tail's rows at the buffer's head;
