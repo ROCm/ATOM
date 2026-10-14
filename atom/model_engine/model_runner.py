@@ -764,6 +764,35 @@ def _lossless_verify_inputs(drafter, req_ids, *, all_greedy, top_ks, top_ps):
     return draft_probs, drafter.draft_probs_row_base(req_ids)
 
 
+def _needs_verification_sample(all_greedy, draft_probs) -> bool:
+    """Does this verify step have to DRAW the target's own tokens?
+
+    `Sampler.sample_verification_tokens` is a full filtered sample over a
+    `[num_draft_tokens, V]` logit block plus, under TP, a broadcast of its
+    result. It is the input to `rejection_sample`'s EXACT-MATCH kernel and to
+    nothing else: the ratio branch is checked first, reads `draft_probs` and
+    `target_p`, and never dereferences `target_token_ids`. So on the ratio path
+    the whole draw was computed and thrown away -- measured here at 72us at
+    bs=1 rising to 196us at bs=64, and 9 of the verify path's 23 kernel
+    launches.
+
+    The skip condition is `draft_probs is not None`, and it is NOT
+    `not all_greedy`. Those differ exactly on the batches this feature does not
+    touch: a non-greedy batch with no q published (the flag off, a filtered
+    batch, a model without `supports_lossless_draft`, the step after a request
+    was expired out of the q slot map). Skipping the draw there would leave
+    `target_token_ids=None` on a path that still reaches the exact-match
+    kernel, which then falls through to `topk_select(target_probs, 1)` -- the
+    target ARGMAX. Requiring a stochastic request's draft to equal the argmax
+    is a different, LOSSY acceptance rule, and it would silently change the
+    emitted distribution of ordinary requests that never asked for any of this.
+
+    `all_greedy` still suppresses the draw, as it always did: a greedy batch
+    wants that argmax, and `Sampler` would have produced it anyway.
+    """
+    return not all_greedy and draft_probs is None
+
+
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -3339,8 +3368,24 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            # Lossless acceptance: compare against the q the draft actually drew
+            # from (`coin * q < p`) instead of requiring the draft token to
+            # equal the target's own draw. Published by the PREVIOUS step's
+            # propose, so it is keyed back onto this batch by req_id -- the
+            # scheduler reorders between the two. See the helper for which
+            # batches take it and which stay on exact match.
+            #
+            # Resolved BEFORE the verification sample below, because it is what
+            # decides whether that sample is needed at all.
+            draft_probs, draft_probs_row_base = _lossless_verify_inputs(
+                getattr(self, "drafter", None),
+                batch.req_ids[:bs],
+                all_greedy=all_greedy,
+                top_ks=top_ks,
+                top_ps=top_ps,
+            )
             target_token_ids = None
-            if not all_greedy:
+            if _needs_verification_sample(all_greedy, draft_probs):
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3357,19 +3402,6 @@ class ModelRunner:
                 top_ps=top_ps,
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
-            # Lossless acceptance: compare against the q the draft actually drew
-            # from (`coin * q < p`) instead of requiring the draft token to
-            # equal the target's own draw. Published by the PREVIOUS step's
-            # propose, so it is keyed back onto this batch by req_id -- the
-            # scheduler reorders between the two. See the helper for which
-            # batches take it and which stay on exact match.
-            draft_probs, draft_probs_row_base = _lossless_verify_inputs(
-                getattr(self, "drafter", None),
-                batch.req_ids[:bs],
-                all_greedy=all_greedy,
-                top_ks=top_ks,
-                top_ps=top_ps,
             )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,

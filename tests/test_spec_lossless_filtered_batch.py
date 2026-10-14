@@ -70,6 +70,7 @@ def _lift(path, name, namespace, cls=None):
 
 
 lossless_verify_inputs = _lift(RUNNER_SOURCE, "_lossless_verify_inputs", {})
+needs_verification_sample = _lift(RUNNER_SOURCE, "_needs_verification_sample", {})
 stage_draft_sampling = _lift(
     PROPOSER_SOURCE,
     "stage_draft_sampling",
@@ -148,6 +149,45 @@ def test_an_all_greedy_batch_stays_on_exact_match():
         drafter, ["a"], all_greedy=True, top_ks=None, top_ps=None
     ) == (None, None)
     assert drafter.asked is None
+
+
+def test_the_ratio_path_skips_the_target_verification_draw():
+    """The saving: on the ratio path `rejection_sample` never dereferences
+    `target_token_ids`, so drawing it was a full filtered `[num_draft, V]`
+    sample (plus a TP broadcast) thrown away every step."""
+    assert not needs_verification_sample(False, torch.zeros(4, 8))
+
+
+def test_a_stochastic_batch_without_q_still_draws_its_own_tokens():
+    """The trap the skip above must not fall into.
+
+    `_lossless_verify_inputs` returns None for plenty of non-greedy batches --
+    the flag off entirely, a top-k/top-p batch, a model that does not declare
+    `supports_lossless_draft`, a request expired out of the q slot map. Those
+    all land on `rejection_sample`'s EXACT-MATCH kernel, which with
+    `target_token_ids=None` falls through to `topk_select(target_probs, 1)` and
+    matches the draft against the target's ARGMAX instead of against the
+    target's own draw. That is a lossy rule, and it would apply to requests
+    that are not using this feature at all.
+
+    Gating on `not all_greedy` instead of on `draft_probs is not None` is
+    exactly how that happens, so pin it here rather than in a comment.
+    """
+    assert needs_verification_sample(False, None)
+    # And the whole gate agrees: every batch the verify side drops to exact
+    # match is a batch that must still be handed the target's own draw.
+    drafter = FakeDrafter()
+    probs, _ = lossless_verify_inputs(
+        drafter, ["a", "b"], all_greedy=False, top_ks=None, top_ps=0.9
+    )
+    assert needs_verification_sample(False, probs)
+
+
+def test_an_all_greedy_batch_never_draws_one():
+    """Unchanged, and for the original reason: a greedy batch wants the argmax
+    the exact-match kernel computes for itself."""
+    assert not needs_verification_sample(True, None)
+    assert not needs_verification_sample(True, torch.zeros(4, 8))
 
 
 class FakeProposer:
