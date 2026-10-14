@@ -77,6 +77,10 @@ class EngineCore:
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
+        # Separate from memory residency: an update in progress, or one that
+        # failed after an in-place write, must not serve.
+        self._weight_sync_fenced = False
+        self._rl_weights_inconsistent = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -216,6 +220,7 @@ class EngineCore:
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+                exchange_prefill_costs=self.scheduler.cost_balance,
             )
         )
 
@@ -368,7 +373,7 @@ class EngineCore:
         When offloaded, busy-wait with a short delay to avoid CPU spin.
         Returns True if the caller should skip model execution this tick.
         """
-        if self._is_rl_weights_offloaded:
+        if self._is_rl_weights_offloaded or self._weight_sync_fenced:
             time.sleep(0.01)
             return True
         return False
@@ -806,14 +811,15 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = (
-                    not self.scheduler.is_finished()
-                    and not self._is_rl_weights_offloaded
+                local_unfinished = not self.scheduler.is_finished() and not (
+                    self._is_rl_weights_offloaded or self._weight_sync_fenced
                 )
 
                 global_has_unfinished, global_shutdown, global_offloaded = (
                     self._sync_dp_state(
-                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                        local_unfinished,
+                        shutdown,
+                        self._is_rl_weights_offloaded or self._weight_sync_fenced,
                     )
                 )
 

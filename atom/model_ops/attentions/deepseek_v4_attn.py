@@ -2110,6 +2110,43 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
+    def _refresh_fp4_rowgroup_decode_meta(
+        self, attn_metadata, *, buf_prefix_ubatch: str = ""
+    ):
+        """Publish fixed-capacity row-group metadata for a token-count graph."""
+        from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+
+        var = self.model_runner.forward_vars
+        rows = attn_metadata.csa_n_committed_per_token.shape[0]
+        name = f"{buf_prefix_ubatch}v4_fp4_query_start_loc"
+        capacity = min(rows, var[name].np.shape[0] - 1)
+        cu = var[f"{buf_prefix_ubatch}cu_seqlens_q"].np[
+            : attn_metadata.cu_seqlens_q.shape[0]
+        ]
+        max_qlen = min(rows, 1 + self.max_spec_steps)
+        # `running_bs` can outrun the rows: when a DP peer is prefilling, the
+        # batch stays the group's while this rank runs only its own tokens (a
+        # non-unified `ForwardMode.running_tokens`; an idle rank's dummy is one
+        # row). Those trailing sequences are padding, published empty, and every
+        # nonempty one holds a row, so they all fit; drop the empty tail. A
+        # nonempty sequence at or past `capacity` would be dropped with it.
+        if cu[-1] > rows or np.any(cu[capacity:] != cu[-1]):
+            raise ValueError("FP4 sequence boundaries exceed the decode bucket")
+        cu = cu[: capacity + 1]
+        if np.any(np.diff(cu) < 0) or np.any(np.diff(cu) > max_qlen):
+            raise ValueError("FP4 query lengths exceed the configured decode span")
+        # Refresh the WHOLE captured view, including slots left over from a
+        # larger batch. Repeated final boundaries mean empty sequences.
+        padded_cu = np.full(capacity + 1, cu[-1], dtype=np.int32)
+        padded_cu[: cu.size] = cu
+        query_start_loc = self._stage(name, padded_cu)
+        # The kernel speculatively reads table entries even for empty slots,
+        # so expose the full allocated table view, not the live-batch slice.
+        # Only nonempty sequences consume KV; their table rows are published
+        # by prepare_decode/capture before this helper.
+        tables = var[f"{buf_prefix_ubatch}block_tables"].gpu[:capacity]
+        return Fp4MqaRaggedMetadata(query_start_loc, max_qlen, tables)
+
     def _refresh_fp4_opus_decode_plan(
         self,
         attn_metadata: AttentionMetaData_DSV4,
@@ -2239,8 +2276,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Reuses `attn_metadata.batch_id_per_q_token` ([padded_T] int32), also set
         by `_attach_v4_per_fwd_meta`.
 
-        DECODE fast path: returns an empty dict, plus the OPUS FP4 decode plan
-        below on gfx1250. Everything else here is prefill-only —
+        DECODE fast path: publishes the FP4 graph metadata (fixed-capacity
+        sequence boundaries on gfx950, an OPUS plan on gfx1250), or an empty
+        dict for FP8. Everything else here is prefill-only —
         `deepgemm_fp8_paged_mqa_logits` and `top_k_per_row_decode` read paged KV
         through `attn_metadata.csa_n_committed_per_token`, never the
         packed-cumsum / per-token `cu_starts/cu_ends` layout this builds.
@@ -2255,17 +2293,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # prepare_*/CG-capture path).
         bs = scheduled_bs
 
-        # DECODE short-circuit: the decode scorers take no field from this dict
-        # except the OPUS FP4 plan added below. The prefill-only derivations
+        # DECODE short-circuit: only FP4 graph metadata is needed here.
+        # The prefill-only derivations
         # further down (CPU cumsum + H2D for `cu_committed_gpu`; GPU launches
         # for `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill`
         # only (cp_gather + fp8_mqa_logits + per-row prefill top-k), so they are
         # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
         if attn_metadata.state is AttnState.DECODE:
             meta = {}
-            # The OPUS decode plan, once per fwd rather than per CSA layer. The
-            # gfx950 FP4 scorer needs none: it reads the per-row bounds and
-            # shares its work out itself.
+            # Keep the gfx950 row-group launch invariant across sequence
+            # layouts sharing a token bucket. FULL uses the same metadata.
+            if self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL:
+                meta["fp4_decode"] = self._refresh_fp4_rowgroup_decode_meta(
+                    attn_metadata, buf_prefix_ubatch=buf_prefix_ubatch
+                )
+            # The OPUS decode plan, once per fwd rather than per CSA layer.
             if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
                 self._refresh_fp4_opus_decode_plan(
                     attn_metadata,
@@ -4144,6 +4186,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         buf_prefix_ubatch: str = "",
         extra_write: int,
         defer_to=None,
+        write_from=None,
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -4200,6 +4243,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_bs=running_bs,
             max_q_len=max_q_len,
             extra_write=extra_write,
+            write_from=write_from,
         )
 
     def _populate_state_slot_mappings(
@@ -4525,6 +4569,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "publication_group": f"{prefix}v4_indexer",
         }
         buffers = {f"{prefix}v4_indexer_cu_committed": CpuGpuBuffer(bs + 1, **i32)}
+        if self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL:
+            buffers[f"{prefix}v4_fp4_query_start_loc"] = CpuGpuBuffer(bs + 1, **i32)
         if getattr(self, "indexer_layout", None) == FP4_GFX1250_NATURAL:
             # Each nonempty query chunk contributes at most one extra request
             # fragment per boundary and one leading zero. Across all chunks:

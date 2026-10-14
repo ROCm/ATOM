@@ -8,49 +8,17 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import (
-    BatchStep,
-    RequestSpan,
-)
+from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.models.deepseek_v41.bounded_replay import (
-    build_late_layer_tail,
+    build_replay_plan,
+    carry_selections,
     decoder_replay_unsupported,
     late_layer_start,
-    late_layer_tail_layout,
-    replay_rows,
+    replayable,
+    rows_of,
 )
 
-
-def _step(lengths, positions):
-    spans, offset = [], 0
-    for i, (n, p) in enumerate(zip(lengths, positions)):
-        spans.append(RequestSpan(100 + i, p, offset, n, 7 + i))
-        offset += n
-    empty = torch.empty(0)
-    return BatchStep(tuple(spans), empty, empty, empty, empty, empty, scheduled=offset)
-
-
-def test_tail_layout_keeps_each_requests_last_rows():
-    lengths, positions, tail = [5, 300, 133, 134], [0, 1000, 40, 7], 133
-    spans, indices, replay_start = late_layer_tail_layout(
-        _step(lengths, positions), tail
-    )
-    kept = [min(n, tail) for n in lengths]
-    assert [s.length for s in spans] == kept
-    assert [s.offset for s in spans] == list(np.cumsum([0] + kept[:-1]))
-    assert [s.slot for s in spans] == [7, 8, 9, 10]
-    assert [s.request_id for s in spans] == [100, 101, 102, 103]
-    # every tail ends where its request ends, in position and in row
-    assert [s.end for s in spans] == [p + n for p, n in zip(positions, lengths)]
-    offsets = np.cumsum([0] + lengths[:-1])
-    expected = np.concatenate(
-        [np.arange(o + n - k, o + n) for o, n, k in zip(offsets, lengths, kept)]
-    )
-    np.testing.assert_array_equal(indices, expected)
-    assert indices.dtype == np.int64 and np.all(np.diff(indices) > 0)
-    # a request kept whole reads its own history; a trimmed one none below
-    # its tail
-    assert replay_start.tolist() == [0, 1000 + 300 - 133, 0, 7 + 134 - 133]
+cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton on GPU")
 
 
 def _config(**overrides):
@@ -81,154 +49,211 @@ def test_refusals_name_their_reason(overrides, reason):
     assert reason in decoder_replay_unsupported(_config(**overrides))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels on GPU")
-def test_both_index_builders_floor_the_window_at_the_replay_start():
-    """`_indptr_scan` counts each row's window from the same first position
-    `_indices` writes it from; a drift between the two leaves holes or
-    overruns in the prefix plane."""
-    from atom.model_ops.attentions.deepseek_v41.indices import _indptr_scan
-
-    window, tokens = 128, 40
-    # two prefill requests whose tails start at positions 500 and 90; the
-    # second keeps its whole history (replay start 0)
-    lengths, starts, floors = [24, 16], [500, 90], [500, 0]
-    batches = torch.tensor(
-        [b for b, n in enumerate(lengths) for _ in range(n)],
-        dtype=torch.int32,
-        device="cuda",
-    )
-    positions = torch.tensor(
-        [p for s, n in zip(starts, lengths) for p in range(s, s + n)],
-        dtype=torch.int32,
-        device="cuda",
-    )
-    cu = torch.tensor([0, 24, 40], dtype=torch.int32, device="cuda")
-    replay_start = torch.tensor(floors, dtype=torch.int32, device="cuda")
-    pptr = torch.empty(tokens + 1, dtype=torch.int32, device="cuda")
-    eptr = torch.empty(tokens + 1, dtype=torch.int32, device="cuda")
-    _indptr_scan[(1,)](
-        batches, positions, cu, pptr, eptr, tokens, replay_start,
-        DECODE=False, WINDOW=window, RATIO=1, TOPK=0, EXTEND=True, SPLIT=False,
-        BLOCK=64,
-    )  # fmt: skip
-    counts = (pptr[1:] - pptr[:-1]).tolist()
-    expected = []
-    for b, n in enumerate(lengths):
-        first = starts[b]  # a prefill row's history ends at its chunk start
-        for j in range(n):
-            lo = max(starts[b] + j - window + 1, 0, floors[b])
-            expected.append(max(first - lo, 0))
-    assert counts == expected
-    # the first replayed request reads no window row at all: its whole
-    # history in these layers is below the replay start
-    assert counts[:24] == [0] * 24
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels on GPU")
-def test_a_replay_start_keeps_the_suffix_of_each_rows_window():
-    """`_indices` writes what `_indptr_scan` reserved: with a replay start each
-    row's window segment is the tail of the same row's segment without one."""
+def _cache(slots=4, pages=64):
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
-    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         V41PoolGeometry,
     )
-    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
-    from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
+    # a window of 8 rows, PAGEs of 32
     geo = V41PoolGeometry(
         2, ((0, 1),), 32, 8, 512, 32, layer_ratios=(0, 1), index_topk=4
     )
-    cache = PagedAttentionCache(geo, 32, 4, "cuda")
+    return PagedAttentionCache(geo, pages, slots, "cuda")
+
+
+def _segments(cache, step):
+    """Each row's `(prefix, extend)` index lists for a window layer."""
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+
+    step.group_indices.clear()
+    step.indptrs = fill_step_indptrs(step, cache.geometry, cache.indptr_buffers)
+    prefix, pptr, extend, eptr = cache.attention_indices(
+        LayerAttentionSpec(1, 0, AttentionMode.WINDOW), step
+    )
+    return [
+        (prefix[a:b].tolist(), extend[c:d].tolist())
+        for (a, b), (c, d) in zip(pairwise(pptr.tolist()), pairwise(eptr.tolist()))
+    ]
+
+
+@cuda
+def test_a_replay_start_keeps_the_suffix_of_each_rows_window():
+    """`_indices` writes what `_indptr_scan` reserved: with a replay start each
+    row's window segment is the tail of the same row's segment without one."""
+    from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
+    cache = _cache()
     requests = (
         PagedRequest(1, 40, 0, 6, 0, (0, 1)),
         PagedRequest(2, 20, 6, 5, 1, (2,)),
     )
-    spec = LayerAttentionSpec(1, 0, AttentionMode.WINDOW)
-
-    def segments(step):
-        step.group_indices.clear()
-        step.indptrs = fill_step_indptrs(step, geo, cache.indptr_buffers)
-        prefix, pptr, _, _ = cache.attention_indices(spec, step)
-        bounds = pptr.tolist()
-        return [prefix[a:b].tolist() for a, b in pairwise(bounds)]
-
     step = begin_step(cache, requests)
-    full = segments(step)
+    full = _segments(cache, step)
     step.swa_replay_start = torch.tensor([37, 0], dtype=torch.int32, device="cuda")
-    floored = segments(step)
-    for p, (whole, kept) in enumerate(zip(full, floored)):
+    floored = _segments(cache, step)
+    for p, ((whole, _), (kept, _)) in enumerate(zip(full, floored)):
         position = step.positions[p].item()
-        request = 0 if p < 6 else 1
-        floor = (37, 0)[request]
-        history_end = (40, 20)[request]
-        first = max(position - geo.window_size + 1, 0, floor)
+        floor, history_end = ((37, 40), (0, 20))[0 if p < 6 else 1]
+        first = max(position - 7, 0, floor)
         assert len(kept) == max(history_end - first, 0)
         assert kept == whole[len(whole) - len(kept) :]
 
 
-def _spec(layer_id, mode, topk_owner=None, candidate_source=None):
-    return SimpleNamespace(
-        layer_id=layer_id,
-        mode=mode,
-        topk_owner=topk_owner,
-        candidate_source=candidate_source,
+@cuda
+def test_rows_past_where_the_ring_holds_read_it_there():
+    """A forward recomputing rows below the point its ring already holds
+    (`swa_cached_until`): its rows from that point read the ring below it, as
+    a forward resuming there would; the rows below read each other only."""
+    from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
+    cache = _cache()
+    # one request recomputing 32..40 below its resume point 40, one ordinary
+    requests = (
+        PagedRequest(1, 32, 0, 16, 0, (0, 1)),
+        PagedRequest(2, 20, 16, 5, 1, (2,)),
+    )
+    step = begin_step(
+        cache,
+        requests,
+        floors=np.asarray([32, 0], np.int32),
+        cached_until=np.asarray([40, 0], np.int32),
+    )
+    resumed = _segments(cache, step)
+    # the same rows from 40 on, as a forward resuming there would build them
+    alone = begin_step(cache, (PagedRequest(1, 40, 0, 8, 0, (0, 1)),))
+    expected = _segments(cache, alone)
+    for j in range(16):
+        prefix, extend = resumed[j]
+        position = 32 + j
+        if position < 40:
+            # nothing below the forward's start, the rest its own rows
+            assert prefix == [] and extend == list(range(j + 1))
+        else:
+            want_prefix, want_extend = expected[position - 40]
+            assert prefix == want_prefix
+            assert extend == [r + 8 for r in want_extend]
+    # the ordinary request reads as it would alone
+    other = _segments(cache, begin_step(cache, (PagedRequest(2, 20, 0, 5, 1, (2,)),)))
+    assert resumed[16:] == [(p, [r + 16 for r in e]) for p, e in other]
+
+
+def _query_rows(step, rows):
+    from dataclasses import replace
+
+    from atom.models.deepseek_v41.bounded_replay import QueryRows
+
+    ids = torch.full_like(step.batch_ids, -1)
+    ids[rows] = step.batch_ids[rows]
+    rows = torch.tensor(rows, device="cuda")
+    return QueryRows(
+        rows,
+        step.positions[rows],
+        replace(step, batch_ids=ids),
+        torch.cat((rows, torch.tensor([step.width], device="cuda"))),
     )
 
 
-def test_tail_step_carries_early_selections_and_candidates_by_row():
-    """The tail step's per-row tensors are the forward's at the tail rows;
-    selections and candidates come over only from early owners."""
+@cuda
+def test_queries_read_the_index_lists_every_row_would():
+    """Some rows of a step as its queries: their index lists are the ones the
+    step builds for those rows, adjacent once the other rows are padding."""
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+    from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
+    cache = _cache()
+    requests = (
+        PagedRequest(1, 40, 0, 12, 0, (0, 1)),
+        PagedRequest(2, 20, 12, 5, 1, (2,)),
+    )
+    step = begin_step(cache, requests)
+    full = _segments(cache, step)
+    queries = _query_rows(step, [9, 10, 11, 16])
+    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
+
+    queries.index.indptrs = fill_step_indptrs(
+        queries.index, cache.geometry, cache.indptr_buffers
+    )
+    prefix, pptr, extend, eptr = queries.indices(
+        cache, LayerAttentionSpec(1, 0, AttentionMode.WINDOW)
+    )
+    got = [
+        (prefix[a:b].tolist(), extend[c:d].tolist())
+        for (a, b), (c, d) in zip(pairwise(pptr.tolist()), pairwise(eptr.tolist()))
+    ]
+    assert got == [full[r] for r in (9, 10, 11, 16)]
+
+
+def _forward_step(cache, lengths, positions, finals):
+    from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
+    requests, offset = [], 0
+    for i, (n, p) in enumerate(zip(lengths, positions)):
+        pages = tuple(range(8 * i, 8 * i + -(-(p + n) // 32)))
+        requests.append(PagedRequest(100 + i, p, offset, n, i, pages))
+        offset += n
+    return begin_step(cache, requests, finals=finals)
+
+
+@cuda
+def test_a_replay_plan_runs_each_finishing_request_on_its_last_rows():
+    cache = _cache(pages=128)
+    # a finishing prompt of 300 rows, an early chunk, one shorter than a window
+    step = _forward_step(cache, [300, 200, 5], [0, 0, 64], [True, False, True])
+    step.visible = {1: torch.arange(step.width, device="cuda", dtype=torch.int32)}
+    plan = build_replay_plan(step, 128)
+    tail = plan.tail
+    assert [(s.request_id, s.position, s.length) for s in tail.requests] == [
+        (100, 172, 128),
+        (102, 64, 5),
+    ]
+    assert plan.tail_rows.tolist() == list(range(172, 300)) + list(range(500, 505))
+    assert tail.visible[1].tolist() == plan.tail_rows.tolist()
+    # every decoder layer's window starts at the tail
+    assert tail.swa_replay_start.tolist() == [172, 64]
+    assert tail.slots.tolist() == [0, 2]
+    # layer 39's queries: each tail's last row
+    assert plan.q39.rows.tolist() == [127, 132]
+    assert plan.q39.positions.tolist() == [299, 68]
+    assert plan.last_rows.tolist() == [299, 504]
+    assert plan.q39.index.batch_ids.tolist().count(-1) == 131
+    assert not tail.plans
+
+
+@cuda
+def test_a_forward_finishing_no_prompt_runs_nothing_past_layer_19():
+    cache = _cache()
+    step = _forward_step(cache, [300], [0], [False])
+    assert build_replay_plan(step, 128).tail is None
+
+
+@cuda
+def test_carried_selections_come_from_layers_that_do_not_run_on_the_rows():
     from atom.models.deepseek_v41.config import AttentionMode
 
-    lengths, positions, tail_len = [5, 300, 140], [0, 1000, 7], 133
-    spans, offset = [], 0
-    for i, (n, p) in enumerate(zip(lengths, positions)):
-        spans.append(RequestSpan(100 + i, p, offset, n, 7 + i))
-        offset += n
-    width = offset
-    forward_positions = torch.cat(
-        [torch.arange(p, p + n) for p, n in zip(positions, lengths)]
-    )
-    rows = torch.arange(width)
-    step = BatchStep(
-        tuple(spans),
-        forward_positions,
-        torch.tensor([0, 5, 305, 445], dtype=torch.int32),
-        torch.tensor([7, 8, 9], dtype=torch.int32),
-        torch.zeros(width, dtype=torch.int32),
-        torch.arange(12, dtype=torch.int32).view(3, 4),
-        scheduled=width,
-        visible={1: rows.int() * 10},
-        plans={1: "plan"},
-    )
-    step.selected = {20: rows.view(1, width, 1).expand(1, width, 3).int()}
-    step.candidates = {20: rows.view(width, 1).int() + 1000}
-    late = [
-        _spec(21, AttentionMode.REUSE, topk_owner=20, candidate_source=20),
-        _spec(24, AttentionMode.REINDEX, topk_owner=24, candidate_source=20),
-        _spec(25, AttentionMode.REUSE, topk_owner=24, candidate_source=20),
+    cache = _cache(pages=128)
+    step = _forward_step(cache, [300], [0], [True])
+    width = step.width
+    rows = torch.arange(width, device="cuda", dtype=torch.int32)
+    step.selected = {
+        14: rows.view(1, width, 1).expand(1, width, 3).contiguous(),
+        20: rows.view(1, width, 1).clone(),
+    }
+    step.candidates = {14: rows.view(width, 1) + 1000}
+    plan = build_replay_plan(step, 128)
+    spec = SimpleNamespace
+    specs = [
+        spec(layer_id=20, topk_owner=20, candidate_source=14, mode=AttentionMode.FULL),
+        spec(layer_id=21, topk_owner=20, candidate_source=14, mode=AttentionMode.REUSE),
+        spec(layer_id=22, topk_owner=14, candidate_source=14, mode=AttentionMode.REUSE),
     ]
-    tail = build_late_layer_tail(step, tail_len, late)
-    kept = tail.token_indices
-    _, expected, replay_start = late_layer_tail_layout(step, tail_len)
-    torch.testing.assert_close(kept, torch.from_numpy(expected))
-    t = tail.step
-    assert t.scheduled == t.width == kept.numel() == 5 + 133 + 133
-    assert t.max_q_len == 133
-    assert t.cu_seqlens_q.tolist() == [0, 5, 138, 271]
-    assert t.batch_ids.tolist() == [0] * 5 + [1] * 133 + [2] * 133
-    assert t.swa_replay_start.tolist() == replay_start.tolist()
-    torch.testing.assert_close(t.positions, forward_positions[kept])
-    torch.testing.assert_close(t.visible[1], step.visible[1][kept])
-    assert t.plans is step.plans
-    # the early owner's selection and candidates come over by row; the late
-    # REINDEX owner (24) selects again on the tail, so nothing of it is carried
-    assert set(t.selected) == {20} and set(t.candidates) == {20}
-    torch.testing.assert_close(t.selected[20], step.selected[20][:, kept])
-    torch.testing.assert_close(t.candidates[20], step.candidates[20][kept])
-    # indptrs are the context manager's to fill, on the GPU
-    assert not t.indptrs
+    carry_selections(step, plan, specs)
+    kept = plan.tail_rows
+    # layer 20 selects again on the tail; layer 14 does not run on it
+    assert set(plan.tail.selected) == {14} and set(plan.tail.candidates) == {14}
+    torch.testing.assert_close(plan.tail.selected[14], step.selected[14][:, kept])
+    torch.testing.assert_close(plan.tail.candidates[14], step.candidates[14][kept])
 
 
 def _forward(lengths, **overrides):
@@ -240,11 +265,7 @@ def _forward(lengths, **overrides):
         width=sum(lengths),
         scheduled=sum(lengths),
     )
-    metadata = SimpleNamespace(
-        step=step,
-        image_mask=None,
-        cache=SimpleNamespace(geometry=SimpleNamespace(ring_slots=133)),
-    )
+    metadata = SimpleNamespace(step=step, image_mask=None)
     context = SimpleNamespace(is_prefill=True, is_dummy_run=False, is_draft=False)
     forward = SimpleNamespace(
         context=context, attn_metadata=metadata, ubatch_slices=None
@@ -260,158 +281,108 @@ def _forward(lengths, **overrides):
 
 
 @pytest.mark.parametrize(
-    "lengths, overrides, expected",
+    "overrides, expected",
     [
-        ([500, 20], {}, 133),
-        ([133, 20], {}, None),  # nothing longer than the ring
-        ([500], {"ctx.is_prefill": False}, None),
-        ([500], {"ctx.is_dummy_run": True}, None),
-        ([500], {"ctx.is_draft": True}, None),
-        ([500], {"fwd.ubatch_slices": [object()]}, None),
-        ([500], {"step.decode": True}, None),
-        # image rows replay: the router reads the tail's slice of the mask
-        ([500], {"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, 133),
-        ([500], {"step.width": 512}, None),  # padded (DP attention) step
+        ({}, True),
+        ({"ctx.is_prefill": False}, False),
+        ({"ctx.is_dummy_run": True}, False),
+        ({"ctx.is_draft": True}, False),
+        ({"fwd.ubatch_slices": [object()]}, False),
+        ({"fwd.dp_metadata": object()}, False),  # unpadded DP still gathers
+        ({"step.decode": True}, False),
+        # image rows replay: the router reads its rows' slice of the mask
+        ({"md.image_mask": torch.ones(1, 500, dtype=torch.bool)}, True),
+        ({"step.width": 512}, False),  # padded (DP attention) step
     ],
 )
-def test_only_an_unpadded_prefill_replays(lengths, overrides, expected):
-    forward = _forward(lengths, **overrides)
-    assert replay_rows(forward, forward.attn_metadata.step.width) == expected
+def test_only_an_unpadded_prefill_replays(overrides, expected):
+    forward = _forward([500], **overrides)
+    assert replayable(forward, 500) == expected
 
 
-def test_the_late_layers_see_the_tails_image_mask():
-    """The late layers' MoE router reads the forward's image mask; during the
-    tail it must be the tail's rows, and the forward's afterwards."""
+def test_a_row_step_sees_its_rows_image_mask(monkeypatch):
+    """The decoder layers' MoE router reads the forward's image mask; while a row
+    step runs it must be that step's rows, and the outer one's afterwards."""
     pytest.importorskip("triton")
-    from atom.models.deepseek_v41.bounded_replay import LateLayerTail, late_layer_tail
+    from atom.model_ops.attentions.deepseek_v41 import indices
 
-    step = _step([300, 20], [0, 0])
+    outer = SimpleNamespace(indptrs={1: 0}, tiles={1: 0})
+    inner = SimpleNamespace(indptrs={}, tiles={})
     rows = torch.tensor([167 + i for i in range(133)] + list(range(300, 320)))
     mask = (torch.arange(320) % 3 == 0)[None]
-    tail_step = SimpleNamespace(indptrs={}, tiles={})
     metadata = SimpleNamespace(
-        step=step,
+        step=outer,
+        queries=None,
         image_mask=mask,
         cache=SimpleNamespace(geometry=None, indptr_buffers=None),
     )
-    from atom.model_ops.attentions.deepseek_v41 import indices
-
+    monkeypatch.setattr(indices, "fill_step_indptrs", lambda *a: {"filled": True})
     seen = {}
-    original = indices.fill_step_indptrs
-    indices.fill_step_indptrs = lambda *a: {}
-    try:
-        with late_layer_tail(metadata, LateLayerTail(rows, tail_step)):
-            seen["mask"] = metadata.image_mask.clone()
-            seen["step"] = metadata.step
-    finally:
-        indices.fill_step_indptrs = original
+    with rows_of(metadata, inner, rows=rows):
+        seen["mask"] = metadata.image_mask.clone()
+        seen["step"] = metadata.step
     torch.testing.assert_close(seen["mask"], mask[:, rows])
-    assert seen["step"] is tail_step
-    assert metadata.image_mask is mask and metadata.step is step
+    assert seen["step"] is inner and inner.indptrs == {"filled": True}
+    assert metadata.image_mask is mask and metadata.step is outer
+    # the inner step's indptrs overwrote the outer one's buffers
+    assert outer.indptrs == {} and outer.tiles == {}
 
 
-def test_late_rows_land_back_at_their_forward_rows(monkeypatch):
-    """A replay's late-layer outputs and DSpark aux captures come back at the
-    forward rows of each request's tail, whatever the mix of lengths."""
+def test_aux_captures_land_back_at_their_forward_rows():
+    """A decoder layer's DSpark capture wrote the tail's rows at the buffer's
+    head; they move to the forward rows, an early layer's capture untouched."""
     pytest.importorskip("aiter")
     from atom.models.deepseek_v41 import runtime
-    from atom.models.deepseek_v41.bounded_replay import LateLayerTail
 
-    lengths, tail_len, hidden = [3, 9, 5, 12], 4, 6
-    step = _step(lengths, [0, 50, 7, 100])
-    _, indices, _ = late_layer_tail_layout(step, tail_len)
-    rows = torch.from_numpy(indices)
-    total = sum(lengths)
     model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(model)
-    aux = [torch.full((64, hidden), -1.0), torch.full((64, hidden), -2.0)]
-
-    def late(*state):
-        # the stage sees only the tail; tag each row with its forward row
-        kept = state[0].shape[0]
-        assert kept == rows.numel()
-        aux[1][:kept] = rows[:, None].float() + 0.5
-        return rows[:, None].float().expand(kept, hidden).clone()
-
-    model.late = late
-    # capture 0 is an early layer's (full rows already), capture 1 a late one's
+    rows = torch.tensor([3, 4, 9, 10, 11])
+    aux = [torch.full((16, 2), -1.0), torch.full((16, 2), -2.0)]
+    aux[1][:5] = rows[:, None].float()
     model.late_aux_layers, model.aux_buffers = (1,), aux
-    metadata = SimpleNamespace(step=step)
-    monkeypatch.setattr(
-        runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
-    )
-    monkeypatch.setattr(runtime, "late_layer_tail", _swap_step_only)
-    # residual [N, hc, H], pre [N, hc], pending [N, H], post [N, hc],
-    # combination [N, hc, hc]: rows first, as the early graph returns them
-    state = (
-        torch.zeros(total, 4, 2),
-        torch.zeros(total, 4),
-        torch.zeros(total, 2),
-        torch.zeros(total, 4),
-        torch.zeros(total, 4, 4),
-    )
-    from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
-
-    tail_state = SinglePassHCState(*state).take_rows(rows)
-    out = model._late_on_tail(tail_state, LateLayerTail(rows, step), total)
-    assert out.shape == (total, hidden)
-    torch.testing.assert_close(out[rows], rows[:, None].float().expand(-1, hidden))
-    # rows outside the tail are zero, not undefined
-    outside = torch.ones(total, dtype=torch.bool)
-    outside[rows] = False
-    assert torch.all(out[outside] == 0)
-    torch.testing.assert_close(
-        aux[1][rows], rows[:, None].float().expand(-1, hidden) + 0.5
-    )
-    # an early layer's capture is left alone
+    model._move_aux_rows(rows)
+    torch.testing.assert_close(aux[1][rows], rows[:, None].float().expand(-1, 2))
     assert torch.all(aux[0] == -1.0)
-    assert metadata.step is step
 
 
-def _swap_step_only(metadata, tail):
-    """`late_layer_tail` without the GPU indptr fill."""
-    import contextlib
-
-    @contextlib.contextmanager
-    def swap():
-        full = metadata.step
-        metadata.step = tail.step
-        try:
-            yield
-        finally:
-            metadata.step = full
-
-    return swap()
-
-
-def test_hidden_state_export_turns_replay_off(monkeypatch):
-    """With replay forbidden (TorchSpec export reads every row), a replayable
-    prefill runs the late layers on every row."""
+def test_hidden_state_export_refuses_a_replaying_model():
+    """TorchSpec export reads every prefill row; replay is fixed at launch, so
+    the export refuses a model that replays rather than turning it off under
+    a prompt whose earlier chunks already skipped the decoder."""
     pytest.importorskip("aiter")
-    from atom.models.deepseek_v41 import runtime
+    from atom.rollout.model_runner_ext import RLHFModelRunner
 
-    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
-    torch.nn.Module.__init__(model)
-    model.replay, model.replay_enabled, model.late_specs = True, True, ()
-    rows_seen = []
-    model.early = lambda input_ids, embeds: (
-        torch.zeros(input_ids.numel(), 4, 2),
-        torch.zeros(input_ids.numel(), 4),
-        torch.zeros(input_ids.numel(), 2),
-        torch.zeros(input_ids.numel(), 4),
-        torch.zeros(input_ids.numel(), 4, 4),
+    runner = SimpleNamespace(label="r", _find_model_attr=lambda name: lambda: True)
+    with pytest.raises(ValueError, match="--no-decoder-swa-bounded-replay"):
+        RLHFModelRunner.configure_hidden_states(runner, [1], {})
+
+
+@pytest.mark.parametrize("image", [None, 7])
+def test_a_replayed_history_marks_image_positions_dead(image):
+    """The Engram history a replayed forward starts at reads the tokens
+    before it as a full prefill does: an image position (it carries the
+    image id) is DEAD."""
+    pytest.importorskip("aiter")
+    from atom.model_engine.sequence import Replay
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
     )
-    model.late = lambda *state: rows_seen.append(state[0].shape[0]) or state[0]
-    forward = _forward([500])
-    monkeypatch.setattr(runtime, "get_forward_context", lambda: forward)
-    monkeypatch.setattr(
-        runtime,
-        "build_late_layer_tail",
-        lambda *a: SimpleNamespace(token_indices=torch.arange(367, 500)),
+    from tests.model_ops.engram.test_hash_bounds import build, tiny_config
+
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    mapping = build(tiny_config())
+    builder.engram = SimpleNamespace(mapping=mapping)
+    builder.geometry = SimpleNamespace(history_size=mapping.config.max_ngram_size - 1)
+    builder.config = SimpleNamespace(image_token_id=image)
+    resumes, floors, cached, histories = builder._replay_layout(
+        {1: Replay(384, True, (5, 7))},
+        np.array([0, 1]),
+        [RequestSpan(1, 0, 0, 10, 0), RequestSpan(2, 256, 10, 200, 1)],
     )
-    monkeypatch.setattr(model, "_late_on_tail", lambda *a: rows_seen.append("tail"))
-    model(torch.zeros(500, dtype=torch.int64), None)
-    assert rows_seen == ["tail"]
-    assert model.set_decoder_replay(False) is False
-    model(torch.zeros(500, dtype=torch.int64), None)
-    assert rows_seen == ["tail", 500]
+    assert (resumes.tolist(), floors.tolist(), cached.tolist()) == (
+        [0, 384],
+        [0, 256],
+        [0, 0],
+    )
+    assert histories[0].tolist() == [-1, -1]
+    assert sorted(histories[1].tolist()) == ([5, 7] if image is None else [-1, 5])

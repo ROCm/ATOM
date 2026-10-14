@@ -10,6 +10,11 @@ flag in XRDY), and xq and the router wait for it and read it at device scope:
 the buffer is every layer's, so a plain load could hit this XCD's L2 copy of
 the previous layer's.
 
+A token-parallel launch (``tok_par``) has each rank's norm publish its own
+tokens' rows here and push them to every other rank's XG (peer buffer); a
+K2b ``gather`` stage brings the other ranks' rows into ``normed`` before xq,
+and the FFN sums are reduce-scattered (``out``: this rank's rows).
+
 Each half keeps its own mailbox tag and its scratch regions, K2b's past K2a's
 (K2a's gate may still poll its partials while another CTA is past the norm).
 Their LDS is one union: a CTA runs K2a's stages, then K2b's, with a barrier
@@ -20,7 +25,9 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr.typing import Int32, Int64
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import moe as k2b
@@ -30,6 +37,7 @@ from atom.models.deepseek_v41.mono.kernels.attn_post import (
     attn_post_smem,
     lds_union,
     run_attn_post,
+    run_gates,
 )
 from atom.models.deepseek_v41.mono.kernels.debug import mailbox
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
@@ -46,19 +54,23 @@ from atom.models.deepseek_v41.mono.kernels.moe_shape import (
     MoeBuild,
     route_shape,
 )
+from atom.models.deepseek_v41.mono.kernels.token_par import own_count
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, traced
+from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc, traced
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
-from atom.mono.device.sync import publish
+from atom.mono.device.sync import preg, publish
 from atom.mono.plan.build_key import key_tuple
 from atom.mono.plan.execution import BLOCKS, THREADS
 from atom.mono.runtime.abi import KernelAbi
 
 _CURRENT_STREAM = fx.Stream(None)
+HIDDEN = k2a.HIDDEN
 
-# ``timeline`` stamps: K2a's points, then K2b's
-TL_STAGES = k2a.TL_STAGES + k2b.TL_STAGES
+# ``timeline`` stamps in the order the stages run: K2a's but its gate, K2b's to
+# shared, the FFN gate, the rest of K2b's
+assert k2a.TL_STAGES[-1] == "gate" and k2b.TL_STAGES[4] == "ug"
+TL_STAGES = k2a.TL_STAGES[:-1] + k2b.TL_STAGES[:4] + ("gate",) + k2b.TL_STAGES[4:]
 TL_POINTS = 1 + len(TL_STAGES)
 
 
@@ -78,6 +90,9 @@ class LayerPostBuild:
     diag_off: int = -1
     # FP4 groups an ug task (``moe_shape.RouteShape.ug_groups``)
     ug_groups: int = 2
+    # token parallel (``AttnPostBuild.tok_par``): each rank's normed rows
+    # gathered through XG before the MoE
+    tok_par: bool = False
 
     def halves(self):
         """(K2a's build key, K2b's). K2b's scratch starts at ``moe_base``, where
@@ -89,6 +104,7 @@ class LayerPostBuild:
             tp=self.tp,
             timeline=self.timeline,
             diag_off=self.diag_off,
+            tok_par=self.tok_par,
         )
         moe_diag = self.diag_off - moe_base(key_a) if self.diag_off >= 0 else -1
         key_b = MoeBuild(
@@ -142,6 +158,56 @@ def publish_x(ca, cb, t):
     publish(cb["put"], cb["xrdy"], t, 1, ca["tid"] == 0)
 
 
+# a row's bf16 pairs two at a time: a 16-byte store of (word, tag) x 2
+_XG_QUADS = HIDDEN // 4
+
+
+@traced
+def publish_x_tok_par(ca, cb, t):
+    """Token t of this rank's (its row ``rank n + t``): the flag here, as
+    ``publish_x``, then the row pushed to every other rank's XG."""
+    tid, rank = ca["tid"], ca["rank"]
+    n = own_count(ca["S"], ca["d"].tp)
+    tg = rank * n + t
+    publish(cb["put"], cb["xrdy"], tg, 1, tid == 0)
+    xg = cb["peer"]["xg"]
+    for k in range_constexpr(-(-_XG_QUADS // THREADS)):
+        q = tid + THREADS * k
+        if q < _XG_QUADS:
+            w = fx.Vector(
+                bo.buffer_load(
+                    rsrc(ca["args"]["normed"]),
+                    tg * (HIDDEN // 2) + 2 * q,
+                    vec_width=2,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            for p in range_constexpr(ca["d"].tp):
+                if rank != p:
+                    dst = preg(cb["peer_addr"](p), xg, "xg")
+                    cb["put_words"](dst, tg * (HIDDEN // 2) + 2 * q, [w[0], w[1]])
+
+
+@traced
+def gather_x(cb, t):
+    """Token t, another rank's: its row from XG -> ``normed`` here (device
+    scope), then its flag (the router's wait)."""
+    tid = cb["tid"]
+    own = preg(cb["sym"], cb["peer"]["xg"], "xg")
+    for k in range_constexpr(-(-_XG_QUADS // THREADS)):
+        q = tid + THREADS * k
+        if q < _XG_QUADS:
+            (w,) = cb["poll"]([(own, t * (HIDDEN // 2) + 2 * q, 2)])
+            bo.buffer_store(
+                fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                rsrc(cb["args"]["x"]),
+                t * (HIDDEN // 2) + 2 * q,
+                cache_modifier=CM_DEV,
+            )
+    publish(cb["put"], cb["xrdy"], t, 1, tid == 0)
+
+
 def build_layer_post(key: LayerPostBuild):
     s = key.tokens
     timeline = key.timeline
@@ -163,7 +229,7 @@ def build_layer_post(key: LayerPostBuild):
 
     name = kernel_symbol(
         "v41_layer_post", s=s, e=rs.experts, k=rs.topk, tl=int(timeline),
-        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4),
+        ix=int(key.index_bound_max > 0), i4=int(key.index_fp4), tpar=int(key.tok_par),
     )  # fmt: skip
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -219,10 +285,21 @@ def build_layer_post(key: LayerPostBuild):
             args_b, rank, sym,
         )  # fmt: skip
         cb["x_cm"], cb["x_ready"] = CM_DEV, True
+        if const_expr(key.tok_par):
+            cb["tok_par"] = True
+            cb["gather_x"] = lambda t: gather_x(cb, t)
+            after_norm = lambda t: publish_x_tok_par(ca, cb, t)
+        else:
+            after_norm = lambda t: publish_x(ca, cb, t)
         tls = stamps.tls.ptr
         stamp_begin(timeline, tls, tid, TL_POINTS)
-        run_attn_post(ca, key_a, bid, tls, 0, lambda t: publish_x(ca, cb, t))
-        run_moe(cb, key_b, bid, tls, len(k2a.TL_STAGES))
+        # the FFN gate, the next layer's, after the stages the MoE waits on
+        # that its CTAs may also hold (router, route, shared)
+        run_attn_post(ca, key_a, bid, tls, 0, after_norm, gates=False)
+        run_moe(
+            cb, key_b, bid, tls, len(k2a.TL_STAGES) - 1,
+            before_ug=lambda: run_gates(ca, key_a, bid),
+        )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
         _ = keyed
 

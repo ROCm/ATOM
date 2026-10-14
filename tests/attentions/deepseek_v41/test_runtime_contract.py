@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
+from atom.models.deepseek_v41.config import (
+    normalize_hf_config,
+    validate_runtime_config,
+    validate_tbo_parallelism,
+)
 from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
 
@@ -57,7 +61,11 @@ def test_production_geometry_has_only_four_global_owners():
     assert geo.paged_bytes == 32 * (3 / 2 + 1) * (512 * 2 + 132)
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes
     assert geo.state_fields[0].layers == 40
-    assert all(field.in_checkpoint for field in geo.state_fields)
+    # Rings and cursor are checkpointed; the compressor tails are not.
+    assert [f.name for f in geo.state_fields if f.in_checkpoint] == [
+        "window",
+        "cursor",
+    ]
 
 
 def runtime_config(**overrides):
@@ -82,7 +90,8 @@ def runtime_config(**overrides):
         "kv_cache_block_size": 16,
         "tensor_parallel_size": 4,
         "enable_expert_parallel": True,
-        "hf_config": SimpleNamespace(),
+        "hf_config": SimpleNamespace(sliding_window=128),
+        "enable_encoder_swa_bounded_replay": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -98,8 +107,6 @@ def runtime_config(**overrides):
         {"prefill_context_parallel_size": 2},
         {"decode_context_parallel_size": 2},
         {"parallel_config": SimpleNamespace(data_parallel_size=2)},
-        {"enable_dp_attention": True},
-        {"enable_tbo": True},
         {"enable_tbo_decode": True},
         {"kv_transfer_config": {"connector": "moriio"}},
         {"enable_rapidserve": True},
@@ -109,6 +116,8 @@ def runtime_config(**overrides):
         {"kv_cache_dtype": "fp8"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
+        # a hit's one-PAGE rebuild would not cover the window
+        {"enable_encoder_swa_bounded_replay": True},
     ],
 )
 def test_unimplemented_modes_fail_before_loading(override):
@@ -365,3 +374,154 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     with pytest.raises(ValueError, match="needs whole 16-row blocks"):
         V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
+@pytest.mark.parametrize("tbo", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_dpa_admission_before_and_after_engine_normalization(tp, dp, tbo, ep):
+    validate_runtime_config(
+        runtime_config(
+            enable_dp_attention=True,
+            enable_tbo=tbo,
+            enable_expert_parallel=ep,
+            tensor_parallel_size=tp,
+            parallel_config=SimpleNamespace(data_parallel_size=dp),
+        )
+    )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+@pytest.mark.parametrize("dpa", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_prefill_tbo_requires_multi_rank_dpa(tp_size, dp_size, dpa, ep):
+    cfg = runtime_config(
+        enable_tbo=True,
+        tensor_parallel_size=tp_size,
+        enable_dp_attention=dpa,
+        enable_expert_parallel=ep,
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+    )
+    if dpa:
+        # Config construction can precede the legacy DP kwargs, so rank-count
+        # admission belongs to the model's startup check below.
+        validate_runtime_config(cfg)
+    if dpa and tp_size * dp_size > 1:
+        validate_tbo_parallelism(cfg)
+        cfg.enable_tbo_decode = True
+        with pytest.raises(ValueError, match="decode TBO"):
+            validate_runtime_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="prefill TBO"):
+            validate_runtime_config(cfg)
+            validate_tbo_parallelism(cfg)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (2, 1), (1, 4), (2, 2)])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("level", [0, 3])
+def test_real_config_accepts_tbo_before_dpa_rank_expansion(
+    monkeypatch, tp, dp, ep, level
+):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config, ParallelConfig
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    # The quantization parser resolves AITER enums. Only bypass that GPU
+    # dependency; execute the real Config.__post_init__, HF config load,
+    # V4.1 admission check and engine rank planner on CPU.
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=tp,
+        parallel_config=ParallelConfig(data_parallel_size=dp),
+        enable_dp_attention=True,
+        enable_expert_parallel=ep,
+        enable_tbo=True,
+        compilation_config=CompilationConfig(level=level),
+        enforce_eager=level == 0,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+    )
+    assert cfg.tensor_parallel_size == tp
+    assert cfg.parallel_config.data_parallel_size == dp
+    assert len(iter_dp_rank_assignments(cfg)) == tp * dp
+
+
+@pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1), (2, 4)])
+def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
+    cfg = runtime_config(
+        enable_dp_attention=True,
+        enable_tbo=True,
+        tensor_parallel_size=tp,
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+    )
+    for _ in range(2):
+        validate_runtime_config(cfg)
+        if tp * dp > 1:
+            validate_tbo_parallelism(cfg)
+        else:
+            with pytest.raises(ValueError, match="multi-rank DP attention"):
+                validate_tbo_parallelism(cfg)
+        cfg.parallel_config.data_parallel_size = tp * dp
+        cfg.tensor_parallel_size = 1
+
+
+@pytest.mark.parametrize("explicit_parallel", [False, True])
+def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
+    import atom.config as config_module
+    import atom.model_engine.llm_engine as engine_module
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
+    hf = normalize_hf_config(json.loads(fixture.read_text()))
+    monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
+    monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
+    # Quantization resolves AITER enums; keep this admission test CPU-only.
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    validated = []
+
+    def start_core(config):
+        # Exercise the unchanged LLMEngine constructor through its handoff to
+        # CoreManager without starting GPU workers.
+        validate_tbo_parallelism(config)
+        assert (
+            config.tensor_parallel_size * config.parallel_config.data_parallel_size == 4
+        )
+        assert config.parallel_config.data_parallel_master_port == 27123
+        validated.append(config.parallel_config)
+
+    monkeypatch.setattr(engine_module, "CoreManager", start_core)
+    monkeypatch.setattr(
+        engine_module,
+        "_load_tokenizer",
+        lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
+    )
+    kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}
+    if explicit_parallel:
+        parallel = config_module.ParallelConfig(
+            data_parallel_size=4,
+            data_parallel_size_local=2,
+            data_parallel_master_port=27123,
+        )
+        kwargs.update(
+            parallel_config=parallel,
+            data_parallel_size=8,
+            data_parallel_master_port=27124,
+        )
+    engine_module.LLMEngine(
+        "v41-test",
+        tensor_parallel_size=1,
+        enable_dp_attention=True,
+        enable_tbo=True,
+        enable_tbo_decode=False,
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        **kwargs,
+    )
+    assert len(validated) == 1
+    if explicit_parallel:
+        assert validated[0] is parallel
+        assert validated[0].data_parallel_size_local == 2

@@ -230,6 +230,9 @@ def test_mega_rejects_the_legacy_shared_expert_fusion(monkeypatch):
 
 
 def test_mega_backend_uses_global_dispatch_width(monkeypatch):
+    pytest.importorskip(
+        "triton", reason="MegaMoE imports its Triton row-zeroing kernel"
+    )
     from atom.model_ops.fused_moe import flydsl_mega_experts as mega_module
 
     captured = {}

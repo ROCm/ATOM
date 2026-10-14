@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import inspect
 import logging
 from dataclasses import dataclass
@@ -75,6 +76,22 @@ from .token_layout.decode import decode_positions
 from .token_layout.slots import slot_mapping
 
 logger = logging.getLogger("atom")
+
+
+@functools.cache
+def _warn_legacy_shuffle_kv() -> None:
+    if envs.ATOM_USE_TRITON_MLA:
+        logger.warning(
+            "ATOM_USE_TRITON_MLA_SHUFFLE_KV is deprecated; use "
+            "ATOM_MLA_KV_SHUFFLED=1 (keep ATOM_USE_TRITON_MLA=1 for the "
+            "Triton decode)"
+        )
+    else:
+        logger.warning(
+            "ATOM_USE_TRITON_MLA_SHUFFLE_KV has no effect without "
+            "ATOM_USE_TRITON_MLA=1 and is deprecated"
+        )
+
 
 # The MLA pool's row space. Named rather than derived from a geometry: every
 # MLA layer packs into one row of the same width, so there is only ever one.
@@ -364,9 +381,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_size = envs.ATOM_MLA_PAGE_SIZE
         else:
             self.block_size = 1
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            _warn_legacy_shuffle_kv()
+        self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
+        if self.kv_shuffled:
             assert model_runner.block_size == 64, (
-                f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
+                f"ATOM_MLA_KV_SHUFFLED=1 expects --block-size 64 "
                 f"for {model_runner.kv_cache_dtype} KV cache, "
                 f"got --block-size {model_runner.block_size}"
             )
@@ -966,6 +986,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sparse_decode: bool = False,
         is_cp_round_robin: bool = False,
     ):
+        if self.kv_shuffled:
+            return {}
         assert num_reject_tokens is None or num_reject_tokens.shape[0] >= bs, (
             f"num_reject_tokens covers {num_reject_tokens.shape[0]} sequences "
             f"but this asks for {bs}; the update kernel loads one per work item "
@@ -2035,11 +2057,136 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ):
                 attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
 
+        self._attach_kv_shuffled_prefill_meta(attn_metadata, bs)
         attn_metadata.dtype_q = self.dtype_q
         # TBO: publish CPU length copies for zero-sync ubatch splits.
         # Attached last, once all metadata is finalized. No-op unless TBO is on.
         self._attach_tbo_prefill_cpu_lens(attn_metadata, bs)
         return attn_metadata, positions
+
+    def _attach_kv_shuffled_prefill_meta(self, attn_metadata, bs: int) -> None:
+        if not (self.kv_shuffled and attn_metadata.has_cached):
+            return
+        # The shuffled cached-prefix gather (gather_kv_b_proj with
+        # shuffled_kv_cache=True) reads block_size-token blocks, so it needs
+        # block-granular CSR indices (logical block ids) instead of the
+        # token-granular kv_indices used by the plain layout. Build them from
+        # the full per-seq context (cached + just-written new tokens).
+        block_size = self.model_runner.block_size
+        var = self.model_runner.forward_vars
+        block_counts = (
+            attn_metadata.context_lens[:bs] + (block_size - 1)
+        ) // block_size
+        indptr = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        torch.cumsum(block_counts, dim=0, dtype=torch.int32, out=indptr[1:])
+
+        # Sizes from the host mirror of context_lens, so no device sync.
+        host_counts = (var["context_lens"].np[:bs] + (block_size - 1)) // block_size
+        indices = torch.empty(
+            int(host_counts.sum()), dtype=torch.int32, device=self.device
+        )
+        kv_indices_generate_triton(
+            var["block_tables"].gpu[:bs], indices, indptr, 1, int(host_counts.max())
+        )
+
+        attn_metadata.shuffle_kv_block_indptr = indptr
+        attn_metadata.shuffle_kv_block_indices = indices
+        # If the cached prefix was chunked (total_kv > attn_prefill_chunk_size),
+        # rebuild block-aligned chunk metadata so
+        # the per-chunk gather can read the shuffled blocks. Otherwise the
+        # single-pass gather above is used (mla_chunk_meta stays None).
+        if (
+            hasattr(attn_metadata, "mla_chunk_meta")
+            and attn_metadata.mla_chunk_meta is not None
+        ):
+            attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta_shuffle(
+                attn_metadata, bs
+            )
+
+    def _build_mla_chunk_meta_shuffle(self, attn_metadata, bs: int):
+        """Block-aligned variant of ``_build_mla_chunk_meta`` for the shuffled
+        KV layout.
+
+        The shuffled gather reads whole ``block_size``-token blocks, so chunks
+        are split along the *block* axis (≤ ``attn_prefill_chunk_size //
+        block_size`` blocks per chunk) rather than the token axis. Each chunk
+        carries block-granular CSR (``shuffle_kv_block_indptr/indices``) plus
+        token-granular ``cu_seqlens_k`` (output positions / flash_attn lens).
+
+        Built entirely on-device from the GPU ``num_cached_tokens`` and the
+        dense logical block table.
+        """
+        device = self.device
+        block_size = self.model_runner.block_size
+        chunk_blocks = max(1, self.attn_prefill_chunk_size // block_size)
+
+        cached = attn_metadata.num_cached_tokens[:bs].to(torch.int64)  # [bs]
+        per_seq_blocks = (cached + (block_size - 1)) // block_size  # [bs]
+        total_blocks = int(per_seq_blocks.sum().item())
+        if total_blocks == 0:
+            return None
+        num_chunks = (total_blocks + chunk_blocks - 1) // chunk_blocks
+
+        # Global logical block list in per-seq CSR order (leading cached blocks
+        # of each seq), via a masked select on the dense block table.
+        block_tables = self.model_runner.forward_vars["block_tables"].gpu[:bs]
+        col = torch.arange(block_tables.shape[1], device=device)
+        global_blocks = block_tables[col[None, :] < per_seq_blocks[:, None]].to(
+            torch.int32
+        )  # [total_blocks]
+        blk_offsets = torch.zeros(bs + 1, dtype=torch.int64, device=device)
+        blk_offsets[1:] = torch.cumsum(per_seq_blocks, dim=0)
+
+        blk_indptr_list: list[torch.Tensor] = []
+        blk_indices_list: list[torch.Tensor] = []
+        cu_seqlens_k_list: list[torch.Tensor] = []
+        chunk_total_tokens: list[torch.Tensor] = []
+        chunk_max_seqlen_k: list[torch.Tensor] = []
+
+        for c in range(num_chunks):
+            gb_start = c * chunk_blocks
+            gb_end = min(gb_start + chunk_blocks, total_blocks)
+            # Per-seq local block range covered by this chunk.
+            seq_lo = blk_offsets[:bs].clamp(gb_start, gb_end)
+            seq_hi = blk_offsets[1 : bs + 1].clamp(gb_start, gb_end)
+            per_seq_chunk_blocks = (seq_hi - seq_lo).to(torch.int32)
+            local_lo = seq_lo - blk_offsets[:bs]  # first local block in chunk
+            local_hi = seq_hi - blk_offsets[:bs]  # last+1 local block in chunk
+            # Token count: full blocks * block_size, clamped to cached_len for
+            # the seq's final (partial) block.
+            per_seq_chunk_tokens = (
+                (torch.minimum(local_hi * block_size, cached) - local_lo * block_size)
+                .clamp_min(0)
+                .to(torch.int32)
+            )
+
+            blk_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            blk_indptr[1:] = torch.cumsum(per_seq_chunk_blocks, dim=0)
+            cu_k = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            cu_k[1:] = torch.cumsum(per_seq_chunk_tokens, dim=0)
+
+            blk_indptr_list.append(blk_indptr)
+            blk_indices_list.append(global_blocks[gb_start:gb_end])
+            cu_seqlens_k_list.append(cu_k)
+            chunk_total_tokens.append(cu_k[-1])
+            chunk_max_seqlen_k.append(per_seq_chunk_tokens.max())
+
+        # Single host sync for the python-int scalars the forward consumes.
+        total_tokens_list = torch.stack(chunk_total_tokens).tolist()
+        max_seqlen_k_list = torch.stack(chunk_max_seqlen_k).tolist()
+
+        return MLAChunkContextMetadata(
+            kv_indptr=blk_indptr_list,  # unused by shuffle gather; kept for parity
+            kv_indices=blk_indices_list,
+            cu_seqlens_k=cu_seqlens_k_list,
+            total_tokens=total_tokens_list,
+            max_seqlen_k=max_seqlen_k_list,
+            num_chunks=num_chunks,
+            k_workspace=self.k_chunk_workspace,
+            v_workspace=self.v_chunk_workspace,
+            shuffle_kv_block_indptr=blk_indptr_list,
+            shuffle_kv_block_indices=blk_indices_list,
+        )
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
