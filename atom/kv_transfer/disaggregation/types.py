@@ -25,6 +25,21 @@ ReqId = str | int
 TransferId = int
 
 
+def kv_config_has_producer(kv_config: object) -> bool:
+    """Whether a KV config contains a P/D producer, including ``multi``.
+
+    Both the scheduler and the model runner branch on this: a producer
+    prefills and hands the request off after one token, so it never
+    speculates. It still defers output (unless its attention keeps recurrent
+    state), so surfacing that token can take one extra q=1 decode.
+    """
+    if not isinstance(kv_config, dict):
+        return False
+    if kv_config.get("kv_role") == "kv_producer":
+        return True
+    return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
+
+
 @dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.
@@ -428,8 +443,9 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
-    # The producer's state slot, for a connector that moves per-request state
-    # by slot. -1 when the model keeps none.
+    # Producer's final committed state slot. This is distinct from
+    # `local_slot_index`, which is the consumer destination slot. Prefix
+    # checkpointing may move the producer request after admission.
     remote_slot_index: int = -1
 
     # PD incremental: blocks already in decode's prefix cache; both sides

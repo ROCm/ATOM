@@ -19,6 +19,29 @@ from atom.models import qwen4_exp
 from atom.quant_spec import LayerQuantConfig
 
 
+def test_stacked_expert_loader_ignores_fused_shared_expert_map_tail():
+    routed = 6
+    w13 = torch.nn.Parameter(torch.zeros(3, 4, 2))
+    w2 = torch.nn.Parameter(torch.zeros(3, 2, 2))
+    w13.weight_loader = lambda *args, **kwargs: None
+    w2.weight_loader = lambda *args, **kwargs: None
+    experts = SimpleNamespace(
+        moe_parallel_config=SimpleNamespace(tp_rank=0),
+        expert_layout=SimpleNamespace(num_routed=routed),
+        expert_map=torch.tensor([0, 1, 2, -1, -1, -1, 3, -1]),
+        w13_weight=w13,
+        w2_weight=w2,
+    )
+    qwen4_exp.install_stacked_expert_loaders(experts)
+
+    source_w13 = torch.arange(routed * 4 * 2).reshape(routed, 4, 2)
+    source_w2 = torch.arange(routed * 2 * 2).reshape(routed, 2, 2)
+    w13.weight_loader(w13, source_w13)
+    w2.weight_loader(w2, source_w2)
+    torch.testing.assert_close(w13, source_w13[:3].float())
+    torch.testing.assert_close(w2, source_w2[:3].float())
+
+
 def ptpc_config():
     config = QuantizationConfig()
     config.quant_method = "compressed-tensors"
