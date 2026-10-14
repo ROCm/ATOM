@@ -2028,9 +2028,7 @@ class Scheduler:
         elif self.prefill_delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
-            running_decode_batch = max(
-                0, len(self.running) - self._partial_prefill_count
-            )
+            running_decode_batch = self._running_decode_count()
             protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
@@ -3994,10 +3992,27 @@ class Scheduler:
         block = self._pp_inflight_token_block
         if not block:
             return False
-        running_decode = len(self.running) - self._partial_prefill_count
-        if not self.prefill_delayer.protects_decode(running_decode):
+        if not self.prefill_delayer.protects_decode(self._running_decode_count()):
             return False
         return all(seq.is_partial_prefill or seq.id in block for seq in self.running)
+
+    def _running_decode_count(self) -> int:
+        """Running seqs past their first token: the decode the delayer protects.
+
+        Under PP a final prompt chunk clears `is_partial_prefill` when it is
+        scheduled, while its forward is still in the pipeline. Until a token
+        comes back the seq is prefill work, and one that stops on that token
+        never decodes; counting it would hold every later prefill for a full
+        pipeline round trip.
+        """
+        n = len(self.running) - self._partial_prefill_count
+        if self.advance_on_schedule and self._pp_inflight_token_block:
+            n -= sum(
+                1
+                for seq in self.running
+                if not seq.is_partial_prefill and seq.num_completion_tokens == 0
+            )
+        return max(0, n)
 
     def mark_pp_inflight(self, batch: ScheduledBatch) -> None:
         """Head: block re-scheduling of seqs whose token is now in flight.

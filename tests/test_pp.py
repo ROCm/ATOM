@@ -770,6 +770,43 @@ def test_decode_window_not_spent_while_all_decode_in_flight():
     assert delayer._decode_interval_remaining == 0
 
 
+def test_prefill_in_flight_does_not_hold_the_next_prefill():
+    """A final prompt chunk still in flight is not decode to protect."""
+    from atom.model_engine.prefill_delayer import PrefillDelayer
+
+    cfg = _pp_config(max_num_batched_tokens=1024)
+    sched = Scheduler(cfg)
+    delayer = PrefillDelayer(
+        dp_size=1,
+        cpu_group=None,
+        max_num_batched_tokens=1024,
+        prefill_decode_interval=4,
+    )
+    sched.set_prefill_delayer(delayer)
+    first = _make_seq(32, block_size=cfg.kv_cache_block_size)
+    sched.add(first)
+    batch1, _ = sched.schedule()
+    assert batch1.is_final_chunk == [True]
+    sched.mark_pp_inflight(batch1)
+    delayer.notify_prefill_executed()
+
+    second = _make_seq(32, block_size=cfg.kv_cache_block_size)
+    sched.add(second)
+    batch2, _ = sched.schedule()
+    assert list(batch2.req_ids) == [second.id]
+    assert batch2.total_seqs_num_prefill == 1
+
+    # Once its token is back, the first seq is decode and the window holds.
+    first.token_ids.append(42)
+    first.num_tokens += 1
+    first.type = SequenceType.DECODE
+    sched.release_pp_inflight(batch1)
+    delayer.notify_prefill_executed()
+    sched.add(_make_seq(32, block_size=cfg.kv_cache_block_size))
+    batch3, _ = sched.schedule()
+    assert batch3.total_seqs_num_prefill == 0
+
+
 def test_multiple_seqs_partial_and_final():
     cfg = _pp_config(max_num_batched_tokens=200)
     sched = Scheduler(cfg)
