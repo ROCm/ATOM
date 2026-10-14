@@ -185,7 +185,9 @@ class SymmetricPeerBuffer:
                 # MonoUnsupported, so an OOM or a failed IPC export here must
                 # disable mono, not take the server down with it. The old
                 # PeerBuffer raised MonoUnsupported for the same reason.
-                raise MonoUnsupported(f"symmetric peer allocation/export failed: {detail}")
+                raise MonoUnsupported(
+                    f"symmetric peer allocation/export failed: {detail}"
+                )
 
             addresses = []
             open_error = None
