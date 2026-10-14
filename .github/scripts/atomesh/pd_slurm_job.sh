@@ -135,19 +135,54 @@ for key, value in sorted(os.environ.items()):
 PY
 }
 
-pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
-
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
+# Succeeds only when the scheduler answers and no longer lists the job; an
+# unreachable controller counts as "still active".
+scheduler_job_inactive() {
+  local job_id="$1"
+  local active
+  command -v squeue >/dev/null 2>&1 || return 1
+  if command -v timeout >/dev/null 2>&1; then
+    active="$(timeout 10 squeue -h -j "${job_id}" -o %i 2>/dev/null)" || return 1
   else
+    active="$(squeue -h -j "${job_id}" -o %i 2>/dev/null)" || return 1
+  fi
+  [[ -z "${active//[[:space:]]/}" ]]
+}
+
+# Spur can place several jobs on one node despite --exclusive, and every worker
+# runs this on start. Stopping all containers would kill co-scheduled jobs, so
+# only stop this job's leftovers and atomesh containers of finished jobs.
+pre_cleanup_local() {
+  echo "=== pre-cleanup: stop stale atomesh containers on $(hostname) ==="
+  set +e
+  local id name status owner_job
+  local stale=()
+  local kept_active=0
+  while IFS=$'\t' read -r id name status; do
+    [[ -n "${id}" ]] || continue
+    owner_job=""
+    if [[ "${name}" =~ ^atomesh-.+-([0-9]+)-[0-9]+(-benchmark|-eval)?$ ]]; then
+      owner_job="${BASH_REMATCH[1]}"
+    fi
+    if [[ "${owner_job}" == "${JOB_ID}" ]]; then
+      echo "  stop ${id} ${name} (${status}): leftover of this job"
+      stale+=("${id}")
+    elif [[ -n "${owner_job}" ]] && scheduler_job_inactive "${owner_job}"; then
+      echo "  stop ${id} ${name} (${status}): job ${owner_job} is no longer active"
+      stale+=("${id}")
+    else
+      echo "  keep ${id} ${name} (${status})"
+      kept_active=1
+    fi
+  done < <(docker ps --format '{{.ID}}\t{{.Names}}\t{{.Status}}' 2>/dev/null)
+
+  if [[ "${#stale[@]}" -gt 0 ]]; then
+    docker stop -t 0 "${stale[@]}" >/dev/null 2>&1 || true
+  elif [[ "${kept_active}" -eq 0 ]]; then
     echo "no running containers"
+  fi
+  if [[ "${kept_active}" -eq 1 ]]; then
+    echo "WARNING: $(hostname) still runs containers of other jobs; GPUs may be shared with them" >&2
   fi
   set -e
 }
