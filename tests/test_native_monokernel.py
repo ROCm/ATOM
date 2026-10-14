@@ -178,6 +178,7 @@ def test_peer_buffer_allocation_failure_is_collective(monkeypatch):
     import torch
 
     from atom.mono.runtime import peer_memory as runtime
+    from atom.mono.runtime.consensus import MonoUnsupported
 
     gathers = []
     monkeypatch.setattr(runtime.torch.cuda, "current_device", lambda: 0)
@@ -199,7 +200,7 @@ def test_peer_buffer_allocation_failure_is_collective(monkeypatch):
 
     group = object()
     with pytest.raises(
-        RuntimeError, match="allocation/export failed.*rank 0 allocation failed"
+        MonoUnsupported, match="allocation/export failed.*rank 0 allocation failed"
     ):
         runtime.SymmetricPeerBuffer(256, rank=0, npes=2, group=group)
 
@@ -211,6 +212,7 @@ def test_peer_buffer_remote_open_failure_is_collective(monkeypatch):
     import torch
 
     from atom.mono.runtime import peer_memory as runtime
+    from atom.mono.runtime.consensus import MonoUnsupported
 
     class Storage:
         device = torch.device("cuda", 0)
@@ -262,7 +264,7 @@ def test_peer_buffer_remote_open_failure_is_collective(monkeypatch):
     )
 
     group = object()
-    with pytest.raises(RuntimeError, match="open failed.*rank 0 open failed"):
+    with pytest.raises(MonoUnsupported, match="open failed.*rank 0 open failed"):
         runtime.SymmetricPeerBuffer(256, rank=0, npes=3, group=group)
 
     assert len(gathers) == 2

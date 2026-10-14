@@ -46,15 +46,17 @@ attention seam through the KDA recurrence, and K2, `o_proj` plus the latent
 MoE. The MLA layers keep the production paged path.
 
 `ATOM_MONO_ENABLE` defaults to `1`, so a qualifying deployment gets mono
-without being asked. It needs TP8, DSpark, FP8 KV, DCP1,
-`--cudagraph-mode FULL` and `ATOM_ENABLE_REPLAYSSM=0`. Neither of the last two
-is a default:
+without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
+`ATOM_ENABLE_REPLAYSSM=0`. Only the last of those is not already a default:
 
-- `--level 3` (itself the default) sets `cudagraph_mode` to **PIECEWISE** for
-  every model except DeepSeek-V4.1, and K3 mono refuses PIECEWISE. Leave the
-  flag off and the server runs correctly on the production path, logging
-  `Kimi-K3 mono decode off: piecewise cudagraph` -- which is easy to miss, so
-  read that line rather than assuming the default armed it.
+- FULL cudagraph **is** the CLI default (`cudagraph_mode: str = "FULL"`,
+  `atom/model_engine/arg_utils.py:145`, passed through at :768), so a launch
+  from the CLI arms mono without passing `--cudagraph-mode` at all. The
+  `None -> PIECEWISE` default at `atom/config.py:2393` applies only to a
+  config that never went through `arg_utils` -- i.e. plugin mode -- and K3
+  mono refuses PIECEWISE, logging `Kimi-K3 mono decode off: piecewise
+  cudagraph`. The examples below still pass the flag explicitly, because it
+  costs nothing and makes the requirement visible in the command.
 - `ATOM_ENABLE_REPLAYSSM` defaults ON whenever spec decode is used, and K1
   resumes a request from a per-token snapshot slot that ReplaySSM does not
   keep live.

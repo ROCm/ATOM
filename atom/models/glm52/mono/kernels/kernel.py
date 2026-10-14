@@ -1823,6 +1823,13 @@ def build_glm5_monokernel(
                 r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
                 r_index_cache = _rsrc(indices)
                 for s in range_constexpr(S):
+                    # Same gate the MLA kv/pe writes above use: a pad row has
+                    # slot_mapping -1 and row_position 0, so an ungated store
+                    # would land on row 0 of whatever page this request's block
+                    # table happens to point at and clobber a live request's
+                    # position-0 index key. The mailbox publishes below stay
+                    # ungated -- index_score polls every row.
+                    active = row_writes_cache(s)
                     ik = getf(mb("index_k"), s * INDEX_DIM + fx.min(tid, INDEX_DIM - 1))
                     live = tid < INDEX_DIM
                     iv = live.select(ik, fx.Float32(0.0))
@@ -1866,18 +1873,19 @@ def build_glm5_monokernel(
                             page, row = index_page_cell(s, row_position(s))
                             pair = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & fx.Int32(0xFFFF)
                             upper_pair = bpermute_i32(fp8_pe_upper_pair_lane(lane) * 4, pair)
-                            if lane % 2 == 0:
-                                bo.buffer_store(
-                                    pair | (upper_pair << 16),
-                                    r_index_cache,
-                                    index_fp8_data_dword(page, row, i0, index_page_size),
-                                )
-                            if tid == 0:
-                                bo.buffer_store(
-                                    qs,
-                                    r_index_cache,
-                                    index_fp8_scale_dword(page, row, index_page_size),
-                                )
+                            if active:
+                                if lane % 2 == 0:
+                                    bo.buffer_store(
+                                        pair | (upper_pair << 16),
+                                        r_index_cache,
+                                        index_fp8_data_dword(page, row, i0, index_page_size),
+                                    )
+                                if tid == 0:
+                                    bo.buffer_store(
+                                        qs,
+                                        r_index_cache,
+                                        index_fp8_scale_dword(page, row, index_page_size),
+                                    )
                             # Consumer: the index_score stage's own-row branch
                             # (`safe_key >= first_position`, below, which selects
                             # the mailbox over a cache read precisely for the
@@ -1894,11 +1902,12 @@ def build_glm5_monokernel(
                             d0, d1 = _fp8_roundtrip(q0, q1)
                             put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [d0 * qs, d1 * qs])
                         else:
-                            bo.buffer_store(
-                                fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16),
-                                r_index_cache,
-                                index_page_slot(s, row_position(s)) * INDEX_DIM + i0,
-                            )
+                            if active:
+                                bo.buffer_store(
+                                    fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16),
+                                    r_index_cache,
+                                    index_page_slot(s, row_position(s)) * INDEX_DIM + i0,
+                                )
                             put_bf(mb("index_k_new"), s * INDEX_DIM + i0, [v0, v1])
                     gpu.barrier()
                     if tid == 0:

@@ -214,7 +214,14 @@ def layer_weights(
         "fused shared-expert count",
     )
     need(not experts.use_ep, "expert parallelism")
-    need(not experts.quant_method.is_guinterleave, "ATOM_MOE_GU_ITLV must be 0")
+    # ``is_guinterleave`` exists only on ``Mxfp4MoEMethod``. A GLM-5/GLM-5.2
+    # FP8 checkpoint has the same ``glm_moe_dsa`` model type and reaches here
+    # with ``Fp8MoEMethod``, where a bare attribute read raises AttributeError
+    # -- which ``_build`` does not catch, so the server dies instead of
+    # falling back. Everything below reads MXFP4 storage, so refuse first.
+    gu_interleave = getattr(experts.quant_method, "is_guinterleave", None)
+    need(gu_interleave is not None, "experts are not MXFP4")
+    need(not gu_interleave, "ATOM_MOE_GU_ITLV must be 0")
     need(experts.intermediate_size_per_partition == cfg.inter, "expert width")
     for name, norm, size in (
         ("input_layernorm", layer.input_layernorm, cfg.hidden),

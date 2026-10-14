@@ -180,7 +180,12 @@ class SymmetricPeerBuffer:
             ]
             if failed:
                 detail = "; ".join(f"rank {peer}: {error}" for peer, error in failed)
-                raise RuntimeError(f"symmetric peer allocation/export failed: {detail}")
+                # MonoUnsupported, not RuntimeError: the GLM runner's _build
+                # catches (MonoUnsupported, ValueError) and LazyRunner catches
+                # MonoUnsupported, so an OOM or a failed IPC export here must
+                # disable mono, not take the server down with it. The old
+                # PeerBuffer raised MonoUnsupported for the same reason.
+                raise MonoUnsupported(f"symmetric peer allocation/export failed: {detail}")
 
             addresses = []
             open_error = None
@@ -213,7 +218,7 @@ class SymmetricPeerBuffer:
                         pass
                 self._remote_bases.clear()
                 detail = "; ".join(f"rank {peer}: {error}" for peer, error in failed)
-                raise RuntimeError(f"symmetric peer open failed: {detail}")
+                raise MonoUnsupported(f"symmetric peer open failed: {detail}")
 
             dist.barrier(group=group)
         assert device is not None

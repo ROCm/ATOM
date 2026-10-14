@@ -195,10 +195,12 @@ def config_refusal(atom_config) -> str | None:
     spec = atom_config.speculative_config
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     # `piecewise_cudagraph_required` is left at its default True, which refuses
-    # PIECEWISE -- and `--level 3`, itself the default, sets PIECEWISE for every
-    # model but DeepSeek-V4.1. So a K3 launch has to pass `--cudagraph-mode
-    # FULL` (or run eager) to arm mono at all; every launch example does, and
-    # `recipes/Kimi-K3.md` says why.
+    # PIECEWISE. That is NOT what a CLI launch gets: `cudagraph_mode` defaults
+    # to "FULL" (`model_engine/arg_utils.py:145`, converted at :768), so mono
+    # arms from the CLI without `--cudagraph-mode` being passed. The
+    # `None -> PIECEWISE` default at `config.py:2393` is reached only by a
+    # config built without `arg_utils`, i.e. plugin mode, which this refusal
+    # then turns mono off for. `recipes/Kimi-K3.md` says the same.
     #
     # Structurally K3 could drop this refusal the way GLM-5.2 does: the
     # installer wraps the *uncompiled* `KimiK3ForConditionalGeneration` and the
