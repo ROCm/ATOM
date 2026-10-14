@@ -319,7 +319,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
     runner.config.enable_tbo = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
-    runner._piecewise_cg_active = lambda: False
+    runner._piecewise_cg_active = lambda **_: False
     runner._local_tbo_eligibility = lambda batch: False
     runner.prepare_inputs = lambda *args, **kwargs: None
     mode = SimpleNamespace(sync=None, max_seqlen_q=1, running_bs=4)
@@ -384,7 +384,7 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
     runner.config.enable_tbo = False
     runner.capture_sizes_np = np.array([1, 2, 4, 8])
     runner._dspark_apply_q_bucket = lambda batch: None
-    runner._piecewise_cg_active = lambda: False
+    runner._piecewise_cg_active = lambda **_: False
     runner._local_tbo_eligibility = lambda batch: False
     mode = SimpleNamespace(sync=None, max_seqlen_q=4, running_bs=4)
     monkeypatch.setattr(model_runner.ForwardMode, "decide", lambda **kwargs: mode)

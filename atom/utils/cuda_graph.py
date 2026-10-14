@@ -471,6 +471,22 @@ class CudagraphCaptureRunner:
                 out_buf.copy_(result)
         self._graphs[key] = {"graph": graph, "in": refresh, "out": out_buf}
 
+    def capture_on_demand(self, key, in_bufs, refresh, compute_fn, output_slot):
+        """Record a live core after warmup, returning that warmup's result once."""
+        if not hasattr(self, "capture_stream"):
+            self.capture_stream = torch.cuda.Stream()
+        current = torch.cuda.current_stream()
+        self.capture_stream.wait_stream(current)
+        with torch.cuda.stream(self.capture_stream):
+            warm = compute_fn(**in_bufs)
+            slot = None if warm is None else output_slot(warm)
+            self.capture(key, in_bufs, refresh, compute_fn, slot)
+            self._graphs[key]["read_from"] = in_bufs
+            if slot is not None:
+                slot.copy_(warm)
+        current.wait_stream(self.capture_stream)
+        return slot
+
     def replay(self, key, named_args: dict) -> torch.Tensor | None:
         """Refresh the inputs this runner owns, replay, and return the output."""
         entry = self._graphs[key]

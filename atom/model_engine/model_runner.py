@@ -1700,7 +1700,7 @@ class ModelRunner:
         # geometry (hidden*dtype*layers*k), not a magic constant. Under-reserve is
         # safe: capture re-checks live free mem per bucket and skips oversized.
         piecewise_overhead = 0
-        if self._piecewise_cg_active():
+        if self._piecewise_cg_active(prefill=True):
             cap_sizes = self.config.compilation_config.cudagraph_capture_sizes or [
                 self.config.max_num_seqs
             ]
@@ -1732,8 +1732,8 @@ class ModelRunner:
                 {bs * q for bs in cap_sizes for q in q_buckets}
                 | {bs * q for bs, q in extra_shapes}
             )
-            if self._hybrid_cg_active():
-                all_shapes = self._hybrid_piecewise_tokens()
+            if not self._piecewise_cg_active():
+                all_shapes = self._piecewise_prefill_tokens()
             # Mirror the capture-loop token-budget skip: a bucket over
             # `max_num_batched_tokens` is not schedulable and is not captured,
             # so reserving for it would only shrink KV.
@@ -1762,7 +1762,7 @@ class ModelRunner:
                 per_token_bytes / (1 << 20),
                 overhead / (1 << 30),
             )
-            if self._piecewise_decode_cg_active():
+            if self._piecewise_cg_active():
                 return overhead
             piecewise_overhead = overhead
         overhead = activation_bytes * 0.2
@@ -2502,7 +2502,7 @@ class ModelRunner:
             # second search on this rank's own count is how the two came to
             # disagree. A miss there forwards the run eagerly, which is what the
             # branch above already does under `enforce_eager`.
-            if not self._piecewise_decode_cg_active():
+            if not self._piecewise_cg_active():
                 return  # stay rectangular
 
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
@@ -2719,11 +2719,7 @@ class ModelRunner:
             capture_sizes_by_q=getattr(self, "capture_sizes_by_q", None),
             captured_tokens=(
                 self._piecewise_sorted_tokens
-                if self._piecewise_cg_active()
-                and (
-                    batch.total_tokens_num_prefill > 0
-                    or self._piecewise_decode_cg_active()
-                )
+                if self._piecewise_cg_active(prefill=batch.total_tokens_num_prefill > 0)
                 else None
             ),
             is_block_drafter=(
@@ -3251,7 +3247,7 @@ class ModelRunner:
                 running_tokens = forward_mode.running_tokens
                 scheduled_tokens = context.scheduled_tokens
 
-                if self._piecewise_decode_cg_active():
+                if self._piecewise_cg_active():
                     _ids, _pos = self._padded_decode_inputs(forward_mode)
                     forward_context.cudagraph_runtime_mode = (
                         CUDAGraphMode.PIECEWISE
@@ -3630,7 +3626,7 @@ class ModelRunner:
             not self.tokenID_processor.is_pd_producer
             or not hasattr(self, "drafter")
             or self.enforce_eager
-            or self._piecewise_decode_cg_active()
+            or self._piecewise_cg_active()
             or not hasattr(self, "graphs")
         ):
             return None
@@ -3808,29 +3804,18 @@ class ModelRunner:
             self.capture_profiler = nullcontext()
 
     @torch.inference_mode()
-    def _piecewise_cg_active(self) -> bool:
-        """Whether either execution phase needs per-piece CUDA graphs."""
+    def _piecewise_cg_active(self, *, prefill=False) -> bool:
+        """Whether this phase replays per-piece graphs instead of FULL decode."""
         if self.enforce_eager:
             return False
         mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
-        return mode is not None and mode.requires_piecewise_compilation()
-
-    def _piecewise_decode_cg_active(self) -> bool:
-        """FULL_AND_PIECEWISE keeps decode on rectangular whole-forward graphs."""
         return (
-            self._piecewise_cg_active()
-            and self.config.compilation_config.cudagraph_mode.decode_mode()
+            mode is not None
+            and (mode.mixed_mode() if prefill else mode.decode_mode())
             == CUDAGraphMode.PIECEWISE
         )
 
-    def _hybrid_cg_active(self) -> bool:
-        return (
-            not self.enforce_eager
-            and self.config.compilation_config.cudagraph_mode
-            == CUDAGraphMode.FULL_AND_PIECEWISE
-        )
-
-    def _hybrid_piecewise_tokens(self):
+    def _piecewise_prefill_tokens(self):
         tokens = [
             t
             for t in self.config.capture_sizes
@@ -3838,22 +3823,6 @@ class ModelRunner:
         ]
         extra = self._extra_piecewise_capture_shapes(tokens, [1])
         return sorted(set(tokens) | {bs * q for bs, q in extra})
-
-    def _hybrid_decode_sizes(self, q, full_q):
-        tokens = self.config.capture_sizes
-        ceiling = min(max(tokens), self.config.max_num_batched_tokens)
-        max_bs = max_schedulable_decode_bs(
-            self.config.max_num_seqs, self.config.max_num_batched_tokens, full_q
-        )
-        return sorted(
-            {
-                (t + q - 1) // q
-                for t in tokens
-                if t > 0
-                and ((t + q - 1) // q) * q <= ceiling
-                and (t + q - 1) // q <= max_bs
-            }
-        )
 
     def _force_aiter_unreg_capture_for_piecewise(self):
         """PIECEWISE cudagraph + aiter custom all_gather/reduce_scatter: force the
@@ -4055,21 +4024,32 @@ class ModelRunner:
 
     def _cudagraph_capture_plan(self, q_buckets):
         """Capture PIECEWISE first, then FULL; each uses descending token sizes."""
-        if self._hybrid_cg_active():
-            return [
-                (CUDAGraphMode.PIECEWISE, 1, self._hybrid_piecewise_tokens()[::-1]),
-                *(
-                    (
-                        CUDAGraphMode.FULL,
-                        q,
-                        self._hybrid_decode_sizes(q, max(q_buckets))[::-1],
-                    )
-                    for q in q_buckets
-                ),
+        if self._piecewise_cg_active(prefill=True) and not self._piecewise_cg_active():
+            tokens = self.config.capture_sizes
+            ceiling = min(max(tokens), self.config.max_num_batched_tokens)
+            max_bs = max_schedulable_decode_bs(
+                self.config.max_num_seqs,
+                self.config.max_num_batched_tokens,
+                max(q_buckets),
+            )
+            plan = [
+                (CUDAGraphMode.PIECEWISE, 1, self._piecewise_prefill_tokens()[::-1])
             ]
-        plan = []
-        if self._piecewise_cg_active():
-            sizes_by_q = {q: list(self.capture_sizes) for q in q_buckets}
+            for q in q_buckets:
+                sizes = {(t + q - 1) // q for t in tokens if t > 0}
+                sizes = sorted(
+                    (bs for bs in sizes if bs <= min(max_bs, ceiling // q)),
+                    reverse=True,
+                )
+                plan.append((CUDAGraphMode.FULL, q, sizes))
+            return plan
+        mode = (
+            CUDAGraphMode.PIECEWISE
+            if self._piecewise_cg_active()
+            else CUDAGraphMode.FULL
+        )
+        sizes_by_q = {q: list(self.capture_sizes) for q in q_buckets}
+        if mode == CUDAGraphMode.PIECEWISE:
             extra_shapes = self._extra_piecewise_capture_shapes(
                 self.capture_sizes, q_buckets
             )
@@ -4080,14 +4060,7 @@ class ModelRunner:
                 )
             for bs, q in extra_shapes:
                 sizes_by_q.setdefault(q, []).append(bs)
-            plan.extend(
-                (CUDAGraphMode.PIECEWISE, q, sizes) for q, sizes in sizes_by_q.items()
-            )
-        if not self._piecewise_decode_cg_active():
-            plan.extend(
-                (CUDAGraphMode.FULL, q, list(self.capture_sizes)) for q in q_buckets
-            )
-        return plan
+        return [(mode, q, sizes) for q, sizes in sizes_by_q.items()]
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -4100,7 +4073,8 @@ class ModelRunner:
 
         warmup_exchange(self.device)
 
-        _piecewise = self._piecewise_cg_active()
+        _piecewise = self._piecewise_cg_active(prefill=True)
+        enable_piecewise_prefill = _piecewise and not self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
         cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
         attn_ffn_piecewise = (
@@ -4117,11 +4091,14 @@ class ModelRunner:
         # Config owns the declared ladder; the runner only narrows it to what
         # this deployment can actually schedule (see the bound below).
         self.capture_sizes = self.config.capture_sizes
-        if self._hybrid_cg_active():
-            full_q = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+        q_buckets = self._dspark_capture_q_buckets(full_q_len)
+        if enable_piecewise_prefill:
+            capture_plan = self._cudagraph_capture_plan(q_buckets)
             self.capture_sizes_by_q = {
-                q: np.asarray(self._hybrid_decode_sizes(q, full_q), dtype=np.int32)
-                for q in self._dspark_capture_q_buckets(full_q)
+                q: np.asarray(sizes[::-1], dtype=np.int32)
+                for mode, q, sizes in capture_plan
+                if mode == CUDAGraphMode.FULL
             }
             # Draft passes must warm every BS any target Q can dispatch.
             self.capture_sizes = sorted(
@@ -4129,7 +4106,7 @@ class ModelRunner:
             )
             logger.info(
                 "FULL_AND_PIECEWISE token buckets: %s; FULL BS by Q: %s",
-                self._hybrid_piecewise_tokens(),
+                capture_plan[0][2][::-1],
                 {q: sizes.tolist() for q, sizes in self.capture_sizes_by_q.items()},
             )
         self.capture_sizes.sort(reverse=True)
@@ -4154,7 +4131,6 @@ class ModelRunner:
         #
         # Warn rather than raise so a misconfig (default cuda_graph_sizes=[512]
         # vs e.g. max_num_seqs=16) stays recoverable.
-        full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         max_seq_bs = self.config.max_num_seqs
         max_tok_bs = self.config.max_num_batched_tokens // full_q_len
         max_bs = max_schedulable_decode_bs(
@@ -4229,7 +4205,6 @@ class ModelRunner:
         # Capture one graph per (bs, query-length bucket). Buckets default to
         # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
         # scheduling expands to the smaller q-buckets a decode step may replay.
-        q_buckets = self._dspark_capture_q_buckets(full_q_len)
         if q_buckets != [full_q_len]:
             logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
         elif hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
@@ -4289,7 +4264,8 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
-        capture_plan = self._cudagraph_capture_plan(q_buckets)
+        if not enable_piecewise_prefill:
+            capture_plan = self._cudagraph_capture_plan(q_buckets)
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for capture_mode, max_q_len, sizes in capture_plan:
@@ -4311,7 +4287,7 @@ class ModelRunner:
                     self._capture_trace_tag = (
                         f"{capture_mode.name.lower()}_bs_{bs}_q_{max_q_len}"
                     )
-                    if piecewise_capture and self._hybrid_cg_active():
+                    if piecewise_capture and enable_piecewise_prefill:
                         # This backend builds token-only metadata, with no live
                         # requests or speculative state to constrain prefill Q.
                         self.h2d_owner.begin()

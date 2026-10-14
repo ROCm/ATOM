@@ -71,6 +71,60 @@ def test_token_views_replay_with_separate_bucket_graph_pools():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+@pytest.mark.parametrize("void", [False, True])
+def test_piecewise_core_live_prefill_captures_once_and_refreshes_inputs(void):
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+    from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
+
+    @piecewise_core(capture_prefill=True, copy_per_step=("hidden",))
+    def core(layer, *, hidden: torch.Tensor):
+        layer.state.add_(1)
+        return None if void else hidden * 2
+
+    layer = SimpleNamespace(state=torch.zeros(1, device="cuda"))
+    runner, outputs = CudagraphCaptureRunner(), StableOutputs()
+    context = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(state=SimpleNamespace(name="PREFILL")),
+        in_hipgraph=False,
+    )
+    for i, tokens in enumerate((4, 4, 2, 4), 1):
+        result = core(
+            layer,
+            hidden=torch.full((tokens, 2), float(i), device="cuda"),
+            piecewise=True,
+            capture=True,
+            capture_key=("prefill", tokens),
+            forward_context=context,
+            runner=runner,
+            outputs=outputs,
+        )
+        assert layer.state.item() == i
+        if void:
+            assert result is None
+        else:
+            torch.testing.assert_close(result, torch.full_like(result, 2 * i))
+    assert len(runner._graphs) == 2
+
+    # Startup/FULL capture must not create a nested live attention graph.
+    context.in_hipgraph = True
+    context.attn_metadata.state.name = "DECODE"
+    core(
+        layer,
+        hidden=torch.ones(8, 2, device="cuda"),
+        piecewise=True,
+        capture=True,
+        capture_key=("prefill", 8),
+        forward_context=context,
+        runner=runner,
+        outputs=outputs,
+    )
+    assert layer.state.item() == 5
+    assert len(runner._graphs) == 2
+    runner.release_graphs()
+
+
 @pytest.mark.parametrize(
     "mode,expected",
     [

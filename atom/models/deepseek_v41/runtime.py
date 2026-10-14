@@ -17,6 +17,7 @@ from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
+from .af_attention import AttentionGraphs
 from .bounded_replay import (
     build_replay_plan,
     carry_selections,
@@ -117,30 +118,25 @@ def _piecewise_output(layer_name, kind, output):
 def v41_piecewise_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     context = get_forward_context()
     layer, rope = context.no_compile_layers[layer_name]
+    metadata = context.attn_metadata
     if (
         getattr(layer, "af_piecewise", False)
         and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+        and AttentionGraphs.eligible(layer.attn, metadata, context)
     ):
-        from .af_attention import AttentionGraphs
-
-        metadata = context.attn_metadata
-        if AttentionGraphs.eligible(layer.attn, metadata, context):
-            graphs = getattr(layer, "_af_attention", None)
-            if graphs is None:
-                graphs = layer._af_attention = AttentionGraphs()
-            output = graphs.forward(
-                layer.attn,
-                hidden,
-                metadata.cache,
-                metadata.step,
-                rope,
-                queries=metadata.queries,
-                output_slot=lambda value: _piecewise_slot(
-                    layer_name, "attention", value
-                ),
-                zero_copy_hidden=layer.af_zero_copy_hidden,
-            )
-            return output
+        if not hasattr(layer, "_af_attention"):
+            layer._af_attention = AttentionGraphs()
+        return layer._af_attention.forward(
+            layer.attn,
+            hidden,
+            metadata.cache,
+            metadata.step,
+            rope,
+            queries=metadata.queries,
+            output_slot=lambda value: _piecewise_slot(layer_name, "attention", value),
+            zero_copy_hidden=layer.af_zero_copy_hidden,
+            forward_context=context,
+        )
     return _piecewise_output(layer_name, "attention", v41_attention(hidden, layer_name))
 
 

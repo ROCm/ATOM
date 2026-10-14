@@ -6,10 +6,12 @@ consumer's output slot. Dynamic request metadata is published once per step,
 shared across layers. CSR construction belongs to the graph that consumes it.
 """
 
+from collections.abc import Callable
 from dataclasses import replace
 
 import torch
 
+from atom.utils.attn_ffn_piecewise import piecewise_core
 from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 from atom.utils.graph_holders import register_graph_holder
 
@@ -100,7 +102,6 @@ class AttentionGraphs(CudagraphCaptureRunner):
     def __init__(self):
         super().__init__()
         self.outputs = StableOutputs()
-        self.capture_stream = torch.cuda.Stream()
 
     def release_graphs(self):
         self.outputs = StableOutputs()
@@ -188,6 +189,10 @@ class AttentionGraphs(CudagraphCaptureRunner):
         if window is not None:
             step.window_rows = window
 
+    @piecewise_core(capture_prefill=True)
+    def _core(self, *, hidden: torch.Tensor, compute: Callable):
+        return compute(hidden)
+
     def forward(
         self,
         attention,
@@ -199,6 +204,7 @@ class AttentionGraphs(CudagraphCaptureRunner):
         *,
         output_slot=None,
         zero_copy_hidden=False,
+        forward_context=None,
     ):
         def slot_for(output):
             return (
@@ -229,18 +235,10 @@ class AttentionGraphs(CudagraphCaptureRunner):
             slot.copy_(output)
             return slot
         inputs = shared.prepare(tensors, step, zero_copy_hidden=zero_copy_hidden)
-        if self.has_graph(key):
-            # No per-layer input copies: the step publisher/dense producer has
-            # already written every address the graph captured.
-            output = self.replay(key, {})
-            self._publish(step, self._graphs[key]["published"])
-            return output
+        produced = []
 
-        produced = None
-
-        def compute(**read_from):
-            nonlocal produced
-            values = bind(read_from)
+        def compute(hidden):
+            values = bind({**inputs, ".hidden": hidden})
             ratio = attention.spec.ratio
             frozen = replace(
                 step,
@@ -264,27 +262,34 @@ class AttentionGraphs(CudagraphCaptureRunner):
                 values["hidden"], None, cache, frozen, rope, queries=query
             )
             layer = attention.spec.layer_id
-            produced = (
-                {layer: frozen.selected[layer]} if layer in frozen.selected else {},
-                {layer: frozen.candidates[layer]} if layer in frozen.candidates else {},
-                frozen.group_indices,
-                frozen.window_rows,
+            produced.append(
+                (
+                    {layer: frozen.selected[layer]} if layer in frozen.selected else {},
+                    (
+                        {layer: frozen.candidates[layer]}
+                        if layer in frozen.candidates
+                        else {}
+                    ),
+                    frozen.group_indices,
+                    frozen.window_rows,
+                )
             )
             return output
 
-        # Match V4's zero-copy policy: these are producer-owned fixed inputs.
-        current = torch.cuda.current_stream()
-        self.capture_stream.wait_stream(current)
-        with torch.cuda.stream(self.capture_stream):
-            warm = compute(**inputs)
-            warm_produced = produced
-            slot = slot_for(warm)
-            self.capture(key, inputs, {}, compute, slot)
-            self._graphs[key]["published"] = produced
-            # Keep producer buffers alive for all graph replays. The graph runner
-            # otherwise only retains COPIED inputs in its refresh dictionary.
-            self._graphs[key]["read_from"] = inputs
-            slot.copy_(warm)
-        current.wait_stream(self.capture_stream)
-        self._publish(step, warm_produced)
-        return slot
+        output = self._core(
+            hidden=inputs[".hidden"],
+            compute=compute,
+            piecewise=True,
+            capture=True,
+            runner=self,
+            output_slot=slot_for,
+            capture_key=key,
+            forward_context=forward_context,
+        )
+        entry = self._graphs[key]
+        if produced:
+            entry["published"] = produced[-1]
+            # Keep every staged metadata tensor alive with its recording.
+            entry["metadata"] = inputs
+        self._publish(step, produced[0] if produced else entry["published"])
+        return output

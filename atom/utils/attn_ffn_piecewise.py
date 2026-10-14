@@ -151,13 +151,18 @@ def piecewise_core(
     key: Callable[[Any], tuple] = lambda _fc: (),
     max_tokens: int | None = None,
     copy_per_step: tuple[str, ...] = (),
+    capture_prefill: bool = False,
 ):
     """Give the decorated function its own cudagraph, keyed per layer and shape.
 
     ``key`` adds whatever else changes the graph's shape beyond the layer and the
     token count -- for a decode core that is the bucket, `decode_bucket_key`.
-    Only DECODE steps are captured; a prefill runs eager, delivering into the
-    persistent output slot. ``max_tokens`` is an OPTIONAL extra cap on the rows
+    By default only DECODE steps are captured. ``capture_prefill=True`` also
+    permits live prefill capture: callers must stage dynamic metadata and pass
+    a complete ``capture_key``. Warmup executes once on a side stream; its
+    result is returned after recording, preserving the core's state effects.
+    ``output_slot`` can bind the result to a model-owned boundary buffer.
+    ``max_tokens`` is an OPTIONAL extra cap on the rows
     a captured graph covers -- a memory lever, off by default. It used to be 512
     and to be the only gate, which silently excluded every decode bucket above
     ~85 sequences at DSpark q=6.
@@ -215,6 +220,8 @@ def piecewise_core(
             runner=None,
             outputs=None,
             forward_context=None,
+            capture_key=None,
+            output_slot=None,
             **inputs,
         ):
             # FULL / eager: the body runs directly, so a caller on that path only
@@ -257,56 +264,65 @@ def piecewise_core(
             # `capture` off (plain PIECEWISE) short-circuits to the deliver tail
             # below: the core runs eager and only its result is stabilised, with
             # no graph of its own ever recorded.
-            # DECODE, not a row count. Prefill is what must not be captured --
-            # its shapes are one-off, and the compressor's prefill plan is
-            # sliced to an actual count rather than a graph-fixed capacity -- and
-            # asking that question directly beats bounding tokens and hoping the
-            # two coincide. They did not: at DSpark q=6 a 512-row bound also cut
-            # every decode above bs~85, so AF was silently OFF for the three
-            # largest buckets. `max_tokens` survives as an optional cap for the
-            # reason the bound was introduced (capture memory), now off by
-            # default -- the pool measured 8.37GB before the granularity split
-            # and 1.62GB after.
+            # Prefill opts in only after its caller stages metadata and keys
+            # every host branch. The default decode policy is unchanged.
+            capturing = getattr(forward_context, "in_hipgraph", False)
             eligible = (
                 capture
                 and not getattr(context, "is_dummy_run", False)
-                and getattr(forward_context, "attn_metadata", None) is not None
-                and _is_decode(forward_context)
+                and (
+                    not capturing
+                    if capture_prefill
+                    else getattr(forward_context, "attn_metadata", None) is not None
+                    and _is_decode(forward_context)
+                )
                 and (max_tokens is None or num_tokens <= max_tokens)
             )
             # num_tokens is a KEY DIM, not an incidental one: the graph is
             # captured at exactly this flat row count.
             graph_key = (
-                (layer_name, num_tokens) + tuple(key(forward_context))
+                (
+                    capture_key
+                    if capture_key is not None
+                    else (layer_name, num_tokens) + tuple(key(forward_context))
+                )
                 if eligible
                 else None
             )
-            # True only inside the capture pass: WHICH KIND of forward this is,
-            # building the graphs vs serving a real step.
-            capturing = getattr(forward_context, "in_hipgraph", False)
+            on_demand = capture_prefill and not capturing
+            if eligible and on_demand and capture_key is None:
+                raise ValueError("Live prefill capture requires a complete capture_key")
+
+            def slot_for(result):
+                return (
+                    output_slot(result)
+                    if output_slot is not None
+                    else outputs.slot(out_key, result)
+                )
 
             if graph_key is not None:
-                if capturing and not runner.has_graph(graph_key):
-                    # First time the capture pass reaches this key. Warm up on
-                    # the buffers the graph will read, size the output slot from
-                    # that result, then record.
+                if (capturing or on_demand) and not runner.has_graph(graph_key):
                     read_from, refresh = runner.input_buffers(
                         tensor_inputs, input_names, zero_copy
                     )
-                    # A void core -- one whose whole effect is on paged state --
-                    # has no result to stabilise and no slot to size.
+                    if on_demand:
+                        return runner.capture_on_demand(
+                            graph_key, read_from, refresh, core, slot_for
+                        )
                     warm = core(**read_from)
-                    out_slot = None if warm is None else outputs.slot(out_key, warm)
+                    out_slot = None if warm is None else slot_for(warm)
                     runner.capture(graph_key, read_from, refresh, core, out_slot)
                 elif runner.has_graph(graph_key) and not capturing:
                     return runner.replay(graph_key, tensor_inputs)
 
-            # Everything else: not eligible, the capture pass revisiting a key,
-            # or a step whose key was never captured. Also the tail of the
-            # capture branch above -- it fed on clones, so its result is not this
-            # forward's answer.
             result = core(**tensor_inputs)
-            return None if result is None else outputs.deliver(out_key, result)
+            if result is None:
+                return None
+            if output_slot is None:
+                return outputs.deliver(out_key, result)
+            slot = slot_for(result)
+            slot.copy_(result)
+            return slot
 
         wrapper.input_names = input_names
         wrapper.passthrough_names = passthrough_names
