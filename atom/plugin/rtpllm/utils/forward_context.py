@@ -111,7 +111,9 @@ if triton is not None:
                 live & (column < table_cols) & (length >= 2),
                 -1,
             )
-            tl.store(write_slots + row * query_len + token, slot, live)
+            # RTP reserves and zeroes state block 0 for Graph padding. The
+            # recurrent consumer cannot safely dereference a negative slot.
+            tl.store(write_slots + row * query_len + token, tl.maximum(slot, 0), live)
         previous = tl.load(
             block_table
             + row * table_stride_row
@@ -120,7 +122,9 @@ if triton is not None:
             -1,
         )
         for token in tl.static_range(query_len):
-            tl.store(read_slots + row * query_len + token, previous, live)
+            tl.store(
+                read_slots + row * query_len + token, tl.maximum(previous, 0), live
+            )
 
     @triton.jit
     def _previous_state_slots_graph_kernel(
@@ -603,16 +607,11 @@ class RTPForwardContext:
             raise ValueError(
                 "RTP plugin requires kv_cache_kernel_block_id_device for GDN metadata."
             )
+        if getattr(attn_inputs, "is_target_verify", False):
+            raise ValueError("MTP target verification requires RTPQwen4ExpContext")
         target_device = block_table.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
         if (
-            getattr(attn_inputs, "is_target_verify", False)
-            and torch.cuda.is_current_stream_capturing()
-            and cg_bufs is not None
-        ):
-            batch_size = int(attn_inputs.input_lengths.numel())
-            query_start_loc = cg_bufs["query_start_loc"][: batch_size + 1]
-        elif (
             not is_prefill
             and torch.cuda.is_current_stream_capturing()
             and cg_bufs is not None
@@ -628,112 +627,6 @@ class RTPForwardContext:
             query_start_loc = RTPForwardContext._query_start_loc(
                 attn_inputs, device=target_device
             )
-        if getattr(attn_inputs, "is_target_verify", False):
-            # PyWrappedModel labels verify rows as prefill because they have
-            # prefix lengths. They are speculative decode instead: RTP's
-            # block table reserves one state block per candidate token.
-            in_capture = torch.cuda.is_current_stream_capturing()
-            batch_size = int(attn_inputs.input_lengths.numel())
-            if batch_size <= 0 or num_tokens % batch_size:
-                raise ValueError("invalid Qwen4Exp MTP target-verify token count")
-            query_len = num_tokens // batch_size
-            if query_len not in (2, 3, 4) or any(
-                int(length) != query_len
-                for length in attn_inputs.input_lengths.tolist()
-            ):
-                raise ValueError(
-                    "Qwen4Exp MTP requires 2, 3, or 4 verify tokens per request "
-                    f"(tokens={num_tokens}, batch={batch_size}, query_len={query_len})"
-                )
-            seq_lens = attn_inputs.sequence_lengths_plus_1_device
-            if seq_lens.numel() != batch_size or block_table.ndim != 2:
-                raise ValueError("invalid Qwen4Exp MTP target-verify state table")
-            if in_capture:
-                if triton is None or cg_bufs is None:
-                    raise RuntimeError(
-                        "Qwen4Exp MTP target Graph requires prewarmed Triton buffers"
-                    )
-                read_slots = cg_bufs["target_read_slots_i32"][:batch_size]
-                write_slots = cg_bufs["target_write_slots_i32"][:batch_size]
-                _target_verify_state_slots_graph_kernel[
-                    (triton.cdiv(batch_size, 128),)
-                ](
-                    block_table,
-                    seq_lens,
-                    read_slots,
-                    write_slots,
-                    batch_size,
-                    block_table.stride(0),
-                    block_table.stride(1),
-                    block_table.shape[1],
-                    seq_size_per_block,
-                    query_len,
-                    128,
-                )
-                sequence_masks = cg_bufs["target_sequence_masks"][:batch_size]
-                accepted_tokens = cg_bufs["target_accepted_tokens"][:batch_size]
-            else:
-                rows = torch.arange(batch_size, device=target_device)[:, None]
-                read_col = torch.div(
-                    seq_lens.to(torch.int64) - 2,
-                    seq_size_per_block,
-                    rounding_mode="floor",
-                )
-                write_cols = torch.div(
-                    seq_lens.to(torch.int64) - 1,
-                    seq_size_per_block,
-                    rounding_mode="floor",
-                )[:, None] + torch.arange(query_len, device=target_device)
-                if bool(torch.any(read_col < 0).item()) or bool(
-                    torch.any(write_cols >= block_table.shape[1]).item()
-                ):
-                    raise ValueError(
-                        "Qwen4Exp MTP target-verify block table is too narrow"
-                    )
-                read_slots = block_table[rows[:, 0], read_col]
-                write_slots = block_table[rows, write_cols]
-                if bool(torch.any(read_slots < 0).item()) or bool(
-                    torch.any(write_slots < 0).item()
-                ):
-                    raise ValueError(
-                        "Qwen4Exp MTP target-verify state block is invalid"
-                    )
-                sequence_masks = torch.ones(
-                    batch_size, device=target_device, dtype=torch.bool
-                )
-                accepted_tokens = torch.ones(
-                    batch_size, device=target_device, dtype=torch.int32
-                )
-            metadata = GDNAttentionMetadata(
-                num_prefills=0,
-                num_prefill_tokens=0,
-                num_decodes=0,
-                num_decode_tokens=0,
-                num_spec_decodes=batch_size,
-                num_spec_decode_tokens=num_tokens,
-                num_actual_tokens=num_tokens,
-                has_initial_state=None,
-                spec_query_start_loc=query_start_loc,
-                non_spec_query_start_loc=None,
-                spec_state_indices_tensor=write_slots.to(torch.int32),
-                spec_state_indices_in_tensor=(
-                    read_slots
-                    if in_capture
-                    else read_slots[:, None]
-                    .expand_as(write_slots)
-                    .to(torch.int32)
-                    .contiguous()
-                ),
-                non_spec_state_indices_tensor=None,
-                spec_sequence_masks=sequence_masks,
-                spec_token_indx=None,
-                non_spec_token_indx=None,
-                num_accepted_tokens=accepted_tokens,
-            )
-            metadata.rtp_target_verify_block_map = block_table
-            metadata.rtp_target_verify_sequence_lengths = seq_lens.to(torch.int32)
-            metadata.rtp_seq_size_per_block = seq_size_per_block
-            return metadata
         state_indices = RTPForwardContext._state_indices(
             attn_inputs=attn_inputs,
             is_prefill=is_prefill,
@@ -2339,7 +2232,27 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         return RTPForwardContext._select_block_table_for_layer(attn_inputs=attn_inputs)
 
     @staticmethod
+    def _is_fixed_mtp_draft_prefill(
+        attn_inputs: Any,
+        num_tokens: int,
+        batch_size: int,
+        cg_bufs: dict | None,
+    ) -> bool:
+        # A token-count multiple is not a model-role signal: generation-prefill
+        # and embedding Graph buckets can have the same geometry. Only the
+        # Qwen4Exp runtime's draft-prefill buffers carry this explicit marker.
+        width = (cg_bufs or {}).get("mtp_window_width")
+        return bool(
+            width in (2, 3, 4)
+            and getattr(attn_inputs, "is_prefill", False)
+            and not getattr(attn_inputs, "is_target_verify", False)
+            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
+            and num_tokens == batch_size * width
+        )
+
+    @classmethod
     def _build_query_start_loc_for_plugin(
+        cls,
         *,
         attn_inputs: Any,
         seq_lens: torch.Tensor,
@@ -2354,11 +2267,8 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             )
 
         in_capture = torch.cuda.is_current_stream_capturing()
-        fixed_draft_prefill = (
-            bool(getattr(attn_inputs, "is_prefill", False))
-            and not bool(getattr(attn_inputs, "is_target_verify", False))
-            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
-            and num_tokens in (2 * batch_size, 3 * batch_size, 4 * batch_size)
+        fixed_draft_prefill = cls._is_fixed_mtp_draft_prefill(
+            attn_inputs, num_tokens, batch_size, cg_bufs
         )
         if in_capture and cg_bufs is not None:
             return cg_bufs["query_start_loc"][: batch_size + 1]
@@ -2484,12 +2394,10 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
 
         is_dummy_warmup = False
         if in_capture:
-            is_fixed_mtp_window = getattr(attn_inputs, "is_target_verify", False) or (
-                is_prefill
-                and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None)
-                is not None
-                and num_actual_tokens
-                in (2 * batch_size, 3 * batch_size, 4 * batch_size)
+            is_fixed_mtp_window = getattr(
+                attn_inputs, "is_target_verify", False
+            ) or cls._is_fixed_mtp_draft_prefill(
+                attn_inputs, num_actual_tokens, batch_size, cg_bufs
             )
             max_query_len = (
                 num_actual_tokens // batch_size if is_fixed_mtp_window else 1
@@ -2576,6 +2484,9 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             context=None,
         )
         plugin_md.rtp_cu_seqlens_q = query_start_loc
+        # PLE and QSA consume the same role-specific Graph buffers selected
+        # for this forward; the generic builder exposes this attribute too.
+        plugin_md.cg_bufs = cg_bufs
         plugin_md.is_dummy_warmup = bool(is_dummy_warmup)
         prefix_lengths = getattr(attn_inputs, "prefix_lengths", None)
         if (
