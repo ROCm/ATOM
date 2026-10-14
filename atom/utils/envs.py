@@ -799,6 +799,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Idle HIP streams held before each decode-graph capture so the graph's
+    # parallel stream never shares the launch stream's hardware queue. "auto"
+    # means GPU_MAX_HW_QUEUES - 1; an integer sets the count; 0 disables.
+    "ATOM_GRAPH_QUEUE_PAD": lambda: os.getenv("ATOM_GRAPH_QUEUE_PAD", "0"),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"

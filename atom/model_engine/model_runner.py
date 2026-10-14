@@ -3979,6 +3979,38 @@ class ModelRunner:
             fc.batch_descriptor = None
             self._piecewise_captured_tokens.add(num_tokens_dp)
 
+    def _pad_graph_queues(self):
+        """Hold ATOM_GRAPH_QUEUE_PAD idle HIP streams before a graph capture.
+
+        HIP gives each instantiated graph its own parallel stream and binds it
+        to the least-used of GPU_MAX_HW_QUEUES hardware queues, rotating per
+        graph. When that is the launch stream's queue the runtime still uses
+        it, so the side branch (shared experts) runs in order behind the main
+        branch. Taking GPU_MAX_HW_QUEUES - 1 queue slots before each capture
+        keeps every graph's parallel stream off the launch queue. The streams
+        must stay alive: releasing them shifts the rotation again.
+        """
+        pad = envs.ATOM_GRAPH_QUEUE_PAD
+        if pad == "auto":
+            n = int(os.environ.get("GPU_MAX_HW_QUEUES", "4")) - 1
+        else:
+            n = int(pad)
+        if n <= 0:
+            return
+        if not hasattr(self, "_graph_queue_pad_streams"):
+            self._graph_queue_pad_streams = []
+            self._hip = ctypes.CDLL("libamdhip64.so")
+            self._hip.hipStreamCreateWithFlags.restype = ctypes.c_int
+            self._hip.hipStreamCreateWithFlags.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_uint,
+            ]
+        for _ in range(n):
+            s = ctypes.c_void_p()
+            ret = self._hip.hipStreamCreateWithFlags(ctypes.byref(s), 1)
+            assert ret == 0, f"HIP err {ret} creating graph queue pad stream"
+            self._graph_queue_pad_streams.append(s)
+
     @torch.inference_mode()
     def capture_cudagraph(self):
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
@@ -4277,6 +4309,7 @@ class ModelRunner:
                         continue
 
                     # Capture
+                    self._pad_graph_queues()
                     with (
                         record_function(f"capture_graph_bs_{bs}")
                         if self.mark_trace
