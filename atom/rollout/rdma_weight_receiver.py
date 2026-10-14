@@ -775,6 +775,7 @@ class RDMAWeightReceiverMixin:
         version: int,
         verify_full_load: bool = True,
         prequantized_fp8: bool = False,
+        engine_refusal: str | None = None,
     ) -> dict[str, float]:
         """Receive one version of the weights into resident memory.
 
@@ -790,6 +791,11 @@ class RDMAWeightReceiverMixin:
         ``weight_scale_inv`` that nothing here maps onto the resident
         ``weight_scale``. It is received and discarded, so the trainer is not
         left in its broadcast, and nothing is written.
+
+        ``engine_refusal`` is the engine's reason to refuse the stream the same
+        way: EngineUtilityHandler sets it while a sync of the direct, SHM or
+        IPC paths is open, until that sync's FINISH or discard. Refused there
+        instead, the stream would leave the trainer in its first broadcast.
         """
         label = getattr(self, "label", "runner")
         groups = getattr(self, "_rdma_weight_groups", {})
@@ -815,6 +821,15 @@ class RDMAWeightReceiverMixin:
                 "once it has rewritten every parameter",
                 label,
             )
+        refusal: Exception | None = None
+        if engine_refusal:
+            refusal = RuntimeError(f"RDMA weight stream refused: {engine_refusal}")
+        elif prequantized_fp8:
+            refusal = NotImplementedError(
+                "a prequantized FP8 stream is not supported: send the weights "
+                "unquantised, and this receiver requantises them to its "
+                "resident format"
+            )
         try:
             stats = receive_weight_stream(
                 groups[group_name],
@@ -823,15 +838,7 @@ class RDMAWeightReceiverMixin:
                 expected_version=int(version),
                 agree=self._vote_with_engine_peers,
                 leave=lambda: self.destroy_rdma_weight_group(group_name),
-                refusal=(
-                    NotImplementedError(
-                        "a prequantized FP8 stream is not supported: send the "
-                        "weights unquantised, and this receiver requantises "
-                        "them to its resident format"
-                    )
-                    if prequantized_fp8
-                    else None
-                ),
+                refusal=refusal,
             )
         except RDMAStreamOutOfStep as exc:
             logger.error(

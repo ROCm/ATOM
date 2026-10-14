@@ -724,6 +724,25 @@ def test_a_prequantized_stream_is_received_then_refused(monkeypatch):
     assert "g" in runner._rdma_weight_groups, "a group still in step was dropped"
 
 
+def test_a_stream_the_engine_refuses_is_received_then_refused(monkeypatch):
+    """Refused by the engine while a sync of another path is open: received
+    first all the same, or the trainer would wait in its first broadcast."""
+    import torch
+
+    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
+    runner = _rdma_runner(monkeypatch, trainer)
+
+    with pytest.raises(RuntimeError, match="refused: weight sync 's1' .* is open"):
+        runner.receive_weights_rdma(
+            "g", 1, engine_refusal="weight sync 's1' of the SHM path is open"
+        )
+
+    assert trainer.frames == [], "the stream was not received"
+    assert runner.model.w.item() == 0.0
+    runner.assert_weight_update_ready()
+    assert "g" in runner._rdma_weight_groups, "a group still in step was dropped"
+
+
 def test_a_worker_without_the_group_votes_before_it_refuses():
     """Raising alone, it left the workers that had the group waiting for it in
     the stream's first vote."""

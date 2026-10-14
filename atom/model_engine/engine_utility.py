@@ -319,10 +319,20 @@ class EngineUtilityHandler:
             return response
 
         try:
+            kwargs = dict(args.get("kwargs") or {})
+            if method in WEIGHT_WRITING_RPC_METHODS and self._weight_sync_in_progress:
+                # Taken between that sync's buckets, or before its FINISH, the
+                # stream committed and the sync's later buckets went on over
+                # it. The runners refuse it, draining it first: refused here,
+                # it would leave the trainer in its first broadcast.
+                kwargs["engine_refusal"] = (
+                    f"weight sync {self._sync_id!r} of the direct, SHM or IPC "
+                    f"paths is open until its FINISH or discard"
+                )
             payload = RpcPayload(
                 request_id=request_id,
                 args=tuple(args.get("args", ())),
-                kwargs=dict(args.get("kwargs") or {}),
+                kwargs=kwargs,
                 barrier=bool(args.get("barrier", False)),
             )
             replies = self.runner_mgr.collective_rpc(

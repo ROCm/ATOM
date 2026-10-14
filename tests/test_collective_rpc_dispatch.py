@@ -511,6 +511,25 @@ def test_a_committed_stream_leaves_the_engine_fenced_while_a_runner_is():
     ]
 
 
+def test_the_runners_refuse_a_stream_while_a_sync_of_another_path_is_open():
+    """Taken after that sync's last bucket but before its FINISH, or between
+    its buckets, the stream committed, and the sync went on over it. Refused
+    by the runners, it is still received: the trainer is not left in its
+    broadcast."""
+    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
+    mgr._replies = _TWO_RANKS_OK
+    engine = _Engine()
+    _stream_rpc(h, out, engine)
+    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", True))
+    _stream_rpc(h, out, engine)
+
+    sent = [call[1].kwargs for call in mgr.calls if call[0] == "receive_weights_rdma"]
+    assert "engine_refusal" not in sent[0]
+    assert sent[0] == {"version": 1}
+    assert "'s1'" in sent[1]["engine_refusal"]
+    assert "FINISH" in sent[1]["engine_refusal"]
+
+
 def test_another_collective_rpc_leaves_the_fence_as_it_was():
     h, mgr, out = _stream_handler(stream=["boom", "boom"], healthy=[0, 0])
     engine = _Engine()
