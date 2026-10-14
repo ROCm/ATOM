@@ -400,6 +400,110 @@ def _bucket(request_id, is_last, sync_id="s1"):
     return {"sync_id": sync_id, "request_id": request_id, "is_last": is_last}
 
 
+# ── a weight stream over collective_rpc settles the serving fence ──────────
+
+
+class _StreamRunners(_RunnerMgr):
+    """Runners that answer a weight stream as given, and their reload fence
+    status as given; other commands as ``_RunnerMgr`` does."""
+
+    def __init__(self, stream, healthy):
+        super().__init__(proc_num=len(stream))
+        self.stream, self.healthy = stream, healthy
+
+    def collective_rpc(self, method, payload, timeout=300.0):
+        self.calls.append((method, payload, timeout))
+        if method == "get_weight_update_status":
+            return [
+                RpcResult(payload.request_id, r, value={"healthy": ok})
+                for r, ok in enumerate(self.healthy)
+            ]
+        return [
+            RpcResult(
+                payload.request_id, r, value=None if e else {"buckets": 1.0}, error=e
+            )
+            for r, e in enumerate(self.stream)
+        ]
+
+
+def _stream_handler(stream, healthy):
+    mgr = _StreamRunners(stream, healthy)
+    out = queue.Queue()
+    return EngineUtilityHandler(mgr, out, label="test"), mgr, out
+
+
+def _stream_rpc(handler, out, engine, method="receive_weights_rdma"):
+    args = {"method": method, "request_id": "r1", "kwargs": {"version": 1}}
+    return _process_one(handler, out, engine, "collective_rpc", args)
+
+
+def test_a_failed_weight_stream_fences_the_engine_not_just_its_runners():
+    """The stream runs as a collective RPC, so a failed one fenced the runners
+    alone: the engine went on scheduling, and its next forward met a fenced
+    runner and took the worker down instead of idling."""
+    h, _, out = _stream_handler(stream=[None, "bucket 2 rejected"], healthy=[0, 0])
+    engine = _Engine()
+
+    (reply,) = _stream_rpc(h, out, engine)
+
+    assert reply["results"][1]["error"] == "bucket 2 rejected"
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+
+
+def test_a_stream_every_rank_refused_leaves_the_engine_serving():
+    """Refused before anything was written, every runner still holds one
+    whole version, so there is nothing to fence."""
+    refused = ["version must increase"] * 2
+    h, mgr, out = _stream_handler(stream=refused, healthy=[1, 1])
+    engine = _Engine()
+
+    _stream_rpc(h, out, engine)
+
+    assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
+    assert [call[0] for call in mgr.calls] == [
+        "receive_weights_rdma",
+        "get_weight_update_status",
+    ]
+
+
+def test_a_committed_weight_stream_lifts_a_fence_a_failed_sync_left():
+    """Committed on every rank, the stream rewrote every parameter, yet the
+    fence a failed bucket of another path had put up stayed up: recovering
+    over RDMA left the engine idle for good."""
+    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
+    mgr._replies = _ONE_RANK_FAILED
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
+    assert engine._weight_sync_fenced and engine._rl_weights_inconsistent
+
+    _stream_rpc(h, out, engine)
+
+    assert not engine._weight_sync_fenced and not engine._rl_weights_inconsistent
+
+
+def test_a_committed_weight_stream_leaves_an_open_sync_to_its_finish():
+    """A bucket of another path is in and its sync not finished: lifting the
+    fence then would serve a model that sync has only partly rewritten."""
+    h, mgr, out = _stream_handler(stream=[None, None], healthy=[1, 1])
+    mgr._replies = _TWO_RANKS_OK
+    engine = _Engine()
+    _process_one(h, out, engine, "update_weights_shm", _bucket("u1", False))
+
+    _stream_rpc(h, out, engine)
+
+    assert engine._weight_sync_fenced
+
+
+def test_another_collective_rpc_leaves_the_fence_as_it_was():
+    h, mgr, out = _stream_handler(stream=["boom", "boom"], healthy=[0, 0])
+    engine = _Engine()
+
+    _stream_rpc(h, out, engine, method="get_worker_capabilities")
+
+    assert not engine._weight_sync_fenced
+    assert [call[0] for call in mgr.calls] == ["get_worker_capabilities"]
+
+
 def test_a_failed_sync_recovers_through_sleep_wake_up_and_a_new_sync():
     """The RL loop after a failed bucket: sleep(level=2) releases the weights,
     wake_up gives them storage back, then a new sync commits. wake_up was

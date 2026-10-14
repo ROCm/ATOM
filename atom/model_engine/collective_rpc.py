@@ -44,6 +44,11 @@ COLLECTIVE_RPC_METHODS = frozenset(
     }
 )
 
+# Those of COLLECTIVE_RPC_METHODS that rewrite weights in place. They run as
+# collective RPCs, not as the weight-update commands that own the engine's
+# serving fence, so EngineUtilityHandler settles that fence on their outcome.
+WEIGHT_WRITING_RPC_METHODS = frozenset({"receive_weights_rdma"})
+
 # These methods have an EngineUtilityHandler command that owns engine state
 # around the worker call. Driving the worker method directly would bypass that
 # state -- sleeping/offload flags and all-rank update checks included.
