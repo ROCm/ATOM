@@ -6,9 +6,11 @@ the pending pool, (3) completing a seq re-feeds the drained rank, (4) a fast ran
 ends up processing MORE total requests than a slow one (the whole point of Fix A).
 """
 
+import logging
 import pickle
 from collections import deque
 from threading import Lock
+from types import SimpleNamespace
 
 from atom.model_engine.engine_core_mgr import CoreManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
@@ -94,6 +96,40 @@ def test_refill_feeds_fast_rank_more():
     assert all(r <= 3 for r in mgr._rank_reqs), mgr._rank_reqs
     # Pending shrank by the 10 refills.
     assert len(mgr._bp_pending) == 40 - 12 - 10, len(mgr._bp_pending)
+
+
+def _init_with_strategy(strategy):
+    mgr = CoreManager.__new__(CoreManager)
+    mgr._init_shared_state(
+        SimpleNamespace(dp_load_balance=strategy, max_num_seqs=1536),
+        label="test",
+        local_engine_count=2,
+    )
+    return mgr
+
+
+def test_init_warns_when_backpressure_overrides_strategy(monkeypatch, caplog):
+    def check(strategy, depth, overridden):
+        monkeypatch.setenv("ATOM_DP_DISPATCH_DEPTH", str(depth))
+        caplog.clear()
+        mgr = None
+        try:
+            with caplog.at_level(logging.WARNING, logger="atom"):
+                mgr = _init_with_strategy(strategy)
+            assert mgr._bp_depth == depth
+            hit = any(
+                f"ignores dp_load_balance={strategy}" in r.getMessage()
+                for r in caplog.records
+            )
+            assert hit is overridden
+        finally:
+            if mgr is not None:
+                mgr.ctx.term()
+
+    check("least_tokens", 8, True)
+    check("round_robin", 8, True)
+    check("least_requests", 8, False)
+    check("least_tokens", 0, False)
 
 
 def test_drains_everything():

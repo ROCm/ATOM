@@ -312,7 +312,19 @@ class CoreManager:
         # dummy batch does not. Finishing prefills together lets the tail stay
         # all-decode and on the graph. 0 keeps the legacy up-front spray. Depth
         # should stay >= max_num_seqs so each rank can fill a full running batch.
+        # The pending drain always picks the rank with the fewest in-flight
+        # requests. That is what lockstep needs. _select_dp_rank_locked cannot
+        # skip ranks already at the cap, so round_robin and least_tokens do
+        # not apply on this path.
         self._bp_depth = envs.ATOM_DP_DISPATCH_DEPTH
+        if self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
+            logger.warning(
+                "%s: ATOM_DP_DISPATCH_DEPTH=%d balances on in-flight request "
+                "count and ignores dp_load_balance=%s",
+                label,
+                self._bp_depth,
+                self._dp_lb_strategy,
+            )
         if 0 < self._bp_depth < config.max_num_seqs:
             logger.warning(
                 "%s: ATOM_DP_DISPATCH_DEPTH=%d is below max_num_seqs=%d; "
@@ -1123,11 +1135,12 @@ class CoreManager:
 
         Fills the lightest rank first (fewest in-flight requests), charging each
         seq as it goes, until every rank is at the cap or the pending pool is
-        empty. Balancing on request count keeps the lockstep DP ranks in phase;
-        the cap is what leaves work queued so a fast rank can be re-fed on its
-        next completion instead of draining to empty. Returns per-rank
-        sub-batches to send after the lock is dropped (ZMQ sends must not hold
-        _lb_lock).
+        empty. Balancing on request count keeps the lockstep DP ranks in phase.
+        ``round_robin`` and ``least_tokens`` are not consulted here; init warns
+        when one of those is configured alongside a positive depth. The cap
+        leaves work queued so a fast rank can be re-fed on its next completion
+        instead of draining to empty. Returns per-rank sub-batches to send
+        after the lock is dropped (ZMQ sends must not hold ``_lb_lock``).
         """
         n = self._routable_engine_count
         batches: list[list] = [[] for _ in range(n)]

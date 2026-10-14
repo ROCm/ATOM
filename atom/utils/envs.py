@@ -182,7 +182,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Per-rank cap on in-flight load-balanced requests. 0 sprays the whole
     # offline batch up front. >0 holds the rest and refills a rank only as it
     # finishes, so ranks finish prefilling together and the tail stays
-    # all-decode (CUDA-graph replay). A non-integer or negative value warns
+    # all-decode (CUDA-graph replay). While set, dispatch balances on in-flight
+    # request count and ignores dp_load_balance; CoreManager warns when that
+    # strategy is not least_requests. A non-integer or negative value warns
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
