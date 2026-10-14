@@ -14,15 +14,15 @@ would otherwise fail at group construction rather than at import.
 
 Follows the multi-main-process-group pattern MILES uses, without depending on
 MILES. It reaches into ``torch.distributed`` internals because there is no public
-API for this; the version guard below is the price of that.
+API for this; the signature check below is the price of that.
 """
 
 from __future__ import annotations
 
+import inspect
 from datetime import timedelta
 from typing import Any
 
-import torch
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -37,17 +37,19 @@ from torch.distributed.distributed_c10d import (
 def _options_keyword() -> str:
     """The name ``_new_process_group_helper`` gives its options argument.
 
-    Renamed from ``pg_options`` to ``backend_options`` in torch 2.6. Parsed off
-    the local version rather than hardcoded, so a container upgrade does not
-    silently pass the option under a name the helper ignores.
+    Renamed from ``pg_options`` to ``backend_options`` in torch 2.6. Read off
+    the helper's own signature, not the version: a fork's or a nightly's tag,
+    such as ``2.5a0``, need not parse as one, and a guess passes the options
+    under a name the helper does not take.
     """
-    base = torch.__version__.split("+", 1)[0]
-    try:
-        major, minor = (int(part) for part in base.split(".")[:2])
-    except ValueError:
-        # Unparseable version (a nightly or a fork tag): assume current naming.
-        return "backend_options"
-    return "backend_options" if (major, minor) >= (2, 6) else "pg_options"
+    parameters = inspect.signature(_new_process_group_helper).parameters
+    for keyword in ("backend_options", "pg_options"):
+        if keyword in parameters:
+            return keyword
+    raise RuntimeError(
+        "torch.distributed's _new_process_group_helper takes neither "
+        "backend_options nor pg_options; this torch is not supported"
+    )
 
 
 def init_independent_process_group(
