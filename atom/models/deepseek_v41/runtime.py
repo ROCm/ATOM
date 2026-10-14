@@ -19,9 +19,9 @@ from .bounded_replay import (
     build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
-    dp_rows,
-    dp_rows_exchangeable,
-    exchange_dp_rows,
+    dp_token_counts,
+    dp_stage_sync_enabled,
+    sync_dp_stage_tokens,
     late_layer_start,
     replayable,
     rows_of,
@@ -33,14 +33,14 @@ from .multimodal import DeepseekV41MultimodalModel
 logger = logging.getLogger("atom")
 
 # Rows a DP rank whose prefill finishes no prompt runs through the decoder to
-# join its peers' MoE collectives (`DeepseekV41RuntimeModel._idle_decoder`).
+# join its peers' MoE collectives (`DeepseekV41RuntimeModel._join_decoder_collectives`).
 # Two, not one: the decoder graph is compiled dynamic in its rows, and a
 # one-row input would specialize it.
-_IDLE_ROWS = 2
+_DP_PLACEHOLDER_TOKENS = 2
 
 
-def _idle_rows(num_tokens: int) -> int:
-    return min(_IDLE_ROWS, num_tokens)
+def _dp_placeholder_tokens(num_tokens: int) -> int:
+    return min(_DP_PLACEHOLDER_TOKENS, num_tokens)
 
 
 def _fake_layer_output(hidden, layer_name):
@@ -313,35 +313,35 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             step = forward.attn_metadata.step
             window = forward.attn_metadata.cache.geometry.window_size
             plan = step.replay = build_replay_plan(step, window)
-        dp = self._exchange_dp_rows(forward, plan, num_tokens)
+        dp_tokens = self._sync_dp_stage_tokens(forward, plan, num_tokens)
         if plan is not None:
-            return self._replayed(state, num_tokens, plan, dp)
-        with dp_rows(forward, dp and dp.decoder):
+            return self._replayed(state, num_tokens, plan, dp_tokens)
+        with dp_token_counts(forward, dp_tokens and dp_tokens.decoder):
             state = self._late_layers(self._layer(self.decoder_start, state))
-            with dp_rows(forward, dp and dp.last):
+            with dp_token_counts(forward, dp_tokens and dp_tokens.last_layer):
                 hidden = self._layer(self.last_layer, state).collapse()
         self.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    def _exchange_dp_rows(self, forward, plan, num_tokens):
+    def _sync_dp_stage_tokens(self, forward, plan, num_tokens):
         """Under DP attention, every rank's rows past the decoder's KV source.
 
         A replaying rank runs the decoder on its tail and layer 39 on its last
         rows; one without a tail still joins each MoE collective, on
-        `_IDLE_ROWS` rows (`_idle_decoder`); every other rank runs all its
+        `_DP_PLACEHOLDER_TOKENS` rows (`_join_decoder_collectives`); every other rank runs all its
         rows. None outside DP, or when no rank replays."""
-        if not dp_rows_exchangeable(forward):
+        if not dp_stage_sync_enabled(forward):
             return None
         if plan is None:
-            rows = (num_tokens, num_tokens)
+            tokens = (num_tokens, num_tokens)
         elif plan.tail is None:
-            idle = _idle_rows(num_tokens)
-            rows = (idle, idle)
+            placeholder = _dp_placeholder_tokens(num_tokens)
+            tokens = (placeholder, placeholder)
         else:
-            rows = (plan.tail.scheduled, len(plan.tail.requests))
-        return exchange_dp_rows(forward, *rows)
+            tokens = (plan.tail.scheduled, len(plan.tail.requests))
+        return sync_dp_stage_tokens(forward, *tokens)
 
-    def _replayed(self, state, num_tokens, plan, dp=None):
+    def _replayed(self, state, num_tokens, plan, dp_tokens=None):
         """The forward's rows cut as `bounded_replay` lays them out: layer 20
         compresses every row; the requests that finish their prompts run the
         decoder on their tails, layer 39's query on their last row, which alone
@@ -349,7 +349,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         read (the LM head's), and a chunk that holds none has its logits
         discarded.
 
-        ``dp``: the group's rows per stage (`DPRows`) when DP attention
+        ``dp_tokens``: the group's tokens per stage (`DPStageTokens`) when DP attention
         replays; the decoder's MoE collectives are sized by it."""
         forward = get_forward_context()
         metadata = forward.attn_metadata
@@ -364,42 +364,46 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
             with (
                 rows_of(metadata, plan.tail, rows=plan.tail_rows),
-                dp_rows(forward, dp and dp.decoder),
+                dp_token_counts(forward, dp_tokens and dp_tokens.decoder),
             ):
                 output = layer.attention_forward(normed, None, None, rope)
                 tail = self._late_layers(layer.ffn_forward(output, *seam))
                 with (
                     rows_of(metadata, plan.tail, plan.q39, plan.q39.rows),
-                    dp_rows(forward, dp and dp.last),
+                    dp_token_counts(forward, dp_tokens and dp_tokens.last_layer),
                 ):
                     last = self._layer(self.last_layer, tail, plan.q39)
             self._move_aux_rows(plan.tail_rows)
             full[plan.last_rows] = last.collapse().squeeze(0)
-        elif dp is not None:
-            self._idle_decoder(forward, layer, rope, normed, seam, dp)
+        elif dp_tokens is not None:
+            self._join_decoder_collectives(
+                forward, layer, rope, normed, seam, dp_tokens
+            )
         self.end_forward(full, None)
         return full
 
-    def _idle_decoder(self, forward, layer, rope, normed, seam, dp):
+    def _join_decoder_collectives(self, forward, layer, rope, normed, seam, dp_tokens):
         """Join the decoder's DP collectives without a tail of one's own.
 
         A rank whose prefill finishes no prompt runs none of the decoder, but
         its peers' MoE gathers still count on it once per layer. It runs the
-        decoder on `_IDLE_ROWS` of its rows under a step with no requests:
+        decoder on `_DP_PLACEHOLDER_TOKENS` of its rows under a step with no requests:
         attention returns zeros and writes no cache (`v41_attention`), so the
         rows only feed the collectives, and their output is dropped."""
         metadata = forward.attn_metadata
         rows = torch.arange(
-            _idle_rows(normed.shape[1]), dtype=torch.int32, device=normed.device
+            _dp_placeholder_tokens(normed.shape[1]),
+            dtype=torch.int32,
+            device=normed.device,
         )
         normed, *seam = gather_rows(rows, normed, *seam, dim=1)
         outer = metadata.step, metadata.queries
         metadata.step, metadata.queries = replace(outer[0], requests=()), None
         try:
-            with dp_rows(forward, dp.decoder):
+            with dp_token_counts(forward, dp_tokens.decoder):
                 output = layer.attention_forward(normed, None, None, rope)
                 state = self._late_layers(layer.ffn_forward(output, *seam))
-                with dp_rows(forward, dp.last):
+                with dp_token_counts(forward, dp_tokens.last_layer):
                     self._layer(self.last_layer, state)
         finally:
             metadata.step, metadata.queries = outer

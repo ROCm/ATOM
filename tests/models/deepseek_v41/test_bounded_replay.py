@@ -413,7 +413,8 @@ class _DPMeta:
 def _dp_forward(sizes, rank, monkeypatch):
     from atom.models.deepseek_v41 import bounded_replay
 
-    monkeypatch.setattr(bounded_replay, "_dp_rank", lambda: rank)
+    monkeypatch.setattr(bounded_replay, "_data_parallel_rank", lambda: rank)
+    monkeypatch.setattr(bounded_replay, "_dp_cpu_group", lambda: None)
     context = SimpleNamespace(
         scheduled_tokens=sizes[rank],
         running_tokens_across_dp=tuple(sizes),
@@ -437,36 +438,31 @@ def _fake_all_reduce(peer_columns):
 
 def test_the_group_trades_decoder_and_last_layer_rows(monkeypatch):
     import torch.distributed as dist
-    from aiter.dist import parallel_state
 
-    from atom.models.deepseek_v41.bounded_replay import DPRows, exchange_dp_rows
+    from atom.models.deepseek_v41.bounded_replay import (
+        DPStageTokens,
+        sync_dp_stage_tokens,
+    )
 
     forward = _dp_forward([500, 40], 0, monkeypatch)
-    monkeypatch.setattr(
-        parallel_state, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
-    )
     # rank 1 decodes (all its rows); this rank replays a 128-row tail of one request
     monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce({1: (40, 40)}))
-    assert exchange_dp_rows(forward, 128, 1) == DPRows((128, 40), (1, 40))
+    assert sync_dp_stage_tokens(forward, 128, 1) == DPStageTokens((128, 40), (1, 40))
 
 
 def test_no_replay_anywhere_keeps_the_steps_own_table(monkeypatch):
     import torch.distributed as dist
-    from aiter.dist import parallel_state
 
-    from atom.models.deepseek_v41.bounded_replay import exchange_dp_rows
+    from atom.models.deepseek_v41.bounded_replay import sync_dp_stage_tokens
 
     forward = _dp_forward([500, 40], 0, monkeypatch)
-    monkeypatch.setattr(
-        parallel_state, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
-    )
     monkeypatch.setattr(dist, "all_reduce", _fake_all_reduce({1: (40, 40)}))
-    assert exchange_dp_rows(forward, 500, 500) is None
+    assert sync_dp_stage_tokens(forward, 500, 500) is None
 
 
 def test_dp_rows_sizes_the_moe_gather_and_restores_it(monkeypatch):
     from atom.models.deepseek_v41 import bounded_replay
-    from atom.models.deepseek_v41.bounded_replay import dp_rows
+    from atom.models.deepseek_v41.bounded_replay import dp_token_counts
 
     forward = _dp_forward([500, 40], 1, monkeypatch)
     outer = forward.dp_metadata
@@ -476,14 +472,14 @@ def test_dp_rows_sizes_the_moe_gather_and_restores_it(monkeypatch):
             parallel_config=SimpleNamespace(data_parallel_size=2, data_parallel_rank=1)
         ),
     )
-    with dp_rows(forward, (128, 40)):
+    with dp_token_counts(forward, (128, 40)):
         assert forward.dp_metadata.get_sizes_across_dp() == [128, 40]
         assert forward.context.scheduled_tokens == 40
         assert forward.context.running_tokens_across_dp == (128, 40)
     assert forward.dp_metadata is outer
     assert forward.context.scheduled_tokens == 40
     assert forward.context.running_tokens_across_dp == (500, 40)
-    with dp_rows(forward, None):  # outside DP replay: nothing changes
+    with dp_token_counts(forward, None):  # outside DP replay: nothing changes
         assert forward.dp_metadata is outer
     assert bounded_replay  # module import kept for monkeypatching
 
@@ -498,7 +494,7 @@ def test_dp_rows_sizes_the_moe_gather_and_restores_it(monkeypatch):
     ],
 )
 def test_the_group_trades_rows_only_on_an_eager_unsplit_dp_step(overrides, expected):
-    from atom.models.deepseek_v41.bounded_replay import dp_rows_exchangeable
+    from atom.models.deepseek_v41.bounded_replay import dp_stage_sync_enabled
 
     forward = _forward([500], **{"fwd.dp_metadata": object(), **overrides})
-    assert dp_rows_exchangeable(forward) == expected
+    assert dp_stage_sync_enabled(forward) == expected
