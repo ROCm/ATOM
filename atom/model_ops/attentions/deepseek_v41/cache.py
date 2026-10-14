@@ -245,6 +245,7 @@ class PagedAttentionCache:
         *,
         block_tables,
         tentative=False,
+        is_prefill=False,
         buffers=None,
         running_bs=None,
         running_tokens=None,
@@ -298,6 +299,7 @@ class PagedAttentionCache:
             block_tables=block_tables,
             page_limit=self.num_pages,
             tentative=tentative,
+            is_prefill=is_prefill,
             buffers=buffers,
             running_bs=running_bs,
             running_tokens=running_tokens,
@@ -327,15 +329,22 @@ class PagedAttentionCache:
             return step
         self._reserve_indptrs(step.width)
         # Before the indptrs, which count each row's window from its floor.
-        zeros = self._replay_start_zeros(count if running_bs is None else running_bs)
+        self.publish_replay_layout(step, count if running_bs is None else running_bs)
+        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
+        return step
+
+    def publish_replay_layout(self, step, running_bs):
+        """`step.swa_replay_start` and `swa_cached_until` from its host
+        `request_floors` and `request_cached_until`, indexed by the step's own
+        batch rows: the fixed zeros unless a request recomputes rows below
+        where it resumed."""
+        zeros = self._replay_start_zeros(running_bs)
         step.swa_replay_start = step.swa_cached_until = zeros
         if step.request_floors.any() and not step.decode:
             step.swa_replay_start, step.swa_cached_until = upload_numpy(
                 np.stack((step.request_floors, step.request_cached_until)),
                 step.positions.device,
             )
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
-        return step
 
     def _replay_start_zeros(self, running_bs):
         """Every request's window from position 0: what a step that is not a
@@ -586,11 +595,22 @@ class PagedAttentionCache:
         """
         table = step.tiles.get(ratio)
         if table is None:
+            block_tables = step.block_tables
+            if not step.decode and step.requests:
+                # Expand only pages visible to a nonempty prefill step,
+                # including the cached prefix of a chunk/TBO microbatch. The
+                # persistent table can hold a 1M context even for an 8k prompt.
+                # Decode/verify and empty steps retain the full table width.
+                end = max(request.end for request in step.requests)
+                columns = (
+                    end + self.geometry.block_size - 1
+                ) // self.geometry.block_size
+                block_tables = block_tables[:, :columns]
             table = step.tiles[ratio] = unit_table(
-                step.block_tables,
+                block_tables,
                 step.batch_ids,
                 self.geometry.index_blocks_per_page(ratio),
-                workspace=self.workspace,
+                workspace=step.tile_workspace or self.workspace,
                 ratio=ratio,
             )
         return table

@@ -19,6 +19,9 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
+| **ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT** | int | 360000 | DP prefill cost balancing (always on under DP attention with more than one rank; needs the prefill delayer): each lockstep prefill step aims at min(costliest, mean x (1 + slack)) of the ranks' estimated chunk costs, and a costlier rank takes fewer tokens. This is the per-token term of the chunk cost, in attended-context tokens: cost = new tokens x (weight + prior context + new / 2). |
+| **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
+| **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
 
 ## Prefill delayer (TP/DCP and DP attention)
 
@@ -74,6 +77,18 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
+
+## Dynamic chunking
+
+Interpolates pipeline-parallel chunk sizes between the configured batch budget
+and the equal-latency size solved from the calibrated chunk model. Used when
+neither `--dynamic-chunking-smooth-factor` nor `Config.dynamic_chunking_smooth_factor`
+is given, and read only when dynamic chunking is enabled, so a malformed value
+cannot affect a server that does not use the feature.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR** | float | 0.75 | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). Must be in `[0, 1]` when dynamic chunking is enabled. |
 
 ## Model loading
 
@@ -152,7 +167,7 @@ combine knob as a quality/throughput tradeoff.
 | **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
 | **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MORI_V2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
 | **ATOM_MEGA_DECODE_MTPR** | int | 128 | Capacity (rows per rank) of the small MegaMoEV2 instance that DP-unified decode / verify / draft passes reuse (`ATOM_MEGA_DECODE_FAST_PATH=1`); one of 128, 256, 512, 1024. A pass with more rows falls back to the instance sized for `max_num_batched_tokens`. Size it to cover the DP-padded decode graphs (`running_bs * (num_speculative_tokens + 1)` rows); above 128 the instance stays on aiter's fixed-slot path only if `AITER_MEGA_FIXED_SLOT_MAX_MTPR` admits it (511 / 1023 / 2047), otherwise it runs compact. |
-| **ATOM_MEGA_MASK_PAD_ROWS** | bool | 0 (false) | If set to `1`, the MegaMoE backend (`--moe-backend mega`) routes this rank's DP pad rows (past `scheduled_tokens` on a step padded to the DP group's `running_tokens`) to expert `-1`: they are not dispatched or computed and come back as zeros, so identical pad rows also stop piling onto the same experts. Covers target and draft passes, eager and CUDA graph. With an aiter whose MegaMoEV2 masks `-1` slots in combine (`supports_combine_mask`) the op returns the zeros; otherwise each MoE layer pays one extra select. Not used by plugin frontends. |
+| **ATOM_MEGA_MASK_PAD_ROWS** | bool | 1 (true) | By default, the MegaMoE backend (`--moe-backend mega`) and the fused MoRI v2 transport (`ATOM_MORI_V2_FUSED=1`, FlyDSL experts) route this rank's DP pad rows (past `scheduled_tokens` on a step padded to the DP group's `running_tokens`) to expert `-1`: they are not dispatched or computed and come back as zeros, so identical pad rows also stop piling onto the same experts. Covers target and draft passes, eager and CUDA graph. With an aiter whose MegaMoEV2 masks `-1` slots in combine (`supports_combine_mask`) the op returns the zeros; otherwise ATOM zeroes only the padded rows with a small Triton kernel. Set to `0` to disable. Not used by plugin frontends. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
 
 ## EPLB
@@ -206,6 +221,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
+| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
 
 ### Llama-style
 
@@ -316,6 +332,7 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+| **ATOM_DSV4_STATE_REPLAY** | bool | 0 (false) | DeepSeek-V4: keep a prefix hit that reaches past the nearest state checkpoint by more than the window's receptive field (7,748 tokens on V4-Pro, 7,875 with MTP or DSpark) and recompute only that field below it, which rebuilds the state exactly, instead of resuming at the checkpoint (`Config.state_replay_tokens`). Off on anything but the DeepSeek-V4 trunk with compress ratios 4 / 128, and with context parallelism, a speculative method other than MTP or the model's own DSpark layers (not a separate `--draft-model`), prefix caching off, or a KV connector. |
 
 ### LMCache offload tier
 
@@ -327,11 +344,11 @@ derive a bound.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_KV_OFFLOAD** | str | "" (off) | Enables LMCache KV offload without `--kv-transfer-config`, so a launcher that owns that flag for P/D can still add offload. `lmcache` selects the in-process `lmcache_offload` connector, `lmcache_mp` the standalone-server `lmcache_mp` connector (start `lmcache server` first). With a P/D connector in `--kv-transfer-config`, both run behind a `multi` connector. Setting it while `--kv-transfer-config` already names an offload connector is an error. |
-| **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`) and, for `lmcache_mp`, `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`). Requires `ATOM_KV_OFFLOAD`. |
+| **ATOM_KV_OFFLOAD** | str | "" (off) | Enables KV offload without `--kv-transfer-config`, so a launcher that owns that flag for P/D can still add offload. `lmcache` selects the in-process `lmcache_offload` connector, `lmcache_mp` the standalone-server `lmcache_mp` connector (start `lmcache server` first), `mooncake_store` the `mooncake_store` connector, which puts and gets KV chunks straight to a Mooncake Store with no LMCache (start the Store's master and owners first; dense layout only). With a P/D connector in `--kv-transfer-config`, both run behind a `multi` connector. Setting it while `--kv-transfer-config` already names an offload connector is an error. |
+| **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`), for `lmcache_mp` `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`), and for `mooncake_store` the `mooncake_store.*` settings (e.g. `{"mooncake_store.master": "10.0.0.1:26051", "mooncake_store.metadata": "http://10.0.0.1:26080/metadata"}`; all of them are listed in `atom/kv_transfer/offload/README.md`). Requires `ATOM_KV_OFFLOAD`. |
 | **OFFLOAD_COPY_WORKERS** | int | 1 | Save executor threads per offload worker. Also scales the default `OFFLOAD_MAX_PENDING_SAVES`. |
 | **OFFLOAD_LOAD_WORKERS** | int | 1 | Load executor threads per offload worker. DSV4's in-process path ignores it (its SLOT load path needs a serial load executor). |
-| **OFFLOAD_MAX_PENDING_SAVES** | int | unset: `max(2, 2 × OFFLOAD_COPY_WORKERS)` for connectors, **2** for the scheduler's state tier | Bound on running-plus-queued saves. KV and state saves share it because both pin the same pool. A non-integer raises on the connector path and warns (using 2) on the state-tier path. Overridden by `max_pending_saves` in `kv_connector_extra_config`. |
+| **OFFLOAD_MAX_PENDING_SAVES** | int | unset: `max(2, 2 × OFFLOAD_COPY_WORKERS)` for connectors, **2** for the scheduler's state tier | Bound on running-plus-queued saves. KV and state saves share it because both pin the same pool. A non-integer raises on the connector path and warns (using 2) on the state-tier path. Overridden by `max_pending_saves` in `kv_connector_extra_config`. While both are unset, `mooncake_store` leaves its saves unbounded (one per request in flight at most). |
 | **OFFLOAD_MIN_LOAD_TOKENS** | int | 8192 | Smallest external-tier hit worth loading; shorter hits are recomputed. Negative values clamp to 0. |
 | **OFFLOAD_MIN_SAVE_TOKENS** | int | 8192 | Shortest prefix native `lmcache_mp` stores, as an absolute boundary for normal and late saves. With the default equal to `OFFLOAD_MIN_LOAD_TOKENS`, a shorter prefix could never be loaded back. Other connectors ignore it. |
 | **OFFLOAD_LOOKUP_MEMO_STEPS** | int | 32 | Scheduler steps a memoised tier-lookup answer is replayed before the tier is asked again. |
@@ -341,7 +358,7 @@ derive a bound.
 | **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
 | **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
 | **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
-| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. |
+| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. Unset, `mooncake_store` bounds it at 48 MiB, which it holds back from the KV budget per save and load thread. |
 | **OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER** | bool | 0 | Free the GPU staging buffer after each transfer instead of keeping it. |
 | **OFFLOAD_SLOT_STAGING_SLOTS** | int | 1 | DSV4 in-process SLOT sidecar staging rows. Overridden by `slot_sidecar_staging_slots`. |
 | **OFFLOAD_COMMITTED_SIDECAR_CAPACITY** | int | 65536 | DSV4 in-process committed SLOT sidecar index capacity. Overridden by `committed_sidecar_index_capacity`. |

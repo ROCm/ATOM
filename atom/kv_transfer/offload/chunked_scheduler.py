@@ -72,18 +72,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        if self._do_save and int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
-            # `Scheduler.advance_on_schedule` bumps num_cached_tokens inside
-            # schedule(), before that chunk's forward. The save frontier below
-            # reads the same field, so under PP a save can cover an in-flight
-            # chunk that the dense producer fence (recorded at dispatch) does
-            # not order after. Named here rather than asserted because PP
-            # offload has no supported configuration yet.
-            logger.warning(
-                "LMCache offload scheduler: pipeline parallelism advances the "
-                "prefill frontier before the forward runs; dense saves may "
-                "include a chunk the producer fence does not cover"
-            )
         self.block_size = offcfg._strict_integer(
             "Offload block size",
             config.kv_cache_block_size,
@@ -520,6 +508,26 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation=operation,
         )
 
+    def _build_load_request(
+        self,
+        seq,
+        load_spec: LoadSpec,
+        load_operation: LoadOperationId,
+        transfer_end: int,
+    ) -> LMCacheReqMeta:
+        """Describe one dispatched load of ``[hbm, transfer_end)`` to the worker.
+
+        Ships the prompt prefix the transfer covers, from which the worker
+        derives the chunk keys. A transport keyed differently overrides this.
+        """
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=list(seq.token_ids[:transfer_end]),
+            block_ids=list(seq.block_table),
+            load_spec=load_spec,
+            load_operation=load_operation,
+        )
+
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""
         del seq, saved
@@ -646,22 +654,23 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 lmc if ls.transfer_end_tokens is None else int(ls.transfer_end_tokens)
             )
             meta.add_request(
-                LMCacheReqMeta(
-                    req_id=seq.id,
-                    token_ids=list(seq.token_ids[:transfer_end]),
-                    block_ids=list(seq.block_table),
-                    load_spec=ls,
-                    load_operation=load_operation,
-                )
+                self._build_load_request(seq, ls, load_operation, transfer_end)
             )
         meta.lookup_requests_in_step = [
             sid
             for sid in self._lookup_in_step
             if sid in loading_sids or sid not in self._load_specs
         ]
-        # Saves: store fully computed prompt chunks. Under scheduler-side
-        # chunked prefill, seq.num_cached_tokens advances after each prefill
-        # chunk's forward has completed; use it as the D2H-safe frontier.
+        # Saves: store prompt chunks up to the computed frontier,
+        # seq.num_cached_tokens. Without PP it advances once a chunk's forward
+        # has returned. Under PP, schedule() advances it as it dispatches a
+        # chunk, right after it builds this metadata, so the frontier covers
+        # the chunks of every batch dispatched before this one, some of them
+        # still running on later stages. The producer fence still orders each
+        # save after the forwards it reads: every stage takes metadata and
+        # batches in dispatch order, one RPC at a time, and records its fence
+        # when it takes this metadata (dense `start_load_kv`), after it has
+        # enqueued every earlier forward on the same stream.
         tracker_sids = list(self._save_tracker.keys())
         if tracker_sids and self._save_rr_last in self._save_tracker:
             start = (tracker_sids.index(self._save_rr_last) + 1) % len(tracker_sids)
@@ -1119,7 +1128,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if self._save_retry_blocked.get(sid) == operation:
             self._retry_or_retire_failed_save(operation)
 
-    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> None:
+    def _retry_or_retire_failed_save(self, operation: SaveOperationId) -> bool:
+        """Retry a failed save that every rank stopped reading, or retire it.
+
+        Returns whether a retry was set up: False when its request has
+        finished, its ID was reused, or nothing of it is tracked any more.
+        """
         sid = str(operation.req_id)
         if self._save_retry_blocked.get(sid) == operation:
             self._save_retry_blocked.pop(sid, None)
@@ -1131,9 +1145,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         entry = self._save_tracker.get(sid)
         owner = self._save_previous_owner.pop(operation, None)
         if entry is None or previous is None:
-            return
+            return False
         if owner is not None and entry[0] is not owner:
-            return  # request ID was reused
+            return False  # request ID was reused
         if getattr(entry[0], "_offload_finished", False):
             # Teardown may already have returned the source blocks to the pool.
             # A missing cache entry is safer than a retry against recycled KV.
@@ -1147,13 +1161,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 # suffix; no further save reads it once the request retires.
                 self._pending_source_safe_releases.append(frozenset(remaining))
                 self.total_source_safe_released_blocks += len(remaining)
-            return
+            return False
         entry[1] = min(int(entry[1]), previous)
         logger.warning(
             "LMCache offload: retrying failed dense save req=%s from token %d",
             sid,
             previous,
         )
+        return True
 
     def _release_operation_lease(self, operation) -> None:
         if not isinstance(operation, SaveOperationId):

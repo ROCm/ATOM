@@ -47,6 +47,7 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -614,13 +615,14 @@ class tokenIDProcessor:
         # A newly admitted request has no row in `prev_token_ids`, so
         # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
         # must be staged here -- `scheduled_tokens` gave it committed history,
-        # correct only at column 0.
+        # correct only at column 0. A batch without drafts (`num_spec_step ==
+        # 0`: a P/D producer's decodes and DP dummies) has no draft table.
         #
         # Looped, not scattered: measured, the loop wins below ~24 admissions
         # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
         # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
         # being few.
-        if self.use_spec and num_new_seqs > 0:
+        if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
@@ -734,6 +736,7 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -1311,23 +1314,23 @@ class ModelRunner:
         )
         return True
 
+    def warmup_max_tokens(self) -> int:
+        """Tokens one warmup forward carries: the activation peak KV sizing allows."""
+        max_tokens = self.config.max_num_batched_tokens
+        if not self.config.enable_dp_attention:
+            max_tokens //= get_dp_group().world_size
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            max_tokens = max(1, max_tokens // pcp_size)
+        return max_tokens
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
+        max_model_len = self.config.max_model_len
         dp_size = get_dp_group().world_size
-        if self.config.enable_dp_attention:
-            warmup_max_tokens = max_num_batched_tokens
-        else:
-            warmup_max_tokens = max_num_batched_tokens // dp_size
-
-        pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
-            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+        warmup_max_tokens = self.warmup_max_tokens()
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1377,6 +1380,14 @@ class ModelRunner:
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
+
+    def profile_dynamic_chunking(self):
+        """Fit chunk overhead from startup dummy forwards (engine RPC)."""
+        return self._dynamic_chunking.profile()
+
+    def take_dynamic_chunking_fit(self):
+        """Return newly calibrated chunk latency coefficients (engine RPC)."""
+        return self._dynamic_chunking.take_fit()
 
     def allocate_forward_vars(self):
         config = self.config
@@ -1939,8 +1950,26 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+            # The charged entry can be larger than the bytes a transfer
+            # publishes: MHA alignment padding is not a region, and a draft
+            # pool merged into the same class is ordinary KV after the
+            # checkpoint regions. The backend names the published unit.
+            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+            published_unit = getattr(
+                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+            )
+            if callable(published_unit):
+                published = published_unit()
+                if published is not None:
+                    published = int(published)
+                    if published <= 0 or published > page_unit_bytes:
+                        raise RuntimeError(
+                            f"checkpoint PAGE unit is {published} B but the "
+                            f"paged pool entry is {page_unit_bytes} B"
+                        )
+                    page_unit_bytes = published
             checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                page_unit_bytes=page_unit_bytes,
                 slot_bytes=slot_bytes,
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,
@@ -2504,6 +2533,20 @@ class ModelRunner:
         # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
         return int(q_eff)
 
+    def _verifies_drafts(self, batch: ScheduledBatch, is_prefill: bool) -> bool:
+        """Whether this forward scores drafts with the rejection sampler.
+
+        A P/D producer keeps the drafter only to write its context KV; the
+        scheduler never pads drafts for it, so its decodes (the step that
+        surfaces a deferred T0) are q=1 and have nothing to verify.
+        """
+        return (
+            not is_prefill
+            and hasattr(self, "drafter")
+            and not self.tokenID_processor.is_pd_producer
+            and not batch.is_dummy_run
+        )
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
@@ -2534,7 +2577,7 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
+        if self._verifies_drafts(batch, is_prefill):
             _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
             # Inside the staging window: without the token group it publishes
             # the indices itself. Packed indices already share the token upload.
@@ -2711,14 +2754,14 @@ class ModelRunner:
             token_group.counts[token_group.indices["cu_seqlens_q"]] = cu_count
             spec_group = self.h2d_groups.get("spec_decode")
             if spec_group is not None:
-                if batch.total_tokens_num_prefill == 0 and not batch.is_dummy_run:
+                if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
                     _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
                     spec_decode_indices = self.drafter.prepare_spec_decode_indices(
                         lens, cu[1:], token_group
                     )
                 else:
-                    # A preceding decode may have filled these counts. Prefill
-                    # and dummy forwards must not publish its stale indices.
+                    # A preceding decode may have filled these counts. Forwards
+                    # that verify nothing must not publish its stale indices.
                     for binding in spec_group.members:
                         token_group.counts[token_group.indices[binding.name]] = None
             # No GPU consumer runs between these host producers and this
@@ -3113,6 +3156,8 @@ class ModelRunner:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
+                # Time only the chunk computation between PP receive and send.
+                chunk_sample = self._dynamic_chunking.start_sample(batch)
                 if pp_enabled:
                     model_output = self.model(
                         input_ids,
@@ -3126,6 +3171,7 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                self._dynamic_chunking.finish_sample(chunk_sample)
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:

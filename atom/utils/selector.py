@@ -3,7 +3,15 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 used by RTP-LLM
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
+
+
 from functools import cache
 from typing import TYPE_CHECKING
 
