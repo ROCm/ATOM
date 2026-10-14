@@ -44,12 +44,12 @@ echo "patch: ${PATCH}"
 
 DRY_OUT="$(mktemp)"
 set +e
-patch -p1 -d "${SRC_ROOT}" --dry-run < "${PATCH}" >"${DRY_OUT}" 2>&1
+patch --batch --forward -p1 -d "${SRC_ROOT}" --dry-run < "${PATCH}" >"${DRY_OUT}" 2>&1
 dry_rc=$?
 set -e
 if [[ "${dry_rc}" -eq 0 ]]; then
-  patch -p1 -d "${SRC_ROOT}" < "${PATCH}"
-elif grep -qE 'previously applied|Reversed|already applied' "${DRY_OUT}"; then
+  patch --batch --forward -p1 -d "${SRC_ROOT}" < "${PATCH}"
+elif patch --batch --reverse -p1 -d "${SRC_ROOT}" --dry-run < "${PATCH}" >/dev/null 2>&1; then
   echo "patch already applied"
 else
   cat "${DRY_OUT}" >&2

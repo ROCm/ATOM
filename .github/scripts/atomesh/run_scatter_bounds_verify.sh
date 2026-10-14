@@ -8,7 +8,7 @@
 #   SCATTER_REPO_ROOT   ATOM checkout visible on this node (NFS path)
 #   SCATTER_OUT_DIR     writable log directory on NFS
 # Optional:
-#   AITER_GIT_REF       ROCm/aiter ref (default: mengqing/moe_scatter_reduce_bounds)
+#   AITER_GIT_REF       ROCm/aiter ref (default: pinned companion commit)
 #   SCATTER_INSTALL_MODE  aiter_ref | patch  (default: aiter_ref)
 #
 # The in-container steps live in a host-written script that is docker-cp'd and
@@ -21,7 +21,7 @@ set -euo pipefail
 : "${SCATTER_REPO_ROOT:?}"
 : "${SCATTER_OUT_DIR:?}"
 
-AITER_GIT_REF="${AITER_GIT_REF:-mengqing/moe_scatter_reduce_bounds}"
+AITER_GIT_REF="${AITER_GIT_REF:-d755e51200f6346287d79573e46b9cf804b955ca}"
 SCATTER_INSTALL_MODE="${SCATTER_INSTALL_MODE:-aiter_ref}"
 job_id="${SLURM_JOB_ID:-local}"
 container="atomesh-scatter-bounds-${job_id}-$$"
@@ -85,6 +85,12 @@ if [[ "${SCATTER_INSTALL_MODE}" == "aiter_ref" && -n "${AITER_GIT_REF}" ]]; then
   cd /app/aiter-test
   git fetch --filter=blob:none --depth=1 origin "${AITER_GIT_REF}"
   git checkout --detach FETCH_HEAD
+  actual_sha="$(git rev-parse HEAD)"
+  if [[ "${AITER_GIT_REF}" =~ ^[0-9a-f]{40}$ && "${actual_sha}" != "${AITER_GIT_REF}" ]]; then
+    echo "ERROR: aiter checkout does not match ${AITER_GIT_REF}" >&2
+    exit 1
+  fi
+  printf '%s\n' "${actual_sha}" | tee /out/aiter-commit.txt
   git submodule sync
   git submodule update --init --recursive
   MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
@@ -123,6 +129,7 @@ python3 -c "import atom, aiter; print('atom', atom.__file__); print('aiter', ait
 
 echo "=== ATOM MiniMax-M3 scatter_reduce tests ==="
 AITER_REBUILD=1 python3 -m pytest -p no:cacheprovider -v -s \
+  --junitxml=/out/pytest_atom_scatter.xml \
   /workspace/ATOM/tests/test_minimax_m3_moe_scatter_reduce.py \
   2>&1 | tee /out/pytest_atom_scatter.log
 
@@ -132,8 +139,12 @@ else
   T=/workspace/ATOM/.github/patches/test_moe_scatter_reduce_aiter.py
 fi
 echo "=== aiter scatter_reduce tests (${T}) ==="
-AITER_REBUILD=1 python3 -m pytest -p no:cacheprovider -v -s "$T" \
+AITER_REBUILD=1 python3 -m pytest -p no:cacheprovider -v -s \
+  --junitxml=/out/pytest_aiter_scatter.xml "$T" \
   2>&1 | tee /out/pytest_aiter_scatter.log
+
+python3 /workspace/ATOM/.github/scripts/atomesh/check_scatter_bounds_results.py \
+  /out/pytest_atom_scatter.xml /out/pytest_aiter_scatter.xml
 
 echo "=== scatter_bounds verify OK ==="
 INNER_EOF

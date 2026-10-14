@@ -249,7 +249,7 @@ on:
       aiter_ref:
         description: 'ROCm/aiter ref for suite=scatter_bounds (install_aiter_from_ref / setup.py develop)'
         required: false
-        default: 'mengqing/moe_scatter_reduce_bounds'
+        default: 'd755e51200f6346287d79573e46b9cf804b955ca'
         type: string
       scatter_install_mode:
         description: 'suite=scatter_bounds: aiter_ref reinstalls from GitHub; patch applies .github/patches/aiter_moe_scatter_reduce_bounds.patch'
@@ -1582,6 +1582,7 @@ jobs:
           # Catch nested-quote / parse errors before burning a Slurm GPU allocation
           # (runs 38532471586, 38535702939 failed only after sbatch).
           bash .github/scripts/atomesh/check_scatter_bounds_syntax.sh
+          python3 -m unittest discover -s tests -p test_scatter_bounds_ci.py
 
       - name: Submit scatter_bounds Slurm verify
         id: scatter-bounds
@@ -1683,8 +1684,8 @@ jobs:
           srun --nodes=1 --ntasks=1 --ntasks-per-node=1 "${rank_script}"
           srun_rc=\$?
           set -e
-          printf '%s\n' "\${srun_rc}" > "${run_dir}/slurm-status.tmp"
-          mv "${run_dir}/slurm-status.tmp" "${run_dir}/slurm-status"
+          printf '%s\n' "\${srun_rc}" > "${run_dir}/slurm-job.rc.tmp"
+          mv "${run_dir}/slurm-job.rc.tmp" "${run_dir}/slurm-job.rc"
           exit "\${srun_rc}"
           EOF
           chmod +x "${batch_script}"

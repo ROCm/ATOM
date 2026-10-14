@@ -33,13 +33,15 @@ if [[ -z "${atom_origin}" ]] \
   exit 1
 fi
 
-# Optional: harden image aiter's moe_scatter_reduce before any server starts.
-# Used by MiniMax-M3 C40 verification so CI does not depend on a rebuilt
-# atom-dev image. Prefer AITER_GIT_REF + install_aiter_from_ref when available;
-# this patch path is the fallback that still proves the fixed kernel.
-if [[ "${ATOM_APPLY_AITER_SCATTER_BOUNDS_PATCH:-0}" == "1" ]]; then
-  echo "[aiter] applying moe_scatter_reduce bounds patch"
+# The common case env is still prefixed at this point (before apply_role_env).
+# Load the pinned source into a writable directory for the P/D regression;
+# the runtime JIT builds it using the image's existing Python/pybind11 ABI.
+scatter_aiter_ref="${ATOMESH_ENV_ATOM_AITER_SCATTER_REF:-${ATOM_AITER_SCATTER_REF:-}}"
+if [[ -n "${scatter_aiter_ref}" ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/prepare_scatter_aiter_source.sh" "${scatter_aiter_ref}"
+elif [[ "${ATOMESH_ENV_ATOM_APPLY_AITER_SCATTER_BOUNDS_PATCH:-${ATOM_APPLY_AITER_SCATTER_BOUNDS_PATCH:-0}}" == "1" ]]; then
   REPO_ROOT="${PWD}" bash "${ATOMESH_SCRIPT_DIR}/../apply_aiter_scatter_reduce_bounds_patch.sh"
+  export AITER_REBUILD=1
 fi
 
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
@@ -2609,7 +2611,7 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -2632,6 +2634,12 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+if sys.argv[3]:
+    import math
+    threshold = float(sys.argv[3])
+    if not isinstance(score, (int, float)) or not math.isfinite(score) or score < threshold:
+        raise SystemExit(f"[eval] GSM8K score {score} is below threshold {threshold}")
+    print(f"[eval] GSM8K threshold passed: {score:.4f} >= {threshold:.4f}")
 PY
   done
 
