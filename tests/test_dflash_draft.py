@@ -508,3 +508,350 @@ def test_dflash_pool_is_built_at_full_tp(tp, dcp):
     builder._make_pool(layers=5, target_block_size=128)
     assert seen["world_size"] == tp
     assert seen["blocks_per_entry"] == dcp
+
+
+# --------------------------------------------------------------------------
+# The target feature: Kimi-K3's aggregate stream
+# --------------------------------------------------------------------------
+#
+# Kimi-K3 carries a BANK of per-`attn_res_block_size` snapshots plus a running
+# PREFIX, recombined by a softmax mixture. The generic aux extractor hands a
+# draft the prefix; SpecForge trained THIS draft against a live SGLang target,
+# whose dspark tap returns the mixture. Feeding it the prefix instead measured
+# -6.43 pp acceptance on GSM8K.
+#
+# The routing is by draft CLASS, not by a flag: `KimiK3DFlash` implements
+# `target_aux_capture_spec`, the MLA draft beside it deliberately does not. The
+# tests below pin both halves of that, because the failure mode in either
+# direction is silent -- a draft fed the wrong feature still proposes tokens,
+# they are just accepted less often.
+
+
+def _reference_mixture(prefix, bank, score_weight, eps):
+    """The mix `apply_attn_res` computes, transcribed into plain torch.
+
+    From `_attn_res_fused_kernel`: over the B bank rows plus the prefix,
+    score = <v, score_weight> * rsqrt(mean(v^2) + eps), softmax over the B+1,
+    then a weighted sum of the RAW candidates (the rmsnorm scales the SCORE,
+    it does not normalize what is summed).
+    """
+    import torch
+
+    rows = torch.cat([bank, prefix.unsqueeze(1)], dim=1).float()
+    rstd = torch.rsqrt(rows.pow(2).mean(-1) + eps)
+    probs = torch.softmax((rows * score_weight).sum(-1) * rstd, dim=-1)
+    return (probs.unsqueeze(-1) * rows).sum(1).to(prefix.dtype)
+
+
+def _fake_attn_res_kernel(monkeypatch, calls):
+    """Stand in for `atom.model_ops.kimi_k3`, which needs aiter and a GPU.
+
+    The draft imports `apply_attn_res` inside the extract, so swapping the
+    module in `sys.modules` is enough -- and it keeps these tests CPU-only,
+    which is the only way they run in CI at all. The stand-in computes the real
+    mixture, so the assertions below pin the ARGUMENTS the draft marshals *and*
+    that what comes back is the mixture rather than the prefix.
+    """
+    import sys
+
+    module = types.ModuleType("atom.model_ops.kimi_k3")
+
+    def apply_attn_res(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden=None,
+        out_norm_weight=None,
+        out_eps=1e-6,
+        add_hidden2=None,
+        quant_dtype=None,
+    ):
+        calls.append(
+            {
+                "prefix": prefix_sum,
+                "bank": block_residual,
+                "score_weight": score_weight,
+                "eps": eps,
+                "out_norm_weight": out_norm_weight,
+                "quant_dtype": quant_dtype,
+            }
+        )
+        return _reference_mixture(prefix_sum, block_residual, score_weight, eps), None
+
+    module.apply_attn_res = apply_attn_res
+    monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", module)
+    return calls
+
+
+def _k3_aux_hidden_state(output):
+    """`KimiDecoderLayer.aux_hidden_state`, transcribed.
+
+    The real one lives on a `@support_torch_compile` model whose import pulls in
+    aiter; its contract -- (prefix_sum, *pendings, block_residual), pendings
+    summed back into the prefix -- is all the extract under test depends on.
+    """
+    prefix_sum, *pendings, _bank = output
+    if prefix_sum is None:
+        return None
+    for pending in pendings:
+        if pending is not None:
+            prefix_sum = prefix_sum + pending
+    return prefix_sum
+
+
+def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
+    """A Kimi-K3 target, down to what aux capture reads off it.
+
+    `_resolve_decoder_layers` wants `.layers`; the extract wants each layer's
+    `layer_idx` and `aux_hidden_state`, and the NEXT layer's
+    `self_attention_attn_res` (that is the whole reason the hook needs the
+    target model and not just the tapped block).
+    """
+    import torch
+
+    torch.manual_seed(0)
+    layers = [
+        types.SimpleNamespace(
+            layer_idx=i,
+            aux_hidden_state=_k3_aux_hidden_state,
+            self_attention_attn_res=types.SimpleNamespace(
+                enabled=enabled,
+                block_size=block_size,
+                eps=1e-6,
+                out_eps=1e-5,
+                score_weight=torch.randn(hidden) * 0.1,
+            ),
+        )
+        for i in range(n_layers)
+    ]
+    return types.SimpleNamespace(layers=layers)
+
+
+def _dflash_spec(target, layer_ids, hidden=16):
+    """Resolve `KimiK3DFlash`'s capture spec without building the draft.
+
+    Called unbound on purpose: the method reads nothing off `self` (its inputs
+    are the tap ids, the target's hidden size, and the target model), and
+    constructing the real draft would want a loaded checkpoint, a TP group and
+    a GPU.
+    """
+    dflash = pytest.importorskip(
+        "atom.models.kimi_k3_dflash",
+        reason="the draft model imports aiter at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    return dflash.KimiK3DFlash.target_aux_capture_spec(None, layer_ids, hidden, target)
+
+
+def _generic_extract():
+    proposer = pytest.importorskip(
+        "atom.spec_decode.dspark_proposer",
+        reason="the proposer imports aiter/triton at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    return proposer.DSparkProposer._extract_layer_hidden
+
+
+def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
+    """(a) The draft resolves to its OWN extract, and that extract mixes.
+
+    Both halves matter: resolving to its own spec is what makes the routing
+    draft-owned, and the extract returning the mixture rather than the prefix is
+    the feature itself. The second is asserted against an independent
+    computation of the mixture, not merely "something different".
+    """
+    torch = pytest.importorskip("torch")
+    generic = _generic_extract()
+
+    hidden, block_size = 16, 4
+    target = _k3_target_stub(hidden=hidden, n_layers=16, block_size=block_size)
+    # Tap 6, not 7: with block_size 4 the ceiling and the floor of
+    # (lid + 1) / block_size differ there, so the bank slice below actually
+    # pins the rounding.
+    spec = _dflash_spec(target, (6, 11), hidden=hidden)
+
+    assert spec.layer_ids == (6, 11)
+    assert spec.hidden_size == hidden
+    assert spec.capture == "output"  # an OUTPUT tap; V4.1's is an input tap
+    assert spec.extract is not generic
+
+    calls = _fake_attn_res_kernel(monkeypatch, [])
+    rows = 5
+    prefix = torch.randn(rows, hidden)
+    pending = torch.randn(rows, hidden)
+    bank = torch.randn(rows, 6, hidden)
+    block = target.layers[6]
+
+    out = spec.extract((prefix, pending, bank), block)
+
+    # The prefix half is still the generic reconstruction: the layer's deferred
+    # addends folded back in. The aggregate is a mixture OF that, not a
+    # replacement for it.
+    reconstructed = generic((prefix, pending, bank), block)
+    assert torch.allclose(reconstructed, prefix + pending)
+
+    # nvb is a CEILING, matching SGLang's `prev_valid_blocks`: layer 6 sits
+    # above ceil(7 / 4) = 2 closed blocks (a floor would say 1), so only 2 of
+    # the bank's 6 rows are candidates.
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["bank"].shape == (rows, 2, hidden)
+    assert torch.equal(call["bank"], bank[:, :2, :])
+    assert torch.equal(call["prefix"], reconstructed)
+    # Scored by the NEXT layer's attn-residual weights -- the one thing only the
+    # target model can supply.
+    res = target.layers[7].self_attention_attn_res
+    assert call["score_weight"] is res.score_weight
+    assert call["eps"] == res.eps
+    # Un-normed and unquantized: SGLang's aggregate is the bare mixture.
+    assert call["out_norm_weight"] is None
+    assert call["quant_dtype"] is None
+
+    expected = _reference_mixture(
+        reconstructed, bank[:, :2, :], res.score_weight, res.eps
+    )
+    assert torch.allclose(out, expected)
+    # ...and it is NOT the plain post-layer hidden state, which is the bug.
+    assert not torch.allclose(out, reconstructed)
+
+
+def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
+    """A layer the draft does not tap keeps the plain reconstruction.
+
+    The hook is installed per tapped layer, but ONE extract serves all of them,
+    so it dispatches on the block it is handed. A miss must degrade to the
+    prefix rather than mix against another layer's bank.
+    """
+    torch = pytest.importorskip("torch")
+    hidden = 16
+    target = _k3_target_stub(hidden=hidden)
+    spec = _dflash_spec(target, (6, 11), hidden=hidden)
+
+    calls = _fake_attn_res_kernel(monkeypatch, [])
+    prefix = torch.randn(3, hidden)
+    bank = torch.randn(3, 6, hidden)
+
+    out = spec.extract((prefix, None, bank), target.layers[5])
+    assert torch.equal(out, prefix)
+    assert calls == []
+
+    # Fewer closed blocks than the tap implies: nothing to mix against.
+    short = spec.extract((prefix, None, bank[:, :1, :]), target.layers[6])
+    assert torch.equal(short, prefix)
+    assert calls == []
+
+
+def test_dflash_falls_back_when_the_target_has_no_attn_residuals():
+    """No attn-residual sites -> the prefix IS the whole stream.
+
+    Guards the shape of the degradation: the draft must not try to mix against
+    a bank that does not exist, and must not raise either -- the generic
+    extractor is a correct answer for a target with no mixture.
+    """
+    generic = _generic_extract()
+    target = _k3_target_stub(enabled=False)
+    spec = _dflash_spec(target, (7, 11))
+    assert spec.extract is generic
+
+
+def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
+    """(b) REGRESSION GUARD. The Inferact MLA draft must NOT get the aggregate.
+
+    `Inferact/Kimi-K3-DSpark` was trained through vLLM/HF against the plain
+    residual stream. Measured, the aggregate costs it ~2.6 pp acceptance -- and
+    it is the draft `.github/benchmark/models_accuracy.json` tracks, so an
+    earlier, globally-defaulted-on version of this feature regressed CI. It
+    keeps the prefix by not implementing the hook at all.
+    """
+    dspark = pytest.importorskip(
+        "atom.models.kimi_k3_dspark",
+        reason="the draft model imports aiter at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    proposer_mod = pytest.importorskip(
+        "atom.spec_decode.dspark_proposer",
+        reason="the proposer imports aiter/triton at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    DSparkProposer = proposer_mod.DSparkProposer
+
+    assert not hasattr(dspark.KimiK3DSpark, "target_aux_capture_spec")
+
+    # ...and that absence must actually route it to the generic extractor.
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.model = dspark.KimiK3DSpark.__new__(dspark.KimiK3DSpark)
+    proposer.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(dspark_target_layer_ids=[7, 11])
+    )
+    proposer.config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(hidden_size=16)
+    )
+    spec = proposer._aux_capture_spec(_k3_target_stub())
+    assert spec.extract is DSparkProposer._extract_layer_hidden
+    assert spec.capture == "output"
+    assert spec.layer_ids == (7, 11)
+
+
+def test_dsv41_dspark_still_owns_its_input_tap():
+    """(c) The signature widening must not disturb the other implementor.
+
+    V4.1 reads its feature off the tapped block's own input and needs nothing
+    from the target model; it takes the new argument and ignores it. Pinned
+    because the call site passes it POSITIONALLY to every implementor -- there
+    is no `inspect.signature` sniffing that could quietly skip it.
+    """
+    v41 = pytest.importorskip(
+        "atom.models.deepseek_v41.dspark",
+        reason="the draft model imports aiter at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    model = v41.DeepseekV41DSpark.__new__(v41.DeepseekV41DSpark)
+    model.config = types.SimpleNamespace(engram_layer_ids=[1, 2, 3])
+
+    spec = model.target_aux_capture_spec((37, 38, 39), 7168, _k3_target_stub())
+    assert spec.layer_ids == (37, 38, 39)
+    assert spec.hidden_size == 7168
+    assert spec.capture == "input"
+    assert spec.extract is v41.DeepseekV41DSpark._target_layer_input
+
+    # The Engram guard still fires, i.e. the extra argument did not shift the
+    # ones it reads.
+    with pytest.raises(ValueError, match="Engram"):
+        model.target_aux_capture_spec((1, 37), 7168, _k3_target_stub())
+
+
+def test_dspark_proposer_hands_the_target_model_to_the_draft():
+    """The call site passes the target model through, positionally.
+
+    This is the plumbing the K3 aggregate needs: without it the draft cannot
+    reach layer `lid + 1`'s scoring weights, and the feature silently degrades
+    to the prefix.
+    """
+    proposer_mod = pytest.importorskip(
+        "atom.spec_decode.dspark_proposer",
+        reason="the proposer imports aiter/triton at module load",
+        exc_type=(ImportError, RuntimeError),
+    )
+    from atom.spec_decode.drafter import AuxCaptureSpec
+
+    seen = {}
+
+    def own(layer_ids, hidden_size, target_model):
+        seen.update(
+            layer_ids=layer_ids, hidden_size=hidden_size, target_model=target_model
+        )
+        return AuxCaptureSpec(layer_ids, hidden_size, lambda output, block: None)
+
+    proposer = proposer_mod.DSparkProposer.__new__(proposer_mod.DSparkProposer)
+    proposer.model = types.SimpleNamespace(target_aux_capture_spec=own)
+    proposer.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(dspark_target_layer_ids=[7, 11])
+    )
+    proposer.config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(hidden_size=16)
+    )
+    target = _k3_target_stub()
+
+    proposer._aux_capture_spec(target)
+    assert seen == {"layer_ids": (7, 11), "hidden_size": 16, "target_model": target}

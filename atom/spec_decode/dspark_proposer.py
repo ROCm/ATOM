@@ -656,9 +656,16 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
+        # `target_model` is passed because a draft's feature can depend on more
+        # of the target than the tapped layer's own return: Kimi-K3's aggregate
+        # stream is scored by the NEXT layer's attn-residual weights, which only
+        # the target holds. Every implementor takes it; the ones that do not
+        # need it ignore it (V4.1). Positional, and declared on both signatures
+        # -- no `inspect.signature` sniffing, so a stale implementor is a loud
+        # TypeError at arm time rather than a silently skipped argument.
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size)
+            return own(layer_ids, self.config.hf_config.hidden_size, target_model)
         return AuxCaptureSpec(
             layer_ids=layer_ids,
             hidden_size=self.config.hf_config.hidden_size,

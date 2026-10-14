@@ -139,6 +139,7 @@ the fp8 read measures slower than bf16. `aiter.utility.dtypes.d_dtypes["fp8"]`
 is `float8_e4m3fn` on this arch, which is what the pool is built from.
 """
 
+import logging
 from typing import ClassVar
 
 import torch
@@ -157,6 +158,8 @@ from atom.model_ops.paged_attention import Attention
 from atom.models.dspark_draft import DSparkDraftModel
 from atom.models.kimi_k3_dspark import DSparkMarkovHead, _linear_out
 from atom.spec_decode.draft_kv import uses_sglang_block_attn
+
+logger = logging.getLogger("atom")
 
 
 class KimiK3DFlashAttention(nn.Module):
@@ -806,6 +809,124 @@ class KimiK3DFlash(DSparkDraftModel):
         # Bound by `share_with_target`.
         self.embed_tokens = None
         self.lm_head = None
+
+    # -- the target feature this draft was trained on ----------------------
+
+    def target_aux_capture_spec(self, layer_ids, hidden_size, target_model):
+        """Tap the target's AGGREGATE stream, not its running prefix.
+
+        Kimi-K3 does not carry a plain pre-norm residual stream. It carries a
+        BANK of per-``attn_res_block_size`` snapshots plus a RUNNING PREFIX,
+        recombined at each attn-residual site by a softmax mixture over the
+        bank plus the prefix (`AttnRes`). ATOM's generic aux tap reconstructs
+        the prefix alone (`KimiDecoderLayer.aux_hidden_state` sums the layer's
+        deferred addends into it) and discards the bank; SGLang's dspark aux tap
+        returns the MIXTURE (`aggregate_stream`).
+
+        This checkpoint (`RadixArk/Kimi-K3-DSpark`) was trained by SpecForge on
+        hidden states captured from a live SGLang Kimi-K3 target, so the
+        mixture is the feature it saw. Measured on GSM8K n=1319 at k=5: feeding
+        the prefix scores 55.61% acceptance, feeding the aggregate 62.04%
+        (+6.43 pp), accuracy unchanged within noise.
+
+        This is a PER-DRAFT contract, not a target-side or global one. The same
+        aggregate makes the vLLM/HF-trained MLA draft (`KimiK3DSpark`,
+        `Inferact/Kimi-K3-DSpark`) about 2.6 pp WORSE -- that one wants the raw
+        prefix, and gets it by not implementing this method at all and falling
+        through to `DSparkProposer._extract_layer_hidden`. Which feature a draft
+        is fed therefore follows from which draft class is loaded, with nothing
+        to configure and no way for the two to disagree.
+
+        The mixture is ATOM's own (`apply_attn_res`), not a transcription of
+        SGLang's: the scoring weight is the NEXT target layer's
+        `self_attention_attn_res.score_weight` (= `self_attention_res_norm.weight *
+        self_attention_res_proj.weight`, folded at load) and the kernel is the
+        one the target itself runs, called with ``out_norm_weight=None`` so the
+        result comes back un-normed -- exactly SGLang's "softmax mixture, no
+        output norm". `kimi_k3.py` is `@support_torch_compile` and is not
+        touched; the whole reconstruction lives here, in the draft that wants it.
+        """
+        # Local: `drafter` imports the model loader, so a module-level import
+        # here would close a cycle. Both are resolved once, at arm time.
+        from atom.spec_decode.drafter import AuxCaptureSpec, _resolve_decoder_layers
+        from atom.spec_decode.dspark_proposer import DSparkProposer
+
+        # The prefix half is still the generic reconstruction -- it is a
+        # property of the TARGET's layer protocol, and the aggregate is a
+        # mixture OF it, not a replacement for it.
+        base_extract = DSparkProposer._extract_layer_hidden
+        layers = _resolve_decoder_layers(target_model)
+
+        # lid -> (num_valid_blocks, the AttnRes that scores the mixture).
+        # Keyed by the layer's OWN `layer_idx`, which is what the extract can
+        # read back off the module it is handed: a module int attribute, which
+        # Dynamo constant-folds inside the target's traced region, where an
+        # `id()`-keyed lookup would graph-break.
+        taps: dict[int, tuple[int, nn.Module]] = {}
+        for lid in layer_ids:
+            if lid < 0 or lid + 1 >= len(layers):
+                continue  # the embedding tap, and the last layer (no successor)
+            if getattr(layers[lid], "layer_idx", lid) != lid:
+                continue  # not a stack we can index; take the prefix
+            res = getattr(layers[lid + 1], "self_attention_attn_res", None)
+            if res is None or not getattr(res, "enabled", False):
+                continue
+            block_size = getattr(res, "block_size", None)
+            if not block_size:
+                continue
+            # CEILING division, matching SGLang's `prev_valid_blocks`: the bank
+            # holds one snapshot per closed block below this layer.
+            nvb = -(-(lid + 1) // block_size)
+            if nvb > 0:
+                taps[lid] = (nvb, res)
+
+        if not taps:
+            # A target without attention residuals (or a stack we could not
+            # index) has no aggregate to form; the prefix IS the whole stream.
+            logger.warning(
+                "DFlash draft found no Kimi-K3 attn-residual sites above its "
+                "taps %s; feeding the plain residual stream, which is NOT the "
+                "feature this checkpoint was trained on.",
+                layer_ids,
+            )
+            return AuxCaptureSpec(layer_ids, hidden_size, base_extract)
+
+        logger.info("DFlash aggregate tap armed on target layers %s", sorted(taps))
+
+        def extract(output, block):
+            prefix = base_extract(output, block)
+            tap = taps.get(getattr(block, "layer_idx", -1))
+            if prefix is None or tap is None:
+                return prefix
+            nvb, res = tap
+            # `KimiDecoderLayer.forward` returns (prefix_sum, *pendings, bank).
+            bank = output[-1] if isinstance(output, tuple) else None
+            if bank is None or bank.shape[1] < nvb:
+                # Fewer closed blocks than this layer implies: nothing to mix
+                # against, so the prefix already is the whole stream.
+                return prefix
+            score_weight = res.score_weight
+            if score_weight is None:  # loader hook did not run (plugin hosts)
+                res.process_weights_after_loading()
+                score_weight = res.score_weight
+            from atom.model_ops.kimi_k3 import apply_attn_res
+
+            # `out_norm_weight=None` -> the mix comes back un-normed. The base
+            # hook then copies it in place into the same fixed capture buffer it
+            # would have filled with `prefix` -- same buffer, same shape, so
+            # cudagraph capture is unaffected.
+            mixed, _ = apply_attn_res(
+                prefix,
+                bank[:, :nvb, :],
+                score_weight,
+                res.eps,
+                None,
+                None,
+                res.out_eps,
+            )
+            return mixed
+
+        return AuxCaptureSpec(layer_ids, hidden_size, extract)
 
     # -- DSparkDraftModel contract ----------------------------------------
 
