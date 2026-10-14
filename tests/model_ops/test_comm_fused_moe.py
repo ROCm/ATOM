@@ -245,6 +245,7 @@ def comm_fused_env(monkeypatch, atom_modules):
     monkeypatch.setattr(atom_modules.comm, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(atom_modules.comm, "get_dp_group", lambda: dp_group)
     monkeypatch.setattr(atom_modules.comm, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(atom_modules.comm, "_get_pci_device_id", lambda: 0x75A3)
     monkeypatch.setattr(atom_modules.host, "ShapeKey", _ShapeKey, raising=False)
     monkeypatch.setattr(atom_modules.host, "winners_for", winners_for, raising=False)
     monkeypatch.setattr(
@@ -361,6 +362,34 @@ def test_support_predicate_honors_disable_flag(monkeypatch, comm_fused_env):
 
     assert _create_backend(modules, state) is None
     assert not state.shape_keys
+
+
+@pytest.mark.parametrize("device_id", [0x75B0, None])
+def test_support_predicate_rejects_unvalidated_gfx950_device(
+    monkeypatch, comm_fused_env, device_id
+):
+    modules, state, _, _ = comm_fused_env
+    monkeypatch.setattr(modules.comm, "_get_pci_device_id", lambda: device_id)
+
+    assert _create_backend(modules, state) is None
+    assert not state.shape_keys
+
+
+def test_pci_device_id_reads_active_device_sysfs(monkeypatch, tmp_path, atom_modules):
+    bdf = "0002:00:01.0"
+    device_file = tmp_path / bdf / "device"
+    device_file.parent.mkdir()
+    device_file.write_text("0x75a3\n", encoding="utf-8")
+    props = SimpleNamespace(pci_domain_id=2, pci_bus_id=0, pci_device_id=1)
+    monkeypatch.setattr(atom_modules.comm, "_PCI_DEVICES_ROOT", tmp_path)
+    monkeypatch.setattr(atom_modules.comm.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        atom_modules.comm.torch.cuda,
+        "get_device_properties",
+        lambda device: props,
+    )
+
+    assert atom_modules.comm._get_pci_device_id() == 0x75A3
 
 
 def test_support_predicate_requires_interleaved_gate_up(monkeypatch, comm_fused_env):
