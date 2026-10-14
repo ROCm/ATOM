@@ -7,8 +7,8 @@
 // language needs, beyond the messages themselves, to drive an EngineCore.
 // CoreManager (atom/model_engine/engine_core_mgr.py) is the reference client
 // and atom/model_engine/protocol/codec.py the reference codec. The Python
-// binding (engine_v1_pb2.py) is generated at install time; after editing this
-// file in an editable checkout, run atom/model_engine/protocol/generate.py.
+// binding, engine_v1_pb2.py, is checked in: after editing this file, run
+// atom/model_engine/protocol/generate.py and commit both.
 //
 // ============================================================== SOCKETS ===
 //
