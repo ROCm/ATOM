@@ -379,3 +379,33 @@ class TestPrefixCachingIsRefused:
         from atom.plugin.vllm.platform import enforce_deepseek_v41_constraints
 
         enforce_deepseek_v41_constraints(self._config(False))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # How the configs in this file describe a group, and how a spec-less
+        # group reaches the reserve in general. Reading `kv_cache_spec`
+        # unguarded raised AttributeError on every one of these.
+        "absent",
+        None,
+        SimpleNamespace(),
+    ],
+)
+def test_a_group_without_a_usable_block_size_falls_back_to_the_page_size(spec):
+    from atom.plugin.vllm.deepseek_v41_bridge import ATOM_DEEPSEEK_V41_BLOCK_SIZE
+
+    group = SimpleNamespace(layer_names=[ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME])
+    if spec != "absent":
+        group.kv_cache_spec = spec
+    config = SimpleNamespace(
+        num_blocks=10_000,
+        kv_cache_groups=[group],
+        kv_cache_tensors=[SimpleNamespace(size=1 << 30)],
+    )
+
+    _reserve_state_tail(
+        [config], 900, _vllm_config(max_model_len=ATOM_DEEPSEEK_V41_BLOCK_SIZE * 4)
+    )
+
+    assert config.num_blocks == 10_000 - 900

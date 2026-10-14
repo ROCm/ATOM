@@ -71,6 +71,17 @@ _PATCH_TARGETS = (
 
 _ATTR = "get_kv_cache_configs"
 
+# The other half of the same reservation. `get_kv_cache_configs` decides
+# `max_model_len` for `--max-model-len -1` by binary search against the memory
+# it is about to buy, and it does that *before* this patch takes the tail out.
+# The fitted length therefore fills the whole pool, the tail comes out of a
+# pool already spoken for, and startup fails over a length vLLM chose itself.
+# vLLM has the shape for this already: it subtracts the null block from the
+# memory auto-fit and the capacity check plan against, while allocation still
+# uses the full amount. The STATE tail is subtracted the same way.
+_AUTOFIT_ATTR = "_auto_fit_max_model_len"
+_POOL_BYTES_ATTR = "_pool_bytes_per_block"
+
 # `BlockPool.__init__` pops one block off the free queue to serve as its null
 # placeholder and never gives it back, so this many of any pool's block ids
 # are not allocatable.
@@ -88,6 +99,25 @@ def deepseek_v41_state_reserve_blocks(vllm_config) -> int:
     )
 
     return v41_proxy_state_reserve_blocks(vllm_config)
+
+
+def _how_to_fit(vllm_config) -> str:
+    """What would actually make this pool bigger, for the config in hand.
+
+    "Raise --gpu-memory-utilization" is the general answer and the wrong one
+    under `--num-gpu-blocks-override`, which pins the block count and ignores
+    the utilization entirely: a reader who follows it changes a number and
+    sees the identical failure.
+    """
+    cache_config = getattr(vllm_config, "cache_config", None)
+    override = getattr(cache_config, "num_gpu_blocks_override", None)
+    if override:
+        return (
+            f"The pool size is pinned by --num-gpu-blocks-override={override}, "
+            "so --gpu-memory-utilization will not change it: raise the override, "
+            "or lower --max-num-seqs or --max-model-len."
+        )
+    return "Raise --gpu-memory-utilization, or lower --max-num-seqs or --max-model-len."
 
 
 def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
@@ -118,9 +148,12 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
     def _blocks_one_request_needs(cfg) -> int:
         total = 0
         for group in cfg.kv_cache_groups:
+            # The spec itself is optional, not just its block size: a group is
+            # reached here from vLLM's own configs and from tests that describe
+            # one by its layer names alone.
+            spec = getattr(group, "kv_cache_spec", None)
             block_size = int(
-                getattr(group.kv_cache_spec, "block_size", 0)
-                or ATOM_DEEPSEEK_V41_BLOCK_SIZE
+                getattr(spec, "block_size", 0) or ATOM_DEEPSEEK_V41_BLOCK_SIZE
             )
             total += max(1, -(-max_model_len // block_size))
         return total
@@ -150,9 +183,8 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
                 f"{min_usable} a single max_model_len={max_model_len} request "
                 f"needs ({per_request} across this pool's "
                 f"{len(cfg.kv_cache_groups)} KV-cache group(s) plus "
-                f"{NULL_BLOCKS} vLLM holds back as its null block). Raise "
-                "--gpu-memory-utilization, or lower --max-num-seqs "
-                "or --max-model-len."
+                f"{NULL_BLOCKS} vLLM holds back as its null block). "
+                + _how_to_fit(vllm_config)
             )
         logger.info(
             "DeepSeek-V4.1 plugin: reserving %d of %d proxy PAGEs for the CSA2 "
@@ -176,6 +208,45 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
         )
 
 
+def _patch_auto_fit(module) -> bool:
+    """Let ``--max-model-len -1`` fit against the pool minus the STATE tail.
+
+    Returns whether it installed here. A module without the symbol is not an
+    error: the length is only auto-fitted on versions that have it.
+    """
+    original = getattr(module, _AUTOFIT_ATTR, None)
+    if original is None or getattr(original, "_atom_v41_autofit_patched", False):
+        return False
+
+    @functools.wraps(original)
+    def patched(vllm_config, projected_groups_per_worker, available_memory, **kwargs):
+        reserve = deepseek_v41_state_reserve_blocks(vllm_config)
+        if reserve:
+            # Read at call time: `spec_decode_patch` replaces this for a pool
+            # whose groups are heterogeneous, and the tail has to be priced in
+            # the same block bytes the rest of the sizing uses.
+            pool_bytes = getattr(module, _POOL_BYTES_ATTR, None)
+            if pool_bytes is not None:
+                available_memory = [
+                    max(0, memory - reserve * pool_bytes(groups)) if groups else memory
+                    for groups, memory in zip(
+                        projected_groups_per_worker, available_memory
+                    )
+                ]
+                logger.info(
+                    "DeepSeek-V4.1 plugin: auto-fitting max_model_len against the "
+                    "pool minus its %d-PAGE STATE tail",
+                    reserve,
+                )
+        return original(
+            vllm_config, projected_groups_per_worker, available_memory, **kwargs
+        )
+
+    patched._atom_v41_autofit_patched = True
+    setattr(module, _AUTOFIT_ATTR, patched)
+    return True
+
+
 def apply_vllm_v41_state_reserve_patch() -> bool:
     """Wrap ``get_kv_cache_configs`` so V4.1 pools keep a STATE tail. Idempotent."""
     import importlib
@@ -188,6 +259,17 @@ def apply_vllm_v41_state_reserve_patch() -> bool:
             logger.debug(
                 "ATOM V4.1 state-reserve patch: %s unavailable (%s), skip", name, e
             )
+    # The auto-fit lives only where it is defined, and is patched whether or
+    # not the outer wrap below is still needed.
+    for module in modules:
+        if _patch_auto_fit(module):
+            logger.info(
+                "ATOM plugin: patched vLLM %s in %s so an auto-fitted "
+                "max_model_len leaves room for the DeepSeek-V4.1 STATE tail",
+                _AUTOFIT_ATTR,
+                module.__name__,
+            )
+
     modules = [m for m in modules if hasattr(m, _ATTR)]
     if not modules:
         return False

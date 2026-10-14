@@ -175,6 +175,101 @@ def _refuse_v41_hf_overrides(vllm_config) -> None:
     raise ValueError(msg)
 
 
+def _refuse_v41_multi_axis_parallelism(vllm_config) -> None:
+    """Refuse pipeline and context parallel, which V4.1 has no split for.
+
+    The model's own `validate_runtime_config` already refuses both, but in
+    plugin mode it cannot see them: `_generate_atom_config_from_vllm_config`
+    never carries `pipeline_parallel_size` or the context-parallel sizes into
+    the ATOM `Config`, so they read 1 whatever vLLM was told, and the check
+    passes because it was never asked the question. `vllm serve -pp 2` is then
+    accepted and fails later, somewhere that does not name the cause.
+
+    Asked of vLLM's config directly, which is the only place the truth is, and
+    kept here rather than fixed in the translation so that admitting a model
+    for a parallelism it does not implement stays one model's decision.
+    """
+    parallel = getattr(vllm_config, "parallel_config", None)
+    if parallel is None:
+        return
+    unsupported = [
+        (name, size)
+        for name, size in (
+            ("pipeline_parallel_size", getattr(parallel, "pipeline_parallel_size", 1)),
+            (
+                "prefill_context_parallel_size",
+                getattr(parallel, "prefill_context_parallel_size", 1),
+            ),
+            (
+                "decode_context_parallel_size",
+                getattr(parallel, "decode_context_parallel_size", 1),
+            ),
+        )
+        if int(size or 1) != 1
+    ]
+    if not unsupported:
+        return
+    msg = (
+        "DeepSeek-V4.1 on the vLLM plugin supports tensor parallel only; it has "
+        "no pipeline or context parallel split. Refused: "
+        + ", ".join(f"{name}={size}" for name, size in unsupported)
+        + ". Use --tensor-parallel-size for the whole device group."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
+def _refuse_v41_kv_transfer(vllm_config) -> None:
+    """Refuse every KV connector on this path, including `lmcache_mp`.
+
+    A V4.1 request's recoverable state is not its PAGEs alone: the window
+    ring, the compressor rings and the Engram cursor live in the STATE region,
+    and a connector that restores PAGE bytes without them hands the forward a
+    prefix it cannot continue from.
+
+    The model's check admits `lmcache_mp` because ATOM's own transport
+    checkpoints STATE through its PAGE-backed images. That reasoning does not
+    carry over here: in plugin mode vLLM resolves the connector through *its*
+    registry, where `LMCacheMPConnector` is vLLM's own, and ATOM's STATE
+    checkpoint path is not what runs. The name alone is why it was admitted --
+    ATOM registers `LMCacheMPConnector` as an alias of `lmcache_mp`.
+
+    Every other name is refused here too, rather than left to
+    `KVConnectorFactory.connector_name`, which raises "unknown KV connector"
+    for vLLM's own `NixlConnector` / `OffloadingConnector` / `MooncakeConnector`
+    -- an error about ATOM's registry, in answer to a question about V4.1.
+
+    ATOM's own `AtomLMCacheOffloadConnector` is refused on this branch for the
+    same reason and not for the alias one: it is selected by explicit
+    `kv_connector_module_path`, so it never goes through that name resolution,
+    but the version here knows nothing about V4.1 -- it carries the recurrent
+    mamba state, and `connector.py` has no V4.1 path at all. A V4.1 hit through
+    it would restore PAGEs and no STATE.
+
+    This is the condition to relax when that changes: a connector that writes
+    and restores V4.1's STATE entries belongs in an allow-list here, added in
+    the same change that teaches it to -- not before, since the failure it
+    would admit is a silently wrong continuation rather than an error.
+    """
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    if transfer is None:
+        return
+    connector = getattr(transfer, "kv_connector", None) or (
+        transfer.get("kv_connector") if isinstance(transfer, dict) else None
+    )
+    if not connector:
+        return
+    msg = (
+        f"DeepSeek-V4.1 on the vLLM plugin does not support KV transfer "
+        f"({connector}): a request's window ring, compressor rings and Engram "
+        "cursor live in the STATE region, and no connector on this path "
+        "restores them, so a hit would resume from PAGEs whose state is "
+        "missing. Run without --kv-transfer-config."
+    )
+    logger.error(msg)
+    raise ValueError(msg)
+
+
 def _refuse_unsupported_v41_speculation(vllm_config) -> None:
     """Admit DSpark, refuse every other speculative method.
 
@@ -330,6 +425,8 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
     _refuse_v41_hf_overrides(vllm_config)
+    _refuse_v41_multi_axis_parallelism(vllm_config)
+    _refuse_v41_kv_transfer(vllm_config)
     _refuse_unsupported_v41_speculation(vllm_config)
     _require_v41_draft_kv_cache_dtype(vllm_config)
 
