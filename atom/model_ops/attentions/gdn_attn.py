@@ -5,7 +5,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -35,6 +35,9 @@ from .pool_layout.paged_state_copy import (
 from .pool_layout.pool_rows import PoolRowsMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 
+if TYPE_CHECKING:
+    from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
 logger = logging.getLogger("atom")
 
 # The linear-attention state pool's row space -- one slot per recurrent layer,
@@ -47,6 +50,27 @@ _GDN_SSM_DTYPES = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
+
+
+def slot_indexed_caches(runner, replayssm: bool) -> list[torch.Tensor]:
+    """The `(layer, slot, ...)` caches that together hold one slot's state.
+
+    `relocate_state_slots` moves exactly these, and `state_slot_regions`
+    describes exactly these; anything added to the pool belongs here so that
+    neither can be extended without the other.
+
+    Takes the runner rather than the builder so that both callers reach it the
+    same way whether or not they are bound: the state tests drive those two
+    methods unbound, against a stub that has the caches but no methods.
+    """
+    caches = [runner.mamba_k_cache, runner.mamba_v_cache]
+    if replayssm:
+        caches += [
+            runner.replayssm_buf_k,
+            runner.replayssm_buf_u,
+            runner.replayssm_buf_g,
+        ]
+    return caches
 
 
 class GDNAttentionBackend(AiterBackend):
@@ -88,6 +112,12 @@ class GDNAttentionMetadata:
     # from `non_spec_state_indices_tensor`. Same tensor otherwise; None on the
     # spec path, which never carries a fork.
     non_spec_state_indices_in_tensor: torch.Tensor | None = None
+    # Prefill-path state bookkeeping built once per step instead of once per
+    # GDN layer: `~has_initial_state`, and the write / read slots as int64 so
+    # index_copy_ / index_select take them without a per-layer cast.
+    no_initial_state: torch.Tensor | None = None
+    non_spec_state_indices_i64: torch.Tensor | None = None
+    non_spec_state_indices_in_i64: torch.Tensor | None = None
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -602,7 +632,9 @@ class GDNStateMixin(PoolRowsMixin):
     # whichever builder owns the paged pool (`_page_unit_regions`).
     #
     # Dormant under `StateTransfer.fork`: nothing produces a store op unless a
-    # subclass declares `copy()`. Only `_KimiMLAGDNCommon` does today.
+    # subclass declares `copy()`. `_KimiMLAGDNCommon` does, over its MLA pool.
+    # `GDNAttentionMetadataBuilder` does for the Qwen GDN/MHA family, over the
+    # MHA pool.
 
     def _checkpoint_layer_ranges(self) -> list[list[tuple[int, int]]]:
         """Per plane, one `(offset, nbytes)` per layer for slot 0.
@@ -927,6 +959,64 @@ class GDNStateMixin(PoolRowsMixin):
                 views.append(cache[layer, slot : slot + 1])
         return views
 
+    def state_slot_regions(self) -> tuple[list["KVTransferRegion"], int]:
+        """RDMA regions for the state pool, addressed by state slot.
+
+        The third view of the bytes `relocate_state_slots` moves and
+        `state_entry_views` names, for the one consumer that needs neither a
+        copy nor a view but an address: a peer's NIC.
+
+        One region per (cache, layer), not per cache. A region resolves an
+        index as `base + slot * unit`, so a slot's bytes must be contiguous
+        and evenly strided -- true within a layer, false across them, since
+        every cache is `(layer, slot) + state_shape` and a slot's rows are a
+        layer-stride apart.
+
+        Returns the regions and the pool's slot count. The count is the
+        allocated width, not the live request count: it is what makes a
+        region's extent, and both ends compute addresses from it.
+        """
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        caches = slot_indexed_caches(self.model_runner, self.replayssm)
+        num_slots = caches[0].shape[1]
+        regions: list[KVTransferRegion] = []
+        for cache in caches:
+            assert cache.is_contiguous(), (
+                "slot-indexed state cache must be contiguous: a transfer "
+                "region addresses a slot as base + slot * unit_bytes"
+            )
+            assert cache.shape[1] == num_slots, (
+                f"state caches disagree on slot count: {cache.shape[1]} != "
+                f"{num_slots}; one slot index has to address all of them"
+            )
+            slot_bytes = cache[0, 0].numel() * cache.element_size()
+            layer_bytes = num_slots * slot_bytes
+            for layer in range(cache.shape[0]):
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=cache.data_ptr() + layer * layer_bytes,
+                        total_bytes=layer_bytes,
+                        unit_bytes=slot_bytes,
+                    )
+                )
+
+        if self.replayssm:
+            # The cursor has no layer axis -- one int32 per slot, shared by
+            # every layer -- so the whole tensor is a single region whose unit
+            # is one element. Without it the records above are unreadable: the
+            # reader cannot tell which of them the sequence has committed.
+            pos = self.model_runner.replayssm_write_pos
+            regions.append(
+                KVTransferRegion(
+                    base_addr=pos.data_ptr(),
+                    total_bytes=pos.numel() * pos.element_size(),
+                    unit_bytes=pos.element_size(),
+                )
+            )
+
+        return regions, num_slots
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Relocate a live GDN state slot between Active Slot positions.
 
@@ -952,17 +1042,13 @@ class GDNStateMixin(PoolRowsMixin):
         range to copy. `_foreach_copy_` keeps it to one launch for the batch.
         The cursor is the exception — one entry per slot, no layer axis.
         """
-        caches = [self.model_runner.mamba_k_cache, self.model_runner.mamba_v_cache]
+        runner = self.model_runner
+        caches = slot_indexed_caches(runner, self.replayssm)
         cursor = None
         if self.replayssm:
-            caches += [
-                self.model_runner.replayssm_buf_k,
-                self.model_runner.replayssm_buf_u,
-                self.model_runner.replayssm_buf_g,
-            ]
             # One entry per slot, no layer axis -- moved alongside, not with
             # the layer-major caches above.
-            cursor = self.model_runner.replayssm_write_pos
+            cursor = runner.replayssm_write_pos
         destinations, sources = [], []
         for src, dst in pairs:
             for cache in caches:
@@ -1207,6 +1293,13 @@ class GDNStateMixin(PoolRowsMixin):
         else:
             has_initial_state = None
 
+        no_initial_state = None
+        non_spec_state_indices_i64 = non_spec_state_indices_in_i64 = None
+        if has_initial_state is not None and non_spec_state_indices_tensor is not None:
+            no_initial_state = ~has_initial_state
+            non_spec_state_indices_i64 = non_spec_state_indices_tensor.long()
+            non_spec_state_indices_in_i64 = non_spec_state_indices_in_tensor.long()
+
         gdn_attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -1221,6 +1314,9 @@ class GDNStateMixin(PoolRowsMixin):
             spec_state_indices_tensor=spec_state_indices_tensor,
             non_spec_state_indices_tensor=non_spec_state_indices_tensor,
             non_spec_state_indices_in_tensor=non_spec_state_indices_in_tensor,
+            no_initial_state=no_initial_state,
+            non_spec_state_indices_i64=non_spec_state_indices_i64,
+            non_spec_state_indices_in_i64=non_spec_state_indices_in_i64,
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
@@ -1402,6 +1498,21 @@ class GDNStateMixin(PoolRowsMixin):
         return gdn_metadata
 
 
+# ``GDNAttentionMetadataBuilder`` is shared, so the model name is the gate.
+# Turning PAGE copies on for every subclass would aim the image at MHA
+# regions. Qwen4Exp inherits the builder and keeps its state on a QSA pool,
+# which this geometry does not address. The set is only the hybrids whose
+# full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
+#
+# These are text-config ``model_type`` values. A Qwen3.5 wrapper may report
+# ``qwen3_5_moe``; ``get_hf_text_config`` peels that to ``qwen3_5_moe_text``
+# before the membership test. Kimi needs no such set: its builder is only
+# constructed for ``kimi_linear``.
+GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
+    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
+)
+
+
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
@@ -1410,6 +1521,191 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+
+    def _uses_paged_checkpoints(self) -> bool:
+        """PAGE image for the Qwen GDN/MHA family; fork otherwise.
+
+        Off under pipeline parallelism and RapidServe. ``get_num_blocks``
+        raises when a copying transfer meets either, and answering yes there
+        would turn "this model keeps fork-slot checkpoints" into "this model
+        does not start". Kimi's ``_uses_paged_checkpoints`` is the same two
+        switches and no model-type set, because that builder is Kimi-only.
+        """
+
+        config = self.model_runner.config
+        if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1 or getattr(
+            config, "enable_rapidserve", False
+        ):
+            return False
+        from atom.utils import get_hf_text_config
+
+        text = get_hf_text_config(config.hf_config)
+        return getattr(text, "model_type", None) in GDN_PAGE_CHECKPOINT_MODEL_TYPES
+
+    def state_transfer(self) -> StateTransfer:
+        """PAGE image for Qwen GDN hybrids; fork for everyone else.
+
+        Qwen4Exp inherits this builder and stays on fork: its model type is
+        not in the set, and its QSA pool is not the MHA destination below.
+        Pipeline parallelism and RapidServe stay on fork so sizing does not
+        refuse to start.
+        """
+
+        if not self._uses_paged_checkpoints():
+            return super().state_transfer()
+
+        shape_k, shape_v = self._state_shape_for_runner()
+        dtype_k, dtype_v = self._state_dtypes()
+        # Same fields Kimi spells inline in ``state_transfer``. ``order`` is
+        # the one fact the shapes cannot say. ``spec`` changes the conv
+        # window. ``tp`` is in the id because the heads are sharded.
+        layout_id = (
+            "gdn-paged-state-v1"
+            f":layers={self.num_state_layers()}"
+            f":conv={tuple(shape_k)},{dtype_k}"
+            f":ssm={tuple(shape_v)},{dtype_v}"
+            ":order=conv-all-layers,ssm-all-layers"
+            f":tp={get_tp_group().world_size}"
+            f":spec={self.num_spec}"
+            ":carry=all"
+        )
+        return StateTransfer.copy(layout_id)
+
+    def checkpoint_page_unit_bytes(self) -> int | None:
+        """Bytes of one MHA page that a transfer actually publishes.
+
+        ``ModelRunner`` sizes the checkpoint unit from the paged pool's
+        ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
+        that charged size. Kimi's MLA pool needs no override: its charged
+        entry is exactly the rows the page geometry walks.
+
+        Qwen's ``MhaKvPool`` does not work that way. The pool is one
+        allocation ATOM lays out itself. Each field (K, V, scale) is rounded
+        up to 256 bytes so a kernel sees aligned rows, and ``entry_bytes``
+        bills those gaps. ``region_tensors()`` publishes only the real fields,
+        so the gaps are not a region. ``lmcache_mp`` requires the checkpoint
+        unit to equal the sum of the published regions; leaving the spec at
+        ``entry_bytes`` makes ``_page_unit_regions`` reject the mismatch.
+        BF16 fields are often already aligned, so the two sizes coincide.
+        Narrow dtypes (FP8, INT8) are where the padding dominates and the
+        sizes diverge. A draft pool merged into the same class is ordinary KV
+        appended after these regions and is not part of the state image, so
+        it is left out of this sum as well.
+
+        The vLLM plugin never consults this. It is handed the tensors to move
+        and sums ``numel * element_size``, which is already the published
+        bytes. There is no second, padded charge to reconcile.
+        """
+
+        if not self._uses_paged_checkpoints():
+            return None
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_published_page_bytes,
+        )
+
+        published = mha_published_page_bytes(self._declare_kv_pools().values())
+        if published <= 0:
+            raise RuntimeError("GDN PAGE checkpoint has no published MHA bytes")
+        return published
+
+    def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Where a scheduler block sits in the MHA pool.
+
+        The mixin raises: it knows the state planes, not this pool. The
+        addresses have to match ``get_kv_transfer_tensors`` or the copy and
+        ``lmcache_mp`` would name different bytes.
+        """
+
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_regions,
+        )
+
+        pools = list(self.kv_pools.values())
+        key = tuple(
+            (
+                tensor.data_ptr(),
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.element_size(),
+            )
+            for pool in pools
+            for _, tensor in pool.region_tensors()
+        )
+        cached = getattr(self, "_page_unit_region_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        regions = mha_page_unit_regions(pools)
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        owned = int(regions[1].sum())
+        if spec is not None and owned != spec.page_unit_bytes:
+            raise RuntimeError(
+                f"a PAGE unit is {spec.page_unit_bytes} B but the MHA regions "
+                f"cover {owned} B"
+            )
+        self._page_unit_region_cache = (key, regions)
+        return regions
+
+    def _page_unit_bases(self, unit_ids):
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_bases,
+        )
+
+        return mha_page_unit_bases(self._page_unit_regions(), unit_ids)
+
+    def _page_unit_stream_sizes(self, units: int):
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_stream_sizes,
+        )
+
+        return mha_page_unit_stream_sizes(self._page_unit_regions(), units)
+
+    def page_unit_views(self, unit_ids):
+        """MHA views of one checkpoint image, for the in-process state tier.
+
+        The tier packs these bytes and unpacks them into ``state_entry_views``.
+        The copy plan already wrote the slot stream across these regions, so
+        the two orders are the same byte sequence once the tail is trimmed to
+        ``image_bytes``.
+        """
+
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_views,
+        )
+
+        self._page_unit_regions()
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        spec = None if runtime is None else runtime.checkpoint_spec
+        image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
+        return mha_page_unit_views(
+            self.kv_pools.values(), unit_ids, image_bytes=image_bytes
+        )
+
+    def get_kv_transfer_tensors(self):
+        """MHA PAGE regions, plus the native checkpoint contract for lmcache_mp."""
+
+        transfer = super().get_kv_transfer_tensors()
+        if transfer is None or not self._uses_paged_checkpoints():
+            return transfer
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        if spec is None:
+            return transfer
+        bases, sizes = self._page_unit_regions()
+        count = len(bases)
+        published = [
+            (page.region.base_addr, page.region.unit_bytes)
+            for page in transfer.pages[:count]
+        ]
+        if published != list(zip(bases.tolist(), sizes.tolist(), strict=True)):
+            raise RuntimeError(
+                "GDN transfer regions do not match its checkpoint PAGE unit: "
+                f"{len(transfer.pages)} published, {count} in a unit"
+            )
+        transfer.paged_state_checkpoint_spec = spec
+        transfer.execute_paged_state_copies = self.execute_paged_state_copies
+        transfer.paged_state_region_count = count
+        transfer.native_state_tp_replication_factor = 1
+        return transfer
 
     def _module_kinds(self, module) -> tuple:
         """The MHA row spaces, plus a slot for every linear-attention layer."""
@@ -1577,9 +1873,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
 
         # Decode replays this graph, so the op must see a plan HERE: absent at
-        # capture time, the static path is what gets recorded and every later
-        # refresh feeds a graph that never reads it -- with no error, and an
-        # A/B of the planner that measures pure overhead.
+        # capture time, the graph records a per-call runtime-plan refresh
+        # instead of this builder's shared plan.
         attn_metadata.flydsl_work_plan = self.refresh_flydsl_plan(
             attn_metadata.context_lens, create=True
         )

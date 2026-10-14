@@ -219,7 +219,7 @@ class KimiRMSNormGated(nn.Module):
         self.quant_type = quant_type
         self.quant_dtype = quant_dtype
 
-    def forward(self, x: torch.Tensor, gate: torch.Tensor):
+    def forward(self, x: torch.Tensor, gate: torch.Tensor, *, is_prefill: bool = False):
         from atom.model_ops.kimi_k3 import rmsnorm_gated
 
         return rmsnorm_gated(
@@ -229,6 +229,7 @@ class KimiRMSNormGated(nn.Module):
             self.variance_epsilon,
             quant_type=self.quant_type,
             quant_dtype=self.quant_dtype,
+            is_prefill=is_prefill,
         )
 
 
@@ -1237,10 +1238,12 @@ class KimiKDAAttention(nn.Module):
         else:
             gate = self.f_b_proj(f_a_view.contiguous())
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
-        out = fused_in.new_empty(
-            (num_actual_tokens, self.num_local_heads, self.head_dim)
-        )
+        # Prefill returns its own contiguous output. Allocate this buffer only
+        # for decode/spec-decode, where the recurrence writes into it directly.
+        if kda_metadata.num_prefills <= 0:
+            out = fused_in.new_empty(
+                (num_actual_tokens, self.num_local_heads, self.head_dim)
+            )
 
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
@@ -1298,7 +1301,14 @@ class KimiKDAAttention(nn.Module):
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
-            out.copy_(kda_out.squeeze(0))
+            # o_norm only reads this tensor, so keep the contiguous KDA output
+            # instead of materializing an identical copy into `out`.
+            assert kda_out.dtype == fused_in.dtype, (
+                "KDA output dtype must match the former fused_in-backed output "
+                f"buffer: got {kda_out.dtype} vs {fused_in.dtype}"
+            )
+            assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
+            out = kda_out.squeeze(0)
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
@@ -1452,7 +1462,9 @@ class KimiKDAAttention(nn.Module):
             out.zero_()
 
         normed = self.o_norm(
-            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
+            out,
+            rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
+            is_prefill=kda_metadata.num_prefills > 0,
         )
         # A fused per-token quant makes o_norm return (quantized, scale); feed it
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.

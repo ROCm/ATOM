@@ -643,8 +643,8 @@ class MoRIIOConnector(KVConnectorBase):
         """Return cached RDMA sessions for the remote engine, building if needed.
 
         With chunked registration, local block ``b`` and remote block ``r``
-        may reside in different chunks, so we build an NxN session grid
-        for K chunks and another NxN grid for V chunks.
+        may reside in different chunks, so we build a local x remote session
+        grid for K chunks and another for V chunks.
 
         Returns ``(per_layer_sessions, remote_meta)`` where each layer
         entry is ``(k_sessions_dict, v_sessions_dict)`` keyed by
@@ -652,15 +652,25 @@ class MoRIIOConnector(KVConnectorBase):
         """
         if remote_engine_id not in self._built_sessions:
             nk = self.num_k_chunks
+            remote_meta = self.remote_moriio_metadata[remote_engine_id]
+            # Both ends cut a pool at the same blocks per chunk, which depends
+            # only on the size of a block, but each registers as many chunks as
+            # its own pool needs. P and D size their KV caches independently,
+            # so one can cross a chunk boundary the other does not.
+            remote_nk = -(-remote_meta.num_blocks // self.blocks_per_chunk)
             per_layer_sessions: list[tuple[dict, dict]] = []
             for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
                 remote_metas = self.layer_name_to_remote_kv_cache_metadata[
                     remote_engine_id
                 ][ln]
-                assert len(local_metas) == len(remote_metas), (
-                    f"layer {ln}: local has {len(local_metas)} descs, "
-                    f"remote has {len(remote_metas)} — chunk count mismatch"
-                )
+                has_v = len(local_metas) > nk
+                if len(remote_metas) != remote_nk * (2 if has_v else 1):
+                    raise ValueError(
+                        f"layer {ln}: {remote_engine_id} advertised "
+                        f"{len(remote_metas)} descriptors for "
+                        f"{remote_meta.num_blocks} blocks, not {remote_nk} per "
+                        f"cache at {self.blocks_per_chunk} blocks per chunk"
+                    )
                 # Packed descriptors carry the owning engine's key, so equal
                 # bytes mean the handshake handed back our own. Every transfer
                 # would then copy this rank onto itself and still report
@@ -677,26 +687,26 @@ class MoRIIOConnector(KVConnectorBase):
                 def _unpack(packed):
                     return self.moriio_wrapper.get_unpack_memory_metadata(packed)
 
-                # K sessions: NxN grid over first nk entries
+                # K sessions: grid over the first nk / remote_nk entries
                 k_sessions: dict[tuple[int, int], Any] = {}
                 for lci in range(nk):
-                    for rci in range(nk):
+                    for rci in range(remote_nk):
                         local_md = _unpack(local_metas[lci])
                         remote_md = _unpack(remote_metas[rci])
                         k_sessions[(lci, rci)] = self.moriio_wrapper.build_session(
                             local_md, remote_md
                         )
 
-                # V sessions: NxN grid over entries [nk:]
+                # V sessions: the same grid over the entries after the K chunks
                 v_sessions: dict[tuple[int, int], Any] = {}
-                nv = len(local_metas) - nk
-                for lci in range(nv):
-                    for rci in range(nv):
-                        local_md = _unpack(local_metas[nk + lci])
-                        remote_md = _unpack(remote_metas[nk + rci])
-                        v_sessions[(lci, rci)] = self.moriio_wrapper.build_session(
-                            local_md, remote_md
-                        )
+                if has_v:
+                    for lci in range(nk):
+                        for rci in range(remote_nk):
+                            local_md = _unpack(local_metas[nk + lci])
+                            remote_md = _unpack(remote_metas[remote_nk + rci])
+                            v_sessions[(lci, rci)] = self.moriio_wrapper.build_session(
+                                local_md, remote_md
+                            )
 
                 per_layer_sessions.append((k_sessions, v_sessions))
 

@@ -28,6 +28,9 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "Glm4MoeForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "GlmMoeDsaForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    # vLLM 0.29 renamed the MTP draft arch of DSA targets (deepseek_v32,
+    # glm_moe_dsa); it is the same draft block as DeepSeekMTPModel.
+    "DeepseekV32MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepSeekV4MTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Glm4MoeMTPModel": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLMVllm",
@@ -266,7 +269,15 @@ def _patch_vllm_harmony_parser_manager() -> None:
         enable_auto_tools=False,
         model_name=None,
         is_harmony=False,
+        **kwargs,
     ):
+        # **kwargs forwards parameters this wrapper does not know about.
+        # vLLM 0.31 added `tool_strict_level` to ParserManager.get_parser;
+        # enumerating the 0.29 parameter list exactly meant the new keyword hit
+        # this wrapper instead of the real method and raised TypeError on the
+        # serving path, after the model had already loaded. Only `is_harmony`
+        # is read here, so everything else can pass straight through and the
+        # next added parameter will not break the patch.
         parser_cls = original(
             cls,
             tool_parser_name=tool_parser_name,
@@ -274,6 +285,7 @@ def _patch_vllm_harmony_parser_manager() -> None:
             enable_auto_tools=enable_auto_tools,
             model_name=model_name,
             is_harmony=is_harmony,
+            **kwargs,
         )
         if parser_cls is not None or not is_harmony:
             return parser_cls

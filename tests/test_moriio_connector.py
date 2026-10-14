@@ -728,6 +728,51 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(conn._awaiting_write, {})
         self.assertEqual(conn._write_reports, {})
 
+    def block_peer(self, local, remote, remote_blocks):
+        """A producer with one block layer, facing a consumer's descriptors."""
+        import types
+
+        conn = self.make(producer=True)
+        conn.layer_name_to_local_kv_cache_metadata = {"layer_0": local}
+        conn.layer_name_to_remote_kv_cache_metadata = {"engine": {"layer_0": remote}}
+        conn.remote_moriio_metadata = {
+            "engine": types.SimpleNamespace(num_blocks=remote_blocks)
+        }
+        conn._built_sessions = {}
+        conn.moriio_wrapper.get_unpack_memory_metadata = lambda packed: packed
+        conn.moriio_wrapper.build_session = lambda local, remote: (local, remote)
+        return conn
+
+    def test_sessions_span_pools_of_different_sizes(self):
+        # Our pool needs two chunks of 4 blocks while the consumer's three
+        # blocks fit in one: P and D size their pools independently.
+        conn = self.block_peer([b"L0", b"L1"], [b"R0"], remote_blocks=3)
+
+        ((k_sessions, v_sessions),), _meta = conn._get_or_build_sessions("engine")
+
+        self.assertEqual(k_sessions, {(0, 0): (b"L0", b"R0"), (1, 0): (b"L1", b"R0")})
+        self.assertEqual(v_sessions, {})
+        # Source block 5 sits in our second chunk, destination 1 in their first.
+        self.assertEqual(list(conn._group_offsets([5], [1], 8)), [(1, 0)])
+
+    def test_v_sessions_split_each_end_at_its_own_k_count(self):
+        conn = self.block_peer(
+            [b"K0", b"K1", b"V0", b"V1"], [b"RK0", b"RV0"], remote_blocks=3
+        )
+
+        ((k_sessions, v_sessions),), _meta = conn._get_or_build_sessions("engine")
+
+        self.assertEqual(k_sessions, {(0, 0): (b"K0", b"RK0"), (1, 0): (b"K1", b"RK0")})
+        self.assertEqual(v_sessions, {(0, 0): (b"V0", b"RV0"), (1, 0): (b"V1", b"RV0")})
+
+    def test_descriptors_that_do_not_cover_the_peers_pool_are_refused(self):
+        # Two descriptors for three blocks at four per chunk: the peer chunked
+        # its pool differently, so no offset would land where it points.
+        conn = self.block_peer([b"L0", b"L1"], [b"R0", b"R1"], remote_blocks=3)
+        with self.assertRaises(ValueError):
+            conn._get_or_build_sessions("engine")
+        self.assertEqual(conn._built_sessions, {})
+
 
 class WrapperMessagingTest(unittest.TestCase):
     """The wrapper's control-plane sends and the status-returning write.

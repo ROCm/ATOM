@@ -227,6 +227,14 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     `_attach_v4_indexer_meta`'s `cu_committed` cumsum, which concatenates the
     sequences' committed K and so needs the per-SEQUENCE total. Per-token counts
     do not come from here — see `visible_csa` in `v4_pool_geometry`."""
+    replay_start_cpu: Any | None = None
+    """[bs] np.int32 or None — prefill only. Per seq, the lowest SWA ring
+    position the forward may read: a bounded replay's start, 0 for every other
+    seq. None when no seq in the batch replays (`ScheduledBatch.replaying`)."""
+    replay_end_cpu: Any | None = None
+    """[bs] np.int32 or None — prefill only. Per seq, the first position whose
+    compression boundary the forward writes: where a bounded replay resumed
+    (`Replay.until`), 0 for every other seq. None when no seq replays."""
 
     # ----- Per-seq GPU scalars (single-source-of-truth, shared by kernels) -----
     state_slot_out: torch.Tensor | None = None
@@ -368,7 +376,7 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     0 (kernel bails on `bid<0` so the value is irrelevant)."""
 
     # ----- Prefill-only paged-prefill index buffers (set in `_build_paged_prefill_meta`) -----
-    # Two-source paged_prefill kernel reads:
+    # Two-source paged_2src kernel reads:
     #   prefix region from `unified_kv` (SWA history + CSA/HCA compress)
     #   extend region from per-fwd `kv` tensor (in-chunk SWA tail)
     # Per-ratio prefix buffers (SWA-only stride for Dense, SWA + compress
@@ -2110,6 +2118,43 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             buf_prefix_ubatch=buf_prefix_ubatch,
         )
 
+    def _refresh_fp4_rowgroup_decode_meta(
+        self, attn_metadata, *, buf_prefix_ubatch: str = ""
+    ):
+        """Publish fixed-capacity row-group metadata for a token-count graph."""
+        from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+
+        var = self.model_runner.forward_vars
+        rows = attn_metadata.csa_n_committed_per_token.shape[0]
+        name = f"{buf_prefix_ubatch}v4_fp4_query_start_loc"
+        capacity = min(rows, var[name].np.shape[0] - 1)
+        cu = var[f"{buf_prefix_ubatch}cu_seqlens_q"].np[
+            : attn_metadata.cu_seqlens_q.shape[0]
+        ]
+        max_qlen = min(rows, 1 + self.max_spec_steps)
+        # `running_bs` can outrun the rows: when a DP peer is prefilling, the
+        # batch stays the group's while this rank runs only its own tokens (a
+        # non-unified `ForwardMode.running_tokens`; an idle rank's dummy is one
+        # row). Those trailing sequences are padding, published empty, and every
+        # nonempty one holds a row, so they all fit; drop the empty tail. A
+        # nonempty sequence at or past `capacity` would be dropped with it.
+        if cu[-1] > rows or np.any(cu[capacity:] != cu[-1]):
+            raise ValueError("FP4 sequence boundaries exceed the decode bucket")
+        cu = cu[: capacity + 1]
+        if np.any(np.diff(cu) < 0) or np.any(np.diff(cu) > max_qlen):
+            raise ValueError("FP4 query lengths exceed the configured decode span")
+        # Refresh the WHOLE captured view, including slots left over from a
+        # larger batch. Repeated final boundaries mean empty sequences.
+        padded_cu = np.full(capacity + 1, cu[-1], dtype=np.int32)
+        padded_cu[: cu.size] = cu
+        query_start_loc = self._stage(name, padded_cu)
+        # The kernel speculatively reads table entries even for empty slots,
+        # so expose the full allocated table view, not the live-batch slice.
+        # Only nonempty sequences consume KV; their table rows are published
+        # by prepare_decode/capture before this helper.
+        tables = var[f"{buf_prefix_ubatch}block_tables"].gpu[:capacity]
+        return Fp4MqaRaggedMetadata(query_start_loc, max_qlen, tables)
+
     def _refresh_fp4_opus_decode_plan(
         self,
         attn_metadata: AttentionMetaData_DSV4,
@@ -2239,8 +2284,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Reuses `attn_metadata.batch_id_per_q_token` ([padded_T] int32), also set
         by `_attach_v4_per_fwd_meta`.
 
-        DECODE fast path: returns an empty dict, plus the OPUS FP4 decode plan
-        below on gfx1250. Everything else here is prefill-only —
+        DECODE fast path: publishes the FP4 graph metadata (fixed-capacity
+        sequence boundaries on gfx950, an OPUS plan on gfx1250), or an empty
+        dict for FP8. Everything else here is prefill-only —
         `deepgemm_fp8_paged_mqa_logits` and `top_k_per_row_decode` read paged KV
         through `attn_metadata.csa_n_committed_per_token`, never the
         packed-cumsum / per-token `cu_starts/cu_ends` layout this builds.
@@ -2255,17 +2301,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # prepare_*/CG-capture path).
         bs = scheduled_bs
 
-        # DECODE short-circuit: the decode scorers take no field from this dict
-        # except the OPUS FP4 plan added below. The prefill-only derivations
+        # DECODE short-circuit: only FP4 graph metadata is needed here.
+        # The prefill-only derivations
         # further down (CPU cumsum + H2D for `cu_committed_gpu`; GPU launches
         # for `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill`
         # only (cp_gather + fp8_mqa_logits + per-row prefill top-k), so they are
         # dead work on the decode hot path. ~50μs / fwd saved at bs=1024.
         if attn_metadata.state is AttnState.DECODE:
             meta = {}
-            # The OPUS decode plan, once per fwd rather than per CSA layer. The
-            # gfx950 FP4 scorer needs none: it reads the per-row bounds and
-            # shares its work out itself.
+            # Keep the gfx950 row-group launch invariant across sequence
+            # layouts sharing a token bucket. FULL uses the same metadata.
+            if self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL:
+                meta["fp4_decode"] = self._refresh_fp4_rowgroup_decode_meta(
+                    attn_metadata, buf_prefix_ubatch=buf_prefix_ubatch
+                )
+            # The OPUS decode plan, once per fwd rather than per CSA layer.
             if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
                 self._refresh_fp4_opus_decode_plan(
                     attn_metadata,
@@ -3003,6 +3053,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens_np = np.asarray(
             var["context_lens"].np[:scheduled_bs], dtype=np.int32
         )
+        # Bounded replay: a forward of a seq replaying below where it resumed
+        # (`ScheduledBatch.replaying`, read as V4.1's `_replay_layout` reads
+        # it) writes no compressed KV below that point, which the cache holds,
+        # and reads no window row below where the replay started
+        # (`Replay.start`, this forward's own start unless an earlier chunk of
+        # the replay began it), which its fresh ring does not hold. Only set
+        # when some seq replays: the common prefill pays nothing.
+        replaying = getattr(batch, "replaying", None)
+        if replaying:
+            starts = np.zeros(scheduled_bs, dtype=np.int32)
+            ends = np.zeros(scheduled_bs, dtype=np.int32)
+            for i, replay in replaying.items():
+                if i < scheduled_bs:
+                    starts[i] = replay.start
+                    ends[i] = replay.until
+            attn_metadata.replay_start_cpu = starts
+            attn_metadata.replay_end_cpu = ends
         attn_metadata.compress_plans = self._build_compress_plans(
             # Prefill: no slack. Nothing rejects a prefill chunk, so the next
             # fwd only ever reads back `K_pool`, and the chunk is wider than
@@ -3010,6 +3077,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             extend_lens_np,
             context_lens_np,
             extra_write=0,
+            write_from=attn_metadata.replay_end_cpu,
         )
         # Prefill is eager (no CG), so it runs exactly what it scheduled and
         # omits `running_tokens` to say so. Must still run BEFORE
@@ -3039,7 +3107,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     else None
                 ),
             )
-        # Two-source paged_prefill index buffers (extend + per-ratio prefix).
+        # Two-source paged_2src index buffers (extend + per-ratio prefix).
         # Eager-only — direct H2D, no forward_vars staging required. Sets
         # attn_metadata.{kv_indices,kv_indptr}_{extend,prefix_swa,prefix_csa,prefix_hca}
         # plus skip_prefix_len_csa and envelope_rows.
@@ -3052,6 +3120,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.state_slot_out_cpu,
             scheduled_bs,
             scheduled_tokens,
+            swa_floor_per_seq_np=attn_metadata.replay_start_cpu,
         )
 
         # ----- PCP: reindex per-query metadata to this rank's 1/W shard -----
@@ -3323,6 +3392,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         context_lens_np = (ub_start_pos_for_ctx + extend_lens_np).astype(np.int32)
         from atom.model_ops.v4_kernels import make_compress_plans
 
+        # A replaying seq keeps its floors in whichever ubatch holds it.
+        if src.replay_end_cpu is not None:
+            ub_attn.replay_start_cpu = src.replay_start_cpu[rs]
+            ub_attn.replay_end_cpu = src.replay_end_cpu[rs]
         if self._unique_compress_ratios_overlap:
             # Per-ubatch plan buffers — sharing the main pool would let
             # ubatch 1's CPU build overwrite ubatch 0's before ubatch 0
@@ -3336,6 +3409,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 plan_buffers=ub_plan_buffers,
                 publication_group=self._compress_publication_group(f"ub{ubatch_idx}_"),
                 extra_write=0,  # TBO prefill is eager-only; nothing rejects it.
+                write_from=ub_attn.replay_end_cpu,
             )
         else:
             ub_attn.compress_plans = {}
@@ -3392,6 +3466,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             positions_gpu=ub_positions_gpu,
             cu_q_per_seq_gpu=ub_cu_q_per_seq_gpu,
             block_tables_gpu=ub_block_tables_gpu,
+            swa_floor_per_seq_np=ub_attn.replay_start_cpu,
         )
 
         if extend_lens_np.size > 0:
@@ -3935,8 +4010,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         positions_gpu: torch.Tensor | None = None,
         cu_q_per_seq_gpu: torch.Tensor | None = None,
         block_tables_gpu: torch.Tensor | None = None,
+        swa_floor_per_seq_np: np.ndarray | None = None,
     ) -> None:
-        """Build per-fwd index buffers consumed by sparse_attn_v4_paged_prefill.
+        """Build per-fwd index buffers consumed by sparse_attn_v4_paged_2src.
+
+        `swa_floor_per_seq_np` raises each seq's `swa_low` to its replay start,
+        below which a replaying seq's ring holds no window; None leaves it at 0.
 
         Two-source layout:
           - prefix region (per-ratio): SWA history from prior chunks + CSA topk
@@ -4008,6 +4087,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         chunk_start_pt = np.repeat(chunk_start_per_seq_np, token_num_per_seq)
         token_pos_in_chunk = positions_arr - chunk_start_pt
         swa_low = np.maximum(positions_arr - win + 1, 0)
+        swa_floor_per_seq_gpu = None
+        if swa_floor_per_seq_np is not None:
+            swa_floor_per_seq_np = np.ascontiguousarray(
+                swa_floor_per_seq_np[:scheduled_bs], dtype=np.int32
+            )
+            swa_low = np.maximum(
+                swa_low, np.repeat(swa_floor_per_seq_np, token_num_per_seq)
+            )
+            swa_floor_per_seq_gpu = upload_numpy(swa_floor_per_seq_np, device)
 
         extend_count_np = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
         prefix_swa_count_np = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
@@ -4108,6 +4196,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             win=win,
             geometry=self.pool_geometry,
             hca_rows_per_block=self.hca_rows_per_block,
+            swa_floor_per_seq=swa_floor_per_seq_gpu,
         )
 
         # ----- skip_prefix_len_csa: per-token SWA prefix length -----
@@ -4144,6 +4233,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         buf_prefix_ubatch: str = "",
         extra_write: int,
         defer_to=None,
+        write_from=None,
     ):
         """Build per-ratio CompressPlan dict consumed by batched compressor.
 
@@ -4200,6 +4290,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             running_bs=running_bs,
             max_q_len=max_q_len,
             extra_write=extra_write,
+            write_from=write_from,
         )
 
     def _populate_state_slot_mappings(
@@ -4525,6 +4616,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "publication_group": f"{prefix}v4_indexer",
         }
         buffers = {f"{prefix}v4_indexer_cu_committed": CpuGpuBuffer(bs + 1, **i32)}
+        if self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL:
+            buffers[f"{prefix}v4_fp4_query_start_loc"] = CpuGpuBuffer(bs + 1, **i32)
         if getattr(self, "indexer_layout", None) == FP4_GFX1250_NATURAL:
             # Each nonempty query chunk contributes at most one extra request
             # fragment per boundary and one leading zero. Across all chunks:

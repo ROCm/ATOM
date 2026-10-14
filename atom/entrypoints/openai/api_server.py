@@ -1163,6 +1163,29 @@ def _engine_kv_transfer_params(
     return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
 
 
+def _prompt_headroom(
+    max_tokens: int, max_ctx: int, kv_transfer_params: dict[str, Any] | None
+) -> int:
+    """Output tokens to reserve when an over-long prompt is truncated.
+
+    A PD router sends the prefill leg ``max_tokens=1`` and the decode leg the
+    client's value. With a KV handoff the reservation therefore cannot depend
+    on ``max_tokens``, or the two legs truncate to different prompts and the
+    transferred blocks no longer match the decode-side sequence.
+    """
+    headroom = max(1024, max_ctx // 8)
+    if kv_transfer_params is None:
+        headroom = min(max_tokens, headroom)
+    return headroom
+
+
+def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
+    """Return the prefill's KV location to the PD router, as chat does."""
+    if "kv_transfer_output_meta_info" in final_output:
+        response["kv_transfer_params"] = final_output["kv_transfer_output_meta_info"]
+    return response
+
+
 async def setup_streaming_request(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -2063,6 +2086,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         )
 
         request_id = uuid.uuid4().hex[:24]
+        kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
         input_tokens = len(tokenizer.encode(prompt))
 
         max_ctx = None
@@ -2083,7 +2107,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if not max_ctx:
             max_ctx = 30720
         logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = min(request.max_tokens, max(1024, max_ctx // 8))
+        headroom = _prompt_headroom(request.max_tokens, max_ctx, kv_transfer_params)
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -2096,7 +2120,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if request.stream:
             # Streaming response
             seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(prompt, sampling_params, request_id)
+                await setup_streaming_request(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=kv_transfer_params,
+                )
             )
 
             async def generate_anthropic_stream():
@@ -2267,7 +2296,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(prompt, sampling_params, request_id),
+            generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
+            ),
             raw_request,
             request_id,
         )
@@ -2298,7 +2332,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         _, tool_calls = flatten_tool_events(events)
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
-        return build_anthropic_response(
+        response = build_anthropic_response(
             request_id=request_id,
             model=model_name,
             events=events,
@@ -2314,6 +2348,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 final_output.get("finish_reason"), bool(tool_calls)
             ),
         )
+        return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
@@ -2369,6 +2404,22 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
+
+    # PD handoff metadata rather than a Responses parameter: take it out before
+    # the body is checked against the Responses schema.
+    kv_transfer_params = body.pop("kv_transfer_params", None)
+    if kv_transfer_params is not None and not isinstance(kv_transfer_params, dict):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": "kv_transfer_params must be a JSON object",
+                    "type": "invalid_request_error",
+                    "code": 400,
+                }
+            },
+        )
+    kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     unsupported = unsupported_responses_parameter(body)
     if unsupported:
@@ -2467,7 +2518,7 @@ async def responses_create(raw_request: Request):
             if value:
                 max_ctx = int(value)
                 break
-        headroom = min(max_tokens, max(1024, max_ctx // 8))
+        headroom = _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -2480,7 +2531,12 @@ async def responses_create(raw_request: Request):
         created_at = int(time.time())
         if request.stream:
             seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(prompt, sampling_params, request_id)
+                await setup_streaming_request(
+                    prompt,
+                    sampling_params,
+                    request_id,
+                    kv_transfer_params=kv_transfer_params,
+                )
             )
 
             async def generate_responses_stream():
@@ -2573,7 +2629,12 @@ async def responses_create(raw_request: Request):
             )
 
         final_output = await _run_nonstream_with_disconnect(
-            generate_async(prompt, sampling_params, request_id),
+            generate_async(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
+            ),
             raw_request,
             request_id,
         )
@@ -2593,7 +2654,7 @@ async def responses_create(raw_request: Request):
         )
         output_tokens = len(tokenizer.encode(raw_text))
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
-        return build_responses_response(
+        response = build_responses_response(
             request_id=request_id,
             model=model_name,
             events=events,
@@ -2604,6 +2665,7 @@ async def responses_create(raw_request: Request):
             cache_read_input_tokens=cache_read_input_tokens,
             created_at=created_at,
         )
+        return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:
         return JSONResponse(status_code=499, content={"detail": "client disconnected"})

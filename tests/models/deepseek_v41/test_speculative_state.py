@@ -306,7 +306,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
-    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
+    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
     torch.manual_seed(863)
     geometry = V41PoolGeometry(
@@ -336,10 +336,18 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
         step,
     )
     spec = LayerAttentionSpec(0, 0, AttentionMode.WINDOW)
-    indices, ptr, _, _ = cache.attention_indices(spec, step)
+    indices, ptr, window, wptr = cache.attention_indices(spec, step)
     query = torch.randn(6, 8, 512, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(8, device="cuda")
-    function = packed_decode if packed else sparse_attn_v4_paged_decode
+
+    def function(query, pool, indices, ptr, sink, scale):
+        if packed:
+            return packed_decode(query, pool, indices, ptr, sink, scale)
+        ring = cache.ring_view(0)
+        return sparse_attn_v4_paged_2src(
+            query, pool, indices, ptr, ring, window, wptr, sink, scale
+        )
+
     output = function(query, cache.pool, indices, ptr, sink, 512**-0.5)
     expected = []
     for t, position in enumerate(range(7, 13)):
