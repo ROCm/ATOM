@@ -412,7 +412,7 @@ def receive_weight_stream(
             if leave is not None:
                 try:
                     leave()
-                except Exception:  # noqa: BLE001 - the stream's own failure is raised
+                except Exception:  # the stream's own failure is raised
                     logger.exception(
                         "RDMA weight stream v%d: leaving its group failed",
                         expected_version,
