@@ -24,7 +24,7 @@ from atom.model_engine.protocol.codec import (
     encode_shutdown,
     encode_submit,
 )
-from atom.model_engine.protocol.requests import CompletionResult, EngineRequest
+from atom.model_engine.protocol.requests import CompletionResult, IngressRequest
 from atom.model_engine.request import RequestOutput
 from atom.utils import (
     envs,
@@ -888,7 +888,7 @@ class CoreManager:
                 [self.control_identities[dp_rank], *frames], copy=copy
             )
 
-    def add_request(self, seqs: list[EngineRequest]):
+    def add_request(self, seqs: list[IngressRequest]):
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -922,7 +922,7 @@ class CoreManager:
         return getattr(self, "global_engine_count", self.local_engine_count)
 
     def _resolve_and_validate_hints(
-        self, seqs: list[EngineRequest]
+        self, seqs: list[IngressRequest]
     ) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
@@ -948,7 +948,7 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: list[EngineRequest]) -> None:
+    def _dispatch_to_dp_ranks(self, seqs: list[IngressRequest]) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -1134,7 +1134,7 @@ class CoreManager:
         return rank
 
     def _select_dp_rank_for_seq_locked(
-        self, seq: EngineRequest, explicit_rank: int | None
+        self, seq: IngressRequest, explicit_rank: int | None
     ) -> int:
         """Route one sequence using explicit hint, strict owner, then load.
 
@@ -1204,7 +1204,7 @@ class CoreManager:
                 "session_count_per_rank": sessions_per_rank,
             }
 
-    def _charge_seq_load_locked(self, seq: EngineRequest, dp_rank: int) -> None:
+    def _charge_seq_load_locked(self, seq: IngressRequest, dp_rank: int) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
@@ -1712,7 +1712,7 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: list[EngineRequest]):
+    def add_request(self, seqs: list[IngressRequest]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).

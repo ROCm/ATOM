@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """What the client side holds instead of a `Sequence`.
 
-`EngineRequest` is a request as the frontend built it: the prompt it tokenized
+`IngressRequest` is a request as the frontend built it: the prompt it tokenized
 and the arguments it chose, kept as-is until they are written to the wire. The
 `Sequence` it describes is built by the EngineCore that admits it.
 
@@ -33,7 +33,7 @@ def prompt_token_array(tokens) -> array.array:
     return array.array("i", tokens)
 
 
-class EngineRequest:
+class IngressRequest:
     """One sequence to submit; mirrors the `Sequence` constructor."""
 
     def __init__(
@@ -87,7 +87,7 @@ class EngineRequest:
 
     def __repr__(self) -> str:
         return (
-            f"EngineRequest(id={self.id}, prompt_tokens={self.num_prompt_tokens}, "
+            f"IngressRequest(id={self.id}, prompt_tokens={self.num_prompt_tokens}, "
             f"max_tokens={self.max_tokens})"
         )
 

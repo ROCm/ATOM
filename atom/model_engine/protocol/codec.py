@@ -14,11 +14,12 @@ ends reads as it did when the payloads were pickled.
 """
 
 import pickle
+from dataclasses import fields
 from itertools import chain
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.protocol import engine_v1_pb2 as pb
-from atom.model_engine.protocol.requests import CompletionResult, EngineRequest
+from atom.model_engine.protocol.requests import CompletionResult, IngressRequest
 from atom.model_engine.protocol.wire import (
     FrameReader,
     FrameWriter,
@@ -33,8 +34,8 @@ from atom.model_engine.request import RequestOutput
 from atom.sampling_params import SamplingParams
 
 # Every SamplingParams field the wire carries. A field added to the dataclass
-# without a wire field here would silently fall back to its default in the
-# Core; tests/test_engine_protocol.py checks the two agree.
+# without a wire field would silently fall back to its default in the Core, so
+# this module refuses to import until the codec carries it.
 SAMPLING_FIELDS = (
     "temperature",
     "top_k",
@@ -45,6 +46,11 @@ SAMPLING_FIELDS = (
     "n",
     "logprobs",
 )
+if {f.name for f in fields(SamplingParams)} != set(SAMPLING_FIELDS):
+    raise ImportError(
+        "SamplingParams and the engine wire protocol disagree on fields; "
+        "update engine_v1.proto and codec._encode/_decode_sampling"
+    )
 
 # A rejected admission's leave_reason starts with this.
 REJECTED_REASON = "rejected"
@@ -120,7 +126,7 @@ def _decode_sampling(msg) -> SamplingParams:
 # ------------------------------------------------------------ client side --
 
 
-def encode_submit(requests: list[EngineRequest], *, max_tokens=None) -> list:
+def encode_submit(requests: list[IngressRequest], *, max_tokens=None) -> list:
     """One SubmitBatch. `max_tokens`, when given, replaces every request's."""
     writer = FrameWriter()
     envelope = pb.Envelope()

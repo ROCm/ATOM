@@ -841,7 +841,7 @@ async def generate_async(
         #   2) Always drop the seq from io_processor.requests. The engine frees
         #      its own KV on finish, but this dict is only cleaned up here for
         #      non-stream requests -- without an unconditional pop, every
-        #      completed non-stream request leaks an EngineRequest (pending grows
+        #      completed non-stream request leaks an IngressRequest (pending grows
         #      forever). Streaming pops via cleanup_stream instead.
         if seq is not None:
             if not _finished_ok:

@@ -43,7 +43,7 @@ from atom.model_engine.protocol.codec import (
     decode_client_message,
     encode_submit,
 )
-from atom.model_engine.protocol.requests import EngineRequest
+from atom.model_engine.protocol.requests import IngressRequest
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -71,7 +71,7 @@ class TestPreprocessSingle:
     def test_returns_single_request(self):
         proc = _make_processor()
         seq = proc.preprocess("hello", SamplingParams(n=1))
-        assert isinstance(seq, EngineRequest)
+        assert isinstance(seq, IngressRequest)
         assert seq.needs_independent_noise is False
         assert seq.sibling_index == 0
         assert seq.parent_request_id is None
