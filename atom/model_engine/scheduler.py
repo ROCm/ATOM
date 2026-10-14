@@ -299,6 +299,9 @@ class ScheduledBatch:
         # `(batch index, lo, hi)` cached-prefix route ranges the runner returns
         # with this step; set by `Scheduler._plan_routed_prefixes`.
         self.routed_prefix_ranges = None
+        # Runner-local: this step's `PendingRoutes`, set after the forward and
+        # claimed when the step's output is built. Never sent back.
+        self.routed_experts_pending = None
 
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
@@ -1741,9 +1744,7 @@ class Scheduler:
         return result
 
     @staticmethod
-    def _plan_routed_prefixes(
-        batch: ScheduledBatch, seqs: dict[int, Sequence]
-    ) -> None:
+    def _plan_routed_prefixes(batch: ScheduledBatch, seqs: dict[int, Sequence]) -> None:
         """Mark cached prefixes whose routes no earlier step returned.
 
         The runner sends only the rows a step forwards, so a prefix-cache hit

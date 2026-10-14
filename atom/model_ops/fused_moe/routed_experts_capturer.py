@@ -12,7 +12,6 @@ slots to the first step that forwards the request.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Sequence as AbcSequence
 from typing import Any, NamedTuple
 
@@ -37,6 +36,24 @@ class RoutedExpertsPatch(NamedTuple):
     starts: np.ndarray
     offsets: np.ndarray
     rows: np.ndarray
+
+
+class PendingRoutes(NamedTuple):
+    """A stored step whose rows may still be copying to the host."""
+
+    req_ids: np.ndarray
+    starts: np.ndarray
+    offsets: np.ndarray
+    rows_cpu: torch.Tensor
+    done: torch.cuda.Event | None
+
+    def patch(self) -> RoutedExpertsPatch:
+        """The step's ``RoutedExpertsPatch``, waiting on its D2H if still queued."""
+        if self.done is not None:
+            self.done.synchronize()
+        return RoutedExpertsPatch(
+            self.req_ids, self.starts, self.offsets, self.rows_cpu.numpy()
+        )
 
 
 def check_return_routed_experts(
@@ -186,12 +203,9 @@ class RoutedExpertsCapturer:
     """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
 
     The extra row is a sacrificial pad target for graph dummy slots (``-1``).
-    Each step's rows are gathered in batch token order by ``store_step`` and
-    claimed once, by ticket, with ``take``.
+    Each step's rows are gathered in batch token order by ``store_step``,
+    which returns them as ``PendingRoutes`` for the caller to keep.
     """
-
-    # Steps stored but never taken (engine reset, dropped deferred output).
-    _MAX_PENDING = 8
 
     def __init__(
         self,
@@ -219,10 +233,6 @@ class RoutedExpertsCapturer:
             dtype=dtype,
             device=device,
         )
-        self._pending: OrderedDict[
-            int, tuple[tuple, torch.Tensor, torch.cuda.Event | None]
-        ] = OrderedDict()
-        self._next_ticket = 0
         # (slot key, last layer id, dest) shared by the MoE layers of one forward.
         self._dest_cache: tuple[tuple, int, torch.Tensor] | None = None
 
@@ -308,13 +318,13 @@ class RoutedExpertsCapturer:
         *,
         prefix: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
         stream: torch.cuda.Stream | None = None,
-    ) -> int | None:
+    ) -> PendingRoutes | None:
         """Gather this step's rows in batch token order and queue their D2H.
 
         Request ``i`` forwarded ``lens[i]`` tokens from position ``starts[i]``.
         ``prefix`` is ``(req_ids, starts, lens, slots)`` for cached prefixes no
-        earlier step returned; their rows go first. Returns the ticket to
-        ``take`` the step with, or None when it forwarded nothing.
+        earlier step returned; their rows go first. Returns None when the step
+        forwarded nothing.
 
         The gather runs on the current stream: ``slot_mapping`` is the reused
         staging buffer, and the next forward rewrites it in order after this
@@ -353,22 +363,7 @@ class RoutedExpertsCapturer:
                 done.record(stream)
         else:
             rows_cpu, done = rows.cpu(), None
-        ticket = self._next_ticket
-        self._next_ticket += 1
-        self._pending[ticket] = ((req_ids, starts, offsets), rows_cpu, done)
-        while len(self._pending) > self._MAX_PENDING:
-            self._pending.popitem(last=False)
-        return ticket
-
-    def take(self, ticket: int | None) -> RoutedExpertsPatch | None:
-        """The stored step for ``ticket``, waiting on its D2H if still queued."""
-        entry = self._pending.pop(ticket, None) if ticket is not None else None
-        if entry is None:
-            return None
-        (req_ids, starts, offsets), rows_cpu, done = entry
-        if done is not None:
-            done.synchronize()
-        return RoutedExpertsPatch(req_ids, starts, offsets, rows_cpu.numpy())
+        return PendingRoutes(req_ids, starts, offsets, rows_cpu, done)
 
 
 def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:

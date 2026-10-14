@@ -45,7 +45,7 @@ def _segments(patch: RoutedExpertsPatch) -> list[tuple[int, int, np.ndarray]]:
 
 
 def _store_take(capturer, slots, req_ids, starts, lens, **kw):
-    return capturer.take(capturer.store_step(slots, req_ids, starts, lens, **kw))
+    return capturer.store_step(slots, req_ids, starts, lens, **kw).patch()
 
 
 def test_config_flag_defaults_off():
@@ -207,7 +207,9 @@ def test_prefix_hit_segment_reads_cached_slots():
 
     b_slots = torch.tensor([3], device=device)
     capturer.capture(
-        0, torch.tensor([[5, 6]], dtype=torch.int32, device=device), slot_mapping=b_slots
+        0,
+        torch.tensor([[5, 6]], dtype=torch.int32, device=device),
+        slot_mapping=b_slots,
     )
     prefix = (
         np.array([2]),
@@ -283,36 +285,27 @@ def test_short_slot_mapping_pads_uncaptured():
     assert patch.offsets.tolist() == [0, 2, 3]
 
 
-def test_empty_step_has_no_ticket():
+def test_empty_step_stores_nothing():
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=2, device="cpu"
     )
     assert capturer.store_step(torch.tensor([], dtype=torch.long), [], [], []) is None
     assert capturer.store_step(None, [1], [0], [1]) is None
-    assert capturer.take(None) is None
 
 
-def test_take_claims_once_and_by_ticket():
+def test_stored_steps_are_independent():
+    """A later store neither replaces nor reorders an earlier one."""
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=1, device="cpu"
     )
+    capturer.capture(0, torch.tensor([[4]], dtype=torch.int32), torch.tensor([1]))
     a = capturer.store_step(torch.tensor([1]), [1], [0], [1])
+    capturer.capture(0, torch.tensor([[6]], dtype=torch.int32), torch.tensor([2]))
     b = capturer.store_step(torch.tensor([2]), [2], [0], [1])
-    assert capturer.take(b).req_ids.tolist() == [2]
-    assert capturer.take(a).req_ids.tolist() == [1]
-    assert capturer.take(a) is None
-
-
-def test_untaken_steps_are_bounded():
-    capturer = RoutedExpertsCapturer.init(
-        num_slots=8, num_layers=1, top_k=1, device="cpu"
-    )
-    tickets = [
-        capturer.store_step(torch.tensor([0]), [1], [i], [1]) for i in range(20)
-    ]
-    assert len(capturer._pending) == RoutedExpertsCapturer._MAX_PENDING
-    assert capturer.take(tickets[0]) is None
-    assert capturer.take(tickets[-1]) is not None
+    assert b.patch().req_ids.tolist() == [2]
+    assert a.patch().req_ids.tolist() == [1]
+    assert a.patch().rows[:, 0, 0].tolist() == [4]
+    assert b.patch().rows[:, 0, 0].tolist() == [6]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for copy stream")
@@ -330,12 +323,12 @@ def test_async_store_snapshots_slots_before_staging_reuse():
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         torch.cuda._sleep(2_000_000_000)
-    ticket = capturer.store_step(slots, [1], [0], [1], stream=stream)
+    pending = capturer.store_step(slots, [1], [0], [1], stream=stream)
     slots.fill_(2)
     capturer.capture(
         0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=slots
     )
-    np.testing.assert_array_equal(capturer.take(ticket).rows[:, 0, :], [[7, 8]])
+    np.testing.assert_array_equal(pending.patch().rows[:, 0, :], [[7, 8]])
 
 
 def test_capture_page_bytes_are_budgeted_per_block():

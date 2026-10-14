@@ -425,7 +425,7 @@ class tokenIDProcessor:
         token_ids = self.recv_async_output(self.token_ids_cpu)
         logprobs = self.recv_logprobs()
         # Queued ahead of this step's token D2H, so the next recv's copy_done
-        # wait also covers the route copy and `take` does not block on it.
+        # wait also covers the route copy and the attach does not block on it.
         if after_recv is not None:
             after_recv()
         self.send_to_cpu_async(
@@ -2411,7 +2411,7 @@ class ModelRunner:
             return
         lens = batch.num_scheduled_tokens
         first = np.cumsum(lens) - lens
-        batch.routed_experts_ticket = capturer.store_step(
+        batch.routed_experts_pending = capturer.store_step(
             slot_mapping,
             batch.req_ids,
             self.forward_vars["positions"].np[first],
@@ -2441,21 +2441,12 @@ class ModelRunner:
     def _attach_routed_experts(
         self, batch: ScheduledBatch, output: ScheduledBatchOutput
     ) -> None:
-        """Hand ``batch``'s stored routes to the scheduler in ``output``."""
-        if not getattr(self.config, "enable_return_routed_experts", False):
+        """Hand ``batch``'s stored routes to the scheduler in ``output``, once."""
+        pending = getattr(batch, "routed_experts_pending", None)
+        if pending is None:
             return
-        if getattr(batch, "is_dummy_run", False) or self.rank != 0:
-            return
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
-
-        capturer = RoutedExpertsCapturer.get()
-        if capturer is None:
-            return
-        output.routed_experts = capturer.take(
-            getattr(batch, "routed_experts_ticket", None)
-        )
+        batch.routed_experts_pending = None
+        output.routed_experts = pending.patch()
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         dp_size = self.config.parallel_config.data_parallel_size

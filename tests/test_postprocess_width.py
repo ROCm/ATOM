@@ -47,6 +47,7 @@ def _runner(seen):
         return torch.zeros(logits.shape[0], dtype=torch.int)
 
     runner.sampler = _sampler
+    runner.config = types.SimpleNamespace(enable_return_routed_experts=False)
     runner.forward_done_event = types.SimpleNamespace(record=lambda: None)
     runner.tokenID_processor = types.SimpleNamespace(
         is_deferred_out=False,
