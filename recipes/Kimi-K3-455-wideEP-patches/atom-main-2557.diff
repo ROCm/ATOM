@@ -1,0 +1,38 @@
+diff --git a/atom/model_ops/attentions/aiter_mla.py b/atom/model_ops/attentions/aiter_mla.py
+index ecc331a0..0bf58673 100644
+--- a/atom/model_ops/attentions/aiter_mla.py
++++ b/atom/model_ops/attentions/aiter_mla.py
+@@ -2810,10 +2810,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
+         # nothing here writes the host copy.
+         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
+ 
++        # The dense plan spans the sequences q/o have rows for: running_tokens
++        # is running_bs * max_seqlen_q on a DP-unified step, which pads the
++        # activations as well, but only this rank's own count while a peer is
++        # prefilling. The persistent kernel loads q[qo_start] and stores
++        # o[qo_start] for every work item, and the planner hands a zero-KV
++        # sequence one whenever its CU has payload left.
++        q_rows_bs = min(running_bs, running_tokens // max_seqlen_q)
++        # Like the positions above, the plan lays every sequence out at
++        # max_seqlen_q rows; one forwarding fewer would get no work item.
++        assert q_rows_bs >= scheduled_bs, (
++            f"{running_tokens} decode rows cannot hold {scheduled_bs} sequences "
++            f"of max_seqlen_q={max_seqlen_q}"
++        )
+         if is_sparse_mtp:
+-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
+-                running_bs, max_seqlen_q
+-            )
++            ctx_mla_ps = self.set_mla_persistent_worker_buffers(q_rows_bs, max_seqlen_q)
+             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
+                 running_tokens
+             )
+@@ -2831,7 +2842,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
+             # that padded nothing reaches here with the two equal, and then this
+             # is a no-op -- but eager no longer implies that, since a DP-unified
+             # batch pads off the graph path too.
+-            meta_bs = scheduled_bs if cp_round_robin else running_bs
++            meta_bs = scheduled_bs if cp_round_robin else q_rows_bs
+             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
+                 meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
+             )

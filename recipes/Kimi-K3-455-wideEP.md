@@ -6,21 +6,24 @@ Full-size **Kimi-K3** on **two gfx1250 B0 trays, 4 GPUs each (432 GiB/GPU, SPX)*
   MXFP4 routed experts, BF16 everything else.
 - **Parallelism:** `-tp 1`, DP 8, EP 8 (112 experts per GPU), DP attention.
 - **Checkpoint:** about 1.42 TiB, needed **in full on every tray**.
-- **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261014`. ATOM and aiter are at `main` of 2026-10-14 and mori is at a
-  `main` commit. Two ATOM patches are applied, and the launch scripts are in `/opt/k3`. The ROCm, torch, Triton
-  and FlyDSL stack comes from `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`. See
-  [Container and patches](#container-and-patches).
+- **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261014`. It was rebuilt in the afternoon of 2026-10-14 and replaces
+  the morning build under the same tag.
+  - ATOM and aiter are at `main` of 2026-10-14, and mori is at a `main` commit.
+  - On top: eight unmerged PRs (six ATOM, two aiter), and the launch scripts in `/opt/k3`.
+  - The launch quantizes the BF16 layers to FP8 online at load.
+  - The ROCm, torch, Triton and FlyDSL stack comes from `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`.
+  - See [Container and patches](#container-and-patches).
 
 Validated on CT11 (node0) and CT10 of the HeliosM rack below, 2026-10-14.
 
 | | |
 |---|---|
-| **GSM8K**, 5-shot, all 1319 | **strict-match 0.9659 ±0.0050**, flexible-extract 0.9651 ±0.0051 (flydsl compact dispatch, fp4 combine, 16384 batched tokens, no prefix caching) |
-| **Throughput**, 14k/500, concurrency 32 | 477.9 output tok/s; median TTFT 7.7 s, median TPOT 50.5 ms (ATOM's standard serving benchmark, `/opt/k3/bench.sh`) |
-| Gate | B0 text, decode matches prefill, chat `17 * 23` answers `391` |
-| Prefix caching | the probe passes (`K3_MODE=agentic`) |
-| Cold start | about 8 min in a fresh container (aiter JIT) |
-| AgentX | not measured with this image yet; method in [Agentic](#agentic-agentx) |
+| **GSM8K**, 5-shot, all 1319 | **strict-match 0.9591 ±0.0055**, flexible-extract 0.9583 ±0.0055 (online FP8, flydsl compact dispatch, fp4 combine, 16384 batched tokens, no prefix caching) |
+| **Throughput**, 14k/500, concurrency 32 | **638.1 output tok/s**; median TTFT 4.4 s, median TPOT 32.5 ms (ATOM's standard serving benchmark, `/opt/k3/bench.sh`). The morning build of this tag gave 477.9 tok/s, 7.7 s and 50.5 ms on the same workload |
+| **Memory** | `peak_torch` 248 GB and `available_for_kv` about 101 GB per rank. With the layers left in BF16 the figures were 294 GB and 56 GB |
+| Gate | B0 text; chat `17 * 23` answers `391`. Decode and prefill continuations may part after a few words, because FP8 runs different kernels at small and large M |
+| Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
+| Prefix caching, AgentX | not run with this build; method in [Agentic](#agentic-agentx) |
 
 Contents:
 
@@ -401,14 +404,17 @@ Then compare `find . -type f -printf '%P %s\n' | sort` on both sides.
 ## Container and patches
 
 **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261014`, digest
-`sha256:4da3dd983701f07caf2b3a2d24529b0f9fcb8e80c4df57323ddd2e96947e8d8d`. It is 150 GB unpacked.
+`sha256:c8260adc5e54d4bee43ff67dabae4fdd59868ea2f87f6ba7974d6697974ae9ff`. It is 150 GB unpacked.
+- **Same tag, rebuilt.** The tag was rebuilt in the afternoon of 2026-10-14 with the six PRs below added. That
+  build replaced the morning one (`sha256:4da3dd98…`), which had only #2380, #2532, #2533 and #2522. Pull again if
+  you have the morning build.
 
 **ATOM, aiter and mori are public `main` commits.** They are editable source checkouts in `/app`:
 
 | | commit | on `main` |
 |---|---|---|
-| ATOM, `/app/ATOM` | `0adc6456` | `main` of 2026-10-14, plus the two patches below |
-| aiter, `/app/aiter` | `1305f0c8` | `main` of 2026-10-14; aiter #5431 and #5844 are merged there |
+| ATOM, `/app/ATOM` | `0adc6456` | `main` of 2026-10-14, plus six unmerged PRs (below) |
+| aiter, `/app/aiter` | `1305f0c8` | `main` of 2026-10-14, plus two unmerged PRs (below); aiter #5431 and #5844 are merged there |
 | mori, `/app/mori` | `695d4c03` | `main` of 2026-10-10. This is the last commit before mori #745 (EPv2 1250x EP8), whose interface aiter `main` does not use yet (aiter #6430) |
 
 The previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261013`, ran ATOM, aiter and mori from the bring-up team's
@@ -453,22 +459,44 @@ sudo docker run -d --name k3dp8 \
 segments with `rm -f /dev/shm/psm_* /dev/shm/nccl-*`. Do this only when no other container shares the host's
 `/dev/shm`.
 
-### Patches
+### Unmerged PRs in this image
 
-| PR | what it fixes | in this image |
+| PR | what it does | why K3 needs it |
 |---|---|---|
-| [ATOM #2380](https://github.com/ROCm/ATOM/pull/2380) | unfused torch `gather_kv_b_proj`, enabled by `ATOM_UNFUSED_GATHER_KV_B_PROJ=1`. Without it, a chunked prefill aborts in an LLVM PHI assertion (fused Triton gather on gfx1250) | **patch 1** (the PR is closed, not merged) |
-| [ATOM #2532](https://github.com/ROCm/ATOM/pull/2532) | with `--enable_prefix_caching`, the DP dummy decode advanced a live KDA state through a stale index and poisoned a rank's cached prefixes | **patch 1** |
-| [ATOM #2533](https://github.com/ROCm/ATOM/pull/2533) | with `--enable_prefix_caching` and a large KV pool, the Triton MLA decode computed KV row offsets in int32 and decoded NaN past row 3,728,270 | **patch 1** |
-| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | ATOM picks MegaMoE's dispatch kernel itself (`MEGA_DISPATCH` overrides the pick) and sizes the cco arena for the compact plan. Without it, ATOM `main` always runs mori's dispatch on the fp4 wire | **patch 2** |
-| [aiter #5431](https://github.com/ROCm/aiter/pull/5431) | custom all-reduce over torch.symm_mem, for the allgather LM head; skips mori's shmem init on gfx125x, without which every rank aborts at MoE init across trays | in aiter `main` |
-| [aiter #5844](https://github.com/ROCm/aiter/pull/5844) | the FlyDSL PS1 MLA decode (`AITER_MLA_DECODE_PS1_FLYDSL`) | in aiter `main` |
+| [ATOM #2532](https://github.com/ROCm/ATOM/pull/2532) | resets stateless rows to PAD, so the DP dummy decode cannot update a live KDA state | with `--enable_prefix_caching`, the dummy decode poisoned a rank's cached prefixes |
+| [ATOM #2533](https://github.com/ROCm/ATOM/pull/2533) | the Triton MLA decode addresses KV rows with int64 ids | with prefix caching and a large KV pool it decoded NaN past row 3,728,270. Only the Triton MLA decode (`ATOM_USE_TRITON_MLA=1`) has the bug; this launch runs aiter's |
+| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | ATOM picks MegaMoE's dispatch kernel (`MEGA_DISPATCH` overrides) and sizes the cco arena for the compact plan | without it, ATOM `main` always runs mori's dispatch on the fp4 wire |
+| [ATOM #2557](https://github.com/ROCm/ATOM/pull/2557) | plans the persistent MLA decode over the q/o rows that exist | while a peer DP rank prefills, the plan covered more rows than q/o have, and the kernel read and wrote past them |
+| [ATOM #2554](https://github.com/ROCm/ATOM/pull/2554) | online per_1x128 FP8 with E8M0 block scales on gfx1250 | without it, the online FP8 layers keep FP32 scales and run the generic Triton blockscale GEMM instead of aiter's mxfp8_128 FlyDSL GEMM. It also adapts K3's fused norm and sigmoid quant producers and KDA's `o_norm` |
+| [ATOM #2466](https://github.com/ROCm/ATOM/pull/2466) | gfx1250's MXFP4 (per_1x32) linear layers always use the Triton preshuffle GEMM | the ASM FP4 GEMM expects another scale permutation and silently corrupts outputs. This is why the launch no longer sets `ATOM_USE_TRITON_GEMM=1` |
+| [aiter #6121](https://github.com/ROCm/aiter/pull/6121) | gfx1250 FlyDSL `gather_kv_b_proj`: one kernel for K3's MLA cached-prefix expansion, from an FP8 cache with a ptpc FP8 `kv_b_proj` | the fused Triton gather hits an LLVM PHI assertion on gfx1250 in chunked prefill. With #6121, ATOM #2380's unfused fallback is not needed (below) |
+| [aiter #6530](https://github.com/ROCm/aiter/pull/6530) | Kimi-K3's tuned mxfp8_128 blockscale GEMM table for gfx1250 | picks the FlyDSL kernel for each of K3's FP8 GEMM shapes. Only the PR's own commit is applied; its branch also carries four newer `main` commits |
 
-**Both patches are applied in this page's image.** `/opt/k3/verify_inside.sh` checks them. The patch files are
-next to this page, in [`Kimi-K3-455-wideEP-patches/`](Kimi-K3-455-wideEP-patches/). Both are made for ATOM
-`0adc6456` and leave out the PRs' tests and docs.
-- **`atom-main-k3.diff`** (patch 1) carries #2380 at `dc83d9ef`, #2532 at `7bf8fc6b` and #2533 at `4229c757`.
-- **`atom-main-2522.diff`** (patch 2) carries #2522 at `9cd096a2`. Apply it after patch 1.
+- **Already in `main`:** aiter #5431, the symm_mem custom all-reduce for the allgather LM head, which also skips
+  mori's shmem init on gfx125x. And aiter #5844, the FlyDSL PS1 MLA decode.
+- **Not in this image: ATOM [#2380](https://github.com/ROCm/ATOM/pull/2380)**, the unfused torch `gather_kv_b_proj`
+  (closed upstream).
+  - With the launch's online quantization, `kv_b_proj` is ptpc FP8 and aiter #6121 serves the gather, so the
+    Triton gather never runs.
+  - **Without online quantization**, `kv_b_proj` stays BF16 and #6121 does not apply. The Triton gather's PHI
+    assertion then comes back on long prompts.
+  - Checked on 2026-10-14. The 14k/500 c32 benchmark prefills in chunks under concurrency, the case that used
+    to hit the assertion. It ran without errors, and FlyDSL compiled #6121's
+    `launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250` for it.
+
+**All eight are applied in this page's image.** `/opt/k3/verify_inside.sh` checks them. The patch files are next
+to this page, in [`Kimi-K3-455-wideEP-patches/`](Kimi-K3-455-wideEP-patches/): one per PR, except one for the pair
+#2532 and #2533. They are listed below in apply order and leave out the PRs' tests and docs.
+
+| file | carries | applies to |
+|---|---|---|
+| `atom-main-pc.diff` | #2532 at `7bf8fc6b`, #2533 at `4229c757` | ATOM `0adc6456` |
+| `atom-main-2522.diff` | #2522 at `9cd096a2` | the result of the line above |
+| `atom-main-2557.diff` | #2557 at `c323a0df` | the result of the line above |
+| `atom-main-2554.diff` | #2554 at `b619c728` | the result of the line above |
+| `atom-main-2466.diff` | #2466 at `5605046b` | the result of the line above |
+| `aiter-main-6121.diff` | #6121 at `7ce0a5de` | aiter `1305f0c8` |
+| `aiter-main-6530.diff` | #6530 at `0f1a9ac8` (its own commit) | the result of the line above |
 
 To build the same tree from the base image instead, check out the three commits, rebuild mori, clear aiter's
 JIT modules, then apply the patches. Run this in a container of `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`
@@ -482,19 +510,21 @@ cd /app/aiter && git fetch -q https://github.com/ROCm/aiter.git 1305f0c8bf78d1d1
 rm -rf aiter/jit/*.so aiter/jit/build      # modules JIT-built from the old sources
 cd /app/ATOM && git fetch -q https://github.com/ROCm/ATOM.git 0adc6456c66ae186fb616c54e85479cf9267ff27 && git checkout -q --detach FETCH_HEAD
 B=https://raw.githubusercontent.com/ROCm/ATOM/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP-patches
-for p in atom-main-k3 atom-main-2522; do
+for p in atom-main-pc atom-main-2522 atom-main-2557 atom-main-2554 atom-main-2466 aiter-main-6121 aiter-main-6530; do
+  d=/app/ATOM; [ "${p%%-*}" = aiter ] && d=/app/aiter
   curl -sSfL $B/$p.diff -o /tmp/$p.diff
-  git apply /tmp/$p.diff && git apply --check -R /tmp/$p.diff && echo "ok $p"; done
+  (cd $d && git apply /tmp/$p.diff && git apply --check -R /tmp/$p.diff) && echo "ok $p"; done
 rm -rf /root/.cache/atom/*                 # after any code change
 ```
 
 - `docker rm` discards changes made by hand. Those in the image stay.
-- After launch, check two lines on every rank:
+- After launch, check three lines on every rank:
   - `Custom allreduce: using torch.symm_mem transport (mori backend)`. If the probe fails, aiter falls back
     to IPC without saying so, and `assert not ca_comm.disabled` comes back at the first decode.
   - `[MORI-V2] Created MegaMoE: … kernel=flydsl_compact (MEGA_DISPATCH) dispatch=flydsl stage1_fused=True
     wire=fp4 combine_quant=mxfp4 … cco_vmm_per_rank=7781MiB`. `dispatch=mori` although `MEGA_DISPATCH=flydsl`
-    means patch 2 is missing.
+    means #2522 is missing.
+  - `Post-load online quantization and weight processing done: … 607 layers online-quantized`.
 
 ---
 
@@ -509,6 +539,10 @@ node0 serves the API on `:8000`.
 - **Logs.** They go to `/logs/server_dp<rank>_<time>.log`, with a `server_dp<rank>.latest.log` link.
 - **Knobs.** `K3_MODE=agentic` turns on prefix caching with session affinity. `K3_LMHEAD=safe` selects the
   replicated LM head.
+- **What changed from the morning build:**
+  - `ATOM_USE_TRITON_GEMM` is no longer set (#2466);
+  - `ATOM_UNFUSED_GATHER_KV_B_PROJ` is no longer needed (aiter #6121);
+  - `ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1` and `--online_quant_config` are added (#2554, aiter #6530).
 
 ```bash
 #!/bin/bash
@@ -521,23 +555,21 @@ export ENABLE_CK=0
 # --- attention
 export ATOM_USE_TRITON_MLA=0
 export AITER_MLA_DECODE_PS1_FLYDSL=1
-export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0  # the unfused gather has no shuffled layout
-export ATOM_UNFUSED_GATHER_KV_B_PROJ=1   # ATOM #2380, patch 1
+export ATOM_USE_TRITON_MLA_SHUFFLE_KV=0  # unshuffled KV cache
 export ATOM_USE_UNIFIED_ATTN=1
 # --- MoE
 export ATOM_MOE_GU_ITLV=1                # required on gfx1250
 export ATOM_USE_TRITON_MOE_DECODE=0      # K3's activation is situ, not SiLU
 export MEGA_DISPATCH_WIRE=fp4
-export MEGA_DISPATCH=flydsl              # ATOM #2522, patch 2: flydsl dispatch with the compact plan; mori for an A/B
+export MEGA_DISPATCH=flydsl              # ATOM #2522: flydsl dispatch with the compact plan; mori for an A/B
 export ATOM_MEGA_COMBINE_WIRE=fp4        # prefill steps only; decode combines in bf16
 export ATOM_MEGA_MASK_PAD_ROWS=0         # on by default in ATOM main (#2474); this page's numbers are with it off
 export ATOM_MORI_V2=1 ATOM_MORI_V2_FUSED=1   # aiter's fused MegaMoE transport
 export AITER_USE_GROUPED_GEMM=1
 export MORI_EP_TOKOFF_EXT=0              # required on more than one tray
 export MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27   # see Known issues
-# --- GEMM / quantization
-export ATOM_USE_TRITON_GEMM=1
-export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1
+# --- GEMM / quantization: no ATOM_USE_TRITON_GEMM (ATOM #2466 picks gfx1250's MXFP4 GEMM itself)
+export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1 ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1   # online FP8: E8M0 scales (#2554)
 export AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1
 # --- communication
 export NCCL_MNNVL_ENABLE=1               # off: silently falls back to TCP
@@ -549,8 +581,13 @@ export HSA_USE_SVM=1 HSA_ENABLE_SDMA=1 ATOM_LOADER_NUM_THREADS=4
 export HSA_XNACK=$([ "$(cat /sys/module/amdgpu/parameters/noretry)" = 1 ] && echo 0 || echo 1)   # follow the driver
 export TRITON_CACHE_DIR=/root/.triton/cache
 
+# Online FP8 for the checkpoint's BF16 layers, at load: per_1x128 blocks with E8M0 scales (#2554, tuned GEMMs from
+# aiter #6530); kv_b_proj per-token/per-channel, which aiter #6121's gather kernel takes; the KDA short convolutions
+# and the MXFP4 routed experts are left as they are. Keep it on: without it the Triton gather's PHI assert returns.
+ONLINE_QUANT='{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*"]}'
+
 MODE_ARGS=(--max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --no-enable_prefix_caching)   # accuracy
-# AgentX: prefix caching (#2532 + #2533, patch 1), sessions pinned to their cache owner
+# AgentX: prefix caching (#2532 + #2533), sessions pinned to their cache owner
 # export ATOM_DP_SESSION_AFFINITY=1
 # MODE_ARGS=(--max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching)
 
@@ -561,7 +598,7 @@ exec python3 -m atom.entrypoints.openai_server \
   --data-parallel-master-ip "$MASTER" --data-parallel-master-port 29500 --data-parallel-base-port 29700 \
   --enable-expert-parallel --enable-dp-attention \
   --kv_cache_dtype fp8 --index-cache-dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
-  "${MODE_ARGS[@]}" --disable_uvicorn_access_log
+  --online_quant_config "$ONLINE_QUANT" "${MODE_ARGS[@]}" --disable_uvicorn_access_log
 ```
 
 ```bash
@@ -571,7 +608,10 @@ ssh root@10.210.11.80 "docker exec -d k3dp8 bash /opt/k3/run_server.sh 4 10.210.
 until curl -sf -m 5 http://10.210.11.26:8000/v1/models >/dev/null; do sleep 15; done
 ```
 
-- **Expect** `peak_torch` 294 GB and `available_for_kv` about 56 GB per rank (55.8–56.8 GB on CT11).
+- **Expect** `607 layers online-quantized` per rank (about 30 s), `peak_torch` 248 GB and `available_for_kv`
+  about 101 GB per rank. In BF16 those layers gave 294 GB and 56 GB.
+- **ATOM warns** `Online quant with compressed-tensors is not fully supported`. The checkpoint is
+  compressed-tensors, and the config above was validated with it (GSM8K below).
 - **0.90, not 0.94, at 16384 batched tokens.** At 0.94, aiter's grouped GEMM allocates its `grouped_out`
   transient (14 GiB at EP 8: received tokens × top-k rows × hidden, bf16) on the first long prefill, and it
   runs out of memory. The budget does not reserve it.
@@ -630,9 +670,14 @@ only `content`, so a small budget scores 0.
 
 | server (dp8ep8, 0.90; CT11 + CT10, 2026-10-14) | strict-match | flexible-extract | time |
 |---|---|---|---|
-| flydsl compact dispatch, fp4 combine, 16384, no prefix caching | **0.9659 ±0.0050** | 0.9651 ±0.0051 | 6 min |
+| this page's image and launch: online FP8, flydsl compact dispatch, fp4 combine, 16384, no prefix caching | **0.9591 ±0.0055** | 0.9583 ±0.0055 | 7 min |
+| the morning build of the same tag (BF16 layers, `ATOM_USE_TRITON_GEMM=1`, #2380 instead of #6121) | 0.9659 ±0.0050 | 0.9651 ±0.0051 | 6 min |
 
-No answer was empty or `!!!!`. The previous image, with ATOM and aiter from the MLPerf branches, scored 0.9674.
+- **The two runs are within their error bars.** The difference is 0.007, and its standard error is about 0.0075.
+- **One question came back empty**, #301: the folding-newspaper puzzle, which reasons for a long time. Its
+  `content` was empty, most likely because the reasoning used up the 12288-token budget.
+- No answer was `!!!!`.
+- The image with ATOM and aiter from the MLPerf branches scored 0.9674.
 
 ---
 
@@ -695,7 +740,8 @@ Not measured with this image yet.
 | All DP ranks stop logging at once, mid-run, with no error. 30 min later all but one log `_sync_dp_state failed: … Timed out waiting 1800000ms`; meanwhile `[aiter] No available shared memory broadcast block found` repeats | The allgather LM head's custom all-gather hung on one rank. rocgdb shows that rank in `aiter::ag_gfx1250_lastdim<bf16, 8>` and the others in `tdm_compact_plan`. Seen twice in a few hours of GSM8K, never in AgentX runs. Workaround: the replicated head. Watch the `Engine 00x: Avg` lines, not the log's mtime: they stop |
 | `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe N) returned hipError 17` at load | aiter's MegaMoE turns on mori's TokOffExt, whose IPC handles do not cross trays. `MORI_EP_TOKOFF_EXT=0` |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` are not set together, the symm_mem probe failed, or DP > 8. Use the replicated head otherwise |
-| LLVM `PHINode::setIncomingValue` assertion on a long prompt at concurrency | Patch 1 (#2380) plus `ATOM_UNFUSED_GATHER_KV_B_PROJ=1` |
+| LLVM `PHINode::setIncomingValue` assertion on a long prompt at concurrency | The fused Triton `gather_kv_b_proj` ran. Keep `--online_quant_config` as in the launch: it makes `kv_b_proj` ptpc FP8, which aiter #6121's FlyDSL gather serves. Without online quantization, the alternative is ATOM #2380 (`ATOM_UNFUSED_GATHER_KV_B_PROJ=1`) |
+| Decode and prefill continuations part after a few words at temperature 0 | Expected with online FP8: small-M decode and large-M prefill run different FP8 kernels. GSM8K is the check |
 | `torch.OutOfMemoryError … Tried to allocate 14.05 GiB` in `_grouped_a8w4_tdm_moe` | 16384 batched tokens at 0.94. Use 0.90 |
 | Ranks on the two trays cannot connect at startup | The image's ENV sets `NCCL_SOCKET_IFNAME=lo GLOO_SOCKET_IFNAME=lo`. Set `NCCL_`, `GLOO_` and `MORI_SOCKET_IFNAME=enp1s0f1` |
 | `MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE` | Drop `MEGA_WIRE` |

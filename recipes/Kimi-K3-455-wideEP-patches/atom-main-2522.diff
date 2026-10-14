@@ -362,7 +362,7 @@ index bade07ca..4bd7e78b 100644
      recv_x, recv_w, recv_idx, total_recv, routing = mega._dispatch(
          hidden_states.contiguous(),
 diff --git a/atom/utils/envs.py b/atom/utils/envs.py
-index dbba221d..9692fca6 100644
+index 33c3ec88..29bcf016 100644
 --- a/atom/utils/envs.py
 +++ b/atom/utils/envs.py
 @@ -310,9 +310,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
