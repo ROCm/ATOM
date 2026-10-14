@@ -15,7 +15,7 @@ from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.protocol.requests import (
     CompletionResult,
-    EngineRequest,
+    IngressRequest,
     prompt_token_array,
 )
 from atom.model_engine.sequence import Sequence
@@ -749,7 +749,7 @@ class InputOutputProcessor:
     ):
         """responsible for:
         1) Tokenize
-        2) Create the EngineRequest
+        2) Create the IngressRequest
 
         Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
         callers which expect exactly one request back cannot silently drop the
@@ -785,8 +785,8 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
-    ) -> list[EngineRequest]:
-        """Tokenize once and materialize ``sampling_params.n`` EngineRequests.
+    ) -> list[IngressRequest]:
+        """Tokenize once and materialize ``sampling_params.n`` IngressRequests.
 
         Returns a list of length ``n``. For ``n == 1`` this is functionally
         equivalent to the legacy single-sequence path. For ``n > 1``:
@@ -865,12 +865,12 @@ class InputOutputProcessor:
 
                 cache_seed = multimodal_cache_seed(multimodal_data)
 
-        seqs: list[EngineRequest] = []
+        seqs: list[IngressRequest] = []
         for i in range(n):
             cb = (
                 stream_callbacks[i] if stream_callbacks is not None else stream_callback
             )
-            seq = EngineRequest(
+            seq = IngressRequest(
                 id=next(Sequence.counter),
                 prompt_token_ids=prompt,
                 sampling_params=sampling_params,

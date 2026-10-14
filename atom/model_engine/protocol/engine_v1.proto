@@ -7,8 +7,7 @@
 // language needs, beyond the messages themselves, to drive an EngineCore.
 // CoreManager (atom/model_engine/engine_core_mgr.py) is the reference client
 // and atom/model_engine/protocol/codec.py the reference codec. Regenerate
-// engine_v1_pb2.py with scripts/gen_engine_protocol.py; tests/fixtures/
-// engine_protocol holds byte-exact example messages (see "Golden vectors").
+// engine_v1_pb2.py with scripts/gen_engine_protocol.py.
 //
 // ============================================================== SOCKETS ===
 //
@@ -101,16 +100,7 @@
 // Field numbers are never reused; a removed field's number and name go into
 // `reserved`. A change an older peer could misread -- a field changing meaning
 // or type, a new message an older Core would drop -- bumps
-// PROTOCOL_VERSION in atom/model_engine/protocol/wire.py, and the golden
-// vectors are regenerated in the same change.
-//
-// ======================================================== GOLDEN VECTORS ==
-//
-// tests/fixtures/engine_protocol/<name>.frames holds one message per file:
-// a little-endian uint32 frame count, then per frame a uint32 length and the
-// frame's bytes. tests/test_engine_protocol_golden.py states what each one
-// means and checks the Python codec encodes exactly those bytes; a client in
-// another language can check its codec against the same files.
+// PROTOCOL_VERSION in atom/model_engine/protocol/wire.py.
 
 syntax = "proto3";
 

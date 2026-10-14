@@ -18,7 +18,7 @@ from atom.model_engine.engine_core_mgr import (
     CoreManager,
 )
 from atom.model_engine.protocol.codec import decode_client_message
-from atom.model_engine.protocol.requests import EngineRequest
+from atom.model_engine.protocol.requests import IngressRequest
 from atom.sampling_params import SamplingParams
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ class _FakeSeq:
 
 def _wire_request(seq_id, num_prompt_tokens=1, data_parallel_rank=None):
     """A request dispatch can actually encode, unlike `_FakeSeq`."""
-    return EngineRequest(
+    return IngressRequest(
         id=seq_id,
         prompt_token_ids=[1] * num_prompt_tokens,
         sampling_params=SamplingParams(),

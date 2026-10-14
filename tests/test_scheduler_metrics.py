@@ -124,13 +124,13 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
         encode_shutdown,
         encode_submit,
     )
-    from atom.model_engine.protocol.requests import EngineRequest
+    from atom.model_engine.protocol.requests import IngressRequest
     from atom.sampling_params import SamplingParams
 
     with stubbed_aiter():
         from atom.model_engine import engine_core as core
 
-    request = EngineRequest(
+    request = IngressRequest(
         id=1, prompt_token_ids=[1, 3, 4], sampling_params=SamplingParams()
     )
     messages = iter([encode_submit([request]), encode_shutdown()])
