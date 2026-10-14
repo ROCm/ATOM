@@ -980,6 +980,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Memoise the local coalescer's per-seq fit probe across hold ticks
+    # (`BlockManager.can_allocate_estimate`): re-walk a waiting prompt's prefix
+    # hit only when an index entry it read changed. Advisory; admission still
+    # probes exactly. "0" re-probes every tick, the old behaviour.
+    "ATOM_PREFILL_DELAYER_PROBE_MEMO": lambda: (
+        os.getenv("ATOM_PREFILL_DELAYER_PROBE_MEMO", "1") == "1"
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

@@ -960,7 +960,8 @@ class Scheduler:
             else:
                 if probed_tokens >= budget:
                     break
-                cached_blocks = self.block_manager.can_allocate(seq, record=False)
+                # Memoised across hold ticks; Phase 2 re-probes exactly.
+                cached_blocks = self.block_manager.can_allocate_estimate(seq)
                 probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.

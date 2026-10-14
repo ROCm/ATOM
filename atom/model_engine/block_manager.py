@@ -3,7 +3,9 @@
 
 import array
 import logging
+from collections import deque
 from dataclasses import dataclass
+from itertools import islice
 from math import inf, isinf
 from time import monotonic
 from weakref import WeakKeyDictionary
@@ -107,6 +109,42 @@ class JointBoundaryDecision:
     skip_reason: str | None = None
 
 
+# Eviction hashes kept for `_FitEstimate` revalidation. An estimate older than
+# this many evictions is re-walked rather than checked. A decode tick at c32
+# evicts a handful of blocks and a full 16k-token admission ~1k, so 8192 spans
+# a delayer hold with room to spare; ~64 KB of ints.
+_RECENT_EVICTIONS = 8192
+
+
+@dataclass(slots=True)
+class _FitEstimate:
+    """One `can_allocate` prefix walk, kept for `can_allocate_estimate`.
+
+    Holds what the walk read from the KV index, so a later call can tell
+    whether the index still answers the same, plus the two numbers the walk
+    produced. `watched` is every hash whose index entry the walk relied on:
+    the hit's chain and the first miss.
+    """
+
+    num_tokens: int
+    cache_seed: int
+    index_clears: int
+    evictions_seen: int
+    compressed_hit: int
+    block_hashes: list[int]
+    watched: set[int]
+    # The first block past the hit, and what the index held for it then: -1
+    # for a plain miss, a block id when the hash matched but the tokens did
+    # not. None when the hit already reaches the last reusable block.
+    boundary_hash: int | None
+    boundary_id: int
+    # The state gate's answer (`_gated_hit`) and the hit the walk returned,
+    # which a bounded replay (`_replay_hit`) may have widened past it.
+    resumable: int
+    hit: int
+    num_new_blocks: int
+
+
 class BlockManager:
     def __init__(
         self,
@@ -142,6 +180,16 @@ class BlockManager:
             Sequence, tuple[int, list[int]]
         ] = WeakKeyDictionary()
         self.total_evicted_blocks: int = 0
+        # The delayer's per-seq probe memo (`can_allocate_estimate`) and what
+        # validates it: the hashes evicted most recently, positioned by
+        # `total_evicted_blocks`, and a count of whole-index clears, which drop
+        # entries without an eviction callback.
+        self._fit_estimates: WeakKeyDictionary[Sequence, _FitEstimate] = (
+            WeakKeyDictionary()
+        )
+        self._recent_evictions: deque[int] = deque(maxlen=_RECENT_EVICTIONS)
+        self._index_clears = 0
+        self.fit_estimate_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -464,6 +512,7 @@ class BlockManager:
         can reach and spends live ones to make room for them.
         """
         self.total_evicted_blocks += 1
+        self._recent_evictions.append(h)
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
@@ -960,6 +1009,7 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
+        remember: bool = False,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -970,6 +1020,8 @@ class BlockManager:
         demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
+        `remember=True` files the walk for `can_allocate_estimate`, its only
+        caller; the answer is unchanged.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -1041,6 +1093,16 @@ class BlockManager:
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
+        if remember:
+            self._remember_walk(
+                seq,
+                prompt,
+                compressed_hit,
+                block_hashes,
+                resumable,
+                num_cached_blocks,
+                num_new_blocks,
+            )
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
@@ -1078,6 +1140,139 @@ class BlockManager:
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
+    def can_allocate_estimate(self, seq: Sequence) -> int:
+        """`can_allocate(seq, record=False)` for the delayer, memoised per seq.
+
+        Its one caller is `Scheduler._local_prefill_pending_work`, the
+        PrefillDelayer's pending-work estimate, which probes the head of
+        `waiting` on every coalescing hold tick. The prompt does not change
+        between those ticks and the index rarely changes under it, yet each
+        probe re-walked the whole hit: at c32 on Qwen3.5 AgentX a 186k-token
+        head is ~11.6k blocks, a p50 14.5 ms `schedule()`, and the GPU idles
+        for whatever exceeds the ~8.5 ms the host runs ahead of it (130 s of
+        253 s idle per hour, 14,861 such ticks).
+
+        So the walk is reused while nothing it read can have moved:
+          - no hash in `watched` left the index. `_record_evicted` sees every
+            removal but `clear_cache`'s, which `_index_clears` counts. A global
+            eviction count alone is useless: at steady state every decode
+            block allocation evicts some LRU block, just rarely one of these.
+          - the first miss is still the same miss. A hit only grows by a
+            publish of exactly that hash; publishes elsewhere cannot reach it
+            through the chain.
+          - same token count and seed (a preempted seq returns longer).
+        A hit block's contents cannot change without its eviction (`publish`
+        writes fresh blocks, `allocate` unindexes first), so the per-block
+        token compare holds as well.
+
+        Asked again on every call, because each moves independently of the KV
+        index: per-request state room, the state gate (`_gated_hit` -- PAGE
+        checkpoints are stored and evicted on their own; a changed answer
+        re-walks), the bounded-replay widening (`_replay_hit`, which reads the
+        tier's answer and records the replay on `seq`; a changed hit
+        re-walks), and free-pool fit. Not asked again: which hit blocks some
+        live seq references, i.e. `num_new_blocks`. That only moves the fit
+        test by the blocks that changed hands.
+
+        Advisory by construction. Admission (Phase 2) still calls the exact
+        `can_allocate` and only that allocates, so a stale estimate can move a
+        FIRE/HOLD decision but never admit a request the pool cannot hold.
+        A reuse also skips `can_allocate`'s checkpoint demand/end refresh and
+        `num_compressed_hit_blocks`; the same walk would rewrite the same
+        values, and Phase 2's probe refreshes them before anything acts on
+        them. A refusal is never served from the memo: fit is retested.
+        `ATOM_PREFILL_DELAYER_PROBE_MEMO=0` probes exactly every call.
+        """
+        if not (self.enable_prefix_caching and self.fit_estimate_memo):
+            return self.can_allocate(seq, record=False)
+        memo = self._fit_estimates.get(seq)
+        if memo is None or not self._walk_still_valid(seq, memo):
+            return self.can_allocate(seq, record=False, remember=True)
+        if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
+            return -1
+        resumable = self._gated_hit(seq, memo.compressed_hit, memo.block_hashes)
+        if resumable != memo.resumable:
+            return self.can_allocate(seq, record=False, remember=True)
+        # Asked again too: it reads the tier's answer, which lands between
+        # ticks, and it sets `seq.replays_hit` / `replay_kv_load` as the exact
+        # probe would. A different hit means a different `num_new_blocks`.
+        hit = self._replay_hit(seq, memo.compressed_hit, resumable)
+        if hit != memo.hit:
+            return self.can_allocate(seq, record=False, remember=True)
+        protected_hash = memo.block_hashes[hit - 1] if hit else None
+        if not self._has_page_units(memo.num_new_blocks, protected_hash):
+            return -1
+        return hit
+
+    def _remember_walk(
+        self,
+        seq: Sequence,
+        prompt: list[int],
+        compressed_hit: int,
+        block_hashes: list[int],
+        resumable: int,
+        hit: int,
+        num_new_blocks: int,
+    ) -> None:
+        boundary_hash = None
+        boundary_id = -1
+        if compressed_hit < self._n_hash_blocks(seq) - 1:
+            # The walk computed this hash before it stopped, so on a prompt
+            # block it is read back from the chain, not hashed again.
+            boundary_hash = self._block_hash(
+                seq,
+                prompt,
+                compressed_hit,
+                block_hashes[-1] if compressed_hit else seq.cache_seed,
+            )
+            boundary_id = self.kv.lookup(boundary_hash)
+        watched = set(block_hashes)
+        if boundary_hash is not None:
+            watched.add(boundary_hash)
+        self._fit_estimates[seq] = _FitEstimate(
+            num_tokens=seq.num_tokens,
+            cache_seed=seq.cache_seed,
+            index_clears=self._index_clears,
+            evictions_seen=self.total_evicted_blocks,
+            compressed_hit=compressed_hit,
+            # `can_allocate` extends nothing in place (`_extend_hash_chain`
+            # copies), so the list is the hit and stays it.
+            block_hashes=block_hashes,
+            watched=watched,
+            boundary_hash=boundary_hash,
+            boundary_id=boundary_id,
+            resumable=resumable,
+            hit=hit,
+            num_new_blocks=num_new_blocks,
+        )
+
+    def _walk_still_valid(self, seq: Sequence, memo: _FitEstimate) -> bool:
+        """Whether the KV index still answers `memo`'s walk the same way.
+
+        Cost is the evictions since the last check, not the prompt: each call
+        consumes them, so a hold tick pays for the handful its decode step
+        evicted.
+        """
+        if (
+            memo.num_tokens != seq.num_tokens
+            or memo.cache_seed != seq.cache_seed
+            or memo.index_clears != self._index_clears
+        ):
+            return False
+        new = self.total_evicted_blocks - memo.evictions_seen
+        if new:
+            if new > len(self._recent_evictions):
+                return False
+            watched = memo.watched
+            for h in islice(reversed(self._recent_evictions), new):
+                if h in watched:
+                    return False
+            memo.evictions_seen = self.total_evicted_blocks
+        return (
+            memo.boundary_hash is None
+            or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
+        )
+
     def record_allocation(
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
     ) -> None:
@@ -1102,6 +1297,9 @@ class BlockManager:
         requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
+        # Admitted: the delayer no longer estimates this seq, and the memo's
+        # `watched` set is a prompt's worth of ints to hold for its lifetime.
+        self._fit_estimates.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
         # it. `claim_blocks` is what it may point its block table at: every
@@ -2867,6 +3065,7 @@ class BlockManager:
         future requests."""
         self.kv.clear_index()
         self._state_checkpoint_cache.clear_index()
+        self._index_clears += 1
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 
