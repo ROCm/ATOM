@@ -65,9 +65,8 @@ class PagedStateImageAdapter:
     block_size: int = 0
     #: vLLM attention backend of the image layers (a ``PagedStateImageBackend``).
     backend_cls: type | None = None
-    #: A speculative drafter keeps its state in the target's slot, so an image
-    #: carries it (else images refuse to run with a drafter).
-    draft_state_in_image: bool = False
+    #: The drafters ``drafter_state_in_image`` accepts, for the refusal message.
+    image_drafters: str = ""
 
     @property
     def proxy_layer_name(self) -> str:
@@ -88,6 +87,12 @@ class PagedStateImageAdapter:
     def checkpoint_defaults(self) -> tuple[int, bool]:
         """Native (state_checkpoint_interval_tokens, state_checkpoint_demand)."""
         raise NotImplementedError
+
+    def drafter_state_in_image(self, vllm_config) -> bool:
+        """Whether the configured speculative drafter keeps all of its state in
+        the target's slot, so an image carries it. Images refuse to run with
+        any other drafter: a prefix hit would resume it without its state."""
+        return False
 
 
 _adapters: list[PagedStateImageAdapter] = []
@@ -378,12 +383,18 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
     sizing = adapter.sizing(vllm_config)
     k = sizing.spec.units_per_checkpoint
     if pc:
-        if getattr(vllm_config, "speculative_config", None) is not None:
-            if not adapter.draft_state_in_image:
+        spec = getattr(vllm_config, "speculative_config", None)
+        if spec is not None:
+            if not adapter.drafter_state_in_image(vllm_config):
+                only = f" ({adapter.image_drafters})" if adapter.image_drafters else ""
                 raise ValueError(
-                    f"{adapter.name} prefix caching through checkpoint images does "
-                    "not carry a drafter's state; drop --speculative-config or pass "
-                    "--no-enable-prefix-caching."
+                    f"{adapter.name} prefix caching through checkpoint images "
+                    "carries a drafter's state only for a drafter that lives in "
+                    f"the target's slot{only}; speculative method "
+                    f"{getattr(spec, 'method', None)!r} keeps its own state, which "
+                    "a prefix hit would not restore. Pass "
+                    "--no-enable-prefix-caching to run it, or drop "
+                    "--speculative-config."
                 )
             follow_native_hit_rule(vllm_config)
         # Align mode also makes vLLM correct an async spec-decode step's

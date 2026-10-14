@@ -465,8 +465,7 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
     layer_suffix = ATOM_DEEPSEEK_V4_IMAGE_LAYER_SUFFIX
     block_size = _V4_IMAGE_BLOCK_SIZE
     backend_cls = AtomDeepseekV4ImageBackend
-    # The MTP draft's ring is layer n_layers of the target's slot carve.
-    draft_state_in_image = True
+    image_drafters = "speculative method 'mtp' with the DeepSeek-V4 MTP draft"
 
     @property
     def proxy_layer_name(self) -> str:
@@ -487,6 +486,29 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
 
     def checkpoint_defaults(self) -> tuple[int, bool]:
         return _native_checkpoint_defaults()
+
+    def drafter_state_in_image(self, vllm_config) -> bool:
+        return v4_drafter_in_target_slot(vllm_config)
+
+
+def v4_drafter_in_target_slot(vllm_config) -> bool:
+    """Whether the drafter is the V4 MTP draft, the one the plugin binds into the
+    target's slot (its ring is layer n_layers of the target's carve, see
+    ``ATOMModelBase``'s proxy registration). Any other drafter (EAGLE3, DSpark,
+    ngram, suffix, ...) keeps its state outside the slot.
+
+    vLLM's ``SpeculativeConfig`` normalizes every MTP spelling (``deepseek_mtp``
+    included) to ``method == "mtp"`` and gives a V4 target the
+    ``DeepSeekV4MTPModel`` draft architecture.
+    """
+    from atom.plugin.vllm.model_wrapper import _DEEPSEEK_V4_MTP_ARCHES
+
+    spec = getattr(vllm_config, "speculative_config", None)
+    if getattr(spec, "method", None) != "mtp":
+        return False
+    draft = getattr(spec, "draft_model_config", None)
+    archs = getattr(draft, "architectures", None) or ()
+    return bool(archs) and archs[0] in _DEEPSEEK_V4_MTP_ARCHES
 
 
 _V4_ADAPTER = DeepseekV4ImageAdapter()

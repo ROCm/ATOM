@@ -257,7 +257,7 @@ def test_kv_config_hook_aligns_and_withholds_slots(fake):
 def test_a_family_whose_draft_is_in_the_slot_runs_images_with_a_drafter(
     fake, monkeypatch, eagle
 ):
-    monkeypatch.setattr(fake, "draft_state_in_image", True, raising=False)
+    monkeypatch.setattr(fake, "drafter_state_in_image", lambda vc: True)
     vc = _vcfg()
     vc.speculative_config = NS(use_eagle=lambda: eagle, disable_eagle_block_drop=False)
     specs = [{fake.proxy_layer_name: object()}]
@@ -266,6 +266,40 @@ def test_a_family_whose_draft_is_in_the_slot_runs_images_with_a_drafter(
     assert cfg.num_blocks == 100 - 11
     # An EAGLE-class drafter: native's hit rule, through vLLM's own switch.
     assert vc.speculative_config.disable_eagle_block_drop is eagle
+
+
+def test_images_refuse_a_drafter_the_family_does_not_keep_in_the_slot(
+    fake, monkeypatch
+):
+    # The capability is per drafter, not per family: only the drafter the
+    # family binds into the target's slot gets images (and the hit rule).
+    monkeypatch.setattr(
+        fake, "drafter_state_in_image", lambda vc: vc.speculative_config.method == "mtp"
+    )
+    monkeypatch.setattr(fake, "image_drafters", "method 'mtp'")
+    specs = [{fake.proxy_layer_name: object()}]
+    for method in ("eagle3", "dspark", "ngram"):
+        vc = _vcfg()
+        vc.speculative_config = NS(
+            method=method, use_eagle=lambda: True, disable_eagle_block_drop=False
+        )
+        with pytest.raises(ValueError) as e:
+            G._kv_cache_configs_hook(lambda *a: [_groups(fake, 3)], vc, specs, 0)
+        msg = str(e.value)
+        assert f"speculative method '{method}'" in msg and "(method 'mtp')" in msg
+        assert "--no-enable-prefix-caching" in msg
+        assert vc.speculative_config.disable_eagle_block_drop is False
+        assert vc.cache_config.mamba_cache_mode == "none"
+        # Without prefix caching there are no images, and nothing to refuse.
+        vc.cache_config.enable_prefix_caching = False
+        G._kv_cache_configs_hook(lambda *a: [_groups(fake, 3)], vc, specs, 0)
+        assert vc.speculative_config.disable_eagle_block_drop is False
+    vc = _vcfg()
+    vc.speculative_config = NS(
+        method="mtp", use_eagle=lambda: True, disable_eagle_block_drop=False
+    )
+    G._kv_cache_configs_hook(lambda *a: [_groups(fake, 3)], vc, specs, 0)
+    assert vc.speculative_config.disable_eagle_block_drop is True
 
 
 def test_a_matching_model_without_the_proxy_layer_passes_through(fake):

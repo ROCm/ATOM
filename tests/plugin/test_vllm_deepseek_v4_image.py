@@ -126,6 +126,8 @@ def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
 
     register_v4_image_adapter()
     vc.speculative_config = NS(
+        method="mtp",
+        draft_model_config=NS(architectures=["DeepSeekV4MTPModel"]),
         num_speculative_tokens=1,
         use_eagle=lambda: True,
         disable_eagle_block_drop=False,
@@ -135,6 +137,147 @@ def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
     )
     assert out == [] and vc.cache_config.mamba_cache_mode == "align"
     assert vc.speculative_config.disable_eagle_block_drop is True
+
+
+@pytest.fixture
+def atom_v4(monkeypatch):
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    from atom.plugin.vllm.deepseek_v4_image import register_v4_image_adapter
+
+    atom = NS(module_name="atom.plugin.vllm.model_wrapper", class_name="X")
+    monkeypatch.setitem(ModelRegistry.models, "DeepseekV4ForCausalLM", atom)
+    register_v4_image_adapter()
+
+
+@pytest.fixture(scope="module")
+def v4_target(tmp_path_factory):
+    """vLLM's ModelConfig of a tiny DeepSeek-V4 checkpoint (config only)."""
+    import json
+
+    from vllm.config import ModelConfig
+
+    d = tmp_path_factory.mktemp("v4")
+    hf = {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "model_type": "deepseek_v4",
+        "num_nextn_predict_layers": 1,
+        "compress_ratios": [0, 4, 0],
+        "num_hidden_layers": 2,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "qk_rope_head_dim": 16,
+        "q_lora_rank": 32,
+        "o_lora_rank": 32,
+        "o_groups": 1,
+        "index_head_dim": 16,
+        "index_n_heads": 2,
+        "index_topk": 8,
+        "sliding_window": 128,
+        "n_routed_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 32,
+        "hc_mult": 1,
+        "vocab_size": 1000,
+        "max_position_embeddings": 4096,
+    }
+    (d / "config.json").write_text(json.dumps(hf))
+    return ModelConfig(
+        model=str(d), skip_tokenizer_init=True, max_model_len=4096, dtype="float16"
+    )
+
+
+def _real_spec(target, method):
+    from vllm.config import ParallelConfig, SpeculativeConfig
+
+    lookup = {"prompt_lookup_max": 2, "prompt_lookup_min": 1}
+    return SpeculativeConfig(
+        method=method,
+        num_speculative_tokens=1,
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+        **(lookup if method == "ngram" else {}),
+    )
+
+
+def _v4_hook(vc):
+    from atom.plugin.vllm import paged_state_image as G
+    from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+
+    return G._kv_cache_configs_hook(
+        lambda *a: [], vc, [{ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME: object()}], [0]
+    )
+
+
+@pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
+def test_v4_mtp_is_the_drafter_bound_into_the_targets_slot(atom_v4, v4_target, method):
+    from atom.plugin.vllm.deepseek_v4_image import v4_drafter_in_target_slot
+
+    spec = _real_spec(v4_target, method)
+    # vLLM normalizes every MTP spelling; the V4 target gets the V4 MTP draft,
+    # whose architecture is what the plugin binds into the target's slot.
+    assert spec.method == "mtp"
+    assert spec.draft_model_config.architectures == ["DeepSeekV4MTPModel"]
+    assert spec.use_eagle_block_drop()
+    vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=spec)
+    assert v4_drafter_in_target_slot(vc)
+    assert _v4_hook(vc) == [] and vc.cache_config.mamba_cache_mode == "align"
+    assert spec.disable_eagle_block_drop is True
+
+
+def _drafters(v4_target):
+    """Every other drafter: vLLM's ngram for real; those that need a draft
+    checkpoint as vLLM normalizes them."""
+    eagle = {"use_eagle": lambda: True, "num_speculative_tokens": 1}
+    return [
+        _real_spec(v4_target, "ngram"),
+        NS(method="eagle3", draft_model_config=NS(architectures=["Eagle3X"]), **eagle),
+        NS(
+            method="dspark",
+            draft_model_config=NS(architectures=["DeepseekV4ForCausalLM"]),
+            **eagle,
+        ),
+        NS(method="eagle", draft_model_config=NS(architectures=["EagleX"]), **eagle),
+        NS(method="suffix", use_eagle=lambda: False, num_speculative_tokens=1),
+        # "mtp" with a draft the plugin does not bind into the slot.
+        NS(
+            method="mtp",
+            draft_model_config=NS(architectures=["DeepSeekMTPModel"]),
+            **eagle,
+        ),
+    ]
+
+
+def test_v4_images_refuse_every_other_drafter_at_startup(atom_v4, v4_target):
+    for spec in _drafters(v4_target):
+        spec.disable_eagle_block_drop = False
+        vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=spec)
+        with pytest.raises(ValueError) as e:
+            _v4_hook(vc)
+        msg = str(e.value)
+        assert msg.startswith("DeepSeek-V4 prefix caching through checkpoint images")
+        assert f"speculative method {spec.method!r}" in msg
+        assert "the DeepSeek-V4 MTP draft" in msg
+        assert "--no-enable-prefix-caching" in msg
+        # Refused before vLLM's EAGLE drop or the image groups are touched.
+        assert spec.disable_eagle_block_drop is False
+        assert vc.cache_config.mamba_cache_mode == "none"
+
+
+def test_v4_without_images_takes_any_drafter_and_no_drafter_takes_images(
+    atom_v4, v4_target
+):
+    for spec in [_real_spec(v4_target, "mtp"), *_drafters(v4_target)]:
+        spec.disable_eagle_block_drop = False
+        vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, prefix=False, spec=spec)
+        assert _v4_hook(vc) == []
+        assert vc.cache_config.mamba_cache_mode == "none"
+        assert spec.disable_eagle_block_drop is False
+    vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS)
+    assert _v4_hook(vc) == [] and vc.cache_config.mamba_cache_mode == "align"
 
 
 def test_event_driven_slots_never_take_a_live_requests_slot():
