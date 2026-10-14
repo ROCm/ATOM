@@ -947,6 +947,10 @@ models:
             cudagraph_mode: FULL
             compilation_level: 3
             extra_args: "--pipeline-parallel-size 8"
+          # GSM8K on a fresh server after the replay. The TP8 C4 cell scores
+          # 0.92-0.94 on the same eval.
+          run_eval: true
+          eval_concurrency: [72]
 
         - <<: *kimi_k3_agentic_agg_pp8
           name: kimi-k3-mxfp4-agg-pp4-tp2-cg-agentic-lmcache-1m-c72
@@ -976,6 +980,7 @@ models:
           benchmark:
             <<: *kimi_k3_agentic_aiperf
             max_output_tokens: 1
+          run_eval: false
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
